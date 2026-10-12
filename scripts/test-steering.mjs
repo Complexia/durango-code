@@ -470,6 +470,9 @@ const createSession = ({ threadId, runId, retained = false }) => {
     skipTranscriptTaskIds: new Set(),
     pendingSuggestionRunId: 'older-turn',
     pendingTaskNotifications: [],
+    tasks: new Map(),
+    pendingTaskToolUses: new Map(),
+    taskToolUseIds: new Set(),
     pendingSteerBoundary: null,
     lastTurnEndSnapshot: { baseline: 'background' },
     resultsOwed: 1,
@@ -651,6 +654,23 @@ await handleClaudeSessionMessage(idleSubagent.session, {
 assert.equal(idleSubagent.session.activeTurns.length, 0, 'Subagent output must not open a main turn');
 assert.equal(idleSubagent.session.resultsOwed, 0, 'Subagent output must not create result debt');
 assert.equal(idleSubagent.events.length, 0, 'Subagent output must not start a visible main run');
+idleSubagent.session.tasks.set('shared-task', { subject: 'Shared work', status: 'in_progress' });
+await handleClaudeSessionMessage(idleSubagent.session, subagentToolUse('TaskUpdate', {
+  taskId: 'shared-task', status: 'completed',
+}));
+await handleClaudeSessionMessage(idleSubagent.session, {
+  type: 'user',
+  parent_tool_use_id: 'toolu_agent',
+  tool_use_result: { statusChange: { to: 'completed' } },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_TaskUpdate', content: 'ok' }] },
+});
+assert.equal(idleSubagent.session.tasks.get('shared-task').status, 'completed');
+assert.equal(idleSubagent.session.activeTurns.length, 0, 'Idle checklist updates must not open a turn');
+assert.equal(idleSubagent.session.resultsOwed, 0, 'Idle checklist updates must not create result debt');
+assert.equal(idleSubagent.events.length, 1, 'Only the checklist update should be emitted');
+assert.equal(idleSubagent.events[0].type, 'activity');
+assert.equal(idleSubagent.events[0].activity.type, 'plan');
+assert.equal(idleSubagent.events[0].runId, 'run-idle-subagent');
 assert.equal(await steerClaudeSdkRun('run-idle-subagent', 'check on it'), true);
 assert.equal(idleSubagent.interruptCount, 0, 'Steering an idle main loop must not interrupt background work');
 assert.deepEqual(idleSubagent.pushed, ['check on it']);
@@ -667,6 +687,38 @@ assert.ok(
   liveSubagent.session.activeTurns[0].toolWrittenPaths.has(subagentWrite),
   'Subagent writes must still count toward the live turn\'s changed files'
 );
+
+// A task created by the parent can be completed by a foreground subagent.
+await handleClaudeSessionMessage(liveSubagent.session, {
+  ...subagentToolUse('TaskCreate', { subject: 'Implement feature' }),
+  parent_tool_use_id: null,
+});
+await handleClaudeSessionMessage(liveSubagent.session, {
+  type: 'user',
+  parent_tool_use_id: null,
+  tool_use_result: { task: { id: 'feature' } },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_TaskCreate', content: 'ok' }] },
+});
+liveSubagent.events.length = 0;
+await handleClaudeSessionMessage(liveSubagent.session, subagentToolUse('TaskUpdate', {
+  taskId: 'feature', status: 'completed',
+}));
+assert.equal(liveSubagent.session.tasks.get('feature').status, 'pending', 'Wait for the successful tool result');
+await handleClaudeSessionMessage(liveSubagent.session, {
+  type: 'user',
+  parent_tool_use_id: 'toolu_agent',
+  tool_use_result: { statusChange: { to: 'completed' } },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_TaskUpdate', content: 'ok' }] },
+});
+assert.equal(liveSubagent.session.tasks.get('feature').status, 'completed');
+assert.equal(liveSubagent.session.pendingTaskToolUses.size, 0, 'The result must consume its pending task update');
+assert.equal(liveSubagent.session.activeTurns.length, 1, 'Checklist updates must keep the existing turn');
+assert.equal(liveSubagent.session.resultsOwed, 1, 'Checklist updates must not create result debt');
+assert.equal(liveSubagent.events.length, 1, 'Only the checklist update should be emitted');
+assert.equal(liveSubagent.events[0].type, 'activity');
+assert.equal(liveSubagent.events[0].runId, 'run-live-subagent');
+assert.equal(liveSubagent.events[0].activity.type, 'plan');
+assert.deepEqual(liveSubagent.events[0].activity.plan, [{ content: 'Implement feature', status: 'completed' }]);
 
 const shellOnly = createSession({
   threadId: 'thread-shell-only',

@@ -1009,10 +1009,20 @@ export const handleClaudeSessionMessage = async (session, message) => {
   // the subagent tracker already renders them from the subagent transcript.
   // They must never open a turn: a background subagent acting while the main
   // loop is idle would otherwise open a synthetic turn that no `result` ever
-  // settles, leaving the thread "running" and unsteerable. While a turn is
-  // live, keep only its changed-file attribution.
+  // settles, leaving the thread "running" and unsteerable. Preserve shared
+  // checklist updates and the live turn's changed-file attribution.
   if (message?.parent_tool_use_id) {
     if (turn) trackClaudeFileWrites(turn, message);
+    const tasksChanged = processClaudeTaskMessage(session, message);
+    const runId = turn?.runId ?? session.backgroundRunId;
+    if (tasksChanged && runId) {
+      emitAgentEvent(session.sender, {
+        runId,
+        threadId: session.threadId,
+        type: 'activity',
+        activity: claudeTaskPlanActivity(session),
+      });
+    }
     return;
   }
 
