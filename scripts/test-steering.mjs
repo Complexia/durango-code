@@ -12,6 +12,7 @@ import {
   endClaudeSession,
   evictIdleClaudeSdkSessions,
   finalizeClaudeTurn,
+  handleClaudeSessionMessage,
   pendingClaudeBackgroundTasks,
   stopClaudeBackgroundTasks,
   steerClaudeSdkRun,
@@ -469,6 +470,9 @@ const createSession = ({ threadId, runId, retained = false }) => {
     skipTranscriptTaskIds: new Set(),
     pendingSuggestionRunId: 'older-turn',
     pendingTaskNotifications: [],
+    tasks: new Map(),
+    pendingTaskToolUses: new Map(),
+    taskToolUseIds: new Set(),
     pendingSteerBoundary: null,
     lastTurnEndSnapshot: { baseline: 'background' },
     resultsOwed: 1,
@@ -622,6 +626,100 @@ assert.equal(retained.session.resultsOwed, 1);
 assert.equal(retained.events[0]?.type, 'started', 'The renderer must receive an owner for retained-run output');
 assert.equal(retained.events[0]?.runId, 'run-retained');
 
+// Subagent frames are forwarded on the main stream with parent_tool_use_id.
+// A background subagent acting while the main loop is idle must not open a
+// synthetic turn: no `result` would ever settle it, and steering would then
+// interrupt the CLI (killing the subagent) and fall back to a queue that
+// never drains.
+const subagentToolUse = (name, input) => ({
+  type: 'assistant',
+  parent_tool_use_id: 'toolu_agent',
+  message: { content: [{ type: 'tool_use', id: `toolu_${name}`, name, input }] },
+});
+const idleSubagent = createSession({
+  threadId: 'thread-idle-subagent',
+  runId: 'run-idle-subagent',
+  retained: true,
+});
+idleSubagent.session.resultsOwed = 0;
+idleSubagent.session.sessionId = 'sdk-session-idle-subagent';
+claudeSdkSessions.set(idleSubagent.session.threadId, idleSubagent.session);
+claudeBackgroundRunSessions.set('run-idle-subagent', idleSubagent.session);
+await handleClaudeSessionMessage(idleSubagent.session, subagentToolUse('Bash', { command: 'date' }));
+await handleClaudeSessionMessage(idleSubagent.session, {
+  type: 'user',
+  parent_tool_use_id: 'toolu_agent',
+  message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_Bash', content: 'ok' }] },
+});
+assert.equal(idleSubagent.session.activeTurns.length, 0, 'Subagent output must not open a main turn');
+assert.equal(idleSubagent.session.resultsOwed, 0, 'Subagent output must not create result debt');
+assert.equal(idleSubagent.events.length, 0, 'Subagent output must not start a visible main run');
+idleSubagent.session.tasks.set('shared-task', { subject: 'Shared work', status: 'in_progress' });
+await handleClaudeSessionMessage(idleSubagent.session, subagentToolUse('TaskUpdate', {
+  taskId: 'shared-task', status: 'completed',
+}));
+await handleClaudeSessionMessage(idleSubagent.session, {
+  type: 'user',
+  parent_tool_use_id: 'toolu_agent',
+  tool_use_result: { statusChange: { to: 'completed' } },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_TaskUpdate', content: 'ok' }] },
+});
+assert.equal(idleSubagent.session.tasks.get('shared-task').status, 'completed');
+assert.equal(idleSubagent.session.activeTurns.length, 0, 'Idle checklist updates must not open a turn');
+assert.equal(idleSubagent.session.resultsOwed, 0, 'Idle checklist updates must not create result debt');
+assert.equal(idleSubagent.events.length, 1, 'Only the checklist update should be emitted');
+assert.equal(idleSubagent.events[0].type, 'activity');
+assert.equal(idleSubagent.events[0].activity.type, 'plan');
+assert.equal(idleSubagent.events[0].runId, 'run-idle-subagent');
+assert.equal(await steerClaudeSdkRun('run-idle-subagent', 'check on it'), true);
+assert.equal(idleSubagent.interruptCount, 0, 'Steering an idle main loop must not interrupt background work');
+assert.deepEqual(idleSubagent.pushed, ['check on it']);
+
+const liveSubagent = createSession({ threadId: 'thread-live-subagent', runId: 'run-live-subagent' });
+liveSubagent.session.sessionId = 'sdk-session-live-subagent';
+const subagentWrite = '/tmp/orion-steering-subagent-write.txt';
+await handleClaudeSessionMessage(
+  liveSubagent.session,
+  subagentToolUse('Write', { file_path: subagentWrite, content: 'x' })
+);
+assert.equal(liveSubagent.events.length, 0, 'Subagent tool rows must not duplicate into the main turn');
+assert.ok(
+  liveSubagent.session.activeTurns[0].toolWrittenPaths.has(subagentWrite),
+  'Subagent writes must still count toward the live turn\'s changed files'
+);
+
+// A task created by the parent can be completed by a foreground subagent.
+await handleClaudeSessionMessage(liveSubagent.session, {
+  ...subagentToolUse('TaskCreate', { subject: 'Implement feature' }),
+  parent_tool_use_id: null,
+});
+await handleClaudeSessionMessage(liveSubagent.session, {
+  type: 'user',
+  parent_tool_use_id: null,
+  tool_use_result: { task: { id: 'feature' } },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_TaskCreate', content: 'ok' }] },
+});
+liveSubagent.events.length = 0;
+await handleClaudeSessionMessage(liveSubagent.session, subagentToolUse('TaskUpdate', {
+  taskId: 'feature', status: 'completed',
+}));
+assert.equal(liveSubagent.session.tasks.get('feature').status, 'pending', 'Wait for the successful tool result');
+await handleClaudeSessionMessage(liveSubagent.session, {
+  type: 'user',
+  parent_tool_use_id: 'toolu_agent',
+  tool_use_result: { statusChange: { to: 'completed' } },
+  message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_TaskUpdate', content: 'ok' }] },
+});
+assert.equal(liveSubagent.session.tasks.get('feature').status, 'completed');
+assert.equal(liveSubagent.session.pendingTaskToolUses.size, 0, 'The result must consume its pending task update');
+assert.equal(liveSubagent.session.activeTurns.length, 1, 'Checklist updates must keep the existing turn');
+assert.equal(liveSubagent.session.resultsOwed, 1, 'Checklist updates must not create result debt');
+assert.equal(liveSubagent.events.length, 1, 'Only the checklist update should be emitted');
+assert.equal(liveSubagent.events[0].type, 'activity');
+assert.equal(liveSubagent.events[0].runId, 'run-live-subagent');
+assert.equal(liveSubagent.events[0].activity.type, 'plan');
+assert.deepEqual(liveSubagent.events[0].activity.plan, [{ content: 'Implement feature', status: 'completed' }]);
+
 const shellOnly = createSession({
   threadId: 'thread-shell-only',
   runId: 'run-shell-only',
@@ -729,8 +827,13 @@ assert.match(
   /if \(activeOwner\) \{[\s\S]*session\.query\.interrupt\(\)[\s\S]*createClaudeTurnState\(runId[\s\S]*session\.pushUserMessage\(text, \{ content \}\)[\s\S]*return true;/,
   'An active steer must interrupt the blocked loop before pushing its continuation'
 );
+assert.match(
+  claudeDriverSource,
+  /perTaskStopAffordance: true/,
+  'Claude sessions must declare per-task stop so a steer interrupt spares background agents'
+);
 
-for (const { session } of [active, retained, monitoredTurn, mixedBackground, expiredMonitor]) {
+for (const { session } of [active, retained, idleSubagent, liveSubagent, monitoredTurn, mixedBackground, expiredMonitor]) {
   if (session.backgroundSettleTimer) clearTimeout(session.backgroundSettleTimer);
 }
 claudeSdkSessions.clear();

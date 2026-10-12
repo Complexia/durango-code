@@ -1005,6 +1005,27 @@ export const handleClaudeSessionMessage = async (session, message) => {
 
   let turn = session.activeTurns[0];
 
+  // Subagent frames (parent_tool_use_id set) ride the main stream too, but
+  // the subagent tracker already renders them from the subagent transcript.
+  // They must never open a turn: a background subagent acting while the main
+  // loop is idle would otherwise open a synthetic turn that no `result` ever
+  // settles, leaving the thread "running" and unsteerable. Preserve shared
+  // checklist updates and the live turn's changed-file attribution.
+  if (message?.parent_tool_use_id) {
+    if (turn) trackClaudeFileWrites(turn, message);
+    const tasksChanged = processClaudeTaskMessage(session, message);
+    const runId = turn?.runId ?? session.backgroundRunId;
+    if (tasksChanged && runId) {
+      emitAgentEvent(session.sender, {
+        runId,
+        threadId: session.threadId,
+        type: 'activity',
+        activity: claudeTaskPlanActivity(session),
+      });
+    }
+    return;
+  }
+
   // A task_notification never opens a turn (the harness may not re-invoke the
   // model for it, and a turn without a coming `result` dangles forever). With
   // no turn active, stash it; it flushes into the next turn that opens.
@@ -1446,6 +1467,11 @@ export const createClaudeSdkSession = ({
             ? Promise.resolve({ behavior: 'allow', updatedInput: toolInput })
             : session.userInputs.canUseTool(toolName, toolInput, toolOptions),
         includePartialMessages: true,
+        // Without this declaration every interrupt kills running background
+        // agents/workflows, so steering a turn would silently stop them. Stop
+        // still halts everything: it stops each live task explicitly via
+        // stopTask and then disposes the session.
+        perTaskStopAffordance: true,
         // Predicted next user prompt after each turn (drives the suggested
         // task card). Emitted out-of-band after the result message off the
         // turn's prompt cache — it never touches the agent's own context or
