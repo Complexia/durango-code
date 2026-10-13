@@ -163,3 +163,19 @@ The probe runs the unsigned dev Electron. Before release, verify a real in-place
 - It finds `out/Durango Code-darwin-<arch>/Durango Code.app` for signing and notarization checks.
 
 orion-next's `app/api/download/macos` and `app/api/update/macos/[arch]/latest-mac.yml` read only `version`, `releasedAt`, `key`, `fileName`, `size` and `sha512`, and don't parse artifact names. They stay compatible. One cosmetic follow-up is for orion-web: their fallback download filename is still `Orion-macos.zip`. It applies only when `fileName` is missing, which deploy.mjs never produces.
+
+## Legacy bundle file name (1.0.149)
+
+Updates install in place, so pre-rebrand installs kept running from
+`/Applications/Orion.app`. macOS shows the bundle's *file* name in the Dock
+tooltip, Finder, Spotlight and Launchpad, so those users still saw "Orion".
+`src/main/legacy-bundle-rename.js` (imported right after the identity pin)
+renames a packaged `Orion.app` to `Durango Code.app` on launch and relaunches
+from the new path. Renaming does not affect the code signature (verified with
+`codesign --verify --deep --strict`), TCC grants (bundle id), Dock/Finder
+aliases (they follow renames) or userData/keychain (pinned separately).
+
+It skips: non-macOS, unpackaged/dev runs, mounted DMGs and App Translocation
+paths, non-writable parent folders, and — never overwriting — when a
+`Durango Code.app` already exists next to it. Opt out with
+`DURANGO_CODE_SKIP_BUNDLE_RENAME=1`. Tests: `bun run test:legacy-bundle-rename`.

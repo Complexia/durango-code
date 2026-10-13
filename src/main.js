@@ -1,6 +1,9 @@
 // Must stay the first import: pins the internal app name and legacy userData
 // path before any other module evaluates (see docs/durango-rebrand.md).
 import './main/pin-app-identity.js';
+// Then: a legacy /Applications/Orion.app renames itself to Durango Code.app
+// and relaunches (Dock/Finder show the bundle file name).
+import './main/rename-legacy-bundle-on-start.js';
 import { createRepositoryCredentials } from './main/repository-credentials.js';
 import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main/app-identity.js';
 import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
