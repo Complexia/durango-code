@@ -20,9 +20,9 @@ export const buildOrchestrationBlock = (orchestration) => {
   const roles = Array.isArray(orchestration?.roles) ? orchestration.roles : [];
   const lines = [
     orchestrationBlockStartMarker,
-    '# Orion Orchestration',
+    '# Durango Code Orchestration',
     '',
-    'These instructions apply only when this session is the Orion orchestrator (main driver), which is indicated by an `[Orion orchestration]` context block in the user prompt. Otherwise ignore this section entirely.',
+    'These instructions apply only when this session is the Durango Code orchestrator (main driver), which is indicated by an `[Orion orchestration]` context block in the user prompt. Otherwise ignore this section entirely.',
     '',
     '## Roles',
     '',
@@ -40,7 +40,7 @@ export const buildOrchestrationBlock = (orchestration) => {
     '',
     '## Delegating to subagents',
     '',
-    '1. **Preferred — the `spawn_subagent` tool.** Current Orion drivers expose a `spawn_subagent` tool from Orion\'s MCP server (the fully-qualified name varies by provider and may be `mcp__orion__spawn_subagent`, `orion.spawn_subagent`, or a plugin-prefixed equivalent). Call it with `{ model, prompt, title?, role? }`. `model` accepts a model id like `codex:gpt-5.6-sol`, a slug, or a label. The task runs on that model as a visible subthread in Orion, and the call blocks until the subagent finishes, returning its final report. Delegate computer-use tasks to the computerUse model, code exploration to the exploring model, code changes to the implementation model, and image/video generation to the imageVideoGen model — unless the user explicitly says otherwise (e.g. via @model mentions). The companion `stop_subagent` tool (`{ model?, title?, all? }`, same server) kills a running subagent you spawned: use it whenever the user asks to cancel a delegation, or when you abandon a stalled subagent and hand its task to another — never leave the replaced subagent running. The selector must match exactly one running subagent (pass `all: true` to stop every match). Stopping a subagent resolves its pending spawn_subagent call with a stopped notice.',
+    '1. **Preferred — the `spawn_subagent` tool.** Current Durango Code drivers expose a `spawn_subagent` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider and may be `mcp__orion__spawn_subagent`, `orion.spawn_subagent`, or a plugin-prefixed equivalent). Call it with `{ model, prompt, title?, role? }`. `model` accepts a model id like `codex:gpt-5.6-sol`, a slug, or a label. The task runs on that model as a visible subthread in Durango Code, and the call blocks until the subagent finishes, returning its final report. Delegate computer-use tasks to the computerUse model, code exploration to the exploring model, code changes to the implementation model, and image/video generation to the imageVideoGen model — unless the user explicitly says otherwise (e.g. via @model mentions). The companion `stop_subagent` tool (`{ model?, title?, all? }`, same server) kills a running subagent you spawned: use it whenever the user asks to cancel a delegation, or when you abandon a stalled subagent and hand its task to another — never leave the replaced subagent running. The selector must match exactly one running subagent (pass `all: true` to stop every match). Stopping a subagent resolves its pending spawn_subagent call with a stopped notice.',
     '2. **Fallback — run the provider CLI from the shell.** Only if the spawn_subagent tool is genuinely absent from your tool list, run the target provider CLI directly as a blocking one-shot command and read its output. The current `[Orion orchestration]` prompt supplies mandatory access flags; preserve them exactly and never grant a subagent more access than the driver:',
     '   - codex: `codex exec --json --cd <cwd> --skip-git-repo-check --color never --model <slug> <access flags> "<task>"`',
     '   - claude: `claude --print --model <slug> <access flags> "<task>"`',

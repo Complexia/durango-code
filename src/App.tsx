@@ -41,6 +41,7 @@ import {
   SquareSlash,
   Eraser,
   Plug,
+  MessageCircle,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -52,6 +53,8 @@ import {
   defaultNotificationSettings,
   defaultEpicsSettings,
   defaultRiftsSettings,
+  defaultDurangoSettings,
+  defaultDurangoDispatchSettings,
   findProjectById,
   isAgentsPanelVisible,
   isNoProjectId,
@@ -143,6 +146,7 @@ import {
   remoteThreadRuntime,
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
+import { dispatchProjectsPayload, durangoDispatchOutcome } from './app/durangoDispatch';
 import {
   AttachmentThumb,
   attachmentKindLabel,
@@ -194,6 +198,17 @@ import {
   hasThreadReaderSupport,
   isThreadReferenceCandidate,
 } from './app/chatMentions';
+import {
+  buildChatMentionsContext,
+  chatMentionToken,
+  formatChatUpdatedAt,
+  knownDurangoChats,
+  parseChatMentions,
+  rememberDurangoChats,
+  type DurangoChatRef,
+} from './app/durangoChats';
+import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
+import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
 import {
   addPromptContext,
   buildSlashCommandCandidates,
@@ -475,9 +490,9 @@ const cloudAppHost = (url: string) => {
 /** Billing page on whichever Orion Web this desktop talks to. */
 const cloudBillingUrl = (repoWebUrl: string | null | undefined) => {
   try {
-    return new URL('/repos/billing', repoWebUrl ?? 'https://orioncode.xyz').toString();
+    return new URL('/repos/billing', repoWebUrl ?? 'https://code.durango.sh').toString();
   } catch {
-    return 'https://orioncode.xyz/repos/billing';
+    return 'https://code.durango.sh/repos/billing';
   }
 };
 
@@ -707,18 +722,50 @@ const renderThreadStatusDot = (thread: Thread) => {
 
 // One row of the composer's @-mention dropdown. The root level offers the
 // mention kinds; picking one (or just typing) narrows to models or threads.
-type ChatMentionMode = 'model' | 'thread' | 'mcp';
+type ChatMentionMode = 'model' | 'thread' | 'mcp' | 'chat';
 type ChatMentionCandidate =
   | { kind: 'category'; category: ChatMentionMode; label: string; hint: string }
   | { kind: 'model'; model: AgentModel }
   | { kind: 'thread'; thread: Thread; projectName: string }
-  | { kind: 'mcp'; server: OrionMcpEntry };
+  | { kind: 'mcp'; server: OrionMcpEntry }
+  | { kind: 'chat'; chat: DurangoChatRef }
+  // Non-selectable row for the Durango chat list: loading, empty, or why it
+  // is unavailable. `action` makes Enter/click do something useful.
+  | { kind: 'chatStatus'; message: string; action?: 'sign-in' };
 
 const chatMentionCategories: Array<Extract<ChatMentionCandidate, { kind: 'category' }>> = [
   { kind: 'category', category: 'model', label: 'Model', hint: 'delegate to a model' },
   { kind: 'category', category: 'thread', label: 'Thread', hint: 'reference another thread' },
+  { kind: 'category', category: 'chat', label: 'Durango chats', hint: 'reference a Durango Chat conversation' },
   { kind: 'category', category: 'mcp', label: 'MCP', hint: 'use a connected MCP server' },
 ];
+
+// Results of the @chat dropdown's Durango search (main → GET /api/v1/chats).
+type DurangoChatSearchState = {
+  query: string;
+  status: 'loading' | 'ready' | 'error';
+  chats: DurangoChatRef[];
+  code?: string;
+  error?: string;
+};
+const DURANGO_CHAT_SEARCH_DEBOUNCE_MS = 250;
+
+// "[Durango memory]" block for a fresh agent session when the user opted in
+// (Settings → Durango). Main caches the recall for 10 minutes; a slow or
+// unreachable Durango never holds a turn back for more than a few seconds.
+const DURANGO_PROFILE_MEMORY_WAIT_MS = 4_000;
+const fetchDurangoProfileMemoryBlock = async (): Promise<string> => {
+  if (!window.orion?.durangoProfileMemory) return '';
+  try {
+    const result = await Promise.race([
+      window.orion.durangoProfileMemory(),
+      new Promise<null>((resolve) => window.setTimeout(() => resolve(null), DURANGO_PROFILE_MEMORY_WAIT_MS)),
+    ]);
+    return result?.ok ? result.block : '';
+  } catch {
+    return '';
+  }
+};
 
 // The thread list inside the @-mention dropdown loads this many rows at a time;
 // scrolling (or arrowing) to the bottom appends the next page.
@@ -962,6 +1009,7 @@ const App: React.FC = () => {
   // How many thread rows the @-mention dropdown currently shows; grows as the
   // user scrolls and resets whenever the thread query changes.
   const [chatMentionThreadLimit, setChatMentionThreadLimit] = useState(CHAT_MENTION_THREAD_PAGE);
+  const [durangoChatSearch, setDurangoChatSearch] = useState<DurangoChatSearchState | null>(null);
   const [threadReaderSupport, setThreadReaderSupport] = useState<{
     providerId: AgentProviderId;
     supported: boolean;
@@ -1918,6 +1966,33 @@ const App: React.FC = () => {
       return { candidates: mcpMatches(20), threadMatchTotal: 0 };
     }
 
+    if (chatMention.mode === 'chat') {
+      // Same capability gate as threads: the agent reads a mentioned chat
+      // with read_chat on the same `orion` MCP server as read_thread.
+      if (!canReferenceThreadsFromComposer) return { candidates: [], threadMatchTotal: 0 };
+      const trimmedQuery = chatMention.query.trim();
+      const search = durangoChatSearch?.query === trimmedQuery ? durangoChatSearch : null;
+      const status = (message: string, action?: 'sign-in') => ({
+        candidates: [{ kind: 'chatStatus' as const, message, ...(action ? { action } : {}) }],
+        threadMatchTotal: 0,
+      });
+      if (search?.status === 'error') {
+        if (search.code === 'not_signed_in') return status('Sign in to your Durango account to mention Durango chats', 'sign-in');
+        if (search.code === 'not_connected') return status(`Durango Chat isn't connected: ${search.error ?? 'try again later'}`);
+        return status(`Couldn't search Durango chats: ${search.error ?? 'try again later'}`);
+      }
+      // While a new query loads, keep showing the previous results.
+      const chats = search?.status === 'ready' ? search.chats : (durangoChatSearch?.chats ?? []);
+      if (chats.length === 0) {
+        if (!search || search.status === 'loading') return status('Searching Durango chats…');
+        return status(trimmedQuery ? `No Durango chats match "${trimmedQuery}"` : 'No Durango chats yet');
+      }
+      return {
+        candidates: chats.map((chat) => ({ kind: 'chat' as const, chat })),
+        threadMatchTotal: 0,
+      };
+    }
+
     if (chatMention.mode === 'thread') {
       // Hide unresolvable references for terminal threads and providers whose
       // installed CLI cannot receive Orion's read_thread tool.
@@ -1984,7 +2059,7 @@ const App: React.FC = () => {
     );
     const categoryAvailable = (category: ChatMentionMode) =>
       category === 'model' ||
-      (category === 'thread' && canReferenceThreadsFromComposer) ||
+      ((category === 'thread' || category === 'chat') && canReferenceThreadsFromComposer) ||
       (category === 'mcp' && canMentionMcpsFromComposer && orionMcps.length > 0);
     if (!query) {
       if (!chatMention.mode) {
@@ -2007,7 +2082,10 @@ const App: React.FC = () => {
       ? []
       : chatMentionCategories.filter(
           (candidate) =>
-            categoryAvailable(candidate.category) && candidate.label.toLowerCase().startsWith(query)
+            categoryAvailable(candidate.category) &&
+            (candidate.label.toLowerCase().startsWith(query) ||
+              // "@chat" reaches "Durango chats" too.
+              (candidate.category === 'chat' && 'chat'.startsWith(query)))
         );
     const models = base
       .filter(
@@ -2029,6 +2107,7 @@ const App: React.FC = () => {
     orionMcps,
     chatMention,
     chatMentionThreadLimit,
+    durangoChatSearch,
     enabledProviderIdSet,
     epics,
     projects,
@@ -2037,6 +2116,53 @@ const App: React.FC = () => {
   ]);
   const chatMentionHasMoreThreads =
     chatMention?.mode === 'thread' && chatMentionThreadTotal > chatMentionCandidates.length;
+  // @chat dropdown: search Durango as the query changes (debounced; the
+  // newest query wins). Nothing is fetched until the user picks "Durango
+  // chats", so composing never touches the network otherwise.
+  const durangoChatQuery =
+    chatMention?.mode === 'chat' && canReferenceThreadsFromComposer ? chatMention.query.trim() : null;
+  useEffect(() => {
+    if (durangoChatQuery === null) return;
+    const query = durangoChatQuery;
+    if (!window.orion?.durangoSearchChats) {
+      setDurangoChatSearch({
+        query,
+        status: 'error',
+        chats: [],
+        code: 'not_connected',
+        error: 'this build cannot reach Durango Chat',
+      });
+      return;
+    }
+    let active = true;
+    setDurangoChatSearch((current) => ({
+      query,
+      status: 'loading',
+      chats: current?.status === 'ready' ? current.chats : [],
+    }));
+    const timer = window.setTimeout(() => {
+      void window.orion!.durangoSearchChats!({ query, limit: 20 }).then(
+        (result) => {
+          if (!active) return;
+          if (result.ok) {
+            rememberDurangoChats(result.data);
+            setDurangoChatSearch({ query, status: 'ready', chats: result.data });
+          } else {
+            setDurangoChatSearch({ query, status: 'error', chats: [], code: result.code, error: result.error });
+          }
+        },
+        () => {
+          if (active) {
+            setDurangoChatSearch({ query, status: 'error', chats: [], code: 'network', error: 'Durango is unreachable' });
+          }
+        }
+      );
+    }, query ? DURANGO_CHAT_SEARCH_DEBOUNCE_MS : 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [durangoChatQuery]);
   // A new thread query starts back at the first page.
   const chatMentionThreadQuery = chatMention?.mode === 'thread' ? chatMention.query.trim() : null;
   useEffect(() => {
@@ -2065,7 +2191,11 @@ const App: React.FC = () => {
           ? `model:${candidate.model.id}`
           : candidate.kind === 'mcp'
             ? `mcp:${candidate.server.id}`
-            : `thread:${candidate.thread.id}`
+            : candidate.kind === 'chat'
+              ? `chat:${candidate.chat.id}`
+              : candidate.kind === 'chatStatus'
+                ? `chatStatus:${candidate.message}`
+                : `thread:${candidate.thread.id}`
     )
     .join('|');
   const prevChatMentionListKeyRef = useRef('');
@@ -2224,15 +2354,15 @@ const App: React.FC = () => {
     appUpdateState?.status === 'error'
       ? (appUpdateState.error ?? 'Update failed')
       : appUpdateState?.status === 'restarting'
-        ? 'Finishing the update, then reopening Orion'
+        ? 'Finishing the update, then reopening Durango Code'
         : appUpdateState?.availableVersion
-          ? `Orion ${appUpdateState.availableVersion} is available`
+          ? `Durango Code ${appUpdateState.availableVersion} is available`
           : appUpdateLabel;
-  const accountName = accountState.user?.name || (accountState.authenticated ? 'Orion account' : 'Not signed in');
+  const accountName = accountState.user?.name || (accountState.authenticated ? 'Durango account' : 'Not signed in');
   const accountEmail = accountState.user?.email ?? null;
   const accountIdentity = accountState.user ? `${accountState.user.id}\n${accountEmail ?? ''}` : null;
   const accountEmailRevealed = accountIdentity !== null && revealedAccountIdentity === accountIdentity;
-  const accountInitials = (accountState.user?.name || accountState.user?.email || 'O')
+  const accountInitials = (accountState.user?.name || accountState.user?.email || 'D')
     .split(/\s+|@/)
     .filter(Boolean)
     .slice(0, 2)
@@ -2991,7 +3121,7 @@ const App: React.FC = () => {
             (retentionDays ? ` settled over ${retentionDays} days ago` : '')
         );
       } else {
-        toast.error('Rifts were freed, but Orion could not durably finish their cleanup');
+        toast.error('Rifts were freed, but Durango Code could not durably finish their cleanup');
       }
     };
 
@@ -3066,9 +3196,69 @@ const App: React.FC = () => {
   // Workspace sync engine lives in main; push the opt-in settings to it on
   // hydration and every change, and mirror its status for the settings panel.
   const [workspaceSyncStatus, setWorkspaceSyncStatus] = useState<WorkspaceSyncStatus | null>(null);
+  const [storeHydrated, setStoreHydrated] = useState(() => useOrionStore.persist.hasHydrated());
   useEffect(() => {
-    void window.orion?.workspaceSyncConfigure?.(workspaceSyncSettings);
-  }, [workspaceSyncSettings]);
+    if (useOrionStore.persist.hasHydrated()) {
+      setStoreHydrated(true);
+      return;
+    }
+    return useOrionStore.persist.onFinishHydration(() => setStoreHydrated(true));
+  }, []);
+  useEffect(() => {
+    // Never push pre-hydration defaults: work sharing defaults to on, and a
+    // user who turned it off must not get a single sync call at startup.
+    if (!storeHydrated) return;
+    void window.orion?.workspaceSyncConfigure?.(useOrionStore.getState().workspaceSyncSettings);
+  }, [storeHydrated, workspaceSyncSettings]);
+  // Durango Tasks backend and Durango Chat dispatch live in main; push the
+  // settings and the project list (for machine registration) on hydration
+  // and on every change. The signature keeps unrelated project edits (icons,
+  // ordering) from re-registering the machine.
+  const durangoSettingsForMain = useOrionStore((state) => state.durangoSettings);
+  const dispatchProjectsSignature = useOrionStore((state) =>
+    JSON.stringify(state.projects.map((project) => [project.id, project.name, project.path]))
+  );
+  useEffect(() => {
+    if (!storeHydrated || !window.orion?.durangoConfigure) return;
+    const state = useOrionStore.getState();
+    const settings = { ...defaultDurangoSettings, ...state.durangoSettings };
+    void window.orion
+      .durangoConfigure({
+        useDurangoTasks: settings.useDurangoTasks !== false,
+        dispatch: { ...defaultDurangoDispatchSettings, ...settings.dispatch },
+        projects: dispatchProjectsPayload(state.projects),
+      })
+      .catch(() => {});
+  }, [storeHydrated, durangoSettingsForMain, dispatchProjectsSignature]);
+  // One-time "your coding work now syncs" notice (workspaceSyncConsent.ts).
+  const showWorkspaceSyncNotice =
+    storeHydrated && shouldShowWorkspaceSyncNotice(workspaceSyncSettings, accountState.authenticated);
+  const acknowledgeWorkspaceSyncNotice = useCallback(() => {
+    setWorkspaceSyncSettings({ consentNoticeSeen: true });
+  }, [setWorkspaceSyncSettings]);
+  const turnOffWorkspaceSyncFromNotice = useCallback(() => {
+    setWorkspaceSyncSettings({ enabled: false, consentNoticeSeen: true });
+    toast.info('Sharing coding work with Durango is off. Turn it back on anytime in Settings → Durango.');
+  }, [setWorkspaceSyncSettings]);
+  // Claude Code CLI terminals take instructions once, at launch: keep the
+  // opted-in "[Durango memory]" block ready for them (main caches the recall).
+  const includeDurangoProfileMemory = useOrionStore(
+    (state) => state.durangoSettings?.includeProfileMemory === true
+  );
+  const [terminalDurangoMemoryBlock, setTerminalDurangoMemoryBlock] = useState('');
+  useEffect(() => {
+    if (!includeDurangoProfileMemory || !accountState.authenticated) {
+      setTerminalDurangoMemoryBlock('');
+      return;
+    }
+    let active = true;
+    void fetchDurangoProfileMemoryBlock().then((block) => {
+      if (active) setTerminalDurangoMemoryBlock(block);
+    });
+    return () => {
+      active = false;
+    };
+  }, [includeDurangoProfileMemory, accountState.authenticated, accountState.user?.id]);
   useEffect(() => {
     const unsubscribe = window.orion?.onWorkspaceSyncState?.((state) => {
       setWorkspaceSyncStatus(state);
@@ -3423,7 +3613,7 @@ const App: React.FC = () => {
       if (seq !== cloudRefreshSeqRef.current) return;
       setCloudState({
         ok: false,
-        error: error instanceof Error ? error.message : 'Unable to read Orion Cloud state',
+        error: error instanceof Error ? error.message : 'Unable to read Durango Cloud state',
       });
     }
   }, [activeWorkingDir]);
@@ -3469,7 +3659,7 @@ const App: React.FC = () => {
       });
     } else if (app.status === 'failed') {
       cloudDeployWatchRef.current.delete(projectPath);
-      toast.error(app.error ?? 'Orion Cloud could not build this app.');
+      toast.error(app.error ?? 'Durango Cloud could not build this app.');
     }
   }, []);
 
@@ -3577,7 +3767,7 @@ const App: React.FC = () => {
 
       await window.orion?.checkForAppUpdate?.({ force: true });
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Could not update Orion');
+      toast.error(error instanceof Error ? error.message : 'Could not update Durango Code');
       setAppUpdateBusy(false);
     }
   }, [appUpdateBusy, appUpdateState]);
@@ -3589,13 +3779,13 @@ const App: React.FC = () => {
     try {
       const result = await window.orion.startAccountAuth();
       if (!result.ok) {
-        toast.error(result.error ?? 'Could not start Orion sign in');
+        toast.error(result.error ?? 'Could not start Durango sign-in');
         setAccountBusy(false);
       } else {
         toast.info('Continue sign in in your browser');
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Could not start Orion sign in');
+      toast.error(error instanceof Error ? error.message : 'Could not start Durango sign-in');
       setAccountBusy(false);
     }
   }, [accountBusy]);
@@ -3606,7 +3796,7 @@ const App: React.FC = () => {
     setAccountBusy(true);
     try {
       setAccountState(await window.orion.signOutAccount());
-      toast.success('Signed out of Orion');
+      toast.success('Signed out of your Durango account');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : 'Could not sign out');
     } finally {
@@ -3787,6 +3977,21 @@ const App: React.FC = () => {
     [updateThread]
   );
 
+  // Rename a linked card's id in place (legacy board id → Durango Tasks id).
+  const migrateLinkedTaskId = useCallback(
+    (threadId: string, fromId: string, toId: string) => {
+      const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
+      const linkedTasks = thread?.linkedTasks;
+      if (!linkedTasks?.some((task) => task.id === fromId)) return;
+      updateThread(threadId, {
+        linkedTasks: linkedTasks.some((task) => task.id === toId)
+          ? linkedTasks.filter((task) => task.id !== fromId)
+          : linkedTasks.map((task) => (task.id === fromId ? { ...task, id: toId } : task)),
+      });
+    },
+    [updateThread]
+  );
+
   // Push a status to the thread's injected cards by default, or just `taskIds`
   // when the action targets one chip (e.g. "mark done"). Pending cards have
   // not been sent to the agent and must not inherit the active run's lifecycle.
@@ -3811,14 +4016,21 @@ const App: React.FC = () => {
             notes,
           })
           .then((result) => {
-            if (result.ok || !result.stale) return;
+            if (result.ok) {
+              // Durango Tasks resolves pre-migration board ids but always
+              // answers with the task's Durango id: adopt it.
+              const nextId = result.task?.id;
+              if (nextId && nextId !== linked.id) migrateLinkedTaskId(threadId, linked.id, nextId);
+              return;
+            }
+            if (!result.stale) return;
             // The card was unlinked or relinked on the web — drop our side.
             dropLinkedTask(threadId, linked.id);
           })
           .catch(() => {});
       }
     },
-    [dropLinkedTask, updateThread]
+    [dropLinkedTask, migrateLinkedTaskId, updateThread]
   );
 
   // Desktop notification when a thread finishes. Suppressed while the user is
@@ -3939,7 +4151,7 @@ const App: React.FC = () => {
 
       const unlink = (async () => {
         if (!window.orion?.unlinkBoardTask) {
-          toast.error('Board tasks are unavailable in this build.');
+          toast.error('Durango Tasks are unavailable in this build.');
           return false;
         }
         try {
@@ -3973,7 +4185,7 @@ const App: React.FC = () => {
   const markLinkedTaskDone = useCallback(
     (threadId: string, taskId: string) => {
       pushLinkedTaskStatus(threadId, 'done', undefined, [taskId]);
-      toast.success('Task moved to Done on your board');
+      toast.success('Task moved to Done in Durango Tasks');
     },
     [pushLinkedTaskStatus]
   );
@@ -3986,8 +4198,13 @@ const App: React.FC = () => {
       const thread = state.threads.find((t) => t.id === state.selectedThreadId);
       if (!thread) return;
       const linkedTasks = thread.linkedTasks ?? [];
-      if (linkedTasks.some((linked) => linked.id === task.id)) {
-        await unlinkTaskFromThread(thread.id, task.id);
+      // Threads linked before the Durango Tasks switch hold the task's old
+      // board id (Durango returns it as `legacyId`).
+      const alreadyLinked = linkedTasks.find(
+        (linked) => linked.id === task.id || (task.legacyId != null && linked.id === task.legacyId)
+      );
+      if (alreadyLinked) {
+        await unlinkTaskFromThread(thread.id, alreadyLinked.id);
         return;
       }
       if (!window.orion?.linkBoardTask) return;
@@ -4097,7 +4314,7 @@ const App: React.FC = () => {
     ? `Linked ${selectedThread.linkedTasks.length === 1 ? 'task' : 'tasks'}: ${selectedThread.linkedTasks
         .map((task) => task.title)
         .join(', ')}`
-    : 'Link tasks from your Orion board';
+    : 'Link tasks from Durango Tasks';
   // Signature of that set, so selecting a thread re-refreshes only when it
   // actually changed (not on every status push).
   const pendingLinkedTaskKey = pendingLinkedTasks.map((task) => task.id).join(':');
@@ -4741,7 +4958,7 @@ const App: React.FC = () => {
         if (exchange.status === 'running') {
           updateBtwExchange(thread.id, exchange.id, {
             status: 'error',
-            error: 'Interrupted before Orion received the answer.',
+            error: 'Interrupted before Durango Code received the answer.',
           });
         }
       }
@@ -4758,12 +4975,12 @@ const App: React.FC = () => {
         appendToThreadMessage(
           thread.id,
           lastMessage.id,
-          'The previous agent run was interrupted before Orion received output. Send the prompt again to start a fresh run.'
+          'The previous agent run was interrupted before Durango Code received output. Send the prompt again to start a fresh run.'
         );
       } else {
         addMessageToThread(thread.id, {
           role: 'system',
-          content: 'The previous agent run was interrupted before Orion received completion.',
+          content: 'The previous agent run was interrupted before Durango Code received completion.',
         });
       }
       updateThread(thread.id, { status: 'error' });
@@ -5050,7 +5267,7 @@ const App: React.FC = () => {
     if (!activeWorkingDir || !window.orion?.changeSourceControlToOrion || repositoryOperationBusy) return;
 
     if (!accountState.authenticated) {
-      toast.info('Sign in to your Orion account to use Orion source control.');
+      toast.info('Sign in to your Durango account to use Durango Cloud source control.');
       setSettingsTab('account');
       setSettingsOpen(true);
       return;
@@ -5064,10 +5281,10 @@ const App: React.FC = () => {
         const authorizationUrl = mirror?.authorizationUrl;
         const mirrorDescription =
           mirror?.status === 'active' && mirror.delivery === 'cloud'
-            ? 'GitHub is mirrored continuously by Orion Cloud.'
+            ? 'GitHub is mirrored continuously by Durango Cloud.'
             : mirror?.status === 'authorization_required'
               ? [
-                  'Authorize GitHub to keep this mirror in sync when Orion Desktop is closed.',
+                  'Authorize GitHub to keep this mirror in sync when Durango Code is closed.',
                   result.mirrorWarning,
                 ]
                   .filter(Boolean)
@@ -5076,8 +5293,8 @@ const App: React.FC = () => {
                 (result.githubMirrorUrl ? 'GitHub is preserved as a read-only mirror.' : undefined);
         toast.success(
           gitState?.sourceProvider === 'github'
-            ? 'Source control changed to Orion'
-            : `Pushed ${activeThreadProject?.name ?? 'project'} to Orion`,
+            ? 'Source control changed to Durango Cloud'
+            : `Pushed ${activeThreadProject?.name ?? 'project'} to Durango Cloud`,
           result.githubMirrorUrl
             ? {
                 description: mirrorDescription,
@@ -5099,7 +5316,7 @@ const App: React.FC = () => {
         setSettingsTab('account');
         setSettingsOpen(true);
       } else {
-        toast.error(result.error ?? 'Could not change source control to Orion');
+        toast.error(result.error ?? 'Could not change source control to Durango Cloud');
       }
     } finally {
       setCloudBusy(false);
@@ -5121,11 +5338,11 @@ const App: React.FC = () => {
       }
       const authorizationUrl = result.mirror?.authorizationUrl;
       if (!authorizationUrl) {
-        toast.error('Orion Cloud did not return a GitHub authorization link.');
+        toast.error('Durango Cloud did not return a GitHub authorization link.');
         return;
       }
       await window.orion.openExternalUrl?.(authorizationUrl);
-      toast.info('Finish authorizing the Orion GitHub App in your browser.');
+      toast.info('Finish authorizing the GitHub App in your browser.');
       await refreshCloudState();
     } finally {
       setCloudBusy(false);
@@ -5139,21 +5356,21 @@ const App: React.FC = () => {
     try {
       const result = await window.orion.pullFromCloud(activeWorkingDir);
       if (!result.ok) {
-        toast.error(result.error ?? 'Pull from Orion Cloud failed');
+        toast.error(result.error ?? 'Pull from Durango Cloud failed');
       } else {
         const merge = result.merge;
         if (merge?.status === 'fast-forwarded' || merge?.status === 'checked-out') {
-          toast.success('Pulled latest changes from Orion Cloud');
+          toast.success('Pulled latest changes from Durango Cloud');
         } else if (merge?.status === 'up-to-date') {
-          toast.info('Already up to date with Orion Cloud');
+          toast.info('Already up to date with Durango Cloud');
         } else if (merge?.status === 'diverged') {
           toast.info(merge.hint ?? 'Local and cloud history diverged — merge manually.');
         } else if (merge?.status === 'ff-failed' || merge?.status === 'unborn-dirty') {
           toast.info(merge.error ?? merge.hint ?? 'Fetched, but could not update your branch.');
         } else if (merge?.status === 'local-ahead') {
-          toast.info('Fetched — your branch is ahead of Orion Cloud. Push when ready.');
+          toast.info('Fetched — your branch is ahead of Durango Cloud. Push when ready.');
         } else {
-          toast.success('Fetched from Orion Cloud');
+          toast.success('Fetched from Durango Cloud');
         }
         if (result.mirrorWarning) toast.warning(result.mirrorWarning);
       }
@@ -5185,10 +5402,11 @@ const App: React.FC = () => {
         ? reasons.join('; ')
         : 'you asked for every deploy to go through the deployment agent';
       const prompt = [
-        'Deploy this app to Orion Cloud. Use the orion-cli tool: run `orion-cli deploy` from the',
-        'appropriate app directory (install with `npm i -g orion-cloud`, or use `npx orion-cloud` if it',
-        'is not installed; run `orion-cli --help` first to see usage; authenticate with `orion-cli',
-        'login` if prompted — tell me if login is required, since it opens a browser).',
+        'Deploy this app to Durango Cloud. Use the Durango Code CLI: run `durango-code deploy` from the',
+        'appropriate app directory (older installs provide the same CLI as `orion-cli`; install with',
+        '`npm i -g durango-code`, or use `npx durango-code` if neither is installed; run `durango-code --help`',
+        'first to see usage; authenticate with `durango-code login` if prompted — tell me if login is',
+        'required, since it opens a browser).',
         `This project was detected as non-trivial to deploy because: ${reasonText}.`,
         'If the working tree has uncommitted changes, review and commit the intended deployable work',
         'before deploying, while preserving unrelated user changes.',
@@ -5198,7 +5416,7 @@ const App: React.FC = () => {
 
       // Deploying pushes commits, installs a CLI, and talks to Orion Cloud over
       // the network, so anything less than full access stalls on the first step.
-      const threadId = createThread(projectId, 'Deploy to Orion Cloud', {
+      const threadId = createThread(projectId, 'Deploy to Durango Cloud', {
         ...(resolvedDeploymentModelId ? { modelId: resolvedDeploymentModelId } : {}),
         accessMode: 'full-access',
         // Keep the thread in the same workspace the Deploy button acted on, so
@@ -5242,7 +5460,7 @@ const App: React.FC = () => {
     const projectPath = activeWorkingDir;
     if (!projectPath || !window.orion?.deployToCloud || cloudDeployingDir) return;
     if (!accountState.authenticated) {
-      toast.info('Sign in to your Orion account to deploy this project.');
+      toast.info('Sign in to your Durango account to deploy this project.');
       setSettingsTab('account');
       setSettingsOpen(true);
       return;
@@ -5274,7 +5492,7 @@ const App: React.FC = () => {
           setSettingsTab('account');
           setSettingsOpen(true);
         } else {
-          toast.error(published?.error ?? 'Could not publish this project to Orion Cloud');
+          toast.error(published?.error ?? 'Could not publish this project to Durango Cloud');
         }
         return false;
       };
@@ -5293,14 +5511,14 @@ const App: React.FC = () => {
           setSettingsTab('account');
           setSettingsOpen(true);
         } else if (result.limitReached || result.upgradeRequired) {
-          toast.error(result.error ?? 'Your plan does not allow another Orion Cloud app.', {
+          toast.error(result.error ?? 'Your plan does not allow another Durango Cloud app.', {
             action: {
               label: 'Upgrade',
               onClick: () => void window.orion?.openExternalUrl?.(cloudBillingUrl(cloudState?.webUrl)),
             },
           });
         } else {
-          toast.error(result.error ?? 'Deploy to Orion Cloud failed');
+          toast.error(result.error ?? 'Deploy to Durango Cloud failed');
         }
         return;
       }
@@ -5310,7 +5528,7 @@ const App: React.FC = () => {
       recordCloudApp(projectPath, app);
       if (app && app.status !== 'deployed' && app.status !== 'failed') {
         toast.info(`Building ${cloudAppHost(app.url)}…`, {
-          description: 'Orion Cloud is building your app. This usually takes a few minutes.',
+          description: 'Durango Cloud is building your app. This usually takes a few minutes.',
         });
       }
       await refreshCloudState();
@@ -5377,7 +5595,7 @@ const App: React.FC = () => {
       if (!project) {
         return {
           ok: false,
-          error: 'The project that requested this Rift is no longer available in Orion.',
+          error: 'The project that requested this Rift is no longer available in Durango Code.',
         };
       }
       const repositories = ownership.repositories?.length
@@ -5446,7 +5664,7 @@ const App: React.FC = () => {
           riftPath: ownership.riftPath,
         })) ?? {
           ok: false,
-          error: 'This Orion build cannot acknowledge Rift ownership.',
+          error: 'This Durango Code build cannot acknowledge Rift ownership.',
         }
       );
     },
@@ -5647,7 +5865,7 @@ const App: React.FC = () => {
       updateEpic(epicId, {
         riftRequest: {
           ...request,
-          error: 'The project selected for this Rift is no longer available in Orion.',
+          error: 'The project selected for this Rift is no longer available in Durango Code.',
         },
       });
       return;
@@ -5681,7 +5899,7 @@ const App: React.FC = () => {
       updateEpic(epicId, {
         riftRequest: {
           ...request,
-          error: 'One or more projects selected for this Rift are no longer available in Orion.',
+          error: 'One or more projects selected for this Rift are no longer available in Durango Code.',
         },
       });
       return;
@@ -5690,7 +5908,7 @@ const App: React.FC = () => {
       updateEpic(epicId, {
         riftRequest: {
           ...request,
-          error: 'This Orion build cannot create Rift workspaces.',
+          error: 'This Durango Code build cannot create Rift workspaces.',
         },
       });
       return;
@@ -5709,7 +5927,7 @@ const App: React.FC = () => {
         updateEpic(epicId, {
           riftRequest: {
             ...request,
-            error: 'Could not save the Rift request. Retry after Orion storage is available.',
+            error: 'Could not save the Rift request. Retry after Durango Code storage is available.',
           },
         });
         toast.error('Could not save the Rift request');
@@ -5837,7 +6055,7 @@ const App: React.FC = () => {
     ]);
     const nextProject = state.projects.find((project) => !existingProjectIds.has(project.id));
     if (!nextProject) {
-      toast.info('Every Orion project is already part of this epic');
+      toast.info('Every Durango Code project is already part of this epic');
       return;
     }
     setAddProjectToEpicDialog({
@@ -5867,7 +6085,7 @@ const App: React.FC = () => {
       return;
     }
     if (!window.orion?.epicAddRiftProject) {
-      toast.error('This Orion build cannot add projects to an existing Rift');
+      toast.error('This Durango Code build cannot add projects to an existing Rift');
       return;
     }
 
@@ -6029,7 +6247,7 @@ const App: React.FC = () => {
     let projectId = project?.id;
     if (!project) {
       if (epic.gitRoot) {
-        toast.info('Select the claimed repository to re-add it to Orion', {
+        toast.info('Select the claimed repository to re-add it to Durango Code', {
           description: epic.gitRoot,
         });
       }
@@ -7131,7 +7349,7 @@ const App: React.FC = () => {
 
     const disposeAgentThread = window.orion?.disposeAgentThread;
     if (!disposeAgentThread) {
-      toast.error('This Orion build cannot safely detach a thread from a live rift');
+      toast.error('This Durango Code build cannot safely detach a thread from a live rift');
       return;
     }
 
@@ -7334,7 +7552,7 @@ const App: React.FC = () => {
 
     const removeRift = window.orion?.epicRemoveRift;
     if (!removeRift) {
-      toast.error('This Orion build cannot safely remove a live epic rift');
+      toast.error('This Durango Code build cannot safely remove a live epic rift');
       return;
     }
 
@@ -7499,7 +7717,7 @@ const App: React.FC = () => {
         // the threads now leave the deleted Epic, also drop every session tied
         // to its old Rift before releasing the workspace guard.
         const threadsSaved = await finalizeDeletedEpicThreads();
-        toast.error('The epic was deleted, but Orion could not confirm Rift cleanup', {
+        toast.error('The epic was deleted, but Durango Code could not confirm Rift cleanup', {
           description: [
             error instanceof Error ? error.message : undefined,
             !threadsSaved ? 'Thread cleanup is still being retried.' : undefined,
@@ -7534,7 +7752,7 @@ const App: React.FC = () => {
       // session in the shared source checkout.
       if (!(await finalizeDeletedEpicThreads())) {
         toast.error('The Rift was removed, but thread cleanup is still being retried', {
-          description: 'Orion will keep retrying the thread save in the background.',
+          description: 'Durango Code will keep retrying the thread save in the background.',
         });
       }
     } finally {
@@ -7594,16 +7812,16 @@ const App: React.FC = () => {
       warnings.push('This epic has no pull request. It will be archived without one.');
     } else if (status?.pr?.state === 'OPEN') {
       warnings.push(
-        'Its pull request is still open. Settling only archives the epic in Orion; it will not merge or close the pull request.'
+        'Its pull request is still open. Settling only archives the epic in Durango Code; it will not merge or close the pull request.'
       );
     } else if (!status?.pr) {
       warnings.push(
-        'Orion could not verify the pull request state. Settling will not merge or close the pull request.'
+        'Durango Code could not verify the pull request state. Settling will not merge or close the pull request.'
       );
     }
     if (!status) {
       warnings.push(
-        'Orion could not inspect the workspace. Any work that has not been committed or pushed will remain unpublished.'
+        'Durango Code could not inspect the workspace. Any work that has not been committed or pushed will remain unpublished.'
       );
     }
 
@@ -7738,7 +7956,7 @@ const App: React.FC = () => {
           // Main reads epic ownership and settled state from the persisted store,
           // so the store has to be on disk before it looks.
           if (!(await flushOrionStoreSave())) {
-            toast.error('Rift cleanup could not start because Orion storage is unavailable');
+            toast.error('Rift cleanup could not start because Durango Code storage is unavailable');
             return;
           }
           const busyEpicIds = state.epics.filter((epic) => epicHasRunningAgents(epic.id)).map((epic) => epic.id);
@@ -7790,7 +8008,7 @@ const App: React.FC = () => {
               // until acknowledgement. The status poll may be idle after a
               // manual/release-on-settle sweep, so wake its backoff retry now.
               setRiftRecoveryRefreshNonce((current) => current + 1);
-              toast.error('Rifts were freed, but Orion could not durably finish their cleanup');
+              toast.error('Rifts were freed, but Durango Code could not durably finish their cleanup');
             }
           } else if (runGc && !result.gcError) {
             const reclaimed = result.reclaimedBytes != null ? ` — reclaimed ${formatBytes(result.reclaimedBytes)}` : '';
@@ -7898,7 +8116,7 @@ const App: React.FC = () => {
           const message = error instanceof Error ? error.message : '';
           toast.error(
             message.includes('No handler registered')
-              ? 'Restart Orion to finish enabling attachments.'
+              ? 'Restart Durango Code to finish enabling attachments.'
               : message || `Could not attach ${file.name || 'file'}`
           );
         }
@@ -8099,7 +8317,10 @@ const App: React.FC = () => {
       const mentionedThreads = promptText
         ? parseThreadMentions(promptText, state.threads, threadId)
         : [];
-      if (mentionedThreads.length > 0) {
+      // @chat mentions of Durango Chat conversations: ids/titles/links only;
+      // the agent reads them with read_chat (same bridge as read_thread).
+      const mentionedChats = promptText ? parseChatMentions(promptText, knownDurangoChats()) : [];
+      if (mentionedThreads.length > 0 || mentionedChats.length > 0) {
         let supportsThreadReader = false;
         try {
           supportsThreadReader =
@@ -8110,9 +8331,14 @@ const App: React.FC = () => {
         if (!supportsThreadReader) {
           return {
             ok: false,
-            error: `${model.providerLabel} cannot read referenced threads with this installation`,
+            error:
+              mentionedThreads.length > 0
+                ? `${model.providerLabel} cannot read referenced threads with this installation`
+                : `${model.providerLabel} cannot read Durango chats with this installation`,
           };
         }
+      }
+      if (mentionedThreads.length > 0) {
         // read_thread runs in main and reads the on-disk transcript snapshot.
         // Persist all live renderer threads before exposing those ids so a
         // just-created or just-updated reference is immediately readable.
@@ -8124,6 +8350,20 @@ const App: React.FC = () => {
         }
         // Capability probing and persistence both yield. Continue from the
         // current source thread so edits made during preflight are preserved.
+        state = useOrionStore.getState();
+        const refreshedThread = state.threads.find((candidate) => candidate.id === threadId);
+        if (!refreshedThread) return { ok: false, error: 'Thread no longer exists' };
+        thread = refreshedThread;
+      }
+      // Optional "[Durango memory]" block (Settings → Durango, default off):
+      // only when this provider's session starts fresh — later turns resume
+      // a session that already has it.
+      let durangoMemoryBlock = '';
+      if (
+        state.durangoSettings?.includeProfileMemory === true &&
+        !thread.agentSessionIds?.[model.providerId]
+      ) {
+        durangoMemoryBlock = await fetchDurangoProfileMemoryBlock();
         state = useOrionStore.getState();
         const refreshedThread = state.threads.find((candidate) => candidate.id === threadId);
         if (!refreshedThread) return { ok: false, error: 'Thread no longer exists' };
@@ -8194,6 +8434,11 @@ const App: React.FC = () => {
         );
         addAgentContext(threadMentionsContext);
       }
+      if (mentionedChats.length > 0) {
+        addAgentContext(buildChatMentionsContext(mentionedChats));
+      }
+      // Sits just below the general/orchestration instructions block.
+      addAgentContext(durangoMemoryBlock);
       if (orchestration) {
         // Added last: ordinary prompts retain orchestration-first ordering;
         // slash commands retain the command at byte zero and put context after it.
@@ -8329,6 +8574,7 @@ const App: React.FC = () => {
           : {}),
         ...(mentionedModels.length > 0 ? { mentions: mentionedModels } : {}),
         ...(mentionedThreads.length > 0 ? { hasThreadMentions: true } : {}),
+        ...(mentionedChats.length > 0 ? { hasChatMentions: true } : {}),
         ...(mcpServerIds.length > 0 ? { mcpServerIds } : {}),
         ...(orchestration ? { orchestration } : {}),
       });
@@ -8474,7 +8720,7 @@ const App: React.FC = () => {
         report(
           false,
           model.providerId === 'orion'
-            ? 'Cannot spawn a subagent on the Orion orchestrator itself'
+            ? 'Cannot spawn a subagent on the Durango Code orchestrator itself'
             : 'Claude Code CLI is an interactive terminal and cannot run as a subagent'
         );
         return;
@@ -8927,7 +9173,7 @@ const App: React.FC = () => {
       const prompt =
         'The harness suggested a follow-up task for this session: ' +
         `"${suggestionText}"\n\n` +
-        'Orion may start that task in a brand-new agent session with NO access to this ' +
+        'Durango Code may start that task in a brand-new agent session with NO access to this ' +
         'conversation. Write the prompt that new agent will receive. Make it fully ' +
         'self-contained: briefly state the background (what this session was working on ' +
         'and what was observed), name the exact files, commands, errors, or outputs the ' +
@@ -10094,7 +10340,8 @@ const App: React.FC = () => {
       const mentionedThreads = promptText
         ? parseThreadMentions(promptText, state.threads, threadId)
         : [];
-      if (mentionedThreads.length > 0) {
+      const mentionedChats = promptText ? parseChatMentions(promptText, knownDurangoChats()) : [];
+      if (mentionedThreads.length > 0 || mentionedChats.length > 0) {
         const supportsThreadReader =
           (await window.orion?.supportsThreadReader?.(target.agentModel.providerId)) === true;
         if (cancelled()) return;
@@ -10102,7 +10349,10 @@ const App: React.FC = () => {
           queueForTurnEnd();
           return;
         }
-        if (!supportsThreadReader || !(await flushOrionThreadsSave())) {
+        if (
+          !supportsThreadReader ||
+          (mentionedThreads.length > 0 && !(await flushOrionThreadsSave()))
+        ) {
           queueForTurnEnd();
           return;
         }
@@ -10153,6 +10403,9 @@ const App: React.FC = () => {
             new Map(state.projects.map((project) => [project.id, project.name]))
           )
         );
+      }
+      if (mentionedChats.length > 0) {
+        addAgentContext(buildChatMentionsContext(mentionedChats));
       }
       prepared = {
         agentPrompt,
@@ -10392,7 +10645,7 @@ const App: React.FC = () => {
       } catch (error) {
         result = {
           ok: false,
-          error: error instanceof Error ? error.message : 'Orion could not stop the background processes.',
+          error: error instanceof Error ? error.message : 'Durango Code could not stop the background processes.',
         };
       }
 
@@ -10406,7 +10659,7 @@ const App: React.FC = () => {
           claudeBackgroundIntervention: {
             ...currentIntervention,
             status: 'error',
-            error: result?.error ?? 'Orion could not stop the background processes.',
+            error: result?.error ?? 'Durango Code could not stop the background processes.',
           },
         });
         return;
@@ -10460,7 +10713,7 @@ const App: React.FC = () => {
       command: RemoteCommandRequest['command'],
       canPrepare: () => boolean,
       claimStart: () => Promise<boolean>
-    ) => Promise<{ ok: boolean; threadId?: string; epicId?: string; error?: string }>
+    ) => Promise<{ ok: boolean; threadId?: string; threadTitle?: string; epicId?: string; error?: string }>
   >(async () => ({ ok: false, error: 'Remote commands are unavailable.' }));
   useLayoutEffect(() => {
     remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
@@ -10710,6 +10963,61 @@ const App: React.FC = () => {
             ? { ok: true, threadId }
             : { ok: false, ...(createdThread ? {} : { threadId }), error: result.error };
         }
+        // Durango Chat dispatch (main: durango-dispatch.js): a fresh thread
+        // only. Link the chat's task first so this turn carries its context
+        // and the card's status automation follows the run, and leave a
+        // visible note that the thread was started remotely.
+        const dispatch = command.durangoDispatch && createdThread && thread ? command.durangoDispatch : null;
+        let dispatchLinkedTaskId: string | null = null;
+        if (dispatch) {
+          const project = findProjectById(useOrionStore.getState(), thread!.projectId);
+          const firstLine =
+            promptText
+              .split('\n')
+              .map((line) => line.trim())
+              .find((line) => line && !/^\[Started from Durango Chat/.test(line)) ?? '';
+          let title = firstLine.length > 60 ? `${firstLine.slice(0, 59).trimEnd()}…` : firstLine;
+          let linkNote = '';
+          if (dispatch.taskId && window.orion?.linkBoardTask) {
+            const linked = await window.orion
+              .linkBoardTask({
+                taskId: dispatch.taskId,
+                threadId,
+                threadTitle: title || thread!.title,
+                projectName: project?.name,
+              })
+              .catch((error: unknown) => ({
+                ok: false as const,
+                error: error instanceof Error ? error.message : String(error),
+                task: undefined,
+              }));
+            if (linked.ok && linked.task) {
+              const linkedTask = linkedTaskFromBoardTask(linked.task);
+              dispatchLinkedTaskId = linkedTask.id;
+              title = linkedTask.title || title;
+              updateThread(threadId, { linkedTasks: [linkedTask] });
+            } else {
+              linkNote = ` Could not link the Durango task: ${linked.error ?? 'unknown error'}.`;
+            }
+          }
+          if (title) updateThread(threadId, { title });
+          const accessLabel =
+            accessModeOptions.find((option) => option.value === requestedAccessMode)?.label ?? 'Read only';
+          const askedForEdits = dispatch.requestedAccessMode === 'auto-edit' && requestedAccessMode === 'read-only';
+          addMessageToThread(threadId, {
+            role: 'system',
+            content:
+              `Started remotely from Durango Chat${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
+              `Access: ${accessLabel}${askedForEdits ? ' (this Mac\'s limit for agents started from chat)' : ''}. ` +
+              'The prompt came from your chat and may quote chat or memory content; review the changes before you ship them.' +
+              linkNote,
+          });
+        }
+        const unlinkDispatchTask = () => {
+          if (dispatchLinkedTaskId) {
+            void window.orion?.unlinkBoardTask?.({ taskId: dispatchLinkedTaskId, threadId }).catch(() => {});
+          }
+        };
         const start = thread
           ? startTurnForThreadRef.current?.(
               threadId,
@@ -10720,22 +11028,47 @@ const App: React.FC = () => {
             )
           : undefined;
         if (!start) {
-          if (createdThread) useOrionStore.getState().deleteThread(threadId);
+          if (createdThread) {
+            unlinkDispatchTask();
+            useOrionStore.getState().deleteThread(threadId);
+          }
           return { ok: false, error: 'The agent turn could not start.' };
         }
         let result: { ok: boolean; error?: string };
         try {
           result = await start;
         } catch (error) {
-          if (createdThread) useOrionStore.getState().deleteThread(threadId);
+          if (createdThread) {
+            unlinkDispatchTask();
+            useOrionStore.getState().deleteThread(threadId);
+          }
           return {
             ok: false,
             error: error instanceof Error ? error.message : 'The agent turn could not start.',
           };
         }
-        if (!result.ok && createdThread) useOrionStore.getState().deleteThread(threadId);
+        if (!result.ok && createdThread) {
+          unlinkDispatchTask();
+          useOrionStore.getState().deleteThread(threadId);
+        }
+        if (result.ok && dispatch) {
+          // From here the settle watcher reports the outcome to Durango Chat.
+          updateThread(threadId, {
+            durangoDispatch: {
+              id: dispatch.id,
+              sourceUrl: dispatch.sourceUrl,
+              startedAt: new Date().toISOString(),
+            },
+          });
+        }
         return result.ok
-          ? { ok: true, threadId }
+          ? {
+              ok: true,
+              threadId,
+              ...(dispatch
+                ? { threadTitle: useOrionStore.getState().threads.find((t) => t.id === threadId)?.title }
+                : {}),
+            }
           : { ok: false, ...(createdThread ? {} : { threadId }), error: result.error };
       }
       if (command.kind === 'stopTurn') {
@@ -10776,7 +11109,7 @@ const App: React.FC = () => {
     if (!window.orion?.onRemoteCommandRequest) return undefined;
     const unsubscribe = window.orion.onRemoteCommandRequest((request) => {
       void (async () => {
-        let outcome: { ok: boolean; threadId?: string; epicId?: string; error?: string };
+        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; epicId?: string; error?: string };
         const canPrepare = () => Date.now() < request.expiresAt;
         let claimPromise: Promise<boolean> | null = null;
         const claimStart = () => {
@@ -10808,6 +11141,49 @@ const App: React.FC = () => {
     return () => unsubscribe?.();
   }, []);
 
+  // Durango Chat dispatch: report each dispatched thread's outcome back to the
+  // chat once its run settles (finished → summary, error/stop → failed). Runs
+  // off the persisted thread state, so a run interrupted by a restart is
+  // still reported (as failed) on the next launch.
+  useEffect(() => {
+    if (!window.orion?.durangoDispatchSettled) return undefined;
+    const inFlight = new Set<string>();
+    const check = (threads: Thread[]) => {
+      for (const thread of threads) {
+        const dispatch = thread.durangoDispatch;
+        if (!dispatch || dispatch.reportedAt || inFlight.has(dispatch.id)) continue;
+        const outcome = durangoDispatchOutcome(thread);
+        if (!outcome) continue;
+        inFlight.add(dispatch.id);
+        updateThread(thread.id, { durangoDispatch: { ...dispatch, reportedAt: new Date().toISOString() } });
+        const settled = window.orion?.durangoDispatchSettled?.({
+          dispatchId: dispatch.id,
+          threadId: thread.id,
+          ...outcome,
+        });
+        void Promise.resolve(settled)
+          .catch(() => {})
+          .finally(() => inFlight.delete(dispatch.id));
+      }
+    };
+    check(useOrionStore.getState().threads);
+    return useOrionStore.subscribe((state, previous) => {
+      if (state.threads !== previous.threads) check(state.threads);
+    });
+  }, [updateThread]);
+
+  // Clicking the "Durango Chat started an agent" notification.
+  useEffect(
+    () =>
+      window.orion?.onDurangoFocusThread?.(({ threadId }) => {
+        const store = useOrionStore.getState();
+        if (!store.threads.some((thread) => thread.id === threadId)) return;
+        store.setActiveTab('agents');
+        store.selectThread(threadId);
+      }),
+    []
+  );
+
   // Track the composer's active @-mention token: the last '@' at/before the
   // caret whose preceding character is start-of-text or whitespace, with no
   // whitespace between the '@' and the caret. Thread mode is the exception:
@@ -10826,7 +11202,8 @@ const App: React.FC = () => {
         const charBefore = atIndex > 0 ? beforeCaret[atIndex - 1] : '';
         const query = beforeCaret.slice(atIndex + 1);
         const mode = prev && prev.start === atIndex ? prev.mode : undefined;
-        const queryAllowed = mode === 'thread' ? !/[\r\n]/.test(query) : !/\s/.test(query);
+        const queryAllowed =
+          mode === 'thread' || mode === 'chat' ? !/[\r\n]/.test(query) : !/\s/.test(query);
         if ((!charBefore || /\s/.test(charBefore)) && queryAllowed) {
           next = { start: atIndex, query, ...(mode ? { mode } : {}) };
         }
@@ -10867,19 +11244,29 @@ const App: React.FC = () => {
       selectChatMentionCategory(candidate.category);
       return;
     }
+    if (candidate.kind === 'chatStatus') {
+      if (candidate.action === 'sign-in') {
+        setChatMention(null);
+        openAccountSettings();
+      }
+      return;
+    }
+    if (candidate.kind === 'chat') rememberDurangoChats([candidate.chat]);
     const inserted =
       candidate.kind === 'model'
         ? `@${modelMentionToken(candidate.model, agentModels)} `
         : candidate.kind === 'mcp'
           ? `@${candidate.server.nickname} `
-          : `@${threadMentionToken(candidate.thread)} `;
-    // Thread searches can contain spaces, so text after the caret is
-    // ambiguous and must be preserved. Model mentions have a safe slug-like
-    // token boundary and still consume a matching suffix.
+          : candidate.kind === 'chat'
+            ? `@${chatMentionToken(candidate.chat)} `
+            : `@${threadMentionToken(candidate.thread)} `;
+    // Thread and chat searches can contain spaces, so text after the caret
+    // is ambiguous and must be preserved. Model mentions have a safe
+    // slug-like token boundary and still consume a matching suffix.
     const replaceEnd = getChatMentionReplaceEnd(
       chatInput,
       chatMention,
-      candidate.kind === 'thread' ? 'thread' : 'model'
+      candidate.kind === 'thread' ? 'thread' : candidate.kind === 'chat' ? 'chat' : 'model'
     );
     const nextValue = chatInput.slice(0, chatMention.start) + inserted + chatInput.slice(replaceEnd);
     const caret = chatMention.start + inserted.length;
@@ -11927,7 +12314,7 @@ const App: React.FC = () => {
                     type="button"
                     className="composer-task-action done"
                     onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
-                    title="Mark the task as done on the board"
+                    title="Mark the task as done in Durango Tasks"
                   >
                     <CircleCheck size={13} />
                   </button>
@@ -12148,7 +12535,13 @@ const App: React.FC = () => {
               };
               if (candidate.kind === 'category') {
                 const CategoryIcon =
-                  candidate.category === 'model' ? Bot : candidate.category === 'mcp' ? Plug : MessageSquare;
+                  candidate.category === 'model'
+                    ? Bot
+                    : candidate.category === 'mcp'
+                      ? Plug
+                      : candidate.category === 'chat'
+                        ? MessageCircle
+                        : MessageSquare;
                 return (
                   <button key={`category:${candidate.category}`} {...rowProps} title={candidate.hint}>
                     <CategoryIcon size={16} />
@@ -12166,6 +12559,38 @@ const App: React.FC = () => {
                     <span className="mention-row-slug">
                       {projectName} · {formatShortTime(getThreadActivityTime(thread))}
                     </span>
+                  </button>
+                );
+              }
+              if (candidate.kind === 'chat') {
+                const { chat } = candidate;
+                const updated = formatChatUpdatedAt(chat.updatedAt);
+                const snippet = chat.snippet?.trim().replace(/\s+/g, ' ') ?? '';
+                return (
+                  <button
+                    key={`chat:${chat.id}`}
+                    {...rowProps}
+                    className={`${rowProps.className} chat-mention-row`}
+                    title={`@${chatMentionToken(chat)}`}
+                  >
+                    <MessageCircle size={16} />
+                    <span className="mention-row-label">{chat.title || 'Untitled chat'}</span>
+                    <span className="mention-row-slug">
+                      {[updated, snippet].filter(Boolean).join(' · ') || 'Durango chat'}
+                    </span>
+                  </button>
+                );
+              }
+              if (candidate.kind === 'chatStatus') {
+                return (
+                  <button
+                    key={`chatStatus:${candidate.message}`}
+                    {...rowProps}
+                    aria-disabled={!candidate.action}
+                    title={candidate.action === 'sign-in' ? 'Open account settings' : candidate.message}
+                  >
+                    <MessageCircle size={16} />
+                    <span className="mention-row-slug">{candidate.message}</span>
                   </button>
                 );
               }
@@ -12444,7 +12869,7 @@ const App: React.FC = () => {
                           title={linkedTasksLabel}
                         >
                           <SquareKanban size={14} />
-                          <span className="composer-menu-row-label">Board tasks</span>
+                          <span className="composer-menu-row-label">Durango Tasks</span>
                           <span className="composer-menu-row-value">
                             {linkedTaskIds.length > 0 ? `${linkedTaskIds.length} linked` : 'None'}
                           </span>
@@ -12669,8 +13094,8 @@ const App: React.FC = () => {
       <div className="app-shellbar">
         <div className="shell-sidebar-chrome">
           <div className="shell-brand">
-            <img src={orionIconUrl} alt="Orion" className="shell-brand-logo" width={28} height={28} draggable={false} />
-            <span className="shell-brand-name">Orion</span>
+            <img src={orionIconUrl} alt="Durango Code" className="shell-brand-logo" width={28} height={28} draggable={false} />
+            <span className="shell-brand-name">Durango Code</span>
           </div>
         </div>
 
@@ -13126,6 +13551,13 @@ const App: React.FC = () => {
             {providerUpdatesRunning ? 'View progress' : 'Update providers'}
           </button>
         </div>
+      )}
+
+      {showWorkspaceSyncNotice && (
+        <WorkspaceSyncNotice
+          onTurnOff={turnOffWorkspaceSyncFromNotice}
+          onAcknowledge={acknowledgeWorkspaceSyncNotice}
+        />
       )}
 
       {settingsOpen && (
@@ -13807,7 +14239,12 @@ const App: React.FC = () => {
                                   focused={pane.focused}
                                   resumeSessionId={pane.thread.agentSessionIds?.claude}
                                   forkSession={pane.thread.pendingForkProviders?.includes('claude')}
-                                  generalInstructions={normalizedOrchestrationSettings.generalInstructions}
+                                  generalInstructions={[
+                                    normalizedOrchestrationSettings.generalInstructions.trim(),
+                                    terminalDurangoMemoryBlock,
+                                  ]
+                                    .filter(Boolean)
+                                    .join('\n\n')}
                                 />
                               </React.Suspense>
                             )

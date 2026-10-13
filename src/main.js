@@ -1,6 +1,12 @@
+// Must stay the first import: pins the internal app name and legacy userData
+// path before any other module evaluates (see docs/durango-rebrand.md).
+import './main/pin-app-identity.js';
 import { createRepositoryCredentials } from './main/repository-credentials.js';
+import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main/app-identity.js';
+import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
 import { isPreviewFilePath } from './app/codeFiles.ts';
-import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, protocol, safeStorage, shell, systemPreferences } from 'electron';
+import { migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent.ts';
+import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, net, Notification, powerMonitor, protocol, safeStorage, shell, systemPreferences } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import {
@@ -56,6 +62,10 @@ import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, get
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
+import { DurangoError, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
+import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
+import { createDispatchWorker, normalizeDispatchSettings } from './main/durango-dispatch.js';
+import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } from './main/durango-tools.js';
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
@@ -86,6 +96,7 @@ import {
   forwardAgentEventToRemote,
   getRemoteControlState,
   initRemoteControl,
+  migrateRemoteControlUserId,
   notifyRemoteControlAccountChanged,
   notifyRemoteCommandRendererLost,
   claimRemoteCommand,
@@ -119,6 +130,7 @@ import {
   ensureBaselineGitignore,
   gitPushWasAlreadyUpToDate,
   inspectSourceControl,
+  isEquivalentOrionGitRemote,
   isOrionRepoRemoteUrl,
   canReuseLinkedCloudRepo,
   parseNamedGitRefs,
@@ -147,11 +159,10 @@ import {
 import { collapseNestedPaths, isExternalRiftLinkedFromWorkspace, isRiftRepositoryChildPath, planRiftStorageEntries, readVolumeFreeSpace, reclaimedBytesAcrossVolumes } from './main/rift-storage-accounting.js';
 import { isRiftDirectoryPath, listRiftRootEntries, loadSizeCache, measurePathSize, riftHasMarker, riftRootForGitRoot, saveSizeCache } from './main/rift-storage.js';
 
-// Set the application name as early as possible.
-// This helps the Dock, menu bar, and tooltips show "Orion" instead of "Electron"
-// especially during development (`npm start`).
-app.setName('Orion');
-app.setAppUserModelId('com.complexia.orion');
+// The internal app name ("Orion") and userData path are pinned by
+// ./main/pin-app-identity.js, imported first. The customer-facing name is
+// PRODUCT_DISPLAY_NAME ("Durango Code"); menus and the About panel use it
+// explicitly because Electron's role-based menu labels follow app.getName().
 
 const hiddenSystemDirectories = new Set(['.git']);
 let quitAfterPendingWork = false;
@@ -602,9 +613,10 @@ const randomBase64Url = (byteLength = 32) => base64Url(crypto.randomBytes(byteLe
 const sha256Base64Url = (value) => base64Url(crypto.createHash('sha256').update(value).digest());
 
 const getOrionWebUrl = () => {
-  // Packaged builds talk to the live site; development defaults to the local
-  // Orion Web dev server. ORION_WEB_URL overrides either.
-  const defaultWebUrl = app.isPackaged ? 'https://orioncode.xyz' : 'http://localhost:3000';
+  // Packaged builds talk to the live site (code.durango.sh; orioncode.xyz is
+  // a legacy alias of the same service); development defaults to the local
+  // Durango Code web dev server. ORION_WEB_URL overrides either.
+  const defaultWebUrl = app.isPackaged ? DEFAULT_PACKAGED_WEB_URL : DEFAULT_DEV_WEB_URL;
   const rawUrl = process.env.ORION_WEB_URL || defaultWebUrl;
   const url = new URL(rawUrl);
   url.hash = '';
@@ -624,8 +636,8 @@ const remotePairingProofRequest = async (method, body, token, { signal } = {}) =
     throw new Error(
       data?.error ||
         (response.status === 404
-          ? 'Orion Cloud does not support secure remote pairing yet.'
-          : 'Orion Cloud could not authenticate remote pairing.')
+          ? 'Durango Cloud does not support secure remote pairing yet.'
+          : 'Durango Cloud could not authenticate remote pairing.')
     );
   }
   return data;
@@ -634,7 +646,7 @@ const remotePairingProofRequest = async (method, body, token, { signal } = {}) =
 const createRemotePairingProof = async ({ token, challenge, machineId, signal }) => {
   const data = await remotePairingProofRequest('POST', { challenge, machineId }, token, { signal });
   if (typeof data?.proof !== 'string' || !data.proof) {
-    throw new Error('Orion Cloud returned an invalid remote pairing proof.');
+    throw new Error('Durango Cloud returned an invalid remote pairing proof.');
   }
   return data.proof;
 };
@@ -662,7 +674,7 @@ const getOrionRelayUrl = () => {
  */
 const relayApiRequest = async (apiPath, body, { signal, method, allowNotFound = false } = {}) => {
   const session = await readAccountSession();
-  if (!session?.token) throw new Error('Sign in to your Orion account first.');
+  if (!session?.token) throw new Error('Sign in to your Durango account first.');
   const { response, data } = await fetchRelayApiJson({
     url: new URL(apiPath, getOrionWebUrl()),
     method,
@@ -675,8 +687,8 @@ const relayApiRequest = async (apiPath, body, { signal, method, allowNotFound = 
     throw new Error(
       data?.error ||
         (response.status === 404
-          ? 'Orion Cloud does not support internet remote control yet.'
-          : 'Orion Cloud refused the relay request.')
+          ? 'Durango Cloud does not support internet remote control yet.'
+          : 'Durango Cloud refused the relay request.')
     );
   }
   return data;
@@ -698,7 +710,7 @@ const deregisterRelayDevice = ({ machineId, signal }) =>
 const mintRelayTicket = async ({ role, machineId, signal }) => {
   const data = await relayApiRequest('/api/relay/ticket', { role, machineId }, { signal });
   if (typeof data?.ticket !== 'string' || !data.ticket) {
-    throw new Error('Orion Cloud returned an invalid relay ticket.');
+    throw new Error('Durango Cloud returned an invalid relay ticket.');
   }
   const relayUrl =
     typeof data?.relayUrl === 'string' && data.relayUrl.trim() ? data.relayUrl.trim() : getOrionRelayUrl();
@@ -707,7 +719,7 @@ const mintRelayTicket = async ({ role, machineId, signal }) => {
     const allowedProtocols = app.isPackaged ? ['wss:', 'https:'] : ['ws:', 'wss:', 'http:', 'https:'];
     if (!allowedProtocols.includes(parsed.protocol)) throw new Error();
   } catch {
-    throw new Error('Orion Cloud returned an invalid relay address.');
+    throw new Error('Durango Cloud returned an invalid relay address.');
   }
   return { ticket: data.ticket, relayUrl };
 };
@@ -798,7 +810,7 @@ const writeAccountSession = async (session) => {
 const repositoryCredentials = createRepositoryCredentials({
   readSession: () => readAccountSession(),
   origin: () => getOrionWebUrl().toString(),
-  deviceName: `Orion Desktop · ${os.hostname()}`.slice(0, 100),
+  deviceName: `Durango Code · ${os.hostname()}`.slice(0, 100),
   readStored: async () => {
     try {
       const stored = JSON.parse(await fs.readFile(`${getAccountSessionFilePath()}.repositories`, 'utf8'));
@@ -819,14 +831,98 @@ const repositoryCredentials = createRepositoryCredentials({
 });
 const readRepositorySession = () => repositoryCredentials.get();
 
+// Durango (durango.sh) device key for the chats/memory API (contracts §7–8).
+// Stored beside the account session like the repository credential: the key
+// is safeStorage-encrypted in packaged builds and never leaves main.
+const durangoKeyFilePath = () => `${getAccountSessionFilePath()}.durango`;
+// Stable per-install device id sent with each key mint so Durango can tell
+// this device's keys apart across re-mints. Not a secret.
+let durangoDeviceIdPromise = null;
+const getDurangoDeviceId = () => {
+  durangoDeviceIdPromise ??= (async () => {
+    const target = path.join(app.getPath('userData'), 'orion-device-id');
+    try {
+      const existing = (await fs.readFile(target, 'utf8')).trim();
+      if (/^[0-9a-f-]{36}$/i.test(existing)) return existing;
+    } catch {}
+    const id = crypto.randomUUID();
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, `${id}\n`, 'utf8');
+    return id;
+  })().catch(() => {
+    durangoDeviceIdPromise = null;
+    return null;
+  });
+  return durangoDeviceIdPromise;
+};
+const durangoCredentials = createDurangoCredentials({
+  readSession: () => readAccountSession(),
+  webOrigin: () => getOrionWebUrl().toString(),
+  deviceName: os.hostname().slice(0, 80),
+  getDeviceId: () => getDurangoDeviceId(),
+  isPackaged: () => app.isPackaged,
+  readStored: async () => {
+    try {
+      const stored = JSON.parse(await fs.readFile(durangoKeyFilePath(), 'utf8'));
+      const key = decryptAccountToken(stored.key);
+      return key ? { ...stored, key } : null;
+    } catch { return null; }
+  },
+  writeStored: async (credential) => {
+    // Same rule as account tokens: packaged builds never persist a key
+    // without OS-backed encryption (it then lives for this process only).
+    if (app.isPackaged && !canUseSafeStorage()) return;
+    const target = durangoKeyFilePath();
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const temporary = `${target}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify({ ...credential, key: encryptAccountToken(credential.key) }), { mode: 0o600 });
+      await fs.rename(temporary, target);
+    } finally { await fs.rm(temporary, { force: true }); }
+  },
+  removeStored: () => fs.rm(durangoKeyFilePath(), { force: true }),
+});
+// DURANGO_MOCK=1 swaps in fixture data (development, GUI verification, tests).
+const durangoMock = process.env.DURANGO_MOCK === '1';
+const durangoClient = durangoMock
+  ? createMockDurangoClient()
+  : createDurangoClient({
+      credentials: durangoCredentials,
+      readSession: () => readAccountSession(),
+      isPackaged: () => app.isPackaged,
+    });
+setDurangoToolsClient(durangoClient);
+const durangoProfileMemory = createProfileMemoryCache({ getClient: () => durangoClient });
+// Lazily connect an already-signed-in user (startup) or a fresh sign-in, off
+// the critical path; tools mint on demand anyway if this fails.
+const warmDurangoKey = () => {
+  if (durangoMock) return;
+  void durangoCredentials.get().catch(() => {});
+};
+const durangoIpcError = (error) => ({
+  ok: false,
+  code: error instanceof DurangoError ? error.code : 'network',
+  error: error instanceof DurangoError ? error.message : durangoErrorText(error),
+});
+
 const clearAccountSession = async ({ preserveRepository = false } = {}) => {
   const repositoryClear = preserveRepository ? Promise.resolve() : repositoryCredentials.clear({ revokeRemote: true });
+  // The Durango key follows the repository credential: an expired session
+  // keeps it (it is unusable while signed out and is revoked with the next
+  // session on sign-in); explicit sign-out revokes it with the session that
+  // is ending, captured before that session is dropped.
+  const durangoClear = preserveRepository
+    ? Promise.resolve()
+    : durangoCredentials.clear({ revokeRemote: true, session: inMemoryAccountSession });
+  durangoProfileMemory.clear();
   inMemoryAccountSession = null;
   // Authorization ends when sign-out begins, not after the session file has
   // finished being removed. This synchronously closes remote listeners and
   // sessions before any account transition can await filesystem work.
   notifyRemoteControlAccountChanged(null, { reconcile: false });
-  await repositoryClear;
+  // Durango Chat dispatch stops polling the moment sign-out begins.
+  dispatchWorker.accountChanged(durangoMock);
+  await Promise.all([repositoryClear, durangoClear.catch(() => {})]);
   await fs.rm(getAccountSessionFilePath(), { force: true });
 };
 
@@ -849,7 +945,22 @@ const publishAccountState = async (session) => {
   // Remote control is gated on the live session: sign-out must stop the
   // listener and drop every connection immediately, sign-in re-arms it.
   notifyRemoteControlAccountChanged(effectiveSession);
+  // Same for Durango Chat dispatch (never claims while signed out).
+  dispatchWorker.accountChanged(durangoMock || account.authenticated);
   return account;
+};
+
+const migrateAccountUserId = async (previousUser, nextUser) => {
+  const fromUserId = typeof previousUser?.id === 'string' ? previousUser.id : null;
+  const toUserId = typeof nextUser?.id === 'string' ? nextUser.id : null;
+  if (!fromUserId || !toUserId || fromUserId === toUserId) return;
+  const [remote] = await Promise.allSettled([
+    migrateRemoteControlUserId({ fromUserId, toUserId }),
+    repositoryCredentials.rebindUser(fromUserId, nextUser),
+  ]);
+  if (remote.status === 'fulfilled' && remote.value?.error) {
+    console.error('account: could not migrate remote-control pairings', remote.value.error);
+  }
 };
 
 const verifyAccountSession = async () => {
@@ -884,8 +995,14 @@ const verifyAccountSession = async () => {
       user: data.user ?? session.user,
       expiresAt: data.expiresAt ?? session.expiresAt ?? null,
     };
+    // Durango identity cutover: the same desktop session (same app user)
+    // now reports a different native Clerk id. Rebind pairings and the
+    // repository credential to it before anything compares ids, so users
+    // neither re-pair machines nor mint a second repository token.
+    await migrateAccountUserId(session.user, nextSession.user);
     await writeAccountSession(nextSession);
     void readRepositorySession().catch(() => {});
+    warmDurangoKey();
     return publishAccountState(nextSession);
   } catch {
     return desktopAccountForRenderer(session);
@@ -946,7 +1063,7 @@ const exchangeDesktopAuthCode = async ({ code, state, codeVerifier }) => {
   } catch {}
 
   if (!response.ok) {
-    throw new Error(data?.error || 'Could not authorize Orion Desktop.');
+    throw new Error(data?.error || 'Could not authorize Durango Code.');
   }
 
   return data;
@@ -985,10 +1102,14 @@ const handleDesktopAuthCallback = async (rawUrl) => {
       codeVerifier: pending.codeVerifier,
     });
     await repositoryCredentials.clear({ revokeRemote: true });
+    // A key left over from an expired session is revoked with the new one.
+    await durangoCredentials.clear({ revokeRemote: true, session }).catch(() => {});
+    durangoProfileMemory.clear();
     await writeAccountSession(session);
     repositoryCredentials.resume();
     await publishAccountState(session);
     void readRepositorySession().catch(() => {});
+    warmDurangoKey();
     const [window] = BrowserWindow.getAllWindows();
     if (window) {
       if (window.isMinimized()) window.restore();
@@ -1013,7 +1134,7 @@ if (started) {
 // immediately; seed it from the installed app's store on first run.
 if (!app.isPackaged) {
   const liveUserData = app.getPath('userData');
-  const devUserData = `${liveUserData} (dev)`;
+  const devUserData = devUserDataPath(liveUserData);
   try {
     mkdirSync(devUserData, { recursive: true });
     // Seed only a brand-new dev profile — BOTH files absent. An existing dev
@@ -1094,7 +1215,7 @@ const createWindow = () => {
     height: 907,
     minWidth: 900,
     minHeight: 600,
-    title: 'Orion',
+    title: PRODUCT_DISPLAY_NAME,
     icon: appIcon,
     backgroundColor: '#101012',
     ...macWindowChrome,
@@ -1160,8 +1281,9 @@ app.whenReady().then(async () => {
   // Orphan recovery first: the retention sweep reads the same journal, and
   // neither should hold the first window open.
   void retryOrphanedRiftCleanup().then(() => startRiftRetentionSweep());
-  // Reinforce the app name (helps in some dev launch scenarios)
-  app.setName('Orion');
+  // Reinforce the internal app name (helps in some dev launch scenarios). It
+  // must stay "Orion": see ./main/app-identity.js.
+  app.setName(INTERNAL_APP_NAME);
 
   // Start maintenance immediately, but never hold the first window behind
   // shell startup or filesystem cleanup. Provider and MCP operations await
@@ -1187,8 +1309,12 @@ app.whenReady().then(async () => {
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
   });
   void readPersistedStoreState().then((state) => {
+    // Same consent reconciliation as the renderer store (work sharing
+    // defaults to Full; a persisted "off" made after consent v1 sticks).
+    // A store without settings yet is a fresh install: the renderer pushes
+    // its defaults on hydration.
     if (state?.workspaceSyncSettings) {
-      configureWorkspaceSync(state.workspaceSyncSettings);
+      configureWorkspaceSync(migrateWorkspaceSyncSettings(state.workspaceSyncSettings));
     }
   });
 
@@ -1212,6 +1338,23 @@ app.whenReady().then(async () => {
     getAppVersion: () => app.getVersion(),
   });
   addAgentEventListener((event) => forwardAgentEventToRemote(event));
+  // Durango Chat dispatch (off by default). Seed from the persisted store so
+  // an enabled worker resumes before the renderer hydrates; the renderer
+  // re-pushes settings and projects over durango:configure on every change.
+  powerMonitor.on('suspend', () => dispatchWorker.suspend());
+  powerMonitor.on('resume', () => dispatchWorker.resume());
+  void Promise.all([readPersistedStoreState(), isDispatchSignedIn()])
+    .then(async ([state, signedIn]) => {
+      if (dispatchConfigureSeq === 0 && state?.durangoSettings) {
+        await configureDurango({
+          useDurangoTasks: state.durangoSettings.useDurangoTasks,
+          dispatch: state.durangoSettings.dispatch,
+          projects: state.projects,
+        });
+      }
+      dispatchWorker.accountChanged(signedIn);
+    })
+    .catch((error) => console.error('Could not start Durango Chat dispatch', error));
   void readPersistedStoreState()
     .then((state) =>
       state?.remoteControlSettings
@@ -1233,10 +1376,36 @@ app.whenReady().then(async () => {
 
   if (process.platform === 'darwin') {
     app.setAboutPanelOptions({
-      applicationName: 'Orion',
+      applicationName: PRODUCT_DISPLAY_NAME,
       applicationVersion: app.getVersion(),
       copyright: '© Complexia',
     });
+    // Electron's default menu labels its app-menu items from app.getName(),
+    // which stays the internal "Orion" (see ./main/app-identity.js). Mirror
+    // the default menu with explicit customer-facing labels instead.
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate([
+        {
+          label: PRODUCT_DISPLAY_NAME,
+          submenu: [
+            { role: 'about', label: `About ${PRODUCT_DISPLAY_NAME}` },
+            { type: 'separator' },
+            { role: 'services' },
+            { type: 'separator' },
+            { role: 'hide', label: `Hide ${PRODUCT_DISPLAY_NAME}` },
+            { role: 'hideOthers' },
+            { role: 'unhide' },
+            { type: 'separator' },
+            { role: 'quit', label: `Quit ${PRODUCT_DISPLAY_NAME}` },
+          ],
+        },
+        { role: 'fileMenu' },
+        { role: 'editMenu' },
+        { role: 'viewMenu' },
+        { role: 'windowMenu' },
+        { role: 'help', submenu: [] },
+      ])
+    );
   }
 
   protocol.handle(attachmentProtocol, async (request) => {
@@ -1515,12 +1684,13 @@ const waitForPendingQuitWork = () =>
 
 const appShutdownError = () =>
   appShutdownReason === 'update'
-    ? 'Orion is restarting to install an update.'
-    : 'Orion is shutting down.';
+    ? 'Durango Code is restarting to install an update.'
+    : 'Durango Code is shutting down.';
 
 app.on('will-quit', (event) => {
   shutdownWorkspaceSync();
   shutdownRemoteControl();
+  dispatchWorker.stop();
   disposeForQuit();
   if (quitBarrierSatisfied) return;
 
@@ -1547,6 +1717,7 @@ const settleQuitBarrierForUpdate = async () => {
   // when will-quit sees the already-satisfied updater barrier.
   shutdownWorkspaceSync();
   shutdownRemoteControl();
+  dispatchWorker.stop();
   disposeForQuit('update');
   // If a quit is already draining this same work, waiting on it here settles at
   // the same time; either way the barrier is open once the work has landed.
@@ -1663,12 +1834,20 @@ ipcMain.handle('remote:stopTurn', (_event, input) => stopRemoteTurn(input));
 // did-start-loading/destroyed clear this authority until the next mount.
 ipcMain.handle('remote:rendererReady', (event) => markRemoteCommandRendererReady(event.sender));
 ipcMain.handle('remote:claimCommand', (event, input) =>
-  event.sender === remoteCommandRenderer ? claimRemoteCommand(input) : { ok: false }
+  event.sender !== remoteCommandRenderer
+    ? { ok: false }
+    : isDispatchRendererCommand(input?.commandId)
+      ? claimDispatchRendererCommand(input)
+      : claimRemoteCommand(input)
 );
 // The host renderer reports a remote command's outcome here, unblocking the
 // controller's pending request (mirrors orchestration:subagentResult).
 ipcMain.handle('remote:commandResult', (event, payload) =>
-  event.sender === remoteCommandRenderer ? resolveRemoteCommand(payload) : { ok: false }
+  event.sender !== remoteCommandRenderer
+    ? { ok: false }
+    : isDispatchRendererCommand(payload?.commandId)
+      ? resolveDispatchRendererCommand(payload)
+      : resolveRemoteCommand(payload)
 );
 
 ipcMain.handle('storage:saveThreads', async (_event, value) => {
@@ -2259,7 +2438,7 @@ ipcMain.handle('git:getState', async (_event, projectPath) => {
       originUrl: null,
       branches: [],
       hasUncommittedChanges: false,
-      error: isPlainProject ? 'This project is ready to publish to Orion.' : detail,
+      error: isPlainProject ? 'This project is ready to publish to Durango Cloud.' : detail,
     };
   }
 });
@@ -2302,7 +2481,7 @@ const pushBranchToSourceControl = async (gitRoot, branch, { signal } = {}) => {
   if (state.sourceProvider === 'orion') {
     const session = await readRepositorySession();
     if (!session?.token) {
-      const error = new Error('Sign in to your Orion account before pushing.');
+      const error = new Error('Sign in to your Durango account before pushing.');
       error.needsAuth = true;
       throw error;
     }
@@ -2322,7 +2501,7 @@ const runOriginNetworkGit = async (gitRoot, args, options = {}) => {
   const state = await getGitStateForPath(gitRoot);
   if (state.sourceProvider === 'orion') {
     const session = await readRepositorySession();
-    if (!session?.token) throw new Error('Sign in to your Orion account first.');
+    if (!session?.token) throw new Error('Sign in to your Durango account first.');
     return await runVerifiedOrionGit({
       gitRoot,
       args,
@@ -2391,13 +2570,13 @@ ipcMain.handle('git:commitAndPush', async (_event, input) => {
     if ((await readGitIndexTree(gitRoot)) !== indexTree) {
       return {
         ok: false,
-        error: 'Staged changes changed while Orion was preparing the commit. Try again.',
+        error: 'Staged changes changed while Durango Code was preparing the commit. Try again.',
       };
     }
     if ((await getCurrentGitBranch(gitRoot)) !== state.currentBranch) {
       return {
         ok: false,
-        error: `The repository moved off ${state.currentBranch} while Orion was preparing the commit. Try again.`,
+        error: `The repository moved off ${state.currentBranch} while Durango Code was preparing the commit. Try again.`,
       };
     }
 
@@ -2840,7 +3019,7 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
         ok: false,
         gitRoot,
         branch,
-        error: 'Staged changes changed while Orion was preparing the commit. Try again.',
+        error: 'Staged changes changed while Durango Code was preparing the commit. Try again.',
       };
     }
     if ((await getCurrentGitBranch(gitRoot)) !== branch) {
@@ -2848,7 +3027,7 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
         ok: false,
         gitRoot,
         branch,
-        error: `The repository moved off ${branch} while Orion was preparing the commit. Switch back and try again.`,
+        error: `The repository moved off ${branch} while Durango Code was preparing the commit. Switch back and try again.`,
       };
     }
     const setupErrorBeforeCommit = pendingRiftSetupError(input);
@@ -3018,7 +3197,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
       };
     }
     if (sourceProvider !== 'github' && sourceProvider !== 'orion') {
-      return { ok: false, error: 'Pull requests are supported for Orion and GitHub repositories.' };
+      return { ok: false, error: 'Pull requests are supported for Durango Cloud and GitHub repositories.' };
     }
 
     const target = await validateEpicGitTarget(gitRoot, branch, input);
@@ -3074,7 +3253,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
           ok: false,
           gitRoot,
           branch,
-          error: `The repository moved off ${branch} while Orion was checking for its pull request. Switch back and try again.`,
+          error: `The repository moved off ${branch} while Durango Code was checking for its pull request. Switch back and try again.`,
         };
       }
       const { stdout } = await execFileAsync(
@@ -3106,7 +3285,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
     if (sourceProvider === 'orion') {
       const link = await getCloudRepoLink(gitRoot);
       if (!link?.repoId) {
-        return { ok: false, gitRoot, branch, error: 'This Orion remote is missing its repository link.' };
+        return { ok: false, gitRoot, branch, error: 'This Durango Cloud remote is missing its repository link.' };
       }
       const existing = await cloudGitApiRequest(
         `/api/git/repos/${encodeURIComponent(link.repoId)}/pulls?state=open`,
@@ -3214,7 +3393,7 @@ ipcMain.handle('epic:createPr', async (event, input) => {
       }
     }
     if (!title) title = input?.epicName || `Changes from ${branch}`;
-    if (!body) body = `Changes from the Orion epic "${input?.epicName ?? branch}".`;
+    if (!body) body = `Changes from the Durango Code epic "${input?.epicName ?? branch}".`;
 
     const worktreeFailureBeforeCreate = await riftWorktreeChangesFailure(
       gitRoot,
@@ -3618,7 +3797,7 @@ const resolveExistingRiftBranchRef = async (gitRoot, epicId, requestedBranch) =>
 
 const createMultiProjectRift = async (event, input) => {
   if (riftShutdownRequested) {
-    return { ok: false, error: 'Rift creation was cancelled because Orion is quitting.' };
+    return { ok: false, error: 'Rift creation was cancelled because Durango Code is quitting.' };
   }
   const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
   const requestedProjects = Array.isArray(input?.projects)
@@ -3724,7 +3903,7 @@ const createMultiProjectRift = async (event, input) => {
       if (namespaceBranchExists) {
         return {
           ok: false,
-          error: `${path.basename(canonicalGitRoot)} has a local branch named orion, which conflicts with Orion’s Rift branch namespace.`,
+          error: `${path.basename(canonicalGitRoot)} has a local branch named orion, which conflicts with Durango Code’s Rift branch namespace.`,
         };
       }
       const baseBranch = String(requested.baseBranch ?? '').trim();
@@ -3808,7 +3987,7 @@ const createMultiProjectRift = async (event, input) => {
 
     for (const source of prepared) {
       if (abortController.signal.aborted || riftShutdownRequested) {
-        throw new Error('Rift creation was cancelled because its Orion window closed.');
+        throw new Error('Rift creation was cancelled because its Durango Code window closed.');
       }
       await riftInit(source.gitRoot, { signal: abortController.signal });
       const baseName = path.basename(source.gitRoot) || 'project';
@@ -3885,7 +4064,7 @@ const createMultiProjectRift = async (event, input) => {
     try { senderGone = event.senderFrame?.isDestroyed?.() === true; } catch { senderGone = true; }
     if (riftShutdownRequested || event.sender.isDestroyed() || senderGone) {
       await cleanupCreatedWorkspace();
-      return { ok: false, error: 'Rift creation was cancelled because its Orion window closed.' };
+      return { ok: false, error: 'Rift creation was cancelled because its Durango Code window closed.' };
     }
 
     const ownership = {
@@ -3915,7 +4094,7 @@ const createMultiProjectRift = async (event, input) => {
 
 const addProjectToExistingRift = async (event, input) => {
   if (riftShutdownRequested) {
-    return { ok: false, error: 'Rift project setup was cancelled because Orion is quitting.' };
+    return { ok: false, error: 'Rift project setup was cancelled because Durango Code is quitting.' };
   }
   const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
   const projectId = typeof input?.projectId === 'string' ? input.projectId : '';
@@ -4067,7 +4246,7 @@ const addProjectToExistingRift = async (event, input) => {
     if (namespaceBranchExists) {
       return {
         ok: false,
-        error: `${path.basename(canonicalGitRoot)} has a local branch named orion, which conflicts with Orion’s Rift branch namespace.`,
+        error: `${path.basename(canonicalGitRoot)} has a local branch named orion, which conflicts with Durango Code’s Rift branch namespace.`,
       };
     }
     const targetBranch =
@@ -4202,7 +4381,7 @@ const addProjectToExistingRift = async (event, input) => {
       throw new Error(`${baseName} does not contain the selected project directory.`);
     }
     if (abortController.signal.aborted || riftShutdownRequested) {
-      throw new Error('Rift project setup was cancelled because its Orion window closed.');
+      throw new Error('Rift project setup was cancelled because its Durango Code window closed.');
     }
 
     const repositories = [
@@ -4258,7 +4437,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
     return createMultiProjectRift(event, input);
   }
   if (riftShutdownRequested) {
-    return { ok: false, error: 'Rift creation was cancelled because Orion is quitting.' };
+    return { ok: false, error: 'Rift creation was cancelled because Durango Code is quitting.' };
   }
   const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
   if (!epicId) {
@@ -4451,7 +4630,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
         ok: false,
         error:
           'The source repository has a local branch named orion, which conflicts with ' +
-          "Orion's orion/... Rift branch namespace. Rename or delete the local orion branch " +
+          "Durango Code's orion/... Rift branch namespace. Rename or delete the local orion branch " +
           'before creating a rift.',
       };
     }
@@ -4500,7 +4679,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
       throw new Error('The new rift does not contain the selected project directory.');
     }
     if (riftShutdownRequested) {
-      throw new Error('Rift creation was cancelled because Orion is quitting.');
+      throw new Error('Rift creation was cancelled because Durango Code is quitting.');
     }
 
     // `--copy-all` copies the source worktree and index as well as ignored
@@ -4534,7 +4713,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
       throw new Error('The new rift could not be reset to a clean Git snapshot.');
     }
     if (riftShutdownRequested) {
-      throw new Error('Rift creation was cancelled because Orion is quitting.');
+      throw new Error('Rift creation was cancelled because Durango Code is quitting.');
     }
 
     // Recreating a freed epic's workspace: check its existing branch straight
@@ -4597,7 +4776,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
         createdRiftPath = '';
         return {
           ok: false,
-          error: 'Rift creation was cancelled because its Orion window closed.',
+          error: 'Rift creation was cancelled because its Durango Code window closed.',
         };
       }
 
@@ -4680,7 +4859,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
       }
     }
     if (abortController.signal.aborted || riftShutdownRequested) {
-      throw new Error('Rift creation was cancelled because its Orion window closed.');
+      throw new Error('Rift creation was cancelled because its Durango Code window closed.');
     }
     if (!branchBase) branchBase = slug;
     branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || slug;
@@ -4712,7 +4891,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
       createdRiftPath = '';
       return {
         ok: false,
-        error: 'Rift creation was cancelled because its Orion window closed.',
+        error: 'Rift creation was cancelled because its Durango Code window closed.',
       };
     }
 
@@ -4764,7 +4943,7 @@ ipcMain.handle('epic:createRift', async (event, input) => {
         ok: false,
         riftPath: createdRiftPath,
         error:
-          `${originalError} Orion also could not move the incomplete rift to trash: ` +
+          `${originalError} Durango Code also could not move the incomplete rift to trash: ` +
           `${cleanupMessage}. Incomplete rift: ${createdRiftPath}`,
       };
     }
@@ -6197,23 +6376,23 @@ const startRiftRetentionSweep = async () => {
 // --- Orion Cloud repositories -------------------------------------------------
 
 const cloudErrorMessage = (error) => {
-  if (error?.status === 401) return 'Orion repository access was revoked or expired. Sign in again to authorize this device.';
-  if (error?.status === 403) return error?.data?.error || 'Your Orion token does not have permission for this operation. Check Settings > Access tokens.';
+  if (error?.status === 401) return 'Durango Cloud repository access was revoked or expired. Sign in again to authorize this device.';
+  if (error?.status === 403) return error?.data?.error || 'Your Durango Cloud token does not have permission for this operation. Check Settings > Access tokens.';
   if (error?.status === 404) {
     // A real "repo not found" comes back as JSON from the git API; a bare 404
     // (HTML page) means this Orion Web deployment doesn't have the API at all.
     return error?.data?.error
       ? 'Cloud repository not found. It may have been deleted.'
-      : `Orion Cloud at ${getOrionWebUrl().host} does not support repositories yet. Deploy the latest Orion Web, or point ORION_WEB_URL at a server that has it.`;
+      : `Durango Cloud at ${getOrionWebUrl().host} does not support repositories yet. Deploy the latest Durango Code web, or point ORION_WEB_URL at a server that has it.`;
   }
-  if (error?.message?.includes('fetch failed')) return 'Could not reach Orion Cloud.';
+  if (error?.message?.includes('fetch failed')) return 'Could not reach Durango Cloud.';
   return error?.stderr?.toString().trim() || error?.message || String(error);
 };
 
 const cloudGitApiRequest = async (apiPath, { method = 'GET', body, signal } = {}) => {
   const session = await readRepositorySession();
   if (!session?.token) {
-    const error = new Error('Sign in to your Orion account first.');
+    const error = new Error('Sign in to your Durango account first.');
     error.needsAuth = true;
     throw error;
   }
@@ -6231,7 +6410,7 @@ const cloudGitApiRequest = async (apiPath, { method = 'GET', body, signal } = {}
     data = await response.json();
   } catch {}
   if (!response.ok) {
-    const error = new Error(data?.error || `Orion Cloud request failed (${response.status}).`);
+    const error = new Error(data?.error || `Durango Cloud request failed (${response.status}).`);
     error.status = response.status;
     error.data = data;
     throw error;
@@ -6247,7 +6426,7 @@ const expectedOrionGitRemote = (gitHttpUrl, repoId) =>
 // complete remote before placing the session token in Git's environment.
 const verifyOrionGitRemote = async ({ gitRoot, token, signal }) => {
   const link = await getCloudRepoLink(gitRoot);
-  if (!link?.repoId) throw new Error('This repository is not linked to Orion Cloud.');
+  if (!link?.repoId) throw new Error('This repository is not linked to Durango Cloud.');
   const [{ stdout }, { stdout: pushUrls }, connection] = await Promise.all([
     execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', 'origin']),
     execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', '--push', '--all', 'origin']),
@@ -6258,10 +6437,12 @@ const verifyOrionGitRemote = async ({ gitRoot, token, signal }) => {
   // Git permits separate (and multiple) push destinations, including URL
   // rewrites. Validate the effective destinations before supplying a token.
   const pushDestinations = pushUrls.trim().split('\n').map((url) => url.trim().replace(/\/+$/, ''));
-  if (!connection?.gitHttpUrl || actual !== expected || !isOrionRepoRemoteUrl(actual, link.repoId)
-    || pushDestinations.length !== 1 || pushDestinations[0] !== expected) {
+  // Existing clones may point at a legacy alias of the advertised git host
+  // (git.orioncode.xyz vs git.durango.sh); both are the same service.
+  if (!connection?.gitHttpUrl || !isEquivalentOrionGitRemote(actual, expected) || !isOrionRepoRemoteUrl(actual, link.repoId)
+    || pushDestinations.length !== 1 || !isEquivalentOrionGitRemote(pushDestinations[0], expected)) {
     throw new Error(
-      'The origin remote does not match this repository’s authenticated Orion Cloud endpoint.'
+      'The origin remote does not match this repository’s authenticated Durango Cloud endpoint.'
     );
   }
   return expected;
@@ -6364,7 +6545,7 @@ const ensureInitialSourceControlCommit = async (gitRoot, session) => {
       'config',
       '--local',
       'user.name',
-      String(session?.user?.name || 'Orion User'),
+      String(session?.user?.name || 'Durango Code User'),
     ]);
   }
   if (!(await readConfig('user.email'))) {
@@ -6434,7 +6615,7 @@ const createAvailableEmptyCloudRepo = async ({ gitRoot, name, defaultBranch, tok
       if (error?.status !== 409) throw error;
     }
   }
-  throw new Error('Could not choose an available Orion repository name.');
+  throw new Error('Could not choose an available Durango Cloud repository name.');
 };
 
 const restoreCloudRepoLink = async (gitRoot, previousLink) => {
@@ -6474,7 +6655,7 @@ const convertGithubSourceControl = async ({ projectPath, state, session }) => {
       remoteHead.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD$/m)?.[1]?.trim() || current;
   } catch {
     throw new Error(
-      'The GitHub remote could not be refreshed completely. Orion left the repository on GitHub.'
+      'The GitHub remote could not be refreshed completely. Durango Code left the repository on GitHub.'
     );
   }
 
@@ -6505,7 +6686,7 @@ const convertGithubSourceControl = async ({ projectPath, state, session }) => {
   if (!connection?.gitHttpUrl || !isOrionRepoRemoteUrl(cloneUrl, provisioned.repo.id)) {
     await restoreCloudRepoLink(gitRoot, provisioned.previousLink);
     await clearGithubImportTagRefs(gitRoot);
-    throw new Error('Orion Cloud did not return a valid Git repository endpoint.');
+    throw new Error('Durango Cloud did not return a valid Git repository endpoint.');
   }
 
   const refspecs = [
@@ -6653,7 +6834,7 @@ const convertGithubSourceControl = async ({ projectPath, state, session }) => {
     ...tagPreservations.map((entry) => `tag ${entry.preserved}`),
   ];
   const preservationMessage = preservedNames.length > 0
-    ? `Differing local refs were preserved in Orion as ${preservedNames.join(', ')}.`
+    ? `Differing local refs were preserved in Durango Cloud as ${preservedNames.join(', ')}.`
     : null;
   return {
     ok: true,
@@ -6676,7 +6857,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, needsAuth: true, error: 'Sign in to your Orion account first.' };
+      return { ok: false, needsAuth: true, error: 'Sign in to your Durango account first.' };
     }
 
     const initialSource = await inspectSourceControl(projectPath);
@@ -6701,7 +6882,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
             baseUrl: getOrionWebUrl(),
             token: session.token,
           });
-          if (!pushed.ok) throw new Error(pushed.error || 'Could not seed the Orion repository.');
+          if (!pushed.ok) throw new Error(pushed.error || 'Could not seed the Durango Cloud repository.');
           repo = pushed.repo ?? { id: link.repoId, name: link.repoName ?? name, defaultBranch };
         } else {
           try {
@@ -6711,7 +6892,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
               baseUrl: getOrionWebUrl(),
               token: session.token,
             });
-            if (!published.ok) throw new Error(published.error || 'Could not seed the Orion repository.');
+            if (!published.ok) throw new Error(published.error || 'Could not seed the Durango Cloud repository.');
             repo = published.repo;
             createdRepository = true;
           } catch (error) {
@@ -6729,7 +6910,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
               baseUrl: getOrionWebUrl(),
               token: session.token,
             });
-            if (!pushed.ok) throw new Error(pushed.error || 'Could not update the Orion repository.');
+            if (!pushed.ok) throw new Error(pushed.error || 'Could not update the Durango Cloud repository.');
           }
         }
 
@@ -6776,7 +6957,7 @@ ipcMain.handle('git:authorizeGithubMirror', async (_event, projectPath) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, needsAuth: true, error: 'Sign in to your Orion account first.' };
+      return { ok: false, needsAuth: true, error: 'Sign in to your Durango account first.' };
     }
     const gitRoot = await getGitRoot(projectPath);
     const [link, state] = await Promise.all([
@@ -6834,7 +7015,7 @@ ipcMain.handle('cloud:publish', async (_event, input) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, error: 'Sign in to your Orion account to publish.', needsAuth: true };
+      return { ok: false, error: 'Sign in to your Durango account to publish.', needsAuth: true };
     }
 
     const gitRoot = await getGitRoot(projectPath);
@@ -6876,11 +7057,11 @@ ipcMain.handle('cloud:push', async (_event, projectPath) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+      return { ok: false, error: 'Sign in to your Durango account first.', needsAuth: true };
     }
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
-    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+    if (!link) return { ok: false, error: 'This repository is not linked to Durango Cloud yet.' };
 
     return await pushRepo({
       gitRoot,
@@ -6898,11 +7079,11 @@ ipcMain.handle('cloud:pull', async (_event, projectPath) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+      return { ok: false, error: 'Sign in to your Durango account first.', needsAuth: true };
     }
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
-    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+    if (!link) return { ok: false, error: 'This repository is not linked to Durango Cloud yet.' };
 
     const pulled = await pullRepo({
       gitRoot,
@@ -7004,14 +7185,14 @@ ipcMain.handle('cloud:deploy', async (_event, projectPath) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+      return { ok: false, error: 'Sign in to your Durango account first.', needsAuth: true };
     }
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
     if (!link) {
       return {
         ok: false,
-        error: 'Publish this project to Orion Cloud first.',
+        error: 'Publish this project to Durango Cloud first.',
         needsPublish: true,
       };
     }
@@ -7045,7 +7226,7 @@ ipcMain.handle('cloud:deploy', async (_event, projectPath) => {
       // copy; the flags let the renderer offer the upgrade path.
       return {
         ok: false,
-        error: error?.data?.error ?? 'Your plan does not allow another Orion Cloud app.',
+        error: error?.data?.error ?? 'Your plan does not allow another Durango Cloud app.',
         limitReached: Boolean(error?.data?.limitReached),
         upgradeRequired: Boolean(error?.data?.upgradeRequired),
         appLimit: error?.data?.appLimit ?? null,
@@ -7064,7 +7245,7 @@ ipcMain.handle('cloud:getAppState', async (_event, projectPath) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+      return { ok: false, error: 'Sign in to your Durango account first.', needsAuth: true };
     }
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
@@ -7088,11 +7269,11 @@ ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const session = await readRepositorySession();
     if (!session?.token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+      return { ok: false, error: 'Sign in to your Durango account first.', needsAuth: true };
     }
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
-    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+    if (!link) return { ok: false, error: 'This repository is not linked to Durango Cloud yet.' };
 
     const app = await getAppState({
       repoId: link.repoId,
@@ -7109,185 +7290,222 @@ ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
   }
 });
 
-// --- Orion board tasks (kanban on the web app) --------------------------------
-
-const boardTasksRequest = async (token, apiPath, options = {}) => {
-  const response = await fetch(new URL(apiPath, getOrionWebUrl()), {
-    ...options,
-    headers: {
-      authorization: `Bearer ${token}`,
-      ...(options.body ? { 'content-type': 'application/json' } : {}),
-    },
-  });
-  let data = {};
-  try {
-    data = await response.json();
-  } catch {
-    // non-JSON error body
-  }
-  if (!response.ok) {
-    const error = new Error(data?.error || `Orion Cloud request failed (${response.status}).`);
-    error.status = response.status;
-    throw error;
-  }
-  return data;
-};
-
-const downloadBoardTaskAttachments = async (token, task) => {
-  const attachments = Array.isArray(task?.attachments) ? task.attachments : [];
-  if (attachments.length === 0) return { ...task, attachments: [] };
-
-  const attachmentDir = getAttachmentDirectoryPath();
-  await fs.mkdir(attachmentDir, { recursive: true });
-  const downloaded = await Promise.all(
-    attachments.map(async (attachment) => {
-      const attachmentId = String(attachment?.id ?? '');
-      const taskId = String(task?.id ?? '');
-      if (!attachmentId || !taskId) {
-        return { ...attachment, downloadError: 'Invalid attachment metadata.' };
-      }
-
-      const originalName = sanitizeAttachmentName(attachment?.fileName || 'attachment');
-      const filePath = path.join(
-        attachmentDir,
-        `board-${sanitizeAttachmentName(taskId)}-${sanitizeAttachmentName(attachmentId)}-${originalName}`
-      );
-      try {
-        const expectedSize = Number(attachment?.size);
-        const existing = await fs.stat(filePath).catch(() => null);
-        if (!existing?.isFile() || (Number.isFinite(expectedSize) && existing.size !== expectedSize)) {
-          const response = await fetch(
-            new URL(
-              `/api/tasks/${encodeURIComponent(taskId)}/attachments/${encodeURIComponent(attachmentId)}`,
-              getOrionWebUrl()
-            ),
-            { headers: { authorization: `Bearer ${token}` } }
-          );
-          if (!response.ok) {
-            throw new Error(`Attachment download failed (${response.status}).`);
-          }
-          const buffer = Buffer.from(await response.arrayBuffer());
-          if (Number.isFinite(expectedSize) && expectedSize >= 0 && buffer.byteLength !== expectedSize) {
-            throw new Error('Attachment download was incomplete.');
-          }
-          await fs.writeFile(filePath, buffer);
-        }
-        return { ...attachment, localPath: filePath };
-      } catch (error) {
-        return { ...attachment, downloadError: cloudErrorMessage(error) };
-      }
-    })
-  );
-  return { ...task, attachments: downloaded };
-};
+// --- Linked tasks: Durango Tasks (legacy: the Durango Code web board) ----------
+// src/main/board-tasks.js. DURANGO_TASKS=0, or turning off "Use Durango Tasks"
+// in Settings → Durango, falls back to orion-next /api/tasks*.
 
 const requireAccountToken = async () => {
   const session = await readAccountSession();
   return session?.token ?? null;
 };
 
-ipcMain.handle('tasks:list', async () => {
+let useDurangoTasksSetting = true;
+const boardTasks = createBoardTasks({
+  useDurango: () => durangoTasksEnabled({ setting: useDurangoTasksSetting }),
+  durango: durangoClient,
+  readToken: requireAccountToken,
+  webOrigin: () => getOrionWebUrl(),
+  attachmentDir: () => getAttachmentDirectoryPath(),
+  sanitizeName: sanitizeAttachmentName,
+  legacyErrorMessage: cloudErrorMessage,
+});
+
+ipcMain.handle('tasks:list', () => boardTasks.list());
+ipcMain.handle('tasks:get', (_event, rawTaskId) => boardTasks.get(rawTaskId));
+ipcMain.handle('tasks:link', (_event, input) => boardTasks.link(input));
+ipcMain.handle('tasks:unlink', (_event, input) => boardTasks.unlink(input));
+ipcMain.handle('tasks:threadStatus', (_event, input) => boardTasks.threadStatus(input));
+// "Open in Durango": durango.sh/tasks (or the legacy web board).
+ipcMain.handle('tasks:openWeb', async () => {
   try {
-    const token = await requireAccountToken();
-    if (!token) {
-      return { ok: false, error: 'Sign in to your Orion account to see board tasks.', needsAuth: true };
-    }
-    const board = await boardTasksRequest(token, '/api/tasks');
-    return { ok: true, columns: board.columns ?? [], tasks: board.tasks ?? [] };
+    const url = externalWebUrl(await boardTasks.webUrl());
+    if (!url) return { ok: false, error: 'Durango Tasks has no web address.' };
+    await shell.openExternal(url);
+    return { ok: true };
   } catch (error) {
-    return { ok: false, error: cloudErrorMessage(error) };
+    return { ok: false, error: error?.message ?? String(error) };
   }
 });
 
-ipcMain.handle('tasks:get', async (_event, rawTaskId) => {
-  try {
-    const taskId = String(rawTaskId ?? '');
-    if (!taskId) return { ok: false, error: 'Missing task id.' };
-    const token = await requireAccountToken();
-    if (!token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+// --- Durango Chat dispatch: agents started from chat (Phase 5) -------------------
+// src/main/durango-dispatch.js runs the claim loop; threads are created by
+// the renderer through the remote-control command bridge (same runTurn path
+// as a paired controller), so the renderer stays authoritative.
+
+const DISPATCH_START_TIMEOUT_MS = 120_000;
+const DISPATCH_COMPLETION_TIMEOUT_MS = 5 * 60_000;
+const DISPATCH_COMMAND_PREFIX = 'durango-dispatch:';
+const dispatchRendererCommands = new Map(); // commandId -> pending
+
+const settleDispatchRendererCommand = (commandId, result) => {
+  const pending = dispatchRendererCommands.get(commandId);
+  if (!pending) return false;
+  dispatchRendererCommands.delete(commandId);
+  clearTimeout(pending.timer);
+  pending.resolve(result);
+  return true;
+};
+
+const requestDispatchRendererCommand = (command, timeoutMs = DISPATCH_START_TIMEOUT_MS) =>
+  new Promise((resolve) => {
+    const commandId = `${DISPATCH_COMMAND_PREFIX}${crypto.randomUUID()}`;
+    const timer = setTimeout(
+      () => settleDispatchRendererCommand(commandId, { ok: false, error: 'Durango Code did not start the agent in time.' }),
+      timeoutMs
+    );
+    timer.unref?.();
+    dispatchRendererCommands.set(commandId, { resolve, timer, claimed: false });
+    if (dispatchRemoteCommand({ commandId, expiresAt: Date.now() + timeoutMs, command }) === 0) {
+      settleDispatchRendererCommand(commandId, {
+        ok: false,
+        error: 'Open a Durango Code window on this Mac to run agents from Durango Chat.',
+      });
     }
-    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`);
-    return { ok: true, task: await downloadBoardTaskAttachments(token, result.task) };
-  } catch (error) {
-    if (error?.status === 404) {
-      return { ok: false, stale: true, error: cloudErrorMessage(error) };
-    }
-    return { ok: false, error: cloudErrorMessage(error) };
-  }
+  });
+
+const isDispatchRendererCommand = (commandId) =>
+  typeof commandId === 'string' && commandId.startsWith(DISPATCH_COMMAND_PREFIX);
+
+const claimDispatchRendererCommand = ({ commandId } = {}) => {
+  const pending = dispatchRendererCommands.get(commandId);
+  if (!pending || pending.claimed) return { ok: false };
+  pending.claimed = true;
+  clearTimeout(pending.timer);
+  pending.timer = setTimeout(
+    () => settleDispatchRendererCommand(commandId, { ok: false, error: 'Durango Code did not confirm the agent start in time.' }),
+    DISPATCH_COMPLETION_TIMEOUT_MS
+  );
+  pending.timer.unref?.();
+  return { ok: true };
+};
+
+const resolveDispatchRendererCommand = (payload) => ({
+  ok: settleDispatchRendererCommand(payload?.commandId, {
+    ok: payload?.ok === true,
+    threadId: typeof payload?.threadId === 'string' ? payload.threadId : undefined,
+    threadTitle: typeof payload?.threadTitle === 'string' ? payload.threadTitle : undefined,
+    error: typeof payload?.error === 'string' ? payload.error : undefined,
+  }),
 });
 
-ipcMain.handle('tasks:link', async (_event, input) => {
-  try {
-    const taskId = String(input?.taskId ?? '');
-    const threadId = String(input?.threadId ?? '');
-    if (!taskId || !threadId) return { ok: false, error: 'Missing task or thread id.' };
-    const token = await requireAccountToken();
-    if (!token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
-    }
-    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`, {
-      method: 'POST',
-      body: JSON.stringify({
-        action: 'link',
-        threadId,
-        threadTitle: input?.threadTitle,
-        projectName: input?.projectName,
-      }),
-    });
-    return { ok: true, task: await downloadBoardTaskAttachments(token, result.task) };
-  } catch (error) {
-    return { ok: false, error: cloudErrorMessage(error) };
+let dispatchMachineName = null;
+const getDispatchMachineName = async () => {
+  if (dispatchMachineName) return dispatchMachineName;
+  if (process.platform === 'darwin') {
+    try {
+      const { stdout } = await execFileAsync('scutil', ['--get', 'ComputerName'], { timeout: 3000 });
+      if (stdout.trim()) dispatchMachineName = stdout.trim();
+    } catch {}
   }
+  dispatchMachineName ??= os.hostname().replace(/\.local$/i, '') || 'Mac';
+  return dispatchMachineName;
+};
+
+// Notifications must stay referenced until clicked or closed, or Electron can
+// garbage-collect them and drop the click handler.
+const dispatchNotifications = new Set();
+const focusThreadInWindow = (threadId) => {
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win) {
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    if (process.platform === 'darwin') app.focus({ steal: true });
+  }
+  sendToAllWindows('durango:focusThread', { threadId });
+};
+const notifyDispatchStarted = ({ dispatch, project, threadId }) => {
+  if (!Notification.isSupported()) return;
+  const firstLine = String(dispatch?.prompt ?? '').trim().split('\n')[0] ?? '';
+  const notification = new Notification({
+    title: `Durango Chat started an agent in ${project?.name ?? 'a project'}`,
+    body: firstLine.length > 140 ? `${firstLine.slice(0, 139)}…` : firstLine,
+  });
+  dispatchNotifications.add(notification);
+  const forget = () => dispatchNotifications.delete(notification);
+  notification.on('click', () => {
+    forget();
+    focusThreadInWindow(threadId);
+  });
+  notification.on('close', forget);
+  notification.show();
+};
+
+const dispatchProjectsWithRepoIds = async (projects) =>
+  Promise.all(
+    (Array.isArray(projects) ? projects : [])
+      .filter((project) => typeof project?.id === 'string' && typeof project?.name === 'string')
+      .map(async (project) => ({
+        id: project.id,
+        name: project.name,
+        path: typeof project.path === 'string' ? project.path : null,
+        // Published projects carry their Durango Cloud repo id in git config.
+        repoId: project.path ? ((await getCloudRepoLink(project.path).catch(() => null))?.repoId ?? null) : null,
+      }))
+  );
+
+const isDispatchSignedIn = async () => {
+  if (durangoMock) return true;
+  const session = await readAccountSession().catch(() => null);
+  return Boolean(session?.token) && !(session.expiresAt && Date.parse(session.expiresAt) <= Date.now());
+};
+
+const dispatchWorker = createDispatchWorker({
+  client: durangoClient,
+  getMachineId: () => getDurangoDeviceId(),
+  getMachineName: () => getDispatchMachineName(),
+  platform: process.platform,
+  isSignedIn: isDispatchSignedIn,
+  isOnline: () => net.isOnline(),
+  canStart: () => Boolean(remoteCommandRenderer && !remoteCommandRenderer.isDestroyed()),
+  startRun: ({ dispatch, project, prompt, accessMode, modelId }) =>
+    requestDispatchRendererCommand({
+      kind: 'runTurn',
+      projectId: project.id,
+      prompt: prompt.slice(0, 200_000),
+      ...(modelId ? { modelId } : {}),
+      accessMode,
+      source: { machineId: 'durango-chat', machineName: 'Durango Chat' },
+      durangoDispatch: {
+        id: dispatch.id,
+        taskId: dispatch.taskId,
+        sourceUrl: dispatch.sourceChat?.url ?? null,
+        requestedAccessMode: dispatch.accessMode,
+      },
+    }),
+  stopRun: (threadId) =>
+    requestDispatchRendererCommand(
+      { kind: 'stopTurn', threadId, source: { machineId: 'durango-chat', machineName: 'Durango Chat' } },
+      30_000
+    ),
+  notify: notifyDispatchStarted,
+  onStateChange: (state) => sendToAllWindows('durango:dispatchState', state),
 });
 
-ipcMain.handle('tasks:unlink', async (_event, input) => {
-  try {
-    const taskId = String(input?.taskId ?? '');
-    if (!taskId) return { ok: false, error: 'Missing task id.' };
-    const token = await requireAccountToken();
-    if (!token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
-    }
-    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'unlink' }),
-    });
-    return { ok: true, task: result.task };
-  } catch (error) {
-    return { ok: false, error: cloudErrorMessage(error) };
-  }
-});
+let dispatchConfigureSeq = 0;
+const configureDurango = async (input) => {
+  const seq = ++dispatchConfigureSeq;
+  if (typeof input?.useDurangoTasks === 'boolean') useDurangoTasksSetting = input.useDurangoTasks;
+  const settings = normalizeDispatchSettings(input?.dispatch);
+  // Resolve repo ids only when they matter (the worker is on).
+  const projects = settings.enabled ? await dispatchProjectsWithRepoIds(input?.projects) : [];
+  if (seq !== dispatchConfigureSeq) return { ok: true, superseded: true };
+  dispatchWorker.configure({ settings, projects });
+  return { ok: true, state: dispatchWorker.getState() };
+};
 
-ipcMain.handle('tasks:threadStatus', async (_event, input) => {
-  try {
-    const taskId = String(input?.taskId ?? '');
-    const threadId = String(input?.threadId ?? '');
-    const status = String(input?.status ?? '');
-    if (!taskId || !threadId || !status) return { ok: false, error: 'Missing task status input.' };
-    const token = await requireAccountToken();
-    if (!token) {
-      return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
-    }
-    const result = await boardTasksRequest(token, `/api/tasks/${encodeURIComponent(taskId)}`, {
-      method: 'POST',
-      body: JSON.stringify({
-        action: 'thread-status',
-        threadId,
-        status,
-        ...(typeof input?.notes === 'string' ? { notes: input.notes } : {}),
-      }),
-    });
-    return { ok: true, task: result.task };
-  } catch (error) {
-    // 409 = the card was unlinked/relinked on the web; tell the renderer to
-    // drop its side of the link instead of retrying forever.
-    if (error?.status === 409) {
-      return { ok: false, stale: true, error: cloudErrorMessage(error) };
-    }
-    return { ok: false, error: cloudErrorMessage(error) };
-  }
-});
+ipcMain.handle('durango:configure', (_event, input) => configureDurango(input));
+ipcMain.handle('durango:dispatchState', () => dispatchWorker.getState());
+// The renderer saw a dispatched thread settle (finished / failed / stopped).
+ipcMain.handle('durango:dispatchSettled', (_event, input) =>
+  dispatchWorker.settle({
+    dispatchId: typeof input?.dispatchId === 'string' ? input.dispatchId : '',
+    threadId: typeof input?.threadId === 'string' ? input.threadId : undefined,
+    outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
+    summary: typeof input?.summary === 'string' ? input.summary : undefined,
+    error: typeof input?.error === 'string' ? input.error : undefined,
+  })
+);
 
 ipcMain.handle('app:openExternalUrl', async (_event, url) => {
   try {
@@ -7536,7 +7754,7 @@ ipcMain.handle('cloud:openInBrowser', async (_event, projectPath) => {
     if (!projectPath) return { ok: false, error: 'Missing project path.' };
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
-    if (!link) return { ok: false, error: 'This repository is not linked to Orion Cloud yet.' };
+    if (!link) return { ok: false, error: 'This repository is not linked to Durango Cloud yet.' };
     await shell.openExternal(cloudRepoWebUrl(link.repoId));
     return { ok: true };
   } catch (error) {
@@ -7868,6 +8086,43 @@ ipcMain.handle('account:startAuth', async () => {
   }
 });
 
+// Durango Chat for the renderer (@chat mentions, profile memory). The key
+// never crosses into the renderer; only results and typed errors do.
+ipcMain.handle('durango:searchChats', async (_event, input) => {
+  try {
+    const query = typeof input?.query === 'string' ? input.query.slice(0, 200) : '';
+    const result = await durangoClient.searchChats(query, {
+      limit: input?.limit,
+      cursor: typeof input?.cursor === 'string' ? input.cursor : undefined,
+    });
+    return { ok: true, ...result };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+// @chat links: open the chat's own URL when known (renderer or main saw it
+// in search results), else Durango Chat. Only http(s) URLs ever open.
+ipcMain.handle('durango:openChat', async (_event, input) => {
+  const chatId = typeof input?.chatId === 'string' ? input.chatId.slice(0, 200) : '';
+  if (!chatId) return { ok: false, error: 'Missing chat id.' };
+  try {
+    const rendererUrl = typeof input?.url === 'string' ? externalWebUrl(input.url) : null;
+    const target = rendererUrl ?? externalWebUrl(await durangoClient.chatUrl(chatId));
+    if (!target) return { ok: false, error: 'This chat link cannot be opened.' };
+    await shell.openExternal(target);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? 'Could not open the chat.' };
+  }
+});
+
+ipcMain.handle('durango:profileMemory', async () => {
+  const session = await readAccountSession();
+  if (!durangoMock && !session?.token) return { ok: false, code: 'not_signed_in', block: '' };
+  return durangoProfileMemory.get(session?.user?.id ?? 'mock');
+});
+
 ipcMain.handle('account:signOut', async () => {
   await clearAccountSession();
   return publishAccountState(null);
@@ -7917,7 +8172,7 @@ const restartForAppUpdate = async () => {
       invalidateAppUpdateDownload();
       const error =
         appUpdateState.error ??
-        'Orion could not prepare the update. Try downloading it again.';
+        'Durango Code could not prepare the update. Try downloading it again.';
       publishAppUpdateState({ status: 'error', progress: null, error });
       return { ok: false, error };
     }
@@ -8014,7 +8269,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // Safety net: the renderer resolves the Orion pseudo-model to its
     // configured main-driver model before ever calling runTurn.
     if (model.providerId === 'orion' || input.modelId === 'orion:orchestrator') {
-      return { ok: false, error: 'Orion orchestrator was not resolved to a driver model' };
+      return { ok: false, error: 'Durango Code orchestrator was not resolved to a driver model' };
     }
 
     // Safety net: Claude Code CLI threads run in an embedded terminal
@@ -8205,7 +8460,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (orionMcps.servers.length > 0 && model.providerId !== 'codex' && !supportsRunPlugin) {
       return {
         ok: false,
-        error: `This ${model.providerId} installation cannot load Orion MCP servers: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Update the provider CLI or switch providers.`,
+        error: `This ${model.providerId} installation cannot load Durango Code MCP servers: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Update the provider CLI or switch providers.`,
       };
     }
     const orionMcp =
@@ -8244,21 +8499,23 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       orionMcp?.release();
       return {
         ok: false,
-        error: `Orion could not load MCP servers for this run: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Try again or switch providers.`,
+        error: `Durango Code could not load MCP servers for this run: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Try again or switch providers.`,
       };
     }
     if (
       isRequiredThreadReaderBridgeMissing(
         model.providerId,
-        input.hasThreadMentions,
+        // @chat mentions need read_chat from the same bridge as read_thread.
+        input.hasThreadMentions === true || input.hasChatMentions === true,
         effectiveThreadReaderBridgeReady
       )
     ) {
       orionMcp?.release();
       return {
         ok: false,
-        error:
-          'Orion could not make read_thread available for this run. Try the referenced-thread turn again.',
+        error: input.hasThreadMentions
+          ? 'Durango Code could not make read_thread available for this run. Try the referenced-thread turn again.'
+          : 'Durango Code could not make read_chat available for this run. Try the Durango chat mention again.',
       };
     }
     if (

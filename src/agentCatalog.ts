@@ -304,8 +304,8 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       type: 'select',
       options: [
         { value: 'inherit', label: 'Automatic (on for Astra)' },
-        { value: 'enabled', label: 'Enabled in Orion' },
-        { value: 'disabled', label: 'Disabled in Orion' },
+        { value: 'enabled', label: 'Enabled in Durango Code' },
+        { value: 'disabled', label: 'Disabled in Durango Code' },
         { value: 'codex', label: 'Use Codex configuration' },
       ],
     },
@@ -313,7 +313,7 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       key: 'codexDeveloperInstructions',
       label: 'Custom instructions',
       description:
-        'Additional instructions and context for Codex chats launched from Orion. Leave blank to use only your normal Codex configuration and AGENTS.md guidance.',
+        'Additional instructions and context for Codex chats launched from Durango Code. Leave blank to use only your normal Codex configuration and AGENTS.md guidance.',
       type: 'textarea',
       placeholder: 'Add your custom instructions…',
     },
@@ -321,24 +321,24 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       key: 'codexMemoryMode',
       label: 'Local memories',
       description:
-        'Use locally stored Codex context across Orion chats and allow eligible Orion chats to contribute to future memories. Inherit follows $CODEX_HOME/config.toml.',
+        'Use locally stored Codex context across Durango Code chats and allow eligible Durango Code chats to contribute to future memories. Inherit follows $CODEX_HOME/config.toml.',
       type: 'select',
       options: [
         { value: 'inherit', label: 'Inherit Codex setting' },
-        { value: 'enabled', label: 'Enabled in Orion' },
-        { value: 'disabled', label: 'Disabled in Orion' },
+        { value: 'enabled', label: 'Enabled in Durango Code' },
+        { value: 'disabled', label: 'Disabled in Durango Code' },
       ],
     },
     {
       key: 'codexChronicleMode',
       label: 'Chronicle memories',
       description:
-        'Let Codex use Chronicle screen-context memories in Orion when the ChatGPT desktop recorder is running. Chronicle is a macOS ChatGPT Pro research preview; Orion does not start or capture the recorder itself.',
+        'Let Codex use Chronicle screen-context memories in Durango Code when the ChatGPT desktop recorder is running. Chronicle is a macOS ChatGPT Pro research preview; Durango Code does not start or capture the recorder itself.',
       type: 'select',
       options: [
         { value: 'inherit', label: 'Inherit Codex setting' },
-        { value: 'enabled', label: 'Enabled in Orion' },
-        { value: 'disabled', label: 'Disabled in Orion' },
+        { value: 'enabled', label: 'Enabled in Durango Code' },
+        { value: 'disabled', label: 'Disabled in Durango Code' },
       ],
     },
     {
@@ -446,7 +446,7 @@ export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; 
 };
 
 export const agentProviders: AgentProvider[] = [
-  { id: 'orion', label: 'Orion', icon: OrionBrandIcon },
+  { id: 'orion', label: 'Durango Code', icon: OrionBrandIcon },
   { id: 'grok', label: 'Grok', icon: GrokBrandIcon },
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },
   { id: 'claude', label: 'Claude', icon: ClaudeBrandIcon },
@@ -460,8 +460,8 @@ export const fallbackAgentModels: AgentModel[] = [
   {
     id: 'orion:orchestrator',
     providerId: 'orion',
-    providerLabel: 'Orion',
-    label: 'Orion',
+    providerLabel: 'Durango Code',
+    label: 'Durango Code',
     slug: 'orion',
     favorite: true,
   },

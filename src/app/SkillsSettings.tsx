@@ -48,7 +48,7 @@ const SkillsSettings = React.memo(function SkillsSettings({ formatBytes, onOpenI
   const refresh = React.useCallback(async (options?: { preserveMessage?: boolean }) => {
     if (!window.orion?.listSkills) {
       setLoading(false);
-      setError('This build of Orion cannot manage skills. Restart the app after updating.');
+      setError('This build of Durango Code cannot manage skills. Restart the app after updating.');
       return;
     }
     setLoading(true);
@@ -167,7 +167,7 @@ const SkillsSettings = React.memo(function SkillsSettings({ formatBytes, onOpenI
             </div>
             <div className="skills-toolbar-caption">
               Skills are folders in <span className="skills-path">{skillsPath}</span>, each with a SKILL.md that tells
-              agents when to use it. Active skills are offered to every agent Orion runs, in every project.
+              agents when to use it. Active skills are offered to every agent Durango Code runs, in every project.
               Deactivating one parks its folder next door so nothing loads it.
             </div>
           </div>

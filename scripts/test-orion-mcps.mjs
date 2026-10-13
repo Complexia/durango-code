@@ -95,7 +95,8 @@ const httpServer = http.createServer(async (req, res) => {
   if (url.pathname === '/register') {
     counters.register += 1;
     const metadata = JSON.parse(await readBody(req));
-    assert.equal(metadata.client_name, 'Orion');
+    assert.equal(metadata.client_name, 'Durango Code');
+    assert.equal(metadata.client_uri, 'https://code.durango.sh');
     assert.match(metadata.redirect_uris[0], /^http:\/\/127\.0\.0\.1:\d+\/callback$/);
     return json(res, 201, { ...metadata, client_id: `client-${counters.register}` });
   }

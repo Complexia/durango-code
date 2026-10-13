@@ -19,7 +19,7 @@ export const fetchRemotePairingProofJson = async ({
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    controller.abort(new Error('Orion Cloud pairing proof request timed out.'));
+    controller.abort(new Error('Durango Cloud pairing proof request timed out.'));
   }, Math.max(1, timeoutMs));
   timer.unref?.();
   const cancelForLifecycle = () =>
@@ -48,7 +48,7 @@ export const fetchRemotePairingProofJson = async ({
     if (controller.signal.aborted) {
       throw new Error(
         timedOut
-          ? 'Orion Cloud did not answer the pairing proof request in time.'
+          ? 'Durango Cloud did not answer the pairing proof request in time.'
           : 'The pairing proof request was cancelled.',
         { cause: error }
       );
@@ -78,7 +78,7 @@ export const fetchRelayApiJson = async ({
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    controller.abort(new Error('Orion Cloud relay request timed out.'));
+    controller.abort(new Error('Durango Cloud relay request timed out.'));
   }, Math.max(1, timeoutMs));
   timer.unref?.();
   const cancelForLifecycle = () => controller.abort(signal?.reason ?? new Error('Relay request cancelled.'));
@@ -107,7 +107,7 @@ export const fetchRelayApiJson = async ({
   } catch (error) {
     if (controller.signal.aborted) {
       throw new Error(
-        timedOut ? 'Orion Cloud did not answer the relay request in time.' : 'The relay request was cancelled.',
+        timedOut ? 'Durango Cloud did not answer the relay request in time.' : 'The relay request was cancelled.',
         { cause: error }
       );
     }

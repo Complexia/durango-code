@@ -254,6 +254,6 @@ export const readMcpRuntimeConfig = async (options = {}) => {
     return mcpRuntimeConfig(await readConfiguredMcps(options), overrides);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Could not apply Orion's MCP settings: ${detail}`);
+    throw new Error(`Could not apply Durango Code's MCP settings: ${detail}`);
   }
 };

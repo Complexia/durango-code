@@ -1,6 +1,7 @@
 import { BrowserWindow, app, autoUpdater as nativeAutoUpdater, net } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { DEFAULT_UPDATE_FEED_URL } from './web-origin.js';
 
 export let appUpdateState = {
   status: 'idle',
@@ -81,7 +82,9 @@ export const getAppIconPath = () => {
 };
 
 export const getAppUpdateFeedUrl = () => {
-  const baseUrl = process.env.ORION_UPDATE_FEED_URL || 'https://orioncode.xyz/api/update/macos';
+  // code.durango.sh serves the same feed as the legacy orioncode.xyz host,
+  // which keeps answering already-installed builds.
+  const baseUrl = process.env.ORION_UPDATE_FEED_URL || DEFAULT_UPDATE_FEED_URL;
   const arch = process.arch === 'x64' ? 'x64' : 'arm64';
   return `${baseUrl.replace(/\/$/, '')}/${arch}/`;
 };
@@ -285,7 +288,7 @@ export const runAppUpdateCheck = async ({ background = false } = {}) => {
   // request instead of letting electron-updater fail it; the retry schedule
   // and the renderer's 'online' event bring the check back once connected.
   if (background && !net.isOnline()) {
-    throw new Error('Orion is offline. The update check will retry once a connection is available.');
+    throw new Error('Durango Code is offline. The update check will retry once a connection is available.');
   }
 
   const autoUpdater = await initializeAppUpdater();

@@ -31,12 +31,17 @@ module.exports = {
       path.join(__dirname, 'assets', 'icon.png'),
       path.join(__dirname, 'assets', 'bundled-skills'),
     ],
-    name: 'Orion',
+    // Customer-facing bundle name. The bundle id, the internal app name
+    // ("Orion", pinned in src/main/pin-app-identity.js), the userData path and
+    // the "Orion Safe Storage" keychain item must NOT change — installed users
+    // depend on them. See docs/durango-rebrand.md.
+    name: 'Durango Code',
     appBundleId: 'com.complexia.orion',
     appCategoryType: 'public.app-category.developer-tools',
     extendInfo: {
+      CFBundleDisplayName: 'Durango Code',
       NSAppleEventsUsageDescription:
-        'Orion uses Apple Events so agents can control Mac apps on your behalf.',
+        'Durango Code uses Apple Events so agents can control Mac apps on your behalf.',
     },
     osxSign: {
       identity: macSigningIdentity,
@@ -121,7 +126,7 @@ module.exports = {
         ],
         icon: path.join(__dirname, 'assets', 'icon.icns'),
         iconSize: 80,
-        title: 'Orion Installer',
+        title: 'Durango Code Installer',
         format: 'ULFO',
         additionalDMGOptions: {
           window: {
@@ -177,7 +182,7 @@ module.exports = {
     // at package time, before code signing the application
     new FusesPlugin({
       version: FuseVersion.V1,
-      // Orion's per-run MCP bridge launches the packaged executable with
+      // Durango Code's per-run MCP bridge launches the packaged executable with
       // ELECTRON_RUN_AS_NODE=1 to run its bundled, dependency-free stdio shim.
       [FuseV1Options.RunAsNode]: true,
       [FuseV1Options.EnableCookieEncryption]: true,

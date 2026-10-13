@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, Link, LogIn, RefreshCw, Search, SquareKanban } from 'lucide-react';
+import { Check, ExternalLink, LogIn, RefreshCw, Search, SquareKanban } from 'lucide-react';
 
 export const TaskPickerPopover = ({
   linkedTaskIds,
@@ -23,7 +23,7 @@ export const TaskPickerPopover = ({
 
   const load = useCallback(async () => {
     if (!window.orion?.listBoardTasks) {
-      setError('Board tasks are unavailable in this build.');
+      setError('Durango Tasks are unavailable in this build.');
       setLoading(false);
       return;
     }
@@ -37,7 +37,7 @@ export const TaskPickerPopover = ({
     } else if (result.needsAuth) {
       setNeedsAuth(true);
     } else {
-      setError(result.error ?? 'Could not load board tasks.');
+      setError(result.error ?? 'Could not load your Durango Tasks.');
     }
     setLoading(false);
   }, []);
@@ -61,19 +61,28 @@ export const TaskPickerPopover = ({
         <SquareKanban size={14} />
         <span>
           {linkedTaskIds.length > 0
-            ? `Link board tasks · ${linkedTaskIds.length} linked`
-            : 'Link board tasks'}
+            ? `Durango Tasks · ${linkedTaskIds.length} linked`
+            : 'Link Durango Tasks'}
         </span>
+        {window.orion?.openBoardTasksWeb && (
+          <button
+            className="task-picker-refresh"
+            onClick={() => void window.orion.openBoardTasksWeb?.()}
+            title="Open in Durango"
+          >
+            <ExternalLink size={13} />
+          </button>
+        )}
         <button className="task-picker-refresh" onClick={() => void load()} title="Refresh">
           <RefreshCw size={13} />
         </button>
       </div>
       {needsAuth ? (
         <div className="task-picker-empty">
-          <p>Sign in to your Orion account to link tasks from your board.</p>
+          <p>Sign in to your Durango account to link tasks from Durango Tasks.</p>
           <button className="task-picker-signin" onClick={onSignIn}>
             <LogIn size={14} />
-            <span>Sign in to Orion</span>
+            <span>Sign in to Durango</span>
           </button>
         </div>
       ) : (
@@ -88,13 +97,25 @@ export const TaskPickerPopover = ({
             />
           </div>
           <div className="task-picker-list">
-            {loading && <div className="task-picker-note">Loading your board…</div>}
+            {loading && <div className="task-picker-note">Loading your tasks…</div>}
             {!loading && error && <div className="task-picker-note error">{error}</div>}
             {!loading && !error && visibleTasks.length === 0 && (
               <div className="task-picker-note">
-                {tasks.length === 0
-                  ? 'No tasks yet — create them on your Orion board on the web.'
-                  : 'No tasks match your search.'}
+                {tasks.length === 0 ? (
+                  <>
+                    No tasks yet — create them in Durango Chat or at{' '}
+                    <button
+                      type="button"
+                      className="task-picker-inline-link"
+                      onClick={() => void window.orion?.openBoardTasksWeb?.()}
+                    >
+                      Durango Tasks
+                    </button>
+                    .
+                  </>
+                ) : (
+                  'No tasks match your search.'
+                )}
               </div>
             )}
             {!loading &&
@@ -106,7 +127,10 @@ export const TaskPickerPopover = ({
                   <div key={column.id} className="task-picker-group">
                     <div className="task-picker-column-label">{column.name}</div>
                     {columnTasks.map((task) => {
-                      const isCurrent = linkedTaskIds.includes(task.id);
+                      // Threads linked before the switch hold the old board id.
+                      const isCurrent =
+                        linkedTaskIds.includes(task.id) ||
+                        (task.legacyId != null && linkedTaskIds.includes(task.legacyId));
                       const linkedElsewhere = Boolean(task.linked) && !isCurrent;
                       return (
                         <button
@@ -139,8 +163,15 @@ export const TaskPickerPopover = ({
           </div>
           <div className="task-picker-footer">
             Pick as many tasks as you like — each one's title, description, and attachments are
-            added to the agent's context, and its card moves across the board as this thread runs.
-            Click a linked task to unlink it.
+            added to the agent's context, and its status in Durango Tasks follows this thread.
+            Click a linked task to unlink it.{' '}
+            <button
+              type="button"
+              className="task-picker-inline-link"
+              onClick={() => void window.orion?.openBoardTasksWeb?.()}
+            >
+              Open in Durango
+            </button>
           </div>
         </>
       )}

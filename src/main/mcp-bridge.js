@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import mcpBridgeShimSource from '../mcp-bridge-shim.cjs?raw';
 import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
+import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
 import {
   acpOrionMcpServers,
   museOrionMcpServers,
@@ -39,7 +40,7 @@ export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessM
     // closes and reopens.
     const sender = getSender();
     if (!sender || sender.isDestroyed()) {
-      resolve('Unable to spawn subagent: the Orion window is no longer available.');
+      resolve('Unable to spawn subagent: the Durango Code window is no longer available.');
       return;
     }
     const spawnId = crypto.randomUUID();
@@ -57,7 +58,7 @@ export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessM
       });
     } catch {
       pendingSubagentSpawns.delete(spawnId);
-      resolve('Unable to spawn subagent: the Orion window is no longer available.');
+      resolve('Unable to spawn subagent: the Durango Code window is no longer available.');
     }
   });
 
@@ -67,7 +68,7 @@ export const requestSubagentStop = ({ getSender, threadId }, args) =>
   new Promise((resolve) => {
     const sender = getSender();
     if (!sender || sender.isDestroyed()) {
-      resolve('Unable to stop subagent: the Orion window is no longer available.');
+      resolve('Unable to stop subagent: the Durango Code window is no longer available.');
       return;
     }
     const stopId = crypto.randomUUID();
@@ -82,7 +83,7 @@ export const requestSubagentStop = ({ getSender, threadId }, args) =>
       });
     } catch {
       pendingSubagentStops.delete(stopId);
-      resolve('Unable to stop subagent: the Orion window is no longer available.');
+      resolve('Unable to stop subagent: the Durango Code window is no longer available.');
     }
   });
 
@@ -136,7 +137,7 @@ export const handleMcpBridgeConnection = (socket) => {
           ? mcpBridgeSessions.get(message.token)
           : undefined;
       if (!session) {
-        reply(false, 'This Orion agent session token is missing, invalid, or expired.');
+        reply(false, 'This Durango Code agent session token is missing, invalid, or expired.');
         continue;
       }
       const args = message.args && typeof message.args === 'object' ? message.args : {};
@@ -176,6 +177,15 @@ export const handleMcpBridgeConnection = (socket) => {
         void readThreadForAgent(args).then(
           (text) => reply(true, text),
           (error) => reply(false, `Could not read the thread: ${error?.message ?? error}`)
+        );
+        continue;
+      }
+      if (DURANGO_TOOL_NAMES.includes(message.tool)) {
+        // Resolves (never rejects) with readable text, including when the
+        // user is signed out or Durango is unreachable.
+        void runDurangoTool(message.tool, args, { accessMode: session.accessMode }).then(
+          ({ ok, text }) => reply(ok, text),
+          (error) => reply(false, `Durango request failed: ${error?.message ?? error}`)
         );
         continue;
       }
@@ -252,7 +262,7 @@ export const writeMcpBridgePlugin = async ({ token, command, args, userServers }
     fs.mkdir(grokManifestDir, { recursive: true, mode: 0o700 }),
   ]);
   const manifest = JSON.stringify(
-    { name: 'orion', version: '1.0.0', description: 'Orion subagent bridge' },
+    { name: 'orion', version: '1.0.0', description: 'Durango Code subagent bridge' },
     null,
     2
   );

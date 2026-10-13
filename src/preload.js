@@ -191,7 +191,8 @@ contextBridge.exposeInMainWorld('orion', {
   precheckCloudDeploy: (projectPath) => ipcRenderer.invoke('cloud:deployPrecheck', projectPath),
   openExternalUrl: (url) => ipcRenderer.invoke('app:openExternalUrl', url),
 
-  // Orion board tasks (kanban on the web app)
+  // Linked tasks: Durango Tasks (legacy: the Durango Code web board)
+  openBoardTasksWeb: () => ipcRenderer.invoke('tasks:openWeb'),
   listBoardTasks: () => ipcRenderer.invoke('tasks:list'),
   getBoardTask: (taskId) => ipcRenderer.invoke('tasks:get', taskId),
   linkBoardTask: (input) => ipcRenderer.invoke('tasks:link', input),
@@ -295,6 +296,25 @@ contextBridge.exposeInMainWorld('orion', {
     const listener = (_event, request) => callback(request);
     ipcRenderer.on('remote:commandRequest', listener);
     return () => ipcRenderer.removeListener('remote:commandRequest', listener);
+  },
+
+  // Durango Chat (@chat mentions, optional profile memory in instructions)
+  durangoSearchChats: (input) => ipcRenderer.invoke('durango:searchChats', input),
+  durangoProfileMemory: () => ipcRenderer.invoke('durango:profileMemory'),
+  durangoOpenChat: (input) => ipcRenderer.invoke('durango:openChat', input),
+  // Durango Tasks backend + Durango Chat dispatch (agents started from chat)
+  durangoConfigure: (input) => ipcRenderer.invoke('durango:configure', input),
+  durangoDispatchState: () => ipcRenderer.invoke('durango:dispatchState'),
+  durangoDispatchSettled: (input) => ipcRenderer.invoke('durango:dispatchSettled', input),
+  onDurangoDispatchState: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('durango:dispatchState', listener);
+    return () => ipcRenderer.removeListener('durango:dispatchState', listener);
+  },
+  onDurangoFocusThread: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('durango:focusThread', listener);
+    return () => ipcRenderer.removeListener('durango:focusThread', listener);
   },
 
   workspaceSyncConfigure: (settings) => ipcRenderer.invoke('sync:configure', settings),

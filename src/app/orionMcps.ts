@@ -34,7 +34,7 @@ export const mergeMcpAttachments = (
 export const buildMcpMentionsContext = (mentions: MentionableMcp[]) =>
   [
     '[MCP mentions]',
-    'The user referenced these MCP servers with @-mentions and wants you to use them for this request. Orion requests these connections under their nicknames when the provider supports them; available tools are named after the server (for example mcp__<nickname>__<tool>, <nickname>.<tool>, or a provider-prefixed equivalent). Prefer these tools over reimplementing what they do; if one is missing from your tool list, say so instead of guessing.',
+    'The user referenced these MCP servers with @-mentions and wants you to use them for this request. Durango Code requests these connections under their nicknames when the provider supports them; available tools are named after the server (for example mcp__<nickname>__<tool>, <nickname>.<tool>, or a provider-prefixed equivalent). Prefer these tools over reimplementing what they do; if one is missing from your tool list, say so instead of guessing.',
     ...mentions.map((server) => `- @${server.nickname} → MCP server "${server.nickname}"`),
     '[/MCP mentions]',
   ].join('\n');

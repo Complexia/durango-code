@@ -65,14 +65,14 @@ const OrionMcpsSection = React.memo(function OrionMcpsSection() {
   const refresh = React.useCallback(async () => {
     if (!window.orion?.listOrionMcps) {
       setLoading(false);
-      setError('This build of Orion cannot connect MCP servers. Restart the app after updating.');
+      setError('This build of Durango Code cannot connect MCP servers. Restart the app after updating.');
       return;
     }
     try {
       const result = await window.orion.listOrionMcps();
       if (!mountedRef.current) return;
       setServers(result?.servers ?? []);
-      if (result?.ok === false) setError(result.error ?? 'Could not read Orion MCP servers.');
+      if (result?.ok === false) setError(result.error ?? 'Could not read Durango Code MCP servers.');
     } catch (caught) {
       if (mountedRef.current) setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -214,7 +214,7 @@ const OrionMcpsSection = React.memo(function OrionMcpsSection() {
 
   return (
     <>
-      <div className="settings-group-label">Orion MCPs</div>
+      <div className="settings-group-label">Durango Code MCPs</div>
       <div className="settings-group">
         <div className="skills-toolbar">
           <div className="skills-toolbar-main">
@@ -397,7 +397,7 @@ const OrionMcpsSection = React.memo(function OrionMcpsSection() {
           <div className="setting-row">
             <div className="setting-label">
               <div className="setting-label-desc">
-                No MCPs connected to Orion yet. Add one with a URL (OAuth sign-in happens automatically) or a local
+                No MCPs connected to Durango Code yet. Add one with a URL (OAuth sign-in happens automatically) or a local
                 command.
               </div>
             </div>
@@ -424,7 +424,7 @@ const OrionMcpsSection = React.memo(function OrionMcpsSection() {
                       {server.detail ? ` · ${server.detail}` : ''}
                     </div>
                     <div className="skills-row-meta truncate">
-                      Orion
+                      Durango Code
                       {server.auth === 'oauth' ? ' · OAuth' : ''}
                       {server.headerNames.length ? ` · ${server.headerNames.join(', ')}` : ''}
                       {server.envNames.length ? ` · ${server.envNames.join(', ')}` : ''}
@@ -487,7 +487,7 @@ const projectName = (projectPath?: string) => projectPath?.split(/[\\/]/).filter
 const sourceLabel = (source: ProviderMcpSource) => {
   if (source.provider === 'codex') {
     return `Codex${source.authStatus ? ` (${source.authStatus.replaceAll('_', ' ')})` : ''}${
-      source.enabled !== source.configuredEnabled ? ' · Orion override' : ''
+      source.enabled !== source.configuredEnabled ? ' · Durango Code override' : ''
     }`;
   }
   if (source.scope === 'plugin') return `Claude Code (${source.plugin ?? 'plugin'} plugin)`;
@@ -506,7 +506,7 @@ const providerCoverage = (entry: ProviderMcpEntry) => {
     return {
       label: entry.orion.enabled ? 'All providers' : 'All providers via @',
       className: 'authenticated',
-      title: `Shared through Orion as @${entry.orion.nickname}`,
+      title: `Shared through Durango Code as @${entry.orion.nickname}`,
     };
   }
   const active = [...new Set(entry.sources.filter((source) => source.enabled).map((source) => source.provider))];
@@ -515,7 +515,7 @@ const providerCoverage = (entry: ProviderMcpEntry) => {
   return {
     label: active.length === 1 ? `${names[0]} only` : names.join(' + '),
     className: 'limited',
-    title: `Only ${names.join(' and ')} runs load this server. Share it to use it with every Orion provider.`,
+    title: `Only ${names.join(' and ')} runs load this server. Share it to use it with every Durango Code provider.`,
   };
 };
 
@@ -551,7 +551,7 @@ const ProviderMcpsSection = React.memo(function ProviderMcpsSection() {
   const refresh = React.useCallback(async (options?: { preserveMessage?: boolean; fresh?: boolean }) => {
     if (!window.orion?.listProviderMcps) {
       setLoading(false);
-      setError('This build of Orion cannot read provider MCP servers. Restart the app after updating.');
+      setError('This build of Durango Code cannot read provider MCP servers. Restart the app after updating.');
       return;
     }
     setLoading(true);
@@ -632,7 +632,7 @@ const ProviderMcpsSection = React.memo(function ProviderMcpsSection() {
       setNotice(
         `Shared ${entry.name} as @${result.server?.nickname ?? entry.name} · ${toolCount} tool${
           toolCount === 1 ? '' : 's'
-        }. Every Orion provider loads it now; switch it to @-only under Orion MCPs.`
+        }. Every Durango Code provider loads it now; switch it to @-only under Durango Code MCPs.`
       );
       notifyOrionMcpsChanged();
     } catch (caught) {
@@ -678,12 +678,12 @@ const ProviderMcpsSection = React.memo(function ProviderMcpsSection() {
             <div className="skills-toolbar-total">
               {loading && servers.length === 0
                 ? 'Reading MCP servers...'
-                : `${servers.length} MCP${servers.length === 1 ? '' : 's'} · ${unsharedCount} not shared with Orion`}
+                : `${servers.length} MCP${servers.length === 1 ? '' : 's'} · ${unsharedCount} not shared with Durango Code`}
             </div>
             <div className="skills-toolbar-caption">
               Servers you connected to Claude Code (claude mcp add, plugins, .mcp.json) or Codex only load when that
-              provider runs. Share one to connect it to Orion so compatible providers can use it. Codex toggles only change
-              Codex runs in Orion; your underlying setup stays intact.
+              provider runs. Share one to connect it to Durango Code so compatible providers can use it. Codex toggles only change
+              Codex runs in Durango Code; your underlying setup stays intact.
             </div>
           </div>
           <div className="skills-toolbar-actions">
@@ -762,13 +762,13 @@ const ProviderMcpsSection = React.memo(function ProviderMcpsSection() {
                     </div>
                     <div className="skills-row-meta truncate">
                       {entry.sources.map(sourceLabel).join(' · ')}
-                      {entry.orion ? ` · Orion (@${entry.orion.nickname})` : ''}
+                      {entry.orion ? ` · Durango Code (@${entry.orion.nickname})` : ''}
                       {entry.headerNames.length ? ` · ${shortList(entry.headerNames)}` : ''}
                       {entry.envNames.length ? ` · ${shortList(entry.envNames)}` : ''}
                     </div>
                     {sharing && (
                       <div className="skills-row-meta">
-                        Connecting to Orion… finish signing in in your browser if it opened.
+                        Connecting to Durango Code… finish signing in in your browser if it opened.
                       </div>
                     )}
                   </div>
@@ -784,7 +784,7 @@ const ProviderMcpsSection = React.memo(function ProviderMcpsSection() {
                         disabled={Boolean(sharingKey) || Boolean(entry.shareBlockedReason)}
                         title={
                           entry.shareBlockedReason ??
-                          'Connect this server to Orion so Claude Code, Codex, Cursor, Grok and every other provider can use it'
+                          'Connect this server to Durango Code so Claude Code, Codex, Cursor, Grok and every other provider can use it'
                         }
                         onClick={() => void handleShare(entry)}
                       >

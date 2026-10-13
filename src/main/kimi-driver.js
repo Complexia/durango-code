@@ -5,6 +5,7 @@ import { lstatSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { getMimeTypeForMediaPath } from './media.js';
 import { killAgentChild } from './run-registry.js';
+import { isPreapprovedOrionTool } from './thread-reader-routing.js';
 import { findKimiSessionIndexEntry } from './session-fork.js';
 import { loginShell } from './shell-env.js';
 import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
@@ -666,14 +667,16 @@ export const createKimiAcpDriver = ({
     const readOnly = kind === 'read' || kind === 'search' || kind === 'fetch' || kind === 'think';
     // Orion's own MCP tools are safe in every mode: the spawned subthread
     // runs with the driver thread's access mode, never more; stopping one
-    // only halts Orion's own child run; read_thread only reads persisted
-    // transcripts. Kimi's initial ACP tool_call records the qualified MCP
-    // identity in toolName; permission titles are presentation fields and
-    // must not grant access.
+    // only halts Orion's own child run; read_thread and the Durango Chat
+    // readers only read the user's own data (`remember`, a write to Durango
+    // memory, is excluded in Read only — see thread-reader-routing.js).
+    // Kimi's initial ACP tool_call records the qualified MCP identity in
+    // toolName; permission titles are presentation fields and must not grant
+    // access.
     const isOrionSpawn =
-      known?.toolName === 'mcp__orion__spawn_subagent' ||
-      known?.toolName === 'mcp__orion__stop_subagent' ||
-      known?.toolName === 'mcp__orion__read_thread';
+      typeof known?.toolName === 'string' &&
+      known.toolName.startsWith('mcp__orion__') &&
+      isPreapprovedOrionTool(known.toolName.slice('mcp__orion__'.length), accessMode);
     let allow;
     let denialDetail = "mode doesn't permit this tool.";
     if (isOrionSpawn) {

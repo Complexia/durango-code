@@ -79,7 +79,7 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
   const refresh = React.useCallback(async () => {
     if (!window.orion?.listDevServers) {
       setLoading(false);
-      setScanError('This build of Orion cannot inspect dev servers. Restart the app after updating.');
+      setScanError('This build of Durango Code cannot inspect dev servers. Restart the app after updating.');
       return;
     }
     if (scanInFlightRef.current) return;
@@ -182,7 +182,7 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
 
   const openPort = React.useCallback(async (port: number) => {
     if (!window.orion?.openDevServer) {
-      setActionError('This build of Orion cannot open dev server ports. Restart the app after updating.');
+      setActionError('This build of Durango Code cannot open dev server ports. Restart the app after updating.');
       return;
     }
     try {

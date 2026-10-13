@@ -51,11 +51,28 @@ const inert = html(
   />
 );
 assert.doesNotMatch(inert, /class="thread-reference"/);
-assert.match(inert, /title="This thread isn&#x27;t available in Orion">@thread:deadbeef-0000</);
+assert.match(inert, /title="This thread isn&#x27;t available in Durango Code">@thread:deadbeef-0000</);
 
 // User bubbles are plain text; their mention tokens are clickable too.
 const user = html(<ThreadReferenceText text={`look at @${threadMentionToken(other)} please`} />);
 assert.match(user, /^look at <button[^>]*class="thread-reference"[\s\S]*Find the App Optimization Thread[\s\S]*<\/button> please$/);
 assert.equal(html(<ThreadReferenceText text="no refs here" />), 'no refs here');
+
+// Durango chat references (@chat:<slug>-<chatId> or @chat:<chatId>) render
+// as browser links, titled from chats seen in @-mention search results.
+const { rememberDurangoChats, chatMentionToken } = await import('../src/app/durangoChats');
+const chat = { id: 'jd7abc123chat', title: 'Billing rewrite plan', url: 'https://durango.sh/chats/p1?node=jd7abc123chat' };
+rememberDurangoChats([chat]);
+const chatProse = html(
+  <MarkdownContent content={`See @chat:${chat.id}, \`@chat:${chat.id}\`, @chat:other-k57unknownchat and @thread:${audit.id}.`} />
+);
+assert.equal(chatProse.match(/class="thread-reference chat-reference"/g)?.length, 3);
+assert.match(chatProse, /Open Durango chat &quot;Billing rewrite plan&quot; in your browser/);
+assert.match(chatProse, />@chat:other-k57unknownchat</, 'unknown chats keep the token as their label');
+assert.equal(chatProse.match(/class="thread-reference"/g)?.length, 1, 'thread chips are unaffected');
+const fenced = html(<MarkdownContent content={['```', `@chat:${chat.id}`, '```', '', `mail@chat:${chat.id}`].join('\n')} />);
+assert.doesNotMatch(fenced, /chat-reference/);
+const chatUser = html(<ThreadReferenceText text={`compare @${chatMentionToken(chat)} with @${threadMentionToken(other)}`} />);
+assert.match(chatUser, /^compare <button[^>]*chat-reference[\s\S]*Billing rewrite plan[\s\S]*<\/button> with <button[^>]*class="thread-reference"/);
 
 console.log('thread reference tests passed');

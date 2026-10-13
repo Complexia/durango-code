@@ -26,8 +26,10 @@ import {
   Workflow,
 } from 'lucide-react';
 import {
+  defaultDurangoSettings,
   defaultEpicsSettings,
   defaultRiftsSettings,
+  useOrionStore,
   defaultSplitViewSettings,
   MAX_THREAD_PANES,
   type BrowserUseMode,
@@ -58,6 +60,7 @@ import {
 import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
+import { DurangoDispatchSettings } from './DurangoDispatchSettings';
 import SkillsSettings from './SkillsSettings';
 import McpsSettings from './McpsSettings';
 import DeploymentsSettings from './DeploymentsSettings';
@@ -341,27 +344,27 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     appUpdateState?.status === 'checking'
       ? 'Checking for updates...'
       : appUpdateState?.status === 'available'
-        ? `Orion v${appUpdateState.availableVersion ?? 'next'} is available.`
+        ? `Durango Code v${appUpdateState.availableVersion ?? 'next'} is available.`
         : appUpdateState?.status === 'downloading'
-          ? `Downloading Orion v${appUpdateState.availableVersion ?? 'next'} — ${appUpdatePercent}%`
+          ? `Downloading Durango Code v${appUpdateState.availableVersion ?? 'next'} — ${appUpdatePercent}%`
           : appUpdateState?.status === 'downloaded'
-            ? `Orion v${appUpdateState.availableVersion ?? 'next'} is ready to install.`
+            ? `Durango Code v${appUpdateState.availableVersion ?? 'next'} is ready to install.`
             : appUpdateState?.status === 'restarting'
-              ? 'Restarting Orion to install the update...'
+              ? 'Restarting Durango Code to install the update...'
               : appUpdateState?.status === 'not-available'
-                ? `Orion is up to date.${
+                ? `Durango Code is up to date.${
                     appUpdateState.checkedAt ? ` Checked ${formatCheckedTime(appUpdateState.checkedAt)}.` : ''
                   }`
                 : appUpdateState?.status === 'error'
                   ? (appUpdateState.error ?? 'Could not check for updates.')
-                  : 'Check for a newer version of Orion.';
+                  : 'Check for a newer version of Durango Code.';
   const appUpdateActionLabel =
     appUpdateState?.status === 'checking'
       ? 'Checking...'
       : appUpdateState?.status === 'available'
         ? appUpdateState.availableVersion
           ? `Update to v${appUpdateState.availableVersion}`
-          : 'Update Orion'
+          : 'Update Durango Code'
         : appUpdateState?.status === 'downloading'
           ? `Downloading ${appUpdatePercent}%`
           : appUpdateState?.status === 'downloaded'
@@ -410,7 +413,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         <div className="settings-nav">
           {[
             { id: 'account', label: 'Account', Icon: UserRound },
-            { id: 'cloud-sync', label: 'Cloud Sync', Icon: Cloud },
+            { id: 'cloud-sync', label: 'Durango', Icon: Cloud },
             { id: 'deployments', label: 'Deployments', Icon: Rocket },
             { id: 'remote-control', label: 'Remote Control', Icon: Cast },
             { id: 'general', label: 'General', Icon: Settings },
@@ -449,7 +452,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
       <div className="settings-content">
         <div className="settings-content-header">
           {settingsTab === 'account' && 'ACCOUNT'}
-          {settingsTab === 'cloud-sync' && 'CLOUD SYNC'}
+          {settingsTab === 'cloud-sync' && 'DURANGO'}
           {settingsTab === 'deployments' && 'DEPLOYMENTS'}
           {settingsTab === 'remote-control' && 'REMOTE CONTROL'}
           {settingsTab === 'general' && 'GENERAL'}
@@ -474,13 +477,13 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   {accountState.user?.imageUrl ? (
                     <img className="account-avatar" src={accountState.user.imageUrl} alt="" aria-hidden />
                   ) : (
-                    <div className="account-avatar account-avatar-fallback">{accountInitials || 'O'}</div>
+                    <div className="account-avatar account-avatar-fallback">{accountInitials || 'D'}</div>
                   )}
                   <div className="account-card-text">
                     <div className="account-card-title">{accountName}</div>
                     <div className="account-card-subtitle">
                       {accountLoading ? (
-                        'Checking Orion account...'
+                        'Checking Durango account...'
                       ) : accountState.authenticated ? (
                         accountEmail ? (
                           <button
@@ -497,10 +500,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                             {accountEmail}
                           </button>
                         ) : (
-                          'Signed in to Orion Web'
+                          'Signed in to your Durango account'
                         )
                       ) : (
-                        'Sign in through Orion Web to authorize this desktop app.'
+                        'Sign in to your Durango account to authorize this desktop app.'
                       )}
                     </div>
                   </div>
@@ -515,7 +518,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   <div className="setting-label">
                     <div className="setting-label-title">Desktop session</div>
                     <div className="setting-label-desc">
-                      Authorized by Orion Web
+                      Authorized by Durango Code web
                       {accountState.expiresAt ? ` until ${formatCheckedTime(accountState.expiresAt)}` : ''}.
                     </div>
                   </div>
@@ -534,9 +537,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               {!accountState.authenticated && (
                 <div className="setting-row">
                   <div className="setting-label">
-                    <div className="setting-label-title">Authorize Orion Desktop</div>
+                    <div className="setting-label-title">Sign in to your Durango account</div>
                     <div className="setting-label-desc">
-                      Opens Orion Web in your browser and returns here after approval.
+                      Opens Durango Code web in your browser and returns here after approval.
                     </div>
                   </div>
                   <button
@@ -557,33 +560,38 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             <>
               <div className="setting-row">
                 <div className="setting-label">
-                  <div className="setting-label-title">Sync workspace to Orion Web</div>
+                  <div className="setting-label-title">Share coding work with Durango</div>
                   <div className="setting-label-desc">
-                    Off by default. When enabled, your projects, epics, threads (full transcripts
-                    including every agent step and tool call), and token usage sync to your Orion
-                    account so you can browse them at Orion Web → Usage. The first enable backfills
-                    everything in the background.
+                    On by default. Your projects, epics, threads (full transcripts including every
+                    agent step and tool call), and token usage sync to your Durango account, and code
+                    syncs through Durango Cloud repos (below). Durango Chat uses summaries of this
+                    work for its memory, so it can answer questions like “what did I ship this
+                    week?”. Browse everything at Durango Code web → Usage. Turn this off to stop all
+                    syncing from this device.
                     {!accountState.authenticated &&
                       (workspaceSyncSettings.enabled
-                        ? ' Sync is paused while signed out. You can turn it off now or sign in to resume.'
-                        : ' Sign in on the Account tab to enable.')}
+                        ? ' Sharing is paused while signed out. You can turn it off now or sign in to resume.'
+                        : ' Sign in on the Account tab to turn it on.')}
                   </div>
                 </div>
                 <label
                   className="provider-toggle"
                   title={
                     accountState.authenticated
-                      ? 'Sync projects, threads, and usage to Orion Web'
+                      ? 'Share threads, transcripts, usage, and code with your Durango account'
                       : workspaceSyncSettings.enabled
-                        ? 'Turn off workspace sync'
-                        : 'Sign in to your Orion account first'
+                        ? 'Turn off sharing coding work with Durango'
+                        : 'Sign in to your Durango account first'
                   }
                 >
                   <input
                     type="checkbox"
                     checked={workspaceSyncSettings.enabled}
                     disabled={!accountState.authenticated && !workspaceSyncSettings.enabled}
-                    onChange={(e) => setWorkspaceSyncSettings({ enabled: e.target.checked })}
+                    onChange={(e) =>
+                      // Any explicit choice also settles the one-time notice.
+                      setWorkspaceSyncSettings({ enabled: e.target.checked, consentNoticeSeen: true })
+                    }
                   />
                   <span />
                 </label>
@@ -591,9 +599,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
 
               <div className="setting-row">
                 <div className="setting-label">
-                  <div className="setting-label-title">Sync code</div>
+                  <div className="setting-label-title">Sync code to Durango Cloud</div>
                   <div className="setting-label-desc">
-                    Publish each git project as a private Orion Cloud repo. New commits sync as
+                    Publish each git project as a private Durango Cloud repo. New commits sync as
                     immutable save points with full history and diffs; uncommitted file changes are
                     never uploaded or deployed.
                   </div>
@@ -640,6 +648,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   </button>
                 </div>
               )}
+
+              <DurangoProfileMemorySetting authenticated={accountState.authenticated} />
+              <DurangoDispatchSettings
+                authenticated={accountState.authenticated}
+                modelGroups={orchestrationModelGroups}
+              />
             </>
           )}
 
@@ -650,7 +664,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-row">
                   <div className="setting-label">
                     <div className="setting-label-title">Theme</div>
-                    <div className="setting-label-desc">Choose how Orion looks across the app. Coming soon.</div>
+                    <div className="setting-label-desc">Choose how Durango Code looks across the app. Coming soon.</div>
                   </div>
                   <select className="setting-select" defaultValue="system" disabled>
                     <option value="system">System</option>
@@ -816,7 +830,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   <div className="setting-label">
                     <div className="setting-label-title">Model</div>
                     <div className="setting-label-desc">
-                      Writes Orion's short generated text: thread titles, epic commit messages from staged changes, and
+                      Writes Durango Code's short generated text: thread titles, epic commit messages from staged changes, and
                       PR descriptions from branch changes. Defaults to the fastest model on the providers you have
                       installed.
                     </div>
@@ -908,7 +922,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     <div className="setting-label">
                       <div className="setting-label-title">Settle confirmation</div>
                       <div className="setting-label-desc">
-                        Ask before every settlement. Orion still warns when work may be archived without a commit, push,
+                        Ask before every settlement. Durango Code still warns when work may be archived without a commit, push,
                         or pull request.
                       </div>
                     </div>
@@ -1016,7 +1030,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               <div className="settings-group">
                 <div className="setting-row">
                   <div className="setting-label">
-                    <div className="setting-label-title">Orion v{appUpdateState?.currentVersion ?? '—'}</div>
+                    <div className="setting-label-title">Durango Code v{appUpdateState?.currentVersion ?? '—'}</div>
                     <div
                       className={`setting-label-desc${
                         appUpdateState?.status === 'error' ? ' setting-update-error' : ''
@@ -1397,7 +1411,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="settings-panel-title">Orchestration</div>
                   <div className="settings-muted">
-                    Pick “Orion” as a thread’s model and Fable-style orchestration kicks in: the main driver model
+                    Pick “Durango Code” as a thread’s model and Fable-style orchestration kicks in: the main driver model
                     coordinates the work, talks to you, and delegates to the role models below via subagents.
                   </div>
                 </div>
@@ -1431,8 +1445,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="setting-label-title">General instructions</div>
                   <div className="setting-label-desc">
-                    Free-form guidance every model follows when run through Orion — like a global
-                    CLAUDE.md that never affects these models outside Orion
+                    Free-form guidance every model follows when run through Durango Code — like a global
+                    CLAUDE.md that never affects these models outside Durango Code
                   </div>
                 </div>
                 <textarea
@@ -1601,9 +1615,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   <div className="setting-label">
                     <div className="setting-label-title">macOS permissions</div>
                     <div className="setting-label-desc">
-                      Agents that control the mouse, keyboard, and screen (Codex computer use and similar) need Orion to
-                      hold these macOS permissions. macOS attributes every CLI Orion launches — codex, claude, grok,
-                      cursor — back to Orion, so granting them here covers all providers.
+                      Agents that control the mouse, keyboard, and screen (Codex computer use and similar) need Durango Code to
+                      hold these macOS permissions. macOS attributes every CLI Durango Code launches — codex, claude, grok,
+                      cursor — back to Durango Code, so granting them here covers all providers.
                     </div>
                   </div>
                 </div>
@@ -1613,7 +1627,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     {
                       kind: 'accessibility',
                       title: 'Accessibility',
-                      desc: 'Lets agents read app windows and send clicks and keystrokes. After requesting, enable Orion in the Accessibility list.',
+                      desc: 'Lets agents read app windows and send clicks and keystrokes. After requesting, enable Durango Code in the Accessibility list.',
                       status: computerUsePerms?.accessibility ?? 'not-determined',
                     },
                     {
@@ -1679,7 +1693,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     <div className="setting-label-title">Apply new grants</div>
                     <div className="setting-label-desc">
                       macOS applies Screen Recording (and sometimes Accessibility) to an already-running app only after
-                      it relaunches. Restart Orion once you’ve granted access.
+                      it relaunches. Restart Durango Code once you’ve granted access.
                     </div>
                   </div>
                   <button
@@ -1690,7 +1704,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     }}
                   >
                     <RefreshCw size={13} />
-                    Relaunch Orion
+                    Relaunch Durango Code
                   </button>
                 </div>
                   </>
@@ -1713,7 +1727,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                       <div className="setting-label-title">Codex</div>
                       <div className="setting-label-desc">
                         Use your signed-in Chrome through the extension, or attach through Chrome’s public debugging
-                        server with chrome-devtools-mcp. If Orion cannot verify the extension integration, Codex
+                        server with chrome-devtools-mcp. If Durango Code cannot verify the extension integration, Codex
                         automatically falls back to the MCP connection.
                       </div>
                     </div>
@@ -1787,7 +1801,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                       <div className="setting-label">
                         <div className="setting-label-title">Codex signed-in Chrome via MCP</div>
                         <div className="setting-label-desc">
-                          Orion starts chrome-devtools-mcp with <code>--autoConnect</code> so it controls your existing
+                          Durango Code starts chrome-devtools-mcp with <code>--autoConnect</code> so it controls your existing
                           Chrome tabs, logins, and cookies through Chrome’s public debugging server.
                           {chromeDebugStatus !== 'enabled' && (
                             <>
@@ -2193,3 +2207,33 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
 });
 
 export default SettingsPage;
+
+// Optional: add what Durango remembers about the user to agent instructions
+// at thread start. Off by default — agents can always pull memory on demand
+// with the recall_memory tool.
+const DurangoProfileMemorySetting: React.FC<{ authenticated: boolean }> = ({ authenticated }) => {
+  const durangoSettings = useOrionStore((state) => state.durangoSettings ?? defaultDurangoSettings);
+  const setDurangoSettings = useOrionStore((state) => state.setDurangoSettings);
+  return (
+    <div className="setting-row">
+      <div className="setting-label">
+        <div className="setting-label-title">Include my Durango profile in agent instructions</div>
+        <div className="setting-label-desc">
+          Off by default. When on, each new thread starts with a short summary of what Durango
+          remembers about you (preferences, working style, tools), up to about 1,200 characters.
+          Agents can always look things up with the recall_memory tool, and you can ask them to
+          remember something for Durango Chat.
+          {!authenticated && ' Requires signing in to your Durango account.'}
+        </div>
+      </div>
+      <label className="provider-toggle" title="Add your Durango profile to new threads">
+        <input
+          type="checkbox"
+          checked={durangoSettings.includeProfileMemory}
+          onChange={(e) => setDurangoSettings({ includeProfileMemory: e.target.checked })}
+        />
+        <span />
+      </label>
+    </div>
+  );
+};

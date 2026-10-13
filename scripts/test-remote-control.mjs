@@ -1245,7 +1245,7 @@ if (
     await rendererState;
     const lossResults = await lossController.waitFor('results', 30_000);
     assert.equal(lossResults.results.runTurn.ok, false);
-    assert.match(lossResults.results.runTurn.error, /Open an Orion window/i);
+    assert.match(lossResults.results.runTurn.error, /Open a Durango Code window/i);
     assert.ok(Date.now() - lostAt < 2000, 'renderer loss should not wait for the 5-second run timeout');
     const claimResult = lossHost.waitFor('claimResult');
     lossHost.send(`claim ${seen.commandId}`);
@@ -1882,7 +1882,7 @@ if (
     });
     const { results } = await wrongUser.waitFor('results');
     assert.equal(results.pair.ok, false, 'pairing must fail across accounts');
-    assert.match(results.pair.error, /same Orion account/i);
+    assert.match(results.pair.error, /same Durango account/i);
     wrongUser.child.kill();
     console.log('ok  cross-account pairing refused');
   }
@@ -2167,7 +2167,7 @@ if (
     assert.equal(results.snapshot.ok, true, 'read-only snapshots should remain available');
     for (const result of [results.runTurn, results.continueTurn, results.stopTurn]) {
       assert.equal(result.ok, false);
-      assert.match(result.error, /Open an Orion window/i);
+      assert.match(result.error, /Open a Durango Code window/i);
     }
     host.send('renderer-on');
     const restored = await host.waitFor('rendererState');

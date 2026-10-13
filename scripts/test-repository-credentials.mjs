@@ -98,3 +98,15 @@ test('expired legacy sessions require explicit reauthorization', async () => {
   await assert.rejects(manager.get(), /Sign in/);
   assert.equal(state.requests.length, 0);
 });
+
+test('identity cutover rebinds the stored credential instead of minting a second one', async () => {
+  const stored = { origin: 'https://orion.example', token, id: 'token-a', user: { id: 'user-old' } };
+  const { state, manager } = fixture({ state: { stored, session: { ...session, user: { id: 'user-new' } } } });
+  assert.equal(await manager.rebindUser('user-old', { id: 'user-new', email: 'a@example.com' }), true);
+  assert.equal(state.stored.user.id, 'user-new');
+  assert.equal((await manager.get()).token, token);
+  assert.equal(state.requests.length, 0);
+  // A credential owned by a different id is never rebound.
+  assert.equal(await manager.rebindUser('user-someone-else', { id: 'user-x' }), false);
+  assert.equal(state.stored.user.id, 'user-new');
+});

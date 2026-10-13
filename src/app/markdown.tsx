@@ -1,12 +1,13 @@
 import React, { useContext, useRef } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { MessageSquare } from 'lucide-react';
+import { MessageCircle, MessageSquare } from 'lucide-react';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
 import { localMediaSrc, videoFileNamePattern } from './attachments';
 import { handleLightboxImageClick } from './imageLightbox';
 import { resolveThreadReference, threadReferencePattern } from './promptContext';
+import { chatIdFromReference, chatReferencePattern, knownDurangoChat, knownDurangoChats, knownDurangoChatUrl } from './durangoChats';
 
 // Candidate base directories (in priority order) used to resolve relative
 // media paths that agents emit in markdown — the thread's project path, plus
@@ -19,7 +20,7 @@ const bareSourceLocationPattern = /^(?!(?:javascript|data|vbscript|https?|mailto
 // react-markdown's default transform strips unknown schemes; let local file
 // references through so MarkdownMedia can route them via orion-attachment.
 export const markdownUrlTransform = (url: string) =>
-  /^(orion-attachment|orion-thread|file):/i.test(url) ||
+  /^(orion-attachment|orion-thread|durango-chat|file):/i.test(url) ||
   /^[a-zA-Z]:[\\/]/.test(url) ||
   bareSourceLocationPattern.test(url)
     ? url
@@ -75,7 +76,7 @@ export const ThreadReferenceLink: React.FC<{ reference: string; children: React.
     threadId ? state.threads.find((thread) => thread.id === threadId)?.title : undefined
   );
   if (!threadId) {
-    return <span title="This thread isn't available in Orion">{children}</span>;
+    return <span title="This thread isn't available in Durango Code">{children}</span>;
   }
 
   const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -101,19 +102,83 @@ export const ThreadReferenceLink: React.FC<{ reference: string; children: React.
   );
 };
 
-// Plain text (user messages) with its @thread references made clickable.
+const CHAT_REFERENCE_SCHEME = 'durango-chat:';
+
+// A Durango Chat reference (`@chat:<slug>-<chatId>` or `@chat:<chatId>`):
+// opens that chat in the browser. Titles come from chats seen in @-mention
+// search results; otherwise the token text stays the label.
+export const ChatReferenceLink: React.FC<{ reference: string; children: React.ReactNode }> = ({
+  reference,
+  children,
+}) => {
+  const chatId = chatIdFromReference(reference, knownDurangoChats());
+  if (!chatId) return <>{children}</>;
+  const title = knownDurangoChat(chatId)?.title?.trim();
+
+  const handleClick = (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void (async () => {
+      try {
+        const result = await window.orion?.durangoOpenChat?.({ chatId, url: knownDurangoChatUrl(chatId) });
+        if (result && !result.ok) toast.error(result.error ?? 'Could not open the Durango chat.');
+      } catch {
+        toast.error('Could not open the Durango chat.');
+      }
+    })();
+  };
+
+  return (
+    <button
+      type="button"
+      className="thread-reference chat-reference"
+      onClick={handleClick}
+      title={`Open Durango chat${title ? ` "${title}"` : ''} in your browser`}
+    >
+      <MessageCircle size={12} aria-hidden />
+      <span>{title || children}</span>
+    </button>
+  );
+};
+
+type ReferenceMatch = { kind: 'thread' | 'chat'; start: number; text: string; reference: string };
+
+// @thread and @chat references in one pass, in text order. Their prefixes
+// differ, so matches never overlap.
+const findReferences = (text: string): ReferenceMatch[] => {
+  const matches: ReferenceMatch[] = [];
+  if (text.includes('@thread:')) {
+    for (const match of text.matchAll(threadReferencePattern)) {
+      matches.push({ kind: 'thread', start: match.index ?? 0, text: match[0], reference: match[1] });
+    }
+  }
+  if (text.includes('@chat:')) {
+    for (const match of text.matchAll(chatReferencePattern)) {
+      matches.push({ kind: 'chat', start: match.index ?? 0, text: match[0], reference: match[1] });
+    }
+  }
+  return matches.sort((a, b) => a.start - b.start);
+};
+
+// Plain text (user messages) with its @thread and @chat references made clickable.
 export const ThreadReferenceText: React.FC<{ text: string }> = React.memo(({ text }) => {
   const parts: React.ReactNode[] = [];
   let last = 0;
-  for (const match of text.matchAll(threadReferencePattern)) {
-    const start = match.index ?? 0;
+  for (const match of findReferences(text)) {
+    const { start } = match;
     if (start > last) parts.push(text.slice(last, start));
     parts.push(
-      <ThreadReferenceLink key={start} reference={match[1]}>
-        {match[0]}
-      </ThreadReferenceLink>
+      match.kind === 'thread' ? (
+        <ThreadReferenceLink key={start} reference={match.reference}>
+          {match.text}
+        </ThreadReferenceLink>
+      ) : (
+        <ChatReferenceLink key={start} reference={match.reference}>
+          {match.text}
+        </ChatReferenceLink>
+      )
     );
-    last = start + match[0].length;
+    last = start + match.text.length;
   }
   if (last === 0) return <>{text}</>;
   if (last < text.length) parts.push(text.slice(last));
@@ -122,20 +187,20 @@ export const ThreadReferenceText: React.FC<{ text: string }> = React.memo(({ tex
 
 type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[] };
 
-const threadReferenceLinkNode = (reference: string, children: MarkdownNode[]): MarkdownNode => ({
+const referenceLinkNode = (match: Pick<ReferenceMatch, 'kind' | 'reference'>, children: MarkdownNode[]): MarkdownNode => ({
   type: 'link',
-  url: `${THREAD_REFERENCE_SCHEME}${reference}`,
+  url: `${match.kind === 'thread' ? THREAD_REFERENCE_SCHEME : CHAT_REFERENCE_SCHEME}${match.reference}`,
   children,
 });
 
 const splitThreadReferences = (value: string): MarkdownNode[] | null => {
   const nodes: MarkdownNode[] = [];
   let last = 0;
-  for (const match of value.matchAll(threadReferencePattern)) {
-    const start = match.index ?? 0;
+  for (const match of findReferences(value)) {
+    const { start } = match;
     if (start > last) nodes.push({ type: 'text', value: value.slice(last, start) });
-    nodes.push(threadReferenceLinkNode(match[1], [{ type: 'text', value: match[0] }]));
-    last = start + match[0].length;
+    nodes.push(referenceLinkNode(match, [{ type: 'text', value: match.text }]));
+    last = start + match.text.length;
   }
   if (last === 0) return null;
   if (last < value.length) nodes.push({ type: 'text', value: value.slice(last) });
@@ -148,10 +213,11 @@ const linkThreadReferences = (node: MarkdownNode) => {
   node.children = node.children.flatMap((child) => {
     if (child.type === 'text' && child.value) return splitThreadReferences(child.value) ?? [child];
     if (child.type === 'inlineCode' && child.value) {
-      // Only a code span that is exactly one reference, e.g. `@thread:<id>`.
-      const match = [...child.value.trim().matchAll(threadReferencePattern)];
-      if (match.length === 1 && match[0][0] === child.value.trim()) {
-        return [threadReferenceLinkNode(match[0][1], [child])];
+      // Only a code span that is exactly one reference, e.g. `@thread:<id>`
+      // or `@chat:<id>`.
+      const match = findReferences(child.value.trim());
+      if (match.length === 1 && match[0].text === child.value.trim()) {
+        return [referenceLinkNode(match[0], [child])];
       }
       return [child];
     }
@@ -160,8 +226,8 @@ const linkThreadReferences = (node: MarkdownNode) => {
   });
 };
 
-// Remark plugin: turn `@thread:<id or mention token>` in prose into links the
-// `a` renderer below opens as threads.
+// Remark plugin: turn `@thread:<id or mention token>` and `@chat:<…>` in prose
+// into links the `a` renderer below opens as threads / Durango chats.
 export const remarkThreadReferences = () => (tree: MarkdownNode) => linkThreadReferences(tree);
 
 export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraProps> = ({
@@ -177,6 +243,11 @@ export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraP
       <ThreadReferenceLink reference={href.slice(THREAD_REFERENCE_SCHEME.length)}>
         {children}
       </ThreadReferenceLink>
+    );
+  }
+  if (href?.startsWith(CHAT_REFERENCE_SCHEME)) {
+    return (
+      <ChatReferenceLink reference={href.slice(CHAT_REFERENCE_SCHEME.length)}>{children}</ChatReferenceLink>
     );
   }
 

@@ -458,6 +458,17 @@ export type RemoteCommandRequest = {
     /** Claude-only context window. Ignored for other providers. */
     claudeContextWindow?: '200k' | '1m';
     source?: { machineId: string; machineName: string };
+    /**
+     * Set when Durango Chat started this run (dispatch worker in main): the
+     * renderer creates the thread exactly like a remote runTurn, links the
+     * task, and adds a visible "started remotely" note.
+     */
+    durangoDispatch?: {
+      id: string;
+      taskId: string | null;
+      sourceUrl: string | null;
+      requestedAccessMode: 'ask' | 'auto-edit' | null;
+    };
   };
 };
 
@@ -590,6 +601,8 @@ type OrionBoardColumn = {
 type OrionBoardAttachment = {
   id: string;
   fileName: string;
+  /** Durango Tasks also sends the display name (same value as fileName). */
+  name?: string;
   contentType: string;
   size: number;
   createdAt: string;
@@ -614,6 +627,13 @@ type OrionBoardTask = {
   } | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Durango Tasks: the pre-migration Durango Code board id of an imported
+   * task. Threads linked before the switch still hold that id.
+   */
+  legacyId?: string | null;
+  /** Durango Tasks: the task on durango.sh. */
+  url?: string;
 };
 
 type OrionBoardResult = {
@@ -647,7 +667,46 @@ type OrionAccountState = {
 type OrionWorkspaceSyncSettings = {
   enabled: boolean;
   syncCode: boolean;
+  consentVersion?: number;
+  consentNoticeSeen?: boolean;
 };
+
+/** A Durango Chat conversation as returned by GET /api/v1/chats (contracts §7). */
+type DurangoChatSummary = {
+  id: string;
+  projectId: string | null;
+  title: string;
+  updatedAt: string | number | null;
+  snippet: string;
+  url: string | null;
+  archived?: boolean;
+};
+
+type DurangoErrorCode = 'not_signed_in' | 'not_connected' | 'network' | 'api';
+
+/** Settings → Durango → "Allow Durango Chat to start agents on this Mac". */
+type DurangoDispatchSettingsInput = {
+  enabled: boolean;
+  /** null = every project. */
+  allowedProjectIds: string[] | null;
+  accessMode: 'read-only' | 'workspace-write' | 'full-access';
+  /** null = the project's usual model. */
+  modelId: string | null;
+  maxConcurrent: 1 | 2;
+};
+
+type DurangoDispatchState = {
+  enabled: boolean;
+  signedIn: boolean;
+  status: 'off' | 'signed_out' | 'paused' | 'offline' | 'no_window' | 'busy' | 'listening' | 'error';
+  lastError: string | null;
+  maxConcurrent: number;
+  running: Array<{ dispatchId: string; threadId: string | null; projectName: string | null }>;
+};
+
+type DurangoSearchChatsResult =
+  | { ok: true; data: DurangoChatSummary[]; nextCursor: string | null }
+  | { ok: false; code: DurangoErrorCode; error: string };
 
 type OrionWorkspaceSyncStatus = {
   enabled: boolean;
@@ -1374,6 +1433,8 @@ type OrionCodexBrowserIntegrationStatus = {
         status: 'running' | 'finished' | 'done' | 'error';
         notes?: string;
       }) => Promise<OrionTaskActionResult>;
+      /** Opens Durango Tasks (durango.sh/tasks) in the browser. */
+      openBoardTasksWeb?: () => Promise<{ ok: boolean; error?: string }>;
       getComputerUsePermissions: () => Promise<OrionComputerUsePermissions>;
       requestComputerUsePermission: (kind: OrionComputerUsePermissionKind) => Promise<{
         ok: boolean;
@@ -1456,6 +1517,8 @@ type OrionCodexBrowserIntegrationStatus = {
         mentions?: Array<{ modelId: string; providerId: string; slug: string; label: string }>;
         /** True when prompt context contains resolvable @thread references and requires read_thread. */
         hasThreadMentions?: boolean;
+        /** The prompt @-mentions Durango chats, so the run needs read_chat. */
+        hasChatMentions?: boolean;
         /** Orion MCP servers attached to the thread (loaded even when switched off). */
         mcpServerIds?: string[];
       }) => Promise<{ ok: boolean; runId?: string; error?: string }>;
@@ -1652,6 +1715,33 @@ type OrionCodexBrowserIntegrationStatus = {
         }) => void
       ) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;
+      durangoSearchChats?: (input: {
+        query: string;
+        limit?: number;
+        cursor?: string;
+      }) => Promise<DurangoSearchChatsResult>;
+      durangoOpenChat?: (input: { chatId: string; url?: string | null }) => Promise<{ ok: boolean; error?: string }>;
+      durangoProfileMemory?: () => Promise<{
+        ok: boolean;
+        code?: DurangoErrorCode;
+        error?: string;
+        block: string;
+      }>;
+      durangoConfigure?: (input: {
+        useDurangoTasks: boolean;
+        dispatch: DurangoDispatchSettingsInput;
+        projects: Array<{ id: string; name: string; path: string }>;
+      }) => Promise<{ ok: boolean; state?: DurangoDispatchState }>;
+      durangoDispatchState?: () => Promise<DurangoDispatchState>;
+      durangoDispatchSettled?: (input: {
+        dispatchId: string;
+        threadId: string;
+        outcome: 'finished' | 'failed';
+        summary?: string;
+        error?: string;
+      }) => Promise<{ ok: boolean; skipped?: boolean }>;
+      onDurangoDispatchState?: (cb: (state: DurangoDispatchState) => void) => () => void;
+      onDurangoFocusThread?: (cb: (payload: { threadId: string }) => void) => () => void;
       workspaceSyncConfigure?: (
         settings: OrionWorkspaceSyncSettings
       ) => Promise<OrionWorkspaceSyncStatus>;

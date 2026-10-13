@@ -77,7 +77,7 @@ export const SelectMenu = ({ label, value, options, onChange, disabled }: Select
         <div
           ref={menuRef}
           role="listbox"
-          className={`absolute right-0 z-[100] min-w-[9rem] overflow-hidden rounded-lg border border-[#3a3a40] bg-[#1f1f21] py-1 shadow-2xl ${
+          className={`absolute right-0 z-[100] max-h-[320px] min-w-[9rem] overflow-y-auto rounded-lg border border-[#3a3a40] bg-[#1f1f21] py-1 shadow-2xl ${
             flipped ? 'bottom-[calc(100%+6px)]' : 'top-[calc(100%+6px)]'
           }`}
         >

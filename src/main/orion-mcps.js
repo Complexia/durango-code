@@ -294,8 +294,8 @@ class OrionOAuthProvider {
 
   get clientMetadata() {
     return {
-      client_name: 'Orion',
-      client_uri: 'https://orion.rifts.dev',
+      client_name: 'Durango Code',
+      client_uri: 'https://code.durango.sh',
       redirect_uris: [String(this.redirectUrl)],
       grant_types: this.grantTypes,
       response_types: ['code'],
@@ -430,7 +430,7 @@ const startOAuthCallbackServer = () =>
       const state = url.searchParams.get('state');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       if (!expectedState || state !== expectedState) {
-        res.writeHead(400).end(callbackPage('Sign-in failed', 'This sign-in link is stale. Start again from Orion.'));
+        res.writeHead(400).end(callbackPage('Sign-in failed', 'This sign-in link is stale. Start again from Durango Code.'));
         return;
       }
       if (error || !code) {
@@ -439,7 +439,7 @@ const startOAuthCallbackServer = () =>
         failCode(new Error(`Sign-in failed: ${detail}`));
         return;
       }
-      res.writeHead(200).end(callbackPage('Connected to Orion', 'You can close this tab and return to Orion.'));
+      res.writeHead(200).end(callbackPage('Connected to Durango Code', 'You can close this tab and return to Durango Code.'));
       settleCode(code);
     });
     server.on('error', reject);
@@ -624,7 +624,7 @@ const probeHttpAuthRequirement = async (url, headers, signal) => {
         params: {
           protocolVersion: '2025-06-18',
           capabilities: {},
-          clientInfo: { name: 'Orion', version: app.getVersion() },
+          clientInfo: { name: 'Durango Code', version: app.getVersion() },
         },
       }),
     }),
@@ -674,7 +674,7 @@ export const readOrionMcpRegistryForMatching = async () => {
 // credentials Orion will hand to agents.
 const listServerTools = async (server, { headers = {}, env = {}, signal } = {}) => {
   signal?.throwIfAborted();
-  const client = new Client({ name: 'Orion', version: app.getVersion() });
+  const client = new Client({ name: 'Durango Code', version: app.getVersion() });
   const connectAndList = async (transport) => {
     await client.connect(transport);
     signal?.throwIfAborted();
@@ -763,7 +763,7 @@ export const listOrionMcps = async () => {
         .sort((a, b) => a.nickname.localeCompare(b.nickname)),
     };
   } catch (error) {
-    return { ok: false, servers: [], error: errorMessage(error, 'Could not read Orion MCP servers.') };
+    return { ok: false, servers: [], error: errorMessage(error, 'Could not read Durango Code MCP servers.') };
   }
 };
 
@@ -771,7 +771,7 @@ const validateNickname = (nickname, servers, exceptId) => {
   if (typeof nickname !== 'string' || !nicknamePattern.test(nickname)) {
     return 'Nicknames use lowercase letters, numbers, - or _ (up to 32 characters).';
   }
-  if (reservedNicknames.has(nickname)) return `“${nickname}” is reserved by Orion.`;
+  if (reservedNicknames.has(nickname)) return `“${nickname}” is reserved by Durango Code.`;
   if (servers.some((server) => server.id !== exceptId && server.nickname === nickname)) {
     return `Another MCP is already called @${nickname}.`;
   }

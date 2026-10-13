@@ -549,7 +549,7 @@ const relayEnabled = () => settings.connectionMode === 'relay' && relaySupported
  * controller still needs the paired device secret to get past the handshake.
  */
 const ensureRelayRegistration = async (signal) => {
-  if (!currentUserId) throw new Error('Sign in to your Orion account first.');
+  if (!currentUserId) throw new Error('Sign in to your Durango account first.');
   if (relayRegisteredFor === currentUserId) return;
   const registrationUserId = currentUserId;
   const registrationGeneration = accountGeneration;
@@ -567,7 +567,7 @@ const ensureRelayRegistration = async (signal) => {
     registrationGeneration !== accountGeneration ||
     registrationUserId !== currentUserId
   ) {
-    throw new Error('The Orion account changed during relay registration.');
+    throw new Error('The Durango account changed during relay registration.');
   }
   relayRegisteredFor = registrationUserId;
 };
@@ -581,9 +581,9 @@ const ensureRelayRegistration = async (signal) => {
  */
 export const deregisterRelayMachine = async () => {
   if (!identity) return { ok: false, error: stateError ?? 'Remote control is unavailable on this machine.' };
-  if (!currentUserId) return { ok: false, error: 'Sign in to your Orion account first.' };
+  if (!currentUserId) return { ok: false, error: 'Sign in to your Durango account first.' };
   if (typeof deps?.deregisterRelayDevice !== 'function') {
-    return { ok: false, error: 'This build cannot manage Orion Cloud registrations.' };
+    return { ok: false, error: 'This build cannot manage Durango Cloud registrations.' };
   }
   // Leave relay mode in the engine's own settings copy as well: the renderer
   // sends its matching configure({connectionMode:'direct'}) asynchronously,
@@ -591,7 +591,7 @@ export const deregisterRelayMachine = async () => {
   // must not restart the listener and re-register the row we are deleting.
   settings = { ...settings, connectionMode: 'direct' };
   stopRelayListener();
-  closeRelaySessions('This machine was removed from Orion Cloud.');
+  closeRelaySessions('This machine was removed from Durango Cloud.');
   relayRegisteredFor = null;
   try {
     await deps.deregisterRelayDevice({ machineId: identity.machineId });
@@ -720,6 +720,7 @@ export const initRemoteControl = async (dependencies) => {
   deps = dependencies;
   shuttingDown = false;
   await loadPersistedState();
+  await applyPendingUserIdMigrations();
   await reconcile();
 };
 
@@ -782,6 +783,65 @@ export const shutdownRemoteControl = () => {
   cancelOutboundPairingAttempts('Shutting down.');
   for (const [machineId] of clientSessions) closeClientSession(machineId, 'Shutting down.');
   cancelPendingRendererCommands('Remote control is shutting down.');
+};
+
+// Durango identity cutover: the account's native Clerk id (`session.user.id`)
+// changes while the desktop session (and the app user id behind it) does not.
+// Every stored pairing carries the account id it was made under — controllers
+// this host accepted and hosts this controller can drive are always the same
+// account — so without this, existing pairings would stop matching the
+// refreshed account and users would have to re-pair every machine.
+let pendingUserIdMigrations = [];
+
+const rewritePairingUserIds = (fromUserId, toUserId) => {
+  let changed = 0;
+  const rewrite = (entry) => {
+    if (entry.userId !== fromUserId) return entry;
+    changed += 1;
+    return { ...entry, userId: toUserId };
+  };
+  // Copies, not in-place writes: mutatePersistedState rolls back by restoring
+  // the previous array references if the durable write fails.
+  hostDevices = hostDevices.map(rewrite);
+  remoteMachines = remoteMachines.map(rewrite);
+  return changed;
+};
+
+/**
+ * Rebind stored pairings from the account's previous user id to its current
+ * one. Only call this for the SAME signed-in session whose `user.id` changed
+ * (GET /api/desktop-auth/session returned a different id for the same token);
+ * a different account signing in must never inherit pairings. Safe to call
+ * before init: the rewrite is applied right after the pairing file loads.
+ */
+export const migrateRemoteControlUserId = async ({ fromUserId, toUserId } = {}) => {
+  if (typeof fromUserId !== 'string' || typeof toUserId !== 'string') return { migrated: 0 };
+  if (!fromUserId || !toUserId || fromUserId === toUserId) return { migrated: 0 };
+  if (!stateLoaded) {
+    pendingUserIdMigrations.push({ fromUserId, toUserId });
+    return { migrated: 0, deferred: true };
+  }
+  if (!identity) return { migrated: 0 };
+  try {
+    const result = await mutatePersistedState({
+      mutate: () => {
+        const changed = rewritePairingUserIds(fromUserId, toUserId);
+        return { changed: changed > 0, value: changed };
+      },
+      afterPersist: () => publishState(),
+    });
+    return { migrated: result.committed ? result.value : 0 };
+  } catch (error) {
+    return { migrated: 0, error: error?.message ?? String(error) };
+  }
+};
+
+const applyPendingUserIdMigrations = async () => {
+  const migrations = pendingUserIdMigrations;
+  pendingUserIdMigrations = [];
+  for (const migration of migrations) {
+    await migrateRemoteControlUserId(migration);
+  }
 };
 
 /** Drain credential mutations before Electron is allowed to terminate. */
@@ -896,11 +956,11 @@ const teardownForAccountChange = () => {
   relayRegisteredFor = null;
   stopServer();
   stopRelayListener();
-  cancelOutboundPairingAttempts('The Orion account changed.');
+  cancelOutboundPairingAttempts('The Durango account changed.');
   for (const [machineId] of clientSessions) {
-    closeClientSession(machineId, 'The Orion account changed.');
+    closeClientSession(machineId, 'The Durango account changed.');
   }
-  cancelPendingRendererCommands('The Orion account changed.');
+  cancelPendingRendererCommands('The Durango account changed.');
 };
 
 export const startRemotePairing = () => {
@@ -911,7 +971,7 @@ export const startRemotePairing = () => {
     return { ok: false, error: 'Enable remote control first.' };
   }
   if (!currentUserId) {
-    return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    return { ok: false, error: 'Sign in to your Durango account first.', needsAuth: true };
   }
   try {
     requirePairingPersistence();
@@ -1246,7 +1306,7 @@ const handlePairRequest = async (session, message) => {
   const accountProof = String(message?.accountProof ?? '');
   if (!deviceId || deviceId.length > 128) return fail('Invalid device id.');
   if (!accountProof || accountProof.length > 16_384 || !session.accountChallenge) {
-    return fail('The controller did not provide a valid Orion account proof.');
+    return fail('The controller did not provide a valid Durango account proof.');
   }
   let controllerUserId = null;
   try {
@@ -1262,7 +1322,7 @@ const handlePairRequest = async (session, message) => {
   if (!ownsPairingSession()) return;
   if (!currentUserId) return fail('The host is signed out.');
   if (!controllerUserId || controllerUserId !== currentUserId) {
-    return fail('Both machines must be signed in to the same Orion account.');
+    return fail('Both machines must be signed in to the same Durango account.');
   }
   if (deviceId === identity.machineId) return fail('A machine cannot pair with itself.');
   try {
@@ -1373,7 +1433,7 @@ const cancelPendingRendererCommands = (
 
 export const notifyRemoteCommandRendererLost = () => {
   cancelPendingRendererCommands(
-    'Open an Orion window on the host to run remote commands.',
+    'Open a Durango Code window on the host to run remote commands.',
     { unclaimedOnly: true }
   );
 };
@@ -1429,7 +1489,7 @@ const requestRendererCommand = (command, timeoutMs, session, onClaim = null) => 
     if (delivered === 0 && pendingRendererCommands.get(commandId) === pending) {
       settlePendingRendererCommand(commandId, pending, {
         ok: false,
-        error: 'Open an Orion window on the host to run remote commands.',
+        error: 'Open a Durango Code window on the host to run remote commands.',
       });
     }
   });
@@ -1680,7 +1740,7 @@ const handleHostRequest = async (session, message) => {
           if (message?.threadChunking !== true) {
             respond({
               ok: false,
-              error: 'This thread is too large for this version of the controller. Update Orion and try again.',
+              error: 'This thread is too large for this version of the controller. Update Durango Code and try again.',
             });
             return;
           }
@@ -1740,7 +1800,7 @@ const handleHostRequest = async (session, message) => {
         if (message?.threadChunking !== true) {
           respond({
             ok: false,
-            error: 'This thread is too large for this version of the controller. Update Orion and try again.',
+            error: 'This thread is too large for this version of the controller. Update Durango Code and try again.',
           });
           return;
         }
@@ -1882,7 +1942,7 @@ const createControllerTransport = async (route, { host, port, machineId }, signa
   if (signal?.aborted) throw cancelledClientSessionError();
   const ticket = typeof issued === 'string' ? issued : issued?.ticket;
   const relayUrl = typeof issued === 'string' ? deps.getRelayUrl?.() : issued?.relayUrl;
-  if (!ticket || !relayUrl) throw new Error('Orion Cloud returned invalid relay connection details.');
+  if (!ticket || !relayUrl) throw new Error('Durango Cloud returned invalid relay connection details.');
   return createRelayTransport({ relayUrl, ticket, machineId });
 };
 
@@ -2029,7 +2089,7 @@ export const pairWithRemoteHost = async ({ host, port, code, machineId } = {}) =
     return { ok: false, error: 'Remote control is disabled in Settings.' };
   }
   if (!currentUserId || !accountSession?.token) {
-    return { ok: false, error: 'Sign in to your Orion account first.', needsAuth: true };
+    return { ok: false, error: 'Sign in to your Durango account first.', needsAuth: true };
   }
   try {
     requirePairingPersistence();
@@ -2170,7 +2230,7 @@ export const pairWithRemoteHost = async ({ host, port, code, machineId } = {}) =
             channel.destroy();
             resolve({
               ok: false,
-              error: error?.message ?? 'Could not authenticate the controlling Orion account.',
+              error: error?.message ?? 'Could not authenticate the controlling Durango account.',
             });
           });
         return;
@@ -2196,7 +2256,7 @@ export const pairWithRemoteHost = async ({ host, port, code, machineId } = {}) =
     return { ok: false, error: 'The host sent an invalid pairing response.' };
   }
   if (result.userId !== currentUserId) {
-    return { ok: false, error: 'The host is signed in to a different Orion account.' };
+    return { ok: false, error: 'The host is signed in to a different Durango account.' };
   }
   if (overRelay && result.host.id !== targetMachineId) {
     return { ok: false, error: 'The relay connected a different machine than the one requested.' };
@@ -2269,11 +2329,11 @@ const ensureClientSession = async (machineId) => {
   if (!identity) throw new Error(stateError ?? 'Remote control is unavailable on this machine.');
   if (!settings.enabled) throw new Error('Remote control is disabled in Settings.');
   await refreshAccount();
-  if (!currentUserId) throw new Error('Sign in to your Orion account first.');
+  if (!currentUserId) throw new Error('Sign in to your Durango account first.');
   const machine = remoteMachines.find((candidate) => candidate.id === machineId);
   if (!machine) throw new Error('This machine is not paired.');
   if (machine.userId && machine.userId !== currentUserId) {
-    throw new Error('This machine was paired under a different Orion account.');
+    throw new Error('This machine was paired under a different Durango account.');
   }
 
   const existing = clientSessions.get(machineId);

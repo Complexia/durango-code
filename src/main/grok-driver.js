@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 import { grokSessionModeForAccessMode } from './grok-access-mode.js';
+import { isPreapprovedOrionTool } from './thread-reader-routing.js';
 
 // --- grok: <session dir>/updates.jsonl holds raw session/update lines -------
 
@@ -515,10 +516,12 @@ export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, a
       typeof toolCall.rawInput?.tool_name === 'string'
         ? toolCall.rawInput.tool_name
         : known?.rawInputToolName;
+    // The Durango Chat tools follow the same rule (`remember` excluded in
+    // Read only — see thread-reader-routing.js).
     const isOrionSpawn =
-      grokMcpToolName === 'orion__spawn_subagent' ||
-      grokMcpToolName === 'orion__stop_subagent' ||
-      grokMcpToolName === 'orion__read_thread';
+      typeof grokMcpToolName === 'string' &&
+      grokMcpToolName.startsWith('orion__') &&
+      isPreapprovedOrionTool(grokMcpToolName.slice('orion__'.length), accessMode);
     const allow =
       isOrionSpawn || accessMode === 'full-access'
         ? true

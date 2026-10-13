@@ -206,7 +206,7 @@ export const SessionImportCard: React.FC<{ agentModels: AgentModel[] }> = ({ age
           ? `Imported ${plural(phase.imported, 'conversation')}${
               phase.projectsAdded > 0 ? ` and added ${plural(phase.projectsAdded, 'project')}` : ''
             }`
-          : 'Sync your chats and continue them in Orion';
+          : 'Sync your chats and continue them in Durango Code';
 
   return (
     <div className={`session-import ${phase.kind === 'ready' ? 'expanded' : ''}`}>
@@ -272,7 +272,7 @@ export const SessionImportCard: React.FC<{ agentModels: AgentModel[] }> = ({ age
                   .filter(Boolean)
                   .join(', ')}) from ${plural(selection.folders.length, 'folder')}.${
                   selection.newFolders.size > 0
-                    ? ` ${plural(selection.newFolders.size, 'folder')} not in Orion yet will be added as ${
+                    ? ` ${plural(selection.newFolders.size, 'folder')} not in Durango Code yet will be added as ${
                         selection.newFolders.size === 1 ? 'a project' : 'projects'
                       }.`
                     : ''

@@ -316,7 +316,7 @@ const createWebSocketTransport = (
       // The WebSocket error event carries no useful detail by design; `close`
       // follows with the code.
       if (!opened) {
-        abortSocket(new Error('Could not reach the Orion relay.'));
+        abortSocket(new Error('Could not reach the Durango Cloud relay.'));
       }
     });
 

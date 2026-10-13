@@ -53,7 +53,7 @@ const linkedTaskBody = (task: LinkedBoardTask, lines: string[]) => {
 };
 
 // Context block prepended to the first agent turn carrying a thread's linked
-// Orion board tasks, so the agent knows what cards it's working on and can read
+// Durango Tasks (formerly the Durango Code board), so the agent knows what cards it's working on and can read
 // local copies of every board attachment. A thread may link any number of
 // cards; they are all presented together as one body of work.
 export const buildLinkedTaskContext = (tasks: LinkedBoardTask[], hasUserMessage: boolean) => {
@@ -62,8 +62,8 @@ export const buildLinkedTaskContext = (tasks: LinkedBoardTask[], hasUserMessage:
   const noun = multiple ? 'tasks' : 'task';
   const pronoun = multiple ? 'them' : 'it';
   const lines = multiple
-    ? [`## Linked tasks from the Orion board`, `${tasks.length} board tasks are linked to this thread.`]
-    : ['## Linked task from the Orion board', `Title: ${tasks[0].title}`];
+    ? [`## Linked tasks from Durango Tasks`, `${tasks.length} tasks are linked to this thread.`]
+    : ['## Linked task from Durango Tasks', `Title: ${tasks[0].title}`];
   if (multiple) {
     tasks.forEach((task, index) => {
       lines.push('', `### Task ${index + 1}: ${task.title}`);
@@ -78,14 +78,14 @@ export const buildLinkedTaskContext = (tasks: LinkedBoardTask[], hasUserMessage:
   if (hasUserMessage) {
     lines.push(
       '',
-      `This thread is linked to the board ${noun} above; treat ${pronoun} as the goal of the work. The user message follows.`,
+      `This thread is linked to the ${noun} above; treat ${pronoun} as the goal of the work. The user message follows.`,
       '',
       '---'
     );
   } else {
     lines.push(
       '',
-      `This thread is linked to the board ${noun} above; treat ${pronoun} as the goal of the work and carry ${pronoun} out.`
+      `This thread is linked to the ${noun} above; treat ${pronoun} as the goal of the work and carry ${pronoun} out.`
     );
   }
   return lines.join('\n');
@@ -215,7 +215,7 @@ export const buildOrchestrationContext = (
     .join('; ');
   const lines = [
     '[Orion orchestration]',
-    'You are the Orion orchestrator (main driver). Delegate specialized work to the configured role models and integrate their results; see the "Orion Orchestration" section of CLAUDE.md / AGENTS.md for delegation mechanics.',
+    'You are the Durango Code orchestrator (main driver). Delegate specialized work to the configured role models and integrate their results; see the "Durango Code Orchestration" section of CLAUDE.md / AGENTS.md for delegation mechanics.',
     `Roles: ${roleSummary}.`,
     'Prefer the spawn_subagent tool when available; otherwise run the provider CLIs directly. Report progress and the integrated final result yourself.',
   ];
@@ -249,7 +249,7 @@ export const buildGeneralInstructionsContext = (generalInstructions: string) => 
   if (!trimmed) return '';
   return [
     '[Orion general instructions]',
-    'The user configured these standing instructions in Orion. They apply to every agent session run through Orion, alongside any project instructions:',
+    'The user configured these standing instructions in Durango Code. They apply to every agent session run through Durango Code, alongside any project instructions:',
     trimmed,
     '[/Orion general instructions]',
   ].join('\n');
@@ -308,7 +308,7 @@ export const parseModelMentions = (text: string, models: AgentModel[]): ModelMen
 export const buildModelMentionsContext = (mentions: ModelMention[]) =>
   [
     '[Model mentions]',
-    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it with the `spawn_subagent` tool from Orion\'s MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt. The task runs as a visible Orion subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list.',
+    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it with the `spawn_subagent` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt. The task runs as a visible Durango Code subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list.',
     ...mentions.map((mention) => `- @${mention.token} → ${mention.label} (${mention.modelId})`),
     '[/Model mentions]',
   ].join('\n');
@@ -389,7 +389,7 @@ export const buildThreadMentionsContext = (
 ) =>
   [
     '[Thread mentions]',
-    'The user referenced these Orion threads (separate agent conversations in this app) with @-mentions. Their transcripts are NOT included here. To see what happened in a mentioned thread, call the `read_thread` tool from Orion\'s MCP server (the fully-qualified name varies by provider, for example mcp__orion__read_thread, orion.read_thread, or a plugin-prefixed equivalent) with its thread_id. It returns thread metadata plus a page of messages — the newest page by default; browse earlier ones with offset/limit. Read a mentioned thread before making claims about what happened in it, and pull only the pages the task needs. To point the user at a thread in your reply, write `@thread:<thread_id>`; Orion renders it as a clickable link that opens the thread.',
+    'The user referenced these Durango Code threads (separate agent conversations in this app) with @-mentions. Their transcripts are NOT included here. To see what happened in a mentioned thread, call the `read_thread` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__read_thread, orion.read_thread, or a plugin-prefixed equivalent) with its thread_id. It returns thread metadata plus a page of messages — the newest page by default; browse earlier ones with offset/limit. Read a mentioned thread before making claims about what happened in it, and pull only the pages the task needs. To point the user at a thread in your reply, write `@thread:<thread_id>`; Durango Code renders it as a clickable link that opens the thread.',
     ...mentions.map(({ thread, token }) => {
       const projectName = projectNameById?.get(thread.projectId);
       const details = [

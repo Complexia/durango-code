@@ -307,10 +307,10 @@ const publicSource = (source) => ({
 
 const shareBlocker = (source) => {
   if (source.transport === 'sse' || source.transport === 'ws') {
-    return `${source.transport.toUpperCase()} servers can't be shared yet; add its streamable HTTP URL in Orion instead.`;
+    return `${source.transport.toUpperCase()} servers can't be shared yet; add its streamable HTTP URL in Durango Code instead.`;
   }
-  if (source.transport === 'unknown') return 'Orion does not recognize this server type.';
-  if (source.headersHelper) return 'It gets its headers from a helper script, which Orion cannot run.';
+  if (source.transport === 'unknown') return 'Durango Code does not recognize this server type.';
+  if (source.headersHelper) return 'It gets its headers from a helper script, which Durango Code cannot run.';
   return null;
 };
 
@@ -491,7 +491,7 @@ export const orionInputForSource = async (source, options = {}) => {
     if (missing.size) {
       return {
         ok: false,
-        error: `Claude Code fills in ${[...missing].map((name) => `$${name}`).join(', ')} from its environment, and ${missing.size === 1 ? 'it is' : 'they are'} not available to Orion's Claude process.`,
+        error: `Claude Code fills in ${[...missing].map((name) => `$${name}`).join(', ')} from its environment, and ${missing.size === 1 ? 'it is' : 'they are'} not available to Durango Code's Claude process.`,
       };
     }
     return { ok: true, input };
@@ -534,7 +534,7 @@ export const orionInputForSource = async (source, options = {}) => {
   if (missing.size) {
     return {
       ok: false,
-      error: `Codex reads ${[...missing].map((name) => `$${name}`).join(', ')} from your environment, and Orion could not find ${missing.size === 1 ? 'it' : 'them'} in your shell.`,
+      error: `Codex reads ${[...missing].map((name) => `$${name}`).join(', ')} from your environment, and Durango Code could not find ${missing.size === 1 ? 'it' : 'them'} in your shell.`,
     };
   }
   return { ok: true, input };
@@ -569,7 +569,7 @@ export const shareProviderMcp = (input = {}) =>
     signal.throwIfAborted();
     const group = groups.find((candidate) => candidate.sources.some((source) => source.id === input?.key));
     if (!group) return { ok: false, error: 'That MCP server is no longer configured.' };
-    if (group.orion) return { ok: false, error: `Already in Orion as @${group.orion.nickname}.` };
+    if (group.orion) return { ok: false, error: `Already in Durango Code as @${group.orion.nickname}.` };
     const source = group.sources.find((candidate) => !shareBlocker(candidate));
     if (!source) return { ok: false, error: group.shareBlockedReason ?? 'This server cannot be shared.' };
     const resolved = await orionInputForSource(source);
@@ -611,7 +611,7 @@ export const assertOpenCodeMcpNamesAvailable = async (servers, options = {}) => 
     const arg = extraArgs[index];
     if (arg === '--') break;
     if (arg === '--attach' || arg.startsWith('--attach=')) {
-      throw new Error('Orion MCPs cannot be loaded with OpenCode --attach. Remove that option to run locally with these connections.');
+      throw new Error('Durango Code MCPs cannot be loaded with OpenCode --attach. Remove that option to run locally with these connections.');
     }
     if (arg === '--dir' || arg.startsWith('--dir=')) {
       directory = arg === '--dir' ? extraArgs[++index] : arg.slice('--dir='.length);
@@ -647,11 +647,11 @@ export const assertOpenCodeMcpNamesAvailable = async (servers, options = {}) => 
   } catch {
     options.signal?.throwIfAborted();
     // CLI output/errors can include credentials. Do not expose them in IPC.
-    throw new Error('Could not check Orion MCP nicknames against the current OpenCode configuration. Try again before starting this turn.');
+    throw new Error('Could not check Durango Code MCP nicknames against the current OpenCode configuration. Try again before starting this turn.');
   }
   const collisions = servers.filter((server) => names.has(server.name));
   if (collisions.length > 0) {
-    throw new Error(`Orion MCP nicknames conflict with configured OpenCode servers: ${collisions.map((server) => `@${server.name}`).join(', ')}. Reconnect these Orion MCPs with different nicknames in Settings → Skills & MCPs.`);
+    throw new Error(`Durango Code MCP nicknames conflict with configured OpenCode servers: ${collisions.map((server) => `@${server.name}`).join(', ')}. Reconnect these Durango Code MCPs with different nicknames in Settings → Skills & MCPs.`);
   }
 };
 
@@ -675,7 +675,7 @@ export const withoutNativeMcps = (servers, sources, providerId, defaultCwd) => {
     const names = new Set(sources.map((source) => source.name));
     const collisions = remaining.filter((server) => names.has(server.name));
     if (collisions.length > 0) {
-      throw new Error(`Orion MCP nicknames conflict with configured Codex servers: ${collisions.map((server) => `@${server.name}`).join(', ')}. Reconnect these Orion MCPs with different nicknames in Settings → Skills & MCPs.`);
+      throw new Error(`Durango Code MCP nicknames conflict with configured Codex servers: ${collisions.map((server) => `@${server.name}`).join(', ')}. Reconnect these Durango Code MCPs with different nicknames in Settings → Skills & MCPs.`);
     }
   }
   return remaining;
@@ -726,7 +726,7 @@ export const withoutCodexNativeMcps = async (servers, options = {}) => {
     // A cached list or failed discovery cannot establish that names are safe.
     sources = await resolveProviderConnections(await readCodexMcpSources({ ...options, fresh: true }), options);
   } catch (error) {
-    throw new Error('Could not check Orion MCP nicknames against the current Codex configuration. Try again before starting this turn.', { cause: error });
+    throw new Error('Could not check Durango Code MCP nicknames against the current Codex configuration. Try again before starting this turn.', { cause: error });
   }
   return withoutNativeMcps(servers, sources, 'codex', options.cwd);
 };

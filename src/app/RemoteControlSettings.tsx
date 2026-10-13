@@ -160,13 +160,13 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
       const result = await window.orion?.remoteRelayDeregister?.();
       if (!mountedRef.current) return;
       if (result?.ok) {
-        setNotice('This machine was removed from your machine list at Orion Cloud.');
+        setNotice('This machine was removed from your machine list at Durango Cloud.');
       } else {
-        setError(result?.error ?? 'Could not remove this machine from Orion Cloud.');
+        setError(result?.error ?? 'Could not remove this machine from Durango Cloud.');
       }
     } catch (cause) {
       if (mountedRef.current) {
-        setError(remoteControlErrorMessage(cause, 'Could not remove this machine from Orion Cloud.'));
+        setError(remoteControlErrorMessage(cause, 'Could not remove this machine from Durango Cloud.'));
       }
     } finally {
       if (mountedRef.current) setBusyId(null);
@@ -253,9 +253,9 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
           <div className="setting-label">
             <div className="setting-label-title">Enable remote control</div>
             <div className="setting-label-desc">
-              Off by default. When enabled, this machine can drive the Orion instances it is
+              Off by default. When enabled, this machine can drive the Durango Code instances it is
               paired with — and devices you pair with a code generated here can drive this one.
-              Everything is end-to-end encrypted and requires your own Orion account on both ends;
+              Everything is end-to-end encrypted and requires your own Durango account on both ends;
               nothing can connect without a pairing code.
               {!authenticated && !settings.enabled && ' Sign in on the Account tab to enable.'}
             </div>
@@ -265,7 +265,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
             title={
               authenticated || settings.enabled
                 ? 'Enable remote control between your machines'
-                : 'Sign in to your Orion account first'
+                : 'Sign in to your Durango account first'
             }
           >
             <input
@@ -286,18 +286,18 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
           <div className="setting-label">
             <div className="setting-label-title">Connect over the internet</div>
             <div className="setting-label-desc">
-              On: Orion Cloud relays the encrypted connection, so your other machines and{' '}
-              <code>app.orioncode.xyz</code> can reach this machine from anywhere — no port
+              On: Durango Cloud relays the encrypted connection, so your other machines and{' '}
+              <code>app.durango.sh</code> can reach this machine from anywhere — no port
               forwarding. The relay cannot read your traffic.
               <br />
               Off: your own network only — same Wi-Fi or a VPN like Tailscale — and nothing
-              contacts Orion Cloud&apos;s relay. Turning this off keeps the machine in your web
+              contacts Durango Cloud&apos;s relay. Turning this off keeps the machine in your web
               machine list, shown as offline.
               {overInternet && settings.enabled && (
                 <>
                   {' '}
                   {relay?.online
-                    ? 'This machine is online at Orion Cloud right now.'
+                    ? 'This machine is online at Durango Cloud right now.'
                     : `This machine is not reachable over the internet right now${relay?.error ? `: ${relay.error}` : '.'}`}
                 </>
               )}
@@ -312,7 +312,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
             className="provider-toggle"
             title={
               overInternet
-                ? 'Go back to your own network only (the machine stays listed at Orion Cloud as offline)'
+                ? 'Go back to your own network only (the machine stays listed at Durango Cloud as offline)'
                 : 'Let your machines and the web app reach this machine from anywhere'
             }
           >
@@ -331,9 +331,9 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
         {settings.enabled && authenticated && (
           <div className="setting-row">
             <div className="setting-label">
-              <div className="setting-label-title">Remove from Orion Cloud</div>
+              <div className="setting-label-title">Remove from Durango Cloud</div>
               <div className="setting-label-desc">
-                Deletes this machine from your machine list at <code>app.orioncode.xyz</code> and
+                Deletes this machine from your machine list at <code>app.durango.sh</code> and
                 turns off the internet connection. Pairings are unaffected; enabling
                 “Connect over the internet” again re-registers it.
               </div>
@@ -342,7 +342,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
               type="button"
               className="btn secondary small"
               disabled={busyId === 'relay-deregister'}
-              title="Remove this machine from your Orion Cloud machine list"
+              title="Remove this machine from your Durango Cloud machine list"
               onClick={() => void handleRelayDeregister()}
             >
               <Trash2 size={13} />

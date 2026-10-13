@@ -195,7 +195,7 @@ try {
       codexPath: '/fake/codex',
       run: async () => ({ stdout: '{malformed', stderr: '' }),
     }),
-    /Could not apply Orion's MCP settings/
+    /Could not apply Durango Code's MCP settings/
   );
 
   const mainSource = await fs.readFile(new URL('../src/main.js', import.meta.url), 'utf-8');
