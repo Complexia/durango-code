@@ -13095,7 +13095,7 @@ const App: React.FC = () => {
         <div className="shell-sidebar-chrome">
           <div className="shell-brand">
             <img src={orionIconUrl} alt="Durango Code" className="shell-brand-logo" width={28} height={28} draggable={false} />
-            <span className="shell-brand-name">Durango Code</span>
+            <span className="shell-brand-name">Code</span>
           </div>
         </div>
 

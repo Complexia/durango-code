@@ -15,6 +15,7 @@
     "deploy": "node scripts/deploy.mjs",
     "test:release-runtime": "node scripts/test-release-runtime.mjs",
     "test:app-identity": "node --no-warnings scripts/test-app-identity.mjs",
+    "test:legacy-bundle-rename": "node --no-warnings scripts/test-legacy-bundle-rename.mjs",
     "update-rifts": "node scripts/update-rifts.mjs",
     "test:rift-storage": "node scripts/test-rift-storage.mjs",
     "test:rift-scrub": "node scripts/test-rift-scrub.mjs",
