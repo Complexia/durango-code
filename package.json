@@ -1,7 +1,7 @@
 {
   "name": "orion",
   "productName": "Durango Code",
-  "version": "1.0.147",
+  "version": "1.0.148",
   "description": "Durango Code - Agentic IDE",
   "main": ".vite/build/main.js",
   "private": true,
