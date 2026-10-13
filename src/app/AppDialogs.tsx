@@ -152,7 +152,7 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 Add project to “{addProjectEpic.name}”
               </h2>
               <p className="modal-subtitle">
-                Orion will create a Rift copy on this epic’s feature branch and add it to the shared workspace.
+                Durango Code will create a Rift copy on this epic’s feature branch and add it to the shared workspace.
               </p>
               <div className="modal-field">
                 <span className="modal-field-label">Project</span>
@@ -262,7 +262,7 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                       e.currentTarget.form?.requestSubmit();
                     }
                   }}
-                  placeholder="Leave empty and Orion writes one from the staged changes"
+                  placeholder="Leave empty and Durango Code writes one from the staged changes"
                   rows={5}
                   autoFocus
                 />
@@ -409,7 +409,7 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                       e.currentTarget.form?.requestSubmit();
                     }
                   }}
-                  placeholder="Leave empty and Orion writes them from the branch changes. Otherwise: first line is the title, the rest is the description."
+                  placeholder="Leave empty and Durango Code writes them from the branch changes. Otherwise: first line is the title, the rest is the description."
                   rows={6}
                 />
               </label>
@@ -560,7 +560,7 @@ const AppDialogs = React.memo(function AppDialogs({ model }: { model: AppDialogs
                 />
                 <span>
                   Empty Rift's trash afterwards. Without this the space is not actually reclaimed — but emptying it is
-                  permanent and covers every repository on this machine, not just Orion's.
+                  permanent and covers every repository on this machine, not just Durango Code's.
                 </span>
               </label>
             )}

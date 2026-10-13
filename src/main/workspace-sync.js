@@ -13,17 +13,29 @@ const execFileAsync = promisify(execFile);
 
 // Workspace sync engine (contract: orion-web/docs/workspace-sync.md). Mirrors
 // the local workspace — projects, epics, threads with full transcripts, token
-// usage, and (optionally) code as Orion Cloud repos — to Orion Web.
+// usage, and (optionally) code as Durango Cloud repos — to Durango Code web.
+// The user-facing name is "Share coding work with Durango": Durango Code web
+// generates the work digests that Durango Chat's memory uses from each
+// completed thread sync, so a finished turn should reach it promptly.
 //
-// Everything here is gated twice: the opt-in setting (disabled by default,
-// pushed from the renderer over sync:configure) AND a signed-in account. While
-// either is missing the engine is inert — no timers, no network, no capture —
-// so users who keep the setting off are entirely unaffected. All work happens
-// on debounced timers in this process; failures land in the status broadcast,
-// never in the agent-run path.
+// Everything here is gated twice: the setting (on by default since the
+// Durango merge — see app/workspaceSyncConsent.ts — pushed from the renderer
+// over sync:configure) AND a signed-in account. While either is missing the
+// engine is inert — no timers, no network, no capture — so users who turn
+// sharing off are entirely unaffected. All work happens on debounced timers
+// in this process; failures land in the status broadcast, never in the
+// agent-run path.
+//
+// Timing: every threads/store save calls notifyWorkspaceChanged(). The pass
+// runs SYNC_DEBOUNCE_MS (15 s) after the last save, so a thread that just
+// finished its turn (its final save is the turn-end write) syncs ~15 s later
+// — prompt enough for digests, while a streaming turn's many saves coalesce
+// into one pass. SYNC_MAX_WAIT_MS caps the debounce: another thread streaming
+// continuously cannot postpone a finished thread's sync for longer than 60 s.
 
 const THREAD_SYNC_BATCH = 50;
 const SYNC_DEBOUNCE_MS = 15_000;
+const SYNC_MAX_WAIT_MS = 60_000;
 const CODE_POLL_MS = 60_000;
 const MIN_SYNC_GAP_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -49,6 +61,8 @@ let codePollTimer = null;
 let syncInFlight = null;
 let syncQueuedOptions = null;
 let scheduledSyncOptions = null;
+// When the currently pending (debounced) pass was first requested.
+let scheduledSyncFirstRequestedAt = 0;
 let syncGeneration = 0;
 let activeSyncController = null;
 let lastSyncStartedAt = 0;
@@ -740,7 +754,7 @@ const syncCode = async (
       if (await usesOrionOrigin(gitRoot)) {
         if (pushedBranchStates.get(gitRoot) === branchState) continue;
         if (typeof deps.pushOrionSourceControl !== 'function') {
-          throw new Error('This Orion build cannot authenticate the repository origin.');
+          throw new Error('This Durango Code build cannot authenticate the repository origin.');
         }
         await deps.pushOrionSourceControl({ gitRoot, token, signal });
         ensureCurrentSync(generation, signal);
@@ -922,9 +936,14 @@ const scheduleSync = (delayMs = SYNC_DEBOUNCE_MS, options) => {
   if (options) {
     scheduledSyncOptions = { ...(scheduledSyncOptions ?? {}), ...options };
   }
+  const now = Date.now();
   if (syncTimer) clearTimeout(syncTimer);
-  const sinceLast = Date.now() - lastSyncStartedAt;
-  const delay = Math.max(delayMs, MIN_SYNC_GAP_MS - sinceLast);
+  else scheduledSyncFirstRequestedAt = now;
+  const sinceLast = now - lastSyncStartedAt;
+  // Trailing debounce, bounded: never push a pending pass past
+  // SYNC_MAX_WAIT_MS after it was first requested.
+  const untilMaxWait = Math.max(0, scheduledSyncFirstRequestedAt + SYNC_MAX_WAIT_MS - now);
+  const delay = Math.max(Math.min(delayMs, untilMaxWait), MIN_SYNC_GAP_MS - sinceLast);
   syncTimer = setTimeout(() => {
     syncTimer = null;
     const nextOptions = scheduledSyncOptions;

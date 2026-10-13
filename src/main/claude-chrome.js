@@ -10,8 +10,8 @@
 export const CLAUDE_CHROME_TOOL_PREFIX = 'mcp__claude-in-chrome__';
 
 export const CLAUDE_CHROME_BROWSER_TIPS = [
-  '# Claude in Chrome (Orion)',
-  'Other Orion threads may share this Chrome. Orion holds a browser call while another thread is using Chrome, so a call can take longer to start.',
+  '# Claude in Chrome (Durango Code)',
+  'Other Durango Code threads may share this Chrome. Durango Code holds a browser call while another thread is using Chrome, so a call can take longer to start.',
   '- "Couldn\'t determine which page this action targets" means the action did not run. Call tabs_context_mcp, then repeat the identical call once. Do not open or close tabs to recover.',
   '- Never close the last tab in your tab group while recovering; closing it loses the group. Navigate an existing tab instead.',
   '- Never type more than a few hundred characters with computer type: per-key input can freeze the page. Set editor or field contents with javascript_tool (for example through the editor\'s own API or its React change handler) and verify the length afterwards.',
@@ -151,7 +151,7 @@ export const claudeChromeLeaseHooks = (session, { emitActivity } = {}) => {
           key,
           type: 'tool',
           title: 'Waiting for Chrome',
-          detail: 'Another Orion thread is using Chrome. This browser call starts when it is done.',
+          detail: 'Another Durango Code thread is using Chrome. This browser call starts when it is done.',
           status: 'running',
         });
       },
@@ -163,8 +163,8 @@ export const claudeChromeLeaseHooks = (session, { emitActivity } = {}) => {
         type: 'tool',
         title: result.timedOut ? 'Chrome still busy' : 'Waited for Chrome',
         detail: result.timedOut
-          ? `Another Orion thread kept using Chrome for ${seconds}s. Proceeding anyway.`
-          : `Another Orion thread was using Chrome; waited ${seconds}s.`,
+          ? `Another Durango Code thread kept using Chrome for ${seconds}s. Proceeding anyway.`
+          : `Another Durango Code thread was using Chrome; waited ${seconds}s.`,
         status: 'done',
       });
     }
@@ -173,7 +173,7 @@ export const claudeChromeLeaseHooks = (session, { emitActivity } = {}) => {
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
-          additionalContext: `Another Orion thread has been using this Chrome for over ${seconds}s and is still active. Browser calls may be slow or be refused with "Couldn't determine which page this action targets"; retry the identical call once after tabs_context_mcp, and keep to your own tab group.`,
+          additionalContext: `Another Durango Code thread has been using this Chrome for over ${seconds}s and is still active. Browser calls may be slow or be refused with "Couldn't determine which page this action targets"; retry the identical call once after tabs_context_mcp, and keep to your own tab group.`,
         },
       };
     }
@@ -181,7 +181,7 @@ export const claudeChromeLeaseHooks = (session, { emitActivity } = {}) => {
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
-          additionalContext: `Orion held this call for ${seconds}s while another Orion thread used Chrome. The browser may have changed focus; take a fresh screenshot before relying on earlier coordinates.`,
+          additionalContext: `Durango Code held this call for ${seconds}s while another Durango Code thread used Chrome. The browser may have changed focus; take a fresh screenshot before relying on earlier coordinates.`,
         },
       };
     }

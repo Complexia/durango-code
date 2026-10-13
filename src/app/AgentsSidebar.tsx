@@ -776,7 +776,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                                     : runningAgentEpicIds.has(epic.id)
                                       ? 'Wait for this epic’s agents to finish before adding a project'
                                       : !hasProjectAvailable
-                                        ? 'Every Orion project is already part of this epic'
+                                        ? 'Every Durango Code project is already part of this epic'
                                         : undefined
                                 }
                                 onClick={() => {

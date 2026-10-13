@@ -10,6 +10,12 @@ import { fileURLToPath } from 'node:url';
 import { relaunchWithPinnedNode, verifyReleaseRuntime } from './check-release-runtime.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+// Customer-facing product and bundle name (forge packagerConfig.name). R2
+// keys, the bucket, and the manifest shape stay as before so orion-next's
+// /api/download and /api/update routes keep reading releases/latest.json.
+const productName = 'Durango Code';
+const artifactBaseName = 'Durango-Code';
+const macAppBundleName = `${productName}.app`;
 
 relaunchWithPinnedNode({ rootDir });
 
@@ -27,7 +33,7 @@ verifyReleaseRuntime({
 });
 
 if (args.checkRuntime) {
-  console.log(`Orion release runtime ready: Node.js ${process.versions.node} (ABI ${process.versions.modules})`);
+  console.log(`${productName} release runtime ready: Node.js ${process.versions.node} (ABI ${process.versions.modules})`);
   process.exit(0);
 }
 
@@ -60,13 +66,13 @@ if (version !== currentVersion) {
   packageJson.version = version;
   await writeJson(packagePath, packageJson);
   await updatePackageLockVersion(version);
-  console.log(`Bumped Orion from ${currentVersion} to ${version}`);
+  console.log(`Bumped ${productName} from ${currentVersion} to ${version}`);
 } else if (args.resumeNotaryId) {
-  console.log(`Resuming Orion ${version} notarization submission ${args.resumeNotaryId}`);
+  console.log(`Resuming ${productName} ${version} notarization submission ${args.resumeNotaryId}`);
 } else if (args.resumeUpload) {
-  console.log(`Resuming Orion ${version} artifact upload`);
+  console.log(`Resuming ${productName} ${version} artifact upload`);
 } else {
-  console.log(`Building Orion ${version}`);
+  console.log(`Building ${productName} ${version}`);
 }
 
 if (!args.resumeNotaryId && !args.resumeUpload) {
@@ -108,7 +114,7 @@ const artifacts = [];
 for (const artifactPath of artifactPaths) {
   const ext = path.extname(artifactPath);
   const kind = artifactKindFor(osName, ext);
-  const fileName = `Orion-${version}-${osName}-${arch}${ext}`;
+  const fileName = `${artifactBaseName}-${version}-${osName}-${arch}${ext}`;
   const key = `releases/v${version}/${osName}/${arch}/${fileName}`;
   const stat = await fs.stat(artifactPath);
   const sha256 = await sha256File(artifactPath);
@@ -179,7 +185,7 @@ for (const artifact of artifacts) {
 }
 
 const manifest = {
-  product: 'Orion',
+  product: productName,
   version,
   channel: 'stable',
   releasedAt,
@@ -194,7 +200,7 @@ const manifest = {
 await uploadJson(client, config.bucket, `releases/v${version}/manifest.json`, manifest, 'public, max-age=31536000, immutable');
 await uploadJson(client, config.bucket, 'releases/latest.json', manifest, 'no-store');
 
-console.log(`Published Orion ${version}`);
+console.log(`Published ${productName} ${version}`);
 console.log('Latest manifest: releases/latest.json');
 
 function parseArgs(argv) {
@@ -273,7 +279,7 @@ async function assessMacApp(appPath) {
 }
 
 async function findMacApp(arch) {
-  const preferred = path.join(rootDir, 'out', `Orion-darwin-${arch}`, 'Orion.app');
+  const preferred = path.join(rootDir, 'out', `${productName}-darwin-${arch}`, macAppBundleName);
   try {
     const stat = await fs.stat(preferred);
     if (stat.isDirectory()) return preferred;
@@ -282,11 +288,11 @@ async function findMacApp(arch) {
   }
 
   const appPaths = (await walk(path.join(rootDir, 'out')))
-    .filter((entry) => entry.endsWith(`${path.sep}Orion.app${path.sep}Contents${path.sep}Info.plist`))
+    .filter((entry) => entry.endsWith(`${path.sep}${macAppBundleName}${path.sep}Contents${path.sep}Info.plist`))
     .map((entry) => entry.slice(0, -`${path.sep}Contents${path.sep}Info.plist`.length));
 
   if (appPaths.length === 0) {
-    throw new Error('Unable to find packaged Orion.app for signing verification');
+    throw new Error(`Unable to find packaged ${macAppBundleName} for signing verification`);
   }
 
   return appPaths.sort()[0];
@@ -354,7 +360,7 @@ async function stapleMacApp(appPath, zipPaths, keychainProfile, resumeNotaryId) 
   if (tryRun('xcrun', ['stapler', 'staple', appPath])) return;
 
   if (resumeNotaryId || zipPaths.length === 0) {
-    throw new Error('Could not staple notarization ticket to Orion.app');
+    throw new Error(`Could not staple notarization ticket to ${macAppBundleName}`);
   }
 
   const zipPath = zipPaths[0];
@@ -423,7 +429,7 @@ function verifyArtifactVersions(artifactPaths, version) {
   const mismatches = artifactPaths.filter((artifactPath) => !versionPattern.test(path.basename(artifactPath)));
   if (mismatches.length > 0) {
     throw new Error(
-      `Cannot resume Orion ${version}: artifact version does not match: ${mismatches.map((entry) => path.basename(entry)).join(', ')}`,
+      `Cannot resume ${productName} ${version}: artifact version does not match: ${mismatches.map((entry) => path.basename(entry)).join(', ')}`,
     );
   }
 }

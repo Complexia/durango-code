@@ -1,6 +1,6 @@
-# Orion
+# Durango Code desktop (Orion)
 
-**Orion** is a lightweight Agentic IDE desktop application.
+**Durango Code** (internal name: Orion) is a lightweight Agentic IDE desktop application. The rebrand only changes customer-facing names; see [docs/durango-rebrand.md](docs/durango-rebrand.md) for what intentionally still says Orion.
 
 ## Features
 
@@ -18,14 +18,14 @@
 - Save files (Cmd/Ctrl+S)
 - Close tabs (Cmd/Ctrl+W)
 
-### Orion Cloud repositories
-- Publish any git project to Orion Cloud and push/pull from the shell bar
-- Browse and edit the code on Orion Web (Monaco); web edits are real git commits you pull back
+### Durango Cloud repositories
+- Publish any git project to Durango Cloud and push/pull from the shell bar
+- Browse and edit the code on Durango Code web (Monaco); web edits are real git commits you pull back
 - See [docs/orion-cloud-repos.md](docs/orion-cloud-repos.md)
 
 ### Remote control
-- Pair two Orion instances and drive one from the other's sidebar (Machines section)
-- End-to-end encrypted connection, either direct over LAN/VPN or through Orion Cloud's internet relay; both machines must be signed in to the same account
+- Pair two Durango Code instances and drive one from the other's sidebar (Machines section)
+- End-to-end encrypted connection, either direct over LAN/VPN or through Durango Cloud's internet relay; both machines must be signed in to the same account
 - See [docs/remote-control.md](docs/remote-control.md)
 
 ### Architecture
@@ -41,9 +41,9 @@ npm install
 npm run start
 ```
 
-Desktop login targets the Orion Web origin: development (`npm run start`)
+Desktop login targets the Durango Code web origin: development (`npm run start`)
 defaults to `http://localhost:3000`, packaged builds default to
-`https://orioncode.xyz`. Set `ORION_WEB_URL` to override either (the origin
+`https://code.durango.sh` (`orioncode.xyz` remains a legacy alias of the same service). Set `ORION_WEB_URL` to override either (the origin
 must have Clerk and the desktop auth routes configured).
 
 ## Build

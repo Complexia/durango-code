@@ -80,7 +80,7 @@ export class CodexAppServerClient extends EventEmitter {
       return true;
     }
     try {
-      this.socket.close(1000, 'Orion run ended');
+      this.socket.close(1000, 'Durango Code run ended');
     } catch {
       try {
         this.abortTransport();

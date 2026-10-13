@@ -148,13 +148,13 @@ export const readThreadForAgent = async (args = {}) => {
   try {
     threads = (await readThreadsIndex()).entries;
   } catch {
-    return 'Orion could not read the stored thread index.';
+    return 'Durango Code could not read the stored thread index.';
   }
-  if (threads.length === 0) return 'No Orion threads are stored yet.';
+  if (threads.length === 0) return 'No Durango Code threads are stored yet.';
 
   const matches = matchThreads(threads, rawId);
   if (matches.length === 0) {
-    return `No Orion thread matches thread_id "${rawId}". Use the exact id from the [Thread mentions] block.`;
+    return `No Durango Code thread matches thread_id "${rawId}". Use the exact id from the [Thread mentions] block.`;
   }
   if (matches.length > 1) {
     const listing = matches
@@ -168,9 +168,9 @@ export const readThreadForAgent = async (args = {}) => {
   try {
     thread = await readThreadById(matches[0].id);
   } catch {
-    return `Orion could not read thread "${matches[0].id}".`;
+    return `Durango Code could not read thread "${matches[0].id}".`;
   }
-  if (!thread) return `Orion thread "${matches[0].id}" is no longer stored.`;
+  if (!thread) return `Durango Code thread "${matches[0].id}" is no longer stored.`;
   const storeState = (await readJson(getStorageFilePath()))?.state;
   const project = Array.isArray(storeState?.projects)
     ? storeState.projects.find((candidate) => candidate?.id === thread.projectId)
@@ -187,7 +187,7 @@ export const readThreadForAgent = async (args = {}) => {
     : Math.max(0, total - limit);
 
   const header = [
-    `# Orion thread "${thread.title}"`,
+    `# Durango Code thread "${thread.title}"`,
     `thread_id: ${thread.id}`,
     `link: @thread:${thread.id} (write this in your reply to give the user a clickable link to the thread)`,
     `status: ${thread.status}; model: ${thread.modelId}; created: ${thread.createdAt}`,

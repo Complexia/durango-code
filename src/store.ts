@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware';
 import { claudeModelSuccessors } from './agentCatalog';
 import { createThreadBranchFamily } from './thread-branching';
+import { defaultWorkspaceSyncConsentSettings, migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent';
 
 export type Project = {
   id: string;
@@ -273,25 +274,79 @@ export const defaultRiftsSettings: RiftsSettings = {
 };
 
 /**
- * Opt-in workspace sync to Orion Web (docs in orion-web/docs/workspace-sync.md):
- * projects, epics, threads (full transcripts), token usage, and — when
- * syncCode is on — code as Orion Cloud repos with full git history. Disabled
- * by default; while disabled (or signed out) the desktop makes no sync calls
- * of any kind and captures nothing extra.
+ * Work sharing ("Share coding work with Durango") — workspace sync to Durango
+ * Code web (docs in orion-web/docs/workspace-sync.md): projects, epics,
+ * threads (full transcripts), token usage, and — when syncCode is on — code
+ * as Durango Cloud repos with full git history. Durango Chat builds its
+ * memory from summaries of the synced threads. On by default since the
+ * Durango merge (consentVersion 1, see app/workspaceSyncConsent.ts); while
+ * off (or signed out) the desktop makes no sync calls of any kind and
+ * captures nothing extra.
  */
 export type WorkspaceSyncSettings = {
-  /** Master switch; requires a signed-in Orion account to take effect. */
+  /** Master switch; requires a signed-in Durango account to take effect. */
   enabled: boolean;
   /**
    * Auto-publish git projects and auto-push branch save points (commits).
    * Dirty working-tree files are never uploaded by workspace sync.
    */
   syncCode: boolean;
+  /** Consent policy these settings were reconciled with (1 = default Full). */
+  consentVersion: number;
+  /** The one-time "your coding work now syncs" notice was acknowledged. */
+  consentNoticeSeen: boolean;
 };
 
 export const defaultWorkspaceSyncSettings: WorkspaceSyncSettings = {
+  ...defaultWorkspaceSyncConsentSettings,
+};
+
+/** Durango (durango.sh) integration preferences. */
+export type DurangoSettings = {
+  /**
+   * Add a compact "[Durango memory]" block (what Durango remembers about the
+   * user) to the agent instructions when a thread starts. Off by default:
+   * memory is otherwise pull-based through the recall_memory tool.
+   */
+  includeProfileMemory: boolean;
+  /**
+   * Linked tasks come from Durango Tasks (durango.sh/tasks). Off switches the
+   * task picker back to the legacy Durango Code web board (rollback; the
+   * DURANGO_TASKS=0 env var does the same).
+   */
+  useDurangoTasks: boolean;
+  /** "Allow Durango Chat to start agents on this Mac" (main: durango-dispatch.js). */
+  dispatch: DurangoDispatchSettings;
+};
+
+export type DurangoDispatchSettings = {
+  /** Off by default. Requires a signed-in Durango account. */
+  enabled: boolean;
+  /** Projects dispatched agents may run in; null = all projects. */
+  allowedProjectIds: string[] | null;
+  /**
+   * Access for dispatched runs, and the ceiling: a run never gets more even
+   * if Durango Chat asks for it. Read only by default.
+   */
+  accessMode: Thread['accessMode'];
+  /** Model for dispatched runs when Durango Chat names none; null = the project's usual model. */
+  modelId: string | null;
+  /** Dispatched runs at a time on this Mac. */
+  maxConcurrent: 1 | 2;
+};
+
+export const defaultDurangoDispatchSettings: DurangoDispatchSettings = {
   enabled: false,
-  syncCode: true,
+  allowedProjectIds: null,
+  accessMode: 'read-only',
+  modelId: null,
+  maxConcurrent: 1,
+};
+
+export const defaultDurangoSettings: DurangoSettings = {
+  includeProfileMemory: false,
+  useDurangoTasks: true,
+  dispatch: defaultDurangoDispatchSettings,
 };
 
 /**
@@ -645,6 +700,17 @@ export type Thread = {
   btwExchanges?: BtwExchange[];
   /** Kanban cards on the Orion web board driving/driven by this thread, in link order. */
   linkedTasks?: LinkedBoardTask[];
+  /**
+   * Set when Durango Chat started this thread (Phase 5 dispatch). The
+   * outcome is reported back to the chat once the first run settles.
+   */
+  durangoDispatch?: {
+    id: string;
+    sourceUrl: string | null;
+    startedAt: string;
+    /** Set once the outcome went back to Durango Chat. */
+    reportedAt?: string;
+  };
   /** Codex goal (/goal) this thread is pursuing, if any. Null after /goal clear. */
   goal?: ThreadGoal | null;
   /** Sidebar epic this thread belongs to, if any. */
@@ -832,6 +898,7 @@ interface OrionState {
   epicsSettings: EpicsSettings;
   riftsSettings: RiftsSettings;
   workspaceSyncSettings: WorkspaceSyncSettings;
+  durangoSettings: DurangoSettings;
   remoteControlSettings: RemoteControlSettings;
   deploymentSettings: DeploymentSettings;
   suggestedTasksSettings: SuggestedTasksSettings;
@@ -887,6 +954,7 @@ interface OrionState {
   setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
   setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
+  setDurangoSettings: (updates: Partial<DurangoSettings>) => void;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
   setSuggestedTasksSettings: (updates: Partial<SuggestedTasksSettings>) => void;
@@ -1479,6 +1547,7 @@ export const useOrionStore = create<OrionState>()(
       epicsSettings: defaultEpicsSettings,
       riftsSettings: defaultRiftsSettings,
       workspaceSyncSettings: defaultWorkspaceSyncSettings,
+      durangoSettings: defaultDurangoSettings,
       remoteControlSettings: defaultRemoteControlSettings,
       deploymentSettings: defaultDeploymentSettings,
       suggestedTasksSettings: defaultSuggestedTasksSettings,
@@ -1894,6 +1963,15 @@ export const useOrionStore = create<OrionState>()(
           workspaceSyncSettings: {
             ...defaultWorkspaceSyncSettings,
             ...state.workspaceSyncSettings,
+            ...updates,
+          },
+        })),
+
+      setDurangoSettings: (updates) =>
+        set((state) => ({
+          durangoSettings: {
+            ...defaultDurangoSettings,
+            ...state.durangoSettings,
             ...updates,
           },
         })),
@@ -2547,6 +2625,10 @@ export const useOrionStore = create<OrionState>()(
           ...defaultWorkspaceSyncSettings,
           ...state.workspaceSyncSettings,
         },
+        durangoSettings: {
+          ...defaultDurangoSettings,
+          ...state.durangoSettings,
+        },
         remoteControlSettings: {
           ...defaultRemoteControlSettings,
           ...state.remoteControlSettings,
@@ -2597,6 +2679,20 @@ export const useOrionStore = create<OrionState>()(
         merged.deploymentSettings = {
           ...defaultDeploymentSettings,
           ...merged.deploymentSettings,
+        };
+        // Durango merge: work sharing defaults to Full. Pre-Durango stores
+        // (no consentVersion) move to enabled once and show a one-time
+        // notice; a later "off" sticks (workspaceSyncConsent.ts).
+        merged.workspaceSyncSettings = migrateWorkspaceSyncSettings(
+          (persisted as Partial<OrionState> | undefined)?.workspaceSyncSettings
+        );
+        merged.durangoSettings = {
+          ...defaultDurangoSettings,
+          ...merged.durangoSettings,
+          dispatch: {
+            ...defaultDurangoDispatchSettings,
+            ...merged.durangoSettings?.dispatch,
+          },
         };
         // The commit/PR message model used to live on epicsSettings; it now
         // also writes thread titles, so it moved to textGenerationSettings.

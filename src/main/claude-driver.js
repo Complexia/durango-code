@@ -8,6 +8,15 @@ import { emitAgentEvent } from './events.js';
 import { captureGitChangeSnapshot, summarizeChangedFiles } from './git-utils.js';
 import { requestSubagentSpawn, requestSubagentStop } from './mcp-bridge.js';
 import { READ_THREAD_DEFAULT_LIMIT, READ_THREAD_MAX_LIMIT, readThreadForAgent } from './thread-reader.js';
+import {
+  DURANGO_TOOL_DESCRIPTIONS,
+  READ_CHAT_DEFAULT_LIMIT,
+  READ_CHAT_MAX_LIMIT,
+  SEARCH_CHATS_DEFAULT_LIMIT,
+  SEARCH_CHATS_MAX_LIMIT,
+  runDurangoTool,
+} from './durango-tools.js';
+import { orionBuiltinToolNamesForAccessMode } from './thread-reader-routing.js';
 import { claudeEffortForCli, claudeModelArgForContextWindow, defaultClaudeContextWindow, defaultClaudeReasoningEffort, parseExtraArgs } from './models.js';
 import { finalizingAgentRuns, startingAgentRuns } from './run-registry.js';
 import { execFileAsync, resolveCommandPath } from './shell-env.js';
@@ -99,7 +108,7 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
     tools: [
       tool(
         'spawn_subagent',
-        'Spawn an Orion subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation).',
+        'Spawn a Durango Code subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation).',
         {
           model: z.string().describe('Target model: model id (e.g. "codex:gpt-5.6-sol"), slug, or label'),
           prompt: z
@@ -155,7 +164,7 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       ),
       tool(
         'stop_subagent',
-        'Stop a running Orion subagent that was started with spawn_subagent. Identify it by model and/or title; the selector must match exactly one running subagent unless `all` is true, which stops every match. With no arguments, stops the single running subagent. Use when the user asks to cancel a delegation or when abandoning a stalled subagent in favor of another. Returns a description of what was stopped, or the list of running subagents when the selector was ambiguous or matched nothing.',
+        'Stop a running Durango Code subagent that was started with spawn_subagent. Identify it by model and/or title; the selector must match exactly one running subagent unless `all` is true, which stops every match. With no arguments, stops the single running subagent. Use when the user asks to cancel a delegation or when abandoning a stalled subagent in favor of another. Returns a description of what was stopped, or the list of running subagents when the selector was ambiguous or matched nothing.',
         {
           model: z
             .string()
@@ -197,7 +206,7 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       ),
       tool(
         'read_thread',
-        'Read the transcript of another Orion thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Orion work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit.',
+        'Read the transcript of another Durango Code thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Durango Code work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit.',
         {
           thread_id: z
             .string()
@@ -226,8 +235,71 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
           annotations: { readOnlyHint: true },
         }
       ),
+      // Durango Chat tools (durango-tools.js). Mirrored in mcp-bridge-shim.cjs
+      // for the other providers; test-durango-tools.mjs keeps them in sync.
+      tool(
+        'search_chats',
+        DURANGO_TOOL_DESCRIPTIONS.search_chats,
+        {
+          query: z.string().describe('Keywords to search chat titles and content'),
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(SEARCH_CHATS_MAX_LIMIT)
+            .optional()
+            .describe(`Maximum number of chats to return (default ${SEARCH_CHATS_DEFAULT_LIMIT})`),
+        },
+        async (args) => durangoToolResult(await runDurangoTool('search_chats', args, session)),
+        { annotations: { readOnlyHint: true } }
+      ),
+      tool(
+        'read_chat',
+        DURANGO_TOOL_DESCRIPTIONS.read_chat,
+        {
+          chatId: z
+            .string()
+            .describe('Durango chat id — from the [Durango chat mentions] block, an @chat token, or search_chats'),
+          cursor: z
+            .string()
+            .optional()
+            .describe('Paging cursor returned by a previous read_chat call; omit for the newest messages'),
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(READ_CHAT_MAX_LIMIT)
+            .optional()
+            .describe(`Maximum number of messages to return (default ${READ_CHAT_DEFAULT_LIMIT})`),
+        },
+        async (args) => durangoToolResult(await runDurangoTool('read_chat', args, session)),
+        { annotations: { readOnlyHint: true } }
+      ),
+      tool(
+        'recall_memory',
+        DURANGO_TOOL_DESCRIPTIONS.recall_memory,
+        {
+          query: z.string().describe('What to recall, e.g. "deployment preferences for futuremail"'),
+        },
+        async (args) => durangoToolResult(await runDurangoTool('recall_memory', args, session)),
+        { annotations: { readOnlyHint: true } }
+      ),
+      tool(
+        'remember',
+        DURANGO_TOOL_DESCRIPTIONS.remember,
+        {
+          fact: z.string().describe('One short, self-contained fact, e.g. "Prefers bun over npm."'),
+        },
+        // Writes a pending memory candidate on Durango; refused in Read only.
+        async (args) => durangoToolResult(await runDurangoTool('remember', args, session))
+      ),
     ],
   });
+
+const durangoToolResult = ({ ok, text }) => ({
+  content: [{ type: 'text', text }],
+  ...(ok ? {} : { isError: true }),
+});
 
 // Legacy extra-flags string ("--foo bar --baz") -> SDK extraArgs map.
 export const claudeExtraArgsMap = (extraArgsString) => {
@@ -1446,9 +1518,9 @@ export const createClaudeSdkSession = ({
         : [
             ...new Set([
               ...sdkOptions.allowedTools,
-              'mcp__orion__spawn_subagent',
-              'mcp__orion__stop_subagent',
-              'mcp__orion__read_thread',
+              ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode).map(
+                (name) => `mcp__orion__${name}`
+              ),
             ]),
           ];
     session.query = sdk.query({
@@ -1807,7 +1879,7 @@ export const discardClaudeBackgroundShellTasks = async (runId) => {
   if (session.activeTurns.length > 0) {
     return {
       ok: false,
-      error: 'Claude has resumed foreground work, so Orion left its background tasks alone.',
+      error: 'Claude has resumed foreground work, so Durango Code left its background tasks alone.',
     };
   }
   const shellTasks = discardableClaudeBackgroundShellTasks(session);
@@ -1817,7 +1889,7 @@ export const discardClaudeBackgroundShellTasks = async (runId) => {
     }
     return {
       ok: false,
-      error: 'Claude is now waiting on non-shell work, so Orion did not discard it.',
+      error: 'Claude is now waiting on non-shell work, so Durango Code did not discard it.',
     };
   }
 

@@ -6027,6 +6027,11 @@ body {
   white-space: nowrap;
 }
 
+/* Durango chat rows: keep the chat title readable next to its long snippet. */
+.mention-row.chat-mention-row {
+  grid-template-columns: 24px fit-content(55%) minmax(0, 1fr);
+}
+
 /* Slash-command menu: argument hint rendered dimmed after the command name. */
 .slash-row-hint {
   opacity: 0.55;
@@ -7072,6 +7077,23 @@ body {
 .task-picker-refresh:hover {
   background: var(--bg-elevated);
   color: var(--text-primary);
+}
+
+.task-picker-refresh + .task-picker-refresh {
+  margin-left: 0;
+}
+
+.task-picker-inline-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.task-picker-inline-link:hover {
+  text-decoration: underline;
 }
 
 .task-picker-search {

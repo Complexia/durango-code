@@ -72,13 +72,13 @@ export const SidebarFooter = React.memo(function SidebarFooter({
         type="button"
         className={`sidebar-account-button ${accountState.authenticated ? 'signed-in' : ''}`}
         onClick={accountState.authenticated ? onOpenAccount : onStartAccountAuth}
-        title={accountState.authenticated ? accountName : 'Sign in to Orion'}
+        title={accountState.authenticated ? accountName : 'Sign in to your Durango account'}
         disabled={accountLoading || accountBusy}
       >
         {accountState.authenticated && accountState.user?.imageUrl ? (
           <img src={accountState.user.imageUrl} alt="" />
         ) : accountState.authenticated ? (
-          <span>{accountInitials || 'O'}</span>
+          <span>{accountInitials || 'D'}</span>
         ) : (
           <LogIn size={16} />
         )}

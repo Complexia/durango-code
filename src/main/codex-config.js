@@ -174,7 +174,7 @@ export const codexBrowserEnvironmentNote = (providerOptions, accessMode) => {
   }
   if (mode === 'mcp') {
     if (providerOptions?.browserAutoConnect === false) {
-      return `[Environment note: Orion configured a dedicated browser for this session. For browser tasks, discover and use the chrome_devtools MCP tools available in this session. They run in a dedicated browser profile, so signed-in Chrome tabs, logins, and cookies are unavailable. Browser verification does not require a separate Chrome skill.]\n\n`;
+      return `[Environment note: Durango Code configured a dedicated browser for this session. For browser tasks, discover and use the chrome_devtools MCP tools available in this session. They run in a dedicated browser profile, so signed-in Chrome tabs, logins, and cookies are unavailable. Browser verification does not require a separate Chrome skill.]\n\n`;
     }
     return `[Environment note: for browser tasks, discover and use the chrome_devtools MCP tools available in this session; they attach to the user's real signed-in Chrome, so treat open tabs and logins with care and do not close tabs you did not open. If those tools report "Could not connect to Chrome", tell the user to open chrome://inspect/#remote-debugging in Chrome, turn the remote debugging toggle on, quit and reopen Chrome (the server only starts on launch), and retry — do not attempt workarounds.]\n\n`;
   }

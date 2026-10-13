@@ -22,7 +22,7 @@ const VideoPreview = ({ src, name }: { src: string; name: string }) => {
     <div className="flex h-full min-h-0 flex-col items-center justify-center gap-4 overflow-auto bg-black/20 p-6" role="region" aria-label="Video preview">
       {failed ? (
         <div className="max-w-md text-center text-sm text-[#aaa]" role="alert">
-          This video could not be played. Its format or codec may not be supported by Orion, or the file may be unavailable.
+          This video could not be played. Its format or codec may not be supported by Durango Code, or the file may be unavailable.
         </div>
       ) : (
         <video

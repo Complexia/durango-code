@@ -661,7 +661,7 @@ export const ChatMessage = React.memo(function ChatMessage({
       <div className="message system claude-background-intervention">
         <div className="claude-background-intervention-heading">
           <Terminal size={15} />
-          <span>Orion · Background monitors still running</span>
+          <span>Durango Code · Background monitors still running</span>
         </div>
         <div className="claude-background-intervention-copy">{message.content}</div>
         <div className="claude-background-intervention-tasks">

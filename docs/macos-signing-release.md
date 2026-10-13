@@ -1,6 +1,6 @@
 # macOS Signing and Notarization
 
-Orion macOS releases are distributed outside the Mac App Store as Developer ID signed and notarized DMGs.
+Durango Code (internally Orion) macOS releases are distributed outside the Mac App Store as Developer ID signed and notarized DMGs.
 
 ## Local Prerequisites
 
@@ -93,21 +93,21 @@ That command waits for the existing signed-DMG submission, staples the local DMG
 After packaging, verify the app:
 
 ```bash
-codesign -dv --verbose=4 out/Orion-darwin-arm64/Orion.app
-codesign --verify --deep --strict --verbose=2 out/Orion-darwin-arm64/Orion.app
-spctl -a -vvv -t exec out/Orion-darwin-arm64/Orion.app
+codesign -dv --verbose=4 "out/Durango Code-darwin-arm64/Durango Code.app"
+codesign --verify --deep --strict --verbose=2 "out/Durango Code-darwin-arm64/Durango Code.app"
+spctl -a -vvv -t exec "out/Durango Code-darwin-arm64/Durango Code.app"
 ```
 
 Notarize and staple the final DMG manually if needed:
 
 ```bash
 codesign --force --sign "Developer ID Application: R&R Unicorns, LLC (KV46DBU287)" \
-  --timestamp out/make/Orion-<version>-arm64.dmg
-codesign -dv --verbose=4 out/make/Orion-<version>-arm64.dmg
-codesign --verify --verbose=2 out/make/Orion-<version>-arm64.dmg
-xcrun notarytool submit out/make/Orion-<version>-arm64.dmg \
+  --timestamp "out/make/Durango Code-<version>-arm64.dmg"
+codesign -dv --verbose=4 "out/make/Durango Code-<version>-arm64.dmg"
+codesign --verify --verbose=2 "out/make/Durango Code-<version>-arm64.dmg"
+xcrun notarytool submit "out/make/Durango Code-<version>-arm64.dmg" \
   --keychain-profile "orion-notary" \
   --wait
-xcrun stapler staple out/make/Orion-<version>-arm64.dmg
-spctl -a -vvv -t open --context context:primary-signature out/make/Orion-<version>-arm64.dmg
+xcrun stapler staple "out/make/Durango Code-<version>-arm64.dmg"
+spctl -a -vvv -t open --context context:primary-signature "out/make/Durango Code-<version>-arm64.dmg"
 ```

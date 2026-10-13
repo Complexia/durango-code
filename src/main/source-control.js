@@ -7,7 +7,57 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 const MAX_GIT_BUFFER = 64 * 1024 * 1024;
 
-export const DEFAULT_ORION_GIT_HOSTS = Object.freeze(['git.orioncode.xyz']);
+// Durango Cloud git hosts. git.durango.sh is canonical after the Durango Code
+// rebrand; git.orioncode.xyz is the same service and keeps serving
+// indefinitely, so existing clones whose remotes point there must keep being
+// recognized, verified and pushed to (contracts.md §2).
+export const ORION_GIT_HOST_ALIAS_GROUPS = Object.freeze([
+  Object.freeze(['git.durango.sh', 'git.orioncode.xyz']),
+]);
+export const DEFAULT_ORION_GIT_HOSTS = Object.freeze(['git.durango.sh', 'git.orioncode.xyz']);
+
+/** Add every alias of the given Cloud git hosts (case-insensitive). */
+export const withOrionGitHostAliases = (hosts) => {
+  const result = new Set();
+  for (const host of hosts ?? []) {
+    const normalized = String(host ?? '').trim().toLowerCase();
+    if (!normalized) continue;
+    result.add(normalized);
+    for (const group of ORION_GIT_HOST_ALIAS_GROUPS) {
+      if (group.includes(normalized)) for (const alias of group) result.add(alias);
+    }
+  }
+  return [...result];
+};
+
+/**
+ * True when `remoteUrl` is `expectedUrl`, or the same URL on an alias host of
+ * the Cloud-advertised git host (scheme, port, path and credentials-free form
+ * must match exactly).
+ */
+export const isEquivalentOrionGitRemote = (remoteUrl, expectedUrl) => {
+  const actual = String(remoteUrl ?? '').trim().replace(/\/+$/, '');
+  const expected = String(expectedUrl ?? '').trim().replace(/\/+$/, '');
+  if (!actual || !expected) return false;
+  if (actual === expected) return true;
+  let actualUrl;
+  let expectedParsed;
+  try {
+    actualUrl = new URL(actual);
+    expectedParsed = new URL(expected);
+  } catch {
+    return false;
+  }
+  if (actualUrl.username || actualUrl.password || actualUrl.search || actualUrl.hash) return false;
+  if (
+    actualUrl.protocol !== expectedParsed.protocol ||
+    actualUrl.port !== expectedParsed.port ||
+    actualUrl.pathname !== expectedParsed.pathname
+  ) {
+    return false;
+  }
+  return withOrionGitHostAliases([expectedParsed.hostname]).includes(actualUrl.hostname.toLowerCase());
+};
 
 // Intentionally small and ecosystem-neutral. A deploy agent can replace this
 // for a new project later, but source control must be safe before that agent
@@ -99,9 +149,7 @@ export const classifyRemoteUrl = (remoteUrl, { orionHosts = DEFAULT_ORION_GIT_HO
     return { kind: 'github', url, host, ...githubCoordinates(url) };
   }
 
-  const normalizedOrionHosts = new Set(
-    orionHosts.map((candidate) => String(candidate).trim().toLowerCase()).filter(Boolean)
-  );
+  const normalizedOrionHosts = new Set(withOrionGitHostAliases(orionHosts));
   if (host && normalizedOrionHosts.has(host)) {
     return { kind: 'orion', url, host, owner: null, repo: null };
   }
@@ -303,7 +351,7 @@ export const configureOrionSourceControl = async ({
 }) => {
   const orionRemote = classifyRemoteUrl(orionUrl, { orionHosts });
   if (orionRemote.kind !== 'orion') {
-    throw new Error('The Orion repository URL is not hosted by a trusted Orion Git host.');
+    throw new Error('The Durango Cloud repository URL is not hosted by a trusted Durango Git host.');
   }
 
   const state = await inspectSourceControl(gitRoot, { orionHosts });
@@ -356,11 +404,11 @@ export const switchSourceControlToOrion = async ({
   const initialized = await ensureGitRepository(projectPath);
   const state = await inspectSourceControl(initialized.gitRoot, { orionHosts });
   if (state.origin.kind === 'other') {
-    throw new Error('Only GitHub repositories and projects without an origin can switch to Orion.');
+    throw new Error('Only GitHub repositories and projects without an origin can switch to Durango Cloud.');
   }
 
   const repoName = sanitizeRepositoryName(name || state.origin.repo || path.basename(initialized.gitRoot));
-  if (!repoName) throw new Error('Could not determine a valid Orion repository name.');
+  if (!repoName) throw new Error('Could not determine a valid Durango Cloud repository name.');
   const provisioned = await provisionRepo({
     name: repoName,
     defaultBranch: await currentBranch(initialized.gitRoot),
@@ -372,7 +420,7 @@ export const switchSourceControlToOrion = async ({
   const repo = provisioned?.repo ?? provisioned;
   const orionUrl = provisioned?.cloneUrl ?? provisioned?.gitUrl ?? repo?.cloneUrl ?? repo?.gitUrl;
   if (!repo?.id || !orionUrl) {
-    throw new Error('Orion repository provisioning did not return a repository ID and clone URL.');
+    throw new Error('Durango Cloud repository provisioning did not return a repository ID and clone URL.');
   }
 
   const configured = await configureOrionSourceControl({
@@ -401,7 +449,7 @@ export const withGitAskPass = async (
   { token, username = 'orion', env = process.env, tempRoot = os.tmpdir() },
   operation
 ) => {
-  if (!token) throw new Error('An Orion Git token is required.');
+  if (!token) throw new Error('A Durango Git token is required.');
   const tempDir = await fs.mkdtemp(path.join(tempRoot, 'orion-git-auth-'));
   const askPassPath = path.join(tempDir, 'askpass.sh');
   try {
@@ -471,15 +519,15 @@ export const describeGitPushFailure = (error, { committed = false } = {}) => {
     };
   }
   if (error?.status === 503 || /(?:503\b|authentication service temporarily unavailable)/i.test(text)) {
-    return { error: title, errorDetail: 'Orion Git is temporarily unavailable. Your local changes are safe; retry shortly.' };
+    return { error: title, errorDetail: 'Durango Git is temporarily unavailable. Your local changes are safe; retry shortly.' };
   }
   if (error?.status === 403 || /(?:requires repo:|insufficient.scope|403\b)/i.test(text)) {
-    return { error: committed ? 'Committed locally, but permission was denied' : 'Push permission denied', errorDetail: 'Your source-control token lacks permission. For Orion repositories, check Settings > Access tokens and enable repo:write.' };
+    return { error: committed ? 'Committed locally, but permission was denied' : 'Push permission denied', errorDetail: 'Your source-control token lacks permission. For Durango Cloud repositories, check Settings > Access tokens and enable repo:write.' };
   }
   if (error?.status === 401 || error?.needsAuth || /(?:authentication failed|could not read username|access denied|unauthorized)/i.test(text)) {
     return {
       error: title,
-      errorDetail: 'The source-control credential was rejected. For Orion repositories, sign in again to authorize this device; check Settings > Access tokens for revoked or expired tokens.',
+      errorDetail: 'The source-control credential was rejected. For Durango Cloud repositories, sign in again to authorize this device; check Settings > Access tokens for revoked or expired tokens.',
     };
   }
   if (/(?:could not resolve host|enotfound|network is unreachable|connection timed out)/i.test(text)) {
@@ -545,7 +593,7 @@ export const pushSourceControl = async ({
     } catch (error) {
       if (signal?.aborted) throw error;
       const detail = error?.stderr?.toString().trim() || error?.message || String(error);
-      mirrorWarning = `Pushed to Orion, but the GitHub mirror could not be updated: ${detail}`;
+      mirrorWarning = `Pushed to Durango Cloud, but the GitHub mirror could not be updated: ${detail}`;
     }
   }
 

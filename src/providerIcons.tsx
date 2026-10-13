@@ -85,9 +85,13 @@ export const OpenCodeBrandIcon = ({ size = 24, className, ...props }: ProviderIc
   </svg>
 );
 
-/** Orion's approved circular-arrow product mark. */
+/**
+ * Durango Code product mark (the app icon, assets/icon.png). The component
+ * keeps its internal Orion name. The viewBox crops the icon's transparent
+ * margin so the squircle fills small provider/model slots.
+ */
 export const OrionBrandIcon = ({ size = 24, className, ...props }: ProviderIconProps) => (
-  <svg viewBox="0 0 1024 1024" {...iconProps(size, className)} {...props}>
+  <svg viewBox="88 88 848 848" {...iconProps(size, className)} {...props}>
     <image
       href={orionIconUrl}
       width="1024"

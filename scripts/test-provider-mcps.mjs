@@ -341,7 +341,7 @@ try {
   assert.equal(seenAuthorization, 'Bearer secret-token');
   const again = await providerMcps.shareProviderMcp({ key: byName.durango.key });
   assert.equal(again.ok, false);
-  assert.match(again.error, /Already in Orion as @durango/);
+  assert.match(again.error, /Already in Durango Code as @durango/);
   const relisted = await providerMcps.listProviderMcps({ projectPaths: [projectPath], fresh: false });
   assert.equal(relisted.servers.find((entry) => entry.name === 'durango').orion.nickname, 'durango');
   assert.ok(!JSON.stringify(relisted).includes('secret-token'));
@@ -402,7 +402,7 @@ try {
     const requested = [{ name: 'new-server', transport: 'http', url: durangoUrl, headers: {} }];
     await assert.rejects(providerMcps.withoutCodexNativeMcps(requested, { fresh: false }), /@new-server/);
     await fs.writeFile(fakeCodex, '#!/bin/sh\nexit 1\n');
-    await assert.rejects(providerMcps.withoutCodexNativeMcps(requested), /Could not check Orion MCP nicknames/);
+    await assert.rejects(providerMcps.withoutCodexNativeMcps(requested), /Could not check Durango Code MCP nicknames/);
     assert.deepEqual(await providerMcps.withoutCodexNativeMcps([]), [], 'no Orion servers requires no discovery');
   } finally {
     await fs.writeFile(fakeCodex, originalCodexScript);
@@ -593,7 +593,7 @@ try {
   for (const stdout of ['', 'not JSON', '[]', '{"mcp":null}', '{"mcp":[]}']) {
     await assert.rejects(providerMcps.assertOpenCodeMcpNamesAvailable([openCodeServer], {
       ...openCodeOptions, run: async () => ({ stdout }),
-    }), /Could not check Orion MCP nicknames/);
+    }), /Could not check Durango Code MCP nicknames/);
   }
   await assert.rejects(providerMcps.assertOpenCodeMcpNamesAvailable([openCodeServer], {
     ...openCodeOptions, run: async () => { throw new Error('native-secret'); },

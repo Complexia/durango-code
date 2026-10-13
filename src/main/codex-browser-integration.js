@@ -129,11 +129,11 @@ export const probeCodexBrowserIntegration = async (runCommand, readSkill = readF
     extensionInstalled === true &&
     extensionEnabled === true &&
     nativeHostReady === true;
-  let detail = 'Chrome extension setup detected. Orion checks the connection when a task uses it and keeps a separate browser available if it cannot connect.';
+  let detail = 'Chrome extension setup detected. Durango Code checks the connection when a task uses it and keeps a separate browser available if it cannot connect.';
   if (!plugin.installed || !plugin.enabled) {
     detail = 'The Codex Chrome plugin is not installed and enabled. Install or update Codex browser support, or use the dedicated MCP browser.';
   } else if (!browserWorkflowAvailable) {
-    detail = 'This Codex installation has no available Chrome browser workflow. Orion will use a separate browser without your Chrome logins or tabs.';
+    detail = 'This Codex installation has no available Chrome browser workflow. Durango Code will use a separate browser without your Chrome logins or tabs.';
   } else if (extensionInstalled === false || extensionEnabled === false) {
     detail = 'Install and enable the ChatGPT Chrome extension to let Codex use your signed-in Chrome.';
   } else if (nativeHostReady === false) {

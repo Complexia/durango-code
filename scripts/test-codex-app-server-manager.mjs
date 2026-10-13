@@ -26,7 +26,7 @@ assert.match(
 );
 assert.match(
   mainSource,
-  /const appShutdownError = \(\) =>\s*appShutdownReason === 'update'[\s\S]*?'Orion is shutting down\.'/,
+  /const appShutdownError = \(\) =>\s*appShutdownReason === 'update'[\s\S]*?'Durango Code is shutting down\.'/,
   'ordinary shutdown must not be mislabeled as an update installation'
 );
 assert.match(

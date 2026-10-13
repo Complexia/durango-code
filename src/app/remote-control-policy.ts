@@ -214,6 +214,8 @@ export const claimRemoteThreadStart = async (
 export type RemoteCommandOutcome = {
   ok: boolean;
   threadId?: string;
+  /** Durango Chat dispatch: the new thread's title, reported with `running`. */
+  threadTitle?: string;
   error?: string;
 };
 

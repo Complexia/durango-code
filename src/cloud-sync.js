@@ -114,7 +114,7 @@ async function api(baseUrl, token, apiPath, options = {}) {
     // non-JSON error body
   }
   if (!response.ok) {
-    const error = new Error(data?.error || `Orion Cloud request failed (${response.status}).`);
+    const error = new Error(data?.error || `Durango Cloud request failed (${response.status}).`);
     error.status = response.status;
     error.data = data;
     throw error;

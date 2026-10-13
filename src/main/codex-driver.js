@@ -909,7 +909,7 @@ export const createCodexAppServerDriver = ({
 
   const start = async () => {
     const init = await request('initialize', {
-      clientInfo: { name: 'orion', title: 'Orion', version: app.getVersion?.() ?? '0.0.0' },
+      clientInfo: { name: 'orion', title: 'Durango Code', version: app.getVersion?.() ?? '0.0.0' },
       capabilities: { experimentalApi: true, requestAttestation: false },
     });
     if (init.error) return fail(init.error);
@@ -1438,7 +1438,7 @@ export const runCodexGoalOp = ({
     (async () => {
       try {
         const init = await request('initialize', {
-          clientInfo: { name: 'orion', title: 'Orion', version: app.getVersion?.() ?? '0.0.0' },
+          clientInfo: { name: 'orion', title: 'Durango Code', version: app.getVersion?.() ?? '0.0.0' },
           capabilities: { experimentalApi: true, requestAttestation: false },
         });
         if (init.error) return settle({ ok: false, error: init.error.message });

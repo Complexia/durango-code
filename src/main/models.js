@@ -278,8 +278,8 @@ export const agentModels = [
   {
     id: 'orion:orchestrator',
     providerId: 'orion',
-    providerLabel: 'Orion',
-    label: 'Orion',
+    providerLabel: 'Durango Code',
+    label: 'Durango Code',
     slug: 'orion',
   },
   {

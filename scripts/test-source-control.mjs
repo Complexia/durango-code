@@ -15,6 +15,7 @@ import {
   describeGitPushFailure,
   gitPushWasAlreadyUpToDate,
   inspectSourceControl,
+  isEquivalentOrionGitRemote,
   isOrionRepoRemoteUrl,
   parseNamedGitRefs,
   planGithubRefImport,
@@ -68,6 +69,23 @@ try {
   assert.equal(isOrionRepoRemoteUrl('https://git.orioncode.xyz/r/repo_123.git', 'repo_123'), true);
   assert.equal(isOrionRepoRemoteUrl('https://attacker.example/r/repo_123.git', 'repo_other'), false);
   console.log('ok  remote URLs classify without fuzzy-host false positives');
+
+  // Durango rebrand: git.durango.sh is canonical, git.orioncode.xyz remotes in
+  // existing clones must keep classifying and verifying as Cloud remotes.
+  assert.equal(classifyRemoteUrl('https://git.durango.sh/r/repo_123.git').kind, 'orion');
+  assert.equal(classifyRemoteUrl('https://git.orioncode.xyz/r/repo_123.git', { orionHosts: ['git.durango.sh'] }).kind, 'orion');
+  assert.equal(classifyRemoteUrl('https://git.durango.sh/r/repo_123.git', { orionHosts: ['git.orioncode.xyz'] }).kind, 'orion');
+  assert.equal(classifyRemoteUrl('https://git.durango.sh.attacker.example/r/repo_123.git').kind, 'other');
+  const advertised = 'https://git.durango.sh/r/repo_123.git';
+  assert.equal(isEquivalentOrionGitRemote(advertised, advertised), true);
+  assert.equal(isEquivalentOrionGitRemote('https://git.orioncode.xyz/r/repo_123.git', advertised), true);
+  assert.equal(isEquivalentOrionGitRemote('https://git.durango.sh/r/repo_123.git', 'https://git.orioncode.xyz/r/repo_123.git'), true);
+  assert.equal(isEquivalentOrionGitRemote('https://git.orioncode.xyz/r/repo_999.git', advertised), false);
+  assert.equal(isEquivalentOrionGitRemote('http://git.orioncode.xyz/r/repo_123.git', advertised), false);
+  assert.equal(isEquivalentOrionGitRemote('https://user:pw@git.orioncode.xyz/r/repo_123.git', advertised), false);
+  assert.equal(isEquivalentOrionGitRemote('https://attacker.example/r/repo_123.git', advertised), false);
+  assert.equal(isEquivalentOrionGitRemote('https://localhost:4000/r/repo_123.git', 'https://localhost:4000/r/repo_123.git'), true);
+  console.log('ok  legacy git.orioncode.xyz remotes stay trusted next to git.durango.sh');
 
   const markerOnlyRepo = await initRepo('marker-only');
   git(markerOnlyRepo, 'remote', 'add', 'origin', 'https://attacker.example/collect.git');
@@ -381,7 +399,7 @@ try {
   const mirrorFailure = await pushSourceControl({ gitRoot: pushRepo, token: 'local-test-token' });
   assert.equal(mirrorFailure.ok, true);
   assert.equal(mirrorFailure.mirroredToGithub, false);
-  assert.match(mirrorFailure.mirrorWarning, /Pushed to Orion.*GitHub mirror/i);
+  assert.match(mirrorFailure.mirrorWarning, /Pushed to Durango Cloud.*GitHub mirror/i);
   assert.equal(git(orionBare, 'rev-parse', 'refs/heads/main'), git(pushRepo, 'rev-parse', 'HEAD'));
   console.log('ok  a mirror failure returns a warning after the Orion push succeeds');
 
@@ -398,7 +416,8 @@ try {
   assert.match(mainSource, /githubName: state\.origin\.repo/);
   assert.match(mainSource, /resolveGithubMirrorDelivery/);
   assert.match(mainSource, /verifyOrionGitRemote/);
-  assert.match(mainSource, /actual !== expected/);
+  assert.match(mainSource, /!isEquivalentOrionGitRemote\(actual, expected\)/);
+  assert.match(mainSource, /!isEquivalentOrionGitRemote\(pushDestinations\[0\], expected\)/);
   assert.match(mainSource, /const legacyFallback = error\?\.status === 404 && persistedDelivery !== 'cloud'/);
   assert.match(mainSource, /args: \['push', '--atomic', cloneUrl, \.\.\.refspecs\]/);
   assert.match(mainSource, /git:authorizeGithubMirror/);

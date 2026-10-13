@@ -290,7 +290,7 @@ export const killDevServers = async ({ targets = [] } = {}) => {
       continue;
     }
     if (protectedPids.has(pid)) {
-      results.push({ pid, ok: false, error: 'Refusing to kill Orion or one of its parent processes.' });
+      results.push({ pid, ok: false, error: 'Refusing to kill Durango Code or one of its parent processes.' });
       continue;
     }
     const listener = listeners.get(pid);

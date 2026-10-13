@@ -79,9 +79,9 @@ const DeploymentsSettings = React.memo(function DeploymentsSettings({
         <div className="setting-label">
           <div className="setting-label-title">Deployment agent model</div>
           <div className="setting-label-desc">
-            Apps Orion Cloud can build unattended deploy straight from the Deploy button. Anything
+            Apps Durango Cloud can build unattended deploy straight from the Deploy button. Anything
             else — monorepos, Compose stacks, repos with no obvious entry point — opens a thread
-            where this model deploys the app with <code>orion-cli</code>. Defaults to your
+            where this model deploys the app with the Durango Code CLI (<code>durango-code</code>). Defaults to your
             text-generation model.
           </div>
         </div>
@@ -157,7 +157,7 @@ const DeploymentsSettings = React.memo(function DeploymentsSettings({
         <div className="setting-label">
           <div className="setting-label-title">Prefer agent deploys</div>
           <div className="setting-label-desc">
-            Always hand deploys to the agent, even for apps Orion judges simple enough to deploy
+            Always hand deploys to the agent, even for apps Durango Code judges simple enough to deploy
             directly. Slower, but you see every step and can steer it.
           </div>
         </div>
