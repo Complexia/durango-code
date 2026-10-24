@@ -3,7 +3,8 @@
 // indefinitely (contracts.md §2), so credentials minted against it stay valid.
 export const DEFAULT_PACKAGED_WEB_URL = 'https://code.durango.sh';
 export const DEFAULT_DEV_WEB_URL = 'http://localhost:3000';
-export const DEFAULT_UPDATE_FEED_URL = 'https://code.durango.sh/api/update/macos';
+// Update feeds are per platform: <base>/macos, <base>/windows, <base>/linux.
+export const DEFAULT_UPDATE_FEED_BASE_URL = 'https://code.durango.sh/api/update';
 
 const LEGACY_WEB_ORIGIN_ALIASES = Object.freeze({
   'https://orioncode.xyz': 'https://code.durango.sh',

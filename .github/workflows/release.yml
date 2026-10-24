@@ -1,0 +1,78 @@
+# Builds and publishes the Windows and Linux releases of a version tag.
+#
+# `bun run deploy` on a Mac pushes the tag (v<version>) and builds macOS
+# itself; this workflow runs scripts/deploy.mjs --ci on Windows and Linux
+# runners for the same commit and version. Each build only writes its own
+# platform's keys in R2 (see scripts/release-manifest.mjs).
+name: Release
+
+run-name: Release ${{ inputs.tag || github.ref_name }}
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to rebuild, e.g. v1.0.150
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      # One platform failing must not cancel the other's publish.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            platform: win32
+            arch: x64
+          - name: Linux x64
+            # The oldest supported Ubuntu keeps the .deb's glibc requirement low.
+            runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.3
+
+      - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y fakeroot dpkg
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build and publish
+        shell: bash
+        env:
+          ORION_R2_BUCKET: ${{ secrets.ORION_R2_BUCKET }}
+          ORION_R2_ENDPOINT: ${{ secrets.ORION_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
+            echo "::error::$RELEASE_TAG is not a version tag"
+            exit 1
+          fi
+          node scripts/deploy.mjs --ci --version "${RELEASE_TAG#v}" --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}

@@ -69,7 +69,19 @@ Create `.env.release.local` from `.env.release.example`, then run:
 bun run deploy
 ```
 
-By default this bumps the patch version, builds the current platform/architecture, uploads artifacts to versioned R2 keys under `releases/v<version>/`, and updates `releases/latest.json`.
+By default this bumps the patch version, builds macOS for the current architecture, and publishes it to R2. It also releases Windows and Linux: it tags HEAD as `v<version>` and pushes the tag, which starts [`.github/workflows/release.yml`](.github/workflows/release.yml). That workflow runs `scripts/deploy.mjs --ci` on Windows (NSIS `.exe`) and Linux (`.deb`) runners while the Mac builds, and the deploy command waits for it at the end (`gh` required to follow it).
+
+Because CI builds the tagged commit, the release refuses to start with uncommitted or untracked changes (other than the version in `package.json`/`package-lock.json`). Pass `--no-ci` to release macOS only.
+
+R2 layout (see [scripts/release-manifest.mjs](scripts/release-manifest.mjs)): every build writes only its own platform's keys, so the Mac and CI builds never overwrite each other.
+
+- `releases/v<version>/<os>/<arch>/`: artifacts plus that build's `manifest.json`
+- `releases/latest/<os>-<arch>.json`: the newest stable build per platform, read by code.durango.sh's `/api/download/<os>` and `/api/update/<os>/<arch>/` feeds
+- `releases/latest.json`: the older macOS-only manifest, still written by macOS releases
+
+Prerelease versions (`--version 1.2.3-rc.1`) upload their artifacts without moving any `latest` pointer, which makes them a safe end-to-end test of the whole pipeline.
+
+The workflow reads the R2 credentials from repository secrets (`ORION_R2_BUCKET`, `ORION_R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`). Set them from your release env file with `gh secret set -f .env.release.local`. To rebuild a tag's Windows/Linux releases, run `gh workflow run release.yml -f tag=v<version>`.
 
 macOS builds are Developer ID signed, notarized, stapled DMGs. See [docs/macos-signing-release.md](docs/macos-signing-release.md) for local keychain setup and verification commands.
 
@@ -80,6 +92,7 @@ bun run deploy --bump minor
 bun run deploy --version 1.2.3
 bun run deploy --bump none
 bun run deploy --resume-upload
+bun run deploy --no-ci
 ```
 
 Use `--resume-upload` after a network failure during artifact upload. It reuses

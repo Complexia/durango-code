@@ -1,7 +1,7 @@
 import { BrowserWindow, app, autoUpdater as nativeAutoUpdater, net } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { DEFAULT_UPDATE_FEED_URL } from './web-origin.js';
+import { DEFAULT_UPDATE_FEED_BASE_URL } from './web-origin.js';
 
 export let appUpdateState = {
   status: 'idle',
@@ -81,10 +81,14 @@ export const getAppIconPath = () => {
   return path.join(app.getAppPath(), 'assets', 'icon.png');
 };
 
+const UPDATE_FEED_PLATFORMS = { darwin: 'macos', win32: 'windows', linux: 'linux' };
+
 export const getAppUpdateFeedUrl = () => {
   // code.durango.sh serves the same feed as the legacy orioncode.xyz host,
-  // which keeps answering already-installed builds.
-  const baseUrl = process.env.ORION_UPDATE_FEED_URL || DEFAULT_UPDATE_FEED_URL;
+  // which keeps answering already-installed builds. ORION_UPDATE_FEED_URL
+  // replaces the whole platform feed, as the macOS default did before.
+  const baseUrl = process.env.ORION_UPDATE_FEED_URL
+    || `${DEFAULT_UPDATE_FEED_BASE_URL}/${UPDATE_FEED_PLATFORMS[process.platform] ?? 'macos'}`;
   const arch = process.arch === 'x64' ? 'x64' : 'arm64';
   return `${baseUrl.replace(/\/$/, '')}/${arch}/`;
 };
@@ -137,18 +141,21 @@ export const initializeAppUpdaterOnce = async () => {
     url: getAppUpdateFeedUrl(),
   });
 
-  // Squirrel reports separately from electron-updater, and only its event
-  // means quitAndInstall() will actually do something.
-  nativeAutoUpdater.on('update-downloaded', () => {
-    appUpdateStagedForInstall = true;
-    settleAppUpdateStagedWaiters(true);
-  });
-  nativeAutoUpdater.on('error', () => {
-    // Staging failed. Invalidate the downloaded-version shortcut so the error
-    // button performs a real download/staging retry instead of restoring the
-    // same permanently unstaged "downloaded" state.
-    invalidateAppUpdateDownload();
-  });
+  // On macOS, Squirrel reports separately from electron-updater, and only its
+  // event means quitAndInstall() will actually do something. Windows (NSIS)
+  // and Linux (.deb) install straight from the downloaded file.
+  if (process.platform === 'darwin') {
+    nativeAutoUpdater.on('update-downloaded', () => {
+      appUpdateStagedForInstall = true;
+      settleAppUpdateStagedWaiters(true);
+    });
+    nativeAutoUpdater.on('error', () => {
+      // Staging failed. Invalidate the downloaded-version shortcut so the error
+      // button performs a real download/staging retry instead of restoring the
+      // same permanently unstaged "downloaded" state.
+      invalidateAppUpdateDownload();
+    });
+  }
 
   autoUpdater.on('checking-for-update', () => {
     // Background re-checks (the startup timer, the 2h interval) must not hide
@@ -232,7 +239,9 @@ export const initializeAppUpdaterOnce = async () => {
   autoUpdater.on('update-downloaded', (info) => {
     appUpdateDownloadedVersion = info?.version ?? appUpdateState.availableVersion;
     // A new zip means a new proxy server, so Squirrel starts staging over.
-    appUpdateStagedForInstall = false;
+    // Elsewhere the downloaded installer is all quitAndInstall() needs.
+    appUpdateStagedForInstall = process.platform !== 'darwin';
+    if (appUpdateStagedForInstall) settleAppUpdateStagedWaiters(true);
     publishAppUpdateState({
       status: 'downloaded',
       availableVersion: info?.version ?? appUpdateState.availableVersion,

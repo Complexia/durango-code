@@ -17,6 +17,10 @@ const packagerTmpdir = path.join(
   'orion-packager',
   crypto.createHash('sha256').update(__dirname).digest('hex').slice(0, 16),
 );
+// Linux needs a lowercase, space-free executable for /usr/bin and the
+// .desktop entry. macOS and Windows keep the "Durango Code" executable.
+const linuxExecutableName = 'durango-code';
+const isLinuxBuild = process.platform === 'linux';
 
 module.exports = {
   packagerConfig: {
@@ -27,9 +31,12 @@ module.exports = {
     asar: { unpack: '**/node_modules/{node-pty,rift-snapshot,@anthropic-ai/claude-agent-sdk-*}/**' },
     icon: path.join(__dirname, 'assets', 'icon'),
     tmpdir: packagerTmpdir,
+    ...(isLinuxBuild ? { executableName: linuxExecutableName } : {}),
     extraResource: [
       path.join(__dirname, 'assets', 'icon.png'),
       path.join(__dirname, 'assets', 'bundled-skills'),
+      // Tells electron-updater to update Linux installs through the .deb.
+      ...(isLinuxBuild ? [path.join(__dirname, 'build', 'linux', 'package-type')] : []),
     ],
     // Customer-facing bundle name. The bundle id, the internal app name
     // ("Orion", pinned in src/main/pin-app-identity.js), the userData path and
@@ -50,7 +57,10 @@ module.exports = {
       ignore: (filePath) => macNonCodeResourcePattern.test(filePath),
     },
   },
-  rebuildConfig: {},
+  // node-pty's Windows prebuilds are Node-API (any Electron ABI) and ship the
+  // ConPTY/winpty binaries; compiling it instead needs MSVC Spectre libraries.
+  // Linux has no prebuild and is compiled.
+  rebuildConfig: process.platform === 'win32' ? { ignoreModules: ['node-pty'] } : {},
   hooks: {
     // The Vite plugin packages only the `.vite` bundle (everything else is
     // ignored), so runtime externals must be copied into the app manually.
@@ -102,8 +112,26 @@ module.exports = {
   },
   makers: [
     {
-      name: '@electron-forge/maker-squirrel',
-      config: {},
+      // An NSIS installer, because electron-updater (the app's updater on
+      // every platform) only installs NSIS updates on Windows.
+      name: '@felixrieseberg/electron-forge-maker-nsis',
+      platforms: ['win32'],
+      config: {
+        getAppBuilderConfig: async () => ({
+          appId: 'com.complexia.orion',
+          productName: 'Durango Code',
+          artifactName: 'Durango-Code-Setup-${version}-${arch}.${ext}',
+          win: { icon: path.join(__dirname, 'assets', 'icon.ico') },
+          nsis: {
+            // Per-user install under %LOCALAPPDATA%: no UAC prompt, and
+            // updates install silently.
+            oneClick: true,
+            perMachine: false,
+            shortcutName: 'Durango Code',
+            uninstallDisplayName: 'Durango Code',
+          },
+        }),
+      },
     },
     {
       name: '@electron-forge/maker-dmg',
@@ -144,11 +172,20 @@ module.exports = {
     },
     {
       name: '@electron-forge/maker-deb',
-      config: {},
-    },
-    {
-      name: '@electron-forge/maker-rpm',
-      config: {},
+      platforms: ['linux'],
+      config: {
+        options: {
+          name: linuxExecutableName,
+          bin: linuxExecutableName,
+          productName: 'Durango Code',
+          genericName: 'Agentic IDE',
+          homepage: 'https://code.durango.sh',
+          icon: path.join(__dirname, 'assets', 'icon.png'),
+          categories: ['Development'],
+          // Desktop sign-in returns through orion://auth/callback.
+          mimeType: ['x-scheme-handler/orion'],
+        },
+      },
     },
   ],
   plugins: [

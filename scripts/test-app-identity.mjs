@@ -91,7 +91,7 @@ for (const literal of ["'orion-store.json'", "'orion-threads.json'", "'orion-thr
 const webOrigin = await import('../src/main/web-origin.js');
 assert.equal(webOrigin.DEFAULT_PACKAGED_WEB_URL, 'https://code.durango.sh');
 assert.equal(webOrigin.DEFAULT_DEV_WEB_URL, 'http://localhost:3000');
-assert.equal(webOrigin.DEFAULT_UPDATE_FEED_URL, 'https://code.durango.sh/api/update/macos');
+assert.equal(webOrigin.DEFAULT_UPDATE_FEED_BASE_URL, 'https://code.durango.sh/api/update');
 assert.equal(webOrigin.isSameWebOrigin('https://orioncode.xyz', 'https://code.durango.sh/'), true);
 assert.equal(webOrigin.isSameWebOrigin('https://code.durango.sh', 'https://code.durango.sh'), true);
 assert.equal(webOrigin.isSameWebOrigin('http://localhost:3000', 'https://code.durango.sh'), false);

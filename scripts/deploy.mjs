@@ -8,13 +8,24 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { relaunchWithPinnedNode, verifyReleaseRuntime } from './check-release-runtime.mjs';
+import { assertReleaseSourceCommitted, pushReleaseTag, watchCiRelease } from './release-git.mjs';
+import {
+  buildLegacyMacManifest,
+  buildPlatformManifest,
+  contentTypeFor,
+  isPrereleaseVersion,
+  isReleaseArtifact,
+  isReleaseVersion,
+  legacyLatestKey,
+  platformLatestKey,
+  platformManifestKey,
+  productName,
+  releaseArtifactLocation,
+  releaseOsName,
+  selectPlatformArtifacts,
+} from './release-manifest.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-// Customer-facing product and bundle name (forge packagerConfig.name). R2
-// keys, the bucket, and the manifest shape stay as before so orion-next's
-// /api/download and /api/update routes keep reading releases/latest.json.
-const productName = 'Durango Code';
-const artifactBaseName = 'Durango-Code';
 const macAppBundleName = `${productName}.app`;
 
 relaunchWithPinnedNode({ rootDir });
@@ -22,9 +33,12 @@ relaunchWithPinnedNode({ rootDir });
 const args = parseArgs(process.argv.slice(2));
 const platform = args.platform ?? process.platform;
 const arch = args.arch ?? process.arch;
-const osName = platform === 'darwin' ? 'macos' : platform === 'win32' ? 'windows' : 'linux';
+const osName = releaseOsName(platform);
 if (args.resumeNotaryId && args.resumeUpload) {
   throw new Error('Use either --resume-notary-id or --resume-upload, not both.');
+}
+if (args.ci && !args.version) {
+  throw new Error('--ci builds publish the version of the release tag; pass it with --version.');
 }
 
 verifyReleaseRuntime({
@@ -39,20 +53,29 @@ if (args.checkRuntime) {
 
 await loadEnvFile(path.join(rootDir, '.env.release.local'));
 
-const bump = args.bump ?? (args.resumeNotaryId || args.resumeUpload ? 'none' : 'patch');
+const isResume = Boolean(args.resumeNotaryId || args.resumeUpload);
+const bump = args.bump ?? (isResume ? 'none' : 'patch');
 const isMacRelease = platform === 'darwin';
 const macSigningIdentity = process.env.ORION_MAC_SIGN_IDENTITY
   ?? 'Developer ID Application: R&R Unicorns, LLC (KV46DBU287)';
 const macNotaryProfile = process.env.ORION_MAC_NOTARY_PROFILE ?? 'orion-notary';
 const macSignedRelease = isMacRelease;
+// A release started on a Mac also builds Windows and Linux: pushing the
+// version tag starts the GitHub Actions workflow, which runs this script
+// with --ci on each platform.
+const triggerCiRelease = isMacRelease && !args.ci && !args.noCi && !isResume;
 
 const packagePath = path.join(rootDir, 'package.json');
 const packageJson = JSON.parse(await fs.readFile(packagePath, 'utf8'));
 const currentVersion = packageJson.version;
 const version = args.version ?? (bump === 'none' ? currentVersion : bumpVersion(currentVersion, bump));
+if (!isReleaseVersion(version)) {
+  throw new Error(`"${version}" is not a release version (expected 1.2.3 or 1.2.3-label)`);
+}
+const publishLatest = !isPrereleaseVersion(version);
 
 const config = {
-  bucket: process.env.ORION_R2_BUCKET ?? 'orion-builds',
+  bucket: process.env.ORION_R2_BUCKET || 'orion-builds',
   endpoint: process.env.ORION_R2_ENDPOINT,
   accessKeyId: process.env.R2_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? process.env.AWS_SECRET_ACCESS_KEY,
@@ -60,6 +83,12 @@ const config = {
 
 for (const [key, value] of Object.entries(config)) {
   if (!value) throw new Error(`Missing required release environment value: ${key}`);
+}
+
+let ciRelease = null;
+if (triggerCiRelease) {
+  // Checked before the version bump so a refused release leaves no changes.
+  assertReleaseSourceCommitted(rootDir);
 }
 
 if (version !== currentVersion) {
@@ -75,7 +104,11 @@ if (version !== currentVersion) {
   console.log(`Building ${productName} ${version}`);
 }
 
-if (!args.resumeNotaryId && !args.resumeUpload) {
+if (triggerCiRelease) {
+  ciRelease = pushReleaseTag(rootDir, version);
+}
+
+if (!isResume) {
   await fs.rm(path.join(rootDir, 'out', 'make'), { recursive: true, force: true });
   run('bun', ['run', 'make', '--', `--platform=${platform}`, `--arch=${arch}`]);
 }
@@ -99,6 +132,8 @@ if (isMacRelease) {
   await assessMacApp(macAppPath);
 }
 
+const releaseArtifacts = selectPlatformArtifacts(osName, artifactPaths);
+
 const client = new S3Client({
   region: 'auto',
   endpoint: config.endpoint,
@@ -111,15 +146,12 @@ const client = new S3Client({
 const releasedAt = new Date().toISOString();
 const artifacts = [];
 
-for (const artifactPath of artifactPaths) {
-  const ext = path.extname(artifactPath);
-  const kind = artifactKindFor(osName, ext);
-  const fileName = `${artifactBaseName}-${version}-${osName}-${arch}${ext}`;
-  const key = `releases/v${version}/${osName}/${arch}/${fileName}`;
+for (const [format, artifactPath] of releaseArtifacts) {
+  const { fileName, key } = releaseArtifactLocation({ version, osName, arch, format });
   const stat = await fs.stat(artifactPath);
   const sha256 = await sha256File(artifactPath);
   const sha512 = await sha512File(artifactPath);
-  const contentType = contentTypeFor(ext);
+  const contentType = contentTypeFor(format);
 
   const upload = {
     Bucket: config.bucket,
@@ -132,9 +164,9 @@ for (const artifactPath of artifactPaths) {
       version,
       platform: osName,
       arch,
+      format,
       sha256,
       sha512,
-      kind,
       signed: macSignedRelease ? 'true' : 'false',
       notarized: macSignedRelease ? 'true' : 'false',
       unsigned: macSignedRelease ? 'false' : 'true',
@@ -155,9 +187,10 @@ for (const artifactPath of artifactPaths) {
   await verifyUploadedArtifact(client, config.bucket, key, stat.size, sha256);
 
   artifacts.push({
-    kind,
+    format,
     platform: osName,
     arch,
+    version,
     key,
     fileName,
     size: stat.size,
@@ -172,36 +205,22 @@ for (const artifactPath of artifactPaths) {
   console.log(`Uploaded ${key}`);
 }
 
-const downloads = {};
-const updates = {};
-for (const artifact of artifacts) {
-  if (artifact.kind === 'update') {
-    updates[artifact.platform] ??= {};
-    updates[artifact.platform][artifact.arch] = artifact;
-  } else {
-    downloads[artifact.platform] ??= {};
-    downloads[artifact.platform][artifact.arch] = artifact;
+const manifest = buildPlatformManifest({ version, osName, arch, releasedAt, artifacts, signed: macSignedRelease });
+
+await uploadJson(client, config.bucket, platformManifestKey({ version, osName, arch }), manifest, 'public, max-age=31536000, immutable');
+if (publishLatest) {
+  await uploadJson(client, config.bucket, platformLatestKey({ osName, arch }), manifest, 'no-store');
+  if (isMacRelease) {
+    await uploadJson(client, config.bucket, legacyLatestKey, buildLegacyMacManifest(manifest), 'no-store');
   }
+  console.log(`Published ${productName} ${version} for ${osName}-${arch}`);
+} else {
+  console.log(`Uploaded prerelease ${productName} ${version} for ${osName}-${arch}; the latest ${osName} release is unchanged`);
 }
 
-const manifest = {
-  product: productName,
-  version,
-  channel: 'stable',
-  releasedAt,
-  signed: macSignedRelease,
-  notarized: macSignedRelease,
-  unsigned: !macSignedRelease,
-  downloads,
-  updates,
-  artifacts,
-};
-
-await uploadJson(client, config.bucket, `releases/v${version}/manifest.json`, manifest, 'public, max-age=31536000, immutable');
-await uploadJson(client, config.bucket, 'releases/latest.json', manifest, 'no-store');
-
-console.log(`Published ${productName} ${version}`);
-console.log('Latest manifest: releases/latest.json');
+if (ciRelease) {
+  await watchCiRelease(rootDir, ciRelease);
+}
 
 function parseArgs(argv) {
   const parsed = {};
@@ -219,6 +238,8 @@ function parseArgs(argv) {
     else if (value.startsWith('--resume-notary-id=')) parsed.resumeNotaryId = value.split('=')[1];
     else if (value === '--resume-upload') parsed.resumeUpload = true;
     else if (value === '--check-runtime') parsed.checkRuntime = true;
+    else if (value === '--ci') parsed.ci = true;
+    else if (value === '--no-ci') parsed.noCi = true;
     else throw new Error(`Unknown argument: ${value}`);
   }
   return parsed;
@@ -419,7 +440,7 @@ async function writeJson(filePath, value) {
 async function findArtifacts(dir) {
   const entries = await walk(dir);
   return entries
-    .filter((entry) => /\.(zip|dmg|exe|deb|rpm)$/i.test(entry))
+    .filter((entry) => isReleaseArtifact(entry))
     .sort();
 }
 
@@ -471,28 +492,7 @@ async function hashFile(filePath, algorithm, encoding = 'hex') {
   return hasher.digest(encoding);
 }
 
-function artifactKindFor(osName, ext) {
-  const normalizedExt = ext.toLowerCase();
-  if (osName === 'macos' && normalizedExt === '.zip') return 'update';
-  return 'installer';
-}
 
-function contentTypeFor(ext) {
-  switch (ext.toLowerCase()) {
-    case '.zip':
-      return 'application/zip';
-    case '.dmg':
-      return 'application/x-apple-diskimage';
-    case '.exe':
-      return 'application/vnd.microsoft.portable-executable';
-    case '.deb':
-      return 'application/vnd.debian.binary-package';
-    case '.rpm':
-      return 'application/x-rpm';
-    default:
-      return 'application/octet-stream';
-  }
-}
 
 async function uploadJson(client, bucket, key, value, cacheControl) {
   await sendWithRetry(
