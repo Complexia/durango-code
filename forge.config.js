@@ -121,6 +121,9 @@ module.exports = {
           appId: 'com.complexia.orion',
           productName: 'Durango Code',
           artifactName: 'Durango-Code-Setup-${version}-${arch}.${ext}',
+          // electron-builder publishes to GitHub Releases on its own when it
+          // runs in CI for a tag; scripts/deploy.mjs uploads to R2 instead.
+          publish: null,
           win: { icon: path.join(__dirname, 'assets', 'icon.ico') },
           nsis: {
             // Per-user install under %LOCALAPPDATA%: no UAC prompt, and
