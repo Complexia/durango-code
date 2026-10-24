@@ -175,8 +175,26 @@ console.log('ok  remote turns reject terminal-only threads before routing');
   );
   assert.deepEqual(
     remoteAgentSettingsPatch(emptyThread, codexModel, { reasoningEffort: 'max' }),
+    { codexReasoningEffort: 'max' },
+    'GPT-5.6 Sol accepts Max like the GPT-6 family'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(
+      emptyThread,
+      { ...gpt6SolModel, reasoningEfforts: ['low', 'medium', 'high'] },
+      { reasoningEffort: 'max' }
+    ),
     {},
-    'GPT-5.6 models must not inherit the GPT-6-only Max tier'
+    'live-catalog tiers replace the static Codex sets'
+  );
+  assert.deepEqual(
+    remoteAgentSettingsPatch(
+      emptyThread,
+      { ...opus55Model, reasoningEfforts: ['low', 'medium', 'high', 'max'] },
+      { reasoningEffort: 'ultracode' }
+    ),
+    {},
+    'Ultracode needs a model whose catalog offers Extra High'
   );
   assert.deepEqual(
     remoteAgentSettingsPatch(emptyThread, opus55Model, {

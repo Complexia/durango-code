@@ -93,19 +93,20 @@ import {
   agentProviders,
   claudeCodeCliModelId,
   claudeContextWindowOptions,
-  claudeReasoningOptions,
+  claudeReasoningOptionsForModel,
   codexReasoningOptionsForModel,
   codexServiceTierOptions,
   defaultAgentModelId,
   defaultClaudeContextWindow,
   defaultClaudeReasoningEffort,
   defaultCodexServiceTier,
-  defaultMuseReasoningEffort,
+  getEffectiveClaudeReasoningEffort,
   getEffectiveCodexReasoningEffort,
   getEffectiveGrokReasoningEffort,
+  getEffectiveMuseReasoningEffort,
   getEffectiveOpenCodeReasoningEffort,
   grokReasoningOptionsForModel,
-  museReasoningOptions,
+  museReasoningOptionsForModel,
   openCodeReasoningOptionsForModel,
   fallbackAgentModels,
   findAgentModel,
@@ -209,6 +210,7 @@ import {
 } from './app/durangoChats';
 import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
 import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
+import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
 import {
   addPromptContext,
   buildSlashCommandCandidates,
@@ -411,17 +413,9 @@ const epicPrStatus = (epic: Pick<Epic, 'prUrl' | 'prState'> | undefined | null):
 
 // Default order for Orion's hidden text-generation turns (thread titles, epic
 // commit messages, PR descriptions) when the user hasn't picked a model in
-// Settings. One entry per provider — the fastest model that provider offers —
-// so a user with a single harness gets that harness's quick model, and a user
-// with several gets them in this order. Falls through to any usable model.
-const UTILITY_MODEL_PREFERENCE = [
-  'codex:gpt-6-luna',
-  'grok:grok-composer-2.5-fast',
-  'cursor:composer-2.5',
-  'claude:claude-haiku-5-5',
-  'kimi:kimi-code/kimi-for-coding',
-  'muse:muse-spark-1.3',
-];
+// Settings. There is deliberately no further fallback: with neither model
+// usable, the user is asked to pick one (TextGenerationModelPrompt).
+const UTILITY_MODEL_PREFERENCE = ['codex:gpt-6-luna', 'claude:claude-haiku-5-5'];
 
 type ReasoningOption = { value: string; label: string };
 
@@ -430,9 +424,9 @@ const reasoningOptionsForModel = (model: AgentModel | null | undefined): Reasoni
     options.map(({ value, label }) => ({ value, label }));
   if (!model) return [];
   if (model.providerId === 'codex') return toOptions(codexReasoningOptionsForModel(model));
-  if (model.providerId === 'claude') return toOptions(claudeReasoningOptions);
+  if (model.providerId === 'claude') return toOptions(claudeReasoningOptionsForModel(model));
   if (model.providerId === 'grok') return toOptions(grokReasoningOptionsForModel(model));
-  if (model.providerId === 'muse') return toOptions(museReasoningOptions);
+  if (model.providerId === 'muse') return toOptions(museReasoningOptionsForModel(model));
   if (model.providerId === 'opencode') return toOptions(openCodeReasoningOptionsForModel(model));
   return [];
 };
@@ -440,9 +434,9 @@ const reasoningOptionsForModel = (model: AgentModel | null | undefined): Reasoni
 const defaultReasoningEffortForModel = (model: AgentModel | null | undefined): string | null => {
   if (!model) return null;
   if (model.providerId === 'codex') return getEffectiveCodexReasoningEffort(model, undefined);
-  if (model.providerId === 'claude') return defaultClaudeReasoningEffort;
+  if (model.providerId === 'claude') return getEffectiveClaudeReasoningEffort(model, undefined);
   if (model.providerId === 'grok') return getEffectiveGrokReasoningEffort(model, undefined);
-  if (model.providerId === 'muse') return defaultMuseReasoningEffort;
+  if (model.providerId === 'muse') return getEffectiveMuseReasoningEffort(model, undefined);
   if (model.providerId === 'opencode') return getEffectiveOpenCodeReasoningEffort(model, undefined);
   return null;
 };
@@ -989,6 +983,10 @@ const App: React.FC = () => {
     });
   }, []);
   const [agentModels, setAgentModels] = useState<AgentModel[]>(fallbackAgentModels);
+  // Whether agentModels holds the main process's list (with availability)
+  // rather than the static fallback, which claims every model is usable.
+  const [agentModelsLoaded, setAgentModelsLoaded] = useState(false);
+  const [textGenerationPromptDismissed, setTextGenerationPromptDismissed] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState('');
   // Settings → General → Text generation drives its own copy of the picker
@@ -1815,11 +1813,15 @@ const App: React.FC = () => {
     selectedCodexReasoningOptions.find((option) => option.value === selectedCodexReasoning)?.label ?? 'Medium';
   const selectedCodexServiceTierLabel =
     codexServiceTierOptions.find((option) => option.value === selectedCodexServiceTier)?.label ?? 'Standard';
-  const selectedClaudeReasoning = selectedThread?.claudeReasoningEffort ?? defaultClaudeReasoningEffort;
+  const selectedClaudeReasoningOptions = claudeReasoningOptionsForModel(selectedAgentModel);
+  const selectedClaudeReasoning = getEffectiveClaudeReasoningEffort(
+    selectedAgentModel,
+    selectedThread?.claudeReasoningEffort
+  );
   const selectedClaudeContextWindow = selectedThread?.claudeContextWindow ?? defaultClaudeContextWindow;
   const effectiveClaudeContextWindow = getEffectiveClaudeContextWindow(selectedAgentModel, selectedClaudeContextWindow);
   const selectedClaudeReasoningLabel =
-    claudeReasoningOptions.find((option) => option.value === selectedClaudeReasoning)?.label ?? 'High';
+    selectedClaudeReasoningOptions.find((option) => option.value === selectedClaudeReasoning)?.label ?? 'High';
   const selectedClaudeContextWindowLabel =
     claudeContextWindowOptions.find((option) => option.value === effectiveClaudeContextWindow)?.label ?? '200k';
   const selectedGrokReasoningOptions = grokReasoningOptionsForModel(selectedAgentModel);
@@ -1829,9 +1831,13 @@ const App: React.FC = () => {
   );
   const selectedGrokReasoningLabel =
     selectedGrokReasoningOptions.find((option) => option.value === selectedGrokReasoning)?.label ?? 'High';
-  const selectedMuseReasoning = selectedThread?.museReasoningEffort ?? defaultMuseReasoningEffort;
+  const selectedMuseReasoningOptions = museReasoningOptionsForModel(selectedAgentModel);
+  const selectedMuseReasoning = getEffectiveMuseReasoningEffort(
+    selectedAgentModel,
+    selectedThread?.museReasoningEffort
+  );
   const selectedMuseReasoningLabel =
-    museReasoningOptions.find((option) => option.value === selectedMuseReasoning)?.label ?? 'High';
+    selectedMuseReasoningOptions.find((option) => option.value === selectedMuseReasoning)?.label ?? 'High';
   const selectedOpenCodeReasoningOptions = openCodeReasoningOptionsForModel(selectedAgentModel);
   const selectedOpenCodeReasoning = getEffectiveOpenCodeReasoningEffort(
     selectedAgentModel,
@@ -2673,8 +2679,8 @@ const App: React.FC = () => {
     [enabledProviderIdSet, utilityCandidateModels]
   );
   // The model behind thread titles and epic commit/PR messages: the Settings
-  // pick when it's installed and its provider is enabled, else the fastest
-  // model on the first available provider in UTILITY_MODEL_PREFERENCE.
+  // pick when it's installed and its provider is enabled, else the first
+  // usable model in UTILITY_MODEL_PREFERENCE, else none.
   const resolvedUtilityModelId = useMemo(() => {
     const isUsable = (id: string | null | undefined): id is string => {
       if (!id) return false;
@@ -2683,13 +2689,7 @@ const App: React.FC = () => {
     };
     const preferred = textGenerationSettings?.modelId ?? null;
     if (isUsable(preferred)) return preferred;
-    for (const id of UTILITY_MODEL_PREFERENCE) {
-      if (isUsable(id)) return id;
-    }
-    return (
-      utilityCandidateModels.find((model) => model.available !== false && enabledProviderIdSet.has(model.providerId))
-        ?.id ?? null
-    );
+    return UTILITY_MODEL_PREFERENCE.find(isUsable) ?? null;
   }, [enabledProviderIdSet, textGenerationSettings?.modelId, utilityCandidateModels]);
   const resolvedUtilityModel = useMemo(
     () => utilityCandidateModels.find((model) => model.id === resolvedUtilityModelId) ?? null,
@@ -2859,6 +2859,7 @@ const App: React.FC = () => {
       const models = await window.orion.listAgentModels({ force });
       if (models.length > 0) {
         setAgentModels(models);
+        setAgentModelsLoaded(true);
       }
     } catch {
       // The fallback catalog remains usable when the bridge is unavailable.
@@ -2889,6 +2890,15 @@ const App: React.FC = () => {
       window.clearInterval(interval);
     };
   }, [refreshAgentModels, refreshProviderUpdates]);
+
+  // Background discovery refreshes the main-process catalog; pick up the
+  // cached result whenever it changes.
+  useEffect(() => {
+    if (!window.orion?.onAgentModelsChanged) return undefined;
+    return window.orion.onAgentModelsChanged(() => {
+      void refreshAgentModels();
+    });
+  }, [refreshAgentModels]);
 
   useEffect(() => {
     if (!window.orion?.onProviderAuthenticated) return undefined;
@@ -3231,6 +3241,18 @@ const App: React.FC = () => {
       .catch(() => {});
   }, [storeHydrated, durangoSettingsForMain, dispatchProjectsSignature]);
   // One-time "your coding work now syncs" notice (workspaceSyncConsent.ts).
+  // No default text-generation model and no usable pick: ask, once per launch,
+  // as long as there is something installed to choose from.
+  const showTextGenerationModelPrompt =
+    storeHydrated &&
+    agentModelsLoaded &&
+    !resolvedUtilityModelId &&
+    !textGenerationPromptDismissed &&
+    !settingsOpen &&
+    utilityCandidateModels.some(
+      (model) => model.available !== false && enabledProviderIdSet.has(model.providerId)
+    );
+
   const showWorkspaceSyncNotice =
     storeHydrated && shouldShowWorkspaceSyncNotice(workspaceSyncSettings, accountState.authenticated);
   const acknowledgeWorkspaceSyncNotice = useCallback(() => {
@@ -8547,7 +8569,7 @@ const App: React.FC = () => {
           : {}),
         ...(model.providerId === 'claude'
           ? {
-              claudeReasoningEffort: thread.claudeReasoningEffort ?? defaultClaudeReasoningEffort,
+              claudeReasoningEffort: getEffectiveClaudeReasoningEffort(model, thread.claudeReasoningEffort),
               claudeContextWindow: getEffectiveClaudeContextWindow(
                 model,
                 thread.claudeContextWindow ?? defaultClaudeContextWindow
@@ -8561,7 +8583,7 @@ const App: React.FC = () => {
           : {}),
         ...(model.providerId === 'muse'
           ? {
-              museReasoningEffort: thread.museReasoningEffort ?? defaultMuseReasoningEffort,
+              museReasoningEffort: getEffectiveMuseReasoningEffort(model, thread.museReasoningEffort),
             }
           : {}),
         ...(model.providerId === 'opencode'
@@ -9095,7 +9117,7 @@ const App: React.FC = () => {
           // replace) the thread's persistent claude session.
           aside: true,
           providerOptions: normalizedProviderSettings.claude?.options,
-          claudeReasoningEffort: thread.claudeReasoningEffort ?? defaultClaudeReasoningEffort,
+          claudeReasoningEffort: getEffectiveClaudeReasoningEffort(model, thread.claudeReasoningEffort),
           claudeContextWindow: getEffectiveClaudeContextWindow(
             model,
             thread.claudeContextWindow ?? defaultClaudeContextWindow
@@ -12037,7 +12059,7 @@ const App: React.FC = () => {
       <div className="codex-settings-section">
         <div className="codex-settings-heading">Reasoning</div>
         <div className="codex-settings-options">
-          {museReasoningOptions.map((option) => {
+          {selectedMuseReasoningOptions.map((option) => {
             const selected = selectedMuseReasoning === option.value;
             return (
               <button
@@ -12093,7 +12115,7 @@ const App: React.FC = () => {
         <div className="codex-settings-section">
           <div className="codex-settings-heading">Reasoning</div>
           <div className="codex-settings-options">
-            {claudeReasoningOptions.map((option) => {
+            {selectedClaudeReasoningOptions.map((option) => {
               const selected = selectedClaudeReasoning === option.value;
               const isDefault = option.value === defaultClaudeReasoningEffort;
               return (
@@ -13551,6 +13573,15 @@ const App: React.FC = () => {
             {providerUpdatesRunning ? 'View progress' : 'Update providers'}
           </button>
         </div>
+      )}
+
+      {showTextGenerationModelPrompt && (
+        <TextGenerationModelPrompt
+          providers={utilityProviders}
+          models={utilityCandidateModels}
+          onSelect={(model) => setTextGenerationSettings({ modelId: model.id })}
+          onDismiss={() => setTextGenerationPromptDismissed(true)}
+        />
       )}
 
       {showWorkspaceSyncNotice && (

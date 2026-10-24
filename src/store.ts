@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware';
-import { claudeModelSuccessors } from './agentCatalog';
+import { agentModelSuccessors } from './agentCatalog';
 import { createThreadBranchFamily } from './thread-branching';
 import { defaultWorkspaceSyncConsentSettings, migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent';
 
@@ -182,8 +182,9 @@ export const defaultEpicsSettings: EpicsSettings = {
 export type TextGenerationSettings = {
   /**
    * AgentModel id. `null` means the user has never picked one, so the model is
-   * resolved from the built-in preference order (see UTILITY_MODEL_PREFERENCE
-   * in App.tsx) against the installed, enabled providers.
+   * resolved from the built-in preference order (GPT-6 Luna, then Claude Haiku
+   * 5.5; see UTILITY_MODEL_PREFERENCE in App.tsx) against the installed,
+   * enabled providers, and the user is asked to pick when neither is usable.
    */
   modelId: string | null;
   /**
@@ -645,7 +646,7 @@ export type Thread = {
   claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
   claudeContextWindow?: '200k' | '1m';
   grokReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
-  museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'ultra';
+  museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   openCodeReasoningEffort?: string;
   createdAt: string;
   /** Removed from the sidebar Recent agents list (still listed under its project). */
@@ -2708,10 +2709,10 @@ export const useOrionStore = create<OrionState>()(
             : {}),
           ...(persisted as Partial<OrionState>)?.textGenerationSettings,
         };
-        // Role and text-generation picks persisted on a retired Claude model
-        // (every store saves the full role map, so the old Haiku 4.5 exploring
+        // Role and text-generation picks persisted on a retired model (every
+        // store saves the full role map, so the old Haiku 4.5 exploring
         // default is on disk for everyone) move to that model's successor.
-        const upgradeModelId = (id: string) => claudeModelSuccessors[id] ?? id;
+        const upgradeModelId = (id: string) => agentModelSuccessors[id] ?? id;
         merged.orchestrationSettings = {
           ...defaultOrchestrationSettings,
           ...merged.orchestrationSettings,

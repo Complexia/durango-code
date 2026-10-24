@@ -3,22 +3,48 @@ import os from 'node:os';
 import path from 'node:path';
 import { checkCommandAvailable, execFileAsync, shellPathSyncPromise } from './shell-env.js';
 
+// Canonical low→high order of every reasoning tier any harness advertises.
+export const reasoningEffortTiers = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+
+// Keep an effort the model supports; otherwise step down to the nearest tier
+// it does support (Ultra → Max → Extra High), or use the model's default.
+export const clampReasoningEffort = (effort, efforts, fallback) => {
+  if (!effort) return fallback;
+  if (efforts.includes(effort)) return effort;
+  for (let rank = reasoningEffortTiers.indexOf(effort) - 1; rank >= 0; rank -= 1) {
+    if (efforts.includes(reasoningEffortTiers[rank])) return reasoningEffortTiers[rank];
+  }
+  return fallback;
+};
+
+// Effort tiers discovered from a provider's live catalog, when there are any.
+export const discoveredReasoningEfforts = (model) =>
+  Array.isArray(model?.reasoningEfforts) && model.reasoningEfforts.length > 0 ? model.reasoningEfforts : null;
+
 export const defaultCodexReasoningEffort = 'medium';
-// The GPT-5.6 family defaults to high effort. The GPT-6 family (Astra, 6.1 Sol,
-// Sol, Luna) uses the Codex default (Low for 6.1 Sol, Medium otherwise) and also
-// accepts Max (and Ultra, except Luna).
+// Static Codex tiers for when the CLI's models_cache.json is unavailable
+// (mirrors that cache as of Codex 0.163). The GPT-6 and GPT-5.6 families
+// accept Max and Ultra, except Luna, which stops at Max; Sol models default to
+// Low, everything else to Medium.
 export const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
 export const gpt6CodexModelSlugs = new Set(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']);
-export const codexReasoningEffortForModel = (model, effort) => {
-  if (gpt6CodexModelSlugs.has(model.slug)) {
-    if (effort === 'ultra' && model.slug === 'gpt-6-luna') return 'max';
-    return effort || (model.slug === 'gpt-6.1-sol' ? 'low' : defaultCodexReasoningEffort);
+const codexLowDefaultModelSlugs = new Set(['gpt-6.1-sol', 'gpt-5.6-sol']);
+const codexNoUltraModelSlugs = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
+export const codexReasoningEffortsForModel = (model) => {
+  const discovered = discoveredReasoningEfforts(model);
+  if (discovered) return discovered;
+  if (!gpt6CodexModelSlugs.has(model.slug) && !gpt56CodexModelSlugs.has(model.slug)) {
+    return ['low', 'medium', 'high', 'xhigh'];
   }
-  const isGpt56 = gpt56CodexModelSlugs.has(model.slug);
-  if (!effort) return isGpt56 ? 'high' : defaultCodexReasoningEffort;
-  if (effort === 'ultra' && !isGpt56) return 'xhigh';
-  return effort;
+  return codexNoUltraModelSlugs.has(model.slug)
+    ? ['low', 'medium', 'high', 'xhigh', 'max']
+    : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 };
+export const codexDefaultReasoningEffortForModel = (model) =>
+  model.defaultReasoningEffort ||
+  (codexLowDefaultModelSlugs.has(model.slug) ? 'low' : defaultCodexReasoningEffort);
+export const codexReasoningEffortForModel = (model, effort) =>
+  clampReasoningEffort(effort, codexReasoningEffortsForModel(model), codexDefaultReasoningEffortForModel(model));
 export const defaultCodexServiceTier = 'default';
 export const defaultClaudeReasoningEffort = 'high';
 // Matches the muse CLI's own --reasoning-effort default.
@@ -188,10 +214,29 @@ export const cursorFallbackModels = [
   },
 ];
 
-// Kimi Code CLI ships these three managed models out of the box; the live
-// list (including any user-added providers) is discovered per launch via
-// `kimi provider list --json` and replaces this block when available.
+// Kimi Code's managed models (K3.1 Pro shipped 2026-10-23), in the order
+// listKimiModels pins them; the live list (including any user-added
+// providers) comes from `kimi provider list --json` and replaces this block.
 export const kimiFallbackModels = [
+  {
+    id: 'kimi:kimi-code/k3.1-pro',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3.1 Pro',
+    slug: 'kimi-code/k3.1-pro',
+    command: 'kimi',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
+    id: 'kimi:kimi-code/k3.1-pro-highspeed',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3.1 Pro Highspeed',
+    slug: 'kimi-code/k3.1-pro-highspeed',
+    command: 'kimi',
+    shortcut: '⌘2',
+  },
   {
     id: 'kimi:kimi-code/k3',
     providerId: 'kimi',
@@ -199,42 +244,59 @@ export const kimiFallbackModels = [
     label: 'K3',
     slug: 'kimi-code/k3',
     command: 'kimi',
-    shortcut: '⌘1',
+    shortcut: '⌘3',
     favorite: true,
   },
   {
     id: 'kimi:kimi-code/kimi-for-coding',
     providerId: 'kimi',
     providerLabel: 'Kimi',
-    label: 'K2.7 Coding',
+    label: 'K2.8 Preview',
     slug: 'kimi-code/kimi-for-coding',
     command: 'kimi',
-    shortcut: '⌘2',
+    shortcut: '⌘4',
   },
   {
     id: 'kimi:kimi-code/kimi-for-coding-highspeed',
     providerId: 'kimi',
     providerLabel: 'Kimi',
-    label: 'K2.7 Coding Highspeed',
+    label: 'K2.7 Code Highspeed',
     slug: 'kimi-code/kimi-for-coding-highspeed',
     command: 'kimi',
-    shortcut: '⌘3',
+    shortcut: '⌘5',
+  },
+  {
+    id: 'kimi:kimi-code/k3-256k',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3-256k',
+    slug: 'kimi-code/k3-256k',
+    command: 'kimi',
+    shortcut: '⌘6',
   },
 ];
 
-// Muse Code (Meta) ships the Muse Spark family. Each generation comes in two
-// tiers: the standard model and a discounted "contributor" tier whose
-// sessions may be used by Meta for product improvement. The CLI caches the
-// provider's live catalog on disk after each run, which listMuseModels reads
-// to replace this block; these are the current rows as of Muse Code 1.0.2.
+// Muse Code (Meta) ships the Muse Wonder and Muse Spark families. Wonder Full
+// is subscription-only (Power/Maximum plans) and never appears in the API.
+// Each Spark generation comes in two tiers: the standard model and a
+// discounted "contributor" tier whose sessions may be used by Meta for
+// product improvement. The CLI caches the provider's live catalog on disk
+// after each run, which listMuseModels reads to replace this block; these
+// are the current rows as of Muse Code 1.4.12.
 export const museFallbackModelSpecs = [
+  ['muse-wonder-full-1.0', 'Muse Wonder Full 1.0'],
+  ['muse-wonder-1.0', 'Muse Wonder 1.0'],
   ['muse-spark-1.3', 'Muse Spark 1.3'],
   ['muse-spark-1.3-contributor', 'Muse Spark 1.3 Contributor'],
   ['muse-spark-1.2', 'Muse Spark 1.2'],
   ['muse-spark-1.2-contributor', 'Muse Spark 1.2 Contributor'],
 ];
 
-export const museFavoriteModelSlugs = new Set(['muse-spark-1.3', 'muse-spark-1.3-contributor']);
+export const museFavoriteModelSlugs = new Set([
+  'muse-wonder-1.0',
+  'muse-spark-1.3',
+  'muse-spark-1.3-contributor',
+]);
 
 export const museFallbackModels = museFallbackModelSpecs.map(([slug, label], index) => ({
   id: `muse:${slug}`,
@@ -252,12 +314,14 @@ export const museFallbackModels = museFallbackModelSpecs.map(([slug, label], ind
 // through `opencode models`. Keep its current built-ins as a launch fallback;
 // live discovery replaces this entire block whenever the CLI is available.
 export const openCodeFallbackModels = [
-  ['opencode/x-preview-f-free', '0x Alpha Free (Unlimited)', ['low', 'high', 'max']],
+  ['opencode/flint-40b-free', 'Flint 40B Free', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['opencode/nemotron-3.5-super-vl-free', 'Nemotron 3.5 Super VL Free', ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']],
+  ['opencode/beam-free', 'Beam Free', ['low', 'medium', 'high', 'xhigh', 'max']],
+  ['opencode/mimo-v2.6-flash-free', 'MiMo-V2.6-Flash Free', []],
+  ['opencode/deepseek-v4.1-flash-free', 'DeepSeek V4.1 Flash Free', ['low', 'high', 'max']],
+  ['opencode/glm-5.3-flash-free', 'GLM-5.3-Flash Free', ['low', 'high', 'max']],
   ['opencode/nemotron-3.5-lightning-free', 'Nemotron 3.5 Lightning Free', []],
-  ['opencode/muse-spark-1.2-contributor-free', 'Muse Spark 1.2 Free', ['minimal', 'low', 'medium', 'high', 'xhigh']],
-  ['opencode/hy3-free', 'Hy3 Free', ['low', 'medium', 'high']],
   ['opencode/nemotron-3-ultra-free', 'Nemotron 3 Ultra Free', []],
-  ['opencode/mimo-v2.5-free', 'MiMo V2.5 Free', []],
   ['opencode/big-pickle', 'Big Pickle', []],
 ].map(([slug, label, reasoningVariants], index) => ({
   id: `opencode:${slug}`,
@@ -270,6 +334,18 @@ export const openCodeFallbackModels = [
   ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
   favorite: slug === 'opencode/big-pickle',
 }));
+
+// Embedded-terminal pseudo-model: the thread runs the interactive `claude`
+// TUI in a PTY (see the terminal:* IPC handlers), never agent:runTurn. Live
+// Claude discovery re-appends it after the discovered models.
+export const claudeCodeCliModel = {
+  id: 'claude:claude-code-cli',
+  providerId: 'claude',
+  providerLabel: 'Claude',
+  label: 'Claude Code CLI',
+  slug: 'claude-code-cli',
+  command: 'claude',
+};
 
 export const agentModels = [
   // Pseudo-model: the renderer resolves it to the configured main-driver
@@ -321,15 +397,15 @@ export const agentModels = [
     command: 'grok',
     shortcut: '⌘4',
   },
+  // Codex's own priority order (models_cache.json); live discovery replaces
+  // this block whenever the CLI has cached its catalog.
   {
-    id: 'grok:grok-composer-2.5-fast',
-    providerId: 'grok',
-    providerLabel: 'Grok',
-    label: 'Composer 2.5 Fast',
-    slug: 'grok-composer-2.5-fast',
-    command: 'grok',
-    shortcut: '⌘5',
-    favorite: true,
+    id: 'codex:gpt-6.1-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6.1 Sol',
+    slug: 'gpt-6.1-sol',
+    command: 'codex',
   },
   {
     id: 'codex:gpt-6-astra',
@@ -340,11 +416,11 @@ export const agentModels = [
     command: 'codex',
   },
   {
-    id: 'codex:gpt-6.1-sol',
+    id: 'codex:gpt-6-sol',
     providerId: 'codex',
     providerLabel: 'Codex',
-    label: 'GPT-6.1 Sol',
-    slug: 'gpt-6.1-sol',
+    label: 'GPT-6 Sol',
+    slug: 'gpt-6-sol',
     command: 'codex',
   },
   {
@@ -353,14 +429,6 @@ export const agentModels = [
     providerLabel: 'Codex',
     label: 'GPT-6 Luna',
     slug: 'gpt-6-luna',
-    command: 'codex',
-  },
-  {
-    id: 'codex:gpt-6-sol',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-6 Sol',
-    slug: 'gpt-6-sol',
     command: 'codex',
   },
   {
@@ -385,38 +453,6 @@ export const agentModels = [
     providerLabel: 'Codex',
     label: 'GPT-5.6 Luna',
     slug: 'gpt-5.6-luna',
-    command: 'codex',
-  },
-  {
-    id: 'codex:gpt-5.5',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.5',
-    slug: 'gpt-5.5',
-    command: 'codex',
-  },
-  {
-    id: 'codex:gpt-5.4',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.4',
-    slug: 'gpt-5.4',
-    command: 'codex',
-  },
-  {
-    id: 'codex:gpt-5.4-mini',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.4 Mini',
-    slug: 'gpt-5.4-mini',
-    command: 'codex',
-  },
-  {
-    id: 'codex:gpt-5.3-codex-spark',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.3 Codex Spark',
-    slug: 'gpt-5.3-codex-spark',
     command: 'codex',
   },
   {
@@ -473,17 +509,7 @@ export const agentModels = [
     command: 'claude',
     shortcut: '⌘6',
   },
-  {
-    // Embedded-terminal pseudo-model: the thread runs the interactive
-    // `claude` TUI in a PTY (see the terminal:* IPC handlers), never
-    // agent:runTurn.
-    id: 'claude:claude-code-cli',
-    providerId: 'claude',
-    providerLabel: 'Claude',
-    label: 'Claude Code CLI',
-    slug: 'claude-code-cli',
-    command: 'claude',
-  },
+  claudeCodeCliModel,
   ...kimiFallbackModels,
   ...museFallbackModels,
   ...cursorFallbackModels,
@@ -622,6 +648,9 @@ export const listCursorAgentModels = async () => {
   return [];
 };
 
+export const kimiPinnedModelAliases = ['kimi-code/k3.1-pro', 'kimi-code/k3.1-pro-highspeed', 'kimi-code/k3'];
+export const kimiFavoriteModelAliases = new Set(['kimi-code/k3.1-pro', 'kimi-code/k3']);
+
 // Kimi models come from the CLI's own provider registry (managed kimi-code
 // models plus any custom providers the user imported). Aliases double as
 // model slugs: they are what `-m` and the ACP model config option accept.
@@ -634,10 +663,15 @@ export const listKimiModels = async () => {
     });
     const parsed = JSON.parse(String(stdout || '').trim());
     const models = parsed?.models && typeof parsed.models === 'object' ? parsed.models : {};
-    // The CLI registry's key order puts newer models last; pin K3 to the top
-    // of the picker (stable sort keeps the rest in registry order).
+    // The CLI registry's key order puts newer models last; pin the current
+    // flagships to the top of the picker (stable sort keeps the rest in
+    // registry order).
+    const pinRank = (alias) => {
+      const rank = kimiPinnedModelAliases.indexOf(alias);
+      return rank === -1 ? kimiPinnedModelAliases.length : rank;
+    };
     return Object.entries(models)
-      .sort(([a], [b]) => Number(b === 'kimi-code/k3') - Number(a === 'kimi-code/k3'))
+      .sort(([a], [b]) => pinRank(a) - pinRank(b))
       .map(([alias, value], index) => {
         if (!alias || typeof alias !== 'string') return null;
         const label =
@@ -651,7 +685,7 @@ export const listKimiModels = async () => {
           slug: alias,
           command: 'kimi',
           ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
-          favorite: alias === 'kimi-code/k3',
+          favorite: kimiFavoriteModelAliases.has(alias),
         };
       })
       .filter(Boolean);
@@ -659,6 +693,22 @@ export const listKimiModels = async () => {
     return [];
   }
 };
+
+// Pull the effort tier names out of a catalog's per-model effort list,
+// ordered low → high.
+const effortValues = (list, key) =>
+  [...new Set(
+    (Array.isArray(list) ? list : [])
+      .map((entry) => (typeof entry === 'string' ? entry : entry?.[key]))
+      .filter((value) => typeof value === 'string' && value)
+  )].sort((a, b) => effortRank(a) - effortRank(b));
+
+const effortRank = (effort) => {
+  const rank = reasoningEffortTiers.indexOf(effort);
+  return rank === -1 ? reasoningEffortTiers.length : rank;
+};
+
+const readJsonFile = async (filePath) => JSON.parse(await fs.readFile(filePath, 'utf8'));
 
 // Muse Code has no models subcommand, but it caches each provider profile's
 // live catalog under its XDG data dir after every run (rows carry model_id,
@@ -710,16 +760,20 @@ export const museModelsFromCatalogRows = (rows) => {
     );
   });
   const newestStandard = records.find((record) => !record.contributor) ?? records[0];
-  return records.map(({ slug, row }, index) => ({
-    id: `muse:${slug}`,
-    providerId: 'muse',
-    providerLabel: 'Muse',
-    label: humanizeModelSlug(row.display_label || slug),
-    slug,
-    command: 'muse',
-    ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
-    favorite: row.is_default === true || slug === newestStandard?.slug,
-  }));
+  return records.map(({ slug, row }, index) => {
+    const reasoningEfforts = effortValues(row.reasoning_effort_variants, 'tier');
+    return {
+      id: `muse:${slug}`,
+      providerId: 'muse',
+      providerLabel: 'Muse',
+      label: humanizeModelSlug(row.display_label || slug),
+      slug,
+      command: 'muse',
+      ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
+      ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+      favorite: row.is_default === true || slug === newestStandard?.slug,
+    };
+  });
 };
 
 export const listMuseModels = async () => {
@@ -735,6 +789,169 @@ export const listMuseModels = async () => {
       } catch {}
     }
     return museModelsFromCatalogRows(rows);
+  } catch {
+    return [];
+  }
+};
+
+// Codex caches the account's model catalog (the list its own /model picker
+// shows) in $CODEX_HOME/models_cache.json. Rows carry a visibility
+// ("list"/"hide"), a priority (lower first), and per-model reasoning tiers
+// and default, so reading it costs no process spawn.
+export const codexModelsCachePath = () =>
+  path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'models_cache.json');
+
+// Codex hyphenates the variant word ("GPT-6.1-Sol"); the picker spaces it
+// ("GPT-6.1 Sol") like the static catalog.
+export const codexModelLabel = (displayName, slug) =>
+  String(displayName || '').trim().replace(/-(?=[A-Za-z])/g, ' ') || humanizeModelSlug(slug);
+
+export const codexModelsFromCache = (cache) => {
+  const priority = (row) => (typeof row.priority === 'number' ? row.priority : Number.MAX_SAFE_INTEGER);
+  const seen = new Set();
+  return (Array.isArray(cache?.models) ? cache.models : [])
+    .filter((row) => row && typeof row.slug === 'string' && row.slug.trim() && row.visibility !== 'hide')
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => priority(a.row) - priority(b.row) || a.index - b.index)
+    .filter(({ row }) => !seen.has(row.slug) && seen.add(row.slug))
+    .map(({ row }) => {
+      const slug = row.slug.trim();
+      const reasoningEfforts = effortValues(row.supported_reasoning_levels, 'effort');
+      return {
+        id: `codex:${slug}`,
+        providerId: 'codex',
+        providerLabel: 'Codex',
+        label: codexModelLabel(row.display_name, slug),
+        slug,
+        command: 'codex',
+        ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
+        ...(typeof row.default_reasoning_level === 'string' && row.default_reasoning_level
+          ? { defaultReasoningEffort: row.default_reasoning_level }
+          : {}),
+      };
+    });
+};
+
+export const listCodexModels = async () => {
+  if (!(await checkCommandAvailable('codex'))) return [];
+  try {
+    return codexModelsFromCache(await readJsonFile(codexModelsCachePath()));
+  } catch {
+    return [];
+  }
+};
+
+// Grok Build caches the account's model catalog (what `grok models` prints)
+// in ~/.grok/models_cache.json, keyed by model id in picker order, with each
+// model's reasoning tiers and default.
+export const grokModelsCachePath = () => path.join(os.homedir(), '.grok', 'models_cache.json');
+
+export const grokFavoriteModelSlugs = new Set(['grok-4.7']);
+
+export const grokModelsFromCache = (cache) => {
+  const models = [];
+  const entries = cache?.models && typeof cache.models === 'object' ? Object.entries(cache.models) : [];
+  for (const [key, value] of entries) {
+    const info = value?.info && typeof value.info === 'object' ? value.info : {};
+    const slug = String(info.id || key || '').trim();
+    if (!slug || info.hidden === true || models.some((model) => model.slug === slug)) continue;
+    const reasoningEfforts =
+      info.supports_reasoning_effort === false ? [] : effortValues(info.reasoning_efforts, 'value');
+    const defaultReasoningEffort =
+      (Array.isArray(info.reasoning_efforts) && info.reasoning_efforts.find((effort) => effort?.default)?.value) ||
+      info.reasoning_effort;
+    const index = models.length;
+    models.push({
+      id: `grok:${slug}`,
+      providerId: 'grok',
+      providerLabel: 'Grok',
+      label: (typeof info.name === 'string' && info.name.trim()) || humanizeModelSlug(slug),
+      slug,
+      command: 'grok',
+      ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
+      ...(reasoningEfforts.length > 0 && typeof defaultReasoningEffort === 'string' && defaultReasoningEffort
+        ? { defaultReasoningEffort }
+        : {}),
+      ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+      favorite: grokFavoriteModelSlugs.has(slug),
+    });
+  }
+  return models;
+};
+
+export const listGrokModels = async () => {
+  if (!(await checkCommandAvailable('grok'))) return [];
+  try {
+    return grokModelsFromCache(await readJsonFile(grokModelsCachePath()));
+  } catch {
+    return [];
+  }
+};
+
+// Claude Code caches its model picker catalog per account under
+// <config dir>/cache/model-catalog. Models in the "main" section are the
+// current lineup; of the older "overflow" section only the models listed
+// here stay in the picker (Sonnet 5, Haiku 4.5 and the 4.x line are left out
+// on purpose).
+export const claudeModelCatalogDir = () =>
+  path.join(
+    process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'),
+    'cache',
+    'model-catalog'
+  );
+
+export const claudeOverflowModelSlugs = new Set(['claude-fable-5', 'claude-opus-5']);
+
+export const claudeModelsFromCatalog = (cacheFile) => {
+  const rows = cacheFile?.catalog?.config?.models;
+  const seen = new Set();
+  const kept = (Array.isArray(rows) ? rows : []).filter((row) => {
+    const slug = typeof row?.id === 'string' ? row.id.trim() : '';
+    if (!slug || seen.has(slug) || row.hidden === true) return false;
+    if (row.section !== 'main' && !claudeOverflowModelSlugs.has(slug)) return false;
+    seen.add(slug);
+    return true;
+  });
+  // Main section first, each section in catalog order.
+  const ordered = [
+    ...kept.filter((row) => row.section === 'main'),
+    ...kept.filter((row) => row.section !== 'main'),
+  ];
+  return ordered.map((row, index) => {
+    const slug = row.id.trim();
+    const name = typeof row.name === 'string' ? row.name.trim() : '';
+    const reasoningEfforts = effortValues(row.runtime?.effort_levels);
+    const defaultReasoningEffort = row.runtime?.default_effort;
+    return {
+      id: `claude:${slug}`,
+      providerId: 'claude',
+      providerLabel: 'Claude',
+      label: name ? (/^claude\b/i.test(name) ? name : `Claude ${name}`) : humanizeModelSlug(slug),
+      slug,
+      command: 'claude',
+      ...(reasoningEfforts.length > 0 ? { reasoningEfforts } : {}),
+      ...(typeof defaultReasoningEffort === 'string' && defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+      ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+    };
+  });
+};
+
+// The catalog file most recently fetched belongs to the account Claude Code
+// is signed in to now. The embedded-terminal pseudo-model rides along.
+export const listClaudeModels = async () => {
+  if (!(await checkCommandAvailable('claude'))) return [];
+  try {
+    const catalogDir = claudeModelCatalogDir();
+    const files = (await fs.readdir(catalogDir)).filter((name) => name.endsWith('.json'));
+    let latest = null;
+    for (const name of files) {
+      try {
+        const parsed = await readJsonFile(path.join(catalogDir, name));
+        if (!latest || (Number(parsed?.fetchedAt) || 0) > (Number(latest?.fetchedAt) || 0)) latest = parsed;
+      } catch {}
+    }
+    const models = claudeModelsFromCatalog(latest);
+    return models.length > 0 ? [...models, claudeCodeCliModel] : [];
   } catch {
     return [];
   }
@@ -835,55 +1052,163 @@ export const spliceProviderModels = (models, providerId, replacements) => {
   ];
 };
 
-export const discoverAgentModels = async () => {
+// One live reader per provider. Codex, Grok, Claude and Muse parse the
+// catalog their CLI already caches on disk (no spawn, no auth); Cursor, Kimi
+// and OpenCode have to spawn their CLI. A reader returns [] when it cannot
+// discover anything, which keeps that provider's previous block.
+export const agentModelDiscoverers = {
+  grok: listGrokModels,
+  codex: listCodexModels,
+  claude: listClaudeModels,
+  kimi: listKimiModels,
+  muse: listMuseModels,
+  cursor: listCursorAgentModels,
+  opencode: listOpenCodeModels,
+};
+
+const providerCommands = {
+  grok: 'grok',
+  codex: 'codex',
+  claude: 'claude',
+  kimi: 'kimi',
+  muse: 'muse',
+  cursor: 'cursor-agent',
+  opencode: 'opencode',
+};
+
+// Discovered blocks replace the static ones in place; providers without a
+// block keep their static fallback.
+export const buildAgentModels = (providerBlocks) =>
+  Object.entries(providerBlocks).reduce(
+    (models, [providerId, block]) => spliceProviderModels(models, providerId, block),
+    agentModels
+  );
+
+export const discoverAgentModels = async (discoverers = agentModelDiscoverers) => {
   // Finder-launched builds start with launchd's minimal PATH. The renderer can
   // request models as soon as its window loads, so do not let that first
   // request cache fallback catalogs before the interactive-shell PATH arrives.
   await shellPathSyncPromise;
-  const [
-    discoveredCursorModels,
-    discoveredKimiModels,
-    discoveredMuseModels,
-    discoveredOpenCodeModels,
-  ] = await Promise.all([
-    listCursorAgentModels(),
-    listKimiModels(),
-    listMuseModels(),
-    listOpenCodeModels(),
-  ]);
-  let models = spliceProviderModels(agentModels, 'cursor', discoveredCursorModels);
-  models = spliceProviderModels(models, 'kimi', discoveredKimiModels);
-  models = spliceProviderModels(models, 'muse', discoveredMuseModels);
-  models = spliceProviderModels(models, 'opencode', discoveredOpenCodeModels);
-  return models;
+  return Object.fromEntries(
+    await Promise.all(
+      Object.entries(discoverers).map(async ([providerId, discover]) => [
+        providerId,
+        await discover().catch(() => []),
+      ])
+    )
+  );
 };
 
+// Model catalog cache. Stale-while-revalidate: once any catalog exists (from
+// this session or the on-disk copy of the last discovery), callers get it
+// immediately and an expired one refreshes in the background, so neither a
+// turn, a title generation nor a model switch ever waits on CLI probes. Only
+// the very first launch (no disk cache yet) or an explicit fresh request
+// waits for discovery. Listeners hear about every refresh that changes the
+// list, so the renderer can pick it up.
 export const AGENT_MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
-export let agentModelsDiscoveryPromise = null;
-export let cachedAgentModels = null;
-export let cachedAgentModelsAt = 0;
-export let agentModelsCacheGeneration = 0;
+const AGENT_MODELS_DISK_CACHE_VERSION = 1;
+let agentModelsCacheFile = null;
+let activeAgentModelDiscoverers = agentModelDiscoverers;
+let agentModelsDiskCacheLoad = Promise.resolve();
+let agentModelsDiscoveryPromise = null;
+let discoveredProviderModels = {};
+let cachedAgentModels = null;
+let cachedAgentModelsAt = 0;
+let agentModelsCacheGeneration = 0;
+const agentModelsListeners = new Set();
+
+export const onAgentModelsChanged = (listener) => {
+  agentModelsListeners.add(listener);
+  return () => agentModelsListeners.delete(listener);
+};
+
+// Only well-formed rows for the provider survive a reload, and the spawn
+// command always comes from this module rather than the file.
+const sanitizeProviderBlocks = (providers) =>
+  Object.fromEntries(
+    Object.entries(providers && typeof providers === 'object' ? providers : {})
+      .filter(([providerId, block]) => providerCommands[providerId] && Array.isArray(block))
+      .map(([providerId, block]) => [
+        providerId,
+        block
+          .filter(
+            (model) =>
+              model &&
+              model.providerId === providerId &&
+              typeof model.id === 'string' &&
+              typeof model.slug === 'string' &&
+              typeof model.label === 'string'
+          )
+          .map((model) => ({ ...model, command: providerCommands[providerId] })),
+      ])
+      .filter(([, block]) => block.length > 0)
+  );
+
+const loadAgentModelsDiskCache = async (filePath) => {
+  try {
+    const parsed = JSON.parse(await fs.readFile(filePath, 'utf8'));
+    // A discovery that finished first is newer than anything on disk.
+    if (parsed?.version !== AGENT_MODELS_DISK_CACHE_VERSION || cachedAgentModels) return;
+    discoveredProviderModels = sanitizeProviderBlocks(parsed.providers);
+    cachedAgentModels = buildAgentModels(discoveredProviderModels);
+    cachedAgentModelsAt = Math.min(Number(parsed.savedAt) || 0, Date.now());
+  } catch {}
+};
+
+const saveAgentModelsDiskCache = async (providers) => {
+  if (!agentModelsCacheFile) return;
+  const tempPath = `${agentModelsCacheFile}.${process.pid}.tmp`;
+  try {
+    await fs.writeFile(
+      tempPath,
+      JSON.stringify({ version: AGENT_MODELS_DISK_CACHE_VERSION, savedAt: Date.now(), providers })
+    );
+    await fs.rename(tempPath, agentModelsCacheFile);
+  } catch {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+  }
+};
+
+// Called once at startup with a path under userData. Tests swap in fake
+// discoverers so no provider CLI is spawned.
+export const configureAgentModelsCache = (filePath, { discoverers = agentModelDiscoverers } = {}) => {
+  agentModelsCacheFile = filePath;
+  activeAgentModelDiscoverers = discoverers;
+  agentModelsDiskCacheLoad = loadAgentModelsDiskCache(filePath);
+  return agentModelsDiskCacheLoad;
+};
+
+// Marks the catalog stale (after a CLI update or sign-in) without dropping
+// it: the next request still answers from it while a fresh discovery runs,
+// and a discovery already in flight is not committed.
 export const invalidateAgentModelsCache = () => {
   agentModelsCacheGeneration += 1;
   agentModelsDiscoveryPromise = null;
-  cachedAgentModels = null;
   cachedAgentModelsAt = 0;
 };
 
-export const getAgentModels = () => {
-  if (
-    cachedAgentModels &&
-    Date.now() - cachedAgentModelsAt < AGENT_MODELS_CACHE_TTL_MS
-  ) {
-    return Promise.resolve(cachedAgentModels);
-  }
+const refreshAgentModels = () => {
   if (agentModelsDiscoveryPromise) return agentModelsDiscoveryPromise;
-
   const cacheGeneration = agentModelsCacheGeneration;
-  const discovery = discoverAgentModels().then((models) => {
-    if (cacheGeneration === agentModelsCacheGeneration) {
-      cachedAgentModels = models;
-      cachedAgentModelsAt = Date.now();
+  const discovery = discoverAgentModels(activeAgentModelDiscoverers).then((blocks) => {
+    const providers = { ...discoveredProviderModels };
+    for (const [providerId, block] of Object.entries(blocks)) {
+      if (block.length > 0) providers[providerId] = block;
+    }
+    const models = buildAgentModels(providers);
+    if (cacheGeneration !== agentModelsCacheGeneration) return models;
+    const changed = !cachedAgentModels || JSON.stringify(models) !== JSON.stringify(cachedAgentModels);
+    discoveredProviderModels = providers;
+    cachedAgentModels = models;
+    cachedAgentModelsAt = Date.now();
+    if (changed) {
+      void saveAgentModelsDiskCache(providers);
+      for (const listener of agentModelsListeners) {
+        try {
+          listener(models);
+        } catch {}
+      }
     }
     return models;
   });
@@ -893,14 +1218,25 @@ export const getAgentModels = () => {
     }
   });
   agentModelsDiscoveryPromise = sharedDiscovery;
-  return agentModelsDiscoveryPromise;
+  return sharedDiscovery;
+};
+
+export const getAgentModels = async ({ fresh = false } = {}) => {
+  await agentModelsDiskCacheLoad;
+  if (cachedAgentModels && !fresh) {
+    if (Date.now() - cachedAgentModelsAt >= AGENT_MODELS_CACHE_TTL_MS) {
+      refreshAgentModels().catch(() => {});
+    }
+    return cachedAgentModels;
+  }
+  return refreshAgentModels();
 };
 
 // Shared by the agent:listModels IPC and the remote-control `models` request.
 // Availability is probed once per provider CLI (not per model), and the
 // internal `command` field never leaves the main process.
-export const listAgentModelsWithAvailability = async () => {
-  const models = await getAgentModels();
+export const listAgentModelsWithAvailability = async ({ fresh = false } = {}) => {
+  const models = await getAgentModels({ fresh });
   const uniqueCommands = [...new Set(models.map((model) => model.command).filter(Boolean))];
   const availability = new Map(
     await Promise.all(

@@ -831,7 +831,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     <div className="setting-label-title">Model</div>
                     <div className="setting-label-desc">
                       Writes Durango Code's short generated text: thread titles, epic commit messages from staged changes, and
-                      PR descriptions from branch changes. Defaults to the fastest model on the providers you have
+                      PR descriptions from branch changes. Defaults to GPT-6 Luna, then Claude Haiku 5.5, when
                       installed.
                     </div>
                   </div>
@@ -858,7 +858,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                                 ?.icon ?? Play;
                             return <ProviderIcon size={15} />;
                           })()}
-                        <span>{resolvedUtilityModel?.label ?? 'No model available'}</span>
+                        <span>{resolvedUtilityModel?.label ?? 'Choose a model'}</span>
                         <ChevronDown
                           size={14}
                           className={`model-trigger-chevron ${utilityModelPickerOpen ? 'open' : ''}`}

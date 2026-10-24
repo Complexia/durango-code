@@ -1,10 +1,21 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 import {
   agentModels,
+  claudeModelsFromCatalog,
   claudeOneMillionContextModels,
+  codexModelsFromCache,
   codexReasoningEffortForModel,
+  configureAgentModelsCache,
+  getAgentModels,
+  grokModelsFromCache,
+  invalidateAgentModelsCache,
+  onAgentModelsChanged,
   cursorFrontierModelSlugs,
   cursorFallbackModels,
   museFallbackModels,
@@ -23,16 +34,15 @@ assert.deepEqual(
     { slug: 'grok-4.7-build-fast', shortcut: '⌘2' },
     { slug: 'grok-4.6', shortcut: '⌘3' },
     { slug: 'grok-4.5', shortcut: '⌘4' },
-    { slug: 'grok-composer-2.5-fast', shortcut: '⌘5' },
   ],
-  'the Grok provider should expose Grok 4.7 (and its Fast variant) first without removing existing models'
+  'the Grok fallback should mirror `grok models`: Grok 4.7 (and its Fast variant) first, no Composer 2.5 Fast'
 );
 
 const codexModels = agentModels.filter((model) => model.providerId === 'codex');
 assert.deepEqual(
-  codexModels.slice(0, 5).map((model) => model.slug),
-  ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-6-sol', 'gpt-5.6-sol'],
-  'the Codex provider should list Astra, then GPT-6.1 Sol, then GPT-6 Luna, ahead of every other model'
+  codexModels.map((model) => model.slug),
+  ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'],
+  "the Codex fallback should follow Codex's own priority order and drop the retired GPT-5.5/5.4/5.3 models"
 );
 assert.equal(
   codexReasoningEffortForModel({ slug: 'gpt-6.1-sol' }),
@@ -71,8 +81,36 @@ assert.equal(
 );
 assert.equal(
   codexReasoningEffortForModel({ slug: 'gpt-5.6-sol' }),
+  'low',
+  'GPT-5.6 Sol should inherit the Codex Low default'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-5.6-terra' }),
+  'medium',
+  'GPT-5.6 Terra should inherit the Codex Medium default'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-5.6-luna' }, 'ultra'),
+  'max',
+  'GPT-5.6 Luna should clamp Ultra to Max'
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'some-older-codex' }, 'ultra'),
+  'xhigh',
+  'models without Max or Ultra should step Ultra down to Extra High'
+);
+assert.equal(
+  codexReasoningEffortForModel(
+    { slug: 'gpt-6-sol', reasoningEfforts: ['low', 'medium', 'high'], defaultReasoningEffort: 'high' },
+    'ultra'
+  ),
   'high',
-  'GPT-5.6 models should keep their High default'
+  "live-catalog tiers should override the static ones when clamping"
+);
+assert.equal(
+  codexReasoningEffortForModel({ slug: 'gpt-6-sol', reasoningEfforts: ['low', 'medium'], defaultReasoningEffort: 'low' }),
+  'low',
+  "a live-catalog default should win over the static default"
 );
 
 const claudeModels = agentModels.filter((model) => model.providerId === 'claude');
@@ -203,16 +241,16 @@ assert.deepEqual(
   ],
   'OpenCode discovery should keep every provider/model slug, remove duplicates, and disambiguate labels'
 );
-assert.equal(openCodeFallbackModels.length, 7, 'OpenCode should retain its built-in Zen catalog as fallback');
+assert.equal(openCodeFallbackModels.length, 9, 'OpenCode should retain its built-in Zen catalog as fallback');
 assert.deepEqual(
   openCodeFallbackModels.slice(0, 3).map(({ label, reasoningVariants }) => ({ label, reasoningVariants })),
   [
-    { label: '0x Alpha Free (Unlimited)', reasoningVariants: ['low', 'high', 'max'] },
-    { label: 'Nemotron 3.5 Lightning Free', reasoningVariants: undefined },
+    { label: 'Flint 40B Free', reasoningVariants: ['low', 'medium', 'high', 'xhigh', 'max'] },
     {
-      label: 'Muse Spark 1.2 Free',
-      reasoningVariants: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+      label: 'Nemotron 3.5 Super VL Free',
+      reasoningVariants: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
     },
+    { label: 'Beam Free', reasoningVariants: ['low', 'medium', 'high', 'xhigh', 'max'] },
   ],
   'the fallback should mirror OpenCode display names, newest-first order, and model variants'
 );
@@ -359,29 +397,38 @@ assert.match(
 
 console.log('Agent model catalog regression tests passed.');
 
-// Muse: the static fallback carries both tiers of each Spark generation, and
-// the live catalog reader orders/dedupes the CLI's cached provider rows.
+// Muse: the static fallback carries Wonder (and Wonder Full) plus both tiers
+// of each Spark generation, and the live catalog reader orders/dedupes the
+// CLI's cached provider rows.
 assert.deepEqual(
   museFallbackModels.map(({ id, slug, label, shortcut, favorite }) => ({ id, slug, label, shortcut, favorite })),
   [
-    { id: 'muse:muse-spark-1.3', slug: 'muse-spark-1.3', label: 'Muse Spark 1.3', shortcut: '⌘1', favorite: true },
+    {
+      id: 'muse:muse-wonder-full-1.0',
+      slug: 'muse-wonder-full-1.0',
+      label: 'Muse Wonder Full 1.0',
+      shortcut: '⌘1',
+      favorite: false,
+    },
+    { id: 'muse:muse-wonder-1.0', slug: 'muse-wonder-1.0', label: 'Muse Wonder 1.0', shortcut: '⌘2', favorite: true },
+    { id: 'muse:muse-spark-1.3', slug: 'muse-spark-1.3', label: 'Muse Spark 1.3', shortcut: '⌘3', favorite: true },
     {
       id: 'muse:muse-spark-1.3-contributor',
       slug: 'muse-spark-1.3-contributor',
       label: 'Muse Spark 1.3 Contributor',
-      shortcut: '⌘2',
+      shortcut: '⌘4',
       favorite: true,
     },
-    { id: 'muse:muse-spark-1.2', slug: 'muse-spark-1.2', label: 'Muse Spark 1.2', shortcut: '⌘3', favorite: false },
+    { id: 'muse:muse-spark-1.2', slug: 'muse-spark-1.2', label: 'Muse Spark 1.2', shortcut: '⌘5', favorite: false },
     {
       id: 'muse:muse-spark-1.2-contributor',
       slug: 'muse-spark-1.2-contributor',
       label: 'Muse Spark 1.2 Contributor',
-      shortcut: '⌘4',
+      shortcut: '⌘6',
       favorite: false,
     },
   ],
-  'the Muse fallback should list Spark 1.3 and 1.2 in both standard and contributor tiers'
+  'the Muse fallback should list Wonder Full, Wonder, then Spark 1.3 and 1.2 in both standard and contributor tiers'
 );
 assert.deepEqual(
   agentModels.filter((model) => model.providerId === 'muse').map((model) => model.slug),
@@ -450,3 +497,198 @@ assert.deepEqual(
 );
 
 assert.deepEqual(museModelsFromCatalogRows(undefined), [], 'a missing Muse catalog yields no models');
+
+// Muse catalog rows carry per-model effort tiers.
+assert.deepEqual(
+  museModelsFromCatalogRows([
+    museCatalogRow('muse-spark-1.2', {
+      reasoning_effort_variants: [{ tier: 'xhigh' }, { tier: 'low' }, { tier: 'minimal' }],
+    }),
+  ])[0].reasoningEfforts,
+  ['minimal', 'low', 'xhigh'],
+  'Muse discovery should keep each model\'s effort tiers, ordered low to high'
+);
+
+// Codex: models_cache.json rows, hidden rows dropped, Codex priority order.
+assert.deepEqual(
+  codexModelsFromCache({
+    models: [
+      {
+        slug: 'gpt-6-astra',
+        display_name: 'GPT-6-Astra',
+        priority: 2,
+        visibility: 'list',
+        default_reasoning_level: 'medium',
+        supported_reasoning_levels: [{ effort: 'low' }, { effort: 'max' }, { effort: 'ultra' }],
+      },
+      { slug: 'codex-auto-review', display_name: 'Codex Auto Review', priority: 0, visibility: 'hide' },
+      { slug: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol', priority: 1, visibility: 'list' },
+      { slug: 'gpt-6.1-sol', display_name: 'duplicate', priority: 3, visibility: 'list' },
+      null,
+    ],
+  }).map(({ id, label, reasoningEfforts, defaultReasoningEffort, command }) => ({
+    id,
+    label,
+    reasoningEfforts,
+    defaultReasoningEffort,
+    command,
+  })),
+  [
+    { id: 'codex:gpt-6.1-sol', label: 'GPT-6.1 Sol', reasoningEfforts: undefined, defaultReasoningEffort: undefined, command: 'codex' },
+    {
+      id: 'codex:gpt-6-astra',
+      label: 'GPT-6 Astra',
+      reasoningEfforts: ['low', 'max', 'ultra'],
+      defaultReasoningEffort: 'medium',
+      command: 'codex',
+    },
+  ],
+  'Codex discovery should read its model cache in priority order with per-model tiers'
+);
+assert.deepEqual(codexModelsFromCache(undefined), [], 'a missing Codex cache yields no models');
+
+// Grok: models_cache.json keyed by id in picker order.
+assert.deepEqual(
+  grokModelsFromCache({
+    models: {
+      'grok-4.7': {
+        info: {
+          id: 'grok-4.7',
+          name: 'Grok 4.7',
+          supports_reasoning_effort: true,
+          reasoning_effort: 'high',
+          reasoning_efforts: [
+            { value: 'xhigh', default: false },
+            { value: 'high', default: true },
+            { value: 'low', default: false },
+          ],
+        },
+      },
+      'grok-internal': { info: { id: 'grok-internal', name: 'Internal', hidden: true } },
+      'grok-4.5': { info: { id: 'grok-4.5', name: 'Grok 4.5', supports_reasoning_effort: false } },
+    },
+  }).map(({ id, label, shortcut, favorite, reasoningEfforts, defaultReasoningEffort }) => ({
+    id,
+    label,
+    shortcut,
+    favorite,
+    reasoningEfforts,
+    defaultReasoningEffort,
+  })),
+  [
+    {
+      id: 'grok:grok-4.7',
+      label: 'Grok 4.7',
+      shortcut: '⌘1',
+      favorite: true,
+      reasoningEfforts: ['low', 'high', 'xhigh'],
+      defaultReasoningEffort: 'high',
+    },
+    {
+      id: 'grok:grok-4.5',
+      label: 'Grok 4.5',
+      shortcut: '⌘2',
+      favorite: false,
+      reasoningEfforts: undefined,
+      defaultReasoningEffort: undefined,
+    },
+  ],
+  'Grok discovery should drop hidden models and keep per-model effort tiers'
+);
+
+// Claude: the current "main" lineup plus only the curated overflow models.
+assert.deepEqual(
+  claudeModelsFromCatalog({
+    catalog: {
+      config: {
+        models: [
+          { id: 'claude-opus-5-5', name: 'Opus 5.5', section: 'main', runtime: { effort_levels: ['low', 'max'], default_effort: 'medium' } },
+          { id: 'claude-opus-4-6', name: 'Opus 4.6', section: 'overflow' },
+          { id: 'claude-fable-5', name: 'Fable 5', section: 'overflow' },
+          { id: 'claude-fable-5-1', name: 'Fable 5.1', section: 'main' },
+        ],
+      },
+    },
+  }).map(({ id, label, shortcut, reasoningEfforts, defaultReasoningEffort }) => ({
+    id,
+    label,
+    shortcut,
+    reasoningEfforts,
+    defaultReasoningEffort,
+  })),
+  [
+    {
+      id: 'claude:claude-opus-5-5',
+      label: 'Claude Opus 5.5',
+      shortcut: '⌘1',
+      reasoningEfforts: ['low', 'max'],
+      defaultReasoningEffort: 'medium',
+    },
+    { id: 'claude:claude-fable-5-1', label: 'Claude Fable 5.1', shortcut: '⌘2', reasoningEfforts: undefined, defaultReasoningEffort: undefined },
+    { id: 'claude:claude-fable-5', label: 'Claude Fable 5', shortcut: '⌘3', reasoningEfforts: undefined, defaultReasoningEffort: undefined },
+  ],
+  'Claude discovery should list the main section first and skip un-curated overflow models'
+);
+
+// Cache: the on-disk copy answers immediately, an expired one revalidates in
+// the background, an empty discovery keeps the previous block, and changes
+// reach listeners and the disk.
+{
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'agent-models-cache-'));
+  const cacheFile = path.join(dir, 'agent-models-cache.json');
+  const cachedCodex = { id: 'codex:gpt-cached', providerId: 'codex', providerLabel: 'Codex', label: 'Cached', slug: 'gpt-cached', command: 'rm' };
+  await writeFile(cacheFile, JSON.stringify({ version: 1, savedAt: 0, providers: { codex: [cachedCodex], bogus: [cachedCodex] } }));
+
+  let discoveries = 0;
+  let releaseDiscovery;
+  const discoveryGate = new Promise((resolve) => {
+    releaseDiscovery = resolve;
+  });
+  const freshGrok = { id: 'grok:grok-9', providerId: 'grok', providerLabel: 'Grok', label: 'Grok 9', slug: 'grok-9', command: 'grok' };
+  await configureAgentModelsCache(cacheFile, {
+    discoverers: {
+      codex: async () => {
+        discoveries += 1;
+        await discoveryGate;
+        return [];
+      },
+      grok: async () => [freshGrok],
+    },
+  });
+  const changed = new Promise((resolve) => {
+    const stop = onAgentModelsChanged((models) => {
+      stop();
+      resolve(models);
+    });
+  });
+
+  const fromDisk = await getAgentModels();
+  assert.deepEqual(
+    fromDisk.filter((model) => model.providerId === 'codex').map(({ id, command }) => ({ id, command })),
+    [{ id: 'codex:gpt-cached', command: 'codex' }],
+    'the disk cache should answer before discovery finishes, with the spawn command taken from code'
+  );
+  assert.equal(discoveries, 1, 'an expired disk cache should start one background refresh');
+  await getAgentModels();
+  assert.equal(discoveries, 1, 'callers during a refresh should share it rather than start another');
+
+  releaseDiscovery();
+  const refreshed = await changed;
+  assert.deepEqual(
+    refreshed.filter((model) => ['codex', 'grok'].includes(model.providerId)).map((model) => model.id),
+    ['grok:grok-9', 'codex:gpt-cached'],
+    'a refresh should replace discovered providers and keep the last good block for empty ones'
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const saved = JSON.parse(await readFile(cacheFile, 'utf8'));
+  assert.deepEqual(Object.keys(saved.providers).sort(), ['codex', 'grok'], 'a changed catalog should be written back to disk');
+
+  const beforeInvalidate = discoveries;
+  invalidateAgentModelsCache();
+  assert.equal((await getAgentModels()).length, refreshed.length, 'an invalidated catalog should still answer immediately');
+  await getAgentModels({ fresh: true });
+  assert.equal(discoveries, beforeInvalidate + 1, 'a fresh request after invalidation should await one new discovery');
+  await rm(dir, { recursive: true, force: true });
+}
+
+console.log('Agent model discovery and cache tests passed.');

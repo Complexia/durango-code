@@ -14,7 +14,7 @@ const GROK_REASONING = new Set(['low', 'medium', 'high']);
 const GROK_XHIGH_REASONING = new Set([...GROK_REASONING, 'xhigh']);
 // Extra High is advertised by Grok 4.6 and newer; older Grok models reject it.
 const GROK_XHIGH_SLUGS = new Set(['grok-4.7', 'grok-4.7-build-fast', 'grok-4.6']);
-const MUSE_REASONING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']);
+const MUSE_REASONING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 const CLAUDE_REASONING = new Set([
   'low',
   'medium',
@@ -24,12 +24,22 @@ const CLAUDE_REASONING = new Set([
   'ultracode',
   'ultrathink',
 ]);
-const CODEX_REASONING = new Set(['low', 'medium', 'high', 'xhigh', 'ultra']);
-const GPT6_CODEX_REASONING = new Set([...CODEX_REASONING, 'max']);
-// GPT-6 Luna offers Max but not Ultra.
-const GPT6_LUNA_CODEX_REASONING = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
-const GPT56_CODEX_SLUGS = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
-const GPT6_CODEX_SLUGS = new Set(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']);
+const CODEX_REASONING = new Set(['low', 'medium', 'high', 'xhigh']);
+const GPT6_CODEX_REASONING = new Set([...CODEX_REASONING, 'max', 'ultra']);
+// Luna offers Max but not Ultra.
+const GPT6_LUNA_CODEX_REASONING = new Set([...CODEX_REASONING, 'max']);
+const GPT6_CODEX_SLUGS = new Set([
+  'gpt-6-astra',
+  'gpt-6.1-sol',
+  'gpt-6-sol',
+  'gpt-6-luna',
+  'gpt-5.6-sol',
+  'gpt-5.6-terra',
+  'gpt-5.6-luna',
+]);
+const CODEX_LUNA_SLUGS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
+// Durango Code's Ultracode and Ultrathink run Claude at Extra High and High.
+const CLAUDE_CLI_EFFORT: Record<string, string> = { ultracode: 'xhigh', ultrathink: 'high' };
 const CLAUDE_1M_ONLY_SLUGS = new Set([
   'claude-fable-5-1',
   'claude-opus-5-5',
@@ -54,6 +64,8 @@ type RemoteAgentSettingsModel = {
   providerId?: string;
   slug?: string;
   reasoningVariants?: string[];
+  // Live-catalog tiers; when present they replace the static sets below.
+  reasoningEfforts?: string[];
 };
 
 /**
@@ -75,34 +87,34 @@ export const remoteAgentSettingsPatch = (
   if (!model?.providerId) return patch;
 
   if (input.reasoningEffort) {
+    const liveEfforts =
+      model.reasoningEfforts && model.reasoningEfforts.length > 0 ? new Set(model.reasoningEfforts) : null;
     if (model.providerId === 'grok') {
       const allowed =
-        model.slug && GROK_XHIGH_SLUGS.has(model.slug) ? GROK_XHIGH_REASONING : GROK_REASONING;
+        liveEfforts ?? (model.slug && GROK_XHIGH_SLUGS.has(model.slug) ? GROK_XHIGH_REASONING : GROK_REASONING);
       if (allowed.has(input.reasoningEffort) && thread.grokReasoningEffort !== input.reasoningEffort) {
         patch.grokReasoningEffort = input.reasoningEffort;
       }
     } else if (model.providerId === 'muse') {
-      if (MUSE_REASONING.has(input.reasoningEffort) && thread.museReasoningEffort !== input.reasoningEffort) {
+      if ((liveEfforts ?? MUSE_REASONING).has(input.reasoningEffort) && thread.museReasoningEffort !== input.reasoningEffort) {
         patch.museReasoningEffort = input.reasoningEffort;
       }
     } else if (model.providerId === 'claude') {
       if (
         CLAUDE_REASONING.has(input.reasoningEffort) &&
+        (!liveEfforts || liveEfforts.has(CLAUDE_CLI_EFFORT[input.reasoningEffort] ?? input.reasoningEffort)) &&
         thread.claudeReasoningEffort !== input.reasoningEffort
       ) {
         patch.claudeReasoningEffort = input.reasoningEffort;
       }
     } else if (model.providerId === 'codex') {
       const allowed =
-        model.slug === 'gpt-6-luna'
+        liveEfforts ??
+        (model.slug && CODEX_LUNA_SLUGS.has(model.slug)
           ? GPT6_LUNA_CODEX_REASONING
           : model.slug && GPT6_CODEX_SLUGS.has(model.slug)
             ? GPT6_CODEX_REASONING
-            : model.slug && GPT56_CODEX_SLUGS.has(model.slug)
-              ? model.slug === 'gpt-5.6-luna'
-                ? new Set(['low', 'medium', 'high', 'xhigh'])
-                : CODEX_REASONING
-              : new Set(['low', 'medium', 'high', 'xhigh']);
+            : CODEX_REASONING);
       if (allowed.has(input.reasoningEffort) && thread.codexReasoningEffort !== input.reasoningEffort) {
         patch.codexReasoningEffort = input.reasoningEffort;
       }

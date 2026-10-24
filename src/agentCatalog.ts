@@ -29,6 +29,10 @@ export type AgentModel = {
   shortcut?: string;
   favorite?: boolean;
   reasoningVariants?: string[];
+  // Effort tiers (low → high) and default from the provider's live catalog;
+  // absent on static fallback rows.
+  reasoningEfforts?: string[];
+  defaultReasoningEffort?: string;
   available?: boolean;
   unavailableReason?: string;
 };
@@ -58,7 +62,77 @@ export type MuseReasoningEffort =
   | 'medium'
   | 'high'
   | 'xhigh'
+  | 'max'
   | 'ultra';
+
+type ReasoningEffortOption = {
+  value: string;
+  label: string;
+  default?: boolean;
+  description?: string;
+};
+
+// Canonical low → high order of every tier any harness advertises; mirrors
+// reasoningEffortTiers in src/main/models.js.
+const reasoningEffortTiers = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+
+const reasoningEffortLabels: Record<string, string> = {
+  none: 'None',
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra High',
+  max: 'Max',
+  ultra: 'Ultra',
+};
+
+const effortRank = (effort: string) => {
+  const rank = reasoningEffortTiers.indexOf(effort);
+  return rank === -1 ? reasoningEffortTiers.length : rank;
+};
+
+// A model's effort menu: the given tiers (live catalog or static fallback)
+// in low → high order, labelled from the provider's option table, with the
+// default mark on `defaultEffort` (else the table's default, if offered).
+const effortMenu = <T extends ReasoningEffortOption>(
+  table: readonly T[],
+  efforts: readonly string[],
+  defaultEffort?: string
+): T[] => {
+  const tiers = [...new Set(efforts)].sort((a, b) => effortRank(a) - effortRank(b));
+  const menuDefault =
+    defaultEffort && tiers.includes(defaultEffort)
+      ? defaultEffort
+      : table.find((option) => option.default && tiers.includes(option.value))?.value;
+  return tiers.map((value) => {
+    const { default: _default, ...option } =
+      table.find((candidate) => candidate.value === value) ??
+      ({ value, label: reasoningEffortLabels[value] ?? value } as T);
+    return (value === menuDefault ? { ...option, default: true } : option) as T;
+  });
+};
+
+// Keep an effort the menu offers; otherwise step down to the nearest offered
+// tier (Ultra → Max → Extra High), else the menu's default. Mirrors
+// clampReasoningEffort in src/main/models.js.
+const clampEffort = <T extends string>(
+  options: readonly ReasoningEffortOption[],
+  effort: string | undefined,
+  fallback: T
+): T => {
+  const offered = (value: string) => options.some((option) => option.value === value);
+  const menuDefault = (options.find((option) => option.default)?.value ?? fallback) as T;
+  if (!effort) return menuDefault;
+  if (offered(effort)) return effort as T;
+  for (let rank = reasoningEffortTiers.indexOf(effort) - 1; rank >= 0; rank -= 1) {
+    if (offered(reasoningEffortTiers[rank])) return reasoningEffortTiers[rank] as T;
+  }
+  return menuDefault;
+};
+
+const liveEfforts = (model: AgentModel | undefined) =>
+  model?.reasoningEfforts && model.reasoningEfforts.length > 0 ? model.reasoningEfforts : null;
 
 export type CodexReasoningOption = {
   value: CodexReasoningEffort;
@@ -74,31 +148,23 @@ export const codexReasoningOptions: CodexReasoningOption[] = [
   { value: 'xhigh', label: 'Extra High' },
 ];
 
-// The GPT-5.6 family renames the effort tiers (Light instead of Low), defaults
-// to High, and adds Ultra. The Codex app offers Ultra on Sol and Terra but
-// not Luna, so we mirror that.
+// The GPT-5.6 family renames Low to Light.
 const gpt56CodexReasoningOptions: CodexReasoningOption[] = [
   { value: 'low', label: 'Light' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High', default: true },
+  { value: 'medium', label: 'Medium', default: true },
+  { value: 'high', label: 'High' },
   { value: 'xhigh', label: 'Extra High' },
+  { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra', description: 'Consumes usage limits faster' },
 ];
 
-const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
-
-// Matches the GPT-6 family's Codex catalog, including its Medium default and
-// Max tier. Astra and Sol also offer Ultra; Luna stops at Max. GPT-6.1 Sol
-// shares the tiers but Codex defaults it to Low.
 const gpt6CodexReasoningOptions: CodexReasoningOption[] = [
   ...codexReasoningOptions,
   { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra', description: 'Maximum reasoning with automatic task delegation' },
 ];
 
-const gpt61SolCodexReasoningOptions: CodexReasoningOption[] = gpt6CodexReasoningOptions.map(
-  ({ default: _default, ...option }) => (option.value === 'low' ? { ...option, default: true } : option)
-);
+const gpt56CodexModelSlugs = new Set(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']);
 
 export const gpt6CodexModelSlugs: ReadonlySet<string> = new Set([
   'gpt-6-astra',
@@ -107,32 +173,38 @@ export const gpt6CodexModelSlugs: ReadonlySet<string> = new Set([
   'gpt-6-luna',
 ]);
 
+// Static tiers for when the CLI's model cache is unavailable (mirrors it as
+// of Codex 0.163): the GPT-6 and GPT-5.6 families offer Max and Ultra except
+// Luna, which stops at Max; Sol models default to Low, the rest to Medium.
+const codexLowDefaultModelSlugs = new Set(['gpt-6.1-sol', 'gpt-5.6-sol']);
+const codexNoUltraModelSlugs = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
+
 export const codexReasoningOptionsForModel = (
   model: AgentModel | undefined
 ): CodexReasoningOption[] => {
-  if (model?.slug === 'gpt-6-luna') {
-    return gpt6CodexReasoningOptions.filter((option) => option.value !== 'ultra');
-  }
-  if (model?.slug === 'gpt-6.1-sol') return gpt61SolCodexReasoningOptions;
-  if (model?.slug && gpt6CodexModelSlugs.has(model.slug)) return gpt6CodexReasoningOptions;
-  if (!model || !gpt56CodexModelSlugs.has(model.slug)) return codexReasoningOptions;
-  if (model.slug === 'gpt-5.6-luna') {
-    return gpt56CodexReasoningOptions.filter((option) => option.value !== 'ultra');
-  }
-  return gpt56CodexReasoningOptions;
+  const slug = model?.slug ?? '';
+  const isGpt56 = gpt56CodexModelSlugs.has(slug);
+  const table = isGpt56 ? gpt56CodexReasoningOptions : gpt6CodexReasoningOptions;
+  const staticEfforts =
+    isGpt56 || gpt6CodexModelSlugs.has(slug)
+      ? table
+          .map((option) => option.value)
+          .filter((value) => value !== 'ultra' || !codexNoUltraModelSlugs.has(slug))
+      : codexReasoningOptions.map((option) => option.value);
+  return effortMenu(
+    table,
+    liveEfforts(model) ?? staticEfforts,
+    model?.defaultReasoningEffort ?? (codexLowDefaultModelSlugs.has(slug) ? 'low' : defaultCodexReasoningEffort)
+  );
 };
 
 // Clamp a stored effort to what the model actually offers (e.g. a thread that
-// picked Ultra on 5.6 Sol and then switched to 5.5 falls back to that model's
-// default).
+// picked Ultra on Sol and then switched to Luna steps down to Max).
 export const getEffectiveCodexReasoningEffort = (
   model: AgentModel | undefined,
   effort: CodexReasoningEffort | undefined
-): CodexReasoningEffort => {
-  const options = codexReasoningOptionsForModel(model);
-  if (effort && options.some((option) => option.value === effort)) return effort;
-  return options.find((option) => option.default)?.value ?? defaultCodexReasoningEffort;
-};
+): CodexReasoningEffort =>
+  clampEffort(codexReasoningOptionsForModel(model), effort, defaultCodexReasoningEffort);
 
 export const codexServiceTierOptions: Array<{
   value: CodexServiceTier;
@@ -161,6 +233,35 @@ export const claudeReasoningOptions: Array<{
   { value: 'ultrathink', label: 'Ultrathink' },
 ];
 
+// Ultracode and Ultrathink are Durango Code modes that run the CLI at Extra
+// High and High (see claudeEffortForCli), so they need those tiers.
+const claudeCliEffortForOption: Partial<Record<ClaudeReasoningEffort, string>> = {
+  ultracode: 'xhigh',
+  ultrathink: 'high',
+};
+
+// Claude Code's catalog lists each model's effort tiers; without it every
+// option is offered. Durango Code keeps High as its default effort.
+export const claudeReasoningOptionsForModel = (model: AgentModel | undefined) => {
+  const efforts = liveEfforts(model);
+  if (!efforts) return claudeReasoningOptions;
+  return claudeReasoningOptions.filter((option) =>
+    efforts.includes(claudeCliEffortForOption[option.value] ?? option.value)
+  );
+};
+
+export const getEffectiveClaudeReasoningEffort = (
+  model: AgentModel | undefined,
+  effort: ClaudeReasoningEffort | undefined
+): ClaudeReasoningEffort => {
+  const options = claudeReasoningOptionsForModel(model);
+  const fallback = options.some((option) => option.value === defaultClaudeReasoningEffort)
+    ? defaultClaudeReasoningEffort
+    : ((options.find((option) => option.value === model?.defaultReasoningEffort) ?? options[0])?.value ??
+      defaultClaudeReasoningEffort);
+  return clampEffort(options, effort, fallback);
+};
+
 export const claudeContextWindowOptions: Array<{
   value: ClaudeContextWindow;
   label: string;
@@ -170,8 +271,8 @@ export const claudeContextWindowOptions: Array<{
 ];
 
 // Grok exposes reasoning effort over ACP; labels/descriptions mirror the
-// tiers the agent itself advertises in session/new model metadata. Extra High
-// is only advertised by Grok 4.6 and newer (4.7 and 4.7 Fast).
+// tiers the agent itself advertises in session/new model metadata. Without
+// the CLI's model cache, Extra High is assumed only for Grok 4.6 and newer.
 export const defaultGrokReasoningEffort: GrokReasoningEffort = 'high';
 
 export const grokExtraHighReasoningSlugs: ReadonlySet<string> = new Set([
@@ -197,21 +298,23 @@ export const grokReasoningOptions: GrokReasoningOption[] = [
 export const grokReasoningOptionsForModel = (
   model: AgentModel | undefined
 ): GrokReasoningOption[] =>
-  model?.slug && grokExtraHighReasoningSlugs.has(model.slug)
-    ? grokReasoningOptions
-    : grokReasoningOptions.filter((option) => option.value !== 'xhigh');
+  effortMenu(
+    grokReasoningOptions,
+    liveEfforts(model) ??
+      grokReasoningOptions
+        .map((option) => option.value)
+        .filter((value) => value !== 'xhigh' || Boolean(model?.slug && grokExtraHighReasoningSlugs.has(model.slug))),
+    model?.defaultReasoningEffort
+  );
 
 export const getEffectiveGrokReasoningEffort = (
   model: AgentModel | undefined,
   effort: GrokReasoningEffort | undefined
-): GrokReasoningEffort => {
-  const options = grokReasoningOptionsForModel(model);
-  if (effort && options.some((option) => option.value === effort)) return effort;
-  return options.find((option) => option.default)?.value ?? defaultGrokReasoningEffort;
-};
+): GrokReasoningEffort => clampEffort(grokReasoningOptionsForModel(model), effort, defaultGrokReasoningEffort);
 
 // Muse Code's reasoning-effort tiers, the wire values `muse exec
-// --reasoning-effort` accepts. The CLI defaults to high.
+// --reasoning-effort` accepts. The CLI defaults to high; its model catalog
+// narrows the tiers per model (e.g. Spark 1.2 has no Max).
 export const defaultMuseReasoningEffort: MuseReasoningEffort = 'high';
 
 export const museReasoningOptions: Array<{
@@ -225,8 +328,21 @@ export const museReasoningOptions: Array<{
   { value: 'medium', label: 'Medium' },
   { value: 'high', label: 'High', default: true },
   { value: 'xhigh', label: 'Extra High' },
+  { value: 'max', label: 'Max' },
   { value: 'ultra', label: 'Ultra' },
 ];
+
+export const museReasoningOptionsForModel = (model: AgentModel | undefined) =>
+  effortMenu(
+    museReasoningOptions,
+    liveEfforts(model) ?? museReasoningOptions.map((option) => option.value),
+    model?.defaultReasoningEffort
+  );
+
+export const getEffectiveMuseReasoningEffort = (
+  model: AgentModel | undefined,
+  effort: MuseReasoningEffort | undefined
+): MuseReasoningEffort => clampEffort(museReasoningOptionsForModel(model), effort, defaultMuseReasoningEffort);
 
 export type OpenCodeReasoningOption = {
   value: string;
@@ -499,13 +615,11 @@ export const fallbackAgentModels: AgentModel[] = [
     shortcut: '⌘4',
   },
   {
-    id: 'grok:grok-composer-2.5-fast',
-    providerId: 'grok',
-    providerLabel: 'Grok',
-    label: 'Composer 2.5 Fast',
-    slug: 'grok-composer-2.5-fast',
-    shortcut: '⌘5',
-    favorite: true,
+    id: 'codex:gpt-6.1-sol',
+    providerId: 'codex',
+    providerLabel: 'Codex',
+    label: 'GPT-6.1 Sol',
+    slug: 'gpt-6.1-sol',
   },
   {
     id: 'codex:gpt-6-astra',
@@ -515,11 +629,11 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'gpt-6-astra',
   },
   {
-    id: 'codex:gpt-6.1-sol',
+    id: 'codex:gpt-6-sol',
     providerId: 'codex',
     providerLabel: 'Codex',
-    label: 'GPT-6.1 Sol',
-    slug: 'gpt-6.1-sol',
+    label: 'GPT-6 Sol',
+    slug: 'gpt-6-sol',
   },
   {
     id: 'codex:gpt-6-luna',
@@ -527,13 +641,6 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Codex',
     label: 'GPT-6 Luna',
     slug: 'gpt-6-luna',
-  },
-  {
-    id: 'codex:gpt-6-sol',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-6 Sol',
-    slug: 'gpt-6-sol',
   },
   {
     id: 'codex:gpt-5.6-sol',
@@ -555,34 +662,6 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Codex',
     label: 'GPT-5.6 Luna',
     slug: 'gpt-5.6-luna',
-  },
-  {
-    id: 'codex:gpt-5.5',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.5',
-    slug: 'gpt-5.5',
-  },
-  {
-    id: 'codex:gpt-5.4',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.4',
-    slug: 'gpt-5.4',
-  },
-  {
-    id: 'codex:gpt-5.4-mini',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.4 Mini',
-    slug: 'gpt-5.4-mini',
-  },
-  {
-    id: 'codex:gpt-5.3-codex-spark',
-    providerId: 'codex',
-    providerLabel: 'Codex',
-    label: 'GPT-5.3 Codex Spark',
-    slug: 'gpt-5.3-codex-spark',
   },
   {
     id: 'claude:claude-fable-5-1',
@@ -640,35 +719,63 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'claude-code-cli',
   },
   {
+    id: 'kimi:kimi-code/k3.1-pro',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3.1 Pro',
+    slug: 'kimi-code/k3.1-pro',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
+    id: 'kimi:kimi-code/k3.1-pro-highspeed',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3.1 Pro Highspeed',
+    slug: 'kimi-code/k3.1-pro-highspeed',
+    shortcut: '⌘2',
+  },
+  {
     id: 'kimi:kimi-code/k3',
     providerId: 'kimi',
     providerLabel: 'Kimi',
     label: 'K3',
     slug: 'kimi-code/k3',
-    shortcut: '⌘1',
+    shortcut: '⌘3',
     favorite: true,
   },
   {
     id: 'kimi:kimi-code/kimi-for-coding',
     providerId: 'kimi',
     providerLabel: 'Kimi',
-    label: 'K2.7 Coding',
+    label: 'K2.8 Preview',
     slug: 'kimi-code/kimi-for-coding',
-    shortcut: '⌘2',
+    shortcut: '⌘4',
   },
   {
     id: 'kimi:kimi-code/kimi-for-coding-highspeed',
     providerId: 'kimi',
     providerLabel: 'Kimi',
-    label: 'K2.7 Coding Highspeed',
+    label: 'K2.7 Code Highspeed',
     slug: 'kimi-code/kimi-for-coding-highspeed',
-    shortcut: '⌘3',
+    shortcut: '⌘5',
   },
-  // Muse Spark ships in two tiers per generation: standard, and a discounted
-  // "contributor" tier whose sessions Meta may use for product improvement.
-  // Mirrors museFallbackModels in src/main/models.js; live discovery from the
-  // CLI's model-catalog cache replaces this block when muse is installed.
+  {
+    id: 'kimi:kimi-code/k3-256k',
+    providerId: 'kimi',
+    providerLabel: 'Kimi',
+    label: 'K3-256k',
+    slug: 'kimi-code/k3-256k',
+    shortcut: '⌘6',
+  },
+  // Muse Wonder (Full is subscription-only), then Muse Spark, which ships in
+  // two tiers per generation: standard, and a discounted "contributor" tier
+  // whose sessions Meta may use for product improvement. Mirrors
+  // museFallbackModels in src/main/models.js; live discovery from the CLI's
+  // model-catalog cache replaces this block when muse is installed.
   ...([
+    ['muse-wonder-full-1.0', 'Muse Wonder Full 1.0'],
+    ['muse-wonder-1.0', 'Muse Wonder 1.0'],
     ['muse-spark-1.3', 'Muse Spark 1.3'],
     ['muse-spark-1.3-contributor', 'Muse Spark 1.3 Contributor'],
     ['muse-spark-1.2', 'Muse Spark 1.2'],
@@ -680,7 +787,7 @@ export const fallbackAgentModels: AgentModel[] = [
     label,
     slug,
     shortcut: `⌘${index + 1}`,
-    favorite: slug.startsWith('muse-spark-1.3'),
+    favorite: slug === 'muse-wonder-1.0' || slug.startsWith('muse-spark-1.3'),
   })),
   {
     id: 'cursor:auto',
@@ -784,12 +891,14 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'gpt-5.5-high',
   },
   ...([
-    ['opencode/x-preview-f-free', '0x Alpha Free (Unlimited)', ['low', 'high', 'max']],
+    ['opencode/flint-40b-free', 'Flint 40B Free', ['low', 'medium', 'high', 'xhigh', 'max']],
+    ['opencode/nemotron-3.5-super-vl-free', 'Nemotron 3.5 Super VL Free', ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']],
+    ['opencode/beam-free', 'Beam Free', ['low', 'medium', 'high', 'xhigh', 'max']],
+    ['opencode/mimo-v2.6-flash-free', 'MiMo-V2.6-Flash Free', []],
+    ['opencode/deepseek-v4.1-flash-free', 'DeepSeek V4.1 Flash Free', ['low', 'high', 'max']],
+    ['opencode/glm-5.3-flash-free', 'GLM-5.3-Flash Free', ['low', 'high', 'max']],
     ['opencode/nemotron-3.5-lightning-free', 'Nemotron 3.5 Lightning Free', []],
-    ['opencode/muse-spark-1.2-contributor-free', 'Muse Spark 1.2 Free', ['minimal', 'low', 'medium', 'high', 'xhigh']],
-    ['opencode/hy3-free', 'Hy3 Free', ['low', 'medium', 'high']],
     ['opencode/nemotron-3-ultra-free', 'Nemotron 3 Ultra Free', []],
-    ['opencode/mimo-v2.5-free', 'MiMo V2.5 Free', []],
     ['opencode/big-pickle', 'Big Pickle', []],
   ] as Array<[string, string, string[]]>).map(([slug, label, reasoningVariants], index) => ({
     id: `opencode:${slug}`,
@@ -820,24 +929,30 @@ export const isClaudeCodeCliModelId = (modelId: string | undefined | null): bool
 export const isOrionModelId = (modelId: string | undefined | null): boolean =>
   modelId === orionOrchestratorModelId || (modelId ?? '').startsWith('orion:');
 
-// Retired Claude models with a direct successor in the catalog. Saved threads
-// and settings that still name one resolve to its successor instead of the
-// generic Claude fallback below.
-export const claudeModelSuccessors: Record<string, string> = {
+// Retired models with a direct successor in the catalog. Saved threads and
+// settings that still name one resolve to its successor instead of the
+// generic same-provider fallback below.
+export const agentModelSuccessors: Record<string, string> = {
   'claude:claude-sonnet-5': 'claude:claude-sonnet-5-5',
   'claude:claude-haiku-4-5': 'claude:claude-haiku-5-5',
+  'codex:gpt-5.5': 'codex:gpt-6.1-sol',
+  'codex:gpt-5.4': 'codex:gpt-6.1-sol',
+  'codex:gpt-5.4-mini': 'codex:gpt-6-luna',
+  'codex:gpt-5.3-codex-spark': 'codex:gpt-6-luna',
+  'grok:grok-composer-2.5-fast': 'grok:grok-4.7-build-fast',
 };
+
+const providerIdOfModelId = (id: string | null | undefined) =>
+  id && id.includes(':') ? id.slice(0, id.indexOf(':')) : '';
 
 export const findAgentModel = (models: AgentModel[], id: string | null | undefined) =>
   models.find((model) => model.id === id) ??
-  (id && claudeModelSuccessors[id] ? models.find((model) => model.id === claudeModelSuccessors[id]) : undefined) ??
-  (id?.startsWith('opencode:')
-    ? models.find((model) => model.providerId === 'opencode')
-    : undefined) ??
-  // Threads saved on a retired Claude model (e.g. the 4.x Opus/Sonnet line)
-  // stay on Claude rather than dropping to another provider's default.
-  (id?.startsWith('claude:')
-    ? models.find((model) => model.providerId === 'claude')
+  (id && agentModelSuccessors[id] ? models.find((model) => model.id === agentModelSuccessors[id]) : undefined) ??
+  // Threads saved on a model the provider no longer lists (live discovery
+  // dropped it, or it was retired) stay on that provider rather than
+  // dropping to another provider's default.
+  (providerIdOfModelId(id)
+    ? models.find((model) => model.providerId === providerIdOfModelId(id))
     : undefined) ??
   models.find((model) => model.id === defaultAgentModelId) ??
   models[0];

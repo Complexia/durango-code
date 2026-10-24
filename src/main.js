@@ -72,7 +72,13 @@ import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } fro
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
-import { getAgentModels, invalidateAgentModelsCache, listAgentModelsWithAvailability } from './main/models.js';
+import {
+  configureAgentModelsCache,
+  getAgentModels,
+  invalidateAgentModelsCache,
+  listAgentModelsWithAvailability,
+  onAgentModelsChanged,
+} from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
@@ -1293,6 +1299,14 @@ app.whenReady().then(async () => {
   // only the prerequisite they actually need.
   startShellPathSync();
   startLegacyMcpCleanup();
+
+  // Seed the model catalog from the last discovery so the first picker render
+  // and first turn never wait on provider CLIs, then revalidate it in the
+  // background; windows refetch whenever a refresh changes the list.
+  onAgentModelsChanged(() => sendToAllWindows('agent:modelsChanged'));
+  void configureAgentModelsCache(path.join(app.getPath('userData'), 'agent-models-cache.json')).then(() =>
+    getAgentModels().catch(() => {})
+  );
 
   // Workspace sync (opt-in, contract in orion-web/docs/workspace-sync.md).
   // Seed the engine from the persisted store so an enabled sync resumes after
@@ -7804,8 +7818,9 @@ ipcMain.handle('attachment:save', saveAttachment);
 ipcMain.handle('attachment:saveImage', saveAttachment);
 
 ipcMain.handle('agent:listModels', async (_event, input) => {
-  if (input?.force === true) invalidateAgentModelsCache();
-  return listAgentModelsWithAvailability();
+  const fresh = input?.force === true;
+  if (fresh) invalidateAgentModelsCache();
+  return listAgentModelsWithAvailability({ fresh });
 });
 
 ipcMain.handle('agent:supportsThreadReader', async (_event, providerId) =>
