@@ -20,13 +20,14 @@ export const legacyLatestKey = 'releases/latest.json';
 
 const osNames = { darwin: 'macos', win32: 'windows', linux: 'linux' };
 
-// `download` is the file the website hands out by default; `update` is the
-// file electron-updater installs on that OS (latest-mac.yml, latest.yml,
-// latest-linux.yml).
+// `download` is the file the website hands out by default; `updates` are the
+// files electron-updater installs from that OS's feed (latest-mac.yml,
+// latest.yml, latest-linux.yml). On Linux each install picks its own package
+// type: .deb installs the .deb, Arch installs the .pacman.
 export const platformFormats = {
-  macos: { download: 'dmg', update: 'zip' },
-  windows: { download: 'exe', update: 'exe' },
-  linux: { download: 'deb', update: 'deb' },
+  macos: { download: 'dmg', updates: ['zip'] },
+  windows: { download: 'exe', updates: ['exe'] },
+  linux: { download: 'deb', updates: ['deb', 'pacman'] },
 };
 
 const contentTypes = {
@@ -34,6 +35,8 @@ const contentTypes = {
   dmg: 'application/x-apple-diskimage',
   exe: 'application/vnd.microsoft.portable-executable',
   deb: 'application/vnd.debian.binary-package',
+  // An Arch Linux package (zstd tar), named as electron-updater expects.
+  pacman: 'application/octet-stream',
 };
 
 export const releaseOsName = (platform) => {
@@ -80,7 +83,7 @@ export const selectPlatformArtifacts = (osName, artifactPaths) => {
     }
     byFormat.set(format, artifactPath);
   }
-  for (const required of new Set([formats.download, formats.update])) {
+  for (const required of new Set([formats.download, ...formats.updates])) {
     if (!byFormat.has(required)) throw new Error(`${osName} release did not produce a .${required} artifact`);
   }
   return byFormat;
@@ -98,7 +101,10 @@ export const buildPlatformManifest = ({ version, osName, arch, releasedAt, artif
     signed,
     notarized: osName === 'macos' && signed,
     download: formats.download,
-    update: formats.update,
+    // `update` is the first update format, for orion-next deploys that
+    // predate `updates`.
+    update: formats.updates[0],
+    updates: formats.updates,
     artifacts: Object.fromEntries(artifacts.map((artifact) => [artifact.format, artifact])),
   };
 };

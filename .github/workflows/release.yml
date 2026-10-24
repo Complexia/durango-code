@@ -97,4 +97,11 @@ jobs:
       - name: Publish durango-code-bin
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-        run: packaging/aur/publish.sh "${RELEASE_TAG#v}"
+        run: |
+          # Until the AUR account's key is configured, skip rather than fail
+          # the release.
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "::notice::AUR_SSH_PRIVATE_KEY is not set; durango-code-bin was not updated"
+            exit 0
+          fi
+          packaging/aur/publish.sh "${RELEASE_TAG#v}"

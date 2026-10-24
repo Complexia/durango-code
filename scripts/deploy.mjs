@@ -111,6 +111,12 @@ if (triggerCiRelease) {
 if (!isResume) {
   await fs.rm(path.join(rootDir, 'out', 'make'), { recursive: true, force: true });
   run('bun', ['run', 'make', '--', `--platform=${platform}`, `--arch=${arch}`]);
+  if (osName === 'linux') {
+    // The Arch Linux package repackages the .deb (needs Docker).
+    const debPath = (await findArtifacts(path.join(rootDir, 'out', 'make'))).find((entry) => entry.endsWith('.deb'));
+    if (!debPath) throw new Error('Linux release did not produce a .deb to repackage for Arch Linux');
+    run('bash', [path.join(rootDir, 'packaging', 'arch', 'build.sh'), debPath, version, path.join(rootDir, 'out', 'make', 'pacman', arch)]);
+  }
 }
 
 const artifactPaths = await findArtifacts(path.join(rootDir, 'out', 'make'));

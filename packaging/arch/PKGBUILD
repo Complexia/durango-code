@@ -1,0 +1,41 @@
+# Maintainer: Complexia <complexia701@gmail.com>
+#
+# The Arch Linux package published with each release as
+# Durango-Code-<version>-linux-x64.pacman (`sudo pacman -U` it). build.sh
+# repackages the release's .deb, so pkgver and the source are filled in
+# there. Installs update themselves through electron-updater's pacman
+# support; the AUR package (packaging/aur) leaves updates to pacman instead.
+
+pkgname=durango-code
+pkgver=0
+pkgrel=1
+pkgdesc='Agentic IDE: run Claude Code, Codex, Grok, Kimi and Cursor side by side'
+arch=('x86_64')
+url='https://code.durango.sh'
+license=('MIT')
+depends=('gtk3' 'nss' 'libnotify' 'xdg-utils' 'at-spi2-core' 'libdrm' 'mesa' 'libxcb' 'alsa-lib')
+optdepends=(
+  'gnome-keyring: keep you signed in between launches (or another Secret Service provider)'
+  'kwallet: keep you signed in between launches on KDE'
+)
+provides=('durango-code')
+conflicts=('durango-code-bin')
+options=('!strip' '!debug')
+source=('durango-code.deb')
+sha256sums=('SKIP')
+
+package() {
+  bsdtar -xf data.tar.zst -C "${pkgdir}"
+
+  # The .deb marks itself for dpkg updates; this package updates with pacman.
+  printf 'pacman\n' > "${pkgdir}/usr/lib/durango-code/resources/package-type"
+
+  # Chromium's sandbox helper, setuid as in the .deb, for kernels without
+  # unprivileged user namespaces.
+  chmod 4755 "${pkgdir}/usr/lib/durango-code/chrome-sandbox"
+
+  # Debian keeps the Electron license under doc/; Arch uses licenses/.
+  install -Dm644 "${pkgdir}/usr/share/doc/durango-code/copyright" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.electron"
+  rm -r "${pkgdir}/usr/share/doc"
+}

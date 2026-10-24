@@ -47,7 +47,7 @@ const builds = [
   writtenKeys('macos', 'arm64', ['dmg', 'zip']),
   writtenKeys('macos', 'x64', ['dmg', 'zip']),
   writtenKeys('windows', 'x64', ['exe']),
-  writtenKeys('linux', 'x64', ['deb']),
+  writtenKeys('linux', 'x64', ['deb', 'pacman']),
 ];
 const allKeys = builds.flat();
 assert.equal(new Set(allKeys).size, allKeys.length, 'no two builds share an R2 key');
@@ -68,8 +68,12 @@ assert.deepEqual(
 );
 assert.throws(() => selectPlatformArtifacts('macos', ['a.dmg']), /did not produce a \.zip/);
 assert.throws(() => selectPlatformArtifacts('windows', []), /did not produce a \.exe/);
-assert.throws(() => selectPlatformArtifacts('linux', ['a.deb', 'b.deb']), /more than one \.deb/);
-assert.deepEqual([...selectPlatformArtifacts('linux', ['x/durango-code_1.2.3_amd64.deb'])], [['deb', 'x/durango-code_1.2.3_amd64.deb']]);
+assert.throws(() => selectPlatformArtifacts('linux', ['a.deb', 'b.deb', 'c.pacman']), /more than one \.deb/);
+assert.throws(() => selectPlatformArtifacts('linux', ['x/durango-code_1.2.3_amd64.deb']), /did not produce a \.pacman/);
+assert.deepEqual(
+  [...selectPlatformArtifacts('linux', ['x/durango-code_1.2.3_amd64.deb', 'y/durango-code-1.2.3-1-x86_64.pacman'])],
+  [['deb', 'x/durango-code_1.2.3_amd64.deb'], ['pacman', 'y/durango-code-1.2.3-1-x86_64.pacman']],
+);
 
 // Platform manifests name the default download and the update file.
 const windows = buildPlatformManifest({
@@ -84,6 +88,7 @@ assert.equal(windows.platform, 'windows');
 assert.equal(windows.channel, 'stable');
 assert.equal(windows.download, 'exe');
 assert.equal(windows.update, 'exe');
+assert.deepEqual(windows.updates, ['exe']);
 assert.equal(windows.artifacts.exe.key, 'releases/v1.2.3/windows/x64/Durango-Code-1.2.3-windows-x64.exe');
 assert.equal(windows.notarized, false);
 
@@ -92,12 +97,14 @@ const linux = buildPlatformManifest({
   osName: 'linux',
   arch: 'x64',
   releasedAt: '2026-10-24T00:00:00.000Z',
-  artifacts: [artifact('linux', 'x64', 'deb', '1.2.4-rc.1')],
+  artifacts: [artifact('linux', 'x64', 'deb', '1.2.4-rc.1'), artifact('linux', 'x64', 'pacman', '1.2.4-rc.1')],
   signed: false,
 });
 assert.equal(linux.channel, 'prerelease');
 assert.equal(linux.download, 'deb');
 assert.equal(linux.update, 'deb');
+assert.deepEqual(linux.updates, ['deb', 'pacman']);
+assert.equal(linux.artifacts.pacman.key, 'releases/v1.2.4-rc.1/linux/x64/Durango-Code-1.2.4-rc.1-linux-x64.pacman');
 
 // The legacy latest.json keeps the shape older orion-next deploys read.
 const mac = buildPlatformManifest({
