@@ -76,3 +76,25 @@ jobs:
             exit 1
           fi
           node scripts/deploy.mjs --ci --version "${RELEASE_TAG#v}" --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+
+  aur:
+    name: AUR package
+    needs: build
+    # Runs when the Windows build failed too: only the Linux .deb matters
+    # here, and publish.sh fails if it was not published. Prereleases stay
+    # off the AUR.
+    if: ${{ !cancelled() && !contains(inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+      - name: Publish durango-code-bin
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: packaging/aur/publish.sh "${RELEASE_TAG#v}"

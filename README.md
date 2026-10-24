@@ -79,6 +79,8 @@ R2 layout (see [scripts/release-manifest.mjs](scripts/release-manifest.mjs)): ev
 - `releases/latest/<os>-<arch>.json`: the newest stable build per platform, read by code.durango.sh's `/api/download/<os>` and `/api/update/<os>/<arch>/` feeds
 - `releases/latest.json`: the older macOS-only manifest, still written by macOS releases
 
+Stable releases also update the Arch Linux package [`durango-code-bin`](https://aur.archlinux.org/packages/durango-code-bin) on the AUR: the workflow's `aur` job fills [packaging/aur/PKGBUILD](packaging/aur/PKGBUILD) with the version and the checksum of the published `.deb` and pushes it with the `AUR_SSH_PRIVATE_KEY` secret ([packaging/aur/publish.sh](packaging/aur/publish.sh)).
+
 Prerelease versions (`--version 1.2.3-rc.1`) upload their artifacts without moving any `latest` pointer, which makes them a safe end-to-end test of the whole pipeline.
 
 The workflow reads the R2 credentials from repository secrets (`ORION_R2_BUCKET`, `ORION_R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`). Set them from your release env file with `gh secret set -f .env.release.local`. To rebuild a tag's Windows/Linux releases, run `gh workflow run release.yml -f tag=v<version>`.

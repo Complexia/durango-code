@@ -1,0 +1,40 @@
+# Maintainer: Complexia <complexia701@gmail.com>
+#
+# Source of the AUR package durango-code-bin. .github/workflows/release.yml
+# sets pkgver and the checksum and pushes it to the AUR after each stable
+# release; edit the rest here, not in the AUR repository.
+
+pkgname=durango-code-bin
+pkgver=1.0.151
+pkgrel=1
+pkgdesc='Agentic IDE: run Claude Code, Codex, Grok, Kimi and Cursor side by side'
+arch=('x86_64')
+url='https://code.durango.sh'
+license=('MIT')
+depends=('gtk3' 'nss' 'libnotify' 'xdg-utils' 'at-spi2-core' 'libdrm' 'mesa' 'libxcb' 'alsa-lib')
+optdepends=(
+  'gnome-keyring: keep you signed in between launches (or another Secret Service provider)'
+  'kwallet: keep you signed in between launches on KDE'
+)
+provides=('durango-code')
+conflicts=('durango-code')
+options=('!strip' '!debug')
+source=("durango-code-${pkgver}.deb::https://code.durango.sh/api/download/linux?version=${pkgver}")
+sha256sums=('ae816f473979332aa94c1539b5264ecf4adb9396db1d2f1daee1235c91f07e4d')
+
+package() {
+  bsdtar -xf data.tar.zst -C "${pkgdir}"
+
+  # The .deb tells the app to update itself with dpkg. Packages from the AUR
+  # are updated by pacman (yay, paru), so leave the app's updater inactive.
+  rm "${pkgdir}/usr/lib/durango-code/resources/package-type"
+
+  # Chromium's sandbox helper, setuid as in the .deb, for kernels without
+  # unprivileged user namespaces.
+  chmod 4755 "${pkgdir}/usr/lib/durango-code/chrome-sandbox"
+
+  # Debian keeps the Electron license under doc/; Arch uses licenses/.
+  install -Dm644 "${pkgdir}/usr/share/doc/durango-code/copyright" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE.electron"
+  rm -r "${pkgdir}/usr/share/doc"
+}
