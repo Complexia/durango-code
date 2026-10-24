@@ -25,6 +25,8 @@ docker run --rm --platform linux/amd64 -v "$work:/build" archlinux:base-devel ba
   cd /build
   # --nodeps: the dependencies matter on install, not for repackaging.
   su builder -c "makepkg --nodeps --noconfirm"
+  # Hand the files back: the runner user cannot delete the container'"'"'s.
+  chmod -R a+rwX /build
 '
 
 mkdir -p "$out"
