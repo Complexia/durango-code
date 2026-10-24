@@ -117,5 +117,8 @@
     "undici": "^7.28.0",
     "zod": "^4.4.3",
     "zustand": "^5.0.14"
+  },
+  "overrides": {
+    "@electron/node-gyp": "10.2.0-electron.1"
   }
 }

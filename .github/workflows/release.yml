@@ -61,11 +61,6 @@ jobs:
         if: matrix.platform == 'linux'
         run: sudo apt-get update && sudo apt-get install -y fakeroot dpkg
 
-      # bun.lock pins @electron/node-gyp (via @electron/rebuild) as a
-      # git+ssh dependency; runners have no SSH key for GitHub.
-      - name: Fetch GitHub git dependencies over HTTPS
-        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
-
       - run: bun install --frozen-lockfile
 
       - name: Build and publish
