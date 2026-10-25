@@ -114,9 +114,8 @@ export type AgentsSidebarModel = {
   handleCreateThread: (projectId: string) => string;
   openCreateEpicModal: () => void;
   handleCreateThreadForEpic: (epic: Epic) => Promise<string | undefined>;
-  openAddProjectToEpicDialog: (epic: Epic) => void;
-  handleRemoveThreadFromEpic: (threadId: string) => Promise<void>;
-  handleDeleteEpic: (epic: Epic) => Promise<void>;
+  handleRemoveThreadFromEpic: (threadId: string) => void;
+  handleDeleteEpic: (epic: Epic) => void;
   handleSettleEpic: (epic: Epic) => Promise<void>;
   renderThreadCliBadge: (thread: Thread) => React.JSX.Element | null;
   renderThreadStatusDot: (thread: Thread) => React.JSX.Element | null;
@@ -245,7 +244,6 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     handleCreateThread,
     openCreateEpicModal,
     handleCreateThreadForEpic,
-    openAddProjectToEpicDialog,
     handleRemoveThreadFromEpic,
     handleDeleteEpic,
     handleSettleEpic,
@@ -674,13 +672,6 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                   const isEpicCollapsed = collapsedEpics[epic.id] ?? false;
                   const isEpicSelected = selectedEpicId === epic.id && !selectedThreadId;
                   const prStatus = epicPrStatus(epic);
-                  const epicRepositoryProjectIds = new Set([
-                    ...(epic.repositories ?? []).map((repository) => repository.projectId),
-                    ...(epic.repositoryProjectId ? [epic.repositoryProjectId] : []),
-                  ]);
-                  const hasProjectAvailable = projects.some(
-                    (project) => !epicRepositoryProjectIds.has(project.id)
-                  );
 
                   return (
                     <div key={epic.id} className="project-section epic-section" data-sidebar-reveal={`epic:${epic.id}`}>
@@ -761,31 +752,6 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                           </button>
                           {epicMenuOpenId === epic.id && (
                             <div className="thread-menu project-menu" role="menu">
-                              <button
-                                type="button"
-                                className="project-menu-item"
-                                role="menuitem"
-                                disabled={
-                                  !epic.riftPath ||
-                                  runningAgentEpicIds.has(epic.id) ||
-                                  !hasProjectAvailable
-                                }
-                                title={
-                                  !epic.riftPath
-                                    ? 'This epic does not have an active Rift workspace'
-                                    : runningAgentEpicIds.has(epic.id)
-                                      ? 'Wait for this epic’s agents to finish before adding a project'
-                                      : !hasProjectAvailable
-                                        ? 'Every Durango Code project is already part of this epic'
-                                        : undefined
-                                }
-                                onClick={() => {
-                                  setEpicMenuOpenId(null);
-                                  openAddProjectToEpicDialog(epic);
-                                }}
-                              >
-                                <FolderPlus size={13} /> Add project to Rift
-                              </button>
                               <button
                                 type="button"
                                 className="project-menu-item"
@@ -935,7 +901,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                                         role="menuitem"
                                         onClick={() => {
                                           setThreadItemMenuKey(null);
-                                          void handleRemoveThreadFromEpic(thread.id);
+                                          handleRemoveThreadFromEpic(thread.id);
                                         }}
                                       >
                                         <EyeOff size={13} /> Remove from epic

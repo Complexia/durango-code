@@ -138,38 +138,13 @@ assert.match(
 );
 assert.match(
   dialogsSource,
-  /newEpicProjectIds\.length > 1 \|\| !newEpicCreateRift/,
-  'an Epic without a Rift must allow its final project selection to be removed'
+  /aria-label=\{`Remove project \$\{index \+ 1\}`\}/,
+  'every Epic project selection, including the last one, must be removable'
 );
 assert.match(
   storeSource,
-  /repositories\?: EpicRepository\[\][\s\S]*projects\?: Array</,
-  'Epic persistence must retain all repositories and every pending Rift request'
-);
-assert.match(
-  mainSource,
-  /createMultiProjectRift[\s\S]*riftWorkingDir: workspacePath[\s\S]*repositories,/,
-  'multi-project Rift creation must return the shared parent as agent cwd and each child repository'
-);
-assert.match(
-  appSource,
-  /activeRiftRepository[\s\S]*activeRiftRepository\?\.riftWorkingDir[\s\S]*activeRiftRepository\?\.riftPath/,
-  'repository controls must use a child checkout while multi-project agents retain the shared cwd'
-);
-assert.match(
-  mainSource,
-  /isRiftRepositoryChildPath\(epic\.riftPath, repository\.riftPath\)[\s\S]*owners\.set\(repository\.riftPath,[\s\S]*repositoryChild: true[\s\S]*ownedRiftHasMarker[\s\S]*removeOwnedRift/,
-  'shared Rift children must be durable owners and the parent lifecycle must delegate to them'
-);
-const sharedRiftRepositories = section(
-  mainSource,
-  'const sharedRiftRepositories =',
-  'const readOwnedRiftWorkState ='
-);
-assert.match(
-  sharedRiftRepositories,
-  /isRiftRepositoryChildPath\(riftPath, repository\.riftPath\)/,
-  'single-project repository metadata must not be validated as a shared-workspace child'
+  /repositories\?: EpicRepository\[\]/,
+  'Epic persistence must retain all repositories'
 );
 assert.match(
   appSource,
@@ -192,31 +167,6 @@ assert.match(
   'a successful multi-project commit must continue into PR creation when enabled'
 );
 assert.match(
-  dialogsSource,
-  /newEpicProjectIds\.map[\s\S]*branchState = newEpicRiftBranches\[projectId\][\s\S]*Branch from:/,
-  'every selected project must get its own styled Rift source-branch picker'
-);
-assert.match(
-  appSource,
-  /const riftProjects = epicProjects\.map[\s\S]*sourceBranch: selectedBranch[\s\S]*baseBranch: selectedBranch/,
-  'each project source-branch choice must be carried into its Rift request'
-);
-assert.match(
-  mainSource,
-  /sourceBranch =\s*[\s\S]*requested\.sourceBranch[\s\S]*repositories\.push\([\s\S]*sourceBranch: source\.sourceBranch/,
-  'multi-project Rift ownership must retain every repository source branch'
-);
-assert.match(
-  appSource,
-  /const restoreProjects = recordedRepositories[\s\S]*existingBranch: repository\.gitBranch[\s\S]*projects: restoreProjects\.map/,
-  'restoring a released shared Rift must request every recorded repository branch'
-);
-assert.match(
-  appSource,
-  /const repositories = ownership\.repositories\?\.length[\s\S]*repositories \? \{ repositories \}/,
-  'Rift acknowledgement must replace stale repository paths with recreated ownership metadata'
-);
-assert.match(
   appSource,
   /result === 'aborted'\) break/,
   'a user-aborted repository operation must stop the remaining batch'
@@ -224,12 +174,12 @@ assert.match(
 assert.match(
   appSource,
   /epic\.repositories\?\.length \?\? 0\) > 1[\s\S]*return UNCLAIMED_EPIC_GIT_WORKSPACE_KEY/,
-  'non-Rift multi-repository actions must use the conservative shared-checkout lock'
+  'multi-repository actions must use the conservative shared-checkout lock'
 );
 assert.match(
   appSource,
   /claimedBranches: claimedBranchesForEpic\(epic\.id\)/,
-  'non-Rift per-repository actions must enforce cross-Epic branch claims'
+  'per-repository actions must enforce cross-Epic branch claims'
 );
 assert.match(
   appSource,
@@ -239,7 +189,7 @@ assert.match(
 assert.match(
   appSource,
   /baseBranch: repository\.sourceBranch \?\? ''/,
-  'each repository pull request must target the source branch selected for its Rift'
+  'each repository pull request must target its recorded source branch'
 );
 assert.match(
   appSource,
@@ -248,98 +198,44 @@ assert.match(
 );
 assert.match(
   sidebarSource,
-  /openAddProjectToEpicDialog\(epic\)[\s\S]*Add project to Rift/,
-  'the Epic options menu must expose the add-project flow'
-);
-assert.match(
-  sidebarSource,
   /useSidebarResize\(\{[\s\S]*storageKey: AGENTS_SIDEBAR_STORAGE_KEY[\s\S]*className="sidebar agents-sidebar" ref=\{sidebarRef\}[\s\S]*<SidebarFooter \{\.\.\.sidebarFooterProps\} \/>\s*\{sidebarResizeHandle\}/,
   'the Agents sidebar must be drag-resizable through the shared sidebar resize hook'
 );
+
+// Durango workspaces replace Rifts (docs/workspaces.md).
+// The store only mentions Rift fields to drop them from persisted state.
+for (const [name, source] of Object.entries({ appSource, mainSource, preloadSource, dialogsSource, sidebarSource })) {
+  assert.doesNotMatch(source, /riftPath|riftStatus|epicCreateRift|riftsSettings/, `no Rift code may remain in ${name}`);
+}
+const turnStart = section(
+  appSource,
+  'const startTurnForThreadUnlocked = useCallback(',
+  'let model = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);'
+);
+assert.match(
+  turnStart,
+  /await ensureThreadDurangoWorkspace\(threadId, promptText\)[\s\S]*const workingDir = threadWorkingDir\(thread, project\)/,
+  'a first turn must create its Durango workspace before resolving the agent cwd'
+);
 assert.match(
   appSource,
-  /className="sidebar-section-action epic-view-add-project"[\s\S]*title="Add project"[\s\S]*aria-label="Add project"[\s\S]*openAddProjectToEpicDialog\(selectedEpic\)[\s\S]*<Plus size=\{14\}/,
-  'the Epic repository row must expose the add-project flow as an accessible plus icon'
-);
-assert.match(
-  dialogsSource,
-  /aria-label="Project to add"[\s\S]*role="option"[\s\S]*Add project/,
-  'the add-project dialog must use the styled project picker instead of a native select'
+  /thread\.durangoWorkspace && !thread\.agentSessionIds\?\.\[model\.providerId\][\s\S]*buildDurangoWorkspaceContext/,
+  'fresh sessions in a workspace must be told they are already in one'
 );
 assert.match(
   appSource,
-  /epicAddRiftProject\([\s\S]*persistAndAcknowledgeRift\([\s\S]*Project added, but Rift ownership could not be persisted/,
-  'the renderer must durably persist and acknowledge an appended Rift repository'
+  /durangoWorkspace: driverThread\.durangoWorkspace \?\? null/,
+  'subagents must work in their driver thread\'s directory'
 );
 assert.match(
   mainSource,
-  /addProjectToExistingRift[\s\S]*readPersistedRiftOwners[\s\S]*existingGitRoots[\s\S]*riftCreate\(canonicalGitRoot,[\s\S]*unacknowledgedRifts\.set/,
-  'main must validate durable ownership and duplicate Git roots before journaling an appended repository'
-);
-assert.match(
-  mainSource,
-  /workspaceLinkPath[\s\S]*fs\.symlink[\s\S]*sharedRiftRepositories[\s\S]*isSymbolicLink\(\)[\s\S]*realpathSync/,
-  'expanding a legacy one-project Rift must retain and validate its original repository through the shared workspace link'
-);
-const addRiftProject = section(
-  mainSource,
-  'const addProjectToExistingRift = async (event, input) => {',
-  "ipcMain.handle('epic:addRiftProject'"
-);
-assert.match(
-  addRiftProject,
-  /pendingRiftEpicIds\.add\(epicId\)[\s\S]*riftRemovalCoordinator\.run\(\[epicId\]/,
-  'adding a project must synchronously reserve the destructive-operation coordinator'
-);
-const removeRift = section(
-  mainSource,
-  "ipcMain.handle('epic:removeRift'",
-  "ipcMain.handle('epic:deleteRiftRestoreRef'"
-);
-assert.match(
-  removeRift,
-  /pendingRiftEpicIds\.has\(epicId\)[\s\S]*still being updated[\s\S]*riftRemovalCoordinator\.run/,
-  'Epic deletion must reject a Rift setup whose ownership is not durable yet'
-);
-assert.match(
-  removeRift,
-  /if \(!existsSync\(riftPath\)\)[\s\S]*isExternalRiftLinkedFromWorkspace[\s\S]*riftRemove\(repositoryRiftPath\)[\s\S]*deleteEpicRestoreRefBestEffort/,
-  'missing shared parents must not orphan an externally linked legacy Rift'
-);
-const storageRelease = section(
-  mainSource,
-  "ipcMain.handle('riftStorage:release'",
-  '// Age-based retention.'
-);
-assert.match(
-  storageRelease,
-  /owner\?\.repositoryChild[\s\S]*workspace-owned/,
-  'Storage release must reject standalone child-repository requests'
-);
-assert.match(
-  storageRelease,
-  /if \(!existsSync\(riftPath\)\)[\s\S]*linkedRepositoriesForMissingWorkspace[\s\S]*readRepositoryRiftsWorkState[\s\S]*preserveRepositoryRiftHeadsForRestore[\s\S]*riftRemove\(repository\.riftPath\)[\s\S]*completeRiftRelease/,
-  'Storage release must preserve and remove linked repositories before settling a missing parent'
-);
-const persistRift = section(
-  appSource,
-  'const persistAndAcknowledgeRift = useCallback(',
-  '  useEffect(() => {'
-);
-assert.match(
-  persistRift,
-  /flushOrionThreadsSave\(\)[\s\S]*updateEpic\(ownership\.epicId[\s\S]*flushOrionStoreSave\(\)/,
-  'provider session resets must reach thread storage before the new workspace is activated'
+  /ipcMain\.handle\('durangoWorkspace:create'[\s\S]*await signInBundledCli\(\)[\s\S]*createDurangoWorkspace\(/,
+  'workspace creation must sign the bundled CLI in before `ws new`'
 );
 assert.match(
   preloadSource,
-  /epicAddRiftProject:[\s\S]*epic:addRiftProject/,
-  'the add-project operation must cross the preload boundary'
-);
-assert.match(
-  mainSource,
-  /input\?\.projectPaths[\s\S]*input\?\.gitRoots[\s\S]*deleteRiftRestoreRefs/,
-  'Epic deletion must remove restore refs from every source repository'
+  /createDurangoWorkspace:[\s\S]*durangoWorkspace:create/,
+  'workspace creation must cross the preload boundary'
 );
 assert.match(
   appSource,

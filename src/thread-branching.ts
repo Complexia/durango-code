@@ -78,6 +78,9 @@ const branchCopy = (
     // to select a model and send follow-up turns like any Orion subagent.
     inheritedSubagent: source.subagent ?? source.inheritedSubagent,
     epicId: source.epicId ?? inheritedEpicId,
+    // Forked sessions are recorded under the source's cwd, so a branch keeps
+    // working in the source thread's Durango workspace (or its project).
+    durangoWorkspace: source.durangoWorkspace,
   };
 };
 

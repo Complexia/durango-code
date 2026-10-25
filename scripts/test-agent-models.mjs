@@ -381,11 +381,11 @@ assert.equal(
   null
 );
 assert.match(
-  await validateAgentWorkspace('/missing-rift', async () => {
+  await validateAgentWorkspace('/missing-workspace', async () => {
     throw Object.assign(new Error('missing'), { code: 'ENOENT' });
   }),
-  /workspace no longer exists.*Recreate the Rift/i,
-  'missing Rift workspaces should fail before spawning a provider'
+  /workspace no longer exists.*start a new thread/i,
+  'missing workspaces should fail before spawning a provider'
 );
 assert.match(
   await validateAgentWorkspace('/locked', async () => {

@@ -17,17 +17,10 @@ import {
   cpSync,
   createReadStream,
   existsSync,
-  lstatSync,
   mkdirSync,
-  readFileSync,
-  readlinkSync,
-  readdirSync,
-  realpathSync,
-  renameSync,
   unwatchFile,
   watch as watchFsPath,
   watchFile,
-  writeFileSync,
 } from 'node:fs';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -131,8 +124,17 @@ import {
 } from './main/workspace-sync.js';
 import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
-import { listRiftTrashPaths, riftBinaryPath, riftCreate, riftGc, riftInit, riftPackageVersion, riftRemove, riftSlug } from './main/rift.js';
-import { scrubRiftWorkspace } from './main/rift-scrub.js';
+import { bundledCliEntry, bundledCliVersion, ensureCliSignedIn, installBundledCliShims, readCliCredential } from './main/bundled-cli.js';
+import {
+  createDurangoWorkspace,
+  durangoWorkspaceStatus,
+  inspectDurangoWorkspaceProject,
+  landDurangoWorkspace,
+  removeDurangoWorkspace,
+  serveDurangoWorkspace,
+  stopAllDurangoWorkspaceServers,
+  stopDurangoWorkspaceServer,
+} from './main/durango-workspaces.js';
 import {
   configureOrionSourceControl,
   describeGitPushFailure,
@@ -151,22 +153,6 @@ import {
   shouldMirrorGithubLocally,
   switchSourceControlToOrion,
 } from './main/source-control.js';
-import {
-  collectCurrentManualRiftReleaseEntries,
-  collectPendingRiftOwnersByPath,
-  createRiftRemovalCoordinator,
-  deleteRiftRestoreRefs,
-  guardedEpicIdsForRiftReleaseJournal,
-  isEpicDeletionPersisted,
-  isManualRiftReleaseEntryCurrent,
-  isRiftReleaseOwnerCurrent,
-  isRetainedRiftOwnerEligible,
-  preserveRiftHeadForRestore,
-  reconcileRiftReleaseJournal,
-  releasedRiftRefForEpic,
-} from './main/rift-release.js';
-import { collapseNestedPaths, isExternalRiftLinkedFromWorkspace, isRiftRepositoryChildPath, planRiftStorageEntries, readVolumeFreeSpace, reclaimedBytesAcrossVolumes } from './main/rift-storage-accounting.js';
-import { isRiftDirectoryPath, listRiftRootEntries, loadSizeCache, measurePathSize, riftHasMarker, riftRootForGitRoot, saveSizeCache } from './main/rift-storage.js';
 
 // The internal app name ("Orion") and userData path are pinned by
 // ./main/pin-app-identity.js, imported first. The customer-facing name is
@@ -178,19 +164,7 @@ let quitAfterPendingWork = false;
 let quitBarrierSatisfied = false;
 let appShutdownRequested = false;
 let appShutdownReason = null;
-let riftShutdownRequested = false;
 let codexAppServerShutdownPromise = null;
-const pendingRiftCreations = new Set();
-const pendingRiftEpicIds = new Set();
-// Destructive Rift operations share one queue. Its reference-counted epic
-// reservations cover both queued and running work, while durable release
-// journal ownership remains separate until renderer acknowledgement.
-const riftRemovalCoordinator = createRiftRemovalCoordinator();
-const pendingRiftReleaseEpicIds = new Set();
-// Successful workspaces remain main-owned until the renderer proves the epic
-// binding reached durable store storage. This bridges invoke completion,
-// renderer reloads, and process crashes without exposing the source checkout.
-const unacknowledgedRifts = new Map(); // epicId -> ownership
 const codexGoalOpsByThread = new Map(); // threadId -> Set<{ controller, promise }>
 const completedCodexQuestions = createCompletedCodexQuestions();
 const disposeCodexGoalOpsForThread = async (threadId) => {
@@ -274,150 +248,6 @@ const cancelActiveProviderUpdate = (operationId = null) => {
 };
 const waitForProviderUpdateShutdown = () =>
   activeProviderUpdate?.promise?.catch(() => {}) ?? Promise.resolve();
-const pendingRiftSetupError = (input) => {
-  if (typeof input?.epicId !== 'string') return null;
-  if (pendingRiftEpicIds.has(input.epicId)) {
-    return 'This epic’s rift workspace is still being created — try again in a moment';
-  }
-  if (
-    riftRemovalCoordinator.hasEpic(input.epicId) ||
-    pendingRiftReleaseEpicIds.has(input.epicId)
-  ) {
-    return 'This epic’s rift workspace is being removed — try again after restoring it';
-  }
-  return null;
-};
-const cancelPendingRiftCreations = () => {
-  for (const creation of pendingRiftCreations) creation.cancel();
-};
-const waitForPendingRiftCreations = async (timeoutMs = 8_000) => {
-  const deadline = new Promise((resolve) => {
-    setTimeout(() => resolve('timeout'), timeoutMs);
-  });
-  while (pendingRiftCreations.size > 0) {
-    const result = await Promise.race([
-      Promise.allSettled([...pendingRiftCreations].map((creation) => creation.promise)).then(
-        () => 'settled'
-      ),
-      deadline,
-    ]);
-    if (result === 'timeout') {
-      // A force-killed Rift child should normally settle well before this
-      // deadline. Journal any workspace path already reported so startup can
-      // retry cleanup without holding Cmd-Q open indefinitely.
-      rememberRiftCleanupForQuit(
-        [...pendingRiftCreations].map((creation) => creation.riftPath()).filter(Boolean)
-      );
-      return;
-    }
-  }
-};
-const riftQuitCleanupPaths = new Set();
-let riftCleanupJournalQueue = Promise.resolve();
-const riftCleanupJournalPath = () => path.join(app.getPath('userData'), 'orphaned-rifts.json');
-const updateRiftCleanupJournal = (update) => {
-  riftCleanupJournalQueue = riftCleanupJournalQueue
-    .catch(() => {})
-    .then(async () => {
-      const journalPath = riftCleanupJournalPath();
-      let paths = [];
-      try {
-        const parsed = JSON.parse(await fs.readFile(journalPath, 'utf-8'));
-        if (Array.isArray(parsed)) paths = parsed.filter((value) => typeof value === 'string');
-      } catch {}
-      const nextPaths = [...new Set([...(await update(paths)), ...riftQuitCleanupPaths])];
-      const tempPath = `${journalPath}.${process.pid}.tmp`;
-      await fs.mkdir(path.dirname(journalPath), { recursive: true });
-      await fs.writeFile(tempPath, JSON.stringify(nextPaths), 'utf-8');
-      await fs.rename(tempPath, journalPath);
-    });
-  return riftCleanupJournalQueue;
-};
-const rememberRiftCleanup = (riftPath) =>
-  updateRiftCleanupJournal((paths) => [...paths, riftPath]);
-const forgetRiftCleanup = (riftPath) =>
-  updateRiftCleanupJournal((paths) => paths.filter((candidate) => candidate !== riftPath));
-const hasRememberedRiftCleanup = async (riftPath) => {
-  let remembered = false;
-  await updateRiftCleanupJournal((paths) => {
-    remembered = paths.includes(riftPath);
-    return paths;
-  });
-  return remembered;
-};
-const isSafeMarkerlessRiftPath = (riftPath) => {
-  const resolvedPath = path.resolve(riftPath);
-  const riftsDirectory = path.dirname(path.dirname(resolvedPath));
-  if (
-    path.basename(riftsDirectory) !== '.rifts' ||
-    !/-[0-9a-f]{24}$/.test(path.basename(resolvedPath))
-  ) {
-    return false;
-  }
-  try {
-    const stat = lstatSync(resolvedPath);
-    return stat.isDirectory() && !stat.isSymbolicLink();
-  } catch {
-    return false;
-  }
-};
-const removeRememberedRiftCleanup = async (riftPath, { allowMarkerless = false } = {}) => {
-  if (existsSync(path.join(riftPath, '.rift'))) {
-    await riftRemove(riftPath);
-    return;
-  }
-  if (!allowMarkerless || !isSafeMarkerlessRiftPath(riftPath)) {
-    throw new Error(
-      'The rift path still exists but its .rift marker is missing; refusing unsafe removal.'
-    );
-  }
-  // A failed `rift create` can leave the deterministic destination behind
-  // before writing its marker. Only pre-journaled Orion destinations reach
-  // this path, and the OS trash keeps their removal recoverable.
-  await shell.trashItem(riftPath);
-};
-const rememberRiftCleanupForQuit = (riftPaths) => {
-  for (const riftPath of riftPaths) riftQuitCleanupPaths.add(riftPath);
-  if (riftQuitCleanupPaths.size === 0) return;
-  try {
-    const journalPath = riftCleanupJournalPath();
-    let paths = [];
-    try {
-      const parsed = JSON.parse(readFileSync(journalPath, 'utf-8'));
-      if (Array.isArray(parsed)) paths = parsed.filter((value) => typeof value === 'string');
-    } catch {}
-    const tempPath = `${journalPath}.${process.pid}.quit.tmp`;
-    mkdirSync(path.dirname(journalPath), { recursive: true });
-    writeFileSync(
-      tempPath,
-      JSON.stringify([...new Set([...paths, ...riftQuitCleanupPaths])]),
-      'utf-8'
-    );
-    renameSync(tempPath, journalPath);
-  } catch (error) {
-    console.error('Could not journal pending Rift cleanup before quit', error);
-  }
-};
-const retryOrphanedRiftCleanup = () =>
-  updateRiftCleanupJournal(async (paths) => {
-    const persistedOwners = await readPersistedRiftOwners();
-    const remaining = [];
-    for (const riftPath of paths) {
-      // The renderer can durably save active ownership immediately before a
-      // crash prevents its acknowledgement IPC. Active ownership wins over the
-      // stale journal; cleanup-pending ownership remains eligible for recovery.
-      const persistedOwner = persistedOwners.get(riftPath);
-      if (persistedOwner && !persistedOwner.cleanupPending) continue;
-      if (!existsSync(riftPath)) continue;
-      try {
-        await removeRememberedRiftCleanup(riftPath, { allowMarkerless: true });
-      } catch {
-        remaining.push(riftPath);
-      }
-    }
-    return remaining;
-  });
-
 let pendingDesktopAuth = null;
 let inMemoryAccountSession = null;
 let lastPublishedAccountAuthenticated = null;
@@ -507,8 +337,7 @@ const sanitizeStoreValue = (value) => {
 };
 
 // The persisted store is the main process's only view of renderer state, and
-// the one that survives a crash. The renderer flushes it before any rift
-// operation, so reading it here stays in step with what the user just did.
+// the one that survives a crash.
 const readPersistedStoreState = async () => {
   try {
     const value = sanitizeStoreValue(await fs.readFile(getStorageFilePath(), 'utf-8'));
@@ -517,97 +346,6 @@ const readPersistedStoreState = async () => {
   } catch {
     return null;
   }
-};
-
-const readPersistedRiftOwners = async (state) => {
-  const owners = new Map();
-  const epics = (state === undefined ? await readPersistedStoreState() : state)?.epics;
-  if (!Array.isArray(epics)) return owners;
-  for (const epic of epics) {
-    if (typeof epic?.id === 'string' && typeof epic?.riftPath === 'string') {
-      const repositories = Array.isArray(epic.repositories)
-        ? epic.repositories.filter(
-            (repository) =>
-              repository &&
-              typeof repository.riftPath === 'string' &&
-              repository.riftPath
-          )
-        : [];
-      const owner = {
-        epicId: epic.id,
-        cleanupPending: epic.riftCleanupPending === true,
-        settledAt: typeof epic.settledAt === 'string' ? epic.settledAt : null,
-        name: typeof epic.name === 'string' ? epic.name : '',
-        gitBranch: typeof epic.gitBranch === 'string' ? epic.gitBranch : null,
-        gitRoot: typeof epic.gitRoot === 'string' ? epic.gitRoot : null,
-        prUrl: typeof epic.prUrl === 'string' ? epic.prUrl : null,
-        prState: typeof epic.prState === 'string' ? epic.prState : null,
-        repositories,
-      };
-      owners.set(epic.riftPath, owner);
-      // A shared Epic workspace is only a container. Its children are the
-      // actual Rift owners and each is separately present in the crash-cleanup
-      // journal, so recovery must recognize them before acknowledgement too.
-      for (const repository of repositories) {
-        if (!isRiftRepositoryChildPath(epic.riftPath, repository.riftPath)) continue;
-        owners.set(repository.riftPath, {
-          ...owner,
-          repositoryChild: true,
-          workspaceRiftPath: epic.riftPath,
-          workspaceLinkPath:
-            typeof repository.workspaceLinkPath === 'string'
-              ? repository.workspaceLinkPath
-              : null,
-          gitBranch:
-            typeof repository.gitBranch === 'string'
-              ? repository.gitBranch
-              : owner.gitBranch,
-          gitRoot:
-            typeof repository.gitRoot === 'string' ? repository.gitRoot : owner.gitRoot,
-          prUrl: typeof repository.prUrl === 'string' ? repository.prUrl : null,
-          prState: typeof repository.prState === 'string' ? repository.prState : null,
-        });
-      }
-    }
-  }
-  return owners;
-};
-
-const readPersistedRuntimeThreadIdsByEpic = async () => {
-  let threads = [];
-  try {
-    threads = (await readThreadsIndex()).entries;
-  } catch {}
-  const result = new Map();
-  const knownEpicIds = new Set(
-    threads
-      .map((thread) => (typeof thread?.epicId === 'string' ? thread.epicId : null))
-      .filter(Boolean)
-  );
-  for (const epicId of knownEpicIds) {
-    const threadIds = new Set(
-      threads
-        .filter((thread) => thread?.epicId === epicId && typeof thread?.id === 'string')
-        .map((thread) => thread.id)
-    );
-    let foundChild = true;
-    while (foundChild) {
-      foundChild = false;
-      for (const thread of threads) {
-        if (
-          typeof thread?.id === 'string' &&
-          typeof thread?.parentThreadId === 'string' &&
-          threadIds.has(thread.parentThreadId) &&
-          !threadIds.has(thread.id)
-        ) {
-          threadIds.add(thread.id);
-          foundChild = true;
-        }
-      }
-    }
-    result.set(epicId, [...threadIds]);
-  }
-  return result;
 };
 
 const base64Url = (value) =>
@@ -1279,17 +1017,6 @@ app.whenReady().then(async () => {
   } catch (error) {
     console.error('Could not install bundled agent skills', error);
   }
-  // Hydrate the release guard before a renderer can launch work against a
-  // stale path. The journal stays authoritative until renderer persistence is
-  // acknowledged, including across full app restarts.
-  try {
-    await hydrateRiftReleaseJournal();
-  } catch (error) {
-    console.error('Could not hydrate Rift release protection', error);
-  }
-  // Orphan recovery first: the retention sweep reads the same journal, and
-  // neither should hold the first window open.
-  void retryOrphanedRiftCleanup().then(() => startRiftRetentionSweep());
   // Reinforce the internal app name (helps in some dev launch scenarios). It
   // must stay "Orion": see ./main/app-identity.js.
   app.setName(INTERNAL_APP_NAME);
@@ -1299,6 +1026,7 @@ app.whenReady().then(async () => {
   // only the prerequisite they actually need.
   startShellPathSync();
   startLegacyMcpCleanup();
+  void installBundledCli();
 
   // Seed the model catalog from the last discovery so the first picker render
   // and first turn never wait on provider CLIs, then revalidate it in the
@@ -1663,16 +1391,12 @@ app.on('window-all-closed', () => {
 const disposeForQuit = (reason = 'quit') => {
   appShutdownRequested = true;
   appShutdownReason ??= reason;
-  riftShutdownRequested = true;
-  rememberRiftCleanupForQuit(
-    [...pendingRiftCreations].map((creation) => creation.riftPath()).filter(Boolean)
-  );
-  cancelPendingRiftCreations();
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
   cancelActiveProviderUpdate();
+  stopAllDurangoWorkspaceServers();
   reapActiveAgentRuns();
   if (!codexAppServerShutdownPromise) {
     // Goal runs must record their pause through the shared server before it
@@ -1694,7 +1418,6 @@ const waitForPendingQuitWork = () =>
   Promise.all([
     waitForPendingAgentShutdowns(),
     waitForProviderUpdateShutdown(),
-    waitForPendingRiftCreations(),
     waitForRemoteControlPersistence(),
   ])
     .then(() => threadsSaveQueue.catch(() => {}));
@@ -2803,9 +2526,7 @@ const canonicalGitPath = async (value) => {
 
 // Epic git actions are confined to one non-default branch in one repository.
 // This prevents two epics (or a later project switch) from silently sharing a
-// push target. A rift-backed epic owns its whole workspace, so the renderer
-// sends no expected root/branch or foreign claims for it — only the
-// default-branch guard, which still applies, runs.
+// push target.
 const validateEpicGitTarget = async (gitRoot, branch, input) => {
   const canonicalRoot = await canonicalGitPath(gitRoot);
   const expectedBranch = String(input?.expectedBranch ?? '').trim();
@@ -2933,10 +2654,6 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
     }
     const { signal } = operation.controller;
     const skipPush = Boolean(input?.skipPush);
-    const riftSetupError = pendingRiftSetupError(input);
-    if (riftSetupError) {
-      return { ok: false, error: riftSetupError };
-    }
     const projectPath = input?.projectPath;
     if (!projectPath) {
       return { ok: false, error: 'Missing project path.' };
@@ -2952,14 +2669,9 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
     const target = await validateEpicGitTarget(gitRoot, branch, input);
     if (!target.ok) return target;
     gitRoot = target.gitRoot;
-    const setupErrorAfterValidation = pendingRiftSetupError(input);
-    if (setupErrorAfterValidation) {
-      return { ok: false, gitRoot, branch, error: setupErrorAfterValidation };
-    }
 
-    // Stage everything. When the epic works inside a rift, the workspace only
-    // ever contains this epic's changes; outside a rift, staging all local
-    // changes is the accepted trade-off.
+    // Stage everything: staging all local changes in the claimed repository
+    // is the accepted trade-off.
     await execFileAsync('git', ['-C', gitRoot, 'add', '-A']);
     const stagedHasChanges = !(
       await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet'])
@@ -2969,8 +2681,7 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
       // its push failed. Only for a branch this epic already owns: an
       // unclaimed epic must not adopt unrelated local commits as its own.
       const epicOwnsBranch = Boolean(
-        input?.isRift ||
-          (String(input?.expectedGitRoot ?? '').trim() && String(input?.expectedBranch ?? '').trim())
+        String(input?.expectedGitRoot ?? '').trim() && String(input?.expectedBranch ?? '').trim()
       );
       if (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch)) {
         if (!epicOwnsBranch) {
@@ -2986,10 +2697,6 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
             branch,
             error: "No new changes to commit. Earlier commits remain unpushed (commit-only is on).",
           };
-        }
-        const setupErrorBeforePush = pendingRiftSetupError(input);
-        if (setupErrorBeforePush) {
-          return { ok: false, gitRoot, branch, error: setupErrorBeforePush };
         }
         const pushed = await pushBranchToSourceControl(gitRoot, branch, { signal });
         return {
@@ -3047,10 +2754,6 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
         error: `The repository moved off ${branch} while Durango Code was preparing the commit. Switch back and try again.`,
       };
     }
-    const setupErrorBeforeCommit = pendingRiftSetupError(input);
-    if (setupErrorBeforeCommit) {
-      return { ok: false, gitRoot, branch, error: setupErrorBeforeCommit };
-    }
     if (signal.aborted) {
       return { ok: false, aborted: true, gitRoot, branch };
     }
@@ -3090,17 +2793,6 @@ ipcMain.handle('epic:commitAndPush', async (event, input) => {
   }
 });
 
-const riftWorktreeChangesFailure = async (gitRoot, branch, input) => {
-  if (!input?.isRift || (await readGitStatusEntries(gitRoot)).length === 0) return null;
-  return {
-    ok: false,
-    gitRoot,
-    branch,
-    error:
-      'This epic’s rift still has uncommitted changes. Commit and push them before opening a pull request.',
-  };
-};
-
 // Everything the PR base picker can resolve without touching the network, so
 // the dialog opens with a real base branch instead of waiting on origin. The
 // full branch list follows over epic:listRemoteBranches while it is open.
@@ -3137,9 +2829,9 @@ ipcMain.handle('epic:localPrBase', async (_event, input) => {
 // directly (not local tracking refs) so a stale clone still offers every
 // branch a PR could actually target.
 //
-// sourceProjectPath is the epic's real repository checkout (the one a rift was
-// cloned from). Its branch is what the PR should default to merging back into,
-// so it is reported alongside the remote branches.
+// sourceProjectPath is the epic's real repository checkout. Its branch is what
+// the PR should default to merging back into, so it is reported alongside the
+// remote branches.
 ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
   try {
     const projectPath = input?.projectPath;
@@ -3193,10 +2885,6 @@ ipcMain.handle('epic:createPr', async (event, input) => {
       return { ok: false, error: 'A git action is already running for this epic.' };
     }
     const { signal } = operation.controller;
-    const riftSetupError = pendingRiftSetupError(input);
-    if (riftSetupError) {
-      return { ok: false, error: riftSetupError };
-    }
     const projectPath = input?.projectPath;
     if (!projectPath) {
       return { ok: false, error: 'Missing project path.' };
@@ -3232,21 +2920,11 @@ ipcMain.handle('epic:createPr', async (event, input) => {
         error: `Cannot open a pull request from ${branch} into itself. Choose a different base branch.`,
       };
     }
-    const setupErrorAfterValidation = pendingRiftSetupError(input);
-    if (setupErrorAfterValidation) {
-      return { ok: false, gitRoot, branch, error: setupErrorAfterValidation };
-    }
 
-    // Every local change in a rift belongs to this epic. Opening or reusing a
-    // PR with any staged, unstaged, or untracked work would publish an
-    // incomplete snapshot. Shared workspaces retain the narrower staged guard
-    // because unrelated unstaged work can legitimately coexist there.
-    const riftWorktreeFailure = await riftWorktreeChangesFailure(gitRoot, branch, input);
-    const sharedWorkspaceHasStagedChanges =
-      !input?.isRift &&
-      !(await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet']));
-    if (riftWorktreeFailure || sharedWorkspaceHasStagedChanges) {
-      if (riftWorktreeFailure) return riftWorktreeFailure;
+    // Staged work would be left out of the PR. Unstaged work is not checked:
+    // unrelated changes can legitimately coexist in a shared checkout.
+    const hasStagedChanges = !(await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet']));
+    if (hasStagedChanges) {
       return {
         ok: false,
         gitRoot,
@@ -3280,12 +2958,6 @@ ipcMain.handle('epic:createPr', async (event, input) => {
       );
       const existing = JSON.parse(stdout);
       if (existing?.url && existing?.state === 'OPEN') {
-        const worktreeFailure = await riftWorktreeChangesFailure(gitRoot, branch, input);
-        if (worktreeFailure) return worktreeFailure;
-        const setupErrorBeforeReuse = pendingRiftSetupError(input);
-        if (setupErrorBeforeReuse) {
-          return { ok: false, gitRoot, branch, error: setupErrorBeforeReuse };
-        }
         return {
           ok: true,
           url: existing.url,
@@ -3324,12 +2996,6 @@ ipcMain.handle('epic:createPr', async (event, input) => {
     }
 
     // The branch must exist on the remote before gh can target a new PR.
-    const worktreeFailureBeforePush = await riftWorktreeChangesFailure(gitRoot, branch, input);
-    if (worktreeFailureBeforePush) return worktreeFailureBeforePush;
-    const setupErrorBeforePush = pendingRiftSetupError(input);
-    if (setupErrorBeforePush) {
-      return { ok: false, gitRoot, branch, error: setupErrorBeforePush };
-    }
     if (signal.aborted) {
       return { ok: false, aborted: true, gitRoot, branch };
     }
@@ -3412,16 +3078,6 @@ ipcMain.handle('epic:createPr', async (event, input) => {
     if (!title) title = input?.epicName || `Changes from ${branch}`;
     if (!body) body = `Changes from the Durango Code epic "${input?.epicName ?? branch}".`;
 
-    const worktreeFailureBeforeCreate = await riftWorktreeChangesFailure(
-      gitRoot,
-      branch,
-      input
-    );
-    if (worktreeFailureBeforeCreate) return worktreeFailureBeforeCreate;
-    const setupErrorBeforeCreate = pendingRiftSetupError(input);
-    if (setupErrorBeforeCreate) {
-      return { ok: false, gitRoot, branch, error: setupErrorBeforeCreate };
-    }
     if (signal.aborted) {
       return { ok: false, aborted: true, gitRoot, branch };
     }
@@ -3609,8 +3265,7 @@ const buildPrStateQuery = (repoGroups) => {
 
 // Batch PR-state lookup behind the sidebar's epic icon colours. Deliberately
 // not a loop over epic:gitStatus: that also runs `git status` and `rev-list`
-// against each epic's workspace, which is wasted work here and throws for
-// rifts that are pending or mid-removal. Per-epic failures are dropped from
+// against each epic's repository, which is wasted work here. Per-epic failures are dropped from
 // the response so the renderer keeps the state it already has.
 ipcMain.handle('epic:prStates', async (_event, input) => {
   const requested = Array.isArray(input?.epics) ? input.epics : [];
@@ -3760,2635 +3415,138 @@ ipcMain.handle('epic:prStates', async (_event, input) => {
   return { ok: true, states };
 });
 
-// --- Epics: rift workspaces (experimental) -------------------------------
+// --- Bundled durango-code CLI and Durango workspaces -----------------------------
 
-ipcMain.handle('rift:status', () => ({
-  available: Boolean(riftBinaryPath()),
-  version: riftPackageVersion(),
-  pendingEpicIds: [...pendingRiftEpicIds],
-  pendingRemovalEpicIds: [
-    ...new Set([...riftRemovalCoordinator.pendingEpicIds(), ...pendingRiftReleaseEpicIds]),
-  ],
-  readyRifts: [...unacknowledgedRifts.values()],
-}));
-
-// Every branch an epic's rift creates is namespaced here, so rift work is
-// recognizable at a glance next to hand-made `feat/`, `fix/` branches.
-const EPIC_BRANCH_NAMESPACE = 'orion/';
-const EPIC_BRANCH_NAMESPACE_REF = `refs/heads/${EPIC_BRANCH_NAMESPACE.slice(0, -1)}`;
-
-const resolveExistingRiftBranchRef = async (gitRoot, epicId, requestedBranch) => {
-  const preservedBranchRef = releasedRiftRefForEpic(epicId);
-  const localBranchRef = `refs/heads/${requestedBranch}`;
-  const remoteBranchRef = `refs/remotes/origin/${requestedBranch}`;
-  const preservedBranchExists = await commandSucceeds('git', [
-    '-C', gitRoot, 'rev-parse', '--verify', '--quiet', preservedBranchRef,
-  ]);
-  const localBranchExists = !preservedBranchExists && await commandSucceeds('git', [
-    '-C', gitRoot, 'rev-parse', '--verify', '--quiet', localBranchRef,
-  ]);
-  let remoteBranchExists = false;
-  if (!preservedBranchExists && !localBranchExists) {
-    remoteBranchExists = await commandSucceeds('git', [
-      '-C', gitRoot, 'rev-parse', '--verify', '--quiet', remoteBranchRef,
-    ]);
-  }
-  if (!preservedBranchExists && !localBranchExists && !remoteBranchExists) {
-    try {
-      await execFileAsync('git', [
-        '-C', gitRoot, 'fetch', '--no-tags', 'origin',
-        `refs/heads/${requestedBranch}:${remoteBranchRef}`,
-      ]);
-      remoteBranchExists = true;
-    } catch {}
-  }
-  const ref = preservedBranchExists
-    ? preservedBranchRef
-    : localBranchExists
-      ? localBranchRef
-      : remoteBranchExists
-        ? remoteBranchRef
-        : '';
-  return { ref, fromPreservedRef: preservedBranchExists };
-};
-
-const createMultiProjectRift = async (event, input) => {
-  if (riftShutdownRequested) {
-    return { ok: false, error: 'Rift creation was cancelled because Durango Code is quitting.' };
-  }
-  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
-  const requestedProjects = Array.isArray(input?.projects)
-    ? input.projects.filter(
-        (project) =>
-          typeof project?.projectId === 'string' &&
-          typeof project?.projectPath === 'string' &&
-          project.projectPath
-      )
-    : [];
-  if (!epicId) return { ok: false, error: 'Missing epic id.' };
-  if (requestedProjects.length < 2) {
-    return { ok: false, error: 'A multi-project Rift needs at least two projects.' };
-  }
-  if (pendingRiftEpicIds.has(epicId)) {
-    return { ok: false, error: 'A rift is already being created for this epic.' };
-  }
-  if (riftRemovalCoordinator.hasEpic(epicId) || pendingRiftReleaseEpicIds.has(epicId)) {
-    return { ok: false, error: 'This epic’s previous rift is still being removed.' };
-  }
-
-  pendingRiftEpicIds.add(epicId);
-  const abortController = new AbortController();
-  const cancelForDestroyedSender = () => abortController.abort();
-  event.sender.once('destroyed', cancelForDestroyedSender);
-  let settlePendingCreation;
-  const pendingCreation = new Promise((resolve) => { settlePendingCreation = resolve; });
-  let workspacePath = '';
-  let awaitingPersistenceAck = false;
-  const createdRepositoryPaths = [];
-  const pendingEntry = {
-    epicId,
-    epicName: typeof input?.epicName === 'string' ? input.epicName : '',
-    promise: pendingCreation,
-    cancel: () => abortController.abort(),
-    riftPath: () => workspacePath,
-  };
-  pendingRiftCreations.add(pendingEntry);
-
-  const cleanupCreatedWorkspace = async () => {
-    for (const repositoryPath of [...createdRepositoryPaths].reverse()) {
-      if (!existsSync(repositoryPath)) continue;
-      try {
-        await removeRememberedRiftCleanup(repositoryPath, { allowMarkerless: true });
-        await forgetRiftCleanup(repositoryPath);
-      } catch {}
-    }
-    const childStillExists = createdRepositoryPaths.some((repositoryPath) => existsSync(repositoryPath));
-    if (workspacePath && existsSync(workspacePath) && !childStillExists) {
-      try {
-        await shell.trashItem(workspacePath);
-        await forgetRiftCleanup(workspacePath);
-      } catch {}
-    }
-  };
-
-  try {
-    if (!riftBinaryPath()) {
-      return { ok: false, error: 'Rift is not available on this platform.' };
-    }
-
-    const prepared = [];
-    const seenGitRoots = new Set();
-    for (const requested of requestedProjects) {
-      const gitRoot = await getGitRoot(requested.projectPath);
-      const [canonicalGitRoot, canonicalProjectPath] = await Promise.all([
-        fs.realpath(gitRoot),
-        fs.realpath(requested.projectPath),
-      ]);
-      if (seenGitRoots.has(canonicalGitRoot)) {
-        return {
-          ok: false,
-          error: 'Two selected projects belong to the same Git repository. Select that repository only once.',
-        };
+// Launchers for the CLI bundled with the app (src/main/bundled-cli.js), on PATH
+// for agents and the embedded terminal. Appended, so a globally installed CLI
+// still wins. The shell PATH sync merges the user's shell PATH in front of
+// whatever process.env.PATH holds, which keeps this directory last either way.
+let bundledCliBinDirPromise = null;
+const installBundledCli = () => {
+  bundledCliBinDirPromise ??= installBundledCliShims()
+    .then((binDir) => {
+      if (binDir) {
+        const entries = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+        if (!entries.includes(binDir)) process.env.PATH = [...entries, binDir].join(path.delimiter);
       }
-      seenGitRoots.add(canonicalGitRoot);
-      const projectRelativePath = path.relative(canonicalGitRoot, canonicalProjectPath);
-      if (
-        path.isAbsolute(projectRelativePath) ||
-        projectRelativePath === '..' ||
-        projectRelativePath.startsWith(`..${path.sep}`)
-      ) {
-        return { ok: false, error: 'A selected project is outside its Git repository.' };
-      }
-      const sourceChanges = await readGitStatusEntries(canonicalGitRoot);
-      if (sourceChanges.length > 0) {
-        const examples = sourceChanges.slice(0, 3).map((entry) => entry.relativePath).join(', ');
-        return {
-          ok: false,
-          error:
-            `${path.basename(canonicalGitRoot)} has staged, unstaged, or untracked changes. ` +
-            'Commit, stash, or remove them before creating the shared Rift.' +
-            (examples ? ` Changed: ${examples}${sourceChanges.length > 3 ? ', …' : ''}` : ''),
-        };
-      }
-      const { stdout } = await execFileAsync('git', [
-        '-C', canonicalGitRoot, 'rev-parse', '--verify', 'HEAD',
-      ]);
-      const sourceHead = stdout.trim();
-      const namespaceBranchExists = await commandSucceeds('git', [
-        '-C', canonicalGitRoot, 'rev-parse', '--verify', '--quiet', EPIC_BRANCH_NAMESPACE_REF,
-      ]);
-      if (namespaceBranchExists) {
-        return {
-          ok: false,
-          error: `${path.basename(canonicalGitRoot)} has a local branch named orion, which conflicts with Durango Code’s Rift branch namespace.`,
-        };
-      }
-      const baseBranch = String(requested.baseBranch ?? '').trim();
-      if (
-        baseBranch &&
-        !(await commandSucceeds('git', [
-          '-C', canonicalGitRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${baseBranch}`,
-        ]))
-      ) {
-        return { ok: false, error: `The selected base branch ${baseBranch} no longer exists.` };
-      }
-      const existingBranch = String(requested.existingBranch ?? '').trim();
-      const existing = existingBranch
-        ? await resolveExistingRiftBranchRef(canonicalGitRoot, epicId, existingBranch)
-        : { ref: '', fromPreservedRef: false };
-      if (existingBranch && !existing.ref) {
-        return {
-          ok: false,
-          error: `The branch ${existingBranch} no longer exists locally or on origin, so ${path.basename(canonicalGitRoot)} cannot be restored.`,
-        };
-      }
-      const sourceBranch =
-        String(requested.sourceBranch ?? '').trim() ||
-        baseBranch ||
-        (await getCurrentGitBranch(canonicalGitRoot)) ||
-        '';
-      prepared.push({
-        projectId: requested.projectId,
-        projectPath: canonicalProjectPath,
-        gitRoot: canonicalGitRoot,
-        projectRelativePath,
-        sourceHead,
-        baseBranch,
-        sourceBranch,
-        existingBranch,
-        existingBranchRef: existing.ref,
-        restoringFromPreservedRef: existing.fromPreservedRef,
-      });
-    }
-
-    const restoring = prepared.some((source) => source.existingBranch);
-    if (restoring && prepared.some((source) => !source.existingBranch)) {
-      return { ok: false, error: 'Every repository needs its recorded branch to restore a shared Rift.' };
-    }
-
-    const slug = riftSlug(input?.epicName);
-    const suffix = crypto.randomBytes(12).toString('hex');
-    const workspaceName = `${slug}-${suffix}`;
-    const workspaceParent = path.join(path.dirname(prepared[0].gitRoot), '.rifts', 'epics');
-    workspacePath = path.resolve(workspaceParent, workspaceName);
-    if (existsSync(workspacePath)) {
-      throw new Error(`The planned Rift workspace already exists: ${workspacePath}`);
-    }
-    await fs.mkdir(workspacePath, { recursive: true });
-    await rememberRiftCleanup(workspacePath);
-
-    let branchBase = slug;
-    if (!restoring && input?.modelId) {
-      try {
-        const prompt =
-          `Choose a git branch name for work on the epic "${input?.epicName ?? ''}"` +
-          (input?.epicDescription ? ` (${truncateForPrompt(String(input.epicDescription), 500)})` : '') +
-          '. Reply with ONLY the branch name: lowercase kebab-case, no namespace prefix, under 50 characters.';
-        const raw = cleanGeneratedGitMessage(
-          await runOneShotForModelId(input.modelId, prompt, prepared[0].projectPath, {
-            signal: abortController.signal,
-            reasoningEffort: input?.reasoningEffort,
-          })
-        );
-        const candidate = raw.split('\n')[0]?.trim().replace(/^['"`]+|['"`]+$/g, '')
-          .replace(/^[^/]+\//, '').replace(/\//g, '-').slice(0, 60);
-        if (candidate && (await validateNewBranchName(`${EPIC_BRANCH_NAMESPACE}${candidate}`))) {
-          branchBase = candidate;
-        }
-      } catch {}
-    }
-    branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || slug;
-    const branch = restoring ? prepared[0].existingBranch : `${EPIC_BRANCH_NAMESPACE}${branchBase}-${suffix}`;
-    const repositories = [];
-    const usedNames = new Set();
-
-    for (const source of prepared) {
-      if (abortController.signal.aborted || riftShutdownRequested) {
-        throw new Error('Rift creation was cancelled because its Durango Code window closed.');
-      }
-      await riftInit(source.gitRoot, { signal: abortController.signal });
-      const baseName = path.basename(source.gitRoot) || 'project';
-      let repositoryName = baseName;
-      let duplicateIndex = 2;
-      while (usedNames.has(repositoryName)) repositoryName = `${baseName}-${duplicateIndex++}`;
-      usedNames.add(repositoryName);
-      const expectedRepositoryPath = path.join(workspacePath, repositoryName);
-      await rememberRiftCleanup(expectedRepositoryPath);
-      const reportedPath = await riftCreate(source.gitRoot, {
-        name: repositoryName,
-        into: workspacePath,
-        signal: abortController.signal,
-      });
-      const repositoryRiftPath = path.resolve(reportedPath);
-      if (repositoryRiftPath !== expectedRepositoryPath) {
-        throw new Error(`rift create reported an unexpected workspace path: ${repositoryRiftPath}`);
-      }
-      createdRepositoryPaths.push(repositoryRiftPath);
-      const { stdout: excludeOutput } = await execFileAsync('git', [
-        '-C', repositoryRiftPath, 'rev-parse', '--git-path', 'info/exclude',
-      ]);
-      const excludePath = path.isAbsolute(excludeOutput.trim())
-        ? excludeOutput.trim()
-        : path.resolve(repositoryRiftPath, excludeOutput.trim());
-      await fs.appendFile(excludePath, '\n# Orion Rift metadata\n.rift\n');
-      await execFileAsync('git', ['-C', repositoryRiftPath, 'reset', '--hard', source.sourceHead]);
-      await execFileAsync('git', [
-        '-C', repositoryRiftPath, 'clean', '-ffd', '-e', '.rift', '-e', '.rift/**',
-      ]);
-      if ((await readGitStatusEntries(repositoryRiftPath)).length > 0) {
-        throw new Error(`${baseName} could not be reset to a clean Git snapshot.`);
-      }
-      if (source.existingBranch) {
-        if (source.restoringFromPreservedRef) {
-          await execFileAsync('git', [
-            '-C', repositoryRiftPath, 'checkout', '-B', source.existingBranch, source.existingBranchRef, '--',
-          ]);
-        } else if (source.existingBranchRef.startsWith('refs/remotes/')) {
-          await execFileAsync('git', [
-            '-C', repositoryRiftPath, 'checkout', '--track', '-b', source.existingBranch, source.existingBranchRef,
-          ]);
-        } else {
-          await execFileAsync('git', ['-C', repositoryRiftPath, 'checkout', source.existingBranch, '--']);
-        }
-      } else if (source.baseBranch) {
-        await execFileAsync('git', ['-C', repositoryRiftPath, 'checkout', source.baseBranch, '--']);
-      }
-      if (!source.existingBranch) {
-        await execFileAsync('git', ['-C', repositoryRiftPath, 'checkout', '-b', branch]);
-      }
-      if ((await readGitStatusEntries(repositoryRiftPath)).length > 0) {
-        throw new Error(`${baseName} could not switch cleanly to its Rift branch.`);
-      }
-      await scrubRiftWorkspace(repositoryRiftPath);
-      const riftProjectPath = source.projectRelativePath
-        ? path.join(repositoryRiftPath, source.projectRelativePath)
-        : repositoryRiftPath;
-      if (!(await fs.stat(riftProjectPath).catch(() => null))?.isDirectory()) {
-        throw new Error(`${baseName} does not contain the selected project directory.`);
-      }
-      repositories.push({
-        projectId: source.projectId,
-        projectPath: source.projectPath,
-        sourceBranch: source.sourceBranch || undefined,
-        riftPath: repositoryRiftPath,
-        riftWorkingDir: riftProjectPath,
-        gitRoot: source.gitRoot,
-        gitBranch: source.existingBranch || branch,
-      });
-    }
-
-    let senderGone = false;
-    try { senderGone = event.senderFrame?.isDestroyed?.() === true; } catch { senderGone = true; }
-    if (riftShutdownRequested || event.sender.isDestroyed() || senderGone) {
-      await cleanupCreatedWorkspace();
-      return { ok: false, error: 'Rift creation was cancelled because its Durango Code window closed.' };
-    }
-
-    const ownership = {
-      epicId,
-      projectId: repositories[0].projectId,
-      projectPath: repositories[0].projectPath,
-      riftPath: workspacePath,
-      riftWorkingDir: workspacePath,
-      gitRoot: repositories[0].gitRoot,
-      branch,
-      repositories,
-    };
-    unacknowledgedRifts.set(epicId, ownership);
-    awaitingPersistenceAck = true;
-    return { ok: true, ...ownership };
-  } catch (error) {
-    const message = error?.stderr?.toString().trim() || error?.message || String(error);
-    await cleanupCreatedWorkspace();
-    return { ok: false, ...(workspacePath ? { riftPath: workspacePath } : {}), error: message };
-  } finally {
-    event.sender.removeListener('destroyed', cancelForDestroyedSender);
-    settlePendingCreation();
-    pendingRiftCreations.delete(pendingEntry);
-    if (!awaitingPersistenceAck) pendingRiftEpicIds.delete(epicId);
-  }
-};
-
-const addProjectToExistingRift = async (event, input) => {
-  if (riftShutdownRequested) {
-    return { ok: false, error: 'Rift project setup was cancelled because Durango Code is quitting.' };
-  }
-  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
-  const projectId = typeof input?.projectId === 'string' ? input.projectId : '';
-  const requestedProjectPath = typeof input?.projectPath === 'string' ? input.projectPath : '';
-  const requestedRiftPath = typeof input?.riftPath === 'string' ? input.riftPath : '';
-  if (!epicId || !projectId || !requestedProjectPath || !requestedRiftPath) {
-    return { ok: false, error: 'Missing epic, project, or Rift workspace details.' };
-  }
-  if (pendingRiftEpicIds.has(epicId)) {
-    return { ok: false, error: 'This epic’s Rift workspace is already being updated.' };
-  }
-  if (epicGitOperations.has(epicId)) {
-    return { ok: false, error: 'This epic already has a Git operation in progress.' };
-  }
-  if (riftRemovalCoordinator.hasEpic(epicId) || pendingRiftReleaseEpicIds.has(epicId)) {
-    return { ok: false, error: 'This epic’s Rift workspace is being removed.' };
-  }
-
-  // Take the same main-owned launch lock used by initial Rift creation before
-  // the first await. Existing agents may finish, but no new turn can enter the
-  // shared workspace while its repository set is changing.
-  pendingRiftEpicIds.add(epicId);
-  const abortController = new AbortController();
-  const cancelForDestroyedSender = () => abortController.abort();
-  event.sender.once('destroyed', cancelForDestroyedSender);
-  let settlePendingCreation;
-  const pendingCreation = new Promise((resolve) => { settlePendingCreation = resolve; });
-  let createdRepositoryPath = '';
-  let createdWorkspaceContainerPath = '';
-  let awaitingPersistenceAck = false;
-  const pendingEntry = {
-    epicId,
-    epicName: '',
-    promise: pendingCreation,
-    cancel: () => abortController.abort(),
-    riftPath: () => createdWorkspaceContainerPath || createdRepositoryPath,
-  };
-  pendingRiftCreations.add(pendingEntry);
-
-  const cleanupCreatedRepository = async () => {
-    try {
-      if (createdRepositoryPath && existsSync(createdRepositoryPath)) {
-        await removeRememberedRiftCleanup(createdRepositoryPath, { allowMarkerless: true });
-      }
-      if (createdRepositoryPath) await forgetRiftCleanup(createdRepositoryPath);
-      if (createdWorkspaceContainerPath && existsSync(createdWorkspaceContainerPath)) {
-        await removeRememberedRiftCleanup(createdWorkspaceContainerPath, { allowMarkerless: true });
-      }
-      if (createdWorkspaceContainerPath) {
-        await forgetRiftCleanup(createdWorkspaceContainerPath);
-      }
-    } catch {}
-  };
-
-  return riftRemovalCoordinator.run([epicId], async () => {
-  try {
-    if (!riftBinaryPath()) {
-      return { ok: false, error: 'Rift is not available on this platform.' };
-    }
-    const persistedState = await readPersistedStoreState();
-    const epic = (Array.isArray(persistedState?.epics) ? persistedState.epics : [])
-      .find((candidate) => candidate?.id === epicId);
-    if (!epic || typeof epic.riftPath !== 'string' || !epic.riftPath) {
-      return { ok: false, error: 'This epic does not have an active Rift workspace.' };
-    }
-    const existingWorkspacePath = path.resolve(epic.riftPath);
-    let workspacePath = existingWorkspacePath;
-    if (path.resolve(requestedRiftPath) !== existingWorkspacePath) {
-      return { ok: false, error: 'The requested Rift workspace no longer belongs to this epic.' };
-    }
-    const persistedOwners = await readPersistedRiftOwners(persistedState);
-    const persistedOwner = persistedOwners.get(epic.riftPath);
-    if (persistedOwner?.epicId !== epicId) {
-      return { ok: false, error: 'The epic’s Rift ownership is not durably recorded.' };
-    }
-    const workspaceStat = await fs.lstat(existingWorkspacePath).catch(() => null);
-    if (!workspaceStat?.isDirectory() || workspaceStat.isSymbolicLink()) {
-      return { ok: false, error: 'The epic’s Rift workspace is missing or unsafe to update.' };
-    }
-
-    const existingRepositories = Array.isArray(epic.repositories)
-      ? epic.repositories.filter(
-          (repository) =>
-            repository &&
-            typeof repository.projectId === 'string' &&
-            typeof repository.projectPath === 'string'
-        )
-      : [];
-    if (!existsSync(path.join(existingWorkspacePath, '.rift'))) {
-      const sharedRepositories = sharedRiftRepositories(epic.riftPath, persistedOwner);
-      const recordedRiftCount = existingRepositories.filter(
-        (repository) => typeof repository.riftPath === 'string' && repository.riftPath
-      ).length;
-      if (sharedRepositories === null || sharedRepositories.length !== recordedRiftCount) {
-        return { ok: false, error: 'The shared Rift contains an invalid repository path.' };
-      }
-    }
-    if (existingRepositories.some((repository) => repository.projectId === projectId)) {
-      return { ok: false, error: 'That project is already part of this epic.' };
-    }
-
-    const [canonicalProjectPath, canonicalGitRoot] = await (async () => {
-      const projectPath = await fs.realpath(requestedProjectPath);
-      const gitRoot = await fs.realpath(await getGitRoot(projectPath));
-      return [projectPath, gitRoot];
-    })();
-    const existingGitRoots = new Set(
-      (await Promise.all(
-        existingRepositories.map(async (repository) => {
-          if (typeof repository.gitRoot === 'string' && repository.gitRoot) {
-            return fs.realpath(repository.gitRoot).catch(() => path.resolve(repository.gitRoot));
-          }
-          try {
-            return await fs.realpath(await getGitRoot(repository.projectPath));
-          } catch {
-            return null;
-          }
-        })
-      )).filter(Boolean)
-    );
-    if (existingGitRoots.has(canonicalGitRoot)) {
-      return {
-        ok: false,
-        error: 'That project belongs to a Git repository already present in this Rift.',
-      };
-    }
-    const projectRelativePath = path.relative(canonicalGitRoot, canonicalProjectPath);
-    if (
-      path.isAbsolute(projectRelativePath) ||
-      projectRelativePath === '..' ||
-      projectRelativePath.startsWith(`..${path.sep}`)
-    ) {
-      return { ok: false, error: 'The selected project is outside its Git repository.' };
-    }
-    const sourceChanges = await readGitStatusEntries(canonicalGitRoot);
-    if (sourceChanges.length > 0) {
-      const examples = sourceChanges.slice(0, 3).map((entry) => entry.relativePath).join(', ');
-      return {
-        ok: false,
-        error:
-          `${path.basename(canonicalGitRoot)} has staged, unstaged, or untracked changes. ` +
-          'Commit, stash, or remove them before adding it to the Rift.' +
-          (examples ? ` Changed: ${examples}${sourceChanges.length > 3 ? ', …' : ''}` : ''),
-      };
-    }
-    const namespaceBranchExists = await commandSucceeds('git', [
-      '-C', canonicalGitRoot, 'rev-parse', '--verify', '--quiet', EPIC_BRANCH_NAMESPACE_REF,
-    ]);
-    if (namespaceBranchExists) {
-      return {
-        ok: false,
-        error: `${path.basename(canonicalGitRoot)} has a local branch named orion, which conflicts with Durango Code’s Rift branch namespace.`,
-      };
-    }
-    const targetBranch =
-      (typeof epic.gitBranch === 'string' && epic.gitBranch) ||
-      existingRepositories.find((repository) => typeof repository.gitBranch === 'string')?.gitBranch ||
-      '';
-    if (!targetBranch) {
-      return { ok: false, error: 'The epic does not have a feature branch for the new project.' };
-    }
-    if (await commandSucceeds('git', [
-      '-C', canonicalGitRoot, 'rev-parse', '--verify', '--quiet', `refs/heads/${targetBranch}`,
-    ])) {
-      return {
-        ok: false,
-        error: `${path.basename(canonicalGitRoot)} already has a local branch named ${targetBranch}.`,
-      };
-    }
-    const [{ stdout: headOutput }, sourceBranch] = await Promise.all([
-      execFileAsync('git', ['-C', canonicalGitRoot, 'rev-parse', '--verify', 'HEAD']),
-      getCurrentGitBranch(canonicalGitRoot),
-    ]);
-    const sourceHead = headOutput.trim();
-
-    const runtimeThreadIds = Array.isArray(input?.runtimeThreadIds)
-      ? [...new Set(input.runtimeThreadIds.filter((threadId) => typeof threadId === 'string' && threadId))]
-      : [];
-    if (runtimeThreadIds.length > 0) {
-      await Promise.all(runtimeThreadIds.map((threadId) => disposeAgentThreadRuntime(threadId)));
-    }
-
-    // Older one-project Epics use the repository Rift itself as their agent
-    // cwd. Turn that into a shared view without moving the live Rift (its
-    // metadata may contain absolute paths): create a neutral container and a
-    // validated symlink to the original repository, then place new Rift
-    // children beside that link. Cleanup continues to target real Rift paths.
-    let persistedRepositories = existingRepositories;
-    if (existsSync(path.join(existingWorkspacePath, '.rift'))) {
-      if (!isRiftDirectoryPath(existingWorkspacePath)) {
-        throw new Error('The existing Rift path is not safe to expand into a shared workspace.');
-      }
-      const suffix = crypto.randomBytes(12).toString('hex');
-      const workspaceName = `${riftSlug(epic.name)}-${suffix}`;
-      const workspaceParent = path.join(
-        path.dirname(path.dirname(existingWorkspacePath)),
-        'epics'
-      );
-      workspacePath = path.resolve(workspaceParent, workspaceName);
-      if (existsSync(workspacePath)) {
-        throw new Error(`The planned shared Rift workspace already exists: ${workspacePath}`);
-      }
-      createdWorkspaceContainerPath = workspacePath;
-      await fs.mkdir(workspacePath, { recursive: true });
-      await rememberRiftCleanup(workspacePath);
-
-      const primaryProject = (Array.isArray(persistedState?.projects) ? persistedState.projects : [])
-        .find((candidate) => candidate?.id === epic.repositoryProjectId);
-      const primary = existingRepositories[0] ?? {
-        projectId: epic.repositoryProjectId,
-        projectPath: primaryProject?.path ?? epic.gitRoot,
-        riftPath: existingWorkspacePath,
-        riftWorkingDir: epic.riftWorkingDir ?? existingWorkspacePath,
-        gitRoot: epic.gitRoot,
-        gitBranch: epic.gitBranch,
-      };
-      if (!primary.projectId || !primary.projectPath) {
-        throw new Error('The existing Rift repository is missing its project identity.');
-      }
-      const primaryRiftPath = path.resolve(primary.riftPath || existingWorkspacePath);
-      if (primaryRiftPath !== existingWorkspacePath) {
-        throw new Error('The existing Rift repository does not match its workspace.');
-      }
-      let primaryName = path.basename(primary.gitRoot || primary.projectPath) || 'project';
-      let primaryIndex = 2;
-      while (existsSync(path.join(workspacePath, primaryName))) {
-        primaryName = `${path.basename(primary.gitRoot || primary.projectPath) || 'project'}-${primaryIndex++}`;
-      }
-      const workspaceLinkPath = path.join(workspacePath, primaryName);
-      await fs.symlink(primaryRiftPath, workspaceLinkPath, 'dir');
-      persistedRepositories = [{ ...primary, riftPath: primaryRiftPath, workspaceLinkPath }];
-    }
-
-    const usedNames = new Set(
-      persistedRepositories
-        .map((repository) =>
-          typeof repository.workspaceLinkPath === 'string'
-            ? path.basename(repository.workspaceLinkPath)
-            : typeof repository.riftPath === 'string'
-              ? path.basename(repository.riftPath)
-              : ''
-        )
-        .filter(Boolean)
-    );
-    const baseName = path.basename(canonicalGitRoot) || 'project';
-    let repositoryName = baseName;
-    let duplicateIndex = 2;
-    while (usedNames.has(repositoryName) || existsSync(path.join(workspacePath, repositoryName))) {
-      repositoryName = `${baseName}-${duplicateIndex++}`;
-    }
-    const expectedRepositoryPath = path.join(workspacePath, repositoryName);
-    createdRepositoryPath = expectedRepositoryPath;
-    await rememberRiftCleanup(expectedRepositoryPath);
-    await riftInit(canonicalGitRoot, { signal: abortController.signal });
-    const reportedPath = await riftCreate(canonicalGitRoot, {
-      name: repositoryName,
-      into: workspacePath,
-      signal: abortController.signal,
-    });
-    const repositoryRiftPath = path.resolve(reportedPath);
-    if (repositoryRiftPath !== expectedRepositoryPath) {
-      throw new Error(`rift create reported an unexpected workspace path: ${repositoryRiftPath}`);
-    }
-    const { stdout: excludeOutput } = await execFileAsync('git', [
-      '-C', repositoryRiftPath, 'rev-parse', '--git-path', 'info/exclude',
-    ]);
-    const excludePath = path.isAbsolute(excludeOutput.trim())
-      ? excludeOutput.trim()
-      : path.resolve(repositoryRiftPath, excludeOutput.trim());
-    await fs.appendFile(excludePath, '\n# Orion Rift metadata\n.rift\n');
-    await execFileAsync('git', ['-C', repositoryRiftPath, 'reset', '--hard', sourceHead]);
-    await execFileAsync('git', [
-      '-C', repositoryRiftPath, 'clean', '-ffd', '-e', '.rift', '-e', '.rift/**',
-    ]);
-    await execFileAsync('git', ['-C', repositoryRiftPath, 'checkout', '-b', targetBranch]);
-    if ((await readGitStatusEntries(repositoryRiftPath)).length > 0) {
-      throw new Error(`${baseName} could not switch cleanly to its Rift branch.`);
-    }
-    await scrubRiftWorkspace(repositoryRiftPath);
-    const riftWorkingDir = projectRelativePath
-      ? path.join(repositoryRiftPath, projectRelativePath)
-      : repositoryRiftPath;
-    if (!(await fs.stat(riftWorkingDir).catch(() => null))?.isDirectory()) {
-      throw new Error(`${baseName} does not contain the selected project directory.`);
-    }
-    if (abortController.signal.aborted || riftShutdownRequested) {
-      throw new Error('Rift project setup was cancelled because its Durango Code window closed.');
-    }
-
-    const repositories = [
-      ...persistedRepositories,
-      {
-        projectId,
-        projectPath: canonicalProjectPath,
-        sourceBranch: sourceBranch || undefined,
-        riftPath: repositoryRiftPath,
-        riftWorkingDir,
-        gitRoot: canonicalGitRoot,
-        gitBranch: targetBranch,
-      },
-    ];
-    const primary = repositories[0];
-    const ownership = {
-      epicId,
-      projectId: primary?.projectId ?? epic.repositoryProjectId,
-      projectPath: primary?.projectPath ?? canonicalProjectPath,
-      riftPath: workspacePath,
-      riftWorkingDir:
-        createdWorkspaceContainerPath ||
-        (typeof epic.riftWorkingDir === 'string' && epic.riftWorkingDir) ||
-        workspacePath,
-      gitRoot: (typeof epic.gitRoot === 'string' && epic.gitRoot) || primary?.gitRoot,
-      branch: targetBranch,
-      sourceBranch: primary?.sourceBranch,
-      repositories,
-      resetRuntimeSessions: Boolean(createdWorkspaceContainerPath),
-    };
-    unacknowledgedRifts.set(epicId, ownership);
-    awaitingPersistenceAck = true;
-    return { ok: true, ...ownership, addedProjectId: projectId };
-  } catch (error) {
-    const message = error?.stderr?.toString().trim() || error?.message || String(error);
-    await cleanupCreatedRepository();
-    return { ok: false, error: message };
-  } finally {
-    event.sender.removeListener('destroyed', cancelForDestroyedSender);
-    settlePendingCreation();
-    pendingRiftCreations.delete(pendingEntry);
-    if (!awaitingPersistenceAck) pendingRiftEpicIds.delete(epicId);
-  }
-  });
-};
-
-ipcMain.handle('epic:addRiftProject', (event, input) =>
-  addProjectToExistingRift(event, input)
-);
-
-ipcMain.handle('epic:createRift', async (event, input) => {
-  if (Array.isArray(input?.projects) && input.projects.length > 1) {
-    return createMultiProjectRift(event, input);
-  }
-  if (riftShutdownRequested) {
-    return { ok: false, error: 'Rift creation was cancelled because Durango Code is quitting.' };
-  }
-  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
-  if (!epicId) {
-    return { ok: false, error: 'Missing epic id.' };
-  }
-  if (pendingRiftEpicIds.has(epicId)) {
-    return { ok: false, error: 'A rift is already being created for this epic.' };
-  }
-  if (riftRemovalCoordinator.hasEpic(epicId) || pendingRiftReleaseEpicIds.has(epicId)) {
-    return { ok: false, error: 'This epic’s previous rift is still being removed.' };
-  }
-  // Register synchronously before the first await. Agent and terminal IPC
-  // handlers consult this main-owned lock, so a recreated renderer cannot run
-  // an epic thread in the source repository while setup is still pending.
-  pendingRiftEpicIds.add(epicId);
-  const abortController = new AbortController();
-  const cancelForDestroyedSender = () => abortController.abort();
-  event.sender.once('destroyed', cancelForDestroyedSender);
-  let settlePendingCreation;
-  const pendingCreation = new Promise((resolve) => {
-    settlePendingCreation = resolve;
-  });
-  let createdRiftPath = '';
-  let awaitingPersistenceAck = false;
-  const pendingEntry = {
-    epicId,
-    epicName: typeof input?.epicName === 'string' ? input.epicName : '',
-    promise: pendingCreation,
-    cancel: () => abortController.abort(),
-    riftPath: () => createdRiftPath,
-  };
-  pendingRiftCreations.add(pendingEntry);
-  try {
-    const projectPath = input?.projectPath;
-    if (!projectPath) {
-      return { ok: false, error: 'Missing project path.' };
-    }
-    if (!riftBinaryPath()) {
-      return { ok: false, error: 'Rift is not available on this platform.' };
-    }
-
-    const gitRoot = await getGitRoot(projectPath);
-    const [canonicalGitRoot, canonicalProjectPath] = await Promise.all([
-      fs.realpath(gitRoot),
-      fs.realpath(projectPath),
-    ]);
-    const projectRelativePath = path.relative(canonicalGitRoot, canonicalProjectPath);
-    if (
-      path.isAbsolute(projectRelativePath) ||
-      projectRelativePath === '..' ||
-      projectRelativePath.startsWith(`..${path.sep}`)
-    ) {
-      return { ok: false, error: 'The selected project is outside its Git repository.' };
-    }
-    const sourceChanges = await readGitStatusEntries(gitRoot);
-    if (sourceChanges.length > 0) {
-      const examples = sourceChanges
-        .slice(0, 3)
-        .map((entry) => entry.relativePath)
-        .join(', ');
-      return {
-        ok: false,
-        error:
-          'The source repository has staged, unstaged, or untracked changes. ' +
-          'Commit, stash, or remove them before creating a rift.' +
-          (examples ? ` Changed: ${examples}${sourceChanges.length > 3 ? ', …' : ''}` : ''),
-      };
-    }
-    const { stdout: sourceHeadOutput } = await execFileAsync('git', [
-      '-C',
-      gitRoot,
-      'rev-parse',
-      '--verify',
-      'HEAD',
-    ]);
-    const sourceHead = sourceHeadOutput.trim();
-    if (!sourceHead) {
-      return { ok: false, error: 'The source repository does not have a commit to create a rift from.' };
-    }
-
-    // Optional base for the epic's feature branch. Resolved in the source
-    // repository up front so a stale selection fails before the expensive
-    // copy, but never checked out there — the switch happens inside the rift
-    // below, so local work in the source checkout is never at risk.
-    const requestedBaseBranch = String(input?.baseBranch ?? '').trim();
-    const sourceBranch =
-      String(input?.sourceBranch ?? '').trim() ||
-      requestedBaseBranch ||
-      (await getCurrentGitBranch(gitRoot)) ||
-      '';
-    if (requestedBaseBranch) {
-      const baseExists = await commandSucceeds('git', [
-        '-C',
-        gitRoot,
-        'rev-parse',
-        '--verify',
-        '--quiet',
-        `refs/heads/${requestedBaseBranch}`,
-      ]);
-      if (!baseExists) {
-        return {
-          ok: false,
-          error: `The selected base branch ${requestedBaseBranch} no longer exists in the source repository.`,
-        };
-      }
-    }
-
-    // Restoring an epic whose rift was freed to reclaim disk. Normal Rift work
-    // pushes from the isolated workspace, so the durable copy is usually
-    // origin's branch rather than a local branch in the source checkout.
-    const requestedExistingBranch = String(input?.existingBranch ?? '').trim();
-    let requestedExistingBranchRef = '';
-    let restoringFromPreservedRef = false;
-    if (requestedExistingBranch) {
-      const preservedBranchRef = releasedRiftRefForEpic(epicId);
-      const localBranchRef = `refs/heads/${requestedExistingBranch}`;
-      const remoteBranchRef = `refs/remotes/origin/${requestedExistingBranch}`;
-      const preservedBranchExists = await commandSucceeds('git', [
-        '-C',
-        gitRoot,
-        'rev-parse',
-        '--verify',
-        '--quiet',
-        preservedBranchRef,
-      ]);
-      const localBranchExists = !preservedBranchExists && await commandSucceeds('git', [
-        '-C',
-        gitRoot,
-        'rev-parse',
-        '--verify',
-        '--quiet',
-        localBranchRef,
-      ]);
-      let remoteBranchExists = false;
-      if (!preservedBranchExists && !localBranchExists) {
-        remoteBranchExists = await commandSucceeds('git', [
-          '-C',
-          gitRoot,
-          'rev-parse',
-          '--verify',
-          '--quiet',
-          remoteBranchRef,
-        ]);
-      }
-      if (!preservedBranchExists && !localBranchExists && !remoteBranchExists) {
-        // A source checkout need not have fetched a branch pushed from its
-        // Rift. Fetch only this explicit ref so restore also works after a
-        // fresh launch without changing the source worktree.
-        try {
-          await execFileAsync('git', [
-            '-C',
-            gitRoot,
-            'fetch',
-            '--no-tags',
-            'origin',
-            `refs/heads/${requestedExistingBranch}:${remoteBranchRef}`,
-          ]);
-          remoteBranchExists = true;
-        } catch {}
-      }
-      requestedExistingBranchRef = preservedBranchExists
-        ? preservedBranchRef
-        : localBranchExists
-          ? localBranchRef
-          : remoteBranchExists
-            ? remoteBranchRef
-            : '';
-      restoringFromPreservedRef = preservedBranchExists;
-      if (!requestedExistingBranchRef) {
-        return {
-          ok: false,
-          error: `The branch ${requestedExistingBranch} no longer exists locally or on origin, so this epic's rift cannot be recreated.`,
-        };
-      }
-    }
-
-    // Git cannot store both `refs/heads/orion` and child refs such as
-    // `refs/heads/orion/<name>`. Check the source before copying it so this
-    // collision does not create an incomplete rift first.
-    const namespaceBranchExists = await commandSucceeds('git', [
-      '-C',
-      gitRoot,
-      'rev-parse',
-      '--verify',
-      '--quiet',
-      EPIC_BRANCH_NAMESPACE_REF,
-    ]);
-    if (namespaceBranchExists) {
-      return {
-        ok: false,
-        error:
-          'The source repository has a local branch named orion, which conflicts with ' +
-          "Durango Code's orion/... Rift branch namespace. Rename or delete the local orion branch " +
-          'before creating a rift.',
-      };
-    }
-
-    // Idempotent: registers the repo with Rift on first use.
-    await riftInit(gitRoot, { signal: abortController.signal });
-
-    const slug = riftSlug(input?.epicName);
-    // The suffix is part of both the workspace and branch names. Always
-    // suffixing the branch prevents collisions with remote branches and with
-    // sibling rifts, whose local refs are intentionally isolated.
-    const suffix = crypto.randomBytes(12).toString('hex');
-    const riftName = `${slug}-${suffix}`;
-    // Rift's default layout is deterministic. Pass it explicitly and retain
-    // it before spawning so cancellations before Rift reports stdout can
-    // still be located and moved to Rift-owned trash.
-    const riftParentPath = path.join(
-      path.dirname(canonicalGitRoot),
-      '.rifts',
-      path.basename(canonicalGitRoot)
-    );
-    const expectedRiftPath = path.resolve(riftParentPath, riftName);
-    if (existsSync(expectedRiftPath)) {
-      throw new Error(`The planned rift destination already exists: ${expectedRiftPath}`);
-    }
-    createdRiftPath = expectedRiftPath;
-    // Persist the deterministic destination before spawning Rift. If Electron
-    // or the machine exits after the CLI starts copying, startup recovery can
-    // still find both markerful and markerless partial workspaces.
-    await rememberRiftCleanup(expectedRiftPath);
-    const reportedRiftPath = await riftCreate(gitRoot, {
-      name: riftName,
-      into: riftParentPath,
-      signal: abortController.signal,
-    });
-    const resolvedReportedRiftPath = path.resolve(reportedRiftPath);
-    if (resolvedReportedRiftPath !== expectedRiftPath) {
-      throw new Error(`rift create reported an unexpected workspace path: ${resolvedReportedRiftPath}`);
-    }
-    createdRiftPath = resolvedReportedRiftPath;
-    const riftWorkingDir = projectRelativePath
-      ? path.join(createdRiftPath, projectRelativePath)
-      : createdRiftPath;
-    const workingDirStat = await fs.stat(riftWorkingDir).catch(() => null);
-    if (!workingDirStat?.isDirectory()) {
-      throw new Error('The new rift does not contain the selected project directory.');
-    }
-    if (riftShutdownRequested) {
-      throw new Error('Rift creation was cancelled because Durango Code is quitting.');
-    }
-
-    // `--copy-all` copies the source worktree and index as well as ignored
-    // dependencies. Pin the new workspace to the clean snapshot captured
-    // above before exposing it: a source edit racing `rift create` cannot
-    // leak into the epic's first `git add -A`.
-    const { stdout: excludeOutput } = await execFileAsync('git', [
-      '-C',
-      createdRiftPath,
-      'rev-parse',
-      '--git-path',
-      'info/exclude',
-    ]);
-    const excludePath = path.isAbsolute(excludeOutput.trim())
-      ? excludeOutput.trim()
-      : path.resolve(createdRiftPath, excludeOutput.trim());
-    await fs.appendFile(excludePath, '\n# Orion Rift metadata\n.rift\n');
-    await execFileAsync('git', ['-C', createdRiftPath, 'reset', '--hard', sourceHead]);
-    await execFileAsync('git', [
-      '-C',
-      createdRiftPath,
-      'clean',
-      '-ffd',
-      '-e',
-      '.rift',
-      '-e',
-      '.rift/**',
-    ]);
-    const copiedChanges = await readGitStatusEntries(createdRiftPath);
-    if (copiedChanges.length > 0) {
-      throw new Error('The new rift could not be reset to a clean Git snapshot.');
-    }
-    if (riftShutdownRequested) {
-      throw new Error('Rift creation was cancelled because Durango Code is quitting.');
-    }
-
-    // Recreating a freed epic's workspace: check its existing branch straight
-    // out and skip both the base-branch switch and the branch-naming turn.
-    if (requestedExistingBranch) {
-      try {
-        if (restoringFromPreservedRef) {
-          // The source may carry a stale local branch with this name. Reset
-          // only the newly copied Rift branch to the exact pre-release HEAD.
-          await execFileAsync('git', [
-            '-C',
-            createdRiftPath,
-            'checkout',
-            '-B',
-            requestedExistingBranch,
-            requestedExistingBranchRef,
-            '--',
-          ]);
-        } else if (requestedExistingBranchRef.startsWith('refs/remotes/')) {
-          await execFileAsync('git', [
-            '-C',
-            createdRiftPath,
-            'checkout',
-            '--track',
-            '-b',
-            requestedExistingBranch,
-            requestedExistingBranchRef,
-          ]);
-        } else {
-          await execFileAsync('git', [
-            '-C',
-            createdRiftPath,
-            'checkout',
-            requestedExistingBranch,
-            '--',
-          ]);
-        }
-      } catch (checkoutError) {
-        const detail = checkoutError?.stderr?.toString().trim();
-        throw new Error(
-          `The rift could not check out ${requestedExistingBranch}.` + (detail ? ` ${detail}` : '')
-        );
-      }
-      const restoredChanges = await readGitStatusEntries(createdRiftPath);
-      if (restoredChanges.length > 0) {
-        throw new Error(`The rift could not switch cleanly to ${requestedExistingBranch}.`);
-      }
-      await scrubRiftWorkspace(createdRiftPath);
-
-      let senderGone = false;
-      try {
-        senderGone = event.senderFrame?.isDestroyed?.() === true;
-      } catch {
-        senderGone = true;
-      }
-      if (riftShutdownRequested || event.sender.isDestroyed() || senderGone) {
-        const abandonedRiftPath = createdRiftPath;
-        await riftRemove(abandonedRiftPath);
-        await forgetRiftCleanup(abandonedRiftPath);
-        createdRiftPath = '';
-        return {
-          ok: false,
-          error: 'Rift creation was cancelled because its Durango Code window closed.',
-        };
-      }
-
-      unacknowledgedRifts.set(epicId, {
-        epicId,
-        projectId: typeof input?.projectId === 'string' ? input.projectId : undefined,
-        projectPath: canonicalProjectPath,
-        riftPath: createdRiftPath,
-        riftWorkingDir,
-        gitRoot,
-        branch: requestedExistingBranch,
-        sourceBranch: sourceBranch || undefined,
-      });
-      awaitingPersistenceAck = true;
-      return {
-        ok: true,
-        riftPath: createdRiftPath,
-        riftWorkingDir,
-        gitRoot,
-        branch: requestedExistingBranch,
-        sourceBranch: sourceBranch || undefined,
-      };
-    }
-
-    // Start the feature branch from the requested base instead of the source
-    // checkout's HEAD. The rift copied the source's local refs, so the branch
-    // is switched here — inside the rift only.
-    if (requestedBaseBranch) {
-      // The trailing `--` forces the argument to be read as a ref. Without it a
-      // branch name that also names a tracked path (`src`, `docs`) and is missing
-      // from the copied refs restores that path instead: exit 0, HEAD unmoved,
-      // clean tree — so the epic would silently branch off sourceHead.
-      try {
-        await execFileAsync('git', ['-C', createdRiftPath, 'checkout', requestedBaseBranch, '--']);
-      } catch (checkoutError) {
-        const detail = checkoutError?.stderr?.toString().trim();
-        throw new Error(
-          `The rift could not check out the base branch ${requestedBaseBranch}.` +
-            (detail ? ` ${detail}` : '')
-        );
-      }
-      const switchedChanges = await readGitStatusEntries(createdRiftPath);
-      if (switchedChanges.length > 0) {
-        throw new Error(`The rift could not switch cleanly to ${requestedBaseBranch}.`);
-      }
-    }
-
-    // The rift starts on a detached HEAD with the source's working tree and
-    // index reset above. Let the epic's message model pick the readable part
-    // of the branch name; fall back to a slug of the epic title. Every epic
-    // branch lives under the `orion/` namespace.
-    let branchBase = '';
-    if (input?.modelId) {
-      try {
-        const prompt =
-          `Choose a git branch name for work on the epic "${input?.epicName ?? ''}"` +
-          (input?.epicDescription ? ` (${truncateForPrompt(String(input.epicDescription), 500)})` : '') +
-          '. Reply with ONLY the branch name: lowercase kebab-case, no namespace prefix ' +
-          '(no "feat/", no "fix/"), under 50 characters. No quotes, no commentary.';
-        const raw = cleanGeneratedGitMessage(
-          await runOneShotForModelId(input.modelId, prompt, riftWorkingDir, {
-            signal: abortController.signal,
-            reasoningEffort: input?.reasoningEffort,
-          })
-        );
-        const candidate = raw
-          .split('\n')[0]
-          ?.trim()
-          .replace(/^["'`]+|["'`]+$/g, '')
-          // The model still reaches for a `feat/` style prefix sometimes. Drop it
-          // and flatten anything else it namespaced so `orion/` stays the only one.
-          .replace(/^[^/]+\//, '')
-          .replace(/\//g, '-')
-          .slice(0, 60);
-        if (candidate && (await validateNewBranchName(`${EPIC_BRANCH_NAMESPACE}${candidate}`))) {
-          branchBase = candidate;
-        }
-      } catch {
-        // Fall back to the slug below.
-      }
-    }
-    if (abortController.signal.aborted || riftShutdownRequested) {
-      throw new Error('Rift creation was cancelled because its Durango Code window closed.');
-    }
-    if (!branchBase) branchBase = slug;
-    branchBase = branchBase.replace(/[-/.]+$/g, '').slice(0, 70) || slug;
-    const branch = `${EPIC_BRANCH_NAMESPACE}${branchBase}-${suffix}`;
-    await execFileAsync('git', ['-C', createdRiftPath, 'checkout', '-b', branch]);
-    // Drop copied build caches and stray lockfiles now that no further branch
-    // switch happens inside this flow (see rift-scrub.js for why the order matters).
-    await scrubRiftWorkspace(createdRiftPath);
-
-    // The initiating renderer can reload or close while the copy/model turn
-    // is in flight. If its frame is gone there is nobody left to persist the
-    // returned path, so remove the completed workspace instead of orphaning
-    // it. Explicit app quit sets the same condition and waits for this cleanup.
-    let senderFrameDestroyed = false;
-    try {
-      senderFrameDestroyed = event.senderFrame?.isDestroyed?.() === true;
-    } catch {
-      // Electron can throw while resolving senderFrame after its frame is disposed.
-      senderFrameDestroyed = true;
-    }
-    if (
-      riftShutdownRequested ||
-      event.sender.isDestroyed() ||
-      senderFrameDestroyed
-    ) {
-      const abandonedRiftPath = createdRiftPath;
-      await riftRemove(abandonedRiftPath);
-      await forgetRiftCleanup(abandonedRiftPath);
-      createdRiftPath = '';
-      return {
-        ok: false,
-        error: 'Rift creation was cancelled because its Durango Code window closed.',
-      };
-    }
-
-    // Keep the pre-create journal entry until the renderer proves the epic
-    // binding reached disk. Until then pendingRiftEpicIds keeps all
-    // source-fallback IPCs locked.
-    unacknowledgedRifts.set(epicId, {
-      epicId,
-      projectId: typeof input?.projectId === 'string' ? input.projectId : undefined,
-      projectPath: canonicalProjectPath,
-      riftPath: createdRiftPath,
-      riftWorkingDir,
-      gitRoot,
-      branch,
-      sourceBranch: sourceBranch || undefined,
-    });
-    awaitingPersistenceAck = true;
-    return {
-      ok: true,
-      riftPath: createdRiftPath,
-      riftWorkingDir,
-      gitRoot,
-      branch,
-      sourceBranch: sourceBranch || undefined,
-    };
-  } catch (error) {
-    const originalError = error?.stderr?.toString().trim() || error?.message || String(error);
-    if (!createdRiftPath || !existsSync(createdRiftPath)) {
-      if (createdRiftPath) await forgetRiftCleanup(createdRiftPath).catch(() => {});
-      return { ok: false, error: originalError };
-    }
-
-    try {
-      if (riftShutdownRequested) {
-        // Quit has a bounded barrier. Record the path before attempting Rift's
-        // recoverable removal so a forced app exit cannot lose cleanup state.
-        await rememberRiftCleanup(createdRiftPath).catch(() => {});
-      }
-      await removeRememberedRiftCleanup(createdRiftPath, { allowMarkerless: true });
-      await forgetRiftCleanup(createdRiftPath);
-      return { ok: false, error: originalError };
-    } catch (cleanupError) {
-      const cleanupMessage =
-        cleanupError?.stderr?.toString().trim() ||
-        cleanupError?.message ||
-        String(cleanupError);
-      await rememberRiftCleanup(createdRiftPath).catch(() => {});
-      return {
-        ok: false,
-        riftPath: createdRiftPath,
-        error:
-          `${originalError} Durango Code also could not move the incomplete rift to trash: ` +
-          `${cleanupMessage}. Incomplete rift: ${createdRiftPath}`,
-      };
-    }
-  } finally {
-    event.sender.removeListener('destroyed', cancelForDestroyedSender);
-    settlePendingCreation();
-    pendingRiftCreations.delete(pendingEntry);
-    if (!awaitingPersistenceAck) pendingRiftEpicIds.delete(epicId);
-  }
-});
-
-ipcMain.handle('epic:acknowledgeRift', async (_event, input) => {
-  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
-  const riftPath = typeof input?.riftPath === 'string' ? input.riftPath : '';
-  if (!epicId || !riftPath) {
-    return { ok: false, error: 'Missing epic id or rift path.' };
-  }
-  const ownership = unacknowledgedRifts.get(epicId);
-  if (!ownership) {
-    // A duplicate acknowledgement may race recovery with the original invoke
-    // continuation. It is safe once this exact epic owns the path on disk.
-    const persistedOwners = await readPersistedRiftOwners();
-    return persistedOwners.get(riftPath)?.epicId === epicId
-      ? { ok: true, skipped: true }
-      : { ok: false, error: 'No matching Rift creation is awaiting acknowledgement.' };
-  }
-  if (ownership.riftPath !== riftPath) {
-    return { ok: false, error: 'The Rift acknowledgement does not match the created workspace.' };
-  }
-
-  const persistedOwners = await readPersistedRiftOwners();
-  if (persistedOwners.get(riftPath)?.epicId !== epicId) {
-    return {
-      ok: false,
-      error: 'The epic’s Rift ownership has not reached durable storage yet.',
-    };
-  }
-
-  try {
-    await Promise.all([
-      forgetRiftCleanup(riftPath),
-      ...(ownership.repositories ?? []).flatMap((repository) =>
-        repository?.riftPath ? [forgetRiftCleanup(repository.riftPath)] : []
-      ),
-    ]);
-  } catch (error) {
-    return {
-      ok: false,
-      error: error?.message || String(error),
-    };
-  }
-  unacknowledgedRifts.delete(epicId);
-  pendingRiftEpicIds.delete(epicId);
-  return { ok: true };
-});
-
-const deleteEpicRestoreRefBestEffort = async (input) => {
-  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
-  if (!epicId) {
-    return { ok: true, skipped: true, warning: 'The epic had no restore-ref identity.' };
-  }
-
-  const candidateRoots = [];
-  // Prefer the project's live path. `git update-ref -d` succeeds when a ref
-  // is already absent, so trying a stale archived path first could falsely
-  // appear to clean the real repository.
-  const projectPaths = [
-    ...(Array.isArray(input?.projectPaths) ? input.projectPaths : []),
-    input?.projectPath,
-  ].filter((value) => typeof value === 'string' && value);
-  for (const projectPath of projectPaths) {
-    try {
-      candidateRoots.push(await getGitRoot(projectPath));
-    } catch {}
-  }
-  for (const gitRoot of [
-    ...(Array.isArray(input?.gitRoots) ? input.gitRoots : []),
-    input?.gitRoot,
-  ]) {
-    if (typeof gitRoot === 'string' && gitRoot) candidateRoots.push(gitRoot);
-  }
-
-  const { deleted, errors } = await deleteRiftRestoreRefs(
-    candidateRoots.map((value) => path.resolve(value)),
-    epicId
-  );
-
-  if (deleted > 0 && errors.length === 0) return { ok: true };
-
-  // The source checkout may have moved or been deleted since the Rift was
-  // released. Its hidden ref is then unreachable anyway, so cleanup must not
-  // make Orion metadata undeletable.
-  const warning =
-    errors.filter(Boolean).join(' ') ||
-    'The source repository is unavailable, so its saved Rift restore ref could not be removed.';
-  console.warn('Could not delete Rift restore ref during epic deletion', epicId, warning);
-  return { ok: true, skipped: true, warning };
-};
-
-ipcMain.handle('epic:removeRift', async (_event, input) => {
-  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
-  if (!epicId) {
-    return { ok: false, error: 'Missing epic id.' };
-  }
-  // Setup takes this main-owned flag before its first await and also reserves
-  // the coordinator synchronously. Reject instead of queueing deletion behind
-  // a workspace mutation whose new ownership is not durable yet.
-  if (pendingRiftEpicIds.has(epicId)) {
-    return { ok: false, error: 'This epic’s Rift workspace is still being updated.' };
-  }
-  return riftRemovalCoordinator.run([epicId], async () => {
-    try {
-      const riftPath = input?.riftPath;
-      if (!riftPath) {
-        return { ok: false, error: 'Missing rift path.' };
-      }
-      // The restore ref may be the only surviving copy of a force-freed,
-      // never-pushed branch. Never delete it (or move the active Rift) while
-      // crash recovery can still resurrect the owning Epic.
-      if (!isEpicDeletionPersisted(await readPersistedStoreState(), epicId)) {
-        return {
-          ok: false,
-          error: 'The epic deletion has not reached durable storage.',
-        };
-      }
-      const runtimeThreadIds = Array.isArray(input?.runtimeThreadIds)
-        ? [
-            ...new Set(
-              input.runtimeThreadIds.filter(
-                (threadId) => typeof threadId === 'string' && threadId
-              )
-            ),
-          ]
-        : [];
-      const requestedRiftRepositories = Array.isArray(input?.riftRepositories)
-        ? input.riftRepositories.filter(
-            (repository) =>
-              repository && typeof repository.riftPath === 'string' && repository.riftPath
-          )
-        : [];
-      let repositoryRiftPaths = requestedRiftRepositories.length > 0
-        ? [...new Set(requestedRiftRepositories.map((repository) => repository.riftPath))]
-        : Array.isArray(input?.riftPaths)
-          ? [...new Set(input.riftPaths.filter((value) => typeof value === 'string' && value))]
-          : [];
-      // Join the shared removal queue before runtime teardown. Retention and
-      // manual release cannot cross this deletion's disposal/ref/removal
-      // sequence, and agent launches remain guarded for the full operation.
-      await Promise.all(
-        runtimeThreadIds.map((threadId) => disposeAgentThreadRuntime(threadId))
-      );
-      // A path already gone is an idempotent success.
-      if (!existsSync(riftPath)) {
-        const linkedRepositoryRiftPaths = requestedRiftRepositories
-          .filter((repository) => isExternalRiftLinkedFromWorkspace(riftPath, repository))
-          .map((repository) => path.resolve(repository.riftPath))
-          .filter((repositoryRiftPath, index, paths) => paths.indexOf(repositoryRiftPath) === index)
-          .filter((repositoryRiftPath) => existsSync(repositoryRiftPath));
-        for (const repositoryRiftPath of linkedRepositoryRiftPaths) {
-          if (
-            !isRiftDirectoryPath(repositoryRiftPath) ||
-            !existsSync(path.join(repositoryRiftPath, '.rift'))
-          ) {
-            return { ok: false, error: 'The linked Rift repository is unsafe to remove.' };
-          }
-        }
-        for (const repositoryRiftPath of [...linkedRepositoryRiftPaths].reverse()) {
-          await riftRemove(repositoryRiftPath);
-          await forgetRiftCleanup(repositoryRiftPath).catch(() => {});
-        }
-        try {
-          await forgetRiftCleanup(riftPath);
-        } catch (error) {
-          console.error('Could not clear old deleted Rift cleanup entry', riftPath, error);
-        }
-        const restoreRefResult = await deleteEpicRestoreRefBestEffort(input);
-        return {
-          ok: true,
-          ...(linkedRepositoryRiftPaths.length === 0 ? { skipped: true } : {}),
-          warning: restoreRefResult.warning,
-        };
-      }
-      if (
-        repositoryRiftPaths.length === 0 &&
-        !existsSync(path.join(riftPath, '.rift')) &&
-        (await hasRememberedRiftCleanup(riftPath))
-      ) {
-        const children = await fs.readdir(riftPath, { withFileTypes: true }).catch(() => []);
-        repositoryRiftPaths = children
-          .filter((entry) => entry.isDirectory())
-          .map((entry) => path.join(riftPath, entry.name))
-          .filter((candidate) => existsSync(path.join(candidate, '.rift')));
-      }
-      if (repositoryRiftPaths.length > 0) {
-        const resolvedWorkspace = path.resolve(riftPath);
-        for (const repositoryRiftPath of repositoryRiftPaths) {
-          const resolvedRepositoryPath = path.resolve(repositoryRiftPath);
-          const relative = path.relative(resolvedWorkspace, resolvedRepositoryPath);
-          if (!existsSync(resolvedRepositoryPath)) continue;
-          const directChild =
-            Boolean(relative) &&
-            !path.isAbsolute(relative) &&
-            relative !== '..' &&
-            !relative.startsWith(`..${path.sep}`) &&
-            path.dirname(resolvedRepositoryPath) === resolvedWorkspace;
-          const requestedRepository = requestedRiftRepositories.find(
-            (repository) => path.resolve(repository.riftPath) === resolvedRepositoryPath
-          );
-          let validatedExternalLink = false;
-          if (!directChild && typeof requestedRepository?.workspaceLinkPath === 'string') {
-            const linkPath = path.resolve(requestedRepository.workspaceLinkPath);
-            try {
-              validatedExternalLink =
-                path.dirname(linkPath) === resolvedWorkspace &&
-                lstatSync(linkPath).isSymbolicLink() &&
-                path.resolve(realpathSync(linkPath)) === resolvedRepositoryPath;
-            } catch {}
-          }
-          if ((!directChild && !validatedExternalLink) || !existsSync(path.join(resolvedRepositoryPath, '.rift'))) {
-            return { ok: false, error: 'The shared Rift contains an invalid repository path.' };
-          }
-        }
-        for (const repositoryRiftPath of [...repositoryRiftPaths].reverse()) {
-          if (!existsSync(repositoryRiftPath)) continue;
-          await riftRemove(repositoryRiftPath);
-          await forgetRiftCleanup(repositoryRiftPath).catch(() => {});
-        }
-        if (existsSync(resolvedWorkspace)) await shell.trashItem(resolvedWorkspace);
-        await forgetRiftCleanup(resolvedWorkspace).catch(() => {});
-        const restoreRefResult = await deleteEpicRestoreRefBestEffort(input);
-        return { ok: true, warning: restoreRefResult.warning };
-      }
-
-      let allowMarkerless = false;
-      if (!existsSync(path.join(riftPath, '.rift'))) {
-        // Renderer input alone is not enough to authorize markerless removal.
-        // Require the main-owned pre-create journal for this exact destination.
-        allowMarkerless = await hasRememberedRiftCleanup(riftPath);
-      }
-      // `rift remove` moves the workspace into Rift-owned trash — nothing is
-      // physically deleted until `rift gc`, and source roots are refused
-      // without --force. Markerless partial creations go to the OS trash.
-      await removeRememberedRiftCleanup(riftPath, { allowMarkerless });
-      try {
-        await forgetRiftCleanup(riftPath);
-      } catch (error) {
-        console.error('Could not clear deleted Rift cleanup entry', riftPath, error);
-      }
-      // The durable Epic deletion and recoverable Rift move are complete.
-      // Ref cleanup can safely lag or fail from here without risking data.
-      const restoreRefResult = await deleteEpicRestoreRefBestEffort(input);
-      return { ok: true, warning: restoreRefResult.warning };
-    } catch (error) {
-      return {
-        ok: false,
-        error: error?.stderr?.toString().trim() || error?.message || String(error),
-      };
-    }
-  });
-});
-
-ipcMain.handle('epic:deleteRiftRestoreRef', async (_event, input) => {
-  const epicId = typeof input?.epicId === 'string' ? input.epicId : '';
-  if (!epicId) return { ok: false, error: 'Missing epic id.' };
-  return riftRemovalCoordinator.run([epicId], () => deleteEpicRestoreRefBestEffort(input));
-});
-
-// --- Rift storage (measurement and sweep) -------------------------------------
-
-// Every rift is a `--copy-all` clone carrying its own node_modules and build
-// output, and settling an epic only writes a timestamp — so a long-lived
-// install accumulates one full repo copy per settled epic with nothing ever
-// reclaiming them. These handlers measure that footprint and let the user
-// sweep it, and they are the only code path in Orion that reaches `rift gc`.
-
-let riftStorageState = {
-  scanning: false,
-  scanId: null,
-  scannedAt: null,
-  entries: [],
-  trashBytes: null,
-  error: null,
-};
-let riftStorageScanQueue = Promise.resolve();
-// Rifts removed by manual or retention cleanup, held until a renderer confirms
-// it has durably cleared both the owning epic pointer and stale thread session
-// ids. The disk journal bridges process crashes as well as window recreation.
-const pendingRetentionReleases = [];
-let pendingRetentionRetentionDays = null;
-let riftReleaseJournalQueue = Promise.resolve();
-let riftReleaseJournalHydrated = false;
-const riftReleaseJournalPath = () => path.join(app.getPath('userData'), 'released-rifts.json');
-
-const updateRiftReleaseJournal = (update) => {
-  riftReleaseJournalQueue = riftReleaseJournalQueue
-    .catch(() => {})
-    .then(async () => {
-      const journalPath = riftReleaseJournalPath();
-      let journal = { releases: [] };
-      try {
-        const parsed = JSON.parse(await fs.readFile(journalPath, 'utf-8'));
-        if (parsed && typeof parsed === 'object' && Array.isArray(parsed.releases)) {
-          journal = parsed;
-        }
-      } catch {}
-      const next = await update(journal);
-      const tempPath = `${journalPath}.${process.pid}.tmp`;
-      await fs.mkdir(path.dirname(journalPath), { recursive: true });
-      await fs.writeFile(tempPath, JSON.stringify(next), 'utf-8');
-      await fs.rename(tempPath, journalPath);
-      return next;
-    });
-  return riftReleaseJournalQueue;
-};
-
-const syncPendingRiftReleases = (journal) => {
-  pendingRiftReleaseEpicIds.clear();
-  for (const epicId of guardedEpicIdsForRiftReleaseJournal(journal)) {
-    pendingRiftReleaseEpicIds.add(epicId);
-  }
-  pendingRetentionReleases.length = 0;
-  const released = journal.releases.filter(
-    (entry) =>
-      entry?.phase === 'released' &&
-      typeof entry.riftPath === 'string' &&
-      typeof entry.epicId === 'string'
-  );
-  pendingRetentionReleases.push(
-    ...released.map(({ riftPath, epicId }) => ({ riftPath, epicId }))
-  );
-  const retentionDays = released
-    .map((entry) => entry.retentionDays)
-    .filter((value) => Number.isFinite(value) && value > 0);
-  pendingRetentionRetentionDays =
-    retentionDays.length > 0 && retentionDays.length === released.length
-      ? Math.min(...retentionDays)
-      : null;
-};
-
-const hydrateRiftReleaseJournal = async () => {
-  if (riftReleaseJournalHydrated) {
-    await riftReleaseJournalQueue.catch(() => {});
-  }
-  const journal = await updateRiftReleaseJournal((current) =>
-    reconcileRiftReleaseJournal(current, {
-      pathExists: existsSync,
-      // A status request can overlap a real removal after its durable intent
-      // lands. Keep that entry until the coordinator releases its reservation;
-      // otherwise a poll could erase the only crash-recovery record.
-      isEpicRemovalPending: (epicId) => riftRemovalCoordinator.hasEpic(epicId),
+      return binDir;
     })
-  );
-  syncPendingRiftReleases(journal);
-  riftReleaseJournalHydrated = true;
-};
-
-const beginRiftRelease = async ({ riftPath, epicId, retentionDays = null }) => {
-  await hydrateRiftReleaseJournal();
-  const journal = await updateRiftReleaseJournal((current) => ({
-    releases: [
-      ...current.releases.filter((entry) => entry.riftPath !== riftPath),
-      { riftPath, epicId, retentionDays, phase: 'removing' },
-    ],
-  }));
-  syncPendingRiftReleases(journal);
-  return journal;
-};
-
-const completeRiftRelease = async ({ riftPath, epicId, retentionDays = null }) => {
-  const journal = await updateRiftReleaseJournal((current) => ({
-    releases: [
-      ...current.releases.filter((entry) => entry.riftPath !== riftPath),
-      { riftPath, epicId, retentionDays, phase: 'released' },
-    ],
-  }));
-  syncPendingRiftReleases(journal);
-};
-
-const cancelRiftRelease = async (riftPath) => {
-  const journal = await updateRiftReleaseJournal((current) => ({
-    releases: current.releases.filter((entry) => entry.riftPath !== riftPath),
-  }));
-  syncPendingRiftReleases(journal);
-};
-
-const acknowledgeRiftReleases = async (riftPaths) => {
-  await hydrateRiftReleaseJournal();
-  const acknowledged = new Set(riftPaths);
-  const journal = await updateRiftReleaseJournal((current) => ({
-    releases: current.releases.filter((entry) => !acknowledged.has(entry.riftPath)),
-  }));
-  syncPendingRiftReleases(journal);
-};
-
-const publishRiftStorageState = (patch) => {
-  riftStorageState = { ...riftStorageState, ...patch };
-  sendToAllWindows('riftStorage:state', riftStorageState);
-  return riftStorageState;
-};
-
-// Uncommitted or unpushed work is the one thing a sweep must never destroy.
-// Settling only *warns* about it, so a settled epic can still be the sole
-// copy of real work. Mirrors the checks in `epic:gitStatus`.
-const readRiftWorkState = async (riftPath) => {
-  const workState = { hasUncommittedChanges: false, hasUnpushedCommits: false, branch: null };
-  try {
-    const { stdout } = await execFileAsync('git', ['-C', riftPath, 'status', '--porcelain'], {
-      maxBuffer: 1024 * 1024 * 4,
+    .catch((error) => {
+      console.error('Could not install the bundled durango-code CLI', error);
+      return null;
     });
-    workState.hasUncommittedChanges = stdout.trim().length > 0;
-  } catch {
-    // Not a readable git worktree. Treat that as "cannot prove it is safe".
-    workState.hasUncommittedChanges = true;
-    return workState;
-  }
-  try {
-    workState.branch = (await getCurrentGitBranch(riftPath)) ?? null;
-  } catch {}
-  if (!workState.branch) {
-    // Detached HEAD, or git would not say. `epic:gitStatus` errs toward
-    // "nothing unpushed" to keep its commit button enabled; a sweep has to err
-    // the other way, because the commits it cannot account for may be the only
-    // copy of the work.
-    workState.hasUnpushedCommits = true;
-    return workState;
-  }
-  try {
-    const { stdout } = await execFileAsync('git', [
-      '-C',
-      riftPath,
-      'rev-list',
-      '--count',
-      `refs/heads/${workState.branch}`,
-      '--not',
-      '--remotes=origin',
-    ]);
-    workState.hasUnpushedCommits = Number.parseInt(stdout.trim(), 10) > 0;
-  } catch {
-    workState.hasUnpushedCommits = true;
-  }
-  return workState;
+  return bundledCliBinDirPromise;
 };
 
-const sharedRiftRepositories = (riftPath, owner) => {
-  if (owner?.repositoryChild || !Array.isArray(owner?.repositories)) return [];
-  const workspacePath = path.resolve(riftPath);
-  const repositories = [];
-  for (const repository of owner.repositories) {
-    if (typeof repository?.riftPath !== 'string' || !repository.riftPath) continue;
-    // Single-project Epics persist one repository row for their workspace.
-    // It is metadata for the parent itself, not a shared-workspace child.
-    if (!isRiftRepositoryChildPath(riftPath, repository.riftPath)) continue;
-    const repositoryPath = path.resolve(repository.riftPath);
-    const relative = path.relative(workspacePath, repositoryPath);
-    const directChild =
-      Boolean(relative) &&
-      !path.isAbsolute(relative) &&
-      relative !== '..' &&
-      !relative.startsWith(`..${path.sep}`) &&
-      path.dirname(repositoryPath) === workspacePath;
-    if (!directChild) {
-      // A one-project Rift can later become shared without relocating that
-      // existing copy. In that case its persisted link must be an immediate
-      // symlink child of the shared container and resolve to this exact Rift.
-      if (typeof repository.workspaceLinkPath !== 'string' || !repository.workspaceLinkPath) {
-        return null;
-      }
-      const linkPath = path.resolve(repository.workspaceLinkPath);
-      try {
-        if (
-          path.dirname(linkPath) !== workspacePath ||
-          !lstatSync(linkPath).isSymbolicLink() ||
-          path.resolve(realpathSync(linkPath)) !== repositoryPath
-        ) {
-          return null;
-        }
-      } catch {
-        return null;
-      }
-    }
-    repositories.push({ ...repository, riftPath: repositoryPath });
-  }
-  return repositories;
-};
+const signInBundledCli = () =>
+  ensureCliSignedIn({ readSession: () => readAccountSession(), origin: getOrionWebUrl().toString() }).catch((error) => ({
+    ok: false,
+    signedIn: false,
+    error: error?.message || String(error),
+  }));
 
-const readOwnedRiftWorkState = async (riftPath, owner) => {
-  const repositories = sharedRiftRepositories(riftPath, owner);
-  if (repositories === null) {
-    return { hasUncommittedChanges: true, hasUnpushedCommits: true, branch: null };
-  }
-  if (repositories.length === 0) return readRiftWorkState(riftPath);
-  const existingRepositories = repositories.filter((repository) =>
-    existsSync(repository.riftPath)
-  );
-  if (existingRepositories.length === 0) {
-    return { hasUncommittedChanges: false, hasUnpushedCommits: false, branch: null };
-  }
-  const states = await Promise.all(
-    existingRepositories.map((repository) => readRiftWorkState(repository.riftPath))
-  );
+const isPathInput = (value) => typeof value === 'string' && value.length > 0 && value.length < 4096 && path.isAbsolute(value);
+const isWorkspaceNameInput = (value) => typeof value === 'string' && /^[a-z0-9][a-z0-9_-]{0,47}$/.test(value);
+
+ipcMain.handle('durangoCli:status', async () => {
+  const binDir = await installBundledCli();
+  const credential = await readCliCredential().catch(() => null);
   return {
-    hasUncommittedChanges: states.some((state) => state.hasUncommittedChanges),
-    hasUnpushedCommits: states.some((state) => state.hasUnpushedCommits),
-    branch: states[0]?.branch ?? null,
-  };
-};
-
-const ownedRiftHasMarker = async (riftPath, owner) => {
-  if (await riftHasMarker(riftPath)) return true;
-  const repositories = sharedRiftRepositories(riftPath, owner);
-  return (
-    Array.isArray(repositories) &&
-    repositories.length > 0 &&
-    (await Promise.all(
-      repositories.map((repository) =>
-        existsSync(repository.riftPath) ? riftHasMarker(repository.riftPath) : true
-      )
-    )).every(Boolean)
-  );
-};
-
-const preserveOwnedRiftHeadsForRestore = async (riftPath, owner) => {
-  const repositories = sharedRiftRepositories(riftPath, owner);
-  if (repositories === null) throw new Error('The shared Rift contains an invalid repository path.');
-  if (repositories.length === 0) return preserveRiftHeadForRestore(riftPath, owner);
-  for (const repository of repositories) {
-    if (!existsSync(repository.riftPath)) continue;
-    await preserveRiftHeadForRestore(repository.riftPath, {
-      ...owner,
-      gitRoot: repository.gitRoot,
-      gitBranch: repository.gitBranch ?? owner.gitBranch,
-    });
-  }
-};
-
-const removeOwnedRift = async (riftPath, owner) => {
-  const repositories = sharedRiftRepositories(riftPath, owner);
-  if (repositories === null) throw new Error('The shared Rift contains an invalid repository path.');
-  if (repositories.length === 0) {
-    await riftRemove(riftPath);
-    return;
-  }
-  for (const repository of repositories) {
-    if (!existsSync(repository.riftPath)) continue;
-    if (!(await riftHasMarker(repository.riftPath))) {
-      throw new Error(`The shared Rift repository ${repository.riftPath} is missing its marker.`);
-    }
-  }
-  for (const repository of [...repositories].reverse()) {
-    if (!existsSync(repository.riftPath)) continue;
-    await riftRemove(repository.riftPath);
-    await forgetRiftCleanup(repository.riftPath).catch(() => {});
-  }
-  if (existsSync(riftPath)) await shell.trashItem(riftPath);
-};
-
-const linkedRepositoriesForMissingWorkspace = (riftPath, owner) => {
-  if (!owner || !Array.isArray(owner.repositories)) return [];
-  const repositories = [];
-  const seen = new Set();
-  for (const repository of owner.repositories) {
-    if (
-      typeof repository?.riftPath !== 'string' ||
-      !repository.riftPath ||
-      !existsSync(repository.riftPath)
-    ) {
-      continue;
-    }
-    if (!isExternalRiftLinkedFromWorkspace(riftPath, repository)) return null;
-    const repositoryRiftPath = path.resolve(repository.riftPath);
-    if (seen.has(repositoryRiftPath)) continue;
-    seen.add(repositoryRiftPath);
-    repositories.push({ ...repository, riftPath: repositoryRiftPath });
-  }
-  return repositories;
-};
-
-const readRepositoryRiftsWorkState = async (repositories) => {
-  const states = await Promise.all(
-    repositories.map((repository) => readRiftWorkState(repository.riftPath))
-  );
-  return {
-    hasUncommittedChanges: states.some((state) => state.hasUncommittedChanges),
-    hasUnpushedCommits: states.some((state) => state.hasUnpushedCommits),
-  };
-};
-
-const preserveRepositoryRiftHeadsForRestore = async (repositories, owner) => {
-  for (const repository of repositories) {
-    await preserveRiftHeadForRestore(repository.riftPath, {
-      ...owner,
-      gitRoot: repository.gitRoot,
-      gitBranch: repository.gitBranch ?? owner.gitBranch,
-    });
-  }
-};
-
-// Rift roots reachable from persisted state: an epic's own rift parent, the
-// root its source repository would use, and every project's. Unowned rifts
-// left behind by crashes or deleted epics only turn up through the last two.
-const collectRiftRoots = async (state) => {
-  const roots = new Set();
-  for (const epic of Array.isArray(state?.epics) ? state.epics : []) {
-    if (typeof epic?.riftPath === 'string' && epic.riftPath) {
-      roots.add(path.dirname(path.resolve(epic.riftPath)));
-    }
-    if (typeof epic?.gitRoot === 'string' && epic.gitRoot) {
-      roots.add(riftRootForGitRoot(epic.gitRoot));
-    }
-  }
-  await Promise.all(
-    (Array.isArray(state?.projects) ? state.projects : []).map(async (project) => {
-      if (typeof project?.path !== 'string' || !project.path) return;
-      try {
-        roots.add(riftRootForGitRoot(await getGitRoot(project.path)));
-      } catch {
-        // A removed or temporarily unreadable project cannot reveal a Git
-        // root. Keep the old direct-root fallback so persisted repositories
-        // remain discoverable when their path itself was the repository.
-        roots.add(riftRootForGitRoot(project.path));
-      }
-    })
-  );
-  return [...roots];
-};
-
-const RIFT_SCAN_CONCURRENCY = 4;
-
-// Runs `worker` over `items` with a bounded number in flight — sizing and
-// `git status` are both IO-heavy enough that an unbounded fan-out over a
-// couple of dozen multi-gigabyte trees just thrashes the disk.
-const mapWithConcurrency = async (items, worker) => {
-  const results = new Array(items.length);
-  let cursor = 0;
-  const runners = Array.from({ length: Math.min(RIFT_SCAN_CONCURRENCY, items.length) }, async () => {
-    for (;;) {
-      const index = cursor++;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index], index);
-    }
-  });
-  await Promise.all(runners);
-  return results;
-};
-
-const scanRiftStorage = async ({ remeasure = false } = {}) => {
-  const state = await readPersistedStoreState();
-  const owners = await readPersistedRiftOwners(state);
-  const pendingOwners = collectPendingRiftOwnersByPath(
-    unacknowledgedRifts,
-    pendingRiftCreations
-  );
-  const scanOwners = new Map(pendingOwners);
-  for (const [riftPath, owner] of owners) scanOwners.set(riftPath, owner);
-  const cache = await loadSizeCache();
-  const nextCache = {};
-
-  const discovered = [];
-  // Registry rows make `rift gc` machine-wide, including repositories Orion
-  // has never persisted. Seed the scan with them, then add known `.trash`
-  // roots and collapse parent/child overlaps before measuring.
-  const trashCandidates = listRiftTrashPaths();
-  for (const riftRoot of await collectRiftRoots(state)) {
-    const { rifts, trashPath } = await listRiftRootEntries(riftRoot);
-    if (trashPath) trashCandidates.push(trashPath);
-    for (const riftPath of rifts) discovered.push({ riftPath, riftRoot });
-  }
-  const { visibleRifts, externalSizePathsByWorkspace } = planRiftStorageEntries(
-    discovered,
-    scanOwners,
-    existsSync
-  );
-  const trashPaths = collapseNestedPaths(trashCandidates);
-
-  const measureCachedPath = async (riftPath) => {
-    const cached = cache[riftPath];
-    const reuseCached = !remeasure && typeof cached?.bytes === 'number';
-    const bytes = reuseCached ? cached.bytes : await measurePathSize(riftPath);
-    nextCache[riftPath] = {
-      bytes,
-      measuredAt: reuseCached ? cached.measuredAt : new Date().toISOString(),
-    };
-    return bytes;
-  };
-
-  const externalSizePaths = [
-    ...new Set([...externalSizePathsByWorkspace.values()].flat()),
-  ];
-  const externalBytes = new Map(
-    await mapWithConcurrency(externalSizePaths, async (riftPath) => [
-      riftPath,
-      await measureCachedPath(riftPath),
-    ])
-  );
-
-  const entries = await mapWithConcurrency(visibleRifts, async ({ riftPath, riftRoot }) => {
-    // Creation can advance while an IO-heavy scan is in flight, so consult
-    // main-owned handshakes at classification time instead of snapshotting
-    // them before directory discovery.
-    const pendingOwner = pendingOwners.get(riftPath);
-    const owner = owners.get(riftPath) ?? pendingOwner;
-    const ownBytes = existsSync(riftPath) ? await measureCachedPath(riftPath) : 0;
-    const measuredBytes = [
-      ownBytes,
-      ...(externalSizePathsByWorkspace.get(path.resolve(riftPath)) ?? []).map(
-        (externalPath) => externalBytes.get(externalPath) ?? null
-      ),
-    ];
-    const bytes = measuredBytes.every((value) => value == null)
-      ? null
-      : measuredBytes.reduce((total, value) => total + (value ?? 0), 0);
-
-    let status = 'orphan';
-    if (owner) {
-      if (owner.cleanupPending) status = 'cleanupPending';
-      else if (owner.settledAt) status = 'settled';
-      else status = 'active';
-    }
-
-    // Individual row actions can manually free a Rift in any lifecycle state,
-    // so every row needs an accurate unpublished-work warning and override.
-    // The bulk/automatic candidate filters remain stricter.
-    const workState = await readOwnedRiftWorkState(riftPath, owner);
-
-    return {
-      riftPath,
-      riftRoot,
-      name: path.basename(riftPath),
-      repoName: path.basename(riftRoot),
-      bytes,
-      status,
-      hasMarker: await ownedRiftHasMarker(riftPath, owner),
-      epicId: owner?.epicId ?? null,
-      epicName: owner?.name ?? null,
-      settledAt: owner?.settledAt ?? null,
-      gitBranch: owner?.gitBranch ?? workState?.branch ?? null,
-      prUrl: owner?.prUrl ?? null,
-      prState: owner?.prState ?? null,
-      hasUncommittedChanges: workState?.hasUncommittedChanges ?? false,
-      hasUnpushedCommits: workState?.hasUnpushedCommits ?? false,
-    };
-  });
-
-  let trashBytes = null;
-  for (const trashPath of trashPaths) {
-    const bytes = await measurePathSize(trashPath);
-    if (typeof bytes === 'number') trashBytes = (trashBytes ?? 0) + bytes;
-  }
-
-  await saveSizeCache(nextCache);
-  entries.sort((left, right) => (right.bytes ?? 0) - (left.bytes ?? 0));
-  return { entries, trashBytes };
-};
-
-const runRiftStorageScan = ({ remeasure = false } = {}) => {
-  riftStorageScanQueue = riftStorageScanQueue
-    .catch(() => {})
-    .then(async () => {
-      publishRiftStorageState({ scanning: true, error: null });
-      try {
-        const { entries, trashBytes } = await scanRiftStorage({ remeasure });
-        publishRiftStorageState({
-          scanning: false,
-          scanId: crypto.randomUUID(),
-          scannedAt: new Date().toISOString(),
-          entries,
-          trashBytes,
-          error: null,
-        });
-      } catch (error) {
-        publishRiftStorageState({ scanning: false, error: error?.message || String(error) });
-      }
-      return riftStorageState;
-    });
-  return riftStorageScanQueue;
-};
-
-ipcMain.handle('riftStorage:getState', async () => {
-  await hydrateRiftReleaseJournal();
-  return {
-    ...riftStorageState,
-    pendingReleases: [...pendingRetentionReleases],
-    pendingReleasesRetentionDays: pendingRetentionRetentionDays,
+    available: Boolean(bundledCliEntry()),
+    version: bundledCliVersion(),
+    binDir,
+    signedIn: Boolean(credential),
+    credentialSource: credential?.source ?? null,
+    user: credential?.user ?? null,
   };
 });
 
-// The renderer has cleared these freed epics' pointers and stale session ids,
-// and has confirmed both persistence files reached disk.
-ipcMain.handle('riftStorage:acknowledgeReleases', async (_event, input) => {
-  const riftPaths = Array.isArray(input?.riftPaths)
-    ? input.riftPaths.filter((value) => typeof value === 'string' && value)
-    : [];
-  if (riftPaths.length === 0) return { ok: false, error: 'No releases were acknowledged.' };
+ipcMain.handle('durangoCli:signIn', () => signInBundledCli());
+
+ipcMain.handle('durangoWorkspace:inspect', async (_event, input) => {
+  if (!isPathInput(input?.projectPath)) return { ok: false, eligible: false, error: 'Missing project path.' };
   try {
-    await riftRemovalCoordinator.run([], () => acknowledgeRiftReleases(riftPaths));
-    return { ok: true };
+    return await inspectDurangoWorkspaceProject(input.projectPath);
+  } catch (error) {
+    return { ok: false, eligible: false, error: error?.message || String(error) };
+  }
+});
+
+ipcMain.handle('durangoWorkspace:create', async (_event, input) => {
+  if (!isPathInput(input?.projectPath) || !isWorkspaceNameInput(input?.name)) {
+    return { ok: false, error: 'Missing project path or workspace name.' };
+  }
+  try {
+    await installBundledCli();
+    // `ws new` starts from main on Durango Source, and the agent will open its
+    // change from here, so make sure the CLI is signed in first (best effort).
+    const cliSignIn = await signInBundledCli();
+    const result = await createDurangoWorkspace({ projectPath: input.projectPath, name: input.name });
+    return { ...result, cliSignedIn: cliSignIn.signedIn === true };
   } catch (error) {
     return { ok: false, error: error?.message || String(error) };
   }
 });
 
-ipcMain.handle('riftStorage:scan', async (_event, input) => {
-  await runRiftStorageScan({ remeasure: input?.remeasure === true });
-  return riftStorageState;
+ipcMain.handle('durangoWorkspace:remove', async (_event, input) => {
+  if (!isWorkspaceNameInput(input?.name) || (input?.repo !== undefined && !isPathInput(input.repo))) {
+    return { ok: false, error: 'Missing workspace name.' };
+  }
+  try {
+    if (isPathInput(input?.path)) {
+      await stopDurangoWorkspaceServer({ path: input.path, name: input.name, repo: input.repo });
+    }
+    return await removeDurangoWorkspace({ name: input.name, repo: input.repo, force: input.force === true });
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
 });
 
-ipcMain.handle('riftStorage:release', async (_event, input) => {
-  const requested = Array.isArray(input?.riftPaths) ? input.riftPaths : [];
-  const runGc = input?.runGc === true;
-  if (requested.length === 0 && !runGc) {
-    return { ok: false, error: 'No rifts were selected.' };
+ipcMain.handle('durangoWorkspace:status', async (_event, input) => {
+  if (!isPathInput(input?.path)) return { ok: false, error: 'Missing workspace path.' };
+  try {
+    return await durangoWorkspaceStatus({
+      path: input.path,
+      name: typeof input.name === 'string' ? input.name : undefined,
+      repo: typeof input.repo === 'string' ? input.repo : undefined,
+      remote: input.remote === true,
+    });
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
   }
-  const forcedPaths = new Set(Array.isArray(input?.forcePaths) ? input.forcePaths : []);
-  const manuallyRequestedPaths = new Set(
-    (Array.isArray(input?.manualPaths) ? input.manualPaths : []).filter(
-      (value) => typeof value === 'string' && value
-    )
-  );
-  const manualScanId = typeof input?.manualScanId === 'string' ? input.manualScanId : null;
-  // The renderer knows about live runs the persisted store cannot show.
-  const busyEpicIds = new Set(Array.isArray(input?.busyEpicIds) ? input.busyEpicIds : []);
-  const runtimeThreadIdsByEpic =
-    input?.runtimeThreadIdsByEpic &&
-    typeof input.runtimeThreadIdsByEpic === 'object' &&
-    !Array.isArray(input.runtimeThreadIdsByEpic)
-      ? input.runtimeThreadIdsByEpic
-      : {};
-  const runtimeThreadIdsForEpic = (epicId) =>
-    Array.isArray(runtimeThreadIdsByEpic[epicId])
-      ? [
-          ...new Set(
-            runtimeThreadIdsByEpic[epicId].filter(
-              (value) => typeof value === 'string' && value
-            )
-          ),
-        ]
-      : [];
+});
 
-  const reservationState = await readPersistedStoreState();
-  const reservationOwners = await readPersistedRiftOwners(reservationState);
-  const reservationPendingOwners = collectPendingRiftOwnersByPath(
-    unacknowledgedRifts,
-    pendingRiftCreations
-  );
-  const guardedEpicIds = new Set(
-    requested
-      .map(
-        (riftPath) =>
-          reservationOwners.get(riftPath)?.epicId ??
-          reservationPendingOwners.get(riftPath)?.epicId
-      )
-      .filter((epicId) => typeof epicId === 'string' && epicId)
-  );
-  return riftRemovalCoordinator.run(guardedEpicIds, async () => {
-  // Ownership may have changed while another destructive operation was ahead
-  // of this one in the queue. Snapshot it only after exclusive ownership.
-  const persistedState = await readPersistedStoreState();
-  const owners = await readPersistedRiftOwners(persistedState);
-  const pendingOwners = collectPendingRiftOwnersByPath(
-    unacknowledgedRifts,
-    pendingRiftCreations
-  );
-  // Manual overrides are accepted only for exact paths main published in the
-  // scan the confirmation dialog displayed. Resolve them after taking the
-  // destructive-operation queue so a rescan cannot silently substitute a
-  // newer row while this request waits.
-  const manuallyConfirmedEntries = collectCurrentManualRiftReleaseEntries(
-    riftStorageState.entries,
-    manuallyRequestedPaths,
-    riftStorageState.scanId,
-    manualScanId
-  );
-  const trashPaths = new Set(runGc ? listRiftTrashPaths() : []);
-  if (runGc) {
-    for (const riftRoot of await collectRiftRoots(persistedState)) {
-      const { trashPath } = await listRiftRootEntries(riftRoot);
-      if (trashPath) trashPaths.add(trashPath);
-    }
+ipcMain.handle('durangoWorkspace:land', async (_event, input) => {
+  if (!isPathInput(input?.path)) return { ok: false, error: 'Missing workspace path.' };
+  const cliSignIn = await signInBundledCli();
+  if (!cliSignIn.signedIn) return { ok: false, error: cliSignIn.error ?? 'Sign in to Durango Code first.' };
+  return landDurangoWorkspace({ path: input.path });
+});
+
+ipcMain.handle('durangoWorkspace:serve', async (_event, input) => {
+  if (!isPathInput(input?.path) || !isWorkspaceNameInput(input?.name)) {
+    return { ok: false, error: 'Missing workspace path or name.' };
   }
-  const trashSamplePath = (trashPath) => {
-    let current = path.resolve(trashPath);
-    while (path.dirname(current) !== current && path.basename(current) !== '.trash') {
-      current = path.dirname(current);
-    }
-    return path.basename(current) === '.trash' ? path.dirname(current) : path.dirname(trashPath);
-  };
-  const measurementPaths = [
-    ...requested.flatMap((value) => {
-      if (typeof value !== 'string' || !value) return [];
-      const owner = owners.get(value);
-      const linkedRepositoryParents = Array.isArray(owner?.repositories)
-        ? owner.repositories.flatMap((repository) =>
-            isExternalRiftLinkedFromWorkspace(value, repository) &&
-            typeof repository.riftPath === 'string' &&
-            repository.riftPath
-              ? [path.dirname(path.resolve(repository.riftPath))]
-              : []
-          )
-        : [];
-      return [path.dirname(path.resolve(value)), ...linkedRepositoryParents];
-    }),
-    ...[...trashPaths].map(trashSamplePath),
-  ];
-  const freeBefore = await readVolumeFreeSpace(measurementPaths);
-
-  const results = [];
-  for (const riftPath of requested) {
-    const reject = (reason) => results.push({ riftPath, ok: false, reason });
-    const manuallyConfirmedEntry = manuallyConfirmedEntries.get(riftPath);
-    const manuallyConfirmed = Boolean(manuallyConfirmedEntry);
-    if (typeof riftPath !== 'string' || !riftPath) {
-      reject('unsafe-path');
-      continue;
-    }
-    // A workspace still owned by the creation handshake is live even when the
-    // renderer has not persisted it yet. Never let orphan cleanup race that
-    // recovery path, including forced release requests.
-    if (pendingOwners.has(riftPath)) {
-      reject('epic-active');
-      continue;
-    }
-    const owner = owners.get(riftPath);
-    if (manuallyRequestedPaths.has(riftPath) && !manuallyConfirmedEntry) {
-      reject(owner && !owner.settledAt && !owner.cleanupPending ? 'epic-active' : 'ownership-changed');
-      continue;
-    }
-    if (manuallyConfirmedEntry && !isManualRiftReleaseEntryCurrent(manuallyConfirmedEntry, owner)) {
-      // A row confirmation authorizes the lifecycle identity the user saw,
-      // not a replacement owner or a same-Epic restore that raced the dialog.
-      reject(owner && !owner.settledAt && !owner.cleanupPending ? 'epic-active' : 'ownership-changed');
-      continue;
-    }
-    // Repository children are implementation details of one Epic workspace.
-    // Even a stale renderer request must release the parent so every linked
-    // repository is checked, preserved, and removed as one lifecycle unit.
-    if (owner?.repositoryChild) {
-      reject('workspace-owned');
-      continue;
-    }
-    if (!existsSync(riftPath)) {
-      const linkedRepositories = linkedRepositoriesForMissingWorkspace(riftPath, owner);
-      if (linkedRepositories === null) {
-        reject('unsafe-path');
-        continue;
-      }
-      if (linkedRepositories.length > 0) {
-        const linkedRepositoriesAreSafe = linkedRepositories.every(
-          (repository) =>
-            isRiftDirectoryPath(repository.riftPath) &&
-            existsSync(path.join(repository.riftPath, '.rift'))
-        );
-        if (!linkedRepositoriesAreSafe) {
-          reject('unsafe-path');
-          continue;
-        }
-        if (owner && !owner.settledAt && !owner.cleanupPending && !manuallyConfirmed) {
-          reject('epic-active');
-          continue;
-        }
-        if (owner && (busyEpicIds.has(owner.epicId) || pendingRiftEpicIds.has(owner.epicId))) {
-          reject('epic-busy');
-          continue;
-        }
-        if (!forcedPaths.has(riftPath)) {
-          const workState = await readRepositoryRiftsWorkState(linkedRepositories);
-          if (workState.hasUncommittedChanges || workState.hasUnpushedCommits) {
-            reject('unpushed-work');
-            continue;
-          }
-        }
-        if (owner && !owner.cleanupPending) {
-          try {
-            await preserveRepositoryRiftHeadsForRestore(linkedRepositories, owner);
-          } catch (error) {
-            results.push({
-              riftPath,
-              ok: false,
-              reason: 'restore-ref-failed',
-              error: error?.message || String(error),
-            });
-            continue;
-          }
-        }
-        try {
-          await Promise.all(
-            runtimeThreadIdsForEpic(owner.epicId).map((threadId) =>
-              disposeAgentThreadRuntime(threadId)
-            )
-          );
-        } catch (error) {
-          results.push({
-            riftPath,
-            ok: false,
-            reason: 'runtime-dispose-failed',
-            error: error?.message || String(error),
-          });
-          continue;
-        }
-        const currentOwner = (await readPersistedRiftOwners()).get(riftPath);
-        if (!isRiftReleaseOwnerCurrent(currentOwner, owner)) {
-          reject(
-            currentOwner && !currentOwner.settledAt && !currentOwner.cleanupPending
-              ? 'epic-active'
-              : 'ownership-changed'
-          );
-          continue;
-        }
-        if (!forcedPaths.has(riftPath)) {
-          const finalWorkState = await readRepositoryRiftsWorkState(linkedRepositories);
-          if (finalWorkState.hasUncommittedChanges || finalWorkState.hasUnpushedCommits) {
-            reject('unpushed-work');
-            continue;
-          }
-        }
-        if (owner && !owner.cleanupPending) {
-          try {
-            await preserveRepositoryRiftHeadsForRestore(linkedRepositories, owner);
-          } catch (error) {
-            results.push({
-              riftPath,
-              ok: false,
-              reason: 'restore-ref-failed',
-              error: error?.message || String(error),
-            });
-            continue;
-          }
-        }
-        const boundaryOwner = (await readPersistedRiftOwners()).get(riftPath);
-        if (!isRiftReleaseOwnerCurrent(boundaryOwner, owner)) {
-          reject(
-            boundaryOwner && !boundaryOwner.settledAt && !boundaryOwner.cleanupPending
-              ? 'epic-active'
-              : 'ownership-changed'
-          );
-          continue;
-        }
-        try {
-          for (const repository of [...linkedRepositories].reverse()) {
-            await riftRemove(repository.riftPath);
-            await forgetRiftCleanup(repository.riftPath).catch(() => {});
-          }
-        } catch (error) {
-          results.push({
-            riftPath,
-            ok: false,
-            reason: 'remove-failed',
-            error: error?.message || String(error),
-          });
-          continue;
-        }
-      }
-
-      // The parent was already gone. Clear its cleanup entry only after any
-      // externally linked repository has crossed the same safety boundary.
-      await forgetRiftCleanup(riftPath);
-      if (owner) {
-        try {
-          // A journal keyed to an already-missing parent cannot safely infer
-          // whether external children were removed after a crash. Record the
-          // release only once every surviving child is gone; before then the
-          // persisted Epic metadata remains the recovery source of truth.
-          await beginRiftRelease({ riftPath, epicId: owner.epicId });
-          await completeRiftRelease({ riftPath, epicId: owner.epicId });
-        } catch (error) {
-          results.push({
-            riftPath,
-            ok: false,
-            reason: 'journal-failed',
-            error: error?.message || String(error),
-          });
-          continue;
-        }
-      }
-      results.push({
-        riftPath,
-        ok: true,
-        ...(linkedRepositories.length === 0 ? { skipped: true } : {}),
-        epicId: owner?.epicId ?? null,
-      });
-      continue;
-    }
-    // Only ever remove something shaped exactly like an Orion-created rift.
-    // The marker remains mandatory for automatic cleanup; an individually
-    // confirmed path from main's current scan may also be an incomplete
-    // markerless destination left by an interrupted create.
-    if (!isRiftDirectoryPath(riftPath)) {
-      reject('unsafe-path');
-      continue;
-    }
-    const hasMarker = await ownedRiftHasMarker(riftPath, owner);
-    if (manuallyConfirmedEntry && hasMarker !== manuallyConfirmedEntry.hasMarker) {
-      reject('ownership-changed');
-      continue;
-    }
-    if (!hasMarker && Array.isArray(owner?.repositories) && owner.repositories.length > 0) {
-      reject('unsafe-path');
-      continue;
-    }
-    if (!hasMarker && !manuallyConfirmed) {
-      reject('missing-marker');
-      continue;
-    }
-    if (owner && !owner.settledAt && !owner.cleanupPending && !manuallyConfirmed) {
-      reject('epic-active');
-      continue;
-    }
-    if (owner && (busyEpicIds.has(owner.epicId) || pendingRiftEpicIds.has(owner.epicId))) {
-      reject('epic-busy');
-      continue;
-    }
-    if (!forcedPaths.has(riftPath)) {
-      const workState = await readOwnedRiftWorkState(riftPath, owner);
-      if (workState.hasUncommittedChanges || workState.hasUnpushedCommits) {
-        reject('unpushed-work');
-        continue;
-      }
-    }
-    if (owner && !owner.cleanupPending) {
-      try {
-        await preserveOwnedRiftHeadsForRestore(riftPath, owner);
-      } catch (error) {
-        results.push({
-          riftPath,
-          ok: false,
-          reason: 'restore-ref-failed',
-          error: error?.message || String(error),
-        });
-        continue;
-      }
-    }
-    if (owner) {
-      try {
-        // This is intentionally main-owned and immediately adjacent to
-        // removal. It reaps idle terminals, resumable provider sessions,
-        // untracked children, and startup races that a renderer "running"
-        // flag cannot represent.
-        await Promise.all(
-          runtimeThreadIdsForEpic(owner.epicId).map((threadId) =>
-            disposeAgentThreadRuntime(threadId)
-          )
-        );
-      } catch (error) {
-        results.push({
-          riftPath,
-          ok: false,
-          reason: 'runtime-dispose-failed',
-          error: error?.message || String(error),
-        });
-        continue;
-      }
-      try {
-        // Write intent before moving the directory. If Orion crashes after
-        // removal but before the completion write, startup infers completion
-        // from the now-missing path and still clears the persisted pointer.
-        await beginRiftRelease({ riftPath, epicId: owner.epicId });
-      } catch (error) {
-        results.push({
-          riftPath,
-          ok: false,
-          reason: 'journal-failed',
-          error: error?.message || String(error),
-        });
-        continue;
-      }
-    }
-    // Restoring an archived epic only changes persisted renderer state; it
-    // does not wait for this cleanup request. Re-read ownership after every
-    // asynchronous guard and immediately before removal so a restored,
-    // rebound, or freshly re-settled epic wins over this stale sweep entry.
-    const currentOwner = (await readPersistedRiftOwners()).get(riftPath);
-    if (!isRiftReleaseOwnerCurrent(currentOwner, owner)) {
-      if (owner) {
-        try {
-          await cancelRiftRelease(riftPath);
-        } catch (error) {
-          console.error('Could not cancel stale Rift release journal entry', riftPath, error);
-        }
-      }
-      reject(
-        currentOwner && !currentOwner.settledAt && !currentOwner.cleanupPending
-          ? 'epic-active'
-          : 'ownership-changed'
-      );
-      continue;
-    }
-    // Runtime disposal and the durable journal write above can take long
-    // enough for a terminal or external Git process to change the workspace.
-    // Recheck unpublished work and repin the exact final HEAD at the
-    // destructive boundary; the earlier checks are only preflight.
-    if (!forcedPaths.has(riftPath)) {
-      const finalWorkState = await readOwnedRiftWorkState(riftPath, owner);
-      if (finalWorkState.hasUncommittedChanges || finalWorkState.hasUnpushedCommits) {
-        if (owner) {
-          try {
-            await cancelRiftRelease(riftPath);
-          } catch (error) {
-            console.error('Could not cancel changed Rift release journal entry', riftPath, error);
-          }
-        }
-        reject('unpushed-work');
-        continue;
-      }
-    }
-    if (owner && !owner.cleanupPending) {
-      try {
-        await preserveOwnedRiftHeadsForRestore(riftPath, owner);
-      } catch (error) {
-        try {
-          await cancelRiftRelease(riftPath);
-        } catch (journalError) {
-          console.error(
-            'Could not cancel unpreserved Rift release journal entry',
-            riftPath,
-            journalError
-          );
-        }
-        results.push({
-          riftPath,
-          ok: false,
-          reason: 'restore-ref-failed',
-          error: error?.message || String(error),
-        });
-        continue;
-      }
-    }
-    // The final Git checks above are asynchronous too. Revalidate lifecycle
-    // ownership once more so a concurrent restore cannot cross removal.
-    const boundaryOwner = (await readPersistedRiftOwners()).get(riftPath);
-    if (!isRiftReleaseOwnerCurrent(boundaryOwner, owner)) {
-      if (owner) {
-        try {
-          await cancelRiftRelease(riftPath);
-        } catch (error) {
-          console.error('Could not cancel stale Rift release journal entry', riftPath, error);
-        }
-      }
-      reject(
-        boundaryOwner && !boundaryOwner.settledAt && !boundaryOwner.cleanupPending
-          ? 'epic-active'
-          : 'ownership-changed'
-      );
-      continue;
-    }
-    try {
-      if (hasMarker) {
-        await removeOwnedRift(riftPath, owner);
-      } else {
-        // Markerless rows are incomplete Orion destinations rather than
-        // registered Rift workspaces. The scan allowlist plus the strict path
-        // shape above authorize this exact directory, and system Trash keeps
-        // the manual removal recoverable.
-        await shell.trashItem(riftPath);
-      }
-    } catch (error) {
-      if (owner) {
-        try {
-          await cancelRiftRelease(riftPath);
-        } catch (journalError) {
-          console.error('Could not cancel failed Rift release journal entry', riftPath, journalError);
-        }
-      }
-      results.push({
-        riftPath,
-        ok: false,
-        reason: 'remove-failed',
-        error: error?.message || String(error),
-      });
-      continue;
-    }
-    try {
-      await forgetRiftCleanup(riftPath);
-    } catch (error) {
-      console.error('Could not clear old Rift cleanup journal entry', riftPath, error);
-    }
-    if (owner) {
-      try {
-        await completeRiftRelease({ riftPath, epicId: owner.epicId });
-      } catch (error) {
-        // The durable pre-removal intent is enough for startup recovery.
-        // Keep reporting the successful move and retain the journal rather
-        // than encouraging a second destructive attempt at a missing path.
-        console.error('Could not mark Rift release complete', riftPath, error);
-      }
-    }
-    results.push({ riftPath, ok: true, epicId: owner?.epicId ?? null });
-  }
-
-  // `rift remove` only relocates into Rift's trash — without this nothing is
-  // actually reclaimed. Machine-wide and permanent, so it stays opt-in and
-  // confirmed by the caller.
-  let gcError = null;
-  if (runGc) {
-    try {
-      await riftGc();
-    } catch (error) {
-      gcError = error?.message || String(error);
-    }
-  }
-
-  const freeAfter = await readVolumeFreeSpace(
-    [...freeBefore.values()].map((sample) => sample.path)
-  );
-  const reclaimedBytes = reclaimedBytesAcrossVolumes(freeBefore, freeAfter);
-
-  void runRiftStorageScan({ remeasure: true });
-
-  return {
-    ok: results.some((result) => result.ok) || (runGc && !gcError),
-    results,
-    reclaimedBytes,
-    gcError,
-    releasedEpicIds: results.filter((result) => result.ok && result.epicId).map((r) => r.epicId),
-  };
+  await installBundledCli();
+  return serveDurangoWorkspace({
+    path: input.path,
+    name: input.name,
+    repo: isPathInput(input.repo) ? input.repo : undefined,
+    onExit: ({ code, error }) =>
+      sendToAllWindows('durangoWorkspace:serverExited', { path: input.path, code, error }),
   });
 });
 
-// Age-based retention. Off unless the user picks a window in Settings, and
-// deliberately never runs `rift gc`: an unattended sweep should stay
-// recoverable, so it only moves settled rifts into Rift's trash.
-const startRiftRetentionSweep = async () => {
-  try {
-    await hydrateRiftReleaseJournal();
-    const state = await readPersistedStoreState();
-    const retentionDays = state?.riftsSettings?.retentionDays;
-    if (!Number.isFinite(retentionDays) || retentionDays <= 0) return;
-    if (!riftBinaryPath()) return;
-
-    const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
-    const owners = await readPersistedRiftOwners(state);
-    const ageCandidates = [];
-    for (const [riftPath, owner] of owners) {
-      if (owner.repositoryChild) continue;
-      if (!isRetainedRiftOwnerEligible(owner, { epicId: owner.epicId, cutoff })) continue;
-      if (!existsSync(riftPath)) continue;
-      ageCandidates.push({ riftPath, owner });
-    }
-    if (ageCandidates.length === 0) return;
-    return await riftRemovalCoordinator.run(
-      ageCandidates.map(({ owner }) => owner.epicId),
-      async () => {
-    const runtimeThreadIdsByEpic = await readPersistedRuntimeThreadIdsByEpic();
-    const expired = [];
-    for (const { riftPath, owner } of ageCandidates) {
-      if (!isRiftDirectoryPath(riftPath) || !(await ownedRiftHasMarker(riftPath, owner))) continue;
-      const workState = await readOwnedRiftWorkState(riftPath, owner);
-      if (workState.hasUncommittedChanges || workState.hasUnpushedCommits) continue;
-      try {
-        await preserveOwnedRiftHeadsForRestore(riftPath, owner);
-      } catch (error) {
-        console.error('Rift retention sweep could not preserve a restore ref', riftPath, error);
-        continue;
-      }
-      expired.push({ riftPath, epicId: owner.epicId });
-    }
-    if (expired.length === 0) return;
-
-    const released = [];
-    for (const { riftPath, epicId } of expired) {
-      try {
-        await Promise.all(
-          (runtimeThreadIdsByEpic.get(epicId) ?? []).map((threadId) =>
-            disposeAgentThreadRuntime(threadId)
-          )
-        );
-        await beginRiftRelease({ riftPath, epicId, retentionDays });
-        // The window is already interactive while this startup sweep runs.
-        // A restore flushes its now-active epic before doing any Rift setup,
-        // so reread durable ownership at the destructive boundary. Missing,
-        // replaced, newly settled, or restored ownership all cancel removal.
-        const currentOwner = (await readPersistedRiftOwners()).get(riftPath);
-        if (!isRetainedRiftOwnerEligible(currentOwner, { epicId, cutoff })) {
-          await cancelRiftRelease(riftPath);
-          continue;
-        }
-        // Disposal and journaling open the same work-state race as a manual
-        // release. Retention is never forced, so newly unpublished work always
-        // cancels the sweep and the exact final HEAD is pinned again.
-        const finalWorkState = await readOwnedRiftWorkState(riftPath, currentOwner);
-        if (finalWorkState.hasUncommittedChanges || finalWorkState.hasUnpushedCommits) {
-          await cancelRiftRelease(riftPath);
-          continue;
-        }
-        await preserveOwnedRiftHeadsForRestore(riftPath, currentOwner);
-        const boundaryOwner = (await readPersistedRiftOwners()).get(riftPath);
-        if (!isRetainedRiftOwnerEligible(boundaryOwner, { epicId, cutoff })) {
-          await cancelRiftRelease(riftPath);
-          continue;
-        }
-        await removeOwnedRift(riftPath, boundaryOwner);
-      } catch (error) {
-        try {
-          await cancelRiftRelease(riftPath);
-        } catch (journalError) {
-          console.error(
-            'Could not cancel failed retained Rift release journal entry',
-            riftPath,
-            journalError
-          );
-        }
-        console.error('Rift retention sweep could not remove', riftPath, error);
-        continue;
-      }
-      try {
-        await forgetRiftCleanup(riftPath);
-      } catch (error) {
-        console.error('Could not clear old retained Rift cleanup journal entry', riftPath, error);
-      }
-      try {
-        await completeRiftRelease({ riftPath, epicId, retentionDays });
-      } catch (error) {
-        // The durable removing phase plus a missing path is recoverable on
-        // next launch even if this completion write cannot land.
-        console.error('Could not mark retained Rift release complete', riftPath, error);
-      }
-      released.push({ riftPath, epicId });
-    }
-    if (released.length === 0) return;
-    // This runs at startup, before any renderer has subscribed, so the
-    // broadcast alone would be lost and the epics would keep pointing at
-    // directories that no longer exist. Park the result until a renderer
-    // acknowledges it, the same way unacknowledgedRifts does for creation.
-    sendToAllWindows('riftStorage:released', { released, retentionDays });
-      }
-    );
-  } catch (error) {
-    console.error('Rift retention sweep failed', error);
+ipcMain.handle('durangoWorkspace:stopServer', async (_event, input) => {
+  if (!isPathInput(input?.path) || !isWorkspaceNameInput(input?.name)) {
+    return { ok: false, error: 'Missing workspace path or name.' };
   }
-};
+  return stopDurangoWorkspaceServer({
+    path: input.path,
+    name: input.name,
+    repo: isPathInput(input.repo) ? input.repo : undefined,
+  });
+});
 
 // --- Orion Cloud repositories -------------------------------------------------
 
@@ -8259,10 +5417,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
       return { ok: false, error: 'Missing threadId, projectPath, prompt, or modelId.' };
     }
-    const riftSetupError = pendingRiftSetupError(input);
-    if (riftSetupError) {
-      return { ok: false, error: riftSetupError };
-    }
     // The No project scratch directory is Orion's own; recreate it if it was
     // cleaned up rather than failing the chat.
     if (path.resolve(input.projectPath) === getNoProjectDirectoryPath()) {
@@ -9363,7 +6517,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       orionMcp?.release();
       // A normal stop is already settled by the renderer and retains the
       // historical successful-startup result. Runtime disposal can also come
-      // directly from main-owned Rift cleanup, though, so report that distinct
+      // directly from workspace removal, though, so report that distinct
       // abort as a startup failure and let hidden renderer runs settle even
       // when no terminal event can be emitted.
       if (abortedStartup.abortError) {
@@ -9473,8 +6627,8 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
   }
   const shutdown = killAgentChild(run.child, run.threadId);
   activeAgentRuns.delete(runId);
-  // Rift deletion uses terminateBackground and must not move the process's
-  // cwd until SIGTERM/SIGKILL has actually reaped it. Ordinary Stop/Steer
+  // Workspace removal uses terminateBackground and must not delete the
+  // process's cwd until SIGTERM/SIGKILL has actually reaped it. Ordinary Stop/Steer
   // remains responsive and lets the global shutdown tracker finish the reap.
   if (options?.terminateBackground) await shutdown;
   return true;
@@ -9497,10 +6651,6 @@ ipcMain.handle('agent:codexGoal', async (_event, input) => {
     }
     if (!['pause', 'clear', 'get'].includes(input.action)) {
       return { ok: false, error: `Unsupported goal action: ${input.action}` };
-    }
-    const riftSetupError = pendingRiftSetupError(input);
-    if (riftSetupError) {
-      return { ok: false, error: riftSetupError };
     }
     const controller = new AbortController();
     const operationEntry = { controller, promise: null };
@@ -9548,8 +6698,8 @@ ipcMain.handle('agent:codexGoal', async (_event, input) => {
 async function disposeAgentThreadRuntime(threadId) {
   if (typeof threadId !== 'string' || !threadId) return false;
   // Cancel and drain startup work too. It may not own a child process yet,
-  // but it can still be resolving sessions or snapshotting the soon-to-move
-  // workspace, and must not spawn after the rift is removed.
+  // but it can still be resolving sessions, and must not spawn after its
+  // workspace is removed.
   let cancelledStartup = false;
   for (const starting of startingAgentRuns.values()) {
     if (starting.threadId !== threadId) continue;
@@ -9598,7 +6748,7 @@ async function disposeAgentThreadRuntime(threadId) {
   }
   // A Claude startup can install a session after the first disposal snapshot
   // but before it observes the aborted startup flag. Repeat the acknowledged
-  // disposal after startup drain so no late session outlives Rift removal.
+  // disposal after startup drain so no late session outlives workspace removal.
   const disposedLateClaude = await disposeClaudeSdkSessionAndWait(threadId);
   return (
     disposedClaude ||
@@ -9941,10 +7091,6 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
       : 'full-access';
     if (!threadId || !projectPath) {
       return { ok: false, error: 'threadId and projectPath are required' };
-    }
-    const riftSetupError = pendingRiftSetupError(input);
-    if (riftSetupError) {
-      return { ok: false, error: riftSetupError };
     }
     // A newer ensure supersedes any older pending start for the same thread
     // (for example, when access mode changes while node-pty is still loading).
@@ -10411,7 +7557,6 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
   }
   threadGenerations.add(generation);
   const operation = (async () => {
-    if (pendingRiftSetupError(input)) return '';
     const models = await getAgentModels();
     if (controller.signal.aborted) return '';
     const model = models.find((candidate) => candidate.id === input.modelId);

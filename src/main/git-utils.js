@@ -144,8 +144,8 @@ export const readNumstatMap = async (gitRoot) => {
 };
 
 // Content versions already reported by a finished run: gitRoot ->
-// (relativePath -> signature). Concurrent turns in the same workspace (epic
-// threads sharing a rift) each diff the working tree against their own
+// (relativePath -> signature). Concurrent turns in the same workspace (threads
+// sharing a Durango workspace) each diff the working tree against their own
 // turn-start snapshot, so one agent's save lands inside every overlapping
 // turn's window and would show up in each of their summaries. The first run
 // to finalize claims that content version; later runs skip it unless they

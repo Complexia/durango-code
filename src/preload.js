@@ -57,30 +57,20 @@ contextBridge.exposeInMainWorld('orion', {
   epicGitStatus: (input) => ipcRenderer.invoke('epic:gitStatus', input),
   epicPrStates: (input) => ipcRenderer.invoke('epic:prStates', input),
 
-  // Rifts (experimental copy-on-write epic workspaces)
-  riftStatus: () => ipcRenderer.invoke('rift:status'),
-  epicCreateRift: (input) => ipcRenderer.invoke('epic:createRift', input),
-  epicAddRiftProject: (input) => ipcRenderer.invoke('epic:addRiftProject', input),
-  epicAcknowledgeRift: (input) => ipcRenderer.invoke('epic:acknowledgeRift', input),
-  epicRemoveRift: (input) => ipcRenderer.invoke('epic:removeRift', input),
-  epicDeleteRiftRestoreRef: (input) =>
-    ipcRenderer.invoke('epic:deleteRiftRestoreRef', input),
-
-  // Rift storage (Settings > Storage)
-  getRiftStorageState: () => ipcRenderer.invoke('riftStorage:getState'),
-  scanRiftStorage: (input) => ipcRenderer.invoke('riftStorage:scan', input),
-  releaseRiftStorage: (input) => ipcRenderer.invoke('riftStorage:release', input),
-  acknowledgeRiftStorageReleases: (input) =>
-    ipcRenderer.invoke('riftStorage:acknowledgeReleases', input),
-  onRiftStorageState: (callback) => {
+  // Bundled durango-code CLI and Durango workspaces (docs/workspaces.md)
+  durangoCliStatus: () => ipcRenderer.invoke('durangoCli:status'),
+  durangoCliSignIn: () => ipcRenderer.invoke('durangoCli:signIn'),
+  inspectDurangoWorkspaceProject: (input) => ipcRenderer.invoke('durangoWorkspace:inspect', input),
+  createDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:create', input),
+  removeDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:remove', input),
+  durangoWorkspaceStatus: (input) => ipcRenderer.invoke('durangoWorkspace:status', input),
+  landDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:land', input),
+  serveDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:serve', input),
+  stopDurangoWorkspaceServer: (input) => ipcRenderer.invoke('durangoWorkspace:stopServer', input),
+  onDurangoWorkspaceServerExited: (callback) => {
     const listener = (_event, data) => callback(data);
-    ipcRenderer.on('riftStorage:state', listener);
-    return () => ipcRenderer.removeListener('riftStorage:state', listener);
-  },
-  onRiftStorageReleased: (callback) => {
-    const listener = (_event, data) => callback(data);
-    ipcRenderer.on('riftStorage:released', listener);
-    return () => ipcRenderer.removeListener('riftStorage:released', listener);
+    ipcRenderer.on('durangoWorkspace:serverExited', listener);
+    return () => ipcRenderer.removeListener('durangoWorkspace:serverExited', listener);
   },
 
   // Agent skills and MCP servers (Settings > Skills & MCPs)

@@ -9,7 +9,7 @@ const macSigningIdentity = process.env.ORION_MAC_SIGN_IDENTITY
 const macEntitlements = path.join(__dirname, 'build', 'entitlements.mac.plist');
 const macNonCodeResourcePattern = /\.(?:pak|bin|dat|png|jpe?g|gif|icns|ico|ttf|woff2?)$/i;
 // @electron/packager wipes `<tmpdir>/electron-packager` at the start of every
-// run, so concurrent packaging from another checkout (rifts, worktrees) would
+// run, so concurrent packaging from another checkout (workspaces, worktrees) would
 // delete this build's staged app mid-signing. Stage per checkout instead. It
 // must live outside the project: packager copies the project into staging.
 const packagerTmpdir = path.join(
@@ -24,11 +24,12 @@ const isLinuxBuild = process.platform === 'linux';
 
 module.exports = {
   packagerConfig: {
-    // node-pty's spawn-helper and rift-snapshot's prebuilt CLI are plain
-    // executables (no .node extension), so the auto-unpack-natives plugin
-    // alone won't unpack them — unpack the whole modules. The plugin merges
-    // its own '**/*.node' pattern into this.
-    asar: { unpack: '**/node_modules/{node-pty,rift-snapshot,@anthropic-ai/claude-agent-sdk-*}/**' },
+    // node-pty's spawn-helper is a plain executable (no .node extension), so
+    // the auto-unpack-natives plugin alone won't unpack it — unpack the whole
+    // module. The bundled durango-code CLI runs in a separate Electron-as-Node
+    // process, so it lives on disk too. The plugin merges its own '**/*.node'
+    // pattern into this.
+    asar: { unpack: '**/node_modules/{node-pty,durango-code,@anthropic-ai/claude-agent-sdk-*}/**' },
     icon: path.join(__dirname, 'assets', 'icon'),
     tmpdir: packagerTmpdir,
     ...(isLinuxBuild ? { executableName: linuxExecutableName } : {}),
@@ -92,22 +93,14 @@ module.exports = {
         }
       }
 
-      // rift-snapshot ships the prebuilt `rift` CLI the same way; the main
-      // process spawns it for epic rift workspaces.
-      const riftSrc = path.join(__dirname, 'node_modules', 'rift-snapshot');
-      const riftDest = path.join(buildPath, 'node_modules', 'rift-snapshot');
-      if (fs.existsSync(riftSrc)) {
-        fs.cpSync(riftSrc, riftDest, { recursive: true, dereference: true });
-        const riftPrebuilds = path.join(riftDest, 'prebuilds');
-        if (fs.existsSync(riftPrebuilds)) {
-          for (const dir of fs.readdirSync(riftPrebuilds)) {
-            for (const name of ['rift', 'rift.exe']) {
-              const binary = path.join(riftPrebuilds, dir, name);
-              if (fs.existsSync(binary)) fs.chmodSync(binary, 0o755);
-            }
-          }
-        }
-      }
+      // The durango-code CLI (dependency-free JavaScript) ships with the app:
+      // agents and the app's workspace features run it through the shim in
+      // src/main/bundled-cli.js, so installs don't need a global CLI.
+      fs.cpSync(
+        path.join(__dirname, 'node_modules', 'durango-code'),
+        path.join(buildPath, 'node_modules', 'durango-code'),
+        { recursive: true, dereference: true },
+      );
     },
   },
   makers: [

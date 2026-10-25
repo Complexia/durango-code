@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 
 export const missingAgentWorkspaceError = (projectPath) =>
-  `This thread's workspace no longer exists: ${projectPath}. Recreate the Rift or start a new thread in an existing project.`;
+  `This thread's workspace no longer exists: ${projectPath}. If it was a Durango workspace, it has been removed; start a new thread in the project.`;
 
 const inaccessibleAgentWorkspaceError = (projectPath, error) =>
   `Durango Code could not access this thread's workspace: ${projectPath}. ${error instanceof Error ? error.message : String(error)}`;

@@ -999,7 +999,6 @@ if (
       name: 'Remote Epic',
       description: 'Created from the web controller',
       projectIds: ['p1'],
-      createRift: true,
     });
     results.emptyPrompt = await engine.runRemoteTurn({ machineId: results.pair.machine?.id, prompt: '   ' });
     results.state = engine.getRemoteControlState();

@@ -1,4 +1,4 @@
-import { type FileAttachment, type LinkedBoardTask, type OrchestrationRoleId, type Thread } from '../store';
+import { type FileAttachment, type LinkedBoardTask, type OrchestrationRoleId, type Thread, type ThreadDurangoWorkspace } from '../store';
 import { type AgentModel } from '../agentCatalog';
 import { getThreadActivityTime } from './time';
 
@@ -418,3 +418,17 @@ export const linkedTaskStatusLabel = (status?: string) => {
       return 'Linked';
   }
 };
+
+// Fresh agent sessions in a Durango workspace learn that Durango Code already
+// made it, so project instructions that say "create a workspace first" are
+// satisfied rather than followed into a second, nested one.
+export const buildDurangoWorkspaceContext = (workspace: ThreadDurangoWorkspace) =>
+  [
+    '[Durango workspace]',
+    `Durango Code created the Durango workspace \`${workspace.name}\` for this thread at ${workspace.path} ` +
+      `(ports ${workspace.portBase}-${workspace.portBase + workspace.portBlock - 1}; see .durango/ws.env). ` +
+      'You are already working in it: do all of this task\'s work here and do not create another workspace ' +
+      'with `durango-code ws new`. `durango-code change create`, `change amend` and `land` work from this ' +
+      'directory; Durango Code removes the workspace when the user is done with it.',
+    '[/Durango workspace]',
+  ].join('\n');

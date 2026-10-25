@@ -5,8 +5,8 @@ import {
   Cloud,
   Columns2,
   FlaskConical,
+  FolderGit2,
   GitPullRequest,
-  HardDrive,
   LogIn,
   LogOut,
   MousePointerClick,
@@ -28,7 +28,6 @@ import {
 import {
   defaultDurangoSettings,
   defaultEpicsSettings,
-  defaultRiftsSettings,
   useOrionStore,
   defaultSplitViewSettings,
   MAX_THREAD_PANES,
@@ -43,7 +42,6 @@ import {
   type ProviderRuntimeOptions,
   type ProviderSettings,
   type RemoteControlSettings as RemoteControlSettingsValue,
-  type RiftsSettings,
   type SavedView,
   type SplitViewSettings,
   type TextGenerationSettings,
@@ -56,7 +54,6 @@ import {
   type AgentProvider,
   type AgentProviderId,
 } from '../agentCatalog';
-import type { RiftStorageEntry, RiftStorageState } from '../types';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
 import { DurangoDispatchSettings } from './DurangoDispatchSettings';
@@ -64,6 +61,7 @@ import SkillsSettings from './SkillsSettings';
 import McpsSettings from './McpsSettings';
 import DeploymentsSettings from './DeploymentsSettings';
 import DevServersSettings from './DevServersSettings';
+import WorkspacesSettings from './WorkspacesSettings';
 import RemoteControlSettings from './RemoteControlSettings';
 import { orchestrationRoleMeta } from './promptContext';
 import { formatShortTime } from './time';
@@ -74,7 +72,6 @@ import type {
   ProviderUpdateItem,
   ProviderUpdateProgress,
   ProviderUpdateState,
-  RiftSweepDialogState,
   SettingsTab,
   WorkspaceSyncStatus,
 } from './appTypes';
@@ -83,8 +80,8 @@ const ARCHIVED_EPICS_COLLAPSED_LIMIT = 5;
 const CODEX_BROWSER_EXTENSION_URL =
   'https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg';
 
-// Settings remains controlled by App because its asynchronous account, update,
-// and Rift operations are shared with the shell. Keeping that integration in a
+// Settings remains controlled by App because its asynchronous account and
+// update operations are shared with the shell. Keeping that integration in a
 // single view model avoids creating a second set of store subscriptions here.
 export type SettingsPageProps = {
   notificationSettings: NotificationSettings;
@@ -101,8 +98,6 @@ export type SettingsPageProps = {
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
   setOrchestrationGeneralInstructions: (text: string) => void;
-  riftsSettings: RiftsSettings;
-  setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
   workspaceSyncSettings: WorkspaceSyncSettings;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   remoteControlSettings: RemoteControlSettingsValue;
@@ -123,35 +118,6 @@ export type SettingsPageProps = {
   utilityModelSearch: string;
   setUtilityModelTab: React.Dispatch<React.SetStateAction<AgentProviderId>>;
   utilityModelTab: AgentProviderId;
-  riftStatus: {
-    available: boolean;
-    version?: string | null;
-    pendingEpicIds?: string[];
-    pendingRemovalEpicIds?: string[];
-    readyRifts?: Array<{
-      epicId: string;
-      projectId?: string;
-      projectPath: string;
-      riftPath: string;
-      riftWorkingDir: string;
-      gitRoot?: string;
-      branch?: string;
-    }>;
-  } | null;
-  riftStorageState: RiftStorageState | null;
-  riftStorageBusy: boolean;
-  riftStorageForced: Record<string, boolean>;
-  setRiftStorageForced: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
-  setRiftSweepDialog: React.Dispatch<React.SetStateAction<RiftSweepDialogState | null>>;
-  riftStorageEntries: RiftStorageEntry[];
-  riftStorageSummary: {
-    total: number;
-    active: number;
-    settled: number;
-    orphan: number;
-    trash: number;
-  };
-  riftSweepSelection: RiftStorageEntry[];
   providerUpdateState: ProviderUpdateState | null;
   providerUpdatesChecking: boolean;
   providerUpdatesRunning: boolean;
@@ -204,7 +170,7 @@ export type SettingsPageProps = {
   handleSignOutAccount: () => Promise<void>;
   handleAuthenticateProvider: (providerId: string) => Promise<void>;
   openEpicPrUrl: (prUrl: string) => void;
-  handleDeleteEpic: (epic: Epic) => Promise<void>;
+  handleDeleteEpic: (epic: Epic) => void;
   handleRestoreEpic: (epic: Epic) => void;
   formatCheckedTime: (iso: string) => string;
   formatBytes: (bytes: number | null | undefined) => string;
@@ -227,8 +193,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setProviderOptions,
     setOrchestrationRoleModel,
     setOrchestrationGeneralInstructions,
-    riftsSettings,
-    setRiftsSettings,
     workspaceSyncSettings,
     setWorkspaceSyncSettings,
     remoteControlSettings,
@@ -249,15 +213,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     utilityModelSearch,
     setUtilityModelTab,
     utilityModelTab,
-    riftStatus,
-    riftStorageState,
-    riftStorageBusy,
-    riftStorageForced,
-    setRiftStorageForced,
-    setRiftSweepDialog,
-    riftStorageEntries,
-    riftStorageSummary,
-    riftSweepSelection,
     providerUpdateState,
     providerUpdatesChecking,
     providerUpdatesRunning,
@@ -422,7 +377,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               Icon: MousePointerClick,
             },
             { id: 'dev-servers', label: 'Dev Servers', Icon: Server },
-            { id: 'storage', label: 'Storage', Icon: HardDrive },
+            { id: 'workspaces', label: 'Workspaces', Icon: FolderGit2 },
             { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
             { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
           ].map(({ id, label, Icon }) => (
@@ -457,13 +412,13 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'split-view' && 'SPLIT VIEW'}
           {settingsTab === 'computer-use' && 'COMPUTER USE'}
           {settingsTab === 'dev-servers' && 'DEV SERVERS'}
-          {settingsTab === 'storage' && 'STORAGE'}
+          {settingsTab === 'workspaces' && 'WORKSPACES'}
           {settingsTab === 'cosmetics' && 'COSMETICS'}
           {settingsTab === 'experimental' && 'EXPERIMENTAL'}
         </div>
 
         <div
-          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'storage' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
+          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'workspaces' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
         >
           {settingsTab === 'account' && (
             <>
@@ -956,14 +911,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                               <span className="archived-epic-date">
                                 Settled {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
                               </span>
-                              {epic.riftReleased && (
-                                <span
-                                  className="provider-status-chip"
-                                  title="Its rift was freed to reclaim disk. Restoring recreates it on the same branch."
-                                >
-                                  Rift freed
-                                </span>
-                              )}
                               {epic.prUrl && (
                                 <button
                                   type="button"
@@ -977,11 +924,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                               <button
                                 type="button"
                                 className="archived-epic-action"
-                                title={
-                                  epic.riftReleased
-                                    ? 'Restore to the sidebar and recreate its rift'
-                                    : 'Restore to the sidebar'
-                                }
+                                title="Restore to the sidebar"
                                 onClick={() => handleRestoreEpic(epic)}
                               >
                                 <RefreshCw size={13} />
@@ -1868,218 +1811,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             </>
           )}
 
-          {settingsTab === 'storage' && (
-            <>
-              <div className="settings-group-label">Rift workspaces</div>
-              <div className="settings-group">
-                <div className="storage-summary">
-                  <div className="storage-summary-main">
-                    <div className="storage-summary-total">{formatBytes(riftStorageSummary.total)}</div>
-                    <div className="storage-summary-caption">
-                      Across {riftStorageEntries.length} rift
-                      {riftStorageEntries.length === 1 ? '' : 's'}. Rifts share unchanged files with their source
-                      repository, so freeing them usually reclaims less than this.
-                    </div>
-                  </div>
-                  <div className="storage-summary-actions">
-                    <button
-                      type="button"
-                      className="btn secondary small"
-                      disabled={riftStorageState?.scanning || riftStorageBusy}
-                      onClick={() =>
-                        void window.orion?.scanRiftStorage?.({
-                          remeasure: true,
-                        })
-                      }
-                    >
-                      <RefreshCw size={13} />
-                      {riftStorageState?.scanning ? 'Measuring...' : 'Rescan'}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn danger small"
-                      disabled={
-                        riftStorageBusy ||
-                        riftStorageState?.scanning ||
-                        (riftSweepSelection.length === 0 && riftStorageSummary.trash <= 0)
-                      }
-                      onClick={() =>
-                        setRiftSweepDialog({
-                          entries: riftSweepSelection,
-                          runGc: true,
-                          forcePaths: riftSweepSelection
-                            .filter((entry) => entry.hasUncommittedChanges || entry.hasUnpushedCommits)
-                            .map((entry) => entry.riftPath),
-                        })
-                      }
-                    >
-                      <Trash2 size={13} />
-                      {riftStorageBusy
-                        ? 'Freeing...'
-                        : riftSweepSelection.length === 0
-                          ? `Empty ${formatBytes(riftStorageSummary.trash)} trash`
-                          : `Free up ${formatBytes(
-                              riftSweepSelection.reduce((total, entry) => total + (entry.bytes ?? 0), 0)
-                            )}`}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="storage-breakdown">
-                  {[
-                    { label: 'Active epics', bytes: riftStorageSummary.active },
-                    {
-                      label: 'Settled epics',
-                      bytes: riftStorageSummary.settled,
-                    },
-                    { label: 'No epic', bytes: riftStorageSummary.orphan },
-                    { label: 'Rift trash', bytes: riftStorageSummary.trash },
-                  ].map(({ label, bytes }) => (
-                    <div key={label} className="storage-breakdown-item">
-                      <span className="storage-breakdown-label">{label}</span>
-                      <span className="storage-breakdown-value">{formatBytes(bytes)}</span>
-                    </div>
-                  ))}
-                </div>
-
-                {riftStorageState?.error && (
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-desc">{riftStorageState.error}</div>
-                    </div>
-                  </div>
-                )}
-
-                {riftStorageEntries.length === 0 && !riftStorageState?.scanning && (
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-desc">
-                        No rift workspaces found. Rifts appear here once epics start creating them.
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {riftStorageEntries.length > 0 && (
-                  <div className="setting-row setting-row-stacked">
-                    <div className="storage-rift-list">
-                      {riftStorageEntries.map((entry) => {
-                        const blocked = entry.hasUncommittedChanges || entry.hasUnpushedCommits;
-                        const forced = Boolean(riftStorageForced[entry.riftPath]);
-                        return (
-                          <div key={entry.riftPath} className="storage-rift-row">
-                            <div className="storage-rift-main">
-                              <span className="storage-rift-name truncate" title={entry.riftPath}>
-                                {entry.epicName || entry.name}
-                              </span>
-                              <span className="storage-rift-meta truncate">
-                                {entry.repoName}
-                                {entry.gitBranch ? ` · ${entry.gitBranch}` : ''}
-                                {entry.settledAt ? ` · settled ${formatShortTime(new Date(entry.settledAt))}` : ''}
-                              </span>
-                            </div>
-                            {entry.status === 'active' && <span className="provider-status-chip">Active</span>}
-                            {entry.status === 'orphan' && <span className="provider-status-chip">No epic</span>}
-                            {entry.status === 'cleanupPending' && (
-                              <span className="provider-status-chip">Incomplete</span>
-                            )}
-                            {blocked && (
-                              <button
-                                type="button"
-                                className={`storage-rift-flag${forced ? ' active' : ''}`}
-                                title={
-                                  forced
-                                    ? 'This rift will be freed even though it has unpushed work'
-                                    : 'Has uncommitted or unpushed work — click to free it anyway'
-                                }
-                                onClick={() =>
-                                  setRiftStorageForced((current) => ({
-                                    ...current,
-                                    [entry.riftPath]: !current[entry.riftPath],
-                                  }))
-                                }
-                              >
-                                {forced ? 'Freeing anyway' : 'Unpushed work'}
-                              </button>
-                            )}
-                            <span className="storage-rift-size">{formatBytes(entry.bytes)}</span>
-                            <button
-                              type="button"
-                              className="archived-epic-action danger"
-                              title="Free this rift"
-                              disabled={riftStorageBusy}
-                              onClick={() =>
-                                setRiftSweepDialog({
-                                  entries: [entry],
-                                  runGc: true,
-                                  // For an individual row, the destructive modal
-                                  // itself is the one-time unpublished-work approval.
-                                  forcePaths: blocked ? [entry.riftPath] : [],
-                                  // The row action is an explicit request to free
-                                  // this exact scan-listed Rift in any state.
-                                  manualPaths: [entry.riftPath],
-                                  manualScanId: riftStorageState?.scanId ?? undefined,
-                                })
-                              }
-                            >
-                              <Trash2 size={13} />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="settings-group-label">Automatic cleanup</div>
-              <div className="settings-group settings-group-overflowing">
-                <div className="setting-row">
-                  <div className="setting-label">
-                    <div className="setting-label-title">Free the rift when settling</div>
-                    <div className="setting-label-desc">
-                      Settling an epic also frees its rift workspace. The epic keeps its branch and pull request, and
-                      restoring it recreates the rift. Rifts with uncommitted or unpushed work are never freed
-                      automatically.
-                    </div>
-                  </div>
-                  <label className="provider-toggle" title="Free the rift when settling">
-                    <input
-                      type="checkbox"
-                      checked={riftsSettings.releaseOnSettle ?? defaultRiftsSettings.releaseOnSettle}
-                      onChange={(e) => setRiftsSettings({ releaseOnSettle: e.target.checked })}
-                    />
-                    <span />
-                  </label>
-                </div>
-
-                <div className="setting-row">
-                  <div className="setting-label">
-                    <div className="setting-label-title">Free settled rifts after</div>
-                    <div className="setting-label-desc">
-                      Checked once at startup. Freed rifts stay recoverable in Rift's trash until you empty it from this
-                      page.
-                    </div>
-                  </div>
-                  <SelectMenu
-                    label="Free settled rifts after"
-                    value={String(riftsSettings.retentionDays ?? defaultRiftsSettings.retentionDays ?? '')}
-                    options={[
-                      { value: '', label: 'Never' },
-                      { value: '7', label: '7 days' },
-                      { value: '14', label: '14 days' },
-                      { value: '30', label: '30 days' },
-                    ]}
-                    onChange={(value) =>
-                      setRiftsSettings({
-                        retentionDays: value ? Number(value) : null,
-                      })
-                    }
-                  />
-                </div>
-              </div>
-            </>
-          )}
+          {settingsTab === 'workspaces' && <WorkspacesSettings />}
 
           {settingsTab === 'cosmetics' && (
             <div className="settings-empty-panel">
@@ -2119,58 +1851,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   </div>
                 </>
               )}
-
-              <div className="settings-group-label">Rifts</div>
-              <div className="settings-group">
-                <div className="setting-row">
-                  <div className="setting-label">
-                    <div className="setting-label-title">Enable Rifts</div>
-                    <div className="setting-label-desc">
-                      Give each epic an instant copy-on-write clone of its repository (github.com/anomalyco/rift). Epic
-                      threads, commits, pushes, and PRs all happen inside the rift, so unrelated local changes never mix
-                      in.
-                      {riftStatus?.available === false
-                        ? ' Unavailable: the bundled rift binary does not support this platform.'
-                        : riftStatus?.version
-                          ? ` Bundled rift v${riftStatus.version} — update with "bun run update-rifts".`
-                          : ''}
-                    </div>
-                  </div>
-                  <label className="provider-toggle" title="Enable Rifts">
-                    <input
-                      type="checkbox"
-                      checked={riftsSettings.enabled}
-                      disabled={riftStatus?.available === false}
-                      onChange={(e) => setRiftsSettings({ enabled: e.target.checked })}
-                    />
-                    <span />
-                  </label>
-                </div>
-
-                {riftsSettings.enabled && (
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Create a rift per epic</div>
-                      <div className="setting-label-desc">
-                        New epics get a rift and a dedicated branch (named by the epic message model) automatically. You
-                        can still opt out per epic in the create dialog.
-                      </div>
-                    </div>
-                    <label className="provider-toggle" title="Create a rift per epic">
-                      <input
-                        type="checkbox"
-                        checked={riftsSettings.autoCreateForEpics}
-                        onChange={(e) =>
-                          setRiftsSettings({
-                            autoCreateForEpics: e.target.checked,
-                          })
-                        }
-                      />
-                      <span />
-                    </label>
-                  </div>
-                )}
-              </div>
             </>
           )}
         </div>

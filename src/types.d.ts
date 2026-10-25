@@ -58,67 +58,37 @@ export type ImportedSessionTranscript = {
   messages: import('./store').Message[];
 };
 
-/**
- * One rift directory found under a `.rifts/<repo>` root.
- *
- * `bytes` comes from block accounting (`du -sk`), so on copy-on-write
- * filesystems it is an upper bound: a rift still sharing blocks with its
- * source repository reports its full size but frees far less than that.
- */
-export type RiftStorageEntry = {
-  riftPath: string;
-  riftRoot: string;
-  name: string;
-  repoName: string;
-  bytes: number | null;
-  /** `orphan` means no epic in the persisted store claims this directory. */
-  status: 'active' | 'settled' | 'orphan' | 'cleanupPending';
-  hasMarker: boolean;
-  epicId: string | null;
-  epicName: string | null;
-  settledAt: string | null;
-  gitBranch: string | null;
-  prUrl: string | null;
-  prState: 'OPEN' | 'CLOSED' | 'MERGED' | null;
-  hasUncommittedChanges: boolean;
-  hasUnpushedCommits: boolean;
+export type DurangoCliStatus = {
+  /** This build ships the durango-code CLI. */
+  available: boolean;
+  version: string | null;
+  /** Directory with the `durango-code` launchers, appended to PATH for agents. */
+  binDir: string | null;
+  signedIn: boolean;
+  credentialSource: 'saved' | 'environment' | null;
+  user: { id?: string; name?: string | null; email?: string | null } | null;
 };
 
-export type RiftStorageState = {
-  scanning: boolean;
-  /** Opaque identity of the last successful scan. */
-  scanId: string | null;
-  scannedAt: string | null;
-  entries: RiftStorageEntry[];
-  /** Total size of Rift's own trash directories, reclaimable only by `rift gc`. */
-  trashBytes: number | null;
-  error: string | null;
-  /**
-   * Rifts removed by manual or retention cleanup whose owning epic/thread
-   * metadata has not yet been durably cleared by a renderer.
-   */
-  pendingReleases?: Array<{ riftPath: string; epicId: string }>;
-  pendingReleasesRetentionDays?: number | null;
-};
-
-export type RiftStorageReleaseResult = {
-  riftPath: string;
+export type DurangoWorkspaceStatus = {
   ok: boolean;
-  /** Path was already gone; the epic pointer should still be cleared. */
-  skipped?: boolean;
-  reason?:
-    | 'unsafe-path'
-    | 'missing-marker'
-    | 'epic-active'
-    | 'epic-busy'
-    | 'unpushed-work'
-    | 'restore-ref-failed'
-    | 'runtime-dispose-failed'
-    | 'journal-failed'
-    | 'ownership-changed'
-    | 'remove-failed';
+  /** The workspace directory is still on disk. */
+  exists?: boolean;
+  /** `durango-code ws list` still knows it. */
+  registered?: boolean;
+  /** `ws serve` state for this workspace's server slot. */
+  server?: 'running' | 'queued' | 'starting' | null;
+  /** The change this workspace holds, if any (`.durango/change.json`). */
+  change?: {
+    changeId: string;
+    status: 'open' | 'queued' | 'landed' | 'abandoned' | null;
+    url: string | null;
+    title: string | null;
+    rejection: string | null;
+    error?: string | null;
+  } | null;
+  /** A `land` started from the app is waiting for the train. */
+  landing?: boolean;
   error?: string;
-  epicId?: string | null;
 };
 
 /**
@@ -269,7 +239,7 @@ export type AddOrionMcpInput = {
 };
 
 // A process holding a listening TCP socket inside one of the user's project
-// or rift roots (Settings > Dev Servers). Rebuilt from lsof/ps on every scan.
+// or workspace roots (Settings > Dev Servers). Rebuilt from lsof/ps on every scan.
 export type DevServerEntry = {
   pid: number;
   /** Process short name from lsof (e.g. "node", "bun"). */
@@ -398,8 +368,6 @@ export type RemoteSnapshot = {
   capturedAt: string;
   features?: {
     epics: boolean;
-    rifts?: boolean;
-    autoCreateRiftsForEpics?: boolean;
   };
   projects: Array<{ id: string; name: string; path: string }>;
   epics: Array<{
@@ -433,7 +401,6 @@ export type RemoteCommandRequest = {
     name?: string;
     description?: string;
     projectIds?: string[];
-    createRift?: boolean;
     threadId?: string;
     projectId?: string;
     epicId?: string;
@@ -937,8 +904,6 @@ type OrionCodexBrowserIntegrationStatus = {
         message?: string;
         /** Commit locally but skip the push (epic "Only commit" tickbox). */
         skipPush?: boolean;
-        /** projectPath is the epic's own rift workspace — claims don't apply. */
-        isRift?: boolean;
         expectedGitRoot?: string;
         expectedBranch?: string;
         claimedBranches?: Array<{
@@ -974,8 +939,6 @@ type OrionCodexBrowserIntegrationStatus = {
          * the description. Empty means the model writes both.
          */
         message?: string;
-        /** projectPath is the epic's own rift workspace — claims don't apply. */
-        isRift?: boolean;
         expectedGitRoot?: string;
         expectedBranch?: string;
         claimedBranches?: Array<{
@@ -1006,7 +969,7 @@ type OrionCodexBrowserIntegrationStatus = {
       /** Local-git answer for the PR base picker's first paint — no network. */
       epicLocalPrBase: (input: {
         projectPath: string;
-        /** The epic's real repository checkout, when it works inside a rift. */
+        /** The epic's source repository checkout, when it differs from projectPath. */
         sourceProjectPath?: string;
       }) => Promise<{
         ok: boolean;
@@ -1019,7 +982,7 @@ type OrionCodexBrowserIntegrationStatus = {
       }>;
       epicListRemoteBranches: (input: {
         projectPath: string;
-        /** The epic's real repository checkout, when it works inside a rift. */
+        /** The epic's source repository checkout, when it differs from projectPath. */
         sourceProjectPath?: string;
       }) => Promise<{
         ok: boolean;
@@ -1048,172 +1011,66 @@ type OrionCodexBrowserIntegrationStatus = {
         states?: Array<{ epicId: string; state: 'OPEN' | 'CLOSED' | 'MERGED' }>;
         error?: string;
       }>;
-      riftStatus: () => Promise<{
-        available: boolean;
-        version?: string | null;
-        pendingEpicIds?: string[];
-        /** Epics protected by an active or unacknowledged Rift release. */
-        pendingRemovalEpicIds?: string[];
-        readyRifts?: Array<{
-          epicId: string;
-          projectId?: string;
-          projectPath: string;
-          riftPath: string;
-          riftWorkingDir: string;
-          gitRoot: string;
-          branch: string;
-          repositories?: Array<{
-            projectId: string;
-            projectPath: string;
-            sourceBranch?: string;
-            riftPath?: string;
-            riftWorkingDir?: string;
-            workspaceLinkPath?: string;
-            gitRoot?: string;
-            gitBranch?: string;
-          }>;
-          resetRuntimeSessions?: boolean;
-        }>;
-      }>;
-      epicCreateRift: (input: {
-        epicId: string;
-        projectId: string;
-        projectPath: string;
-        epicName?: string;
-        epicDescription?: string;
-        modelId?: string | null;
-        reasoningEffort?: string | null;
-        /** Local branch the feature branch starts from; checked out inside the rift only. */
-        baseBranch?: string;
-        /** Source branch this snapshot is based on and its pull request should target. */
-        sourceBranch?: string;
-        /**
-         * Recreate a freed epic's workspace on the branch it already owns
-         * instead of naming a new one. Takes precedence over baseBranch.
-         */
-        existingBranch?: string;
-        /** Two or more projects create sibling repository copies in one shared Epic workspace. */
-        projects?: Array<{
-          projectId: string;
-          projectPath: string;
-          baseBranch?: string;
-          sourceBranch?: string;
-          existingBranch?: string;
-        }>;
-      }) => Promise<{
+      durangoCliStatus?: () => Promise<DurangoCliStatus>;
+      durangoCliSignIn?: () => Promise<{
         ok: boolean;
-        riftPath?: string;
-        riftWorkingDir?: string;
-        gitRoot?: string;
-        branch?: string;
-        sourceBranch?: string;
-        repositories?: Array<{
-          projectId: string;
-          projectPath: string;
-          sourceBranch?: string;
-          riftPath?: string;
-          riftWorkingDir?: string;
-          workspaceLinkPath?: string;
-          gitRoot?: string;
-          gitBranch?: string;
-          prUrl?: string;
-          prState?: 'OPEN' | 'CLOSED' | 'MERGED';
-          prStateCheckedAt?: string;
-        }>;
-        resetRuntimeSessions?: boolean;
+        signedIn: boolean;
+        created?: boolean;
+        needsSignIn?: boolean;
         error?: string;
       }>;
-      epicAddRiftProject: (input: {
-        epicId: string;
-        riftPath: string;
-        projectId: string;
-        projectPath: string;
-        /** Retained provider runtimes to dispose before a legacy cwd migration. */
-        runtimeThreadIds?: string[];
-      }) => Promise<{
+      inspectDurangoWorkspaceProject?: (input: { projectPath: string }) => Promise<{
         ok: boolean;
-        addedProjectId?: string;
-        projectId?: string;
-        projectPath?: string;
-        riftPath?: string;
-        riftWorkingDir?: string;
-        gitRoot?: string;
-        branch?: string;
-        sourceBranch?: string;
-        repositories?: Array<{
-          projectId: string;
-          projectPath: string;
-          sourceBranch?: string;
-          riftPath?: string;
-          riftWorkingDir?: string;
-          workspaceLinkPath?: string;
-          gitRoot?: string;
-          gitBranch?: string;
-          prUrl?: string;
-          prState?: 'OPEN' | 'CLOSED' | 'MERGED';
-          prStateCheckedAt?: string;
-        }>;
-        resetRuntimeSessions?: boolean;
+        /** The project is in the main checkout of a repository with a durango.toml. */
+        eligible: boolean;
+        reason?: 'missing' | 'not-git' | 'worktree' | 'no-config';
+        baseRoot?: string;
         error?: string;
       }>;
-      epicAcknowledgeRift: (input: { epicId: string; riftPath: string }) => Promise<{
+      createDurangoWorkspace?: (input: { projectPath: string; name: string }) => Promise<{
         ok: boolean;
-        skipped?: boolean;
+        workspace?: import('./store').ThreadDurangoWorkspace;
+        /** Dependency directories that could not be cloned (run `hints` to install). */
+        failedClones?: string[];
+        hints?: string[];
+        configErrors?: string[];
+        cliSignedIn?: boolean;
         error?: string;
       }>;
-      epicRemoveRift: (input: {
-        epicId: string;
-        riftPath: string;
-        /** Child Git roots for a shared multi-project Rift workspace. */
-        riftPaths?: string[];
-        /** Child Rift paths plus validated workspace links for expanded legacy Rifts. */
-        riftRepositories?: Array<{ riftPath: string; workspaceLinkPath?: string }>;
-        runtimeThreadIds?: string[];
-        gitRoot?: string;
-        projectPath?: string;
-        gitRoots?: string[];
-        projectPaths?: string[];
-      }) => Promise<{
+      removeDurangoWorkspace?: (input: {
+        name: string;
+        repo?: string;
+        path?: string;
+        /** Discard work that has not landed. */
+        force?: boolean;
+      }) => Promise<{ ok: boolean; alreadyRemoved?: boolean; unlanded?: boolean; error?: string }>;
+      durangoWorkspaceStatus?: (input: {
+        path: string;
+        name?: string;
+        repo?: string;
+        /** Also ask Durango Source for the change's status and URL. */
+        remote?: boolean;
+      }) => Promise<DurangoWorkspaceStatus>;
+      landDurangoWorkspace?: (input: { path: string }) => Promise<{
         ok: boolean;
-        skipped?: boolean;
-        error?: string;
-        warning?: string;
-      }>;
-      epicDeleteRiftRestoreRef: (input: {
-        epicId: string;
-        gitRoot?: string;
-        projectPath?: string;
-        gitRoots?: string[];
-        projectPaths?: string[];
-      }) => Promise<{ ok: boolean; skipped?: boolean; error?: string; warning?: string }>;
-      getRiftStorageState: () => Promise<RiftStorageState>;
-      acknowledgeRiftStorageReleases?: (input: {
-        riftPaths: string[];
-      }) => Promise<{ ok: boolean; error?: string }>;
-      scanRiftStorage: (input?: { remeasure?: boolean }) => Promise<RiftStorageState>;
-      releaseRiftStorage: (input: {
-        riftPaths: string[];
-        /** Paths the user explicitly chose to free despite uncommitted or unpushed work. */
-        forcePaths?: string[];
-        /** Current scan entries individually confirmed for manual removal in any state. */
-        manualPaths?: string[];
-        /** Successful Storage scan whose rows the confirmation dialog displayed. */
-        manualScanId?: string;
-        /** Epics with live agent runs or terminals, which the persisted store cannot show. */
-        busyEpicIds?: string[];
-        /** Every thread whose runtime is rooted in the owning epic's Rift. */
-        runtimeThreadIdsByEpic?: Record<string, string[]>;
-        /** Empty Rift's trash afterwards. Machine-wide and permanent. */
-        runGc?: boolean;
-      }) => Promise<{
-        ok: boolean;
-        results: RiftStorageReleaseResult[];
-        /** Free-space delta measured across the sweep; null when unavailable. */
-        reclaimedBytes: number | null;
-        gcError?: string | null;
-        releasedEpicIds: string[];
+        changeId?: string | null;
+        url?: string | null;
+        code?: string | null;
+        conflictFiles?: string[] | null;
+        exitCode?: number;
         error?: string;
       }>;
+      serveDurangoWorkspace?: (input: { path: string; name: string; repo?: string }) => Promise<{
+        ok: boolean;
+        error?: string;
+      }>;
+      stopDurangoWorkspaceServer?: (input: { path: string; name: string; repo?: string }) => Promise<{
+        ok: boolean;
+        error?: string;
+      }>;
+      onDurangoWorkspaceServerExited?: (
+        cb: (payload: { path: string; code: number; error: string | null }) => void
+      ) => () => void;
       listSkills?: () => Promise<SkillsListResult>;
       /** Omit `paths` to let the user pick folders, SKILL.md files, or .zip archives. */
       importSkills?: (input?: { paths?: string[] }) => Promise<{
@@ -1257,7 +1114,7 @@ type OrionCodexBrowserIntegrationStatus = {
         tools?: string[];
         error?: string;
       }>;
-      /** `roots` are project/rift directories; servers outside them (and unattributed to a thread) are excluded. */
+      /** `roots` are project/workspace directories; servers outside them (and unattributed to a thread) are excluded. */
       listDevServers?: (input?: { roots?: string[] }) => Promise<DevServersListResult>;
       /** Opens a validated localhost HTTP URL for a listed dev-server port. */
       openDevServer?: (input: { port: number }) => Promise<{ ok: boolean; error?: string }>;
@@ -1707,14 +1564,6 @@ type OrionCodexBrowserIntegrationStatus = {
       onSubagentStopRequest(callback: (request: SubagentStopRequest) => void): () => void;
       onFileChange?: (cb: (data: { path: string; exists: boolean; mtimeMs: number | null }) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
-      onRiftStorageState?: (cb: (state: RiftStorageState) => void) => () => void;
-      /** The startup retention sweep freed rifts; the renderer clears their epic pointers. */
-      onRiftStorageReleased?: (
-        cb: (payload: {
-          released: Array<{ riftPath: string; epicId: string }>;
-          retentionDays: number;
-        }) => void
-      ) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;
       durangoSearchChats?: (input: {
         query: string;
@@ -1815,7 +1664,6 @@ type OrionCodexBrowserIntegrationStatus = {
         name: string;
         description?: string;
         projectIds?: string[];
-        createRift?: boolean;
       }) => Promise<{ ok: boolean; epicId?: string; error?: string }>;
       remoteStopTurn?: (input: {
         machineId: string;

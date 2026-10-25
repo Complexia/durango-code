@@ -42,8 +42,8 @@ const threadSourceLabel: Record<string, string> = {
 };
 
 const DevServersSettings = React.memo(function DevServersSettings({ formatBytes }: DevServersSettingsProps) {
-  const { threads, projects, epics } = useOrionStore(
-    useShallow((state) => ({ threads: state.threads, projects: state.projects, epics: state.epics }))
+  const { threads, projects } = useOrionStore(
+    useShallow((state) => ({ threads: state.threads, projects: state.projects }))
   );
   const [servers, setServers] = React.useState<DevServerEntry[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -63,16 +63,13 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
     };
   }, []);
 
-  // Scan scope: every project plus every epic's rift workspace.
+  // Scan scope: every project plus every thread's Durango workspace.
   const roots = React.useMemo(() => {
     const set = new Set<string>();
     for (const project of projects) if (project.path) set.add(project.path);
-    for (const epic of epics) {
-      if (epic.riftPath) set.add(epic.riftPath);
-      if (epic.riftWorkingDir) set.add(epic.riftWorkingDir);
-    }
+    for (const thread of threads) if (thread.durangoWorkspace) set.add(thread.durangoWorkspace.path);
     return [...set];
-  }, [projects, epics]);
+  }, [projects, threads]);
   const rootsRef = React.useRef(roots);
   rootsRef.current = roots;
 
@@ -119,15 +116,11 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
 
   const threadsById = React.useMemo(() => new Map(threads.map((thread) => [thread.id, thread])), [threads]);
   const projectsById = React.useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects]);
-  const epicsById = React.useMemo(() => new Map(epics.map((epic) => [epic.id, epic])), [epics]);
 
   const threadWorkingDir = React.useCallback(
-    (thread: Thread) => {
-      const epic = thread.epicId ? epicsById.get(thread.epicId) : undefined;
-      if (epic?.riftPath) return normalizeDir(epic.riftWorkingDir ?? epic.riftPath);
-      return normalizeDir(projectsById.get(thread.projectId)?.path);
-    },
-    [epicsById, projectsById]
+    (thread: Thread) =>
+      normalizeDir(thread.durangoWorkspace?.path ?? projectsById.get(thread.projectId)?.path),
+    [projectsById]
   );
 
   // Completes attribution for servers main couldn't tie to a live run: the
@@ -148,8 +141,8 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
       for (const thread of threads) {
         const dir = threadWorkingDir(thread);
         if (!dir || (cwd !== dir && !cwd.startsWith(`${dir}/`))) continue;
-        // Deeper working dirs are more specific (a rift beats the project it
-        // was copied from); among equals the busiest thread wins.
+        // Deeper working dirs are more specific; among equals the busiest
+        // thread wins.
         if (dir.length > bestDepth || (dir.length === bestDepth && best && rank(thread) > rank(best))) {
           best = thread;
           bestDepth = dir.length;
@@ -242,7 +235,7 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
                 : `${servers.length} dev server${servers.length === 1 ? '' : 's'} running`}
             </div>
             <div className="skills-toolbar-caption">
-              Processes listening on a TCP port inside one of your projects or rift workspaces — dev servers your
+              Processes listening on a TCP port inside one of your projects or Durango workspaces — dev servers your
               agents started (and any you started there yourself). Killing one here sends SIGTERM, then SIGKILL if it
               lingers. The list refreshes every few seconds while this tab is open.
             </div>

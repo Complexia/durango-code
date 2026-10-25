@@ -9,7 +9,7 @@ import { execFileAsync } from './shell-env.js';
 //   1. the server is a descendant of a live agent CLI process (run registry)
 //   2. the server is a descendant of a thread's embedded terminal PTY
 //   3. the server's cwd matches a live Claude SDK session's project path
-// Anything else is matched renderer-side by cwd against project/rift roots.
+// Anything else is matched renderer-side by cwd against project/workspace roots.
 
 const TOOL_TIMEOUT_MS = 10000;
 
@@ -38,7 +38,7 @@ export const runTool = async (file, args, { acceptedExitCodes = [] } = {}) => {
 };
 
 // macOS reports /private/var paths where the store holds /var (and vice
-// versa); compare with the alias stripped so rift cwd matches don't miss.
+// versa); compare with the alias stripped so workspace cwd matches don't miss.
 export const normalizeCwd = (value) => {
   if (typeof value !== 'string' || !value) return null;
   const resolved = path.resolve(value);
@@ -217,7 +217,7 @@ export const listDevServers = async ({
       }
 
       // Only processes tied to Orion's world: attributed to a thread, or
-      // working inside a known project/rift root. Everything else on the
+      // working inside a known project/workspace root. Everything else on the
       // machine (browsers, system daemons) is out of scope.
       const inKnownRoot = cwd !== null && normalizedRoots.some((root) => isUnderRoot(cwd, root));
       if (!threadId && !inKnownRoot) continue;

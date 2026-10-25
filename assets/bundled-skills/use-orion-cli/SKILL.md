@@ -28,6 +28,15 @@ when using anything beyond the quick workflows below.
   uncommitted work. Verify the terminal deploy state and smoke-test the
   returned URL.
 
+## Durango workspaces
+
+Durango Code bundles this CLI and adds `durango-code` (and `ds`) to your `PATH`,
+so do not install it. In repositories with a `durango.toml`, Durango Code
+creates a Durango workspace for each new thread and starts you inside it; a
+`[Durango workspace]` block in your prompt names it. Work, run, and test there,
+open the change with `durango-code change create` from that directory, and do
+not create another workspace with `durango-code ws new`.
+
 ## Publish a requested plan
 
 Publish a plan only when the user explicitly asks for a plan of something. Do

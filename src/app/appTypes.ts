@@ -1,12 +1,6 @@
 import type { Epic } from '../store';
-import type { RiftStorageEntry } from '../types';
 
 export type EpicPrStatus = 'open' | 'merged' | 'closed';
-
-export type NewEpicRiftBranches = Record<string, {
-  currentBranch: string | null;
-  branches: string[];
-}>;
 
 export type EpicCommitDialogState = {
   epic: Epic;
@@ -28,25 +22,6 @@ export type EpicPrBaseDialogState = {
 export type EpicSettleDialogState = {
   epic: Epic;
   warnings: string[];
-  canReleaseRift: boolean;
-  releaseRift: boolean;
-};
-
-export type AddProjectToEpicDialogState = {
-  epicId: string;
-  projectId: string;
-  submitting: boolean;
-};
-
-export type RiftSweepDialogState = {
-  entries: RiftStorageEntry[];
-  runGc: boolean;
-  /** Unpublished-work overrides this confirmation is allowed to grant. */
-  forcePaths: string[];
-  /** Scan-listed paths the user selected individually, regardless of lifecycle or marker status. */
-  manualPaths?: string[];
-  /** Successful Storage scan whose rows this dialog displayed. */
-  manualScanId?: string;
 };
 
 export type GitBranchInfo = {
@@ -168,6 +143,6 @@ export type SettingsTab =
   | 'split-view'
   | 'computer-use'
   | 'dev-servers'
-  | 'storage'
+  | 'workspaces'
   | 'cosmetics'
   | 'experimental';

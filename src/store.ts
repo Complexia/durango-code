@@ -33,19 +33,10 @@ export const findProjectById = (
 export type EpicRepository = {
   /** Orion project represented by this repository. */
   projectId: string;
-  /** Original project path, retained for Rift recovery if the project is re-added. */
+  /** Project path, retained so the repository is recognised if the project is re-added. */
   projectPath: string;
-  /** Source branch this Rift snapshot was based on and its pull request targets. */
+  /** Branch this repository's pull request targets. */
   sourceBranch?: string;
-  /** Git root participating in the Epic Rift workspace. */
-  riftPath?: string;
-  /**
-   * Symlink inside the shared workspace for a legacy one-project Rift that
-   * was later expanded without relocating its existing repository copy.
-   */
-  workspaceLinkPath?: string;
-  /** Project-relative directory inside this repository's Rift copy. */
-  riftWorkingDir?: string;
   /** Canonical source repository root. */
   gitRoot?: string;
   /** Feature branch owned by this Epic in this repository. */
@@ -105,52 +96,6 @@ export type Epic = {
   gitRoot?: string;
   /** Dedicated feature branch claimed by this epic's git actions. */
   gitBranch?: string;
-  /**
-   * Root of the copy-on-write Rift workspace created for this epic. A
-   * multi-project Epic stores its agent-visible container here; repository
-   * controls and removal use the child paths in repositories.
-   */
-  riftPath?: string;
-  /** Directory where this Epic's agents run (the shared container for multiple projects). */
-  riftWorkingDir?: string;
-  /**
-   * Durable record that the user chose to work in a rift. It remains until
-   * setup succeeds, so a recoverable creation failure cannot silently send
-   * later turns to the shared source checkout.
-   */
-  riftRequest?: {
-    projectId: string;
-    projectPath: string;
-    /** All requested repositories. Absent on single-project legacy Epics. */
-    projects?: Array<{
-      projectId: string;
-      projectPath: string;
-      baseBranch?: string;
-      sourceBranch?: string;
-      existingBranch?: string;
-    }>;
-    /**
-     * Local branch the rift's feature branch starts from. Only set when it
-     * differs from the source checkout's current branch; the switch happens
-     * inside the rift so the source worktree is never touched.
-     */
-    baseBranch?: string;
-    sourceBranch?: string;
-    error?: string;
-  };
-  /**
-   * The rift was created but post-create setup and automatic cleanup both
-   * failed. Keep its path durably so deletion can retry cleanup; threads and
-   * git actions must not use the incomplete workspace.
-   */
-  riftCleanupPending?: boolean;
-  /**
-   * The epic's rift was freed to reclaim disk (Settings > Storage, the settle
-   * sweep, or retention). riftPath is cleared, but gitRoot/gitBranch/prUrl
-   * survive so the archived epic still shows its branch and PR — and so
-   * restoring it can recreate the rift on the same branch.
-   */
-  riftReleased?: boolean;
 };
 
 export type EpicsSettings = {
@@ -230,31 +175,18 @@ export const defaultDeploymentSettings: DeploymentSettings = {
   preferAgentDeploys: false,
 };
 
-/** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */
-export type RiftsSettings = {
-  /** Master switch for the experimental Rifts integration. */
+/**
+ * Durango workspaces (docs/workspaces.md): an isolated checkout per thread,
+ * created with the bundled durango-code CLI (`ws new`) before the thread's
+ * first turn in a repository that has a durango.toml.
+ */
+export type DurangoWorkspaceSettings = {
+  /** Create a workspace automatically for new threads in Durango repositories. */
   enabled: boolean;
-  /** Create a rift (and branch) automatically for every new epic. */
-  autoCreateForEpics: boolean;
-  /**
-   * Free an epic's rift as part of settling it. A rift is a whole repository
-   * copy, so keeping one per settled epic adds up fast — but settling is
-   * otherwise a cheap, reversible timestamp, so this stays opt-in.
-   */
-  releaseOnSettle: boolean;
-  /**
-   * Free rifts belonging to epics settled more than this many days ago, swept
-   * at startup. `null` disables retention entirely. The sweep never touches a
-   * rift with uncommitted or unpushed work, and never empties Rift's trash.
-   */
-  retentionDays: number | null;
 };
 
-export const defaultRiftsSettings: RiftsSettings = {
-  enabled: false,
-  autoCreateForEpics: true,
-  releaseOnSettle: false,
-  retentionDays: null,
+export const defaultDurangoWorkspaceSettings: DurangoWorkspaceSettings = {
+  enabled: true,
 };
 
 /**
@@ -672,10 +604,33 @@ export type Thread = {
   /** Sidebar epic this thread belongs to, if any. */
   epicId?: string;
   /**
+   * Durango workspace this thread's agents run in, created before its first
+   * turn. Branches and subagents share their source thread's workspace, so a
+   * resumed or forked session keeps the cwd it was recorded under. `null`
+   * means the thread works in its project directory and never gets one.
+   */
+  durangoWorkspace?: ThreadDurangoWorkspace | null;
+  /** Set when the thread's workspace was removed; its next turn creates a new one. */
+  durangoWorkspaceRemovedAt?: string;
+  /**
    * Orion MCP servers this thread attached with @nickname mentions. They load
    * on every turn here (even when switched off in Settings) until detached.
    */
   mcpServerIds?: string[];
+};
+
+export type ThreadDurangoWorkspace = {
+  /** `durango-code ws` name, unique per repository. */
+  name: string;
+  /** Workspace root (a git worktree of `repo`). */
+  path: string;
+  /** Where the agent runs: the project's directory inside the workspace. */
+  workingDir: string;
+  /** Base checkout the workspace was created from. */
+  repo: string;
+  portBase: number;
+  portBlock: number;
+  createdAt: string;
 };
 
 export type OpenFile = {
@@ -850,7 +805,7 @@ interface OrionState {
   /** Selected epic (epic view in the main panel). Cleared when a thread is selected. */
   selectedEpicId: string | null;
   epicsSettings: EpicsSettings;
-  riftsSettings: RiftsSettings;
+  durangoWorkspaceSettings: DurangoWorkspaceSettings;
   workspaceSyncSettings: WorkspaceSyncSettings;
   durangoSettings: DurangoSettings;
   remoteControlSettings: RemoteControlSettings;
@@ -892,7 +847,6 @@ interface OrionState {
       description?: string;
       repositoryProjectId?: string;
       repositoryProjectIds?: string[];
-      riftRequest?: Epic['riftRequest'];
     }
   ) => string; // returns new epic id
   renameEpic: (id: string, name: string) => void;
@@ -901,11 +855,9 @@ interface OrionState {
   deleteEpic: (id: string, options?: { retainThreadMembership?: boolean }) => void;
   settleEpic: (id: string) => void;
   unsettleEpic: (id: string) => void;
-  /** Clear an epic's rift pointers only if it still owns the freed path. */
-  releaseEpicRift: (id: string, riftPath: string) => void;
   selectEpic: (id: string | null) => void;
   setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
-  setRiftsSettings: (updates: Partial<RiftsSettings>) => void;
+  setDurangoWorkspaceSettings: (updates: Partial<DurangoWorkspaceSettings>) => void;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   setDurangoSettings: (updates: Partial<DurangoSettings>) => void;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
@@ -923,6 +875,8 @@ interface OrionState {
       subagent?: NativeSubagentInfo;
       /** Epic the new thread is grouped under. */
       epicId?: string;
+      /** Durango workspace to work in; defaults to the parent thread's. `null` opts out. */
+      durangoWorkspace?: ThreadDurangoWorkspace | null;
       /** false = don't switch the UI to the new thread (background spawns). */
       select?: boolean;
     }
@@ -1497,7 +1451,7 @@ export const useOrionStore = create<OrionState>()(
       epics: [],
       selectedEpicId: null,
       epicsSettings: defaultEpicsSettings,
-      riftsSettings: defaultRiftsSettings,
+      durangoWorkspaceSettings: defaultDurangoWorkspaceSettings,
       workspaceSyncSettings: defaultWorkspaceSyncSettings,
       durangoSettings: defaultDurangoSettings,
       remoteControlSettings: defaultRemoteControlSettings,
@@ -1718,7 +1672,6 @@ export const useOrionStore = create<OrionState>()(
           id: crypto.randomUUID(),
           name,
           ...(description ? { description } : {}),
-          ...(options?.riftRequest ? { riftRequest: options.riftRequest } : {}),
           createdAt: new Date().toISOString(),
         };
         set((state) => {
@@ -1785,7 +1738,7 @@ export const useOrionStore = create<OrionState>()(
         set((state) => ({
           epics: state.epics.filter((epic) => epic.id !== id),
           // Threads survive their epic — they stay in Recent agents and their
-          // project list; only the grouping is gone. Rift-backed deletion can
+          // project list; only the grouping is gone. Deletion can
           // retain membership until workspace removal succeeds so the epic's
           // launch guards keep covering those threads during cleanup.
           threads: options?.retainThreadMembership
@@ -1808,30 +1761,6 @@ export const useOrionStore = create<OrionState>()(
         set((state) => ({
           epics: state.epics.map((epic) =>
             epic.id === id ? { ...epic, settledAt: undefined } : epic
-          ),
-        })),
-
-      // The epic's rift directory is gone from disk. Drop the pointers that
-      // would now resolve to nothing, and keep everything that still describes
-      // the work — the branch is what lets a restore recreate the rift.
-      releaseEpicRift: (id, riftPath) =>
-        set((state) => ({
-          epics: state.epics.map((epic) =>
-            epic.id === id && epic.riftPath === riftPath
-              ? {
-                  ...epic,
-                  riftPath: undefined,
-                  riftWorkingDir: undefined,
-                  riftCleanupPending: undefined,
-                  riftReleased: true,
-                  repositories: epic.repositories?.map((repository) => ({
-                    ...repository,
-                    riftPath: undefined,
-                    riftWorkingDir: undefined,
-                    workspaceLinkPath: undefined,
-                  })),
-                }
-              : epic
           ),
         })),
 
@@ -1891,11 +1820,11 @@ export const useOrionStore = create<OrionState>()(
           };
         }),
 
-      setRiftsSettings: (updates) =>
+      setDurangoWorkspaceSettings: (updates) =>
         set((state) => ({
-          riftsSettings: {
-            ...defaultRiftsSettings,
-            ...state.riftsSettings,
+          durangoWorkspaceSettings: {
+            ...defaultDurangoWorkspaceSettings,
+            ...state.durangoWorkspaceSettings,
             ...updates,
           },
         })),
@@ -1981,6 +1910,9 @@ export const useOrionStore = create<OrionState>()(
           hiddenFromRecent: options?.hiddenFromRecent,
           subagent: options?.subagent,
           epicId: options?.epicId,
+          // Subagents work in their driver's directory.
+          durangoWorkspace:
+            options?.durangoWorkspace !== undefined ? options.durangoWorkspace : parentThread?.durangoWorkspace,
           messages: [],
         };
         set((state) => ({
@@ -2559,9 +2491,9 @@ export const useOrionStore = create<OrionState>()(
           ...defaultEpicsSettings,
           ...state.epicsSettings,
         },
-        riftsSettings: {
-          ...defaultRiftsSettings,
-          ...state.riftsSettings,
+        durangoWorkspaceSettings: {
+          ...defaultDurangoWorkspaceSettings,
+          ...state.durangoWorkspaceSettings,
         },
         workspaceSyncSettings: {
           ...defaultWorkspaceSyncSettings,
@@ -2604,6 +2536,40 @@ export const useOrionStore = create<OrionState>()(
       }),
       merge: (persisted, current) => {
         const merged = { ...current, ...(persisted as Partial<OrionState>) };
+        // Rifts (per-epic copy-on-write workspaces) were replaced by Durango
+        // workspaces. Drop their persisted pointers so no epic keeps a path
+        // into a .rifts directory; the directories themselves stay on disk.
+        delete (merged as { riftsSettings?: unknown }).riftsSettings;
+        merged.epics = (merged.epics ?? []).map((epic) => {
+          const {
+            riftPath: _riftPath,
+            riftWorkingDir: _riftWorkingDir,
+            riftRequest: _riftRequest,
+            riftCleanupPending: _riftCleanupPending,
+            riftReleased: _riftReleased,
+            ...rest
+          } = epic as Epic & Record<string, unknown>;
+          return {
+            ...rest,
+            ...(rest.repositories
+              ? {
+                  repositories: rest.repositories.map((repository) => {
+                    const {
+                      riftPath: _repositoryRiftPath,
+                      riftWorkingDir: _repositoryRiftWorkingDir,
+                      workspaceLinkPath: _workspaceLinkPath,
+                      ...repositoryRest
+                    } = repository as EpicRepository & Record<string, unknown>;
+                    return repositoryRest;
+                  }),
+                }
+              : {}),
+          };
+        });
+        merged.durangoWorkspaceSettings = {
+          ...defaultDurangoWorkspaceSettings,
+          ...merged.durangoWorkspaceSettings,
+        };
         // The settings UI no longer has a separate "allow this machine to be
         // controlled" toggle: enabling remote control implies it (pairing
         // codes still gate every connection). Lift configs persisted before

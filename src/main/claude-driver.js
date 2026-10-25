@@ -1989,7 +1989,7 @@ export const disposeClaudeSdkSession = (threadId) => {
   return true;
 };
 
-// Rift removal must not move a workspace while its persistent Claude process
+// Workspace removal must not delete a workspace while its persistent Claude process
 // is still unwinding after AbortController.abort(). The ordinary disposal API
 // stays synchronous for UI/model-switch call sites; destructive workspace
 // lifecycle paths use this bounded acknowledgement.
@@ -2032,7 +2032,7 @@ export const disposeClaudeSdkSessionAndWait = async (threadId, timeoutMs = 3000)
 export const disposeAllClaudeSdkSessions = () => {
   // Keep every disposed harness in the terminating map until its query
   // acknowledges shutdown. On macOS a new window can open before those
-  // acknowledgements arrive, and a destructive rift removal must still see
+  // acknowledgements arrive, and a workspace removal must still see
   // and wait for sessions owned by the previous window.
   for (const threadId of [...claudeSdkSessions.keys()]) {
     disposeClaudeSdkSession(threadId);

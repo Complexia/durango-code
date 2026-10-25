@@ -1550,9 +1550,6 @@ const buildSnapshot = async () => {
     capturedAt: new Date().toISOString(),
     features: {
       epics: state.epicsSettings?.enabled !== false,
-      rifts: state.riftsSettings?.enabled === true,
-      autoCreateRiftsForEpics:
-        state.riftsSettings?.enabled === true && state.riftsSettings?.autoCreateForEpics === true,
     },
     // Remote clients group threads by these entries. Include the scratch
     // workspace on the wire without adding it to the host's saved projects.
@@ -1723,7 +1720,6 @@ const handleHostRequest = async (session, message) => {
             name: name.slice(0, 500),
             ...(description ? { description } : {}),
             ...(projectIds.length > 0 ? { projectIds } : {}),
-            ...(message?.createRift === true ? { createRift: true } : {}),
             source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
           },
           Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
@@ -2711,7 +2707,7 @@ export const runRemoteTurn = async ({
   }
 };
 
-export const createRemoteEpic = async ({ machineId, name, description, projectIds, createRift } = {}) => {
+export const createRemoteEpic = async ({ machineId, name, description, projectIds } = {}) => {
   try {
     const response = await clientRequest(
       String(machineId ?? ''),
@@ -2720,7 +2716,6 @@ export const createRemoteEpic = async ({ machineId, name, description, projectId
         name: String(name ?? ''),
         ...(description ? { description: String(description) } : {}),
         ...(Array.isArray(projectIds) ? { projectIds: projectIds.map(String) } : {}),
-        ...(createRift === true ? { createRift: true } : {}),
       },
       (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
         (Number.isFinite(deps?.clientResponseGraceMs)

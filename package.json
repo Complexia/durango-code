@@ -19,10 +19,8 @@
     "test:release-git": "node scripts/test-release-git.mjs",
     "test:app-identity": "node --no-warnings scripts/test-app-identity.mjs",
     "test:legacy-bundle-rename": "node --no-warnings scripts/test-legacy-bundle-rename.mjs",
-    "update-rifts": "node scripts/update-rifts.mjs",
-    "test:rift-storage": "node scripts/test-rift-storage.mjs",
-    "test:rift-scrub": "node scripts/test-rift-scrub.mjs",
     "test:dev-servers": "node scripts/test-dev-servers.mjs",
+    "test:durango-workspaces": "node scripts/run-electron-test.mjs scripts/test-durango-workspaces.mjs",
     "test:skills": "electron scripts/test-skills.mjs",
     "test:mcps": "electron scripts/test-mcps.mjs",
     "test:orion-mcps": "node scripts/run-electron-test.mjs scripts/test-orion-mcps.mjs",
@@ -68,7 +66,7 @@
     "test:source-control": "node --no-warnings scripts/test-source-control.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",
-    "postinstall": "node -e \"const fs=require('fs');try{for(const d of fs.readdirSync('node_modules/node-pty/prebuilds')){try{fs.chmodSync('node_modules/node-pty/prebuilds/'+d+'/spawn-helper',0o755)}catch{}}}catch{};try{for(const d of fs.readdirSync('node_modules/rift-snapshot/prebuilds')){for(const b of ['rift','rift.exe']){try{fs.chmodSync('node_modules/rift-snapshot/prebuilds/'+d+'/'+b,0o755)}catch{}}}}catch{}\""
+    "postinstall": "node -e \"const fs=require('fs');try{for(const d of fs.readdirSync('node_modules/node-pty/prebuilds')){try{fs.chmodSync('node_modules/node-pty/prebuilds/'+d+'/spawn-helper',0o755)}catch{}}}catch{}\""
   },
   "keywords": [],
   "author": {
@@ -102,6 +100,7 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "date-fns": "^4.4.0",
+    "durango-code": "0.8.6",
     "electron-squirrel-startup": "^1.0.1",
     "electron-updater": "^6.8.9",
     "lucide-react": "^1.21.0",
@@ -112,7 +111,6 @@
     "react-dom": "^19.2.7",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
-    "rift-snapshot": "0.0.10",
     "sonner": "^2.0.7",
     "undici": "^7.28.0",
     "zod": "^4.4.3",
