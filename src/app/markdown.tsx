@@ -1,10 +1,10 @@
-import React, { useContext, useRef } from 'react';
+import React, { useContext, useRef, useState } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { MessageCircle, MessageSquare } from 'lucide-react';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
-import { localMediaSrc, videoFileNamePattern } from './attachments';
+import { imageFileNamePattern, isLocalFilePath, localMediaSrc, videoFileNamePattern } from './attachments';
 import { handleLightboxImageClick } from './imageLightbox';
 import { resolveThreadReference, threadReferencePattern } from './promptContext';
 import { chatIdFromReference, chatReferencePattern, knownDurangoChat, knownDurangoChats, knownDurangoChatUrl } from './durangoChats';
@@ -26,13 +26,20 @@ export const markdownUrlTransform = (url: string) =>
     ? url
     : defaultUrlTransform(url);
 
-export const MarkdownMedia: React.FC<{ src?: string; alt?: string; title?: string }> = ({
-  src,
-  alt,
-  title,
-}) => {
+export const MarkdownMedia: React.FC<{
+  src?: string;
+  alt?: string;
+  title?: string;
+  'data-path-preview'?: unknown;
+}> = ({ src, alt, title, 'data-path-preview': pathPreview }) => {
   const baseDirs = useContext(MarkdownBaseDirContext);
+  const [failed, setFailed] = useState(false);
   if (!src) return null;
+  // A preview of a path the agent only mentioned disappears when the file
+  // isn't there; an image the agent embedded keeps its broken-image marker.
+  if (failed) return null;
+  const isPathPreview = pathPreview !== undefined;
+  const handleError = isPathPreview ? () => setFailed(true) : undefined;
 
   const resolvedSrc = /^(https?|data|blob|orion-attachment):/i.test(src)
     ? src
@@ -46,6 +53,8 @@ export const MarkdownMedia: React.FC<{ src?: string; alt?: string; title?: strin
         controls
         preload="metadata"
         title={title ?? alt}
+        data-path-preview={isPathPreview ? '' : undefined}
+        onError={handleError}
       />
     );
   }
@@ -58,6 +67,8 @@ export const MarkdownMedia: React.FC<{ src?: string; alt?: string; title?: strin
       loading="lazy"
       data-lightbox=""
       onClick={handleLightboxImageClick}
+      data-path-preview={isPathPreview ? '' : undefined}
+      onError={handleError}
     />
   );
 };
@@ -185,7 +196,14 @@ export const ThreadReferenceText: React.FC<{ text: string }> = React.memo(({ tex
   return <>{parts}</>;
 });
 
-type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[] };
+type MarkdownNode = {
+  type: string;
+  value?: string;
+  url?: string;
+  alt?: string;
+  data?: { hProperties?: Record<string, unknown> };
+  children?: MarkdownNode[];
+};
 
 const referenceLinkNode = (match: Pick<ReferenceMatch, 'kind' | 'reference'>, children: MarkdownNode[]): MarkdownNode => ({
   type: 'link',
@@ -287,8 +305,71 @@ export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraP
   );
 };
 
+// An absolute local path to an image or video, as agents write it when they
+// report a screenshot or recording (`/tmp/shots/home.png`, `~/out.mp4`,
+// `file:///…`, `C:\…`). Relative paths stay text: they're usually source
+// files under discussion, not something to show.
+const isMediaPath = (value: string) =>
+  (isLocalFilePath(value) || /^file:\/\//i.test(value)) &&
+  (imageFileNamePattern.test(value) || videoFileNamePattern.test(value));
+
+// The same paths inside prose, where they end at whitespace or punctuation.
+const proseMediaPathPattern =
+  /(?<=^|[\s(])(?:file:\/\/|~\/|\/)[^\s`'"<>()[\]]*\.(?:apng|avif|gif|jpe?g|png|svg|webp|mp4|webm|mov|m4v|ogv|mkv|avi)(?=$|[\s,;:!?)\]]|\.(?:\s|$))/gi;
+
+const collectMediaPaths = (node: MarkdownNode, paths: string[]) => {
+  for (const child of node.children ?? []) {
+    if (child.type === 'inlineCode' && child.value && isMediaPath(child.value.trim())) {
+      paths.push(child.value.trim());
+    } else if (child.type === 'text' && child.value?.includes('/')) {
+      for (const match of child.value.matchAll(proseMediaPathPattern)) paths.push(match[0]);
+    } else if (child.type === 'link') {
+      // The link's target, not its label.
+      if (child.url && isMediaPath(child.url)) paths.push(child.url);
+    } else if (child.type !== 'image') {
+      collectMediaPaths(child, paths);
+    }
+  }
+};
+
+const collectImageUrls = (node: MarkdownNode, urls: Set<string>) => {
+  if (node.type === 'image' && node.url) urls.add(node.url);
+  for (const child of node.children ?? []) collectImageUrls(child, urls);
+};
+
+const previewMediaPaths = (node: MarkdownNode, shown: Set<string>) => {
+  for (const child of node.children ?? []) {
+    if (child.type !== 'paragraph') {
+      previewMediaPaths(child, shown);
+      continue;
+    }
+    const paths: string[] = [];
+    collectMediaPaths(child, paths);
+    for (const path of paths) {
+      if (shown.has(path)) continue;
+      shown.add(path);
+      child.children?.push({
+        type: 'image',
+        url: path,
+        alt: path.split(/[\\/]/).pop(),
+        data: { hProperties: { dataPathPreview: '' } },
+      });
+    }
+  }
+};
+
+// Remark plugin: show the image or video behind a local path an agent
+// mentions (`/tmp/shot.png` in a code span, a link, or plain prose) below the
+// paragraph that mentions it, once per path, unless the message already
+// embeds it as an image.
+export const remarkMediaPathPreviews = () => (tree: MarkdownNode) => {
+  const shown = new Set<string>();
+  collectImageUrls(tree, shown);
+  previewMediaPaths(tree, shown);
+};
+
 export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink };
-const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences];
+const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences, remarkMediaPathPreviews];
 
 export const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (
   <div className="markdown-content">
