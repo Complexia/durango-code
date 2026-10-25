@@ -145,9 +145,9 @@ const endedRunLabel = (status?: Message['status']) => {
   return 'Ended';
 };
 
-// Drag + clamp behavior shared by the floating cards pinned over the chat
-// area (Tasks, Suggested task). Keeps the card inside its positioned host
-// while it is dragged and when the host resizes.
+// Drag + clamp behavior for the floating Tasks card pinned over the chat
+// area. Keeps the card inside its positioned host while it is dragged and
+// when the host resizes.
 export const useFloatingCardDrag = (
   position: { x: number; y: number } | null,
   onMove: (position: { x: number; y: number }) => void

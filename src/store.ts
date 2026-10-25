@@ -230,23 +230,6 @@ export const defaultDeploymentSettings: DeploymentSettings = {
   preferAgentDeploys: false,
 };
 
-/**
- * The suggested-task card: the Claude harness's predicted next prompt for a
- * thread, surfaced after each turn (promptSuggestions in claude-driver.js).
- */
-export type SuggestedTasksSettings = {
-  /**
-   * Master switch. Off drops incoming suggestions before they reach a thread
-   * — no card, and no detailed-prompt fork run — and hides any card already
-   * showing.
-   */
-  enabled: boolean;
-};
-
-export const defaultSuggestedTasksSettings: SuggestedTasksSettings = {
-  enabled: true,
-};
-
 /** Experimental Rifts (github.com/anomalyco/rift): copy-on-write epic workspaces. */
 export type RiftsSettings = {
   /** Master switch for the experimental Rifts integration. */
@@ -606,34 +589,6 @@ export type LinkedBoardTask = {
   lastStatus?: string;
 };
 
-// The harness's predicted next prompt for a thread (Claude's promptSuggestions
-// stream message), surfaced as a "Suggested task" card the user can start as a
-// regular thread on the current branch or spin off into its own epic + rift.
-// At most one per thread; each new one replaces it.
-export type SuggestedTask = {
-  /** The suggested prompt, verbatim from the harness. */
-  text: string;
-  createdAt: string;
-  /** Run generation that produced this suggestion. */
-  turnRunId: string;
-  /**
-   * Self-contained prompt for starting this task in a fresh session, written
-   * by a read-only fork of the source session (which has the context the terse
-   * suggestion text leaves out). Start sends this; `text` stays the card copy.
-   */
-  detailedPrompt?: string;
-  /**
-   * Progress of the detailed-prompt fork. Unset when no fork was started
-   * (non-Claude thread, no session yet); Start then falls back to `text` plus
-   * a no-context preamble.
-   */
-  detailedPromptStatus?: 'pending' | 'ready' | 'failed';
-  /** Epic created from this suggestion, once the user started it in a rift. */
-  startedEpicId?: string;
-  /** Thread created from this suggestion, once the user started it on the current branch. */
-  startedThreadId?: string;
-};
-
 export type Thread = {
   id: string;
   projectId: string;
@@ -716,8 +671,6 @@ export type Thread = {
   goal?: ThreadGoal | null;
   /** Sidebar epic this thread belongs to, if any. */
   epicId?: string;
-  /** Latest harness-suggested next task for this thread, if any. */
-  suggestedTask?: SuggestedTask;
   /**
    * Orion MCP servers this thread attached with @nickname mentions. They load
    * on every turn here (even when switched off in Settings) until detached.
@@ -902,7 +855,6 @@ interface OrionState {
   durangoSettings: DurangoSettings;
   remoteControlSettings: RemoteControlSettings;
   deploymentSettings: DeploymentSettings;
-  suggestedTasksSettings: SuggestedTasksSettings;
 
   // Code tab workspace
   workspacePath: string | null;
@@ -958,7 +910,6 @@ interface OrionState {
   setDurangoSettings: (updates: Partial<DurangoSettings>) => void;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
-  setSuggestedTasksSettings: (updates: Partial<SuggestedTasksSettings>) => void;
 
   createThread: (
     projectId: string,
@@ -1551,7 +1502,6 @@ export const useOrionStore = create<OrionState>()(
       durangoSettings: defaultDurangoSettings,
       remoteControlSettings: defaultRemoteControlSettings,
       deploymentSettings: defaultDeploymentSettings,
-      suggestedTasksSettings: defaultSuggestedTasksSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -1946,15 +1896,6 @@ export const useOrionStore = create<OrionState>()(
           riftsSettings: {
             ...defaultRiftsSettings,
             ...state.riftsSettings,
-            ...updates,
-          },
-        })),
-
-      setSuggestedTasksSettings: (updates) =>
-        set((state) => ({
-          suggestedTasksSettings: {
-            ...defaultSuggestedTasksSettings,
-            ...state.suggestedTasksSettings,
             ...updates,
           },
         })),
@@ -2637,10 +2578,6 @@ export const useOrionStore = create<OrionState>()(
         deploymentSettings: {
           ...defaultDeploymentSettings,
           ...state.deploymentSettings,
-        },
-        suggestedTasksSettings: {
-          ...defaultSuggestedTasksSettings,
-          ...state.suggestedTasksSettings,
         },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,

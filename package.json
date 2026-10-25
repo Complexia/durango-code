@@ -49,7 +49,6 @@
     "test:remote-control-identity": "node --no-warnings scripts/test-remote-control-identity.mjs",
     "test:remote-relay": "node scripts/test-remote-relay.mjs",
     "test:remote-view-races": "node --no-warnings --experimental-strip-types scripts/test-remote-view-races.mjs",
-    "test:suggested-tasks": "node scripts/test-suggested-tasks.mjs",
     "test:steering": "node scripts/run-electron-test.mjs scripts/test-steering.mjs",
     "test:claude-chrome": "node --no-warnings scripts/test-claude-chrome.mjs",
     "test:claude-capabilities": "node scripts/run-electron-test.mjs scripts/test-claude-capabilities.mjs",

@@ -468,7 +468,6 @@ const createSession = ({ threadId, runId, retained = false }) => {
     backgroundSettleTimer: retained ? setTimeout(() => {}, 60_000) : null,
     backgroundTasks: new Map(),
     skipTranscriptTaskIds: new Set(),
-    pendingSuggestionRunId: 'older-turn',
     pendingTaskNotifications: [],
     tasks: new Map(),
     pendingTaskToolUses: new Map(),
@@ -530,7 +529,6 @@ assert.equal(active.session.activeTurns.length, 1, 'An active steer must replace
 assert.equal(active.session.resultsOwed, 1, 'The continuation must own exactly one SDK result');
 assert.deepEqual(active.pushed, ['change direction']);
 assert.equal(active.session.backgroundSettleTimer, null, 'A live steer must disarm background settlement');
-assert.equal(active.session.pendingSuggestionRunId, null, 'A steer supersedes the prior suggestion owner');
 assert.equal(active.events.length, 0, 'The interrupted transport boundary must not settle the visible run');
 active.session.resultsOwed -= 1;
 await finalizeClaudeTurn(active.session, {

@@ -23,7 +23,7 @@ let savedValue = JSON.stringify({
     workspacePath: existingProject.path,
     // A copied profile must adopt this machine's path after hydration.
     noProject: { id: 'orion:no-project', name: 'No project', path: '/old-machine/chats' },
-    suggestedTasksSettings: { enabled: false },
+    deploymentSettings: { preferAgentDeploys: true },
     threads: [],
   },
 });
@@ -99,7 +99,7 @@ assert.equal(await flushOrionStoreSave(), true);
 const savedState = JSON.parse(savedValue).state;
 assert.deepEqual(savedState.projects, [existingProject]);
 assert.deepEqual(savedState.epics, [existingEpic]);
-assert.equal(savedState.suggestedTasksSettings.enabled, false);
+assert.equal(savedState.deploymentSettings.preferAgentDeploys, true);
 assert.equal(savedState.noProject.path, '/this-machine/chats');
 disposeActive();
 
