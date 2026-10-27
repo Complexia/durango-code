@@ -8,6 +8,9 @@ export let appUpdateState = {
   currentVersion: app.getVersion(),
   checkedAt: null,
   availableVersion: null,
+  // What changed in availableVersion, one line per change, for the update
+  // button's hover card. Null when the feed sends none.
+  releaseNotes: null,
   progress: null,
   error: null,
 };
@@ -72,6 +75,25 @@ export const waitForAppUpdateStagedForInstall = (timeoutMs = APP_UPDATE_STAGE_TI
     }, timeoutMs);
     appUpdateStagedWaiters.add(waiter);
   });
+};
+
+// code.durango.sh sends `releaseNotes` as a Markdown list (one change per
+// line). electron-updater passes it through as a string, or as
+// [{ version, note }] from providers that collect several releases.
+export const normalizeReleaseNotes = (releaseNotes) => {
+  const text = Array.isArray(releaseNotes)
+    ? releaseNotes.map((entry) => (typeof entry === 'string' ? entry : entry?.note ?? '')).join('\n')
+    : typeof releaseNotes === 'string'
+      ? releaseNotes
+      : '';
+  const notes = text
+    .replace(/<\/(?:li|p|h\d)>|<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#/.test(line))
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim())
+    .filter(Boolean);
+  return notes.length > 0 ? notes : null;
 };
 
 export const getAppIconPath = () => {
@@ -173,6 +195,7 @@ export const initializeAppUpdaterOnce = async () => {
 
   autoUpdater.on('update-available', (info) => {
     const availableVersion = info?.version ?? null;
+    const releaseNotes = normalizeReleaseNotes(info?.releaseNotes);
 
     // A restart is already under way — leave the staged update alone. Starting
     // a fresh download here would reset Squirrel's staging and strand it.
@@ -186,6 +209,7 @@ export const initializeAppUpdaterOnce = async () => {
       publishAppUpdateState({
         status: 'downloaded',
         availableVersion,
+        releaseNotes,
         checkedAt: new Date().toISOString(),
         progress: null,
         error: null,
@@ -199,6 +223,7 @@ export const initializeAppUpdaterOnce = async () => {
     publishAppUpdateState({
       status: 'available',
       availableVersion,
+      releaseNotes,
       checkedAt: new Date().toISOString(),
       progress: null,
       error: null,
@@ -217,6 +242,7 @@ export const initializeAppUpdaterOnce = async () => {
     publishAppUpdateState({
       status: 'not-available',
       availableVersion: null,
+      releaseNotes: null,
       checkedAt: new Date().toISOString(),
       progress: null,
       error: null,
@@ -245,6 +271,7 @@ export const initializeAppUpdaterOnce = async () => {
     publishAppUpdateState({
       status: 'downloaded',
       availableVersion: info?.version ?? appUpdateState.availableVersion,
+      releaseNotes: normalizeReleaseNotes(info?.releaseNotes) ?? appUpdateState.releaseNotes,
       progress: null,
       error: null,
     });

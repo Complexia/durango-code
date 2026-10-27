@@ -2,6 +2,11 @@ import { defineConfig } from 'vite';
 
 // https://vitejs.dev/config
 export default defineConfig({
+  // The release notes scripts/deploy.mjs collected for this build (a JSON
+  // array of strings), shown in "What's new". Empty in development.
+  define: {
+    __DURANGO_RELEASE_NOTES__: JSON.stringify(process.env.DURANGO_RELEASE_NOTES ?? '[]'),
+  },
   build: {
     rollupOptions: {
       // node-pty is a native module (prebuilt .node + spawn-helper binary);

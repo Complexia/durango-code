@@ -11,6 +11,7 @@ import {
   releaseOsName,
   selectPlatformArtifacts,
 } from './release-manifest.mjs';
+import { maxReleaseNotes, parseReleaseNotes, releaseNotesFromSubjects } from './release-notes.mjs';
 
 const artifact = (osName, arch, format, version = '1.2.3') => ({
   format,
@@ -91,6 +92,7 @@ assert.equal(windows.update, 'exe');
 assert.deepEqual(windows.updates, ['exe']);
 assert.equal(windows.artifacts.exe.key, 'releases/v1.2.3/windows/x64/Durango-Code-1.2.3-windows-x64.exe');
 assert.equal(windows.notarized, false);
+assert.deepEqual(windows.releaseNotes, [], 'a release without notes lists none');
 
 const linux = buildPlatformManifest({
   version: '1.2.4-rc.1',
@@ -114,7 +116,9 @@ const mac = buildPlatformManifest({
   releasedAt: '2026-10-24T00:00:00.000Z',
   artifacts: [artifact('macos', 'arm64', 'dmg'), artifact('macos', 'arm64', 'zip')],
   signed: true,
+  releaseNotes: ['Show images inline in chat'],
 });
+assert.deepEqual(mac.releaseNotes, ['Show images inline in chat']);
 const legacy = buildLegacyMacManifest(mac);
 assert.equal(legacy.version, '1.2.3');
 assert.equal(legacy.signed, true);
@@ -128,5 +132,24 @@ assert.equal(legacy.updates.macos.arm64.sha512, 'zip-sha512');
 assert.equal(legacy.updates.macos.arm64.size, 10);
 assert.deepEqual(Object.keys(legacy.downloads), ['macos']);
 assert.throws(() => buildLegacyMacManifest(windows), /only describes macOS/);
+
+// Release notes: commit subjects minus version bumps and repeats, or the
+// lines of a --notes-file.
+assert.deepEqual(
+  releaseNotesFromSubjects([
+    'Show images inline in chat',
+    'Bump Durango Code package version to 1.0.153',
+    '1.0.153',
+    '',
+    'Show images inline in chat',
+    'Remove suggested tasks from Claude threads',
+  ]),
+  ['Show images inline in chat', 'Remove suggested tasks from Claude threads'],
+);
+assert.equal(
+  releaseNotesFromSubjects(Array.from({ length: maxReleaseNotes + 5 }, (_, index) => `Change ${index}`)).length,
+  maxReleaseNotes,
+);
+assert.deepEqual(parseReleaseNotes('## Notes\n\n- One\n* Two\n  3. Three\nFour\n'), ['One', 'Two', 'Three', 'Four']);
 
 console.log('release manifest tests passed');

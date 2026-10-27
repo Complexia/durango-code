@@ -91,6 +91,8 @@ export type AppUpdateState = {
   currentVersion: string;
   checkedAt?: string | null;
   availableVersion?: string | null;
+  /** What changed in availableVersion, one line per change. */
+  releaseNotes?: string[] | null;
   progress?: {
     percent: number;
     transferred: number;
@@ -98,6 +100,13 @@ export type AppUpdateState = {
     bytesPerSecond: number;
   } | null;
   error?: string | null;
+};
+
+/** This version's release notes, and whether its "What's new" is still due. */
+export type WhatsNewState = {
+  version: string;
+  notes: string[];
+  unseen: boolean;
 };
 
 export type OrionAccountState = {

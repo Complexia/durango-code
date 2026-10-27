@@ -42,6 +42,7 @@ import {
   pushRepo,
   setCloudRepoLink,
 } from './cloud-sync.js';
+import { getWhatsNew, markWhatsNewSeen } from './main/whats-new.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
@@ -5363,6 +5364,13 @@ const restartForAppUpdate = async () => {
     return { ok: false, error: error?.message ?? 'Could not restart to update' };
   }
 };
+
+ipcMain.handle('whatsNew:get', async () => getWhatsNew());
+
+ipcMain.handle('whatsNew:dismiss', async () => {
+  await markWhatsNewSeen();
+  return { ok: true };
+});
 
 ipcMain.handle('appUpdate:restart', async () => {
   if (appUpdateState.status !== 'downloaded' && appUpdateState.status !== 'restarting') {

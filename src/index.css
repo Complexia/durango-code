@@ -1796,40 +1796,28 @@ body {
 }
 
 .sidebar-update-button {
-  min-width: 0;
-  max-width: 184px;
+  flex-shrink: 0;
+  width: 32px;
   height: 32px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
-  padding: 0 10px;
+  padding: 0;
   border: 1px solid rgb(139 130 255 / 32%);
   border-radius: var(--radius-sm);
   background: rgb(139 130 255 / 12%);
   color: var(--text-primary);
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
   cursor: pointer;
   transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
 }
 
-.sidebar-update-button:hover:not(:disabled) {
+.sidebar-update-button:hover:not([aria-disabled='true']) {
   background: rgb(139 130 255 / 18%);
   border-color: rgb(139 130 255 / 48%);
 }
 
-.sidebar-update-button:disabled {
+.sidebar-update-button[aria-disabled='true'] {
   cursor: default;
-  opacity: 0.82;
-}
-
-.sidebar-update-button span:last-child {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .sidebar-update-button.downloaded,

@@ -89,7 +89,7 @@ export const selectPlatformArtifacts = (osName, artifactPaths) => {
   return byFormat;
 };
 
-export const buildPlatformManifest = ({ version, osName, arch, releasedAt, artifacts, signed }) => {
+export const buildPlatformManifest = ({ version, osName, arch, releasedAt, artifacts, signed, releaseNotes = [] }) => {
   const formats = platformFormats[osName];
   return {
     product: productName,
@@ -105,6 +105,9 @@ export const buildPlatformManifest = ({ version, osName, arch, releasedAt, artif
     // predate `updates`.
     update: formats.updates[0],
     updates: formats.updates,
+    // One line per change (scripts/release-notes.mjs); the update feed passes
+    // them to electron-updater as `releaseNotes`.
+    releaseNotes,
     artifacts: Object.fromEntries(artifacts.map((artifact) => [artifact.format, artifact])),
   };
 };

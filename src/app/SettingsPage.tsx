@@ -73,8 +73,10 @@ import type {
   ProviderUpdateProgress,
   ProviderUpdateState,
   SettingsTab,
+  WhatsNewState,
   WorkspaceSyncStatus,
 } from './appTypes';
+import { ReleaseNotesList } from './AppUpdateUi';
 
 const ARCHIVED_EPICS_COLLAPSED_LIMIT = 5;
 const CODEX_BROWSER_EXTENSION_URL =
@@ -124,6 +126,7 @@ export type SettingsPageProps = {
   providerUpdateProgress: ProviderUpdateProgress | null;
   appUpdateState: AppUpdateState | null;
   appUpdateBusy: boolean;
+  whatsNew: WhatsNewState | null;
   setSettingsOpen: React.Dispatch<React.SetStateAction<boolean>>;
   settingsTab: SettingsTab;
   setSettingsTab: React.Dispatch<React.SetStateAction<SettingsTab>>;
@@ -219,6 +222,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     providerUpdateProgress,
     appUpdateState,
     appUpdateBusy,
+    whatsNew,
     setSettingsOpen,
     settingsTab,
     setSettingsTab,
@@ -1001,6 +1005,27 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     />
                     {appUpdateActionLabel}
                   </button>
+                </div>
+                {(appUpdateState?.status === 'available' ||
+                  appUpdateState?.status === 'downloading' ||
+                  appUpdateState?.status === 'downloaded') &&
+                  (appUpdateState.releaseNotes?.length ?? 0) > 0 && (
+                    <div className="setting-row setting-row-stacked">
+                      <div className="setting-label-title">
+                        What&apos;s changed in v{appUpdateState.availableVersion ?? 'next'}
+                      </div>
+                      <ReleaseNotesList notes={appUpdateState.releaseNotes ?? []} />
+                    </div>
+                  )}
+                <div className="setting-row setting-row-stacked" data-testid="settings-whats-new">
+                  <div className="setting-label-title">
+                    What&apos;s new in v{whatsNew?.version ?? appUpdateState?.currentVersion ?? '—'}
+                  </div>
+                  {whatsNew && whatsNew.notes.length > 0 ? (
+                    <ReleaseNotesList notes={whatsNew.notes} />
+                  ) : (
+                    <div className="setting-label-desc">No release notes were published with this version.</div>
+                  )}
                 </div>
               </div>
             </>

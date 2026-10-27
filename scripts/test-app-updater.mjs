@@ -77,6 +77,34 @@ const main = async () => {
     assert.equal(updater.appUpdateState.status, 'idle', 'the scheduled check should stay silent when it fails');
     assert.ok(updater.appUpdateRetryTimer, 'the scheduled check should fall back to the retry schedule');
 
+    // --- Release notes from the feed become one line per change. ---
+    assert.deepEqual(updater.normalizeReleaseNotes('- Icon-only update button\n- Show "What\'s new"\n'), [
+      'Icon-only update button',
+      'Show "What\'s new"',
+    ]);
+    assert.deepEqual(updater.normalizeReleaseNotes('<ul><li>One</li><li>Two</li></ul>'), ['One', 'Two']);
+    assert.deepEqual(updater.normalizeReleaseNotes([{ version: '9.9.9', note: '* Three' }]), ['Three']);
+    assert.equal(updater.normalizeReleaseNotes(null), null);
+    assert.equal(updater.normalizeReleaseNotes('  \n'), null);
+
+    // --- "What's new" shows once per version updated to, never on a fresh install. ---
+    const fs = await import('node:fs/promises');
+    const { getStorageFilePath } = await import('../src/main/paths.js');
+    const whatsNew = await import('../src/main/whats-new.js');
+    const whatsNewFile = path.join(app.getPath('userData'), 'whats-new.json');
+    assert.equal((await whatsNew.getWhatsNew()).unseen, false, 'a fresh install has nothing to announce');
+    assert.equal(JSON.parse(await fs.readFile(whatsNewFile, 'utf8')).seenVersion, app.getVersion());
+    await fs.rm(whatsNewFile);
+    await fs.writeFile(getStorageFilePath(), '{}');
+    assert.equal((await whatsNew.getWhatsNew()).unseen, true, 'updating from a version without the record announces');
+    await fs.writeFile(whatsNewFile, JSON.stringify({ seenVersion: '0.0.1' }));
+    const due = await whatsNew.getWhatsNew();
+    assert.equal(due.unseen, true, 'a newer version than the one last announced is due');
+    assert.equal(due.version, app.getVersion());
+    assert.deepEqual(due.notes, [], 'raw source has no bundled notes');
+    await whatsNew.markWhatsNewSeen();
+    assert.equal((await whatsNew.getWhatsNew()).unseen, false, 'dismissing hides it until the next version');
+
     console.log('App updater regression tests passed.');
     process.exitCode = 0;
   } catch (error) {

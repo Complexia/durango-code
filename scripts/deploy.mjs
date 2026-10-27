@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { relaunchWithPinnedNode, verifyReleaseRuntime } from './check-release-runtime.mjs';
 import { assertReleaseSourceCommitted, pushReleaseTag, watchCiRelease } from './release-git.mjs';
+import { collectReleaseNotes } from './release-notes.mjs';
 import {
   buildLegacyMacManifest,
   buildPlatformManifest,
@@ -107,6 +108,15 @@ if (version !== currentVersion) {
 if (triggerCiRelease) {
   ciRelease = pushReleaseTag(rootDir, version);
 }
+
+const releaseNotes = await collectReleaseNotes({ rootDir, version, notesFile: args.notesFile });
+console.log(
+  releaseNotes.length > 0
+    ? `Release notes (${releaseNotes.length}):\n${releaseNotes.map((note) => `  - ${note}`).join('\n')}`
+    : 'No release notes: no earlier release tag to compare against (pass --notes-file to write them).',
+);
+// vite.main.config.mjs bakes these into the build for the app's "What's new".
+process.env.DURANGO_RELEASE_NOTES = JSON.stringify(releaseNotes);
 
 if (!isResume) {
   await fs.rm(path.join(rootDir, 'out', 'make'), { recursive: true, force: true });
@@ -211,7 +221,7 @@ for (const [format, artifactPath] of releaseArtifacts) {
   console.log(`Uploaded ${key}`);
 }
 
-const manifest = buildPlatformManifest({ version, osName, arch, releasedAt, artifacts, signed: macSignedRelease });
+const manifest = buildPlatformManifest({ version, osName, arch, releasedAt, artifacts, signed: macSignedRelease, releaseNotes });
 
 await uploadJson(client, config.bucket, platformManifestKey({ version, osName, arch }), manifest, 'public, max-age=31536000, immutable');
 if (publishLatest) {
@@ -243,6 +253,8 @@ function parseArgs(argv) {
     else if (value === '--resume-notary-id') parsed.resumeNotaryId = argv[++index];
     else if (value.startsWith('--resume-notary-id=')) parsed.resumeNotaryId = value.split('=')[1];
     else if (value === '--resume-upload') parsed.resumeUpload = true;
+    else if (value === '--notes-file') parsed.notesFile = argv[++index];
+    else if (value.startsWith('--notes-file=')) parsed.notesFile = value.split('=')[1];
     else if (value === '--check-runtime') parsed.checkRuntime = true;
     else if (value === '--ci') parsed.ci = true;
     else if (value === '--no-ci') parsed.noCi = true;

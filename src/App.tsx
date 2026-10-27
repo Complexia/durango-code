@@ -208,6 +208,7 @@ import {
 } from './app/durangoChats';
 import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
 import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
+import { RestartToUpdateDialog, WhatsNewNotice } from './app/AppUpdateUi';
 import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
 import {
   addPromptContext,
@@ -234,6 +235,7 @@ import type { SidebarFooterProps } from './app/SidebarFooter';
 import type { SettingsPageProps } from './app/SettingsPage';
 import type {
   AppUpdateState,
+  WhatsNewState,
   EpicCommitDialogState,
   EpicPrBaseDialogState,
   EpicPrStatus,
@@ -1158,6 +1160,8 @@ const App: React.FC = () => {
   const providerUpdateInvocationRef = useRef(false);
   const [appUpdateState, setAppUpdateState] = useState<AppUpdateState | null>(null);
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
+  const [restartToUpdateConfirmOpen, setRestartToUpdateConfirmOpen] = useState(false);
+  const [whatsNew, setWhatsNew] = useState<WhatsNewState | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
   const [authenticatingProviderId, setAuthenticatingProviderId] = useState<string | null>(null);
   const [accountState, setAccountState] = useState<OrionAccountState>({
@@ -2276,6 +2280,13 @@ const App: React.FC = () => {
     }
     return running;
   }, [activeRunsByThread, epicsEnabled, threads]);
+  const runningThreadCount = useMemo(
+    () =>
+      restartToUpdateConfirmOpen
+        ? threads.filter((thread) => thread.status === 'running' || activeRunsByThread[thread.id]).length
+        : 0,
+    [activeRunsByThread, restartToUpdateConfirmOpen, threads]
+  );
 
   const projectForGitRoot = useCallback(
     (gitRoot: string | undefined, preferredProjectId?: string) => {
@@ -2806,6 +2817,9 @@ const App: React.FC = () => {
 
     void window.orion?.getAppUpdateState?.().then((state) => {
       if (mounted) setAppUpdateState(state);
+    });
+    void window.orion?.getWhatsNew?.().then((state) => {
+      if (mounted) setWhatsNew(state);
     });
 
     const unsubscribe = window.orion?.onAppUpdateState?.((state) => {
@@ -3431,19 +3445,15 @@ const App: React.FC = () => {
       return;
     }
 
+    // Restarting interrupts every running agent; RestartToUpdateDialog asks
+    // first and calls confirmRestartToUpdate.
+    if (appUpdateState.status === 'downloaded') {
+      setRestartToUpdateConfirmOpen(true);
+      return;
+    }
+
     setAppUpdateBusy(true);
     try {
-      if (appUpdateState.status === 'downloaded') {
-        // Stays busy on success: the app is on its way out. Only a restart that
-        // could not go through hands the button back.
-        const result = await window.orion?.restartToUpdate?.();
-        if (result && result.ok === false) {
-          toast.error(result.error ?? 'Could not restart to update');
-          setAppUpdateBusy(false);
-        }
-        return;
-      }
-
       if (appUpdateState.status === 'available') {
         await window.orion?.downloadAppUpdate?.();
         return;
@@ -3455,6 +3465,29 @@ const App: React.FC = () => {
       setAppUpdateBusy(false);
     }
   }, [appUpdateBusy, appUpdateState]);
+
+  const cancelRestartToUpdate = useCallback(() => setRestartToUpdateConfirmOpen(false), []);
+  const confirmRestartToUpdate = useCallback(async () => {
+    setRestartToUpdateConfirmOpen(false);
+    setAppUpdateBusy(true);
+    try {
+      // Stays busy on success: the app is on its way out. Only a restart that
+      // could not go through hands the button back.
+      const result = await window.orion?.restartToUpdate?.();
+      if (result && result.ok === false) {
+        toast.error(result.error ?? 'Could not restart to update');
+        setAppUpdateBusy(false);
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not update Durango Code');
+      setAppUpdateBusy(false);
+    }
+  }, []);
+
+  const dismissWhatsNew = useCallback(() => {
+    setWhatsNew((current) => (current ? { ...current, unseen: false } : current));
+    void window.orion?.dismissWhatsNew?.().catch(() => {});
+  }, []);
 
   const handleStartAccountAuth = useCallback(async () => {
     if (!window.orion?.startAccountAuth || accountBusy) return;
@@ -9446,6 +9479,7 @@ const App: React.FC = () => {
     providerUpdateProgress,
     appUpdateState,
     appUpdateBusy,
+    whatsNew,
     setSettingsOpen,
     settingsTab,
     setSettingsTab,
@@ -11496,6 +11530,19 @@ const App: React.FC = () => {
           models={utilityCandidateModels}
           onSelect={(model) => setTextGenerationSettings({ modelId: model.id })}
           onDismiss={() => setTextGenerationPromptDismissed(true)}
+        />
+      )}
+
+      {whatsNew?.unseen && (
+        <WhatsNewNotice version={whatsNew.version} notes={whatsNew.notes} onDismiss={dismissWhatsNew} />
+      )}
+
+      {restartToUpdateConfirmOpen && appUpdateState?.status === 'downloaded' && (
+        <RestartToUpdateDialog
+          version={appUpdateState.availableVersion}
+          runningThreadCount={runningThreadCount}
+          onCancel={cancelRestartToUpdate}
+          onConfirm={() => void confirmRestartToUpdate()}
         />
       )}
 

@@ -221,6 +221,8 @@ contextBridge.exposeInMainWorld('orion', {
   checkForAppUpdate: (input) => ipcRenderer.invoke('appUpdate:check', input),
   downloadAppUpdate: () => ipcRenderer.invoke('appUpdate:download'),
   restartToUpdate: () => ipcRenderer.invoke('appUpdate:restart'),
+  getWhatsNew: () => ipcRenderer.invoke('whatsNew:get'),
+  dismissWhatsNew: () => ipcRenderer.invoke('whatsNew:dismiss'),
 
   // Project assets
   findProjectIcon: (projectPath) => ipcRenderer.invoke('project:findIcon', projectPath),

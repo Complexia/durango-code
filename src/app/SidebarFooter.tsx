@@ -1,6 +1,7 @@
 import React from 'react';
-import { Download, LogIn, RefreshCw, Settings } from 'lucide-react';
+import { Download, LogIn, RefreshCw, Settings, TriangleAlert } from 'lucide-react';
 import type { AppUpdateState, OrionAccountState } from './appTypes';
+import { AppUpdateHoverCard } from './AppUpdateUi';
 
 export type SidebarFooterProps = {
   appUpdateVisible: boolean;
@@ -39,34 +40,40 @@ export const SidebarFooter = React.memo(function SidebarFooter({
 }: SidebarFooterProps) {
   return (
     <div className="sidebar-footer">
-      {appUpdateVisible && (
-        <button
-          type="button"
-          className={`sidebar-update-button ${appUpdateState?.status ?? 'idle'}`}
-          onClick={onAppUpdateClick}
-          title={appUpdateTitle}
-          disabled={
-            appUpdateBusy || appUpdateState?.status === 'downloading' || appUpdateState?.status === 'restarting'
-          }
-        >
-          {appUpdateState?.status === 'downloaded' || appUpdateState?.status === 'restarting' ? (
-            <RefreshCw size={15} />
-          ) : appUpdateState?.status === 'downloading' ? (
-            <span
-              className="sidebar-update-progress"
-              style={
-                {
-                  '--update-progress': `${appUpdatePercent}%`,
-                } as React.CSSProperties
-              }
-            >
-              <Download size={14} />
-            </span>
-          ) : (
-            <Download size={15} />
-          )}
-          <span>{appUpdateLabel}</span>
-        </button>
+      {appUpdateVisible && appUpdateState && (
+        <AppUpdateHoverCard state={appUpdateState} percent={appUpdatePercent}>
+          {/* Icon only; the hover card says what the update is. Not `disabled`
+              while busy: a disabled button gets no hover, and the click
+              handler already ignores downloads and restarts in progress. */}
+          <button
+            type="button"
+            className={`sidebar-update-button ${appUpdateState.status}`}
+            onClick={onAppUpdateClick}
+            aria-label={`${appUpdateLabel}. ${appUpdateTitle}`}
+            aria-disabled={
+              appUpdateBusy || appUpdateState.status === 'downloading' || appUpdateState.status === 'restarting'
+            }
+          >
+            {appUpdateState.status === 'downloaded' || appUpdateState.status === 'restarting' ? (
+              <RefreshCw size={15} />
+            ) : appUpdateState.status === 'downloading' ? (
+              <span
+                className="sidebar-update-progress"
+                style={
+                  {
+                    '--update-progress': `${appUpdatePercent}%`,
+                  } as React.CSSProperties
+                }
+              >
+                <Download size={12} />
+              </span>
+            ) : appUpdateState.status === 'error' ? (
+              <TriangleAlert size={15} />
+            ) : (
+              <Download size={15} />
+            )}
+          </button>
+        </AppUpdateHoverCard>
       )}
       <button
         type="button"

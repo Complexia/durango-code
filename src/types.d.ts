@@ -13,6 +13,7 @@ type AppUpdateState = {
   currentVersion: string;
   checkedAt?: string | null;
   availableVersion?: string | null;
+  releaseNotes?: string[] | null;
   progress?: {
     percent: number;
     transferred: number;
@@ -20,6 +21,12 @@ type AppUpdateState = {
     bytesPerSecond: number;
   } | null;
   error?: string | null;
+};
+
+type WhatsNewState = {
+  version: string;
+  notes: string[];
+  unseen: boolean;
 };
 
 type ProviderUpdateProgress = {
@@ -1309,6 +1316,8 @@ type OrionCodexBrowserIntegrationStatus = {
       checkForAppUpdate: (input?: { force?: boolean; background?: boolean }) => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;
       restartToUpdate: () => Promise<{ ok: boolean; error?: string }>;
+      getWhatsNew?: () => Promise<WhatsNewState>;
+      dismissWhatsNew?: () => Promise<{ ok: boolean }>;
       runAgentTurn: (input: {
         runId?: string;
         threadId: string;
