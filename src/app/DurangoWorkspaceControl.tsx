@@ -16,7 +16,8 @@ import type { DurangoWorkspaceStatus } from '../types';
 // where it is, the change it holds, its dev server, landing, and removal. The
 // status is main-process state (the workspace's change file, `ws list`), so
 // the pill polls it while mounted and asks Durango Source for the change's
-// own status only when the menu opens.
+// own status only when the menu opens. A workspace whose directory is gone is
+// handed back to the thread (onMissing), which then shows its branch again.
 
 const STATUS_POLL_MS = 10_000;
 
@@ -32,13 +33,17 @@ type Props = {
   /** Repository work is running or the workspace is changing. */
   disabled: boolean;
   onRemove: () => void;
+  /** The workspace directory is gone (removed by the agent or outside the app). */
+  onMissing: () => void;
 };
 
-const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ workspace, disabled, onRemove }: Props) {
+const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ workspace, disabled, onRemove, onMissing }: Props) {
   const [open, setOpen] = React.useState(false);
   const [status, setStatus] = React.useState<DurangoWorkspaceStatus | null>(null);
   const [busy, setBusy] = React.useState<'land' | 'serve' | 'stop' | null>(null);
   const rootRef = React.useRef<HTMLDivElement>(null);
+  const onMissingRef = React.useRef(onMissing);
+  onMissingRef.current = onMissing;
   const lastPorts = workspace.portBase + workspace.portBlock - 1;
   const localUrl = `http://127.0.0.1:${workspace.portBase}`;
 
@@ -47,6 +52,7 @@ const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ wo
       const next = await window.orion
         ?.durangoWorkspaceStatus?.({ path: workspace.path, name: workspace.name, repo: workspace.repo, remote })
         .catch(() => null);
+      if (next?.ok && !next.exists) onMissingRef.current();
       if (next?.ok) {
         // A local poll keeps the URL and title the last remote lookup found.
         setStatus((current) =>

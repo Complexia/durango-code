@@ -97,6 +97,7 @@ try {
   assert.equal(status.server, null);
   assert.equal(status.change, null);
   assert.equal(status.landing, false);
+  assert.deepEqual(workspaces.missingDurangoWorkspaces([workspace.path]), []);
 
   // --- ws rm ---------------------------------------------------------------------
   await fs.writeFile(path.join(workspace.workingDir, 'new.js'), 'export {};\n');
@@ -108,6 +109,7 @@ try {
   const removed = await workspaces.removeDurangoWorkspace({ name: workspace.name, repo, force: true });
   assert.equal(removed.ok, true, removed.error);
   assert.equal(existsSync(workspace.path), false);
+  assert.deepEqual(workspaces.missingDurangoWorkspaces([workspace.path]), [workspace.path], 'threads release it');
   assert.deepEqual(await workspaces.removeDurangoWorkspace({ name: workspace.name, repo }), {
     ok: true,
     alreadyRemoved: true,

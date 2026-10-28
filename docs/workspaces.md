@@ -20,10 +20,17 @@ installed into the agent's skills on first launch). A question or a quick
 look-up is answered straight away from the project directory; only work that
 edits, installs, runs dev servers or opens a change makes a workspace first.
 
-When a turn ran `durango-code ws new <name>` successfully, the app attaches
-that workspace to the thread (`adoptAgentWorkspace` in `src/App.tsx`, the
-`durangoWorkspace:find` IPC), marked `adopted`: the header shows it with Land
-and Run dev server, and deleting the thread cleans it up as below. The thread's
+When the agent runs `durango-code ws new <name>` successfully, the app attaches
+that workspace to the thread as soon as the command finishes
+(`syncAgentWorkspace` in `src/App.tsx`, the `durangoWorkspace:find` IPC),
+marked `adopted`: the header shows it with Land and Run dev server, and
+deleting the thread cleans it up as below. A later `ws new` replaces an adopted
+workspace with the new one. When the workspace's directory is gone (the agent
+ran `ws rm` after landing, or it was removed outside the app), every thread
+pointing at it lets go (`releaseMissingDurangoWorkspaces`, the
+`durangoWorkspace:missing` IPC, checked after each `ws new` / `ws rm`, at the
+end of a turn, every 15 seconds and on window focus) and the composer shows the
+project's own branch again. The thread's
 sessions were recorded in the project directory, so its later turns keep
 running there and the agent works in the workspace by path; a fresh session in
 the thread is told where it is in a `[Durango workspace]` prompt block.
@@ -62,6 +69,8 @@ CLI), **Land** (`land`, which waits until the change is merged and live), and
 **Remove workspace** (`ws rm`). Removing it asks first, and asks again before
 discarding work that has not landed; the threads that worked in it keep their
 transcripts, and their next message starts a fresh session in a new workspace.
+A workspace the app made that disappears on its own is treated the same way,
+once no agent is running in it.
 Deleting the last thread that uses a workspace removes it too, unless it holds
 unlanded work, which is never discarded silently.
 

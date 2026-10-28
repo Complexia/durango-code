@@ -139,6 +139,7 @@ import {
   findDurangoWorkspace,
   inspectDurangoWorkspaceProject,
   landDurangoWorkspace,
+  missingDurangoWorkspaces,
   removeDurangoWorkspace,
   serveDurangoWorkspace,
   stopAllDurangoWorkspaceServers,
@@ -2615,6 +2616,11 @@ ipcMain.handle('durangoWorkspace:status', async (_event, input) => {
   } catch (error) {
     return { ok: false, error: error?.message || String(error) };
   }
+});
+
+ipcMain.handle('durangoWorkspace:missing', (_event, input) => {
+  const paths = Array.isArray(input?.paths) ? input.paths.filter(isPathInput).slice(0, 500) : [];
+  return missingDurangoWorkspaces(paths);
 });
 
 ipcMain.handle('durangoWorkspace:land', async (_event, input) => {

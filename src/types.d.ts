@@ -960,6 +960,8 @@ type OrionCodexBrowserIntegrationStatus = {
         /** Also ask Durango Source for the change's status and URL. */
         remote?: boolean;
       }) => Promise<DurangoWorkspaceStatus>;
+      /** The workspace directories in `paths` that no longer exist. */
+      missingDurangoWorkspaces?: (input: { paths: string[] }) => Promise<string[]>;
       landDurangoWorkspace?: (input: { path: string }) => Promise<{
         ok: boolean;
         changeId?: string | null;

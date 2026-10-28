@@ -131,6 +131,12 @@ export const removeDurangoWorkspace = async ({ name, repo, force = false }) => {
   return { ok: false, error, unlanded: /unlanded change/i.test(error) };
 };
 
+/**
+ * The workspace directories in `paths` that no longer exist: removed by an
+ * agent's own `ws rm`, or outside the app. Cheap enough to poll.
+ */
+export const missingDurangoWorkspaces = (paths) => paths.filter((workspacePath) => !existsSync(workspacePath));
+
 const readLocalChange = (workspacePath) => {
   try {
     const state = JSON.parse(readFileSync(path.join(workspacePath, '.durango', 'change.json'), 'utf8'));

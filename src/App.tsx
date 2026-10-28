@@ -402,45 +402,116 @@ const cloudBillingUrl = (repoWebUrl: string | null | undefined) => {
 const threadWorkingDir = (thread: Pick<Thread, 'durangoWorkspace'> | undefined, project: Project) =>
   thread?.durangoWorkspace && !thread.durangoWorkspace.adopted ? thread.durangoWorkspace.workingDir : project.path;
 
-// `durango-code ws new <name>` (or an alias) in a shell command an agent ran.
-const WS_NEW_COMMAND = /\b(?:durango-code|ds|durango-source|orion-cli)\s+ws\s+new\s+([^\n;&|]*)/g;
+// `durango-code ws new <name>` or `ws rm <name>` (or an alias) in a shell
+// command an agent ran.
+const WS_COMMAND = /\b(?:durango-code|ds|durango-source|orion-cli)\s+ws\s+(new|rm)\s+([^\n;&|]*)/g;
 // `ws new` options that take a value (`--from <rev>`, `--repo <dir>`, `--change <id>`).
 const WS_NEW_VALUE_FLAGS = new Set(['--from', '--repo', '--change']);
-const workspaceNameFromWsNew = (args: string) =>
+const workspaceNameFromWsArgs = (args: string) =>
   args
     .split(/\s+/)
     .map((token) => token.replace(/^["']|["']$/g, ''))
     .find((token, index, tokens) => token && !token.startsWith('-') && !WS_NEW_VALUE_FLAGS.has(tokens[index - 1] ?? '')) ??
   null;
 
+const activityRanWorkspaceCommand = (activity: AgentActivity) =>
+  /\bws\s+(?:new|rm)\s/.test(`${activity.title}\n${activity.input ?? ''}`);
+
 /**
- * Agents create their workspace when they start real work (the
- * durango-workspaces skill). When a turn ran `ws new` successfully, attach
- * that workspace to the thread so the header shows it with Land / Run dev
- * server, and deleting the thread cleans it up.
+ * The last `ws new` / `ws rm` that succeeded in a turn. Mid-turn only finished
+ * commands count; once the turn is over, so does any that did not fail.
  */
-const adoptAgentWorkspace = async (threadId: string, messageId: string) => {
-  const state = useOrionStore.getState();
-  const thread = state.threads.find((candidate) => candidate.id === threadId);
-  if (!thread || thread.durangoWorkspace || !window.orion?.findDurangoWorkspace) return;
-  const project = findProjectById(state, thread.projectId);
-  if (!project || isNoProjectId(project.id)) return;
-  const message = thread.messages.find((candidate) => candidate.id === messageId);
-  let name: string | null = null;
-  for (const activity of message?.activities ?? []) {
+const lastWorkspaceCommand = (activities: AgentActivity[], turnOver: boolean) => {
+  let last: { action: 'new' | 'rm'; name: string } | null = null;
+  for (const activity of activities) {
+    if (!turnOver && activity.status !== 'done' && activity.exitCode === undefined) continue;
     if (activity.status === 'error' || (activity.exitCode !== undefined && activity.exitCode !== 0)) continue;
     const text = `${activity.title}\n${activity.input ?? ''}`;
-    for (const match of text.matchAll(WS_NEW_COMMAND)) {
-      const candidate = workspaceNameFromWsNew(match[1]);
-      if (candidate) name = candidate;
+    for (const match of text.matchAll(WS_COMMAND)) {
+      const name = workspaceNameFromWsArgs(match[2]);
+      if (name) last = { action: match[1] as 'new' | 'rm', name };
     }
   }
-  if (!name || !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(name)) return;
-  const result = await window.orion.findDurangoWorkspace({ projectPath: project.path, name }).catch(() => null);
-  if (!result?.ok || !result.workspace) return;
-  const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
-  if (!current || current.durangoWorkspace) return;
-  useOrionStore.getState().updateThread(threadId, { durangoWorkspace: { ...result.workspace, adopted: true } });
+  return last;
+};
+
+const WORKSPACE_PRESENCE_POLL_MS = 15_000;
+
+/**
+ * Threads whose workspace directory is gone (the agent ran `ws rm`, or it was
+ * removed outside the app) stop pointing at it, so the composer shows the
+ * project's own branch again. An adopted workspace was never the run
+ * directory, so it is simply detached; a workspace the app made held the
+ * thread's sessions, so they go too and the next message starts over, as after
+ * Remove workspace. Those wait while an agent is still running inside it.
+ */
+const releaseMissingDurangoWorkspaces = async (paths?: string[]) => {
+  const tracked = [
+    ...new Set(
+      useOrionStore
+        .getState()
+        .threads.flatMap((thread) => (thread.durangoWorkspace ? [thread.durangoWorkspace.path] : []))
+    ),
+  ].filter((path) => !paths || paths.includes(path));
+  if (tracked.length === 0 || !window.orion?.missingDurangoWorkspaces) return;
+  const missing = await window.orion.missingDurangoWorkspaces({ paths: tracked }).catch(() => []);
+  if (missing.length === 0) return;
+  const removedAt = new Date().toISOString();
+  let released = false;
+  for (const path of missing) {
+    const state = useOrionStore.getState();
+    const sharing = state.threads.filter((thread) => thread.durangoWorkspace?.path === path);
+    if (sharing.some((thread) => !thread.durangoWorkspace?.adopted && thread.status === 'running')) continue;
+    for (const thread of sharing) {
+      released = true;
+      if (thread.durangoWorkspace?.adopted) {
+        state.updateThread(thread.id, { durangoWorkspace: undefined });
+        continue;
+      }
+      void window.orion.disposeAgentThread?.(thread.id);
+      state.updateThread(thread.id, {
+        durangoWorkspace: undefined,
+        durangoWorkspaceRemovedAt: removedAt,
+        agentSessionIds: undefined,
+        pendingForkProviders: undefined,
+      });
+    }
+  }
+  if (released) await flushOrionThreadsSave();
+};
+
+/**
+ * Agents create their workspace when they start real work (the
+ * durango-workspaces skill) and remove it once its change has landed. After
+ * each `ws new` / `ws rm` and at the end of a turn, the thread follows: the
+ * workspace the agent last made is attached (replacing an earlier one it
+ * made), so the header shows it with Land / Run dev server and deleting the
+ * thread cleans it up; one that is gone is released.
+ */
+const syncAgentWorkspace = async (threadId: string, messageId: string, turnOver: boolean) => {
+  const state = useOrionStore.getState();
+  const thread = state.threads.find((candidate) => candidate.id === threadId);
+  if (!thread) return;
+  const message = thread.messages.find((candidate) => candidate.id === messageId);
+  const last = lastWorkspaceCommand(message?.activities ?? [], turnOver);
+  const current = thread.durangoWorkspace;
+  if (
+    last?.action === 'new' &&
+    /^[a-z0-9][a-z0-9_-]{0,47}$/.test(last.name) &&
+    (!current || (current.adopted && current.name !== last.name)) &&
+    window.orion?.findDurangoWorkspace
+  ) {
+    const project = findProjectById(state, thread.projectId);
+    if (project && !isNoProjectId(project.id)) {
+      const result = await window.orion.findDurangoWorkspace({ projectPath: project.path, name: last.name }).catch(() => null);
+      const latest = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.durangoWorkspace;
+      if (result?.ok && result.workspace && (!latest || (latest.adopted && latest.path !== result.workspace.path))) {
+        useOrionStore.getState().updateThread(threadId, { durangoWorkspace: { ...result.workspace, adopted: true } });
+      }
+    }
+  }
+  const workspace = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.durangoWorkspace;
+  if (workspace) await releaseMissingDurangoWorkspaces([workspace.path]);
 };
 
 const getStoredThreadTitle = (threadId: string) =>
@@ -2389,6 +2460,19 @@ const App: React.FC = () => {
     [activeRunsByThread, clearActiveRun, deleteThread, disposeThreadRuntime]
   );
 
+  // A workspace removed outside its thread (by another thread's agent, or in a
+  // terminal) is released from every thread that still points at it.
+  useEffect(() => {
+    const check = () => void releaseMissingDurangoWorkspaces();
+    check();
+    const timer = window.setInterval(check, WORKSPACE_PRESENCE_POLL_MS);
+    window.addEventListener('focus', check);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', check);
+    };
+  }, []);
+
   // Removes a thread's Durango workspace (and with it, the workspace of every
   // branch or subagent sharing it). Their sessions were recorded inside it, so
   // they are cleared: the next message starts a fresh session in a new one.
@@ -3089,6 +3173,13 @@ const App: React.FC = () => {
     window.addEventListener('focus', onFocus);
     return () => window.removeEventListener('focus', onFocus);
   }, [refreshGitState]);
+
+  // An agent can switch branches (or leave its workspace) during a turn;
+  // re-read when the turn ends so the pill shows where the checkout is now.
+  const selectedThreadRunning = selectedThread?.status === 'running';
+  useEffect(() => {
+    if (!selectedThreadRunning) void refreshGitState();
+  }, [refreshGitState, selectedThreadRunning]);
 
   // Same stale-response race as refreshGitState: only the latest request may
   // write, so a slow read for the previous project can't repaint the cloud
@@ -4192,6 +4283,20 @@ const App: React.FC = () => {
         // that streamed before it (contentOffset), not before it.
         flushChunkBuffers();
         addActivityToThreadMessage(tracked.threadId, tracked.messageId, event.activity);
+        if (event.activity.status === 'done' || event.activity.exitCode !== undefined) {
+          // A keyed update may carry only the result; the command is on the row.
+          const { key } = event.activity;
+          const merged = key
+            ? useOrionStore
+                .getState()
+                .threads.find((thread) => thread.id === tracked.threadId)
+                ?.messages.find((message) => message.id === tracked.messageId)
+                ?.activities?.find((activity) => activity.key === key)
+            : undefined;
+          if (activityRanWorkspaceCommand(merged ?? event.activity)) {
+            void syncAgentWorkspace(tracked.threadId, tracked.messageId, false);
+          }
+        }
       }
 
       if (event.type === 'session' && event.sessionId && event.providerId) {
@@ -4238,7 +4343,7 @@ const App: React.FC = () => {
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
         });
-        void adoptAgentWorkspace(tracked.threadId, tracked.messageId);
+        void syncAgentWorkspace(tracked.threadId, tracked.messageId, true);
         if (discardableShellTasks.length > 0) {
           const content = `Left running in the background: ${discardableShellTasks.join('; ')}`;
           const existingMonitor = [...(useOrionStore.getState().threads.find(
@@ -8932,6 +9037,7 @@ const App: React.FC = () => {
             workspace={activeDurangoWorkspace}
             disabled={repositoryOperationBusy || activeWorkspaceUnavailable}
             onRemove={() => void handleRemoveThreadWorkspace(selectedThread.id)}
+            onMissing={() => void releaseMissingDurangoWorkspaces([activeDurangoWorkspace.path])}
           />
         )}
         {!activeDurangoWorkspace && (
