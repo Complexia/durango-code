@@ -4113,8 +4113,7 @@ const App: React.FC = () => {
         });
         void adoptAgentWorkspace(tracked.threadId, tracked.messageId);
         if (discardableShellTasks.length > 0) {
-          const count = discardableShellTasks.length;
-          const content = `Claude finished its response. ${count === 1 ? 'A background shell process is' : `${count} background shell processes are`} still running as ${count === 1 ? 'a monitor' : 'monitors'}, but ${count === 1 ? 'it does' : 'they do'} not keep the turn open. Stop ${count === 1 ? 'it' : 'them'} here when ${count === 1 ? 'it is' : 'they are'} no longer needed.`;
+          const content = `Left running in the background: ${discardableShellTasks.join('; ')}`;
           const existingMonitor = [...(useOrionStore.getState().threads.find(
             (thread) => thread.id === tracked.threadId
           )?.messages ?? [])]

@@ -3621,84 +3621,58 @@ body {
   text-align: center;
 }
 
-.message.system.claude-background-intervention {
-  align-self: stretch;
-  width: 100%;
-  max-width: 100%;
-  padding: 14px 16px;
-  text-align: left;
-  color: var(--text-primary);
-  border-color: rgb(245 158 11 / 28%);
-  background: linear-gradient(135deg, rgb(245 158 11 / 8%), var(--bg-surface));
-}
-
-.claude-background-intervention-heading {
+.message.system.claude-background-shells {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 7px;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.claude-background-intervention-heading svg {
-  color: rgb(245 158 11);
-}
-
-.claude-background-intervention-copy {
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-.claude-background-intervention-tasks {
-  display: grid;
-  gap: 4px;
-  margin: 10px 0;
+  align-self: stretch;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 13px;
+  text-align: left;
+  animation: none;
 }
 
-.claude-background-intervention-tasks > div {
+.claude-background-shells svg {
+  flex-shrink: 0;
+}
+
+.claude-background-shells-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.claude-background-intervention-action {
-  border: 1px solid rgb(245 158 11 / 35%);
-  border-radius: var(--radius-sm);
-  padding: 7px 11px;
-  background: rgb(245 158 11 / 12%);
-  color: var(--text-primary);
+.claude-background-shells-label code {
+  font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 600;
-  transition: background 120ms ease, border-color 120ms ease;
+  color: var(--text-secondary);
 }
 
-.claude-background-intervention-action:hover:not(:disabled) {
-  border-color: rgb(245 158 11 / 55%);
-  background: rgb(245 158 11 / 18%);
+.claude-background-shells-error {
+  flex-shrink: 0;
+  color: var(--danger);
 }
 
-.claude-background-intervention-action:disabled {
-  cursor: progress;
-  opacity: 0.65;
-}
-
-.claude-background-intervention-result {
-  margin-top: 9px;
+.claude-background-shells-stop {
+  flex-shrink: 0;
+  margin-left: auto;
   color: var(--text-secondary);
   font-size: 12px;
+  font-weight: 500;
 }
 
-.claude-background-intervention-result.success {
-  color: rgb(110 196 140);
+.claude-background-shells-stop:hover:not(:disabled) {
+  color: var(--text-primary);
 }
 
-.claude-background-intervention-result.error {
-  color: var(--danger);
+.claude-background-shells-stop:disabled {
+  cursor: progress;
+  opacity: 0.65;
 }
 
 /* Welcome hero */

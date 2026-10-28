@@ -14,6 +14,7 @@ import {
   finalizeClaudeTurn,
   handleClaudeSessionMessage,
   pendingClaudeBackgroundTasks,
+  setClaudeBackgroundTasksAwaited,
   stopClaudeBackgroundTasks,
   steerClaudeSdkRun,
 } from '../src/main/claude-driver.js';
@@ -761,6 +762,67 @@ assert.equal(
   claudeBackgroundRunSessions.get('run-monitored-turn'),
   monitoredTurn.session,
   'A completed monitored turn must retain a handle for the explicit stop action'
+);
+
+const awaitedShell = createSession({
+  threadId: 'thread-awaited-shell',
+  runId: 'run-awaited-shell',
+});
+awaitedShell.session.resultsOwed = 0;
+awaitedShell.session.backgroundTasks = new Map([
+  ['bash-release', { taskType: 'local_bash', description: 'desktop release: signing, notarization' }],
+  ['bash-dev', { taskType: 'local_bash', description: 'dev server' }],
+]);
+assert.deepEqual(
+  setClaudeBackgroundTasksAwaited(awaitedShell.session, ['bash-release', 'bash-typo']),
+  { matched: ['bash-release'], unmatched: ['bash-typo'] },
+  'Only live background tasks can be awaited'
+);
+assert.deepEqual(pendingClaudeBackgroundTasks(awaitedShell.session), ['desktop release: signing, notarization']);
+assert.deepEqual(
+  discardableClaudeBackgroundShellTasks(awaitedShell.session),
+  [],
+  'An awaited shell is work the model rejoins, not a disposable monitor'
+);
+claudeSdkSessions.set(awaitedShell.session.threadId, awaitedShell.session);
+await finalizeClaudeTurn(awaitedShell.session, { usage: { input_tokens: 2, output_tokens: 1 } });
+assert.equal(awaitedShell.events[0]?.type, 'done');
+assert.deepEqual(
+  awaitedShell.events[0]?.pendingBackgroundTasks,
+  ['desktop release: signing, notarization'],
+  'A turn that ends while an awaited shell runs must keep the thread working'
+);
+assert.equal(awaitedShell.events[0]?.pendingBackgroundShellTasks, undefined);
+const sessionsBeforeEviction = [...claudeSdkSessions];
+claudeSdkSessions.clear();
+claudeSdkSessions.set(awaitedShell.session.threadId, awaitedShell.session);
+evictIdleClaudeSdkSessions(Date.now() + CLAUDE_SESSION_IDLE_EVICT_MS + 1);
+assert.equal(awaitedShell.session.ended, false, 'An awaited shell keeps its Claude runtime alive');
+for (const [threadId, session] of sessionsBeforeEviction) claudeSdkSessions.set(threadId, session);
+await handleClaudeSessionMessage(awaitedShell.session, {
+  type: 'system',
+  subtype: 'background_tasks_changed',
+  tasks: [{ task_id: 'bash-dev', task_type: 'local_bash', description: 'dev server' }],
+});
+assert.equal(
+  awaitedShell.session.awaitedBackgroundTaskIds.has('bash-release'),
+  false,
+  'A finished awaited shell is forgotten'
+);
+assert.deepEqual(pendingClaudeBackgroundTasks(awaitedShell.session), []);
+assert.deepEqual(
+  setClaudeBackgroundTasksAwaited(awaitedShell.session, ['bash-dev']),
+  { matched: ['bash-dev'], unmatched: [] }
+);
+setClaudeBackgroundTasksAwaited(awaitedShell.session, ['bash-dev'], false);
+assert.deepEqual(pendingClaudeBackgroundTasks(awaitedShell.session), [], 'waiting: false releases the hold');
+if (awaitedShell.session.backgroundSettleTimer) clearTimeout(awaitedShell.session.backgroundSettleTimer);
+claudeSdkSessions.delete(awaitedShell.session.threadId);
+
+assert.match(
+  claudeDriverSource,
+  /preset: 'claude_code',\s*append: \[CLAUDE_BACKGROUND_WAIT_TIP/,
+  'Every Claude SDK session learns when to call wait_for_background_tasks'
 );
 
 const nativeStops = [];

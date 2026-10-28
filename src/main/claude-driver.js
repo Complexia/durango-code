@@ -97,6 +97,16 @@ export const retainClaudeBackgroundRun = (session, runId) => {
   claudeBackgroundRunSessions.set(runId, session);
 };
 
+// Claude only: other providers have no background-task roster to attach to.
+export const WAIT_FOR_BACKGROUND_TASKS_DESCRIPTION =
+  'Keep this Durango Code thread in Working while background commands you are waiting on run. Call it right after starting a background Bash command (run_in_background) whose result you will act on, such as a build, deploy, release, test run, or a wait-until loop, passing the task id it printed. When the command finishes you are re-invoked with its result, and the thread reads as Working the whole time instead of finished. Do not use it for work you leave running (dev servers, watchers, log tails). `waiting: false` stops waiting without stopping the command.';
+
+// The tool is usually deferred (only its name is listed), so say when to use it.
+export const CLAUDE_BACKGROUND_WAIT_TIP = [
+  '# Background commands (Durango Code)',
+  'When you start a background Bash command (run_in_background) and will wait for its result before you are done, such as a build, deploy, release, test run or a wait-until loop, call mcp__orion__wait_for_background_tasks with its task id right after starting it. Durango Code then keeps the thread Working until it finishes and you are re-invoked. Without it, ending your turn shows the thread as finished while you are still waiting. Skip it for work you leave running (dev servers, watchers).',
+].join('\n');
+
 // In-process MCP server offered to every Claude SDK session (not only
 // orchestrator ones — @-mentions can request delegation from any thread).
 // The tool asks the renderer to spawn a subthread on another model and
@@ -234,6 +244,41 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
           // mutates nothing. Mirrored in mcp-bridge-shim.cjs; keep in sync.
           annotations: { readOnlyHint: true },
         }
+      ),
+      tool(
+        'wait_for_background_tasks',
+        WAIT_FOR_BACKGROUND_TASKS_DESCRIPTION,
+        {
+          task_ids: z
+            .array(z.string())
+            .min(1)
+            .max(20)
+            .describe('Background task ids, as printed when the command started ("running in background with ID: …")'),
+          waiting: z
+            .boolean()
+            .optional()
+            .describe('false stops waiting on these tasks (they keep running); default true'),
+        },
+        async ({ task_ids: taskIds, waiting = true }) => {
+          const { matched, unmatched } = setClaudeBackgroundTasksAwaited(session, taskIds, waiting);
+          const lines = [];
+          if (matched.length > 0) {
+            lines.push(
+              waiting
+                ? `Waiting on ${matched.join(', ')}: the thread stays Working until ${matched.length === 1 ? 'it finishes' : 'they finish'} and you are re-invoked with the result.`
+                : `No longer waiting on ${matched.join(', ')}. ${matched.length === 1 ? 'It keeps' : 'They keep'} running.`
+            );
+          }
+          if (unmatched.length > 0) {
+            lines.push(`No running background task has the id ${unmatched.join(', ')}.`);
+          }
+          return {
+            content: [{ type: 'text', text: lines.join('\n') }],
+            ...(matched.length === 0 ? { isError: true } : {}),
+          };
+        },
+        // Only changes how Durango Code presents this thread's own turn.
+        { annotations: { readOnlyHint: true } }
       ),
       // Durango Chat tools (durango-tools.js). Mirrored in mcp-bridge-shim.cjs
       // for the other providers; test-durango-tools.mjs keeps them in sync.
@@ -618,7 +663,9 @@ export const flushPendingClaudeTaskNotifications = (session, turn) => {
 // to rejoin. Agent/workflow completion re-invokes the model, so those tasks
 // keep Orion working between turns. A local_bash dev server, log tail, or
 // monitor can intentionally run forever: keep it visible and stoppable, but
-// never let it pin the completed turn or the persistent SDK session forever.
+// never let it pin the completed turn or the persistent SDK session forever —
+// unless the model declared it waits on that shell (wait_for_background_tasks),
+// which only it can know.
 const liveClaudeBackgroundTasks = (session) =>
   [...session.backgroundTasks.entries()].filter(
     ([taskId]) => !session.skipTranscriptTaskIds.has(taskId)
@@ -630,17 +677,38 @@ const liveClaudeBackgroundTasks = (session) =>
 const CLAUDE_BACKGROUND_SHELL_TASK_TYPES = new Set(['local_bash', 'bash', 'shell']);
 const isClaudeBackgroundShellTask = (task) =>
   CLAUDE_BACKGROUND_SHELL_TASK_TYPES.has(task.taskType);
+const claudeBackgroundTaskHoldsTurn = (session, taskId, task) =>
+  !isClaudeBackgroundShellTask(task) || Boolean(session.awaitedBackgroundTaskIds?.has(taskId));
 
 export const pendingClaudeBackgroundTasks = (session) =>
   liveClaudeBackgroundTasks(session)
-    .filter(([, task]) => !isClaudeBackgroundShellTask(task))
+    .filter(([taskId, task]) => claudeBackgroundTaskHoldsTurn(session, taskId, task))
     .map(([, task]) => task.description);
+
+// wait_for_background_tasks: mark (or unmark) live background shells as work
+// the model rejoins when they finish. Unknown ids are reported back so the
+// model can correct a typo instead of silently ending its turn.
+export const setClaudeBackgroundTasksAwaited = (session, taskIds, waiting = true) => {
+  session.awaitedBackgroundTaskIds ??= new Set();
+  const matched = [];
+  const unmatched = [];
+  for (const taskId of new Set(taskIds)) {
+    if (!session.backgroundTasks.has(taskId)) {
+      unmatched.push(taskId);
+      continue;
+    }
+    matched.push(taskId);
+    if (waiting) session.awaitedBackgroundTaskIds.add(taskId);
+    else session.awaitedBackgroundTaskIds.delete(taskId);
+  }
+  return { matched, unmatched };
+};
 
 export const discardableClaudeBackgroundShellTasks = (session) => {
   const liveTasks = liveClaudeBackgroundTasks(session);
   if (
     liveTasks.length === 0 ||
-    liveTasks.some(([, task]) => !isClaudeBackgroundShellTask(task))
+    liveTasks.some(([taskId, task]) => claudeBackgroundTaskHoldsTurn(session, taskId, task))
   ) {
     return [];
   }
@@ -1036,6 +1104,10 @@ export const handleClaudeSessionMessage = async (session, message) => {
         },
       ])
     );
+    // An awaited shell that left the live set is no longer waited on.
+    for (const taskId of session.awaitedBackgroundTaskIds ?? []) {
+      if (!session.backgroundTasks.has(taskId)) session.awaitedBackgroundTaskIds.delete(taskId);
+    }
     // A tracked subagent that left the live set without a terminal signal
     // (its notification was suppressed) still has to settle in the UI.
     if (session.subagentTracker) {
@@ -1428,6 +1500,7 @@ export const createClaudeSdkSession = ({
     // interruptClaudeSdkRun, which uses it to recover instead of interrupting.
     resultsOwed: 0,
     backgroundTasks: new Map(), // task_id -> { taskType, description }
+    awaitedBackgroundTaskIds: new Set(), // shells the model waits on (wait_for_background_tasks)
     skipTranscriptTaskIds: new Set(),
     // Native subagents (Agent/Task tool): created lazily on first spawn.
     subagentTracker: null,
@@ -1487,9 +1560,10 @@ export const createClaudeSdkSession = ({
         : [
             ...new Set([
               ...sdkOptions.allowedTools,
-              ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode).map(
-                (name) => `mcp__orion__${name}`
-              ),
+              ...[
+                ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode),
+                'wait_for_background_tasks',
+              ].map((name) => `mcp__orion__${name}`),
             ]),
           ];
     session.query = sdk.query({
@@ -1519,7 +1593,7 @@ export const createClaudeSdkSession = ({
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          ...(chromeEnabled ? { append: CLAUDE_CHROME_BROWSER_TIPS } : {}),
+          append: [CLAUDE_BACKGROUND_WAIT_TIP, ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : [])].join('\n\n'),
         },
         // Match the CLI's behavior: without this the SDK loads no user or
         // project settings — no CLAUDE.md, no skills, no MCP servers.

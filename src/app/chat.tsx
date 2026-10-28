@@ -431,46 +431,30 @@ export const ChatMessage = React.memo(function ChatMessage({
   const backgroundIntervention = message.claudeBackgroundIntervention;
 
   if (message.kind === 'claude-background-intervention' && backgroundIntervention) {
-    const busy = backgroundIntervention.status === 'stopping';
-    const actionable =
-      backgroundIntervention.status === 'pending' ||
-      backgroundIntervention.status === 'stopping' ||
-      backgroundIntervention.status === 'error';
-    const taskCount = backgroundIntervention.tasks.length;
+    // Background shells the finished turn left running (dev servers, watchers),
+    // as in T3 Code: one quiet line with a Stop action, gone once they end on
+    // their own. Shells the agent waits on never get here: they keep the turn
+    // Working (wait_for_background_tasks).
+    const { status, tasks, error } = backgroundIntervention;
+    if (status === 'settled') return null;
+    const only = tasks.length === 1 ? tasks[0] : null;
     return (
-      <div className="message system claude-background-intervention">
-        <div className="claude-background-intervention-heading">
-          <Terminal size={15} />
-          <span>Durango Code · Background monitors still running</span>
-        </div>
-        <div className="claude-background-intervention-copy">{message.content}</div>
-        <div className="claude-background-intervention-tasks">
-          {backgroundIntervention.tasks.slice(0, 3).map((task, index) => (
-            <div key={`${index}:${task}`} title={task}>{task}</div>
-          ))}
-          {taskCount > 3 && <div>+{taskCount - 3} more shell processes</div>}
-        </div>
-        {actionable && onDiscardClaudeBackgroundTasks && (
+      <div className="message system claude-background-shells" title={tasks.join('\n')}>
+        <Terminal size={13} />
+        <span className="claude-background-shells-label">
+          {status === 'stopped' ? 'Stopped ' : 'Running '}
+          {only ? <code>{only}</code> : `${tasks.length} background commands`}
+        </span>
+        {status === 'error' && error && <span className="claude-background-shells-error">{error}</span>}
+        {status !== 'stopped' && onDiscardClaudeBackgroundTasks && (
           <button
             type="button"
-            className="claude-background-intervention-action"
-            disabled={busy}
+            className="claude-background-shells-stop"
+            disabled={status === 'stopping'}
             onClick={() => onDiscardClaudeBackgroundTasks(message.id, backgroundIntervention.runId)}
           >
-            {busy ? 'Stopping background monitors…' : 'Stop background monitors'}
+            {status === 'stopping' ? 'Stopping…' : 'Stop'}
           </button>
-        )}
-        {backgroundIntervention.status === 'stopping' && (
-          <div className="claude-background-intervention-result">Stopping the remaining Claude shell monitors…</div>
-        )}
-        {backgroundIntervention.status === 'stopped' && (
-          <div className="claude-background-intervention-result success">Background processes stopped. The completed response and file changes were preserved.</div>
-        )}
-        {backgroundIntervention.status === 'settled' && (
-          <div className="claude-background-intervention-result success">The background processes finished on their own.</div>
-        )}
-        {backgroundIntervention.status === 'error' && backgroundIntervention.error && (
-          <div className="claude-background-intervention-result error">{backgroundIntervention.error}</div>
         )}
       </div>
     );

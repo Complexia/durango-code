@@ -108,8 +108,8 @@ assert.match(
 );
 assert.match(
   chatSource,
-  /Stop background monitors[\s\S]*onDiscardClaudeBackgroundTasks/,
-  'The monitor card must expose an explicit stop action in the transcript'
+  /claude-background-shells-stop[\s\S]*onDiscardClaudeBackgroundTasks\(message\.id/,
+  'The background-shells row must expose an explicit stop action in the transcript'
 );
 assert.match(
   mainSource,

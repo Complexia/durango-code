@@ -150,7 +150,7 @@ resetClaudeChromeLeaseForTests();
 }
 
 const driverSource = await fs.readFile(new URL('../src/main/claude-driver.js', import.meta.url), 'utf8');
-assert.match(driverSource, /append: CLAUDE_CHROME_BROWSER_TIPS/, 'SDK sessions with Chrome get the browser tips');
+assert.match(driverSource, /chromeEnabled \? \[CLAUDE_CHROME_BROWSER_TIPS\]/, 'SDK sessions with Chrome get the browser tips');
 assert.match(driverSource, /hooks: claudeChromeLeaseHooks\(session/, 'SDK sessions with Chrome take the cross-thread lease');
 const commandSource = await fs.readFile(new URL('../src/main/command-for-model.js', import.meta.url), 'utf8');
 assert.match(commandSource, /\['--chrome', '--append-system-prompt', CLAUDE_CHROME_BROWSER_TIPS\]/, 'one-shot Chrome runs get the browser tips');
