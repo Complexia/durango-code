@@ -1,7 +1,7 @@
 {
   "name": "orion",
   "productName": "Durango Code",
-  "version": "1.0.154",
+  "version": "1.0.155",
   "description": "Durango Code - Agentic IDE",
   "main": ".vite/build/main.js",
   "desktopName": "durango-code.desktop",
