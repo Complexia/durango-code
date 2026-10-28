@@ -12,7 +12,7 @@
         "@xterm/addon-fit": "^0.11.0",
         "@xterm/xterm": "^6.0.0",
         "date-fns": "^4.4.0",
-        "durango-code": "0.8.6",
+        "durango-code": "0.8.9",
         "electron-squirrel-startup": "^1.0.1",
         "electron-updater": "^6.8.9",
         "lucide-react": "^1.21.0",
@@ -762,7 +762,7 @@
 
     "dunder-proto": ["dunder-proto@1.0.1", "", { "dependencies": { "call-bind-apply-helpers": "^1.0.1", "es-errors": "^1.3.0", "gopd": "^1.2.0" } }, "sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A=="],
 
-    "durango-code": ["durango-code@0.8.6", "", { "bin": { "ds": "dist/index.js", "orion-cli": "dist/index.js", "orion-cloud": "dist/index.js", "durango-code": "dist/index.js", "durango-source": "dist/index.js" } }, "sha512-9pw8l9BxWN4AuxoMonE6sKq4fQ4trrd1+cpZWniWyAYiB73IzEhpAOboGp/wHwafPEFc2E+85SGUC8FO+uBf2w=="],
+    "durango-code": ["durango-code@0.8.9", "", { "bin": { "ds": "dist/index.js", "orion-cli": "dist/index.js", "orion-cloud": "dist/index.js", "durango-code": "dist/index.js", "durango-source": "dist/index.js" } }, "sha512-BYcUwW3otHpvfn2YBxHVZbRwLJWu+zb9JGnQMHtILUz6pSeLuGkjTX1AlrztfKttjCzxPQIOZleow/iB3u0/vQ=="],
 
     "eastasianwidth": ["eastasianwidth@0.2.0", "", {}, "sha512-I88TYZWc9XiYHRQ4/3c5rjjfgkjhLyW2luGIheGERbNQ6OY7yTybanSpDXZa8y7VUP9YmDcYa+eyq4ca7iLqWA=="],
 
