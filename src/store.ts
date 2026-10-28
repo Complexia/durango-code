@@ -367,6 +367,13 @@ export type Message = {
   linkedTasks?: Array<Pick<LinkedBoardTask, 'id' | 'title' | 'description'>>;
 };
 
+/**
+ * The caption of a Claude turn that finished while the agent still waits on
+ * background tasks (waitingOnBackgroundStatusText in App.tsx; keep the two in
+ * sync). The thread stays Working until the follow-up turn.
+ */
+export const WAITING_ON_BACKGROUND_CAPTION = /^Waiting on (\d+ background (?:agents?|tasks?)|background task)\b.*…$/;
+
 export type QueuedMessage = {
   id: string;
   text: string;
@@ -2459,9 +2466,9 @@ export const useOrionStore = create<OrionState>()(
         // event or the synthetic follow-up turn finishing) flips the thread
         // off 'running' but leaves the old caption behind as history, and
         // history must not be rebranded as a restart casualty. The first
-        // alternation matches captions persisted by older builds ("Waiting on
-        // N background agents…").
-        const waitingOnBackground = /^Waiting on (\d+ background (?:agents?|tasks?)|background task)\b.*…$/;
+        // alternation of the pattern matches captions persisted by older
+        // builds ("Waiting on N background agents…").
+        const waitingOnBackground = WAITING_ON_BACKGROUND_CAPTION;
         merged.threads = merged.threads.map((thread) => {
           // Threads used to carry a single board task; they now carry a list.
           thread = migrateLegacyLinkedTask(thread);

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Thread } from '../store';
+import { WAITING_ON_BACKGROUND_CAPTION, type Message, type Thread } from '../store';
 import { getThreadActivityTime } from './time';
 
 export type SidebarV2View = 'pinned' | 'recent' | 'snoozed' | 'settled';
@@ -76,6 +76,27 @@ export const sidebarV2RecentRank = (thread: Thread, attentionSince?: number) => 
 export const compareSidebarV2Recent =
   (attentionSince: ReadonlyMap<string, number>) => (a: Thread, b: Thread) =>
     sidebarV2RecentRank(b, attentionSince.get(b.id)) - sidebarV2RecentRank(a, attentionSince.get(a.id));
+
+/**
+ * When the work leading up to `message` (an agent run) began: the user's
+ * message before it. Turns the agent was re-invoked for while it waited on
+ * background tasks (the thread stayed Working) count as the same stretch, so
+ * a release that finishes in a follow-up turn still counts from the request.
+ * A run that follows one that finished outright (a scheduled wake-up) starts
+ * its own stretch.
+ */
+export const workStartedAt = (messages: Message[], message: Message) => {
+  const index = messages.indexOf(message);
+  let since = Date.parse(message.startedAt ?? message.ts);
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const earlier = messages[i];
+    if (earlier.role === 'user') return Math.min(since, Date.parse(earlier.ts));
+    if (earlier.kind !== 'agent-run') continue;
+    if (!WAITING_ON_BACKGROUND_CAPTION.test(earlier.statusText ?? '')) break;
+    since = Date.parse(earlier.startedAt ?? earlier.ts);
+  }
+  return since;
+};
 
 /**
  * How long a thread's agents have worked: the sum of its runs, from start to

@@ -14,6 +14,7 @@ import {
   ThreadReferenceText,
 } from './markdown';
 import { linkedTaskStatusLabel } from './promptContext';
+import { workStartedAt } from './threadLists';
 
 export const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ text, className }) => {
   const [copied, setCopied] = useState(false);
@@ -283,6 +284,11 @@ export const ProviderAuthPrompt: React.FC<{
   );
 };
 
+const workSinceIso = (messages: Message[], message: Message) => {
+  const since = workStartedAt(messages, message);
+  return Number.isFinite(since) ? new Date(since).toISOString() : undefined;
+};
+
 // "Working for 5s" while the run is live: its own ticking component, so the
 // memoized message around it doesn't re-render every second.
 const RunElapsed: React.FC<{ startedAt?: string; completedAt?: string; running: boolean }> = ({
@@ -300,16 +306,20 @@ const RunElapsed: React.FC<{ startedAt?: string; completedAt?: string; running: 
  * heads the live turn with its steps listed flat underneath; once it ends the
  * line reads "Worked for 8s ›" and the steps fold away behind it, leaving the
  * final answer. Stops, failures and background waits keep their status line.
+ * The time counts from the user's message (`workSince`), so a turn the agent
+ * was re-invoked for after a background wait includes the wait.
  */
 const AgentRunMessage: React.FC<{
   message: Message;
+  workSince?: string;
   runRunning?: boolean;
   btwExchanges: BtwExchange[];
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
-}> = ({ message, runRunning, btwExchanges, renderBtwAside, onAuthenticateProvider, authenticatingProviderId }) => {
+}> = ({ message, workSince, runRunning, btwExchanges, renderBtwAside, onAuthenticateProvider, authenticatingProviderId }) => {
   const isRunning = message.status === 'running';
+  const startedAt = workSince ?? message.startedAt;
   const [stepsOpen, setStepsOpen] = useState(false);
   const hasContent = message.content.trim().length > 0;
   const activities = message.activities ?? [];
@@ -341,13 +351,13 @@ const AgentRunMessage: React.FC<{
               aria-expanded={stepsOpen}
               title={stepsOpen ? 'Hide the steps' : 'Show the steps'}
             >
-              Worked for <RunElapsed startedAt={message.startedAt} completedAt={message.completedAt} running={false} />
+              Worked for <RunElapsed startedAt={startedAt} completedAt={message.completedAt} running={false} />
               <ChevronRight size={14} className={`agent-run-header-chevron${stepsOpen ? ' open' : ''}`} />
             </button>
           ) : (
             <span>
               {isRunning ? 'Working for ' : 'Worked for '}
-              <RunElapsed startedAt={message.startedAt} completedAt={message.completedAt} running={isRunning} />
+              <RunElapsed startedAt={startedAt} completedAt={message.completedAt} running={isRunning} />
             </span>
           )}
         </div>
@@ -399,6 +409,8 @@ const AgentRunMessage: React.FC<{
 
 export type ChatMessageProps = {
   message: Message;
+  /** An agent run's work start (ISO): the user's message it answers, see workStartedAt. */
+  workSince?: string;
   /** Whether work owned by this turn is still live, including background agents. */
   runRunning?: boolean;
   /** The thread's currently linked tasks, for live status on the message's task chips. */
@@ -415,6 +427,7 @@ export type ChatMessageProps = {
 
 export const ChatMessage = React.memo(function ChatMessage({
   message,
+  workSince,
   runRunning,
   liveTasks,
   taskBusy,
@@ -465,6 +478,7 @@ export const ChatMessage = React.memo(function ChatMessage({
     return (
       <AgentRunMessage
         message={message}
+        workSince={workSince}
         runRunning={runRunning}
         btwExchanges={btwExchanges}
         renderBtwAside={renderBtwAside}
@@ -905,6 +919,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
               <React.Fragment key={message.id}>
                 <ChatMessage
                   message={message}
+                  workSince={message.kind === 'agent-run' ? workSinceIso(thread.messages, message) : undefined}
                   runRunning={
                     message.status === 'running' ||
                     (message.id === latestAgentRun?.id && thread.status === 'running')

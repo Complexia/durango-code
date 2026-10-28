@@ -14,7 +14,7 @@ Object.assign(globalThis, {
   window: { addEventListener() {}, localStorage: { getItem: () => null }, orion: bridge },
 });
 const { useOrionStore, defaultSidebarV2Settings } = await import('../src/store');
-const { compareSidebarV2Recent, formatWorkedDuration, sidebarV2ThreadLists, threadSidebarTone, threadWorkedMs } =
+const { compareSidebarV2Recent, formatWorkedDuration, sidebarV2ThreadLists, threadSidebarTone, threadWorkedMs, workStartedAt } =
   await import('../src/app/threadLists');
 const { projectMonogram } = await import('../src/app/ProjectBadge');
 
@@ -166,6 +166,27 @@ const runThread = {
   ],
 } as typeof base;
 assert.equal(threadWorkedMs(runThread, Date.parse('2026-10-28T00:10:05.000Z')), 12_000);
+// Working time counts from the user's message, through turns the agent was
+// re-invoked for after a background wait, but not past a turn that finished.
+const waitThread = [
+  { id: 'u0', role: 'user', content: 'earlier', ts: '2026-10-28T00:00:00.000Z' },
+  { id: 'w0', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-28T00:00:01.000Z', status: 'done',
+    statusText: 'Finished.', startedAt: '2026-10-28T00:00:01.000Z', completedAt: '2026-10-28T00:00:05.000Z' },
+  { id: 'u1', role: 'user', content: 'release it', ts: '2026-10-28T00:10:00.000Z' },
+  { id: 'w1', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-28T00:10:01.000Z', status: 'done',
+    statusText: 'Waiting on background task: Run desktop release…', startedAt: '2026-10-28T00:10:01.000Z',
+    completedAt: '2026-10-28T00:10:21.000Z' },
+  { id: 'm1', role: 'system', kind: 'claude-background-intervention', content: '', ts: '2026-10-28T00:10:21.000Z' },
+  { id: 'w2', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-28T00:26:00.000Z', status: 'done',
+    statusText: 'Finished.', startedAt: '2026-10-28T00:26:00.000Z', completedAt: '2026-10-28T00:27:00.000Z' },
+  { id: 'w3', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-28T01:00:00.000Z', status: 'running',
+    startedAt: '2026-10-28T01:00:00.000Z' },
+] as typeof base.messages;
+const workStart = (id: string) => workStartedAt(waitThread, waitThread.find((message) => message.id === id)!);
+assert.equal(workStart('w1'), Date.parse('2026-10-28T00:10:00.000Z'), 'a run counts from the user message');
+assert.equal(workStart('w2'), Date.parse('2026-10-28T00:10:00.000Z'), 'the turn after a background wait too');
+assert.equal(workStart('w3'), Date.parse('2026-10-28T01:00:00.000Z'), 'a wake-up after a finished turn starts afresh');
+
 assert.equal(formatWorkedDuration(7_000), '7s');
 assert.equal(formatWorkedDuration(38 * 60_000), '38m');
 assert.equal(formatWorkedDuration(125 * 60_000), '2h 5m');
