@@ -3,6 +3,8 @@ import { app } from 'electron';
 import { readFile } from 'node:fs/promises';
 
 import {
+  CLAUDE_BACKGROUND_CHECK_IN_DEFAULT_S,
+  CLAUDE_BACKGROUND_CHECK_IN_MAX_S,
   CLAUDE_SESSION_IDLE_EVICT_MS,
   claudeBackgroundRunSessions,
   claudeSdkSessions,
@@ -14,9 +16,11 @@ import {
   finalizeClaudeTurn,
   handleClaudeSessionMessage,
   pendingClaudeBackgroundTasks,
+  runClaudeBackgroundCheckIn,
   setClaudeBackgroundTasksAwaited,
   stopClaudeBackgroundTasks,
   steerClaudeSdkRun,
+  updateClaudeBackgroundCheckIn,
 } from '../src/main/claude-driver.js';
 import {
   codexSteerableRunDrivers,
@@ -818,6 +822,75 @@ setClaudeBackgroundTasksAwaited(awaitedShell.session, ['bash-dev'], false);
 assert.deepEqual(pendingClaudeBackgroundTasks(awaitedShell.session), [], 'waiting: false releases the hold');
 if (awaitedShell.session.backgroundSettleTimer) clearTimeout(awaitedShell.session.backgroundSettleTimer);
 claudeSdkSessions.delete(awaitedShell.session.threadId);
+
+// A shell can outlive its work (npm publish fed by `(sleep 4; printf '\n';
+// sleep 840) | script …` kept the thread waiting 14 minutes after npm exited).
+// While the model idles on an awaited shell, Durango Code re-invokes it to
+// check on the shell, backing off between check-ins.
+const checkIn = createSession({
+  threadId: 'thread-check-in',
+  runId: 'run-check-in',
+  retained: true,
+});
+clearTimeout(checkIn.session.backgroundSettleTimer);
+checkIn.session.backgroundSettleTimer = null;
+checkIn.session.resultsOwed = 0;
+checkIn.session.awaitedBackgroundTaskIds = new Set();
+checkIn.session.backgroundTasks = new Map([
+  ['bash-publish', { taskType: 'local_bash', description: 'Publish to npm in a pty' }],
+]);
+claudeSdkSessions.set(checkIn.session.threadId, checkIn.session);
+claudeBackgroundRunSessions.set('run-check-in', checkIn.session);
+setClaudeBackgroundTasksAwaited(checkIn.session, ['bash-publish']);
+updateClaudeBackgroundCheckIn(checkIn.session);
+assert.equal(
+  checkIn.session.backgroundCheckIn?.delayMs,
+  CLAUDE_BACKGROUND_CHECK_IN_DEFAULT_S * 1000,
+  'Waiting on a shell arms a default check-in'
+);
+const firstCheckInTimer = checkIn.session.backgroundCheckIn.timer;
+updateClaudeBackgroundCheckIn(checkIn.session);
+assert.equal(
+  checkIn.session.backgroundCheckIn.timer,
+  firstCheckInTimer,
+  'A repeated wait without check_in_seconds keeps the armed schedule'
+);
+updateClaudeBackgroundCheckIn(checkIn.session, 60_000);
+assert.equal(checkIn.session.backgroundCheckIn.delayMs, 60_000, 'check_in_seconds re-arms the check-in');
+
+runClaudeBackgroundCheckIn(checkIn.session);
+assert.equal(checkIn.pushed.length, 1, 'An idle thread is re-invoked to check on the shell');
+assert.match(checkIn.pushed[0], /\[Durango Code check-in\]/);
+assert.match(checkIn.pushed[0], /bash-publish: Publish to npm in a pty/);
+assert.match(checkIn.pushed[0], /next check-in is in 2m/);
+assert.equal(checkIn.session.activeTurns.length, 1, 'The check-in owns a real turn');
+assert.equal(checkIn.session.resultsOwed, 1);
+assert.equal(checkIn.events[0]?.type, 'started');
+assert.equal(checkIn.events[0]?.runId, 'run-check-in', 'The check-in continues the retained run');
+assert.equal(checkIn.session.backgroundCheckIn.delayMs, 120_000, 'Check-ins back off');
+
+// Busy: the model sees its tasks itself, so only reschedule.
+runClaudeBackgroundCheckIn(checkIn.session);
+assert.equal(checkIn.pushed.length, 1, 'A busy thread is not interrupted by a check-in');
+assert.equal(checkIn.session.backgroundCheckIn.delayMs, 240_000);
+updateClaudeBackgroundCheckIn(checkIn.session, CLAUDE_BACKGROUND_CHECK_IN_MAX_S * 1000);
+runClaudeBackgroundCheckIn(checkIn.session);
+assert.equal(
+  checkIn.session.backgroundCheckIn.delayMs,
+  CLAUDE_BACKGROUND_CHECK_IN_MAX_S * 1000,
+  'Backoff is capped'
+);
+
+await handleClaudeSessionMessage(checkIn.session, {
+  type: 'system',
+  subtype: 'background_tasks_changed',
+  tasks: [],
+});
+assert.equal(checkIn.session.backgroundCheckIn, null, 'A finished shell disarms its check-in');
+checkIn.session.activeTurns.splice(0);
+if (checkIn.session.backgroundSettleTimer) clearTimeout(checkIn.session.backgroundSettleTimer);
+claudeSdkSessions.delete(checkIn.session.threadId);
+claudeBackgroundRunSessions.delete('run-check-in');
 
 assert.match(
   claudeDriverSource,

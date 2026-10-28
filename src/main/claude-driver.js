@@ -99,12 +99,13 @@ export const retainClaudeBackgroundRun = (session, runId) => {
 
 // Claude only: other providers have no background-task roster to attach to.
 export const WAIT_FOR_BACKGROUND_TASKS_DESCRIPTION =
-  'Keep this Durango Code thread in Working while background commands you are waiting on run. Call it right after starting a background Bash command (run_in_background) whose result you will act on, such as a build, deploy, release, test run, or a wait-until loop, passing the task id it printed. When the command finishes you are re-invoked with its result, and the thread reads as Working the whole time instead of finished. Do not use it for work you leave running (dev servers, watchers, log tails). `waiting: false` stops waiting without stopping the command.';
+  'Keep this Durango Code thread in Working while background commands you are waiting on run. Call it right after starting a background Bash command (run_in_background) whose result you will act on, such as a build, deploy, release, test run, or a wait-until loop, passing the task id it printed. When the command finishes you are re-invoked with its result, and the thread reads as Working the whole time instead of finished. Do not use it for work you leave running (dev servers, watchers, log tails). While the thread idles on a command that is still running, Durango Code re-invokes you to check on it (after check_in_seconds, then at doubling intervals), so a command that finished its work but has not exited does not hold the thread. `waiting: false` stops waiting without stopping the command.';
 
 // The tool is usually deferred (only its name is listed), so say when to use it.
 export const CLAUDE_BACKGROUND_WAIT_TIP = [
   '# Background commands (Durango Code)',
   'When you start a background Bash command (run_in_background) and will wait for its result before you are done, such as a build, deploy, release, test run or a wait-until loop, call mcp__orion__wait_for_background_tasks with its task id right after starting it. Durango Code then keeps the thread Working until it finishes and you are re-invoked. Without it, ending your turn shows the thread as finished while you are still waiting. Skip it for work you leave running (dev servers, watchers).',
+  'Make a background command exit as soon as its work is done: a pipeline only ends when every part has, so never feed a prompt from a pipeline padded with a long `sleep`, and give polling loops a stop condition.',
 ].join('\n');
 
 // In-process MCP server offered to every Claude SDK session (not only
@@ -258,14 +259,29 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
             .boolean()
             .optional()
             .describe('false stops waiting on these tasks (they keep running); default true'),
+          check_in_seconds: z
+            .number()
+            .int()
+            .min(CLAUDE_BACKGROUND_CHECK_IN_MIN_S)
+            .max(CLAUDE_BACKGROUND_CHECK_IN_MAX_S)
+            .optional()
+            .describe(
+              `Seconds until you are re-invoked to check on a task that is still running (default ${CLAUDE_BACKGROUND_CHECK_IN_DEFAULT_S}; later check-ins double, up to ${CLAUDE_BACKGROUND_CHECK_IN_MAX_S}). Set it to when you expect the work to be done.`
+            ),
         },
-        async ({ task_ids: taskIds, waiting = true }) => {
+        async ({ task_ids: taskIds, waiting = true, check_in_seconds: checkInSeconds }) => {
           const { matched, unmatched } = setClaudeBackgroundTasksAwaited(session, taskIds, waiting);
+          if (matched.length > 0) {
+            updateClaudeBackgroundCheckIn(
+              session,
+              checkInSeconds === undefined ? undefined : checkInSeconds * 1000
+            );
+          }
           const lines = [];
           if (matched.length > 0) {
             lines.push(
               waiting
-                ? `Waiting on ${matched.join(', ')}: the thread stays Working until ${matched.length === 1 ? 'it finishes' : 'they finish'} and you are re-invoked with the result.`
+                ? `Waiting on ${matched.join(', ')}: the thread stays Working until ${matched.length === 1 ? 'it finishes' : 'they finish'} and you are re-invoked with the result. If ${matched.length === 1 ? 'it is' : 'any is'} still running in ${formatClaudeCheckInDelay(session.backgroundCheckIn?.delayMs)}, you are re-invoked to check on ${matched.length === 1 ? 'it' : 'them'}.`
                 : `No longer waiting on ${matched.join(', ')}. ${matched.length === 1 ? 'It keeps' : 'They keep'} running.`
             );
           }
@@ -704,6 +720,86 @@ export const setClaudeBackgroundTasksAwaited = (session, taskIds, waiting = true
   return { matched, unmatched };
 };
 
+// An awaited shell can outlive its work: a pipeline held open by a trailing
+// `sleep`, a prompt nobody will answer, a poll loop without a stop condition.
+// Only the model can tell that from the output, so while the thread idles on
+// one, re-invoke it on a backing-off schedule instead of waiting for an exit
+// that may be many minutes away.
+export const CLAUDE_BACKGROUND_CHECK_IN_DEFAULT_S = 120;
+export const CLAUDE_BACKGROUND_CHECK_IN_MIN_S = 30;
+export const CLAUDE_BACKGROUND_CHECK_IN_MAX_S = 30 * 60;
+
+const awaitedLiveClaudeBackgroundTasks = (session) =>
+  [...(session.awaitedBackgroundTaskIds ?? [])]
+    .filter((taskId) => session.backgroundTasks.has(taskId))
+    .map((taskId) => [taskId, session.backgroundTasks.get(taskId)]);
+
+export const formatClaudeCheckInDelay = (delayMs = CLAUDE_BACKGROUND_CHECK_IN_DEFAULT_S * 1000) => {
+  const seconds = Math.round(delayMs / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return seconds % 60 === 0 ? `${minutes}m` : `${minutes}m ${seconds % 60}s`;
+};
+
+export const clearClaudeBackgroundCheckIn = (session) => {
+  if (session.backgroundCheckIn?.timer) clearTimeout(session.backgroundCheckIn.timer);
+  session.backgroundCheckIn = null;
+};
+
+// delayMs given: (re)arm with it. Omitted: keep an armed schedule (a repeated
+// wait call must not undo the backoff), else arm the default. Nothing awaited
+// any more: disarm.
+export const updateClaudeBackgroundCheckIn = (session, delayMs) => {
+  if (session.ended || awaitedLiveClaudeBackgroundTasks(session).length === 0) {
+    clearClaudeBackgroundCheckIn(session);
+    return;
+  }
+  if (delayMs === undefined && session.backgroundCheckIn) return;
+  const nextDelayMs = delayMs ?? CLAUDE_BACKGROUND_CHECK_IN_DEFAULT_S * 1000;
+  const waitingSince = session.backgroundCheckIn?.waitingSince ?? Date.now();
+  clearClaudeBackgroundCheckIn(session);
+  session.backgroundCheckIn = {
+    delayMs: nextDelayMs,
+    waitingSince,
+    timer: setTimeout(() => runClaudeBackgroundCheckIn(session), nextDelayMs),
+  };
+  session.backgroundCheckIn.timer.unref?.();
+};
+
+export const claudeBackgroundCheckInPrompt = (tasks, waitedMs, nextDelayMs) => {
+  const list = tasks
+    .map(([taskId, task]) => `- ${taskId}: ${task.description}`)
+    .join('\n');
+  const one = tasks.length === 1;
+  return [
+    `[Durango Code check-in] You are waiting on ${one ? 'a background command that is' : 'background commands that are'} still running after ${formatClaudeCheckInDelay(waitedMs)}:`,
+    list,
+    `Read ${one ? 'its' : 'their'} output now. If the work ${one ? 'it was' : 'they were'} started for is done, or ${one ? 'it is' : 'one is'} stuck (for example a pipeline held open by a \`sleep\`, or a prompt nobody will answer), stop ${one ? 'it' : 'that one'} and carry on with the task. If ${one ? 'it is' : 'they are'} still making progress, say so in one short line and end your turn: you stay waiting without calling wait_for_background_tasks again, and the next check-in is in ${formatClaudeCheckInDelay(nextDelayMs)} (pass check_in_seconds to change that).`,
+  ].join('\n');
+};
+
+export const runClaudeBackgroundCheckIn = (session) => {
+  const checkIn = session.backgroundCheckIn;
+  if (!checkIn || session.ended || session.disposed) return;
+  const tasks = awaitedLiveClaudeBackgroundTasks(session);
+  if (tasks.length === 0) {
+    clearClaudeBackgroundCheckIn(session);
+    return;
+  }
+  const nextDelayMs = Math.min(checkIn.delayMs * 2, CLAUDE_BACKGROUND_CHECK_IN_MAX_S * 1000);
+  const waitedMs = Date.now() - checkIn.waitingSince;
+  // A busy model sees its tasks itself; look again after the next interval.
+  if (session.activeTurns.length === 0 && session.query) {
+    openClaudeBackgroundTurn(
+      session,
+      session.backgroundRunId ?? crypto.randomUUID(),
+      'claude — checking on background work'
+    );
+    session.pushUserMessage(claudeBackgroundCheckInPrompt(tasks, waitedMs, nextDelayMs));
+  }
+  updateClaudeBackgroundCheckIn(session, nextDelayMs);
+};
+
 export const discardableClaudeBackgroundShellTasks = (session) => {
   const liveTasks = liveClaudeBackgroundTasks(session);
   if (
@@ -1108,6 +1204,7 @@ export const handleClaudeSessionMessage = async (session, message) => {
     for (const taskId of session.awaitedBackgroundTaskIds ?? []) {
       if (!session.backgroundTasks.has(taskId)) session.awaitedBackgroundTaskIds.delete(taskId);
     }
+    updateClaudeBackgroundCheckIn(session);
     // A tracked subagent that left the live set without a terminal signal
     // (its notification was suppressed) still has to settle in the UI.
     if (session.subagentTracker) {
@@ -1301,6 +1398,7 @@ export const endClaudeSession = (session, error) => {
     clearTimeout(session.backgroundSettleTimer);
     session.backgroundSettleTimer = null;
   }
+  clearClaudeBackgroundCheckIn(session);
   if (claudeSdkSessions.get(session.threadId) === session) {
     claudeSdkSessions.delete(session.threadId);
   }
@@ -1510,6 +1608,7 @@ export const createClaudeSdkSession = ({
     pendingTaskToolUses: new Map(), // tool_use id -> { name, input }
     taskToolUseIds: new Set(), // suppress these ids from generic tool rows
     backgroundSettleTimer: null,
+    backgroundCheckIn: null, // { timer, delayMs, waitingSince } while awaiting shells
     backgroundRunId: null,
     lastTurnEndSnapshot: null,
     inputQueue,
@@ -1804,6 +1903,24 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
 // interrupt, so open one and use normal result accounting. Returns false when
 // the run/session disappears or an interrupt cannot be completed promptly;
 // the renderer then preserves the message as an ordinary queued follow-up.
+// Open a foreground turn on an idle session that only holds background work
+// (retained run id, or none), for input Durango Code pushes on its own.
+const openClaudeBackgroundTurn = (session, runId, command) => {
+  clearClaudeBackgroundRun(session);
+  const turn = createClaudeTurnState(runId, session.lastTurnEndSnapshot);
+  session.activeTurns.push(turn);
+  updateClaudeBackgroundSettle(session);
+  emitAgentEvent(session.sender, {
+    runId,
+    threadId: session.threadId,
+    type: 'started',
+    background: true,
+    command,
+  });
+  flushPendingClaudeTaskNotifications(session, turn);
+  return turn;
+};
+
 export const steerClaudeSdkRun = async (runId, text, attachments) => {
   const content = await claudeUserContent(text, attachments);
   for (const session of claudeSdkSessions.values()) {
@@ -1880,21 +1997,7 @@ export const steerClaudeSdkRun = async (runId, text, attachments) => {
       session.pushUserMessage(text, { content });
       return true;
     }
-    clearClaudeBackgroundRun(session);
-    const turn = createClaudeTurnState(
-      runId,
-      session.lastTurnEndSnapshot
-    );
-    session.activeTurns.push(turn);
-    updateClaudeBackgroundSettle(session);
-    emitAgentEvent(session.sender, {
-      runId,
-      threadId: session.threadId,
-      type: 'started',
-      background: true,
-      command: 'claude — steered background work',
-    });
-    flushPendingClaudeTaskNotifications(session, turn);
+    openClaudeBackgroundTurn(session, runId, 'claude — steered background work');
     session.pushUserMessage(text, { content });
     return true;
   }
