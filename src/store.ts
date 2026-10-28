@@ -117,7 +117,7 @@ export const defaultAppearanceSettings: AppearanceSettings = {
 
 export const defaultSidebarV2Settings: SidebarV2Settings = {
   enabled: false,
-  views: { pinned: true, recent: true, snoozed: false, settled: false },
+  views: { pinned: false, recent: true, snoozed: false, settled: false },
 };
 
 /**
@@ -2391,10 +2391,12 @@ export const useOrionStore = create<OrionState>()(
           ...merged.deploymentSettings,
         };
         merged.appearanceSettings = { ...defaultAppearanceSettings, ...merged.appearanceSettings };
+        // The Pinned group starts off on every launch; turning it on lasts
+        // until the app quits.
         merged.sidebarV2Settings = {
           ...defaultSidebarV2Settings,
           ...merged.sidebarV2Settings,
-          views: { ...defaultSidebarV2Settings.views, ...merged.sidebarV2Settings?.views },
+          views: { ...defaultSidebarV2Settings.views, ...merged.sidebarV2Settings?.views, pinned: false },
         };
         // Durango merge: work sharing defaults to Full. Pre-Durango stores
         // (no consentVersion) move to enabled once and show a one-time

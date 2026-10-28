@@ -2028,15 +2028,20 @@ const App: React.FC = () => {
     (threadId: string) => updateThread(threadId, { snoozedAt: undefined }),
     [updateThread]
   );
+  // A thread still running can't be settled; it would leave the sidebar
+  // mid-run.
   const settleThread = useCallback(
-    (threadId: string) =>
+    (threadId: string) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      if (thread?.status === 'running') return;
       updateThread(threadId, {
         settledAt: new Date().toISOString(),
         snoozedAt: undefined,
         wokeAt: undefined,
         wokeReason: undefined,
         finishedUnseenAt: undefined,
-      }),
+      });
+    },
     [updateThread]
   );
   const unsettleThread = useCallback(
@@ -3239,7 +3244,12 @@ const App: React.FC = () => {
       if (openWithOpen && !openWithRef.current?.contains(target)) {
         setOpenWithOpen(false);
       }
-      if (threadSearchOpen && !threadSearchRef.current?.contains(target)) {
+      // Sidebar v2's search panel is portaled out of the header row.
+      if (
+        threadSearchOpen &&
+        !threadSearchRef.current?.contains(target) &&
+        !(target instanceof Element && target.closest('[data-thread-search-popover]'))
+      ) {
         setThreadSearchOpen(false);
       }
       if (threadMenuOpen && !threadMenuRef.current?.contains(target)) {
@@ -8168,7 +8178,10 @@ const App: React.FC = () => {
     [putAwayThread, snoozeThread]
   );
   const settleThreadFromSidebar = useCallback(
-    (threadId: string) => putAwayThread(threadId, settleThread),
+    (threadId: string) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      if (thread?.status !== 'running') putAwayThread(threadId, settleThread);
+    },
     [putAwayThread, settleThread]
   );
   const sidebarV2Actions = useMemo<SidebarV2Actions>(

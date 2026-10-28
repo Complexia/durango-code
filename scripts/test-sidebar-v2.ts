@@ -20,6 +20,7 @@ const { projectMonogram } = await import('../src/app/ProjectBadge');
 const store = useOrionStore.getState;
 assert.equal(store().sidebarV2Settings.enabled, false, 'sidebar v2 is opt-in');
 assert.deepEqual(store().sidebarV2Settings.views, defaultSidebarV2Settings.views);
+assert.equal(store().sidebarV2Settings.views.pinned, false, 'the Pinned list starts off');
 store().setSidebarV2Settings({ views: { ...defaultSidebarV2Settings.views, settled: true } });
 assert.equal(store().sidebarV2Settings.views.settled, true);
 assert.equal(store().sidebarV2Settings.views.recent, true, 'toggling one list keeps the others');
@@ -83,9 +84,9 @@ store().setSidebarV2Settings({ enabled: true });
 assert.equal(thread(later).settledAt, undefined, 'only the first switch settles');
 store().setSidebarV2Settings({ enabled: false });
 
-// Lists: settled beats snoozed beats pinned; children never appear. Every
-// active thread (pinned or not) is in `active`, which Recent shows when
-// pinned threads aren't grouped; snoozing or settling keeps the pin.
+// Lists: settled beats snoozed beats pinned; children never appear. Pinned
+// threads are only in Pinned (so turning it off hides them); snoozing or
+// settling keeps the pin.
 const now = Date.now();
 const base = thread(onScreen);
 const make = (id: string, extra: Record<string, unknown>) => ({ ...base, id, status: 'idle' as const, ...extra });
@@ -104,7 +105,6 @@ assert.deepEqual(
     recent: ['recent'],
     snoozed: ['snoozed'],
     settled: ['settled'],
-    active: ['recent', 'pinned'],
   }
 );
 assert.ok(lists.snoozed[0].pinnedAt, 'a snoozed pinned thread stays pinned');

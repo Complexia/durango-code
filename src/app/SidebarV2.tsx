@@ -47,12 +47,12 @@ const VIEW_LABELS: Record<SidebarV2View, string> = {
   snoozed: 'Snoozed',
   settled: 'Settled',
 };
-// Sections in sidebar order. Recent (every thread you haven't snoozed or
-// settled) is always shown; the menu toggles the others.
+// Sections in sidebar order. Recent (every thread you haven't pinned,
+// snoozed or settled) is always shown; the menu toggles the others.
 const VIEW_ORDER: SidebarV2View[] = ['pinned', 'recent', 'snoozed', 'settled'];
 const TOGGLEABLE_VIEWS: SidebarV2View[] = ['pinned', 'snoozed', 'settled'];
 const VIEW_MENU_HINTS: Partial<Record<SidebarV2View, string>> = {
-  pinned: 'Group pinned threads at the top',
+  pinned: 'Show pinned threads at the top; off hides them',
 };
 
 /** Row actions. App passes one stable object so memoized rows skip re-renders. */
@@ -369,6 +369,9 @@ const ThreadRow = React.memo(function ThreadRow({
   useEffect(() => clearHoverTimer, []);
 
   const tone = threadSidebarTone(thread, needsAttention);
+  // A running thread keeps its Working label on hover and focus, and can't be
+  // settled until its run ends (snoozing it is fine: it wakes when it ends).
+  const running = thread.status === 'running';
   // As in T3: the row's number is how long the thread's agents have worked.
   const workedMs = useMemo(() => threadWorkedMs(thread), [thread]);
   const statusLabel =
@@ -380,7 +383,7 @@ const ThreadRow = React.memo(function ThreadRow({
   const isNoProject = !project || isNoProjectId(project.id);
   const projectName = isNoProject ? NO_PROJECT_NAME : project.name;
 
-  const actions: RowMenuAction[] = [
+  const menuActions: (RowMenuAction | null)[] = [
     { key: 'rename', label: 'Rename', icon: <SquarePen size={13} />, run: () => onStartRename(thread.id) },
     { key: 'branch', label: 'Branch', icon: <GitBranch size={13} />, run: () => model.branchThread(thread.id) },
     thread.pinnedAt
@@ -396,7 +399,9 @@ const ThreadRow = React.memo(function ThreadRow({
           icon: <ArchiveRestore size={13} />,
           run: () => model.unsettleThread(thread.id),
         }
-      : { key: 'settle', label: 'Settle', icon: <Archive size={13} />, run: () => model.settleThread(thread.id) },
+      : running
+        ? null
+        : { key: 'settle', label: 'Settle', icon: <Archive size={13} />, run: () => model.settleThread(thread.id) },
     {
       key: 'delete',
       label: 'Delete',
@@ -407,6 +412,7 @@ const ThreadRow = React.memo(function ThreadRow({
       },
     },
   ];
+  const actions = menuActions.filter((action): action is RowMenuAction => action !== null);
 
   const toneClass =
     tone === 'attention'
@@ -431,20 +437,24 @@ const ThreadRow = React.memo(function ThreadRow({
         <QuickAction label="Unsnooze thread" onClick={() => model.unsnoozeThread(thread.id)} iconOnly>
           <AlarmClock size={13} />
         </QuickAction>
-        <QuickAction label="Settle thread" onClick={() => putAwayOnce(() => model.settleThread(thread.id))}>
-          <Check size={13} />
-          <span>Settle</span>
-        </QuickAction>
+        {!running && (
+          <QuickAction label="Settle thread" onClick={() => putAwayOnce(() => model.settleThread(thread.id))}>
+            <Check size={13} />
+            <span>Settle</span>
+          </QuickAction>
+        )}
       </>
     ) : (
       <>
         <QuickAction label="Snooze thread" onClick={() => putAwayOnce(() => model.snoozeThread(thread.id))} iconOnly>
           <Clock size={13} />
         </QuickAction>
-        <QuickAction label="Settle thread" onClick={() => putAwayOnce(() => model.settleThread(thread.id))}>
-          <Check size={13} />
-          <span>Settle</span>
-        </QuickAction>
+        {!running && (
+          <QuickAction label="Settle thread" onClick={() => putAwayOnce(() => model.settleThread(thread.id))}>
+            <Check size={13} />
+            <span>Settle</span>
+          </QuickAction>
+        )}
       </>
     );
 
@@ -505,7 +515,9 @@ const ThreadRow = React.memo(function ThreadRow({
         )}
         <span className="min-w-0 flex-1 truncate text-[12px] text-neutral-500">{projectName}</span>
         <span
-          className={`flex shrink-0 items-center gap-1 ${menuOpen ? 'hidden' : 'group-hover:hidden group-focus-within:hidden'}`}
+          className={`flex shrink-0 items-center gap-1 ${
+            running ? '' : menuOpen ? 'hidden' : 'group-hover:hidden group-focus-within:hidden'
+          }`}
         >
           {thread.pinnedAt && view !== 'pinned' && <Pin size={11} className="text-neutral-500" aria-label="Pinned" />}
           {statusLabel ??
@@ -580,6 +592,35 @@ const ThreadRow = React.memo(function ThreadRow({
     </div>
   );
 });
+
+// Search results pop out of the sidebar at a fixed width, so a narrow sidebar
+// doesn't squeeze them. Portaled because the sidebar clips its overflow.
+const SEARCH_POPOVER_WIDTH = 520;
+const SearchPopover: React.FC<{ anchorRef: React.RefObject<HTMLDivElement | null>; children: React.ReactNode }> = ({
+  anchorRef,
+  children,
+}) => {
+  const [position, setPosition] = useState<{ left: number; top: number; width: number } | null>(null);
+  useLayoutEffect(() => {
+    const place = () => {
+      const anchor = anchorRef.current?.getBoundingClientRect();
+      if (!anchor) return;
+      const left = anchor.left + 10;
+      const width = Math.max(anchor.width - 20, Math.min(SEARCH_POPOVER_WIDTH, window.innerWidth - left - 12));
+      setPosition({ left, top: anchor.bottom - 8, width });
+    };
+    place();
+    window.addEventListener('resize', place);
+    return () => window.removeEventListener('resize', place);
+  }, [anchorRef]);
+  if (!position) return null;
+  return createPortal(
+    <div data-thread-search-popover className="fixed z-[1040]" style={position}>
+      {children}
+    </div>,
+    document.body
+  );
+};
 
 const QuickAction: React.FC<{
   label: string;
@@ -728,15 +769,12 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
   };
   // Search labels No project threads too.
   const searchProjects = useMemo(() => (noProject ? [...projects, noProject] : projects), [noProject, projects]);
-  // Recent always shows; with Pinned off, pinned threads stay in it by
-  // recency instead of being grouped at the top. An empty Pinned group is
-  // hidden; Snoozed and Settled were turned on deliberately, so they say
-  // they're empty instead.
+  // Recent always shows; with Pinned off, pinned threads are hidden. An
+  // empty Pinned group is hidden; Snoozed and Settled were turned on
+  // deliberately, so they say they're empty instead.
   const shownViews = VIEW_ORDER.filter((view) =>
     view === 'recent' ? true : view === 'pinned' ? views.pinned && threadsByView.pinned.length > 0 : views[view]
   );
-  const threadsFor = (view: SidebarV2View) =>
-    view === 'recent' && !views.pinned ? threadsByView.active : threadsByView[view];
   const projectLookup = { projects, noProject };
 
   const handleSearchSelectThread = useCallback(
@@ -758,7 +796,7 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
 
   return (
     <div className="sidebar agents-sidebar" ref={sidebarRef}>
-      {/* The header row anchors search results so they span the sidebar. */}
+      {/* The header row anchors the search results. */}
       <div className="relative flex items-center gap-1 px-2.5 pb-2 pt-2.5" ref={threadSearchRef}>
         <button
           type="button"
@@ -776,13 +814,13 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
           <span className="truncate">Search</span>
         </button>
         {threadSearchOpen && (
-          <div className="absolute inset-x-2.5 top-[calc(100%-8px)] z-30">
+          <SearchPopover anchorRef={threadSearchRef}>
             <SidebarSearchPanel
               projects={searchProjects}
               onSelectThread={handleSearchSelectThread}
               onSelectProject={handleSearchSelectProject}
             />
-          </div>
+          </SearchPopover>
         )}
         <HeaderIconButton
           label="New agent"
@@ -808,7 +846,7 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
       <div className="sidebar-content agents-sidebar-content !pt-0">
         {extraSections}
         {shownViews.map((view) => {
-          const threads = threadsFor(view);
+          const threads = threadsByView[view];
           const limit = limits[view];
           const showHeader = shownViews.length > 1 || view !== 'recent';
           return (

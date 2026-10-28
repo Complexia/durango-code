@@ -21,38 +21,29 @@ export const threadSidebarTone = (thread: Thread, hasPendingInput: boolean): Thr
 };
 
 /**
- * The sidebar v2 lists. Every thread you haven't snoozed or settled is active
- * and always listed; pinned ones are grouped at the top when the Pinned list
- * is on, otherwise they sit in Recent by recency. Snoozing or settling a pinned
- * thread moves it out of the active list but keeps its pin, so it comes back
- * pinned.
+ * The sidebar v2 lists. Pinned threads are listed only in Pinned, so turning
+ * the Pinned list off hides them. Snoozing or settling a pinned thread moves
+ * it to that list but keeps its pin, so it comes back pinned.
  */
-export type SidebarV2Lists = Record<SidebarV2View, Thread[]> & {
-  /** Pinned and Recent together, in Recent's order. */
-  active: Thread[];
-};
+export type SidebarV2Lists = Record<SidebarV2View, Thread[]>;
 
 export const sidebarV2ThreadLists = (
   threads: Thread[],
   isChild: (thread: Thread) => boolean,
   compareRecent: (a: Thread, b: Thread) => number
 ): SidebarV2Lists => {
-  const lists: SidebarV2Lists = { pinned: [], recent: [], snoozed: [], settled: [], active: [] };
+  const lists: SidebarV2Lists = { pinned: [], recent: [], snoozed: [], settled: [] };
   for (const thread of threads) {
     if (isChild(thread)) continue;
     if (thread.settledAt) lists.settled.push(thread);
     else if (thread.snoozedAt) lists.snoozed.push(thread);
-    else {
-      lists.active.push(thread);
-      if (thread.pinnedAt) lists.pinned.push(thread);
-      else lists.recent.push(thread);
-    }
+    else if (thread.pinnedAt) lists.pinned.push(thread);
+    else lists.recent.push(thread);
   }
   const newest = (key: 'pinnedAt' | 'snoozedAt' | 'settledAt') => (a: Thread, b: Thread) =>
     new Date(b[key] ?? 0).getTime() - new Date(a[key] ?? 0).getTime();
   lists.pinned.sort(newest('pinnedAt'));
   lists.recent.sort(compareRecent);
-  lists.active.sort(compareRecent);
   lists.snoozed.sort(newest('snoozedAt'));
   lists.settled.sort(newest('settledAt'));
   return lists;
