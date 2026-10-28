@@ -21,9 +21,10 @@ export const threadSidebarTone = (thread: Thread, hasPendingInput: boolean): Thr
 };
 
 /**
- * The sidebar v2 lists. Pinned threads are listed only in Pinned, so turning
- * the Pinned list off hides them. Snoozing or settling a pinned thread moves
- * it to that list but keeps its pin, so it comes back pinned.
+ * The sidebar v2 lists. Recent has every thread you haven't snoozed or
+ * settled, pinned or not; pinned ones are also in Pinned. Settling a pinned
+ * thread keeps it in Pinned (and adds it to Settled); snoozing one moves it to
+ * Snoozed but keeps its pin, so it comes back pinned.
  */
 export type SidebarV2Lists = Record<SidebarV2View, Thread[]>;
 
@@ -37,8 +38,8 @@ export const sidebarV2ThreadLists = (
     if (isChild(thread)) continue;
     if (thread.settledAt) lists.settled.push(thread);
     else if (thread.snoozedAt) lists.snoozed.push(thread);
-    else if (thread.pinnedAt) lists.pinned.push(thread);
     else lists.recent.push(thread);
+    if (thread.pinnedAt && (thread.settledAt || !thread.snoozedAt)) lists.pinned.push(thread);
   }
   const newest = (key: 'pinnedAt' | 'snoozedAt' | 'settledAt') => (a: Thread, b: Thread) =>
     new Date(b[key] ?? 0).getTime() - new Date(a[key] ?? 0).getTime();

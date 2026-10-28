@@ -62,10 +62,12 @@ assert.equal(thread(onScreen).wokeReason, undefined);
 // Pending input outranks everything, even while running.
 assert.equal(threadSidebarTone({ ...thread(onScreen), status: 'running' }, true), 'attention');
 
-// New work in a settled thread brings it back.
-store().updateThread(onScreen, { settledAt: new Date().toISOString() });
+// New work in a settled thread brings it back; a pinned one keeps its pin.
+store().updateThread(onScreen, { pinnedAt: new Date().toISOString(), settledAt: new Date().toISOString() });
 store().updateThread(onScreen, { status: 'running' });
 assert.equal(thread(onScreen).settledAt, undefined, 'running again unsettles');
+assert.ok(thread(onScreen).pinnedAt, 'unsettling keeps the pin');
+store().updateThread(onScreen, { pinnedAt: undefined });
 
 // Turning sidebar v2 on the first time settles the threads from before it,
 // except pinned ones (and running or snoozed ones); later toggles don't.
@@ -84,27 +86,29 @@ store().setSidebarV2Settings({ enabled: true });
 assert.equal(thread(later).settledAt, undefined, 'only the first switch settles');
 store().setSidebarV2Settings({ enabled: false });
 
-// Lists: settled beats snoozed beats pinned; children never appear. Pinned
-// threads are only in Pinned (so turning it off hides them); snoozing or
-// settling keeps the pin.
+// Lists: settled beats snoozed; children never appear. Recent has every
+// thread not snoozed or settled, pinned or not; Pinned keeps settled pinned
+// threads but not snoozed ones. Snoozing or settling keeps the pin.
 const now = Date.now();
 const base = thread(onScreen);
 const make = (id: string, extra: Record<string, unknown>) => ({ ...base, id, status: 'idle' as const, ...extra });
+const at = new Date(now).toISOString();
 const threads = [
   make('recent', {}),
-  make('pinned', { pinnedAt: new Date(now).toISOString() }),
-  make('snoozed', { pinnedAt: new Date(now).toISOString(), snoozedAt: new Date(now).toISOString() }),
-  make('settled', { snoozedAt: new Date(now).toISOString(), settledAt: new Date(now).toISOString() }),
+  make('pinned', { pinnedAt: at }),
+  make('snoozed', { pinnedAt: at, snoozedAt: at }),
+  make('settled', { snoozedAt: at, settledAt: at }),
+  make('settled-pinned', { pinnedAt: at, settledAt: at }),
   make('child', { parentThreadId: 'recent' }),
 ];
 const lists = sidebarV2ThreadLists(threads, (candidate) => !!candidate.parentThreadId, () => 0);
 assert.deepEqual(
   Object.fromEntries(Object.entries(lists).map(([view, list]) => [view, list.map((entry) => entry.id)])),
   {
-    pinned: ['pinned'],
-    recent: ['recent'],
+    pinned: ['pinned', 'settled-pinned'],
+    recent: ['recent', 'pinned'],
     snoozed: ['snoozed'],
-    settled: ['settled'],
+    settled: ['settled', 'settled-pinned'],
   }
 );
 assert.ok(lists.snoozed[0].pinnedAt, 'a snoozed pinned thread stays pinned');

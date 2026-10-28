@@ -47,12 +47,12 @@ const VIEW_LABELS: Record<SidebarV2View, string> = {
   snoozed: 'Snoozed',
   settled: 'Settled',
 };
-// Sections in sidebar order. Recent (every thread you haven't pinned,
-// snoozed or settled) is always shown; the menu toggles the others.
+// Sections in sidebar order. Recent (every thread you haven't snoozed or
+// settled, pinned ones included) is always shown; the menu toggles the others.
 const VIEW_ORDER: SidebarV2View[] = ['pinned', 'recent', 'snoozed', 'settled'];
 const TOGGLEABLE_VIEWS: SidebarV2View[] = ['pinned', 'snoozed', 'settled'];
 const VIEW_MENU_HINTS: Partial<Record<SidebarV2View, string>> = {
-  pinned: 'Show pinned threads at the top; off hides them',
+  pinned: 'Also list pinned threads at the top',
 };
 
 /** Row actions. App passes one stable object so memoized rows skip re-renders. */
@@ -378,8 +378,8 @@ const ThreadRow = React.memo(function ThreadRow({
     thread.status === 'running' || tone || needsAttention ? (
       <ThreadStatusLabel thread={thread} tone={tone} needsInput={needsAttention} />
     ) : null;
-  // Settled threads recede until hovered, as in T3.
-  const recede = view === 'settled' && !selected;
+  // Settled threads recede until hovered, as in T3 (also in Pinned).
+  const recede = !!thread.settledAt && !selected;
   const isNoProject = !project || isNoProjectId(project.id);
   const projectName = isNoProject ? NO_PROJECT_NAME : project.name;
 
@@ -425,9 +425,10 @@ const ThreadRow = React.memo(function ThreadRow({
   const selectedRing = selected && tone ? 'ring-1 ring-inset ring-white/[0.12]' : '';
 
   // Hover actions replace the time: snooze/settle for live threads, wake /
-  // restore inside the Snoozed and Settled views.
+  // restore inside the Snoozed and Settled views (and for a settled thread
+  // that stays in Pinned).
   const quickActions =
-    view === 'settled' ? (
+    view === 'settled' || thread.settledAt ? (
       <QuickAction label="Restore to sidebar" onClick={() => model.unsettleThread(thread.id)}>
         <ArchiveRestore size={13} />
         <span>Restore</span>
@@ -769,8 +770,7 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
   };
   // Search labels No project threads too.
   const searchProjects = useMemo(() => (noProject ? [...projects, noProject] : projects), [noProject, projects]);
-  // Recent always shows; with Pinned off, pinned threads are hidden. An
-  // empty Pinned group is hidden; Snoozed and Settled were turned on
+  // Recent always shows. An empty Pinned group is hidden; Snoozed and Settled were turned on
   // deliberately, so they say they're empty instead.
   const shownViews = VIEW_ORDER.filter((view) =>
     view === 'recent' ? true : view === 'pinned' ? views.pinned && threadsByView.pinned.length > 0 : views[view]
