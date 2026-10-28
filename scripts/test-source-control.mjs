@@ -410,7 +410,6 @@ try {
     fs.readFile(new URL('../src/cloud-sync.js', import.meta.url), 'utf8'),
   ]);
   assert.match(mainSource, /git:changeSourceControlToOrion/);
-  assert.match(mainSource, /\/api\/git\/repos\/\$\{encodeURIComponent\(link\.repoId\)\}\/pulls/);
   assert.match(mainSource, /pushBranchToSourceControl/);
   assert.match(mainSource, /githubOwner: state\.origin\.owner/);
   assert.match(mainSource, /githubName: state\.origin\.repo/);
@@ -446,7 +445,7 @@ try {
   assert.match(appSource, /Authorize GitHub/);
   assert.match(appSource, /handleAuthorizeGithubMirror/);
   assert.match(cloudSyncSource, /mirror: state\.mirror/);
-  console.log('ok  desktop IPC, provider-aware PRs, and retained cloud handlers stay wired');
+  console.log('ok  desktop IPC and retained cloud handlers stay wired');
 
   console.log('\nAll source-control tests passed.');
 } finally {

@@ -125,7 +125,6 @@ if (role) {
     readSession: async () => activeSession(),
     readStoreState: async () => ({
       projects: [{ id: 'p1', name: 'orion', path: '/tmp/orion' }],
-      epics: [{ id: 'e1', name: 'Remote epic', description: '', createdAt: '2026-08-01T09:00:00.000Z' }],
     }),
     readThreadsFile: async () => ({ threads: fixtureThreads }),
     broadcast: () => 1,

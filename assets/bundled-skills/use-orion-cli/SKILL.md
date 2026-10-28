@@ -31,11 +31,12 @@ when using anything beyond the quick workflows below.
 ## Durango workspaces
 
 Durango Code bundles this CLI and adds `durango-code` (and `ds`) to your `PATH`,
-so do not install it. In repositories with a `durango.toml`, Durango Code
-creates a Durango workspace for each new thread and starts you inside it; a
-`[Durango workspace]` block in your prompt names it. Work, run, and test there,
-open the change with `durango-code change create` from that directory, and do
-not create another workspace with `durango-code ws new`.
+so do not install it. In repositories with a `durango.toml`, follow the
+`durango-workspaces` skill: create a workspace with `durango-code ws new` when
+you start changing code (not for questions or reading), work and open the change
+from there, and land only when the user asks. If your prompt has a
+`[Durango workspace]` block, that workspace is already yours; do not create
+another.
 
 ## Publish a requested plan
 

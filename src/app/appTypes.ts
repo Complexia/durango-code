@@ -1,29 +1,3 @@
-import type { Epic } from '../store';
-
-export type EpicPrStatus = 'open' | 'merged' | 'closed';
-
-export type EpicCommitDialogState = {
-  epic: Epic;
-  message: string;
-};
-
-export type EpicPrBaseDialogState = {
-  instanceId: number;
-  epic: Epic;
-  branches: string[];
-  branchesLoading: boolean;
-  branchesError: string;
-  defaultBranch: string;
-  sourceBranch: string;
-  baseBranch: string;
-  message: string;
-};
-
-export type EpicSettleDialogState = {
-  epic: Epic;
-  warnings: string[];
-};
-
 export type GitBranchInfo = {
   name: string;
   current: boolean;
@@ -133,7 +107,6 @@ export type WorkspaceSyncStatus = {
   backfillDone: boolean;
   counts: {
     projects: number;
-    epics: number;
     threads: number;
     transcriptsUploaded: number;
     codePushes: number;

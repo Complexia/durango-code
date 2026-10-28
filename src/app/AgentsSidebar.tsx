@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  Archive,
   ChevronRight,
   Columns2,
   Ellipsis,
@@ -14,12 +13,11 @@ import {
   PinOff,
   Plus,
   Search,
-  SquareKanban,
   SquarePen,
   Trash2,
   X,
 } from 'lucide-react';
-import { isNoProjectId, type Epic, type Project, type SavedView, type Thread } from '../store';
+import { isNoProjectId, type Project, type SavedView, type Thread } from '../store';
 import type { RemoteMachineEntry } from '../types';
 import { ProjectIcon } from './ProjectIcon';
 import { InlineRenameInput } from './fileTree';
@@ -27,10 +25,8 @@ import { SidebarSearchPanel, warmSearchIndex } from './threadSearch';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { useSidebarResize } from './useSidebarResize';
-import type { EpicPrStatus } from './appTypes';
 
 const THREADS_VISIBLE_LIMIT = 5;
-const EMPTY_EPICS: Epic[] = [];
 const AGENTS_SIDEBAR_STORAGE_KEY = 'orion.agentsSidebarWidth';
 
 export type AgentsSidebarModel = {
@@ -51,9 +47,6 @@ export type AgentsSidebarModel = {
   setSavedViewsSectionOpen: React.Dispatch<React.SetStateAction<boolean>>;
   updateThread: (id: string, updates: Partial<Thread>) => void;
   branchThread: (sourceThreadId: string) => string | null;
-  selectedEpicId: string | null;
-  renameEpic: (id: string, name: string) => void;
-  selectEpic: (id: string | null) => void;
   renameProject: (id: string, name: string) => void;
   selectProject: (id: string | null) => void;
   threadSearchOpen: boolean;
@@ -78,18 +71,9 @@ export type AgentsSidebarModel = {
   pinnedAgentsOpen: boolean;
   setPinnedAgentsShowAll: React.Dispatch<React.SetStateAction<boolean>>;
   pinnedAgentsShowAll: boolean;
-  setEpicsSectionOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  epicsSectionOpen: boolean;
-  collapsedEpics: Record<string, boolean>;
-  setCollapsedEpics: React.Dispatch<React.SetStateAction<Record<string, boolean>>>;
-  epicMenuOpenId: string | null;
-  setEpicMenuOpenId: React.Dispatch<React.SetStateAction<string | null>>;
-  epicRenameId: string | null;
-  setEpicRenameId: React.Dispatch<React.SetStateAction<string | null>>;
   threadSearchRef: React.RefObject<HTMLDivElement | null>;
   projectMenuRef: React.RefObject<HTMLDivElement | null>;
   threadItemMenuRef: React.RefObject<HTMLDivElement | null>;
-  epicMenuRef: React.RefObject<HTMLDivElement | null>;
   selectedProject: Project | null;
   sortedProjects: Project[];
   recentAgentsTargetProject: Project;
@@ -99,28 +83,17 @@ export type AgentsSidebarModel = {
   unpinThread: (threadId: string) => void;
   runningAgentCount: number;
   projectThreadsByProject: Map<string, Thread[]>;
-  epicsEnabled: boolean;
-  activeEpics: Epic[];
-  threadsByEpic: Map<string, Thread[]>;
-  runningAgentEpicIds: Set<string>;
-  projectForGitRoot: (gitRoot: string | undefined, preferredProjectId?: string) => Project | null;
   deleteThreadWithRuntime: (threadId: string) => Promise<void>;
   removeProjectWithRuntimes: (projectId: string) => Promise<void>;
   handleAddProject: (options?: {
+    path?: string;
     createInitialThread?: boolean;
-    expectedGitRoot?: string;
   }) => Promise<string | undefined>;
   handleNewAgent: () => void;
   handleCreateThread: (projectId: string) => string;
-  openCreateEpicModal: () => void;
-  handleCreateThreadForEpic: (epic: Epic) => Promise<string | undefined>;
-  handleRemoveThreadFromEpic: (threadId: string) => void;
-  handleDeleteEpic: (epic: Epic) => void;
-  handleSettleEpic: (epic: Epic) => Promise<void>;
   renderThreadCliBadge: (thread: Thread) => React.JSX.Element | null;
   renderThreadStatusDot: (thread: Thread) => React.JSX.Element | null;
   sidebarFooterProps: SidebarFooterProps;
-  epicPrStatus: (epic: Pick<Epic, 'prUrl' | 'prState'> | null | undefined) => EpicPrStatus | null;
   /** Machines section (remote control). Hidden entirely while the feature is off. */
   remoteMachinesVisible: boolean;
   machinesSectionOpen: boolean;
@@ -168,6 +141,173 @@ const ThreadItemSelect = ({
   );
 };
 
+export type MachinesAndSavedViewsProps = Pick<
+  AgentsSidebarModel,
+  | 'setActiveTab'
+  | 'savedViews'
+  | 'activeSavedViewId'
+  | 'threadTitlesById'
+  | 'openSavedView'
+  | 'deleteSavedView'
+  | 'savedViewsSectionOpen'
+  | 'setSavedViewsSectionOpen'
+  | 'remoteMachinesVisible'
+  | 'machinesSectionOpen'
+  | 'setMachinesSectionOpen'
+  | 'remoteMachines'
+  | 'activeRemoteMachineId'
+  | 'selectRemoteMachine'
+  | 'localMachineName'
+>;
+
+/** The Machines and Saved views sections, shared by both sidebar versions. */
+export const MachinesAndSavedViews = ({
+  setActiveTab,
+  savedViews,
+  activeSavedViewId,
+  threadTitlesById,
+  openSavedView,
+  deleteSavedView,
+  savedViewsSectionOpen,
+  setSavedViewsSectionOpen,
+  remoteMachinesVisible,
+  machinesSectionOpen,
+  setMachinesSectionOpen,
+  remoteMachines,
+  activeRemoteMachineId,
+  selectRemoteMachine,
+  localMachineName,
+}: MachinesAndSavedViewsProps) => (
+  <>
+    {/*
+      Machines (remote control): every paired host this instance can drive,
+      plus a "this machine" row to switch back. Absent entirely while remote
+      control is off or no remote machines are paired.
+    */}
+    {remoteMachinesVisible && (
+      <div className="recent-agents-section machines-section">
+        <button
+          type="button"
+          className="sidebar-section-toggle"
+          onClick={() => setMachinesSectionOpen((open) => !open)}
+          aria-expanded={machinesSectionOpen}
+        >
+          <ChevronRight
+            size={12}
+            className={`sidebar-section-chevron ${machinesSectionOpen ? 'open' : ''}`}
+          />
+          <span>Machines</span>
+        </button>
+        {machinesSectionOpen && (
+          <div className="threads-list machines-list">
+            <div className={`thread-item machine-item${activeRemoteMachineId === null ? ' selected' : ''}`}>
+              <button
+                type="button"
+                className="thread-item-select"
+                onClick={() => selectRemoteMachine(null)}
+                title="Work on this machine"
+              >
+                <Monitor size={13} className="machine-item-icon" />
+                <span className="thread-title">
+                  <span className="thread-title-text">{localMachineName || 'This machine'}</span>
+                </span>
+                <span className="machine-status-dot local" />
+              </button>
+            </div>
+            {remoteMachines.map((machine) => (
+              <div
+                key={machine.id}
+                className={`thread-item machine-item${activeRemoteMachineId === machine.id ? ' selected' : ''}`}
+              >
+                <button
+                  type="button"
+                  className="thread-item-select"
+                  onClick={() => selectRemoteMachine(machine.id)}
+                  title={`${machine.name} (${machine.host ? `${machine.host}:${machine.port}` : 'over the internet'}) — ${machine.status}${machine.error ? ` — ${machine.error}` : ''}`}
+                >
+                  <MonitorSmartphone size={13} className="machine-item-icon" />
+                  <span className="thread-title">
+                    <span className="thread-title-text">{machine.name}</span>
+                  </span>
+                  <span className={`machine-status-dot ${machine.status}`} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )}
+
+    {/*
+      Saved views only exist while there are splits to return to — an empty
+      section would be a permanent reminder of a feature the user isn't
+      using, so it isn't rendered at all.
+    */}
+    {savedViews.length > 0 && (
+      <div className="recent-agents-section saved-views-section">
+        <button
+          type="button"
+          className="sidebar-section-toggle"
+          onClick={() => setSavedViewsSectionOpen((open) => !open)}
+          aria-expanded={savedViewsSectionOpen}
+        >
+          <ChevronRight
+            size={12}
+            className={`sidebar-section-chevron ${savedViewsSectionOpen ? 'open' : ''}`}
+          />
+          <span>Saved views</span>
+        </button>
+        {savedViewsSectionOpen && (
+          <div className="threads-list saved-views-list">
+            {savedViews.map((view) => {
+              const paneTitles = view.threadIds.map(
+                (threadId) => threadTitlesById.get(threadId) ?? 'Untitled'
+              );
+              return (
+                <div
+                  key={view.id}
+                  className={`thread-item saved-view-item${
+                    activeSavedViewId === view.id ? ' selected' : ''
+                  }`}
+                >
+                  <button
+                    type="button"
+                    className="thread-item-select"
+                    onClick={() => {
+                      openSavedView(view.id);
+                      setActiveTab('agents');
+                    }}
+                    title={paneTitles.join('\n')}
+                  >
+                    <Columns2 size={13} className="saved-view-icon" />
+                    <span className="thread-title">
+                      <span className="thread-title-text">{view.name}</span>
+                    </span>
+                    {/* thread-meta: fades out on hover so the delete
+                        button has the row's right edge to itself. */}
+                    <span className="sidebar-section-count thread-meta">
+                      {view.threadIds.length}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="saved-view-remove"
+                    title="Delete this saved view — its threads stay"
+                    aria-label={`Delete saved view ${view.name}`}
+                    onClick={() => deleteSavedView(view.id)}
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    )}
+  </>
+);
+
 export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSidebarModel) {
   const {
     projects,
@@ -175,18 +315,8 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     setActiveTab,
     selectedThreadId,
     paneThreadIds,
-    savedViews,
-    activeSavedViewId,
-    threadTitlesById,
-    openSavedView,
-    deleteSavedView,
-    savedViewsSectionOpen,
-    setSavedViewsSectionOpen,
     updateThread,
     branchThread,
-    selectedEpicId,
-    renameEpic,
-    selectEpic,
     renameProject,
     selectProject,
     threadSearchOpen,
@@ -211,18 +341,9 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     pinnedAgentsOpen,
     setPinnedAgentsShowAll,
     pinnedAgentsShowAll,
-    setEpicsSectionOpen,
-    epicsSectionOpen,
-    collapsedEpics,
-    setCollapsedEpics,
-    epicMenuOpenId,
-    setEpicMenuOpenId,
-    epicRenameId,
-    setEpicRenameId,
     threadSearchRef,
     projectMenuRef,
     threadItemMenuRef,
-    epicMenuRef,
     selectedProject,
     sortedProjects,
     recentAgentsTargetProject,
@@ -232,32 +353,14 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     unpinThread,
     runningAgentCount,
     projectThreadsByProject,
-    epicsEnabled,
-    activeEpics,
-    threadsByEpic,
-    runningAgentEpicIds,
-    projectForGitRoot,
     deleteThreadWithRuntime,
     removeProjectWithRuntimes,
     handleAddProject,
     handleNewAgent,
     handleCreateThread,
-    openCreateEpicModal,
-    handleCreateThreadForEpic,
-    handleRemoveThreadFromEpic,
-    handleDeleteEpic,
-    handleSettleEpic,
     renderThreadCliBadge,
     renderThreadStatusDot,
     sidebarFooterProps,
-    epicPrStatus,
-    remoteMachinesVisible,
-    machinesSectionOpen,
-    setMachinesSectionOpen,
-    remoteMachines,
-    activeRemoteMachineId,
-    selectRemoteMachine,
-    localMachineName,
   } = props;
 
   const { sidebarRef, resizeHandle: sidebarResizeHandle } = useSidebarResize({
@@ -266,13 +369,13 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
   });
 
   // A thread can appear in several sidebar sections at once (pinned, recent,
-  // its project, its epic); every copy shows the same open/focused state.
+  // its project); every copy shows the same open/focused state.
   const threadItemClassName = (threadId: string) =>
     `thread-item${selectedThreadId === threadId ? ' selected' : ''}${
       paneThreadIds.includes(threadId) ? ' in-split' : ''
     }`;
 
-  // Picking a project or epic from search scrolls the sidebar to its section
+  // Picking a project from search scrolls the sidebar to its section
   // and flashes it, so the user lands where it lives rather than just in it.
   const [revealTarget, setRevealTarget] = useState<{ key: string; nonce: number } | null>(null);
   useEffect(() => {
@@ -309,17 +412,6 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
     },
     [selectProject, setActiveTab, setCollapsedProjects, setThreadSearchOpen]
   );
-  const handleSearchSelectEpic = useCallback(
-    (epicId: string) => {
-      selectEpic(epicId);
-      setActiveTab('agents');
-      setEpicsSectionOpen(true);
-      setCollapsedEpics((prev) => (prev[epicId] ? { ...prev, [epicId]: false } : prev));
-      setThreadSearchOpen(false);
-      setRevealTarget((prev) => ({ key: `epic:${epicId}`, nonce: (prev?.nonce ?? 0) + 1 }));
-    },
-    [selectEpic, setActiveTab, setCollapsedEpics, setEpicsSectionOpen, setThreadSearchOpen]
-  );
 
   return (
     <div className="sidebar agents-sidebar" ref={sidebarRef}>
@@ -344,141 +436,14 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
             {threadSearchOpen && (
               <SidebarSearchPanel
                 projects={projects}
-                epics={epicsEnabled ? activeEpics : EMPTY_EPICS}
                 onSelectThread={handleSearchSelectThread}
                 onSelectProject={handleSearchSelectProject}
-                onSelectEpic={handleSearchSelectEpic}
               />
             )}
           </div>
         </div>
 
-        {/*
-          Machines (remote control): every paired host this instance can drive,
-          plus a "this machine" row to switch back. Absent entirely while remote
-          control is off or no remote machines are paired.
-        */}
-        {remoteMachinesVisible && (
-          <div className="recent-agents-section machines-section">
-            <button
-              type="button"
-              className="sidebar-section-toggle"
-              onClick={() => setMachinesSectionOpen((open) => !open)}
-              aria-expanded={machinesSectionOpen}
-            >
-              <ChevronRight
-                size={12}
-                className={`sidebar-section-chevron ${machinesSectionOpen ? 'open' : ''}`}
-              />
-              <span>Machines</span>
-            </button>
-            {machinesSectionOpen && (
-              <div className="threads-list machines-list">
-                <div className={`thread-item machine-item${activeRemoteMachineId === null ? ' selected' : ''}`}>
-                  <button
-                    type="button"
-                    className="thread-item-select"
-                    onClick={() => selectRemoteMachine(null)}
-                    title="Work on this machine"
-                  >
-                    <Monitor size={13} className="machine-item-icon" />
-                    <span className="thread-title">
-                      <span className="thread-title-text">{localMachineName || 'This machine'}</span>
-                    </span>
-                    <span className="machine-status-dot local" />
-                  </button>
-                </div>
-                {remoteMachines.map((machine) => (
-                  <div
-                    key={machine.id}
-                    className={`thread-item machine-item${activeRemoteMachineId === machine.id ? ' selected' : ''}`}
-                  >
-                    <button
-                      type="button"
-                      className="thread-item-select"
-                      onClick={() => selectRemoteMachine(machine.id)}
-                      title={`${machine.name} (${machine.host ? `${machine.host}:${machine.port}` : 'over the internet'}) — ${machine.status}${machine.error ? ` — ${machine.error}` : ''}`}
-                    >
-                      <MonitorSmartphone size={13} className="machine-item-icon" />
-                      <span className="thread-title">
-                        <span className="thread-title-text">{machine.name}</span>
-                      </span>
-                      <span className={`machine-status-dot ${machine.status}`} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/*
-          Saved views only exist while there are splits to return to — an empty
-          section would be a permanent reminder of a feature the user isn't
-          using, so it isn't rendered at all.
-        */}
-        {savedViews.length > 0 && (
-          <div className="recent-agents-section saved-views-section">
-            <button
-              type="button"
-              className="sidebar-section-toggle"
-              onClick={() => setSavedViewsSectionOpen((open) => !open)}
-              aria-expanded={savedViewsSectionOpen}
-            >
-              <ChevronRight
-                size={12}
-                className={`sidebar-section-chevron ${savedViewsSectionOpen ? 'open' : ''}`}
-              />
-              <span>Saved views</span>
-            </button>
-            {savedViewsSectionOpen && (
-              <div className="threads-list saved-views-list">
-                {savedViews.map((view) => {
-                  const paneTitles = view.threadIds.map(
-                    (threadId) => threadTitlesById.get(threadId) ?? 'Untitled'
-                  );
-                  return (
-                    <div
-                      key={view.id}
-                      className={`thread-item saved-view-item${
-                        activeSavedViewId === view.id ? ' selected' : ''
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        className="thread-item-select"
-                        onClick={() => {
-                          openSavedView(view.id);
-                          setActiveTab('agents');
-                        }}
-                        title={paneTitles.join('\n')}
-                      >
-                        <Columns2 size={13} className="saved-view-icon" />
-                        <span className="thread-title">
-                          <span className="thread-title-text">{view.name}</span>
-                        </span>
-                        {/* thread-meta: fades out on hover so the delete
-                            button has the row's right edge to itself. */}
-                        <span className="sidebar-section-count thread-meta">
-                          {view.threadIds.length}
-                        </span>
-                      </button>
-                      <button
-                        type="button"
-                        className="saved-view-remove"
-                        title="Delete this saved view — its threads stay"
-                        aria-label={`Delete saved view ${view.name}`}
-                        onClick={() => deleteSavedView(view.id)}
-                      >
-                        <X size={13} />
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
+        <MachinesAndSavedViews {...props} />
 
         {pinnedThreads.length > 0 && (
           <div className="recent-agents-section">
@@ -618,340 +583,6 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                     {pinnedAgentsShowAll ? 'Show less' : 'Show more'}
                   </button>
                 )}
-              </>
-            )}
-          </div>
-        )}
-
-        {epicsEnabled && projects.length > 0 && (
-          <div className="recent-agents-section epics-section">
-            <div className="epics-section-header">
-              <button
-                type="button"
-                className="sidebar-section-toggle"
-                onClick={() => setEpicsSectionOpen((open) => !open)}
-                aria-expanded={epicsSectionOpen}
-              >
-                <ChevronRight size={15} className={`sidebar-section-chevron ${epicsSectionOpen ? 'open' : ''}`} />
-                <span>Epics</span>
-              </button>
-              <button type="button" className="sidebar-section-action" title="New epic" onClick={openCreateEpicModal}>
-                <Plus size={15} />
-              </button>
-            </div>
-            {epicsSectionOpen && (
-              <>
-                {activeEpics.map((epic) => {
-                  const epicThreads = threadsByEpic.get(epic.id) ?? [];
-                  const epicThreadListKey = `epic:${epic.id}`;
-                  const epicVisibleLimit = threadListLimits[epicThreadListKey] ?? THREADS_VISIBLE_LIMIT;
-                  const visibleEpicThreads = epicThreads.slice(0, epicVisibleLimit);
-                  const hasMoreEpicThreads = epicThreads.length > epicVisibleLimit;
-                  const isEpicListExpanded =
-                    epicVisibleLimit > THREADS_VISIBLE_LIMIT && epicThreads.length > THREADS_VISIBLE_LIMIT;
-                  // The project label sits on the epic row instead of
-                  // repeating on every thread under it — but only while
-                  // those threads agree on one project, so a mixed epic
-                  // keeps its per-thread tags.
-                  const epicProjectNames = new Set(
-                    epicThreads
-                      .map((thread) => projects.find((p) => p.id === thread.projectId)?.name)
-                      .filter((name): name is string => Boolean(name))
-                  );
-                  const explicitlyBoundEpicProject = epic.gitRoot
-                    ? projectForGitRoot(epic.gitRoot, epic.repositoryProjectId)
-                    : epic.repositoryProjectId
-                      ? projects.find((project) => project.id === epic.repositoryProjectId)
-                      : undefined;
-                  const epicProjectName =
-                    epicThreads.length === 0
-                      ? explicitlyBoundEpicProject?.name
-                      : epicProjectNames.size === 1
-                        ? [...epicProjectNames][0]
-                        : undefined;
-                  const isEpicCollapsed = collapsedEpics[epic.id] ?? false;
-                  const isEpicSelected = selectedEpicId === epic.id && !selectedThreadId;
-                  const prStatus = epicPrStatus(epic);
-
-                  return (
-                    <div key={epic.id} className="project-section epic-section" data-sidebar-reveal={`epic:${epic.id}`}>
-                      <div className="project-section-header-row">
-                        <button
-                          type="button"
-                          className="project-collapse-toggle"
-                          title={isEpicCollapsed ? 'Expand threads' : 'Collapse threads'}
-                          aria-expanded={!isEpicCollapsed}
-                          onClick={() => {
-                            // Collapsing resets the list back to the default 5 on next expand.
-                            if (!isEpicCollapsed) {
-                              setThreadListLimits((prev) => {
-                                if (!(epicThreadListKey in prev)) return prev;
-                                const { [epicThreadListKey]: _removed, ...rest } = prev;
-                                return rest;
-                              });
-                            }
-                            setCollapsedEpics((prev) => ({
-                              ...prev,
-                              [epic.id]: !isEpicCollapsed,
-                            }));
-                          }}
-                        >
-                          <ChevronRight
-                            size={12}
-                            className={`sidebar-section-chevron ${isEpicCollapsed ? '' : 'open'}`}
-                          />
-                        </button>
-                        {epicRenameId === epic.id ? (
-                          <div className="project-section-header project-section-header-renaming">
-                            <SquareKanban
-                              size={13}
-                              className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
-                            />
-                            <InlineRenameInput
-                              className="thread-rename-input"
-                              initialValue={epic.name}
-                              onSubmit={(name) => {
-                                renameEpic(epic.id, name);
-                                setEpicRenameId(null);
-                              }}
-                              onCancel={() => setEpicRenameId(null)}
-                            />
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            className={`project-section-header epic-section-header ${isEpicSelected ? 'epic-section-header-selected' : ''}`}
-                            onClick={() => {
-                              selectEpic(epic.id);
-                              setActiveTab('agents');
-                            }}
-                            title={prStatus ? `${epic.name} — PR ${prStatus}` : epic.name}
-                          >
-                            <SquareKanban
-                              size={13}
-                              className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
-                            />
-                            {epicProjectName && <span className="epic-project-tag">{epicProjectName}</span>}
-                            <span className="truncate">{epic.name}</span>
-                            {isEpicCollapsed && epicThreads.length > 0 && (
-                              <span className="sidebar-section-count">{epicThreads.length}</span>
-                            )}
-                          </button>
-                        )}
-                        <div className="project-menu-wrap" ref={epicMenuOpenId === epic.id ? epicMenuRef : undefined}>
-                          <button
-                            type="button"
-                            className="project-options-trigger"
-                            title="Epic options"
-                            aria-label={`Options for ${epic.name}`}
-                            aria-haspopup="menu"
-                            aria-expanded={epicMenuOpenId === epic.id}
-                            onClick={() => setEpicMenuOpenId((open) => (open === epic.id ? null : epic.id))}
-                          >
-                            <Ellipsis size={13} />
-                          </button>
-                          {epicMenuOpenId === epic.id && (
-                            <div className="thread-menu project-menu" role="menu">
-                              <button
-                                type="button"
-                                className="project-menu-item"
-                                role="menuitem"
-                                onClick={() => {
-                                  setEpicMenuOpenId(null);
-                                  setEpicRenameId(epic.id);
-                                }}
-                              >
-                                <SquarePen size={13} /> Rename
-                              </button>
-                              <button
-                                type="button"
-                                className="project-menu-item"
-                                role="menuitem"
-                                disabled={runningAgentEpicIds.has(epic.id)}
-                                title={
-                                  runningAgentEpicIds.has(epic.id)
-                                    ? 'Agents are still running in this epic — wait for them to finish before settling it'
-                                    : undefined
-                                }
-                                onClick={() => {
-                                  setEpicMenuOpenId(null);
-                                  void handleSettleEpic(epic);
-                                }}
-                              >
-                                <Archive size={13} /> Settle
-                              </button>
-                              <button
-                                type="button"
-                                className="project-menu-item danger"
-                                role="menuitem"
-                                onClick={() => {
-                                  setEpicMenuOpenId(null);
-                                  handleDeleteEpic(epic);
-                                }}
-                              >
-                                <Trash2 size={13} /> Delete
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                        <button
-                          type="button"
-                          className="project-new-thread"
-                          title={`New thread in ${epic.name}`}
-                          onClick={() => handleCreateThreadForEpic(epic)}
-                        >
-                          <SquarePen size={13} />
-                        </button>
-                      </div>
-
-                      {!isEpicCollapsed && (
-                        <>
-                          <div className="threads-list">
-                            {epicThreads.length === 0 ? (
-                            <button
-                              type="button"
-                              className="thread-item thread-item-empty"
-                              onClick={() => handleCreateThreadForEpic(epic)}
-                            >
-                              <span className="thread-title">New thread</span>
-                            </button>
-                          ) : (
-                            visibleEpicThreads.map((thread) => (
-                              <div
-                                key={thread.id}
-                                className={threadItemClassName(thread.id)}
-                                {...threadDragProps(thread.id, threadRenameKey === `epic:${thread.id}`)}
-                              >
-                                <ThreadItemSelect
-                                  isRenaming={threadRenameKey === `epic:${thread.id}`}
-                                  onActivate={() => selectThread(thread.id)}
-                                >
-                                  {renderThreadStatusDot(thread)}
-                                  {threadRenameKey === `epic:${thread.id}` ? (
-                                    <InlineRenameInput
-                                      className="thread-rename-input"
-                                      initialValue={thread.title}
-                                      onSubmit={(title) => {
-                                        updateThread(thread.id, { title });
-                                        setThreadRenameKey(null);
-                                      }}
-                                      onCancel={() => setThreadRenameKey(null)}
-                                    />
-                                  ) : (
-                                    <span className="thread-title">
-                                      {renderThreadCliBadge(thread)}
-                                      <span className="thread-title-text" title={thread.title}>{thread.title}</span>
-                                    </span>
-                                  )}
-                                  {!epicProjectName && (
-                                    <span className="thread-project-tag thread-meta">
-                                      {projects.find((p) => p.id === thread.projectId)?.name}
-                                    </span>
-                                  )}
-                                  <span className="thread-time thread-meta">
-                                    {formatShortTime(getThreadActivityTime(thread))}
-                                  </span>
-                                </ThreadItemSelect>
-                                <div
-                                  className="thread-menu-wrap"
-                                  ref={threadItemMenuKey === `epic:${thread.id}` ? threadItemMenuRef : undefined}
-                                >
-                                  <button
-                                    type="button"
-                                    className="thread-options-trigger"
-                                    title="Thread options"
-                                    aria-label={`Options for ${thread.title}`}
-                                    aria-haspopup="menu"
-                                    aria-expanded={threadItemMenuKey === `epic:${thread.id}`}
-                                    onClick={() =>
-                                      setThreadItemMenuKey((open) =>
-                                        open === `epic:${thread.id}` ? null : `epic:${thread.id}`
-                                      )
-                                    }
-                                  >
-                                    <Ellipsis size={13} />
-                                  </button>
-                                  {threadItemMenuKey === `epic:${thread.id}` && (
-                                    <div className="thread-menu thread-item-menu" role="menu">
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          setThreadRenameKey(`epic:${thread.id}`);
-                                        }}
-                                      >
-                                        <SquarePen size={13} /> Rename
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          branchThread(thread.id);
-                                        }}
-                                      >
-                                        <GitBranch size={13} /> Branch
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          handleRemoveThreadFromEpic(thread.id);
-                                        }}
-                                      >
-                                        <EyeOff size={13} /> Remove from epic
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="project-menu-item danger"
-                                        role="menuitem"
-                                        onClick={() => {
-                                          setThreadItemMenuKey(null);
-                                          if (confirm('Delete this thread?')) {
-                                            void deleteThreadWithRuntime(thread.id);
-                                          }
-                                        }}
-                                      >
-                                        <Trash2 size={13} /> Delete
-                                      </button>
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            ))
-                            )}
-                          </div>
-
-                          {(hasMoreEpicThreads || isEpicListExpanded) && (
-                            <button
-                              type="button"
-                              className="threads-show-more"
-                              onClick={() =>
-                                setThreadListLimits((prev) => {
-                                  if (hasMoreEpicThreads) {
-                                    return {
-                                      ...prev,
-                                      [epicThreadListKey]: epicThreads.length,
-                                    };
-                                  }
-                                  const { [epicThreadListKey]: _removed, ...rest } = prev;
-                                  return rest;
-                                })
-                              }
-                            >
-                              {hasMoreEpicThreads ? 'Show more' : 'Show less'}
-                            </button>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  );
-                })}
               </>
             )}
           </div>
@@ -1169,9 +800,9 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
         {sortedProjects.map((project) => {
           const projectThreads = projectThreadsByProject.get(project.id) ?? [];
           const isActiveProject = selectedProject?.id === project.id;
-          // Highlighted like a selected epic: only while the project itself,
-          // not one of its threads or an epic, is what the main view shows.
-          const isProjectSelected = isActiveProject && !selectedThreadId && !selectedEpicId;
+          // Highlighted only while the project itself, not one of its
+          // threads, is what the main view shows.
+          const isProjectSelected = isActiveProject && !selectedThreadId;
           const isCollapsed = collapsedProjects[project.id] ?? false;
           const visibleLimit = threadListLimits[project.id] ?? THREADS_VISIBLE_LIMIT;
           const visibleThreads = projectThreads.slice(0, visibleLimit);

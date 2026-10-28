@@ -709,7 +709,8 @@ if (
       return {
         projects: [{ id: 'p1', name: 'orion', path: '/tmp/orion' }],
         noProject: { id: 'orion:no-project', name: 'No project', path: '/tmp/orion-chats' },
-        epics: [{ id: 'e1', name: 'Remote epic', description: '', createdAt: '2026-08-01T09:00:00.000Z' }],
+        // Left behind by builds that had Epics; the host must not expose it.
+        epics: [{ id: 'e1', name: 'Retired epic', description: '', createdAt: '2026-08-01T09:00:00.000Z' }],
       };
     },
     readThreadsFile: async ({ threadId } = {}) => {
@@ -815,8 +816,6 @@ if (
       }
       if (command.kind === 'runTurn') {
         engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId ?? 't-new' });
-      } else if (command.kind === 'createEpic') {
-        engine.resolveRemoteCommand({ commandId, ok: true, epicId: 'epic-new' });
       } else if (command.kind === 'stopTurn') {
         engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId });
       }
@@ -994,12 +993,6 @@ if (
       prompt: 'keep going',
     });
     results.stopTurn = await engine.stopRemoteTurn({ machineId: results.pair.machine?.id, threadId: 't1' });
-    results.createEpic = await engine.createRemoteEpic({
-      machineId: results.pair.machine?.id,
-      name: 'Remote Epic',
-      description: 'Created from the web controller',
-      projectIds: ['p1'],
-    });
     results.emptyPrompt = await engine.runRemoteTurn({ machineId: results.pair.machine?.id, prompt: '   ' });
     results.state = engine.getRemoteControlState();
     send({ kind: 'results', results });
@@ -1915,7 +1908,7 @@ if (
       1,
       'The remote project groups must expose No project chats'
     );
-    assert.equal(results.snapshot.snapshot.epics.length, 1);
+    assert.equal(results.snapshot.snapshot.epics, undefined, 'Retired Epics must not reach controllers');
     assert.equal(results.snapshot.snapshot.threads.length, 3);
     assert.equal(results.thread.ok, true);
     assert.equal(results.thread.thread.messages.length, 2);
@@ -1927,8 +1920,6 @@ if (
     assert.equal(results.continueTurn.ok, true);
     assert.equal(results.continueTurn.threadId, 't1');
     assert.equal(results.stopTurn.ok, true, `stopTurn failed: ${results.stopTurn.error}`);
-    assert.equal(results.createEpic.ok, true, `createEpic failed: ${results.createEpic.error}`);
-    assert.equal(results.createEpic.epicId, 'epic-new');
     assert.equal(results.emptyPrompt.ok, false);
     assert.equal(results.state.machines.length, 1);
     assert.equal(results.state.machines[0].status, 'connected');

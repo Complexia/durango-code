@@ -22,7 +22,7 @@ button in the shell bar:
 - **Push to Orion** appears for a plain project or a Git repository without an
   origin. Plain projects are initialized on `main`, receive a conservative
   `.gitignore` when they do not already have one, and get an initial commit.
-- **Commit and Push**, Epic pushes, branch reads, and Epic pull requests use
+- **Commit and Push** and branch reads use
   the provider behind `origin`. An Orion push is authoritative. When the
   optional GitHub authorization is active, Orion Cloud continuously updates
   the preserved GitHub mirror even while Desktop is closed. Until then,

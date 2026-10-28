@@ -17,7 +17,6 @@ import '@xterm/xterm/css/xterm.css';
 // the thread (agentSessionIds.claude) for --resume after an app restart.
 type TerminalViewProps = {
   threadId: string;
-  epicId?: string;
   projectPath: string;
   accessMode: 'read-only' | 'workspace-write' | 'full-access';
   /** Whether this pane currently owns keyboard input. */
@@ -44,7 +43,6 @@ const terminalTheme = {
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
   threadId,
-  epicId,
   projectPath,
   accessMode,
   focused,
@@ -133,7 +131,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       if (options.fresh) term.reset();
       const result = await window.orion.terminalEnsure({
         threadId,
-        ...(epicId ? { epicId } : {}),
         projectPath,
         accessMode,
         cols: term.cols,
@@ -201,7 +198,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       if (terminalRef.current === term) terminalRef.current = null;
       term.dispose();
     };
-  }, [threadId, epicId, projectPath, accessMode, forkSession]);
+  }, [threadId, projectPath, accessMode, forkSession]);
 
   useEffect(() => {
     const terminal = terminalRef.current;

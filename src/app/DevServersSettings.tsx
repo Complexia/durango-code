@@ -365,7 +365,7 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
                   )}
                   <button
                     type="button"
-                    className="archived-epic-action danger"
+                    className="settings-item-action danger"
                     title={`Kill ${server.command} (pid ${server.pid})`}
                     disabled={busy}
                     onClick={() => void killServers([server])}

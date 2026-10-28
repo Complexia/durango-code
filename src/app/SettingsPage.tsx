@@ -6,7 +6,6 @@ import {
   Columns2,
   FlaskConical,
   FolderGit2,
-  GitPullRequest,
   LogIn,
   LogOut,
   MousePointerClick,
@@ -20,21 +19,19 @@ import {
   Sparkles,
   Square,
   SquareArrowOutUpRight,
-  SquareKanban,
-  Trash2,
   UserRound,
   Workflow,
 } from 'lucide-react';
 import {
   defaultDurangoSettings,
-  defaultEpicsSettings,
+  defaultSidebarV2Settings,
+  defaultAppearanceSettings,
+  UI_SCALE_OPTIONS,
   useOrionStore,
   defaultSplitViewSettings,
   MAX_THREAD_PANES,
   type BrowserUseMode,
   type DeploymentSettings,
-  type Epic,
-  type EpicsSettings,
   type NotificationSettings,
   type OrchestrationRoleId,
   type OrchestrationSettings,
@@ -64,10 +61,8 @@ import DevServersSettings from './DevServersSettings';
 import WorkspacesSettings from './WorkspacesSettings';
 import RemoteControlSettings from './RemoteControlSettings';
 import { orchestrationRoleMeta } from './promptContext';
-import { formatShortTime } from './time';
 import type {
   AppUpdateState,
-  EpicPrStatus,
   OrionAccountState,
   ProviderUpdateItem,
   ProviderUpdateProgress,
@@ -78,7 +73,6 @@ import type {
 } from './appTypes';
 import { ReleaseNotesList } from './AppUpdateUi';
 
-const ARCHIVED_EPICS_COLLAPSED_LIMIT = 5;
 const CODEX_BROWSER_EXTENSION_URL =
   'https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg';
 
@@ -89,8 +83,6 @@ export type SettingsPageProps = {
   notificationSettings: NotificationSettings;
   setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
   setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
-  setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
-  epicsSettings: EpicsSettings;
   splitViewSettings: SplitViewSettings;
   setSplitViewSettings: (updates: Partial<SplitViewSettings>) => void;
   savedViews: SavedView[];
@@ -153,9 +145,6 @@ export type SettingsPageProps = {
   accountIdentity: string | null;
   accountEmailRevealed: boolean;
   accountInitials: string;
-  epicsEnabled: boolean;
-  epicPromptGitMessages: boolean;
-  archivedEpics: Epic[];
   utilityCandidateModels: AgentModel[];
   utilityProviders: AgentProvider[];
   resolvedUtilityModelId: string | null;
@@ -172,12 +161,8 @@ export type SettingsPageProps = {
   handleStartAccountAuth: () => Promise<void>;
   handleSignOutAccount: () => Promise<void>;
   handleAuthenticateProvider: (providerId: string) => Promise<void>;
-  openEpicPrUrl: (prUrl: string) => void;
-  handleDeleteEpic: (epic: Epic) => void;
-  handleRestoreEpic: (epic: Epic) => void;
   formatCheckedTime: (iso: string) => string;
   formatBytes: (bytes: number | null | undefined) => string;
-  epicPrStatus: (epic: Pick<Epic, 'prUrl' | 'prState'> | null | undefined) => EpicPrStatus | null;
 };
 
 const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) {
@@ -185,8 +170,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     notificationSettings,
     setNotificationSettings,
     setTextGenerationSettings,
-    setEpicsSettings,
-    epicsSettings,
     splitViewSettings,
     setSplitViewSettings,
     savedViews,
@@ -248,9 +231,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     accountIdentity,
     accountEmailRevealed,
     accountInitials,
-    epicsEnabled,
-    epicPromptGitMessages,
-    archivedEpics,
     utilityCandidateModels,
     utilityProviders,
     resolvedUtilityModelId,
@@ -267,20 +247,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     handleStartAccountAuth,
     handleSignOutAccount,
     handleAuthenticateProvider,
-    openEpicPrUrl,
-    handleDeleteEpic,
-    handleRestoreEpic,
     formatCheckedTime,
     formatBytes,
-    epicPrStatus,
   } = props;
-  const [archivedEpicsExpanded, setArchivedEpicsExpanded] = React.useState(false);
   const [computerUseSubtab, setComputerUseSubtab] = React.useState<'permissions' | 'browser-use'>('permissions');
   const [skillsAndMcpsSubtab, setSkillsAndMcpsSubtab] = React.useState<'skills' | 'mcps'>('skills');
-  const visibleArchivedEpics = archivedEpicsExpanded
-    ? archivedEpics
-    : archivedEpics.slice(0, ARCHIVED_EPICS_COLLAPSED_LIMIT);
-  const hiddenArchivedEpicCount = Math.max(0, archivedEpics.length - ARCHIVED_EPICS_COLLAPSED_LIMIT);
   const configuredCodexBrowserMode = providerSettings.codex?.options?.browserUseMode;
   const codexBrowserMode: BrowserUseMode =
     configuredCodexBrowserMode === 'disabled' ||
@@ -422,7 +393,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         </div>
 
         <div
-          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'workspaces' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
+          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'cosmetics' || settingsTab === 'workspaces' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
         >
           {settingsTab === 'account' && (
             <>
@@ -516,7 +487,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="setting-label-title">Share coding work with Durango</div>
                   <div className="setting-label-desc">
-                    On by default. Your projects, epics, threads (full transcripts including every
+                    On by default. Your projects, threads (full transcripts including every
                     agent step and tool call), and token usage sync to your Durango account, and code
                     syncs through Durango Cloud repos (below). Durango Chat uses summaries of this
                     work for its memory, so it can answer questions like “what did I ship this
@@ -784,7 +755,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   <div className="setting-label">
                     <div className="setting-label-title">Model</div>
                     <div className="setting-label-desc">
-                      Writes Durango Code's short generated text: thread titles, epic commit messages from staged changes, and
+                      Writes Durango Code's short generated text: thread titles, commit messages from staged changes, and
                       PR descriptions from branch changes. Defaults to GPT-6 Luna, then Claude Haiku 5.5, when
                       installed.
                     </div>
@@ -849,123 +820,6 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     )}
                   </div>
                 </div>
-              </div>
-
-              <div className="settings-group-label">Epics</div>
-              <div className="settings-group">
-                <div className="setting-row">
-                  <div className="setting-label">
-                    <div className="setting-label-title">Epics section</div>
-                    <div className="setting-label-desc">
-                      Show Epics in the sidebar — big-ticket tasks that group threads and can commit, push, and open PRs
-                      for the work as a whole.
-                    </div>
-                  </div>
-                  <label className="provider-toggle" title="Epics section">
-                    <input
-                      type="checkbox"
-                      checked={epicsEnabled}
-                      onChange={(e) => setEpicsSettings({ enabled: e.target.checked })}
-                    />
-                    <span />
-                  </label>
-                </div>
-
-                {epicsEnabled && (
-                  <div className="setting-row">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Settle confirmation</div>
-                      <div className="setting-label-desc">
-                        Ask before every settlement. Durango Code still warns when work may be archived without a commit, push,
-                        or pull request.
-                      </div>
-                    </div>
-                    <label className="provider-toggle" title="Settle confirmation">
-                      <input
-                        type="checkbox"
-                        checked={epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle}
-                        onChange={(e) => setEpicsSettings({ confirmSettle: e.target.checked })}
-                      />
-                      <span />
-                    </label>
-                  </div>
-                )}
-
-                {epicsEnabled && archivedEpics.length > 0 && (
-                  <div className="setting-row setting-row-stacked">
-                    <div className="setting-label">
-                      <div className="setting-label-title">Archived epics</div>
-                      <div className="setting-label-desc">
-                        Settled epics land here. Restore one to bring it back to the sidebar.
-                      </div>
-                    </div>
-                    <div className="archived-epics-list">
-                      <div id="settings-archived-epics-list" className="archived-epics-items">
-                        {visibleArchivedEpics.map((epic) => {
-                          const prStatus = epicPrStatus(epic);
-                          return (
-                            <div key={epic.id} className="archived-epic-row">
-                              <SquareKanban
-                                size={13}
-                                className={`epic-icon ${prStatus ? `epic-icon--${prStatus}` : ''}`}
-                              />
-                              <span className="archived-epic-name truncate" title={epic.name}>
-                                {epic.name}
-                              </span>
-                              <span className="archived-epic-date">
-                                Settled {formatShortTime(new Date(epic.settledAt ?? epic.createdAt))}
-                              </span>
-                              {epic.prUrl && (
-                                <button
-                                  type="button"
-                                  className="archived-epic-action"
-                                  title="Open the pull request"
-                                  onClick={() => openEpicPrUrl(epic.prUrl as string)}
-                                >
-                                  <GitPullRequest size={13} />
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                className="archived-epic-action"
-                                title="Restore to the sidebar"
-                                onClick={() => handleRestoreEpic(epic)}
-                              >
-                                <RefreshCw size={13} />
-                              </button>
-                              <button
-                                type="button"
-                                className="archived-epic-action danger"
-                                title="Delete epic"
-                                onClick={() => handleDeleteEpic(epic)}
-                              >
-                                <Trash2 size={13} />
-                              </button>
-                            </div>
-                          );
-                        })}
-                      </div>
-                      {archivedEpics.length > ARCHIVED_EPICS_COLLAPSED_LIMIT && (
-                        <button
-                          type="button"
-                          className="archived-epics-toggle"
-                          aria-expanded={archivedEpicsExpanded}
-                          aria-controls="settings-archived-epics-list"
-                          onClick={() => setArchivedEpicsExpanded((expanded) => !expanded)}
-                        >
-                          <span>
-                            {archivedEpicsExpanded ? 'Show less' : `Show ${hiddenArchivedEpicCount} more`}
-                          </span>
-                          <ChevronDown
-                            size={13}
-                            className={archivedEpicsExpanded ? 'open' : ''}
-                            aria-hidden="true"
-                          />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                )}
               </div>
 
               <div className="settings-group-label">About</div>
@@ -1518,17 +1372,17 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                       Delete one here or from the sidebar. Its threads are untouched either way.
                     </div>
                   </div>
-                  <div className="archived-epics-list">
+                  <div className="settings-item-list">
                     {savedViews.map((view) => (
-                      <div key={view.id} className="archived-epic-row">
+                      <div key={view.id} className="settings-item-row">
                         <Columns2 size={13} />
-                        <span className="archived-epic-name truncate" title={view.name}>
+                        <span className="settings-item-name truncate" title={view.name}>
                           {view.name}
                         </span>
-                        <span className="archived-epic-date">{view.threadIds.length} threads</span>
+                        <span className="settings-item-meta">{view.threadIds.length} threads</span>
                         <button
                           type="button"
-                          className="archived-epic-action"
+                          className="settings-item-action"
                           onClick={() => deleteSavedView(view.id)}
                         >
                           Delete
@@ -1839,43 +1693,19 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'workspaces' && <WorkspacesSettings />}
 
           {settingsTab === 'cosmetics' && (
-            <div className="settings-empty-panel">
-              <div className="settings-panel-title">Cosmetics</div>
-              <div className="settings-muted">Coming soon.</div>
-            </div>
+            <>
+              <div className="settings-group-label">Appearance</div>
+              <div className="settings-group">
+                <TextSizeSetting />
+              </div>
+            </>
           )}
           {settingsTab === 'experimental' && (
             <>
-              {epicsEnabled && (
-                <>
-                  <div className="settings-group-label">Epics</div>
-                  <div className="settings-group">
-                    <div className="setting-row">
-                      <div className="setting-label">
-                        <div className="setting-label-title">Commit &amp; PR message prompts</div>
-                        <div className="setting-label-desc">
-                          Ask before an epic commits or opens a PR, so you can write the message yourself (leave it
-                          empty and the epic message model still writes it) and pick the PR's base branch. Turn off to
-                          skip both dialogs: messages are always generated, and PRs target your project's current branch
-                          on origin.
-                        </div>
-                      </div>
-                      <label className="provider-toggle" title="Commit & PR message prompts">
-                        <input
-                          type="checkbox"
-                          checked={epicPromptGitMessages}
-                          onChange={(e) =>
-                            setEpicsSettings({
-                              promptGitMessages: e.target.checked,
-                            })
-                          }
-                        />
-                        <span />
-                      </label>
-                    </div>
-                  </div>
-                </>
-              )}
+              <div className="settings-group-label">Sidebar</div>
+              <div className="settings-group">
+                <SidebarV2Setting />
+              </div>
             </>
           )}
         </div>
@@ -1885,6 +1715,62 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
 });
 
 export default SettingsPage;
+
+// Text size: zooms the whole window, so text, icons and spacing grow together.
+const TextSizeSetting: React.FC = () => {
+  const uiScale = useOrionStore((state) => state.appearanceSettings?.uiScale ?? defaultAppearanceSettings.uiScale);
+  const setAppearanceSettings = useOrionStore((state) => state.setAppearanceSettings);
+  return (
+    <div className="setting-row">
+      <div className="setting-label">
+        <div className="setting-label-title">Text size</div>
+        <div className="setting-label-desc">Scales the whole window: sidebar, threads, chat and settings.</div>
+      </div>
+      <div role="radiogroup" aria-label="Text size" className="flex shrink-0 rounded-lg border border-white/10 bg-white/[0.03] p-0.5">
+        {UI_SCALE_OPTIONS.map((scale) => (
+          <button
+            key={scale}
+            type="button"
+            role="radio"
+            aria-checked={uiScale === scale}
+            className={`min-w-[52px] rounded-md px-2.5 py-1 text-[12px] font-medium tabular-nums transition-colors ${
+              uiScale === scale ? 'bg-white/[0.1] text-neutral-100' : 'text-neutral-400 hover:text-neutral-200'
+            }`}
+            onClick={() => setAppearanceSettings({ uiScale: scale })}
+          >
+            {Math.round(scale * 100)}%
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// Sidebar v2: a flat thread list (after T3 Code) with snooze and settle.
+const SidebarV2Setting: React.FC = () => {
+  const enabled = useOrionStore((state) => state.sidebarV2Settings?.enabled ?? defaultSidebarV2Settings.enabled);
+  const setSidebarV2Settings = useOrionStore((state) => state.setSidebarV2Settings);
+  return (
+    <div className="setting-row">
+      <div className="setting-label">
+        <div className="setting-label-title">Sidebar v2</div>
+        <div className="setting-label-desc">
+          One list of threads instead of project groups, with search, New agent and Add project. Every thread stays
+          in the list until you snooze it (it comes back when it finishes or needs you) or settle it (archived); a
+          menu shows pinned threads at the top and the Snoozed and Settled lists.
+        </div>
+      </div>
+      <label className="provider-toggle" title="Sidebar v2">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setSidebarV2Settings({ enabled: e.target.checked })}
+        />
+        <span />
+      </label>
+    </div>
+  );
+};
 
 // Optional: add what Durango remembers about the user to agent instructions
 // at thread start. Off by default — agents can always pull memory on demand

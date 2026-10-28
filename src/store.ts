@@ -13,7 +13,7 @@ export type Project = {
 /**
  * Pseudo-project for agents started with "No project" selected (a plain chat,
  * not tied to a repository). It is never stored in `projects`, so project
- * lists, epics and repository controls don't see it; threads reference it by
+ * lists and repository controls don't see it; threads reference it by
  * id and run in an Orion-owned scratch directory (`noProject.path`).
  */
 export const NO_PROJECT_ID = 'orion:no-project';
@@ -30,96 +30,8 @@ export const findProjectById = (
   return state.projects.find((project) => project.id === id);
 };
 
-export type EpicRepository = {
-  /** Orion project represented by this repository. */
-  projectId: string;
-  /** Project path, retained so the repository is recognised if the project is re-added. */
-  projectPath: string;
-  /** Branch this repository's pull request targets. */
-  sourceBranch?: string;
-  /** Canonical source repository root. */
-  gitRoot?: string;
-  /** Feature branch owned by this Epic in this repository. */
-  gitBranch?: string;
-  prUrl?: string;
-  prState?: 'OPEN' | 'CLOSED' | 'MERGED';
-  prStateCheckedAt?: string;
-};
-
 /**
- * A big-ticket epic ("Optimize memory usage") that groups threads in the
- * sidebar Epics section. Threads keep living in Recent agents and under their
- * project as usual; an epic is an extra lens over them plus git actions
- * (commit & push, PR) for the work as a whole. Settling archives the epic.
- */
-export type Epic = {
-  id: string;
-  name: string;
-  /** Optional longer notes for the epic (editable in the epic view). */
-  description?: string;
-  createdAt: string;
-  /** Set when the user settles the epic; settled epics are archived. */
-  settledAt?: string;
-  /** URL of the PR opened from this epic, if any. */
-  prUrl?: string;
-  /**
-   * "Auto create PR on commit" under "Commit & push": a successful commit
-   * carries straight on into "Create PR" without a second click, so the user
-   * can start the commit and navigate away. The unattended PR skips the
-   * base-branch dialog and takes the same base the promptless button would.
-   * Per epic, and persisted so it holds for that epic's later commits.
-   */
-  autoPrAfterCommit?: boolean;
-  /**
-   * "Only commit (don't push)" under "Commit & push": a successful commit
-   * stays local — no push, and auto-PR is suppressed since a PR needs a push.
-   * Per epic, and persisted so it holds for that epic's later commits.
-   */
-  commitWithoutPush?: boolean;
-  /**
-   * Last known lifecycle state of prUrl's pull request. Persisted so the
-   * sidebar can colour every epic's icon on first paint instead of waiting on
-   * a round of `gh pr view` calls.
-   */
-  prState?: 'OPEN' | 'CLOSED' | 'MERGED';
-  /** ISO start timestamp of the last accepted successful prState refresh. */
-  prStateCheckedAt?: string;
-  /** Project explicitly selected as the repository for this epic's git actions. */
-  repositoryProjectId?: string;
-  /**
-   * Every repository participating in the Epic. The first entry is mirrored
-   * into the legacy single-repository fields above so older persisted Epics
-   * and older renderer paths continue to work.
-   */
-  repositories?: EpicRepository[];
-  /** Canonical repository root claimed by this epic's git actions. */
-  gitRoot?: string;
-  /** Dedicated feature branch claimed by this epic's git actions. */
-  gitBranch?: string;
-};
-
-export type EpicsSettings = {
-  /** Show the Epics sidebar section and epic views. */
-  enabled: boolean;
-  /** Ask for confirmation before settling an epic. */
-  confirmSettle: boolean;
-  /**
-   * Open a dialog before "Commit & push" and "Create PR" so the message can be
-   * written by hand (empty still means the model writes it) and the PR's base
-   * branch picked. Off skips both dialogs: the message is always generated and
-   * the PR targets the source project's current branch on origin.
-   */
-  promptGitMessages: boolean;
-};
-
-export const defaultEpicsSettings: EpicsSettings = {
-  enabled: true,
-  confirmSettle: true,
-  promptGitMessages: true,
-};
-
-/**
- * The model behind Orion's hidden text-generation turns: thread titles, epic
+ * The model behind Orion's hidden text-generation turns: thread titles,
  * commit messages, and PR descriptions. These are short, latency-sensitive
  * one-shots, so the default is the fastest model on whichever providers the
  * user actually has installed.
@@ -176,22 +88,57 @@ export const defaultDeploymentSettings: DeploymentSettings = {
 };
 
 /**
- * Durango workspaces (docs/workspaces.md): an isolated checkout per thread,
- * created with the bundled durango-code CLI (`ws new`) before the thread's
- * first turn in a repository that has a durango.toml.
+ * Sidebar v2 (Settings → Experimental): one flat thread list with snooze and
+ * settle instead of project groups. `views` are the lists toggled from its
+ * header menu.
+ */
+export type SidebarV2Settings = {
+  enabled: boolean;
+  views: { pinned: boolean; recent: boolean; snoozed: boolean; settled: boolean };
+};
+
+/** Settings → Cosmetics. */
+export type AppearanceSettings = {
+  /** Zoom factor for the whole window (text, icons and spacing alike). */
+  uiScale: number;
+};
+
+export const UI_SCALE_OPTIONS = [1, 1.1, 1.2, 1.3] as const;
+
+export const defaultAppearanceSettings: AppearanceSettings = {
+  uiScale: 1.1,
+};
+
+export const defaultSidebarV2Settings: SidebarV2Settings = {
+  enabled: false,
+  views: { pinned: true, recent: true, snoozed: false, settled: false },
+};
+
+/**
+ * Durango workspaces (docs/workspaces.md): an isolated checkout per thread.
+ * Agents create one themselves (`durango-code ws new`, the bundled
+ * durango-workspaces skill) when they start work in a repository that has a
+ * durango.toml; with `enabled` the app instead creates it before every new
+ * thread's first turn.
  */
 export type DurangoWorkspaceSettings = {
-  /** Create a workspace automatically for new threads in Durango repositories. */
+  /** Create a workspace before the first turn of every new thread in Durango repositories. */
   enabled: boolean;
+  /**
+   * 2 since agents create workspaces themselves: stores from before then had
+   * `enabled` on by default and are switched off once.
+   */
+  version?: number;
 };
 
 export const defaultDurangoWorkspaceSettings: DurangoWorkspaceSettings = {
-  enabled: true,
+  enabled: false,
+  version: 2,
 };
 
 /**
  * Work sharing ("Share coding work with Durango") — workspace sync to Durango
- * Code web (docs in orion-web/docs/workspace-sync.md): projects, epics,
+ * Code web (docs in orion-web/docs/workspace-sync.md): projects,
  * threads (full transcripts), token usage, and — when syncCode is on — code
  * as Durango Cloud repos with full git history. Durango Chat builds its
  * memory from summaries of the synced threads. On by default since the
@@ -295,31 +242,6 @@ export const defaultRemoteControlSettings: RemoteControlSettings = {
   allowIncoming: false,
   port: 47615,
   connectionMode: 'direct',
-};
-
-const normalizeRepoPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
-
-/**
- * The project acting as the repository for an epic's git actions, if it can be
- * resolved: the claimed git root wins (that is what the git actions operate
- * on), then the explicitly selected repository project.
- */
-const projectForEpicRepository = (projects: Project[], epic: Epic | undefined) => {
-  if (!epic) return undefined;
-  const selectedRepository = epic.repositoryProjectId
-    ? projects.find((project) => project.id === epic.repositoryProjectId)
-    : undefined;
-  if (epic.gitRoot) {
-    const epicRoot = normalizeRepoPath(epic.gitRoot);
-    const belongsToRoot = (project: Project) => {
-      const projectPath = normalizeRepoPath(project.path);
-      return projectPath === epicRoot || projectPath.startsWith(`${epicRoot}/`);
-    };
-    if (selectedRepository && belongsToRoot(selectedRepository)) return selectedRepository;
-    const byRoot = projects.find(belongsToRoot);
-    if (byRoot) return byRoot;
-  }
-  return selectedRepository;
 };
 
 export type AgentToolSource = { url: string; title?: string };
@@ -548,6 +470,16 @@ export type Thread = {
    */
   finishedUnseenAt?: string;
   /**
+   * Sidebar v2: snoozed threads leave the list until their run finishes or
+   * they need the user (a question, an approval, a failure), then wake up.
+   */
+  snoozedAt?: string;
+  /** Set when a snoozed thread woke; cleared once it is opened. */
+  wokeAt?: string;
+  wokeReason?: 'finished' | 'attention';
+  /** Sidebar v2: settled (archived) threads leave the list until restored or run again. */
+  settledAt?: string;
+  /**
    * Set on threads imported from a Claude Code or Codex session the user ran
    * outside Orion. The session id doubles as the dedupe key for re-imports;
    * agentSessionIds carries the same id so the next turn resumes it.
@@ -601,8 +533,6 @@ export type Thread = {
   };
   /** Codex goal (/goal) this thread is pursuing, if any. Null after /goal clear. */
   goal?: ThreadGoal | null;
-  /** Sidebar epic this thread belongs to, if any. */
-  epicId?: string;
   /**
    * Durango workspace this thread's agents run in, created before its first
    * turn. Branches and subagents share their source thread's workspace, so a
@@ -631,6 +561,14 @@ export type ThreadDurangoWorkspace = {
   portBase: number;
   portBlock: number;
   createdAt: string;
+  /**
+   * The agent made this workspace itself during a turn (`durango-code ws new`)
+   * instead of the app making it before the first one. The thread's sessions
+   * were recorded in the project directory, so its turns keep running there
+   * and the agent works in the workspace by path; the app still shows it in
+   * the header and cleans it up with the thread.
+   */
+  adopted?: boolean;
 };
 
 export type OpenFile = {
@@ -800,16 +738,13 @@ interface OrionState {
   activeSavedViewId: string | null;
   splitViewSettings: SplitViewSettings;
 
-  // Epics
-  epics: Epic[];
-  /** Selected epic (epic view in the main panel). Cleared when a thread is selected. */
-  selectedEpicId: string | null;
-  epicsSettings: EpicsSettings;
   durangoWorkspaceSettings: DurangoWorkspaceSettings;
   workspaceSyncSettings: WorkspaceSyncSettings;
   durangoSettings: DurangoSettings;
   remoteControlSettings: RemoteControlSettings;
   deploymentSettings: DeploymentSettings;
+  sidebarV2Settings: SidebarV2Settings;
+  appearanceSettings: AppearanceSettings;
 
   // Code tab workspace
   workspacePath: string | null;
@@ -841,27 +776,13 @@ interface OrionState {
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
-  addEpic: (
-    name: string,
-    options?: {
-      description?: string;
-      repositoryProjectId?: string;
-      repositoryProjectIds?: string[];
-    }
-  ) => string; // returns new epic id
-  renameEpic: (id: string, name: string) => void;
-  updateEpic: (id: string, updates: Partial<Epic>) => void;
-  /** Deletes the epic; its threads survive and normally just lose the grouping. */
-  deleteEpic: (id: string, options?: { retainThreadMembership?: boolean }) => void;
-  settleEpic: (id: string) => void;
-  unsettleEpic: (id: string) => void;
-  selectEpic: (id: string | null) => void;
-  setEpicsSettings: (updates: Partial<EpicsSettings>) => void;
   setDurangoWorkspaceSettings: (updates: Partial<DurangoWorkspaceSettings>) => void;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   setDurangoSettings: (updates: Partial<DurangoSettings>) => void;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
+  setSidebarV2Settings: (updates: Partial<SidebarV2Settings>) => void;
+  setAppearanceSettings: (updates: Partial<AppearanceSettings>) => void;
 
   createThread: (
     projectId: string,
@@ -873,8 +794,6 @@ interface OrionState {
       spawnId?: string;
       accessMode?: Thread['accessMode'];
       subagent?: NativeSubagentInfo;
-      /** Epic the new thread is grouped under. */
-      epicId?: string;
       /** Durango workspace to work in; defaults to the parent thread's. `null` opts out. */
       durangoWorkspace?: ThreadDurangoWorkspace | null;
       /** false = don't switch the UI to the new thread (background spawns). */
@@ -1305,8 +1224,8 @@ type PaneUpdate = PaneSelection & Partial<Pick<OrionState, 'savedViews' | 'activ
  *
  * `ejectOnCollapse` marks a change the user made by closing panes: falling back
  * to a single thread then throws the entry away, because a "view" that restores
- * one pane is just that thread. Every other route to one pane — picking an
- * epic, opening a thread elsewhere — only stops tracking, so the saved view
+ * one pane is just that thread. Every other route to one pane — opening a
+ * thread elsewhere — only stops tracking, so the saved view
  * survives to be reopened.
  */
 const syncSavedView = (
@@ -1423,13 +1342,14 @@ const pruneSavedViews = (savedViews: SavedView[], threads: Thread[]) => {
 // away" mark, including background panes in a saved/restored split.
 const threadsWithOpenedSeen = (state: OrionState, ids: string | string[]) => {
   const openedIds = new Set(Array.isArray(ids) ? ids : [ids]);
-  const isUnseen = (thread: Thread) => Boolean(thread.finishedUnseenAt || thread.importedUnseen);
+  const isUnseen = (thread: Thread) =>
+    Boolean(thread.finishedUnseenAt || thread.importedUnseen || thread.wokeAt || thread.wokeReason);
   if (!state.threads.some((thread) => openedIds.has(thread.id) && isUnseen(thread))) {
     return state.threads;
   }
   return state.threads.map((thread) =>
     openedIds.has(thread.id) && isUnseen(thread)
-      ? { ...thread, finishedUnseenAt: undefined, importedUnseen: undefined }
+      ? { ...thread, finishedUnseenAt: undefined, importedUnseen: undefined, wokeAt: undefined, wokeReason: undefined }
       : thread
   );
 };
@@ -1448,14 +1368,13 @@ export const useOrionStore = create<OrionState>()(
       savedViews: [],
       activeSavedViewId: null,
       splitViewSettings: defaultSplitViewSettings,
-      epics: [],
-      selectedEpicId: null,
-      epicsSettings: defaultEpicsSettings,
       durangoWorkspaceSettings: defaultDurangoWorkspaceSettings,
       workspaceSyncSettings: defaultWorkspaceSyncSettings,
       durangoSettings: defaultDurangoSettings,
       remoteControlSettings: defaultRemoteControlSettings,
       deploymentSettings: defaultDeploymentSettings,
+      sidebarV2Settings: defaultSidebarV2Settings,
+      appearanceSettings: defaultAppearanceSettings,
       workspacePath: null,
       openFiles: [],
       activeFilePath: null,
@@ -1613,9 +1532,6 @@ export const useOrionStore = create<OrionState>()(
           const remainingProjects = state.projects.filter((p) => p.id !== id);
           const fallbackProject = remainingProjects[0] ?? null;
           const wasWorkspaceProject = removedProject?.path === state.workspacePath;
-          const selectedEpic = state.epics.find((epic) => epic.id === state.selectedEpicId);
-          const selectedEpicRepository = projectForEpicRepository(state.projects, selectedEpic);
-          const removedSelectedEpicRepository = selectedEpicRepository?.id === id;
           // Saved views lose the threads that went with the project.
           const threads = state.threads.filter((thread) => thread.projectId !== id);
           const savedViews = pruneSavedViews(state.savedViews, threads);
@@ -1629,11 +1545,6 @@ export const useOrionStore = create<OrionState>()(
 
           return {
             projects: remainingProjects,
-            epics: state.epics.map((epic) =>
-              epic.repositoryProjectId === id
-                ? { ...epic, repositoryProjectId: undefined }
-                : epic
-            ),
             threads,
             selectedProjectId:
               focusedPaneThread?.projectId ??
@@ -1645,14 +1556,6 @@ export const useOrionStore = create<OrionState>()(
             activeSavedViewId: savedViews.some((view) => view.id === state.activeSavedViewId)
               ? state.activeSavedViewId
               : null,
-            // A surviving focused pane owns the shell's epic context. With no
-            // pane left, dismiss an epic whose repository was removed; its
-            // durable gitRoot/branch claim remains if that repository returns.
-            selectedEpicId: focusedPaneThread
-              ? focusedPaneThread.epicId ?? null
-              : removedSelectedEpicRepository
-                ? null
-                : state.selectedEpicId,
             expandedProjects: state.expandedProjects.filter((pid) => pid !== id),
             workspacePath: wasWorkspaceProject ? fallbackProject?.path ?? null : state.workspacePath,
             openFiles: wasWorkspaceProject ? [] : state.openFiles,
@@ -1664,137 +1567,6 @@ export const useOrionStore = create<OrionState>()(
       renameProject: (id, name) =>
         set((state) => ({
           projects: state.projects.map((p) => (p.id === id ? { ...p, name } : p)),
-        })),
-
-      addEpic: (name, options) => {
-        const description = options?.description?.trim();
-        const newEpic: Epic = {
-          id: crypto.randomUUID(),
-          name,
-          ...(description ? { description } : {}),
-          createdAt: new Date().toISOString(),
-        };
-        set((state) => {
-          const requestedProjectIds = [
-            ...(options?.repositoryProjectIds ?? []),
-            ...(options?.repositoryProjectId ? [options.repositoryProjectId] : []),
-          ];
-          const repositoryProjects = [...new Set(requestedProjectIds)]
-            .map((projectId) => state.projects.find((project) => project.id === projectId))
-            .filter((project): project is Project => Boolean(project));
-          const repositoryProject = repositoryProjects[0];
-          if (repositoryProject) newEpic.repositoryProjectId = repositoryProject.id;
-          if (repositoryProjects.length > 0) {
-            newEpic.repositories = repositoryProjects.map((project) => ({
-              projectId: project.id,
-              projectPath: project.path,
-            }));
-          }
-          return {
-            epics: [newEpic, ...state.epics],
-            selectedEpicId: newEpic.id,
-            selectedThreadId: null,
-            paneThreadIds: [],
-            // The split is put away, not thrown away: its saved view stays in
-            // the sidebar to come back to.
-            activeSavedViewId: null,
-            // The shell repository follows the epic's binding: the project
-            // picked in the create modal, or none — header git controls must
-            // not keep targeting the previously selected project while the
-            // epic view asks the user to choose one.
-            selectedProjectId: repositoryProject?.id ?? null,
-          };
-        });
-        return newEpic.id;
-      },
-
-      renameEpic: (id, name) =>
-        set((state) => ({
-          epics: state.epics.map((epic) => (epic.id === id ? { ...epic, name } : epic)),
-        })),
-
-      updateEpic: (id, updates) =>
-        set((state) => {
-          const repositoryChanged = Object.prototype.hasOwnProperty.call(
-            updates,
-            'repositoryProjectId'
-          );
-          const repositoryProject = repositoryChanged
-            ? state.projects.find((project) => project.id === updates.repositoryProjectId)
-            : undefined;
-
-          return {
-            epics: state.epics.map((epic) => (epic.id === id ? { ...epic, ...updates } : epic)),
-            // Repository selection in the active epic view also defines the
-            // shell context used by the header branch picker and generic git
-            // controls. Keep the epic selected while retargeting atomically.
-            ...(state.selectedEpicId === id && repositoryChanged
-              ? { selectedProjectId: repositoryProject?.id ?? null }
-              : {}),
-          };
-        }),
-
-      deleteEpic: (id, options) =>
-        set((state) => ({
-          epics: state.epics.filter((epic) => epic.id !== id),
-          // Threads survive their epic — they stay in Recent agents and their
-          // project list; only the grouping is gone. Deletion can
-          // retain membership until workspace removal succeeds so the epic's
-          // launch guards keep covering those threads during cleanup.
-          threads: options?.retainThreadMembership
-            ? state.threads
-            : state.threads.map((t) =>
-                t.epicId === id ? { ...t, epicId: undefined } : t
-              ),
-          selectedEpicId: state.selectedEpicId === id ? null : state.selectedEpicId,
-        })),
-
-      settleEpic: (id) =>
-        set((state) => ({
-          epics: state.epics.map((epic) =>
-            epic.id === id ? { ...epic, settledAt: new Date().toISOString() } : epic
-          ),
-          selectedEpicId: state.selectedEpicId === id ? null : state.selectedEpicId,
-        })),
-
-      unsettleEpic: (id) =>
-        set((state) => ({
-          epics: state.epics.map((epic) =>
-            epic.id === id ? { ...epic, settledAt: undefined } : epic
-          ),
-        })),
-
-      selectEpic: (id) =>
-        set((state) => {
-          if (!id) return { selectedEpicId: null };
-          // Retarget the shell's project context (header branch picker and
-          // generic git controls) to the epic's repository — otherwise they
-          // keep operating on whatever project was selected before, letting a
-          // commit land in the wrong repository while the epic view shows
-          // another one.
-          const epic = state.epics.find((candidate) => candidate.id === id);
-          const repositoryProject = projectForEpicRepository(state.projects, epic);
-          return {
-            selectedEpicId: id,
-            // The epic view replaces the thread view; open panes would shadow
-            // it.
-            selectedThreadId: null,
-            paneThreadIds: [],
-            // Leaving the split for an epic keeps its saved view in the
-            // sidebar; only closing panes retires one.
-            activeSavedViewId: null,
-            // An unbound epic must not inherit the previous shell repository.
-            selectedProjectId: repositoryProject?.id ?? null,
-          };
-        }),
-
-      setEpicsSettings: (updates) =>
-        set((state) => ({
-          epicsSettings: {
-            ...defaultEpicsSettings,
-            ...state.epicsSettings,
-            ...updates,
-          },
         })),
 
       setSplitViewSettings: (updates) =>
@@ -1865,6 +1637,25 @@ export const useOrionStore = create<OrionState>()(
           },
         })),
 
+      setAppearanceSettings: (updates) =>
+        set((state) => ({
+          appearanceSettings: { ...defaultAppearanceSettings, ...state.appearanceSettings, ...updates },
+        })),
+
+      setSidebarV2Settings: (updates) =>
+        set((state) => ({
+          sidebarV2Settings: {
+            ...defaultSidebarV2Settings,
+            ...state.sidebarV2Settings,
+            ...updates,
+            views: {
+              ...defaultSidebarV2Settings.views,
+              ...state.sidebarV2Settings?.views,
+              ...updates.views,
+            },
+          },
+        })),
+
       createThread: (projectId, title, options) => {
         // Inherit model + settings from the most recently used thread in the
         // same project so new top-level threads default to what the user last
@@ -1909,10 +1700,15 @@ export const useOrionStore = create<OrionState>()(
           spawnId: options?.spawnId,
           hiddenFromRecent: options?.hiddenFromRecent,
           subagent: options?.subagent,
-          epicId: options?.epicId,
-          // Subagents work in their driver's directory.
+          // Subagents work in their driver's directory. A workspace the driver's
+          // agent made itself is their run directory outright: their sessions
+          // are new, so nothing was recorded elsewhere.
           durangoWorkspace:
-            options?.durangoWorkspace !== undefined ? options.durangoWorkspace : parentThread?.durangoWorkspace,
+            options?.durangoWorkspace !== undefined
+              ? options.durangoWorkspace
+              : parentThread?.durangoWorkspace
+                ? { ...parentThread.durangoWorkspace, adopted: undefined }
+                : parentThread?.durangoWorkspace,
           messages: [],
         };
         set((state) => ({
@@ -1924,7 +1720,6 @@ export const useOrionStore = create<OrionState>()(
                 ...syncSavedView(state, panesForSelection(state, newThread.id), {
                   threads: [newThread, ...state.threads],
                 }),
-                selectedEpicId: options?.epicId ?? null,
               }),
         }));
         return newThread.id;
@@ -1942,7 +1737,6 @@ export const useOrionStore = create<OrionState>()(
             threads,
             selectedProjectId: newThread.projectId,
             ...syncSavedView(state, panesForSelection(state, newThread.id), { threads }),
-            selectedEpicId: newThread.epicId ?? null,
           };
         });
         return family.rootId;
@@ -1964,8 +1758,6 @@ export const useOrionStore = create<OrionState>()(
             // The split's saved view stays in the sidebar; it just stops
             // following the panes once they're gone.
             activeSavedViewId: leavesThread ? null : state.activeSavedViewId,
-            // Picking a project moves focus off the epic view.
-            selectedEpicId: null,
           };
         }),
 
@@ -1976,10 +1768,6 @@ export const useOrionStore = create<OrionState>()(
           return {
             ...syncSavedView(state, panesForSelection(state, id)),
             selectedProjectId: thread?.projectId ?? state.selectedProjectId,
-            // Preserve epic context only for a thread that actually belongs to
-            // that epic. Selecting an unrelated (or missing) thread must not
-            // leave a stale epic view waiting behind it.
-            selectedEpicId: thread?.epicId ?? null,
             threads: id ? threadsWithOpenedSeen(state, id) : state.threads,
           };
         }),
@@ -1999,7 +1787,6 @@ export const useOrionStore = create<OrionState>()(
           return {
             ...syncSavedView(state, { selectedThreadId: id, paneThreadIds }),
             selectedProjectId: thread.projectId,
-            selectedEpicId: thread.epicId ?? null,
             threads: threadsWithOpenedSeen(state, id),
           };
         }),
@@ -2016,7 +1803,6 @@ export const useOrionStore = create<OrionState>()(
             // view: the user has taken the split apart by hand.
             ...syncSavedView(state, next, { ejectOnCollapse: true }),
             selectedProjectId: focused?.projectId ?? state.selectedProjectId,
-            selectedEpicId: focused?.epicId ?? null,
           };
         }),
 
@@ -2046,7 +1832,6 @@ export const useOrionStore = create<OrionState>()(
             paneThreadIds,
             selectedThreadId: focusedId,
             selectedProjectId: focused?.projectId ?? state.selectedProjectId,
-            selectedEpicId: focused?.epicId ?? null,
             threads: threadsWithOpenedSeen(state, paneThreadIds),
             ...(state.splitViewSettings.autoSave
               ? {
@@ -2087,6 +1872,26 @@ export const useOrionStore = create<OrionState>()(
                 (!isAgentsPanelVisible(state) || !state.paneThreadIds.includes(id))
                   ? new Date().toISOString()
                   : undefined;
+              // A snoozed thread wakes when its run ends: finished, or (on a
+              // failure) needing the user. A stop was deliberate and keeps it
+              // snoozed. Questions and approvals wake it too (App).
+              if (
+                t.snoozedAt &&
+                !('snoozedAt' in updates) &&
+                t.status === 'running' &&
+                (updates.status === 'done' || updates.status === 'error')
+              ) {
+                next.snoozedAt = undefined;
+                // Already on screen: nothing to flag, it just rejoins the list.
+                if (!isAgentsPanelVisible(state) || !state.paneThreadIds.includes(id)) {
+                  next.wokeAt = new Date().toISOString();
+                  next.wokeReason = updates.status === 'error' ? 'attention' : 'finished';
+                }
+              }
+              // New work in a settled thread brings it back to the sidebar.
+              if (t.settledAt && updates.status === 'running' && !('settledAt' in updates)) {
+                next.settledAt = undefined;
+              }
             }
             return next;
           });
@@ -2120,7 +1925,6 @@ export const useOrionStore = create<OrionState>()(
             threads,
             ...panes,
             selectedProjectId: focusedPaneThread?.projectId ?? state.selectedProjectId,
-            selectedEpicId: focusedPaneThread?.epicId ?? null,
             savedViews,
             activeSavedViewId: savedViews.some((view) => view.id === state.activeSavedViewId)
               ? state.activeSavedViewId
@@ -2485,12 +2289,6 @@ export const useOrionStore = create<OrionState>()(
           ...defaultSplitViewSettings,
           ...state.splitViewSettings,
         },
-        epics: state.epics,
-        selectedEpicId: state.selectedEpicId,
-        epicsSettings: {
-          ...defaultEpicsSettings,
-          ...state.epicsSettings,
-        },
         durangoWorkspaceSettings: {
           ...defaultDurangoWorkspaceSettings,
           ...state.durangoWorkspaceSettings,
@@ -2511,6 +2309,12 @@ export const useOrionStore = create<OrionState>()(
           ...defaultDeploymentSettings,
           ...state.deploymentSettings,
         },
+        sidebarV2Settings: {
+          ...defaultSidebarV2Settings,
+          ...state.sidebarV2Settings,
+          views: { ...defaultSidebarV2Settings.views, ...state.sidebarV2Settings?.views },
+        },
+        appearanceSettings: { ...defaultAppearanceSettings, ...state.appearanceSettings },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
         providerSettings: {
@@ -2536,40 +2340,19 @@ export const useOrionStore = create<OrionState>()(
       }),
       merge: (persisted, current) => {
         const merged = { ...current, ...(persisted as Partial<OrionState>) };
-        // Rifts (per-epic copy-on-write workspaces) were replaced by Durango
-        // workspaces. Drop their persisted pointers so no epic keeps a path
-        // into a .rifts directory; the directories themselves stay on disk.
+        // Retired features whose persisted state may linger in older stores:
+        // Rifts (replaced by Durango workspaces) and Epics.
         delete (merged as { riftsSettings?: unknown }).riftsSettings;
-        merged.epics = (merged.epics ?? []).map((epic) => {
-          const {
-            riftPath: _riftPath,
-            riftWorkingDir: _riftWorkingDir,
-            riftRequest: _riftRequest,
-            riftCleanupPending: _riftCleanupPending,
-            riftReleased: _riftReleased,
-            ...rest
-          } = epic as Epic & Record<string, unknown>;
-          return {
-            ...rest,
-            ...(rest.repositories
-              ? {
-                  repositories: rest.repositories.map((repository) => {
-                    const {
-                      riftPath: _repositoryRiftPath,
-                      riftWorkingDir: _repositoryRiftWorkingDir,
-                      workspaceLinkPath: _workspaceLinkPath,
-                      ...repositoryRest
-                    } = repository as EpicRepository & Record<string, unknown>;
-                    return repositoryRest;
-                  }),
-                }
-              : {}),
-          };
-        });
-        merged.durangoWorkspaceSettings = {
-          ...defaultDurangoWorkspaceSettings,
-          ...merged.durangoWorkspaceSettings,
-        };
+        delete (merged as { epics?: unknown }).epics;
+        delete (merged as { selectedEpicId?: unknown }).selectedEpicId;
+        delete (merged as { epicsSettings?: unknown }).epicsSettings;
+        const persistedWorkspaceSettings = (persisted as Partial<OrionState> | undefined)?.durangoWorkspaceSettings;
+        merged.durangoWorkspaceSettings =
+          persistedWorkspaceSettings && (persistedWorkspaceSettings.version ?? 1) < 2
+            ? // Before agents made their own workspaces the app made one for
+              // every thread by default; move those stores to the new default.
+              { ...persistedWorkspaceSettings, enabled: false, version: 2 }
+            : { ...defaultDurangoWorkspaceSettings, ...merged.durangoWorkspaceSettings };
         // The settings UI no longer has a separate "allow this machine to be
         // controlled" toggle: enabling remote control implies it (pairing
         // codes still gate every connection). Lift configs persisted before
@@ -2583,6 +2366,12 @@ export const useOrionStore = create<OrionState>()(
         merged.deploymentSettings = {
           ...defaultDeploymentSettings,
           ...merged.deploymentSettings,
+        };
+        merged.appearanceSettings = { ...defaultAppearanceSettings, ...merged.appearanceSettings };
+        merged.sidebarV2Settings = {
+          ...defaultSidebarV2Settings,
+          ...merged.sidebarV2Settings,
+          views: { ...defaultSidebarV2Settings.views, ...merged.sidebarV2Settings?.views },
         };
         // Durango merge: work sharing defaults to Full. Pre-Durango stores
         // (no consentVersion) move to enabled once and show a one-time
@@ -2651,6 +2440,11 @@ export const useOrionStore = create<OrionState>()(
         merged.threads = merged.threads.map((thread) => {
           // Threads used to carry a single board task; they now carry a list.
           thread = migrateLegacyLinkedTask(thread);
+          // Epics were removed; drop the grouping older builds persisted.
+          if ('epicId' in thread) {
+            const { epicId: _epicId, ...rest } = thread as Thread & { epicId?: unknown };
+            thread = rest;
+          }
           const waitUnresolved = thread.status === 'running';
           const stale =
             waitUnresolved || thread.messages.some((message) => message.status === 'running');

@@ -97,6 +97,23 @@ export const createDurangoWorkspace = async ({ projectPath, name, env }) => {
 };
 
 /**
+ * A workspace an agent made itself (`durango-code ws new` in a turn), by name,
+ * from the project's base checkout's `ws list`. Null when the CLI doesn't know
+ * it or it belongs to another repository.
+ */
+export const findDurangoWorkspace = async ({ projectPath, name }) => {
+  const project = await inspectDurangoWorkspaceProject(projectPath);
+  if (!project.eligible) return { ok: true, workspace: null };
+  const result = await runBundledCli(['ws', 'list', '--json'], { cwd: project.baseRoot, timeout: 30_000 });
+  if (!result.json?.ok) return { ok: false, error: bundledCliError(result, 'durango-code ws list failed.') };
+  const entry = (result.json.workspaces ?? []).find(
+    (workspace) =>
+      workspace?.name === name && workspace.exists !== false && realpath(workspace.repo ?? '') === project.baseRoot
+  );
+  return { ok: true, workspace: entry ? workspaceFromCli(entry, project.relativeDir) : null };
+};
+
+/**
  * `ws rm`. Without `force` the CLI refuses while the workspace holds work that
  * has not landed; that refusal comes back as `unlanded` so the renderer can
  * ask before discarding it. A workspace the CLI no longer knows is reported

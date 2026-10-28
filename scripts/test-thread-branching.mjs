@@ -37,7 +37,6 @@ const root = {
   messages: [message('root-message')],
   agentSessionIds: { claude: 'root-session' },
   hiddenFromRecent: true,
-  epicId: 'epic',
 };
 const child = {
   ...root,
@@ -49,9 +48,6 @@ const child = {
   createdAt: '2026-08-01T00:01:00.000Z',
   messages: [message('child-message')],
   agentSessionIds: { codex: 'child-session' },
-  // Legacy descendants can predate direct epic inheritance; the family link
-  // must still keep their branch copy in the root's workspace.
-  epicId: undefined,
 };
 const nativeGrandchild = {
   ...root,
@@ -120,7 +116,6 @@ assert.equal(branchedChild.parentThreadId, branchedRoot.id);
 assert.equal(branchedChild.branchedFromThreadId, child.id);
 assert.equal(branchedChild.title, child.title);
 assert.equal(branchedChild.status, 'done');
-assert.equal(branchedChild.epicId, root.epicId);
 assert.deepEqual(branchedChild.agentSessionIds, { codex: 'child-session' });
 assert.deepEqual(branchedChild.pendingForkProviders, ['codex']);
 assert.equal(branchedNative.parentThreadId, branchedChild.id);

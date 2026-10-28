@@ -43,6 +43,7 @@ import {
   setCloudRepoLink,
 } from './cloud-sync.js';
 import { getWhatsNew, markWhatsNewSeen } from './main/whats-new.js';
+import { browseDirectories, resolveProjectDirectory } from './main/project-browse.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
@@ -91,7 +92,6 @@ import {
   cancelRemotePairing,
   configureRemoteControl,
   connectRemoteMachine,
-  createRemoteEpic,
   deregisterRelayMachine,
   disconnectRemoteMachine,
   fetchRemoteSnapshot,
@@ -129,6 +129,7 @@ import { bundledCliEntry, bundledCliVersion, ensureCliSignedIn, installBundledCl
 import {
   createDurangoWorkspace,
   durangoWorkspaceStatus,
+  findDurangoWorkspace,
   inspectDurangoWorkspaceProject,
   landDurangoWorkspace,
   removeDurangoWorkspace,
@@ -1504,7 +1505,7 @@ ipcMain.handle('storage:save', async (_event, value) => {
 
   try {
     await save;
-    // Projects/epics/settings changed — nudge the (opt-in) workspace sync.
+    // Projects/settings changed — nudge the (opt-in) workspace sync.
     notifyWorkspaceChanged();
     notifyRemoteWorkspaceChanged();
     return true;
@@ -1569,7 +1570,6 @@ ipcMain.handle('remote:disconnectMachine', (_event, input) => disconnectRemoteMa
 ipcMain.handle('remote:fetchSnapshot', (_event, input) => fetchRemoteSnapshot(input));
 ipcMain.handle('remote:fetchThread', (_event, input) => fetchRemoteThread(input));
 ipcMain.handle('remote:runTurn', (_event, input) => runRemoteTurn(input));
-ipcMain.handle('remote:createEpic', (_event, input) => createRemoteEpic(input));
 ipcMain.handle('remote:stopTurn', (_event, input) => stopRemoteTurn(input));
 // Registered only after the renderer has installed onRemoteCommandRequest.
 // did-start-loading/destroyed clear this authority until the next mount.
@@ -1817,6 +1817,12 @@ ipcMain.handle('dialog:openDirectory', async () => {
   if (result.canceled || result.filePaths.length === 0) return null;
   return result.filePaths[0];
 });
+
+// The project picker's "Add project" view browses folders from its search field.
+ipcMain.handle('fs:browseDirectories', (_event, requestedPath) => browseDirectories(requestedPath));
+ipcMain.handle('fs:resolveProjectDirectory', (_event, inputPath, options) =>
+  resolveProjectDirectory(inputPath, { create: options?.create === true })
+);
 
 // Agents started without a project run in an Orion-owned scratch directory.
 ipcMain.handle('app:getNoProjectDir', async () => {
@@ -2238,23 +2244,6 @@ const pushBranchToSourceControl = async (gitRoot, branch, { signal } = {}) => {
   };
 };
 
-const runOriginNetworkGit = async (gitRoot, args, options = {}) => {
-  const state = await getGitStateForPath(gitRoot);
-  if (state.sourceProvider === 'orion') {
-    const session = await readRepositorySession();
-    if (!session?.token) throw new Error('Sign in to your Durango account first.');
-    return await runVerifiedOrionGit({
-      gitRoot,
-      args,
-      token: session.token,
-      signal: options.signal,
-      timeout: options.timeout,
-      maxBuffer: options.maxBuffer,
-    });
-  }
-  return await execFileAsync('git', ['-C', gitRoot, ...args], options);
-};
-
 // The navbar action passes `{ projectPath, modelId, reasoningEffort }`; older
 // callers passed the path alone and keep the diffstat-style fallback message.
 ipcMain.handle('git:commitAndPush', async (_event, input) => {
@@ -2297,8 +2286,7 @@ ipcMain.handle('git:commitAndPush', async (_event, input) => {
       return { ok: false, error: 'No staged changes to commit.' };
     }
 
-    // Freeze the index across the message turn, the same way the epic commit
-    // does: staging keeps moving while the model writes, and committing after
+    // Freeze the index across the message turn: staging keeps moving while the model writes, and committing after
     // that would ship changes the message never described.
     const indexTree = await readGitIndexTree(gitRoot);
     const stagedEntries = await readStagedGitEntries(gitRoot);
@@ -2344,7 +2332,7 @@ ipcMain.handle('git:commitAndPush', async (_event, input) => {
   }
 });
 
-// --- Epics: git actions with LLM-written messages ------------------------
+// --- Git commit messages written by the text-generation model ------------
 
 const truncateForPrompt = (text, limit) =>
   text.length > limit ? `${text.slice(0, limit)}\n… (truncated)` : text;
@@ -2428,35 +2416,15 @@ const readGitIndexTree = async (gitRoot) => {
   return stdout.trim();
 };
 
-// origin/HEAD as the clone recorded it. Purely local, so the PR base picker
-// can paint with it immediately; it can be stale, which is why
-// resolveRemoteDefaultBranch below asks the remote first.
-const readLocalDefaultBranch = async (gitRoot) => {
-  try {
-    const { stdout } = await execFileAsync('git', [
-      '-C',
-      gitRoot,
-      'symbolic-ref',
-      '--short',
-      'refs/remotes/origin/HEAD',
-    ]);
-    return stdout.trim().replace(/^origin\//, '');
-  } catch {
-    return '';
-  }
-};
-
 // Ask the text-generation model for a commit message describing the staged
 // entries. Without a model — or when the turn comes back empty because the
 // model is unavailable or errored — this degrades to the mechanical
 // "Update N files" summary rather than blocking the commit.
-const writeGitCommitMessage = async ({ gitRoot, entries, epicName, modelId, reasoningEffort, signal }) => {
+const writeGitCommitMessage = async ({ gitRoot, entries, modelId, reasoningEffort, signal }) => {
   if (modelId) {
     const context = await readStagedGitChangesContext(gitRoot, entries);
     const prompt =
-      'Write a git commit message for the changes below' +
-      (epicName ? `, which are part of the epic "${epicName}"` : '') +
-      '. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
+      'Write a git commit message for the changes below. First line: a specific summary under 72 characters. Then a blank line, then a short ' +
       'body of bullet points covering the substantive changes. Reply with ONLY the commit ' +
       'message — no quotes, no code fences, no commentary.\n\n' +
       context;
@@ -2467,954 +2435,6 @@ const writeGitCommitMessage = async ({ gitRoot, entries, epicName, modelId, reas
   }
   return commitMessageForEntries(entries);
 };
-
-const resolveRemoteDefaultBranch = async (gitRoot) => {
-  // Ask the remote first: origin/HEAD is only locally recorded metadata and
-  // can remain stale after the repository changes its default branch.
-  try {
-    // Cap the network round trip and refuse credential prompts: an
-    // unreachable or auth-gated remote would otherwise never settle and pin
-    // the epic action in its disabled-UI busy state. The fallbacks below are
-    // local, so failing fast here degrades gracefully.
-    const { stdout } = await runOriginNetworkGit(
-      gitRoot,
-      ['ls-remote', '--symref', 'origin', 'HEAD'],
-      { timeout: 15_000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }
-    );
-    const branch = stdout.match(/^ref:\s+refs\/heads\/(\S+)\s+HEAD$/m)?.[1]?.trim();
-    if (branch) return branch;
-  } catch {
-    // An offline or inaccessible remote may still have usable local metadata.
-  }
-
-  // No usable answer from the remote; local metadata may still be right.
-  const localDefaultBranch = await readLocalDefaultBranch(gitRoot);
-  if (localDefaultBranch) return localDefaultBranch;
-
-  const sourceProvider = (await getGitStateForPath(gitRoot)).sourceProvider;
-  if (sourceProvider === 'orion') {
-    try {
-      const link = await getCloudRepoLink(gitRoot);
-      if (!link?.repoId) return '';
-      const state = await cloudGitApiRequest(`/api/git/repos/${encodeURIComponent(link.repoId)}`);
-      return typeof state?.repo?.defaultBranch === 'string' ? state.repo.defaultBranch.trim() : '';
-    } catch {
-      return '';
-    }
-  }
-  if (sourceProvider !== 'github') return '';
-
-  try {
-    const { stdout } = await execFileAsync(
-      'gh',
-      ['repo', 'view', '--json', 'defaultBranchRef'],
-      { cwd: gitRoot }
-    );
-    const branch = JSON.parse(stdout)?.defaultBranchRef?.name;
-    return typeof branch === 'string' ? branch.trim() : '';
-  } catch {
-    return '';
-  }
-};
-
-const canonicalGitPath = async (value) => {
-  try {
-    return await fs.realpath(value);
-  } catch {
-    return path.resolve(value);
-  }
-};
-
-// Epic git actions are confined to one non-default branch in one repository.
-// This prevents two epics (or a later project switch) from silently sharing a
-// push target.
-const validateEpicGitTarget = async (gitRoot, branch, input) => {
-  const canonicalRoot = await canonicalGitPath(gitRoot);
-  const expectedBranch = String(input?.expectedBranch ?? '').trim();
-  const expectedRoot = String(input?.expectedGitRoot ?? '').trim();
-
-  if (expectedBranch && expectedBranch !== branch) {
-    return {
-      ok: false,
-      error: `This epic is linked to ${expectedBranch}. Switch back to that branch before using its git actions.`,
-    };
-  }
-  if (expectedRoot && (await canonicalGitPath(expectedRoot)) !== canonicalRoot) {
-    return {
-      ok: false,
-      error: 'This epic is linked to a different repository. Use its original project for git actions.',
-    };
-  }
-
-  for (const claim of Array.isArray(input?.claimedBranches) ? input.claimedBranches : []) {
-    if (!claim?.gitRoot || !claim?.branch || claim.branch !== branch) continue;
-    if ((await canonicalGitPath(claim.gitRoot)) !== canonicalRoot) continue;
-    const owner = String(claim.epicName ?? '').trim();
-    return {
-      ok: false,
-      error:
-        `${branch} is already linked to another epic${owner ? ` (${owner})` : ''}. ` +
-        'Switch to a dedicated feature branch for this epic.',
-    };
-  }
-
-  const baseBranch = await resolveRemoteDefaultBranch(canonicalRoot);
-  if (!baseBranch) {
-    return {
-      ok: false,
-      error:
-        'Could not determine the remote default branch. Check the origin remote and source-control authentication.',
-    };
-  }
-  if (baseBranch === branch) {
-    return {
-      ok: false,
-      error: `You are on ${branch}, the repository default branch — switch to a dedicated feature branch first.`,
-    };
-  }
-
-  return { ok: true, gitRoot: canonicalRoot, baseBranch };
-};
-
-const hasLocalCommitsToPush = async (gitRoot, branch, baseBranch) => {
-  const branchRef = `refs/heads/${branch}`;
-  const countAheadOf = async (revision) => {
-    try {
-      const { stdout } = await execFileAsync('git', [
-        '-C',
-        gitRoot,
-        'rev-list',
-        '--count',
-        `${revision}..${branchRef}`,
-      ]);
-      return Number.parseInt(stdout.trim(), 10) > 0;
-    } catch {
-      return null;
-    }
-  };
-
-  const aheadOfRemoteBranch = await countAheadOf(`refs/remotes/origin/${branch}`);
-  if (aheadOfRemoteBranch !== null) return aheadOfRemoteBranch;
-
-  // A first push can fail before -u records an upstream. In that case, a
-  // feature commit ahead of the default branch is still retryable without
-  // requiring the user to stage and commit an unrelated change.
-  for (const revision of [`refs/remotes/origin/${baseBranch}`, `refs/heads/${baseBranch}`]) {
-    const ahead = await countAheadOf(revision);
-    if (ahead !== null) return ahead;
-  }
-  return false;
-};
-
-// One in-flight commit/PR operation per epic, abortable from the renderer.
-// Only network-bound children (push, fetch, gh) and the model turn receive the
-// abort signal; local git steps (add/commit) run to completion with checkpoint
-// checks between them, so a kill can never leave a stale .git/index.lock.
-const epicGitOperations = new Map(); // epicId -> { controller, kind, finish }
-
-const beginEpicGitOperation = (event, epicId, kind) => {
-  if (epicGitOperations.has(epicId)) return null;
-  const controller = new AbortController();
-  // A window reload mid-operation must not orphan the child process or leak
-  // the registry entry (which would permanently block this epic).
-  const onDestroyed = () => controller.abort();
-  event.sender.once('destroyed', onDestroyed);
-  const entry = {
-    controller,
-    kind,
-    finish: () => {
-      event.sender.removeListener('destroyed', onDestroyed);
-      epicGitOperations.delete(epicId);
-    },
-  };
-  epicGitOperations.set(epicId, entry);
-  return entry;
-};
-
-const isAbortError = (error) => error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
-
-ipcMain.handle('epic:abortGitOperation', (_event, input) => {
-  const entry = epicGitOperations.get(typeof input?.epicId === 'string' ? input.epicId : '');
-  if (!entry) return { ok: false };
-  entry.controller.abort();
-  return { ok: true, kind: entry.kind };
-});
-
-ipcMain.handle('epic:commitAndPush', async (event, input) => {
-  let gitRoot = '';
-  let branch = '';
-  let committed = false;
-  let operation = null;
-  try {
-    if (typeof input?.epicId !== 'string' || !input.epicId) {
-      return { ok: false, error: 'Missing epic id.' };
-    }
-    operation = beginEpicGitOperation(event, input.epicId, 'commit');
-    if (!operation) {
-      return { ok: false, error: 'A git action is already running for this epic.' };
-    }
-    const { signal } = operation.controller;
-    const skipPush = Boolean(input?.skipPush);
-    const projectPath = input?.projectPath;
-    if (!projectPath) {
-      return { ok: false, error: 'Missing project path.' };
-    }
-
-    gitRoot = await getGitRoot(projectPath);
-    branch = (await getCurrentGitBranch(gitRoot)) ?? '';
-    if (!branch) {
-      return { ok: false, error: 'Cannot push from a detached HEAD.' };
-    }
-
-    // Refuse a drifted or shared target before touching the index.
-    const target = await validateEpicGitTarget(gitRoot, branch, input);
-    if (!target.ok) return target;
-    gitRoot = target.gitRoot;
-
-    // Stage everything: staging all local changes in the claimed repository
-    // is the accepted trade-off.
-    await execFileAsync('git', ['-C', gitRoot, 'add', '-A']);
-    const stagedHasChanges = !(
-      await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet'])
-    );
-    if (!stagedHasChanges) {
-      // Nothing new to commit — retry the push if a previous commit landed but
-      // its push failed. Only for a branch this epic already owns: an
-      // unclaimed epic must not adopt unrelated local commits as its own.
-      const epicOwnsBranch = Boolean(
-        String(input?.expectedGitRoot ?? '').trim() && String(input?.expectedBranch ?? '').trim()
-      );
-      if (await hasLocalCommitsToPush(gitRoot, branch, target.baseBranch)) {
-        if (!epicOwnsBranch) {
-          return {
-            ok: false,
-            error: `${branch} has local commits, but this epic has not claimed it. Make this epic's first commit here to claim the branch.`,
-          };
-        }
-        if (skipPush) {
-          return {
-            ok: false,
-            gitRoot,
-            branch,
-            error: "No new changes to commit. Earlier commits remain unpushed (commit-only is on).",
-          };
-        }
-        const pushed = await pushBranchToSourceControl(gitRoot, branch, { signal });
-        return {
-          ok: true,
-          gitRoot,
-          branch,
-          message: 'Pushed existing local commits',
-          pushed: true,
-          ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
-        };
-      }
-      return { ok: false, error: 'No local changes to commit.' };
-    }
-
-    // Freeze the index: the message model turn below takes seconds, during
-    // which a running agent or the user can stage more work. Committing then
-    // would ship changes the generated message never described.
-    const indexTree = await readGitIndexTree(gitRoot);
-    const entries = await readStagedGitEntries(gitRoot);
-    // A message typed in the commit dialog is used verbatim — no model turn,
-    // and no cleanup pass (that one strips artifacts of generated text).
-    let message = String(input?.message ?? '').trim();
-    if (!message) {
-      message = await writeGitCommitMessage({
-        gitRoot,
-        entries,
-        epicName: input?.epicName,
-        modelId: input?.modelId,
-        reasoningEffort: input?.reasoningEffort,
-        signal,
-      });
-    }
-    // An aborted message turn returns '' and would fall back to the mechanical
-    // message — distinguish "user aborted" from "model failed" before committing.
-    if (signal.aborted) {
-      return { ok: false, aborted: true, gitRoot, branch };
-    }
-
-    // Re-verify what the commit will actually land, and where: `git commit`
-    // uses the index and the current checkout, but the push below targets the
-    // branch captured above.
-    if ((await readGitIndexTree(gitRoot)) !== indexTree) {
-      return {
-        ok: false,
-        gitRoot,
-        branch,
-        error: 'Staged changes changed while Durango Code was preparing the commit. Try again.',
-      };
-    }
-    if ((await getCurrentGitBranch(gitRoot)) !== branch) {
-      return {
-        ok: false,
-        gitRoot,
-        branch,
-        error: `The repository moved off ${branch} while Durango Code was preparing the commit. Switch back and try again.`,
-      };
-    }
-    if (signal.aborted) {
-      return { ok: false, aborted: true, gitRoot, branch };
-    }
-
-    await execFileAsync('git', ['-C', gitRoot, 'commit', '-m', message]);
-    committed = true;
-    if (skipPush) {
-      return { ok: true, gitRoot, branch, message, committed: true, pushed: false };
-    }
-    const pushed = await pushBranchToSourceControl(gitRoot, branch, { signal });
-
-    return {
-      ok: true,
-      gitRoot,
-      branch,
-      message,
-      pushed: true,
-      ...(pushed.mirrorWarning ? { mirrorWarning: pushed.mirrorWarning } : {}),
-    };
-  } catch (error) {
-    if (isAbortError(error) || operation?.controller.signal.aborted) {
-      return {
-        ok: false,
-        aborted: true,
-        ...(gitRoot ? { gitRoot, branch } : {}),
-        ...(committed ? { committed: true } : {}),
-      };
-    }
-    return {
-      ok: false,
-      ...(gitRoot ? { gitRoot, branch } : {}),
-      ...(committed ? { committed: true } : {}),
-      error: error?.stderr?.toString().trim() || error?.message || String(error),
-    };
-  } finally {
-    operation?.finish();
-  }
-});
-
-// Everything the PR base picker can resolve without touching the network, so
-// the dialog opens with a real base branch instead of waiting on origin. The
-// full branch list follows over epic:listRemoteBranches while it is open.
-ipcMain.handle('epic:localPrBase', async (_event, input) => {
-  try {
-    const projectPath = input?.projectPath;
-    if (!projectPath) {
-      return { ok: false, error: 'Missing project path.' };
-    }
-    const gitRoot = await getGitRoot(projectPath);
-    const currentBranch = (await getCurrentGitBranch(gitRoot)) ?? null;
-    let sourceBranch = null;
-    if (input?.sourceProjectPath) {
-      try {
-        sourceBranch =
-          (await getCurrentGitBranch(await getGitRoot(input.sourceProjectPath))) ?? null;
-      } catch {
-        // The source checkout may be gone; the picker just loses its default.
-      }
-    }
-    return {
-      ok: true,
-      gitRoot,
-      currentBranch,
-      sourceBranch,
-      defaultBranch: await readLocalDefaultBranch(gitRoot),
-    };
-  } catch (error) {
-    return { ok: false, error: error?.message || String(error) };
-  }
-});
-
-// Branches currently on origin, for the PR base picker. Asks the remote
-// directly (not local tracking refs) so a stale clone still offers every
-// branch a PR could actually target.
-//
-// sourceProjectPath is the epic's real repository checkout. Its branch is what
-// the PR should default to merging back into, so it is reported alongside the
-// remote branches.
-ipcMain.handle('epic:listRemoteBranches', async (_event, input) => {
-  try {
-    const projectPath = input?.projectPath;
-    if (!projectPath) {
-      return { ok: false, error: 'Missing project path.' };
-    }
-    const gitRoot = await getGitRoot(projectPath);
-    const currentBranch = (await getCurrentGitBranch(gitRoot)) ?? null;
-    let sourceBranch = null;
-    if (input?.sourceProjectPath) {
-      try {
-        sourceBranch =
-          (await getCurrentGitBranch(await getGitRoot(input.sourceProjectPath))) ?? null;
-      } catch {
-        // The source checkout may be gone; the picker just loses its default.
-      }
-    }
-    const { stdout } = await runOriginNetworkGit(
-      gitRoot,
-      ['ls-remote', '--heads', 'origin'],
-      {
-        timeout: 15_000,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-        maxBuffer: 1024 * 1024 * 4,
-      }
-    );
-    const branches = stdout
-      .split('\n')
-      .map((line) => line.match(/refs\/heads\/(.+)$/)?.[1]?.trim())
-      .filter(Boolean);
-    const defaultBranch = await resolveRemoteDefaultBranch(gitRoot);
-    return { ok: true, gitRoot, currentBranch, sourceBranch, defaultBranch, branches };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error?.stderr?.toString().trim() || error?.message || String(error),
-    };
-  }
-});
-
-ipcMain.handle('epic:createPr', async (event, input) => {
-  let gitRoot = '';
-  let branch = '';
-  let operation = null;
-  try {
-    if (typeof input?.epicId !== 'string' || !input.epicId) {
-      return { ok: false, error: 'Missing epic id.' };
-    }
-    operation = beginEpicGitOperation(event, input.epicId, 'pr');
-    if (!operation) {
-      return { ok: false, error: 'A git action is already running for this epic.' };
-    }
-    const { signal } = operation.controller;
-    const projectPath = input?.projectPath;
-    if (!projectPath) {
-      return { ok: false, error: 'Missing project path.' };
-    }
-    gitRoot = await getGitRoot(projectPath);
-    branch = (await getCurrentGitBranch(gitRoot)) ?? '';
-    if (!branch) {
-      return { ok: false, error: 'Cannot open a PR from a detached HEAD.' };
-    }
-    const sourceProvider = (await getGitStateForPath(gitRoot)).sourceProvider;
-    if (sourceProvider === 'github' && !(await checkCommandAvailable('gh'))) {
-      return {
-        ok: false,
-        error: 'The GitHub CLI (gh) is required to open GitHub PRs. Install it and run `gh auth login`.',
-      };
-    }
-    if (sourceProvider !== 'github' && sourceProvider !== 'orion') {
-      return { ok: false, error: 'Pull requests are supported for Durango Cloud and GitHub repositories.' };
-    }
-
-    const target = await validateEpicGitTarget(gitRoot, branch, input);
-    if (!target.ok) return target;
-    gitRoot = target.gitRoot;
-    // The renderer's base picker may target any origin branch; without a
-    // choice, fall back to the remote default branch.
-    const requestedBase = String(input?.baseBranch ?? '').trim();
-    const baseBranch = requestedBase || target.baseBranch;
-    if (baseBranch === branch) {
-      return {
-        ok: false,
-        gitRoot,
-        branch,
-        error: `Cannot open a pull request from ${branch} into itself. Choose a different base branch.`,
-      };
-    }
-
-    // Staged work would be left out of the PR. Unstaged work is not checked:
-    // unrelated changes can legitimately coexist in a shared checkout.
-    const hasStagedChanges = !(await commandSucceeds('git', ['-C', gitRoot, 'diff', '--cached', '--quiet']));
-    if (hasStagedChanges) {
-      return {
-        ok: false,
-        gitRoot,
-        branch,
-        error: 'This epic still has staged changes. Commit and push them before opening a pull request.',
-      };
-    }
-
-    // Reuse an already-open PR for this branch instead of failing on create.
-    // Check before pushing: a stale or diverged local branch can still have a
-    // valid open PR even though its non-fast-forward push would fail. With no
-    // selector, gh resolves the checked-out branch and its head repository;
-    // filtering only by branch name could select a same-named fork PR.
-    if (sourceProvider === 'github') try {
-      // `gh pr view` below intentionally relies on the checkout so it can
-      // distinguish the current repository's head from a same-named fork.
-      // Revalidate at the last possible moment so a concurrent agent or
-      // terminal checkout cannot attach another branch's PR to this epic.
-      if ((await getCurrentGitBranch(gitRoot)) !== branch) {
-        return {
-          ok: false,
-          gitRoot,
-          branch,
-          error: `The repository moved off ${branch} while Durango Code was checking for its pull request. Switch back and try again.`,
-        };
-      }
-      const { stdout } = await execFileAsync(
-        'gh',
-        ['pr', 'view', '--json', 'url,state'],
-        { cwd: gitRoot, signal }
-      );
-      const existing = JSON.parse(stdout);
-      if (existing?.url && existing?.state === 'OPEN') {
-        return {
-          ok: true,
-          url: existing.url,
-          alreadyExists: true,
-          gitRoot,
-          branch,
-          baseBranch,
-        };
-      }
-    } catch {
-      // No PR yet.
-    }
-
-    if (sourceProvider === 'orion') {
-      const link = await getCloudRepoLink(gitRoot);
-      if (!link?.repoId) {
-        return { ok: false, gitRoot, branch, error: 'This Durango Cloud remote is missing its repository link.' };
-      }
-      const existing = await cloudGitApiRequest(
-        `/api/git/repos/${encodeURIComponent(link.repoId)}/pulls?state=open`,
-        { signal }
-      );
-      const pull = (existing.pulls ?? []).find(
-        (candidate) => candidate.headBranch === branch && candidate.baseBranch === baseBranch
-      );
-      if (pull) {
-        return {
-          ok: true,
-          url: orionPullRequestWebUrl(link.repoId, pull.number),
-          alreadyExists: true,
-          gitRoot,
-          branch,
-          baseBranch,
-        };
-      }
-    }
-
-    // The branch must exist on the remote before gh can target a new PR.
-    if (signal.aborted) {
-      return { ok: false, aborted: true, gitRoot, branch };
-    }
-    const pushedBranch = await pushBranchToSourceControl(gitRoot, branch, { signal });
-
-    let title = '';
-    let body = '';
-    // A message typed in the PR dialog replaces the generated one: its first
-    // line is the title, the rest is the description.
-    const userMessage = String(input?.message ?? '').trim();
-    if (userMessage) {
-      const newline = userMessage.indexOf('\n');
-      title = (newline === -1 ? userMessage : userMessage.slice(0, newline)).trim();
-      body = newline === -1 ? '' : userMessage.slice(newline + 1).trim();
-    }
-    if (!title && input?.modelId) {
-      // Ensure the range used for message generation exists locally even when
-      // the clone did not previously have an origin/HEAD tracking reference.
-      // Only the generated message needs it — gh targets the remote directly,
-      // and the push above already succeeded, so a failed fetch must not abort
-      // the PR: fall through to the static title/body.
-      let fetchedCurrentBase = false;
-      try {
-        await runOriginNetworkGit(
-          gitRoot,
-          [
-            'fetch',
-            '--no-tags',
-            'origin',
-            `refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`,
-          ],
-          { signal }
-        );
-        fetchedCurrentBase = true;
-      } catch {}
-
-      if (fetchedCurrentBase) {
-        const baseRef = `refs/remotes/origin/${baseBranch}`;
-        const branchRef = `refs/heads/${branch}`;
-        let commits = '';
-        let diffstat = '';
-        try {
-          ({ stdout: commits } = await execFileAsync('git', [
-            '-C',
-            gitRoot,
-            'log',
-            `${baseRef}..${branchRef}`,
-            '--pretty=- %s',
-          ]));
-        } catch {}
-        try {
-          ({ stdout: diffstat } = await execFileAsync('git', [
-            '-C',
-            gitRoot,
-            'diff',
-            `${baseRef}...${branchRef}`,
-            '--stat',
-          ]));
-        } catch {}
-        const prompt =
-          'Write a pull request title and description for the branch changes below' +
-          (input?.epicName ? `, which deliver the epic "${input.epicName}"` : '') +
-          '. First line: the PR title (specific, under 72 characters). Then a blank line, then the ' +
-          'PR description in markdown: a short summary paragraph followed by a "## Changes" bullet ' +
-          'list. Reply with ONLY the title and description — no quotes, no code fences, no commentary.\n\n' +
-          `Commits:\n${truncateForPrompt(commits, 3000)}\n\nDiffstat:\n${truncateForPrompt(diffstat, 3000)}`;
-        const text = cleanGeneratedGitMessage(
-          await runOneShotForModelId(input.modelId, prompt, gitRoot, {
-            reasoningEffort: input?.reasoningEffort,
-            signal,
-          })
-        );
-        if (text) {
-          const newline = text.indexOf('\n');
-          title = (newline === -1 ? text : text.slice(0, newline)).trim();
-          body = newline === -1 ? '' : text.slice(newline + 1).trim();
-        }
-      }
-    }
-    if (!title) title = input?.epicName || `Changes from ${branch}`;
-    if (!body) body = `Changes from the Durango Code epic "${input?.epicName ?? branch}".`;
-
-    if (signal.aborted) {
-      return { ok: false, aborted: true, gitRoot, branch };
-    }
-    let url = '';
-    if (sourceProvider === 'orion') {
-      const link = await getCloudRepoLink(gitRoot);
-      const created = await cloudGitApiRequest(
-        `/api/git/repos/${encodeURIComponent(link.repoId)}/pulls`,
-        {
-          method: 'POST',
-          body: { title, body, baseBranch, headBranch: branch },
-          signal,
-        }
-      );
-      url = orionPullRequestWebUrl(link.repoId, created.pull.number);
-    } else {
-      const { stdout } = await execFileAsync(
-        'gh',
-        ['pr', 'create', '--head', branch, '--base', baseBranch, '--title', title, '--body', body],
-        { cwd: gitRoot, signal }
-      );
-      url = stdout.match(/https?:\/\/\S+/)?.[0] ?? '';
-    }
-    return {
-      ok: true,
-      url,
-      title,
-      gitRoot,
-      branch,
-      baseBranch,
-      ...(pushedBranch.mirrorWarning ? { mirrorWarning: pushedBranch.mirrorWarning } : {}),
-    };
-  } catch (error) {
-    if (isAbortError(error) || operation?.controller.signal.aborted) {
-      return { ok: false, aborted: true, ...(gitRoot ? { gitRoot, branch } : {}) };
-    }
-    return {
-      ok: false,
-      ...(gitRoot ? { gitRoot, branch } : {}),
-      error: error?.stderr?.toString().trim() || error?.message || String(error),
-    };
-  } finally {
-    operation?.finish();
-  }
-});
-
-// Status backing the epic view's git buttons: whether "Commit & push" has
-// anything to do, and — when the epic already has a PR — that PR's lifecycle
-// state. The renderer polls this while an epic view is open, so the git
-// checks stay local-only (no ls-remote/fetch); only the optional PR lookup
-// talks to its source-control provider, and only when prUrl is passed.
-ipcMain.handle('epic:gitStatus', async (_event, input) => {
-  try {
-    const projectPath = input?.projectPath;
-    if (!projectPath) {
-      return { ok: false, error: 'Missing project path.' };
-    }
-
-    const gitRoot = await getGitRoot(projectPath);
-    const branch = (await getCurrentGitBranch(gitRoot)) ?? '';
-
-    const { stdout: porcelain } = await execFileAsync(
-      'git',
-      ['-C', gitRoot, 'status', '--porcelain'],
-      { maxBuffer: 1024 * 1024 * 4 }
-    );
-    const hasChangesToCommit = porcelain.trim().length > 0;
-
-    // Commits origin does not have yet, judged purely from local tracking
-    // refs. With no origin refs at all every commit counts, which errs toward
-    // keeping the commit button enabled.
-    let hasUnpushedCommits = false;
-    if (branch) {
-      try {
-        const { stdout } = await execFileAsync('git', [
-          '-C',
-          gitRoot,
-          'rev-list',
-          '--count',
-          `refs/heads/${branch}`,
-          '--not',
-          '--remotes=origin',
-        ]);
-        hasUnpushedCommits = Number.parseInt(stdout.trim(), 10) > 0;
-      } catch {
-        hasUnpushedCommits = false;
-      }
-    }
-
-    let pr;
-    const orionPr = input?.prUrl ? parseOrionPrUrl(input.prUrl) : null;
-    if (orionPr) {
-      try {
-        const result = await cloudGitApiRequest(
-          `/api/git/repos/${encodeURIComponent(orionPr.repoId)}/pulls/${orionPr.number}`
-        );
-        if (result.pull?.status) {
-          pr = {
-            state: String(result.pull.status).toUpperCase(),
-            url: String(input.prUrl),
-          };
-        }
-      } catch {
-        // Offline, expired session, or the PR is gone — keep the last state.
-      }
-    } else if (input?.prUrl && (await checkCommandAvailable('gh'))) {
-      try {
-        const { stdout } = await execFileAsync(
-          'gh',
-          ['pr', 'view', String(input.prUrl), '--json', 'state,url'],
-          { cwd: gitRoot, timeout: 15_000 }
-        );
-        const parsed = JSON.parse(stdout);
-        if (parsed?.state) {
-          pr = { state: parsed.state, url: parsed.url ?? String(input.prUrl) };
-        }
-      } catch {
-        // Offline, gh unauthenticated, or the PR is gone — the renderer keeps
-        // its last known state.
-      }
-    }
-
-    return {
-      ok: true,
-      gitRoot,
-      branch,
-      hasChangesToCommit,
-      hasUnpushedCommits,
-      ...(pr ? { pr } : {}),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error?.stderr?.toString().trim() || error?.message || String(error),
-    };
-  }
-});
-
-// https://<host>/<owner>/<repo>/pull/<number>, allowing the trailing path or
-// query GitHub adds for files/commits views on a copied URL.
-const PR_URL_PATTERN = /^https?:\/\/([^/]+)\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[/?#]|$)/;
-const ORION_PR_URL_PATTERN = /^https?:\/\/[^/]+\/repos\/([^/]+)\/pulls\/(\d+)(?:[/?#]|$)/;
-
-const orionPullRequestWebUrl = (repoId, number) =>
-  new URL(`/repos/${encodeURIComponent(repoId)}/pulls/${number}`, getOrionWebUrl()).toString();
-
-const parseOrionPrUrl = (prUrl) => {
-  const match = ORION_PR_URL_PATTERN.exec(String(prUrl));
-  if (!match) return null;
-  const number = Number(match[2]);
-  if (!Number.isSafeInteger(number) || number <= 0) return null;
-  return { repoId: decodeURIComponent(match[1]), number };
-};
-
-const parsePrUrl = (prUrl) => {
-  const match = PR_URL_PATTERN.exec(String(prUrl));
-  if (!match) return null;
-  const number = Number(match[4]);
-  if (!Number.isSafeInteger(number) || number <= 0) return null;
-  return { host: match[1], owner: match[2], repo: match[3], number };
-};
-
-// GraphQL string literal. Owner/repo come from a URL, so they cannot contain a
-// quote in practice, but the query is assembled by hand — escape anyway.
-const graphqlString = (value) =>
-  `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-
-// One aliased query per host collapses every epic's PR into a single request
-// (rate-limit cost 1, regardless of how many PRs are in it). Aliases must be
-// synthetic: GraphQL names are /^[_A-Za-z][_0-9A-Za-z]*$/, and repo names
-// routinely contain `-` and `.`.
-const buildPrStateQuery = (repoGroups) => {
-  const repoFields = repoGroups.map(
-    (group, repoIndex) =>
-      `  r${repoIndex}: repository(owner: ${graphqlString(group.owner)}, name: ${graphqlString(
-        group.repo
-      )}) {\n` +
-      group.pulls
-        .map((pull, pullIndex) => `    p${pullIndex}: pullRequest(number: ${pull.number}) { state }`)
-        .join('\n') +
-      '\n  }'
-  );
-  return `query {\n${repoFields.join('\n')}\n}`;
-};
-
-// Batch PR-state lookup behind the sidebar's epic icon colours. Deliberately
-// not a loop over epic:gitStatus: that also runs `git status` and `rev-list`
-// against each epic's repository, which is wasted work here. Per-epic failures are dropped from
-// the response so the renderer keeps the state it already has.
-ipcMain.handle('epic:prStates', async (_event, input) => {
-  const requested = Array.isArray(input?.epics) ? input.epics : [];
-  const targets = requested.filter((entry) => entry?.epicId && entry?.prUrl);
-  if (targets.length === 0) return { ok: true, states: [] };
-
-  const states = [];
-  const githubTargets = [];
-  const orionTargets = [];
-  for (const target of targets) {
-    const parsed = parseOrionPrUrl(target.prUrl);
-    if (parsed) orionTargets.push({ ...target, ...parsed });
-    else githubTargets.push(target);
-  }
-
-  await Promise.all(
-    orionTargets.map(async (target) => {
-      try {
-        const result = await cloudGitApiRequest(
-          `/api/git/repos/${encodeURIComponent(target.repoId)}/pulls/${target.number}`
-        );
-        if (result.pull?.status) {
-          states.push({ epicId: target.epicId, state: String(result.pull.status).toUpperCase() });
-        }
-      } catch {
-        // Keep the epic's persisted state when the cloud lookup is unavailable.
-      }
-    })
-  );
-
-  if (githubTargets.length === 0) return { ok: true, states };
-  if (!(await checkCommandAvailable('gh'))) {
-    return { ok: states.length > 0, states, error: 'The GitHub CLI (gh) is not available.' };
-  }
-
-  // Several epics can point at one PR, so every pull carries the list of epics
-  // waiting on it rather than a single id.
-  const byHost = new Map();
-  const unparsed = [];
-  for (const target of githubTargets) {
-    const parsed = parsePrUrl(target.prUrl);
-    if (!parsed) {
-      unparsed.push(target);
-      continue;
-    }
-    const repoKey = `${parsed.owner}/${parsed.repo}`;
-    if (!byHost.has(parsed.host)) byHost.set(parsed.host, new Map());
-    const repos = byHost.get(parsed.host);
-    if (!repos.has(repoKey)) {
-      repos.set(repoKey, { owner: parsed.owner, repo: parsed.repo, pulls: new Map() });
-    }
-    const group = repos.get(repoKey);
-    if (!group.pulls.has(parsed.number)) {
-      group.pulls.set(parsed.number, { number: parsed.number, epicIds: [] });
-    }
-    group.pulls.get(parsed.number).epicIds.push(target.epicId);
-  }
-
-  // Everything GraphQL could not resolve falls back to the per-PR `gh pr view`
-  // path below, so an unfamiliar URL shape or a host without GraphQL access
-  // degrades to the old behaviour instead of losing the epic entirely.
-  const fallbackTargets = [...unparsed];
-
-  await Promise.all(
-    [...byHost.entries()].map(async ([host, repos]) => {
-      const repoGroups = [...repos.values()].map((group) => ({
-        owner: group.owner,
-        repo: group.repo,
-        pulls: [...group.pulls.values()],
-      }));
-      const hostTargets = repoGroups.flatMap((group) =>
-        group.pulls.flatMap((pull) =>
-          pull.epicIds.map((epicId) => ({
-            epicId,
-            prUrl: `https://${host}/${group.owner}/${group.repo}/pull/${pull.number}`,
-          }))
-        )
-      );
-      let payload;
-      try {
-        const { stdout } = await execFileAsync(
-          'gh',
-          ['api', 'graphql', '--hostname', host, '-f', `query=${buildPrStateQuery(repoGroups)}`],
-          { timeout: 15_000 }
-        );
-        payload = JSON.parse(stdout);
-      } catch (error) {
-        // `gh api graphql` exits non-zero when the response carries `errors`,
-        // but still prints a body that can hold partial `data` — one bad PR in
-        // the batch must not discard the rest.
-        try {
-          payload = JSON.parse(error?.stdout?.toString() ?? '');
-        } catch {
-          payload = null;
-        }
-      }
-      if (!payload?.data) {
-        fallbackTargets.push(...hostTargets);
-        return;
-      }
-      for (const [repoIndex, group] of repoGroups.entries()) {
-        const repoData = payload.data[`r${repoIndex}`];
-        for (const [pullIndex, pull] of group.pulls.entries()) {
-          // A null repository or pullRequest means deleted or no access; leave
-          // those epics on the state they already have.
-          const state = repoData?.[`p${pullIndex}`]?.state;
-          if (!state) continue;
-          for (const epicId of pull.epicIds) states.push({ epicId, state });
-        }
-      }
-    })
-  );
-
-  if (fallbackTargets.length > 0) {
-    const queue = [...fallbackTargets];
-    const byEpicId = new Map(githubTargets.map((target) => [target.epicId, target]));
-    const lookup = async () => {
-      for (;;) {
-        const target = queue.shift();
-        if (!target) return;
-        // prUrl is a full URL, so gh resolves the repo from it; cwd only
-        // decides which credentials apply. Fall back to the app cwd when the
-        // epic's workspace is gone rather than failing the lookup outright.
-        const projectPath = byEpicId.get(target.epicId)?.projectPath;
-        let cwd;
-        try {
-          cwd = projectPath ? await getGitRoot(projectPath) : undefined;
-        } catch {
-          cwd = undefined;
-        }
-        try {
-          const { stdout } = await execFileAsync(
-            'gh',
-            ['pr', 'view', String(target.prUrl), '--json', 'state'],
-            { ...(cwd ? { cwd } : {}), timeout: 15_000 }
-          );
-          const parsed = JSON.parse(stdout);
-          if (parsed?.state) states.push({ epicId: target.epicId, state: parsed.state });
-        } catch {
-          // Offline, gh unauthenticated, or the PR is gone.
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(4, queue.length) }, lookup));
-  }
-
-  return { ok: true, states };
-});
 
 // --- Bundled durango-code CLI and Durango workspaces -----------------------------
 
@@ -3470,6 +2490,17 @@ ipcMain.handle('durangoWorkspace:inspect', async (_event, input) => {
     return await inspectDurangoWorkspaceProject(input.projectPath);
   } catch (error) {
     return { ok: false, eligible: false, error: error?.message || String(error) };
+  }
+});
+
+ipcMain.handle('durangoWorkspace:find', async (_event, input) => {
+  if (!isPathInput(input?.projectPath) || !isWorkspaceNameInput(input?.name)) {
+    return { ok: false, error: 'Missing project path or workspace name.' };
+  }
+  try {
+    return await findDurangoWorkspace({ projectPath: input.projectPath, name: input.name });
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
   }
 });
 
@@ -7375,7 +6406,7 @@ const titleFromResponseText = (responseText) => {
 
 // Run a single non-streaming prompt through a provider CLI in read-only mode
 // and return the model's plain-text reply ('' on any failure). Backs the
-// hidden utility turns: thread titles and epic commit/PR messages.
+// hidden utility turns: thread titles and commit/PR messages.
 const runOneShotAgentText = async (
   model,
   prompt,
@@ -7459,8 +6490,8 @@ const runOneShotAgentText = async (
       return;
     }
     // A provider CLI stalled on auth or network input would otherwise pin the
-    // awaiting caller forever — the epic git actions hold their disabled-UI
-    // busy state on this promise. Cap the turn and reap the child; callers
+    // awaiting caller forever — the navbar commit holds its busy state on
+    // this promise. Cap the turn and reap the child; callers
     // fall back to their non-LLM message.
     deadline = setTimeout(abort, 120_000);
 

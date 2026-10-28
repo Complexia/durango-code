@@ -280,7 +280,7 @@ const SkillsSettings = React.memo(function SkillsSettings({ formatBytes, onOpenI
                   </label>
                   <button
                     type="button"
-                    className="archived-epic-action"
+                    className="settings-item-action"
                     title="Open in the Code tab"
                     disabled={busy}
                     onClick={() => onOpenInEditor(skill)}
@@ -289,7 +289,7 @@ const SkillsSettings = React.memo(function SkillsSettings({ formatBytes, onOpenI
                   </button>
                   <button
                     type="button"
-                    className="archived-epic-action"
+                    className="settings-item-action"
                     title="Reveal in Finder"
                     disabled={busy}
                     onClick={() =>
@@ -300,7 +300,7 @@ const SkillsSettings = React.memo(function SkillsSettings({ formatBytes, onOpenI
                   </button>
                   <button
                     type="button"
-                    className="archived-epic-action danger"
+                    className="settings-item-action danger"
                     title="Delete this skill"
                     disabled={busy}
                     onClick={() => void handleDelete(skill)}

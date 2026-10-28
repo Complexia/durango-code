@@ -419,16 +419,25 @@ export const linkedTaskStatusLabel = (status?: string) => {
   }
 };
 
-// Fresh agent sessions in a Durango workspace learn that Durango Code already
-// made it, so project instructions that say "create a workspace first" are
-// satisfied rather than followed into a second, nested one.
-export const buildDurangoWorkspaceContext = (workspace: ThreadDurangoWorkspace) =>
-  [
+// Fresh agent sessions in a Durango workspace learn about it, so project
+// instructions that say "create a workspace first" are satisfied rather than
+// followed into a second one. A workspace an earlier agent in the thread made
+// itself (`adopted`) is not where the session starts, so it says to work there.
+export const buildDurangoWorkspaceContext = (workspace: ThreadDurangoWorkspace) => {
+  const where =
+    `the Durango workspace \`${workspace.name}\` at ${workspace.path} ` +
+    `(ports ${workspace.portBase}-${workspace.portBase + workspace.portBlock - 1}; see .durango/ws.env)`;
+  return [
     '[Durango workspace]',
-    `Durango Code created the Durango workspace \`${workspace.name}\` for this thread at ${workspace.path} ` +
-      `(ports ${workspace.portBase}-${workspace.portBase + workspace.portBlock - 1}; see .durango/ws.env). ` +
-      'You are already working in it: do all of this task\'s work here and do not create another workspace ' +
-      'with `durango-code ws new`. `durango-code change create`, `change amend` and `land` work from this ' +
-      'directory; Durango Code removes the workspace when the user is done with it.',
+    workspace.adopted
+      ? `An earlier turn of this thread created ${where} for its work. Your shell starts in the project's base ` +
+        'checkout: do this thread\'s edits, installs, dev servers and tests in the workspace (cd there or use its ' +
+        'paths), not in the base checkout, and do not create another one. `durango-code change create`, ' +
+        '`change amend` and `land` work from the workspace directory.'
+      : `Durango Code created ${where} for this thread. ` +
+        'You are already working in it: do all of this task\'s work here and do not create another workspace ' +
+        'with `durango-code ws new`. `durango-code change create`, `change amend` and `land` work from this ' +
+        'directory; Durango Code removes the workspace when the user is done with it.',
     '[/Durango workspace]',
   ].join('\n');
+};

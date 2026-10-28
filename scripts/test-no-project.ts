@@ -13,12 +13,15 @@ const deferred = <T>() => {
 const transcriptPage = deferred<{ ok: boolean; value: string }>();
 const pageRequested = deferred<void>();
 const existingProject = { id: 'repository', name: 'Existing project', path: '/tmp/existing' };
-const existingEpic = { id: 'epic', name: 'Existing epic', createdAt: '2026-09-01T00:00:00Z' };
+// Epics were removed; a store written before then must drop them on save.
+const retiredEpic = { id: 'epic', name: 'Retired epic', createdAt: '2026-09-01T00:00:00Z' };
 let savedValue = JSON.stringify({
   version: 1,
   state: {
     projects: [existingProject],
-    epics: [existingEpic],
+    epics: [retiredEpic],
+    selectedEpicId: retiredEpic.id,
+    epicsSettings: { enabled: true },
     selectedProjectId: existingProject.id,
     workspacePath: existingProject.path,
     // A copied profile must adopt this machine's path after hydration.
@@ -98,7 +101,9 @@ assert.equal(useOrionStore.getState().noProject?.path, '/this-machine/chats');
 assert.equal(await flushOrionStoreSave(), true);
 const savedState = JSON.parse(savedValue).state;
 assert.deepEqual(savedState.projects, [existingProject]);
-assert.deepEqual(savedState.epics, [existingEpic]);
+assert.equal(savedState.epics, undefined, 'Retired Epics state must not be re-saved');
+assert.equal(savedState.selectedEpicId, undefined);
+assert.equal(savedState.epicsSettings, undefined);
 assert.equal(savedState.deploymentSettings.preferAgentDeploys, true);
 assert.equal(savedState.noProject.path, '/this-machine/chats');
 disposeActive();

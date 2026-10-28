@@ -8,9 +8,6 @@ import {
   Code2,
   GitBranch,
   GitCommit,
-  GitMerge,
-  GitPullRequest,
-  GitPullRequestClosed,
   ChevronDown,
   Columns3,
   Ellipsis,
@@ -28,7 +25,6 @@ import {
   ArrowUp,
   Paperclip,
   RefreshCw,
-  Archive,
   AppWindow,
   SquareArrowOutUpRight,
   ListPlus,
@@ -45,19 +41,18 @@ import {
 import { useShallow } from 'zustand/react/shallow';
 import {
   useOrionStore,
-  flushOrionStoreSave,
   flushOrionThreadsSave,
   defaultProviderSettings,
   defaultOrchestrationSettings,
   defaultNotificationSettings,
-  defaultEpicsSettings,
   defaultDurangoSettings,
   defaultDurangoDispatchSettings,
+  defaultSidebarV2Settings,
+  defaultAppearanceSettings,
   findProjectById,
   isAgentsPanelVisible,
   isNoProjectId,
   MAX_THREAD_PANES,
-  NO_PROJECT_ID,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -67,11 +62,10 @@ import {
   type OrchestrationRoleId,
   type Project,
   type ProviderId,
+  type SidebarV2Settings,
   type Thread,
   type ThreadGoal,
   type TurnTokenStats,
-  type Epic,
-  type EpicRepository,
 } from './store';
 import type {
   OrionMcpEntry,
@@ -120,13 +114,13 @@ import {
 import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
 import orionIconUrl from '../assets/icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
-import { epicHasActionableCommitWork, epicRepositoryShouldAutoCreatePr } from './app/epicGit';
-import { epicThreadRows } from './app/epicThreads';
-import { AgentsSidebar, type AgentsSidebarModel, THREAD_DRAG_MIME } from './app/AgentsSidebar';
+import { AgentsSidebar, type AgentsSidebarModel, MachinesAndSavedViews, THREAD_DRAG_MIME } from './app/AgentsSidebar';
+import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
+import { ProjectPickerModal, type ProjectPickerView } from './app/ProjectPickerModal';
+import { sidebarV2ThreadLists, useStableIdList, useThreadsNeedingInput } from './app/threadLists';
 import { ThreadPane } from './app/ThreadPane';
-import type { AppDialogsModel } from './app/AppDialogs';
 import { ImageLightbox } from './app/imageLightbox';
-import { ProjectIcon } from './app/ProjectIcon';
+import { ProjectBadge } from './app/ProjectBadge';
 import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import { ComposerPopover } from './app/ComposerPopover';
@@ -236,10 +230,6 @@ import type { SettingsPageProps } from './app/SettingsPage';
 import type {
   AppUpdateState,
   WhatsNewState,
-  EpicCommitDialogState,
-  EpicPrBaseDialogState,
-  EpicPrStatus,
-  EpicSettleDialogState,
   GitRepoState,
   OrionAccountState,
   ProviderUpdateProgress,
@@ -254,7 +244,6 @@ import type {
 // counterpart, node-pty, is likewise only import()ed on first terminal:ensure.)
 const TerminalView = React.lazy(() => import('./TerminalView'));
 const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
-const AppDialogs = React.lazy(() => import('./app/AppDialogs'));
 // Remote control is opt-in and rarely on screen; keep its view out of the
 // startup chunk like the settings page.
 const RemoteMachineView = React.lazy(() => import('./app/RemoteMachineView'));
@@ -299,43 +288,10 @@ const formatBytes = (bytes: number | null | undefined) => {
 
 const THREADS_VISIBLE_LIMIT = 5;
 
-// How often the sidebar refreshes non-merged PRs. One `gh api graphql` call
-// covers every epic at once (rate-limit cost 1 of 5000/hour), so this is a
-// fixed cost per tick rather than per PR, and stays well under the 5s local-git
-// poll behind the selected epic's buttons. A merge can land any time — minutes
-// or a day after the PR opens, and possibly by someone else — so this periodic
-// refresh, not any user-driven event, is what has to catch it.
-const EPIC_PR_STATE_REFRESH_MS = 60_000;
-
-// Returning to Orion right after merging in the browser is the moment the icon
-// is most likely stale, so focus gets its own much shorter throttle.
-const EPIC_PR_STATE_FOCUS_REFRESH_MS = 15_000;
-
-type EpicPrLookupRequest = {
-  expectedPrUrl: string;
-  order: number;
-  startedAt: string;
-};
-
 type AgentRunStartupResult = { ok: boolean; runId?: string; error?: string };
 type ThreadTurnStartResult =
   | { ok: false; error?: string }
   | { ok: true; startup: Promise<AgentRunStartupResult> };
-
-// What prompted a batch PR-state refresh, which decides how long it must wait
-// since the last one: the background interval or a window focus.
-type EpicPrRefreshReason = 'tick' | 'focus';
-
-// The git action an epic currently has in flight, with the checkout it acts
-// on. Tracked per epic so one epic's commit or PR never blocks another epic's.
-type EpicGitBusyKind = 'commit' | 'pr' | 'pr-branches' | 'settle';
-
-type EpicGitBusyEntry = {
-  kind: EpicGitBusyKind;
-  workspaceKey?: string;
-};
-
-type EpicRepositoryActionResult = 'completed' | 'failed' | 'aborted';
 
 // Which group of the composer's overflow menu is expanded, when the controls
 // row is too narrow to show them as separate chips. One at a time.
@@ -348,46 +304,7 @@ type ComposerMenuSection = 'agent' | 'access' | 'tasks' | null;
 const estimateChipWidth = (label: string, perChar: number, fixed: number) =>
   Math.ceil(label.length * perChar) + fixed;
 
-const UNCLAIMED_EPIC_GIT_WORKSPACE_KEY = 'git:unclaimed';
-
-const epicGitWorkspacesOverlap = (left: string, right: string) =>
-  left === right ||
-  left === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY ||
-  right === UNCLAIMED_EPIC_GIT_WORKSPACE_KEY;
-
-// Whether an epic has to wait before starting a git action: either it already
-// has one in flight, or another epic is working in the same canonical checkout.
-const epicGitWorkspaceBusy = (
-  epicId: string,
-  workspaceKey: string | undefined,
-  entries: Record<string, EpicGitBusyEntry>
-) =>
-  Object.entries(entries).some(([busyEpicId, entry]) => {
-    if (busyEpicId === epicId) return true;
-    if (!workspaceKey || !entry.workspaceKey) return false;
-    return epicGitWorkspacesOverlap(workspaceKey, entry.workspaceKey);
-  });
-
-// Single source of truth for "what state is this epic's PR in", shared by the
-// sidebar icon colour and the epic view's badge. Successful selected-workspace
-// reads and URL-only batch reads both update the persisted epic, so rendering
-// from that value prevents an older local status cache masking a newer batch
-// result when the selected workspace later becomes unavailable.
-const epicPrStatus = (epic: Pick<Epic, 'prUrl' | 'prState'> | undefined | null): EpicPrStatus | null => {
-  if (!epic?.prUrl) return null;
-  switch (epic.prState) {
-    case 'OPEN':
-      return 'open';
-    case 'MERGED':
-      return 'merged';
-    case 'CLOSED':
-      return 'closed';
-    default:
-      return null;
-  }
-};
-
-// Default order for Orion's hidden text-generation turns (thread titles, epic
+// Default order for Orion's hidden text-generation turns (thread titles,
 // commit messages, PR descriptions) when the user hasn't picked a model in
 // Settings. There is deliberately no further fallback: with neither model
 // usable, the user is asked to pick one (TextGenerationModelPrompt).
@@ -468,8 +385,52 @@ const cloudBillingUrl = (repoWebUrl: string | null | undefined) => {
 
 // Threads with a Durango workspace (docs/workspaces.md) run their agent
 // processes inside it instead of the project directory.
+// Where a thread's agent runs: the workspace the app made for it, else the
+// project. A workspace the agent made itself mid-thread is not a run
+// directory — the thread's sessions were recorded in the project directory.
 const threadWorkingDir = (thread: Pick<Thread, 'durangoWorkspace'> | undefined, project: Project) =>
-  thread?.durangoWorkspace?.workingDir ?? project.path;
+  thread?.durangoWorkspace && !thread.durangoWorkspace.adopted ? thread.durangoWorkspace.workingDir : project.path;
+
+// `durango-code ws new <name>` (or an alias) in a shell command an agent ran.
+const WS_NEW_COMMAND = /\b(?:durango-code|ds|durango-source|orion-cli)\s+ws\s+new\s+([^\n;&|]*)/g;
+// `ws new` options that take a value (`--from <rev>`, `--repo <dir>`, `--change <id>`).
+const WS_NEW_VALUE_FLAGS = new Set(['--from', '--repo', '--change']);
+const workspaceNameFromWsNew = (args: string) =>
+  args
+    .split(/\s+/)
+    .map((token) => token.replace(/^["']|["']$/g, ''))
+    .find((token, index, tokens) => token && !token.startsWith('-') && !WS_NEW_VALUE_FLAGS.has(tokens[index - 1] ?? '')) ??
+  null;
+
+/**
+ * Agents create their workspace when they start real work (the
+ * durango-workspaces skill). When a turn ran `ws new` successfully, attach
+ * that workspace to the thread so the header shows it with Land / Run dev
+ * server, and deleting the thread cleans it up.
+ */
+const adoptAgentWorkspace = async (threadId: string, messageId: string) => {
+  const state = useOrionStore.getState();
+  const thread = state.threads.find((candidate) => candidate.id === threadId);
+  if (!thread || thread.durangoWorkspace || !window.orion?.findDurangoWorkspace) return;
+  const project = findProjectById(state, thread.projectId);
+  if (!project || isNoProjectId(project.id)) return;
+  const message = thread.messages.find((candidate) => candidate.id === messageId);
+  let name: string | null = null;
+  for (const activity of message?.activities ?? []) {
+    if (activity.status === 'error' || (activity.exitCode !== undefined && activity.exitCode !== 0)) continue;
+    const text = `${activity.title}\n${activity.input ?? ''}`;
+    for (const match of text.matchAll(WS_NEW_COMMAND)) {
+      const candidate = workspaceNameFromWsNew(match[1]);
+      if (candidate) name = candidate;
+    }
+  }
+  if (!name || !/^[a-z0-9][a-z0-9_-]{0,47}$/.test(name)) return;
+  const result = await window.orion.findDurangoWorkspace({ projectPath: project.path, name }).catch(() => null);
+  if (!result?.ok || !result.workspace) return;
+  const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+  if (!current || current.durangoWorkspace) return;
+  useOrionStore.getState().updateThread(threadId, { durangoWorkspace: { ...result.workspace, adopted: true } });
+};
 
 const getStoredThreadTitle = (threadId: string) =>
   useOrionStore.getState().threads.find((thread) => thread.id === threadId)?.title;
@@ -523,10 +484,14 @@ const threadShellSignature = (thread: Thread): string => {
     // Drives the sidebar's finished-but-unopened dot, and clearing it on open
     // changes nothing else — so the shell has to wake for it.
     thread.finishedUnseenAt,
+    // Sidebar v2 lists and row tints.
+    thread.snoozedAt,
+    thread.settledAt,
+    thread.wokeAt,
+    thread.wokeReason,
     thread.importedUnseen ? '1' : '0',
     thread.parentThreadId,
     thread.branchedFromThreadId,
-    thread.epicId,
     thread.spawnId,
     thread.terminalActivityAt,
     thread.messages.length,
@@ -543,72 +508,13 @@ const threadShellSignature = (thread: Thread): string => {
     JSON.stringify(thread.linkedTasks ?? null),
     // Composer chips for @-attached MCP servers.
     (thread.mcpServerIds ?? []).join(','),
+    // The header's workspace pill and run directory; an agent can attach its
+    // own workspace when a turn ends, after every other field has settled.
+    JSON.stringify(thread.durangoWorkspace ?? null),
+    thread.durangoWorkspaceRemovedAt,
   ].join('\u0000');
   threadShellSignatureCache.set(thread, signature);
   return signature;
-};
-
-// The epic-view description draft stays local while typing: every store write
-// rebuilds `epics`, re-renders the whole shell, and re-serializes the persisted
-// state, so committing per keystroke would tax typing latency for no benefit.
-// Commits happen on blur, on a short idle debounce, and on unmount (which
-// covers switching epics — the caller keys this component by epic id).
-const EpicDescriptionEditor: React.FC<{
-  epicId: string;
-  initialValue: string;
-  onCommit: (epicId: string, description: string) => void;
-}> = ({ epicId, initialValue, onCommit }) => {
-  const [draft, setDraft] = useState(initialValue);
-  const latestRef = useRef({ epicId, draft, initialValue, onCommit });
-  const commitTimerRef = useRef<number | null>(null);
-
-  const flush = useCallback(() => {
-    if (commitTimerRef.current !== null) {
-      window.clearTimeout(commitTimerRef.current);
-      commitTimerRef.current = null;
-    }
-    const latest = latestRef.current;
-    if (latest.draft !== latest.initialValue) latest.onCommit(latest.epicId, latest.draft);
-  }, []);
-
-  // Sync on every commit rather than during render: a discarded concurrent
-  // render must not leave its draft behind for the flush to write.
-  useEffect(() => {
-    latestRef.current = { epicId, draft, initialValue, onCommit };
-  });
-
-  useEffect(() => flush, [flush]);
-
-  return (
-    <textarea
-      id="epic-description"
-      className="epic-view-description"
-      value={draft}
-      onChange={(e) => {
-        setDraft(e.target.value);
-        if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
-        commitTimerRef.current = window.setTimeout(flush, 400);
-      }}
-      onBlur={flush}
-      placeholder="Add notes for this epic…"
-      rows={4}
-    />
-  );
-};
-
-const runtimeThreadsForEpic = (threads: Thread[], epicId: string) => {
-  const threadIds = new Set(threads.filter((thread) => thread.epicId === epicId).map((thread) => thread.id));
-  let foundChild = true;
-  while (foundChild) {
-    foundChild = false;
-    for (const thread of threads) {
-      if (thread.parentThreadId && threadIds.has(thread.parentThreadId) && !threadIds.has(thread.id)) {
-        threadIds.add(thread.id);
-        foundChild = true;
-      }
-    }
-  }
-  return threads.filter((thread) => threadIds.has(thread.id));
 };
 
 const formatCheckedTime = (iso: string): string => {
@@ -767,9 +673,6 @@ const App: React.FC = () => {
     deleteSavedView,
     splitViewSettings,
     setSplitViewSettings,
-    epics,
-    selectedEpicId,
-    epicsSettings,
     durangoWorkspaceSettings,
     setDurangoWorkspaceSettings,
     workspaceSyncSettings,
@@ -778,17 +681,11 @@ const App: React.FC = () => {
     setRemoteControlSettings,
     deploymentSettings,
     setDeploymentSettings,
+    sidebarV2Settings,
+    setSidebarV2Settings,
     addProject,
     removeProject,
     renameProject,
-    addEpic,
-    renameEpic,
-    updateEpic,
-    deleteEpic,
-    settleEpic,
-    unsettleEpic,
-    selectEpic,
-    setEpicsSettings,
     createThread,
     branchThread,
     selectProject,
@@ -840,9 +737,6 @@ const App: React.FC = () => {
       deleteSavedView: state.deleteSavedView,
       splitViewSettings: state.splitViewSettings,
       setSplitViewSettings: state.setSplitViewSettings,
-      epics: state.epics,
-      selectedEpicId: state.selectedEpicId,
-      epicsSettings: state.epicsSettings,
       durangoWorkspaceSettings: state.durangoWorkspaceSettings,
       setDurangoWorkspaceSettings: state.setDurangoWorkspaceSettings,
       workspaceSyncSettings: state.workspaceSyncSettings,
@@ -851,17 +745,11 @@ const App: React.FC = () => {
       setRemoteControlSettings: state.setRemoteControlSettings,
       deploymentSettings: state.deploymentSettings,
       setDeploymentSettings: state.setDeploymentSettings,
+      sidebarV2Settings: state.sidebarV2Settings,
+      setSidebarV2Settings: state.setSidebarV2Settings,
       addProject: state.addProject,
       removeProject: state.removeProject,
       renameProject: state.renameProject,
-      addEpic: state.addEpic,
-      renameEpic: state.renameEpic,
-      updateEpic: state.updateEpic,
-      deleteEpic: state.deleteEpic,
-      settleEpic: state.settleEpic,
-      unsettleEpic: state.unsettleEpic,
-      selectEpic: state.selectEpic,
-      setEpicsSettings: state.setEpicsSettings,
       createThread: state.createThread,
       branchThread: state.branchThread,
       selectProject: state.selectProject,
@@ -973,6 +861,16 @@ const App: React.FC = () => {
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [accessModeOpen, setAccessModeOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+  const [projectPickerView, setProjectPickerView] = useState<ProjectPickerView>('projects');
+  const openProjectPicker = useCallback(() => {
+    setProjectPickerView('projects');
+    setProjectPickerOpen(true);
+  }, []);
+  const openAddProjectPicker = useCallback(() => {
+    setProjectPickerView('add-project');
+    setProjectPickerOpen(true);
+  }, []);
+  const closeProjectPicker = useCallback(() => setProjectPickerOpen(false), []);
   const [branchPickerOpen, setBranchPickerOpen] = useState(false);
   const [creatingBranch, setCreatingBranch] = useState(false);
 
@@ -1017,18 +915,7 @@ const App: React.FC = () => {
   const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
   const [pinnedAgentsOpen, setPinnedAgentsOpen] = useState(true);
   const [pinnedAgentsShowAll, setPinnedAgentsShowAll] = useState(false);
-  const [epicsSectionOpen, setEpicsSectionOpen] = useState(true);
   const [savedViewsSectionOpen, setSavedViewsSectionOpen] = useState(true);
-  const [collapsedEpics, setCollapsedEpics] = useState<Record<string, boolean>>({});
-  // Create-item modal (title + optional description).
-  const [createEpicOpen, setCreateEpicOpen] = useState(false);
-  const [newEpicName, setNewEpicName] = useState('');
-  const [newEpicDescription, setNewEpicDescription] = useState('');
-  // Project the new epic binds to; preset on open to the project the user
-  // last sent a message in.
-  const [newEpicProjectIds, setNewEpicProjectIds] = useState<string[]>([]);
-  // Tailwind dropdown open state for the create-epic project / base-branch pickers.
-  const [createEpicProjectPickerIndex, setCreateEpicProjectPickerIndex] = useState<number | null>(null);
   // Threads whose Durango workspace is being created (before their first
   // turn) or removed. Mirrored in refs so turn dispatch, which reads state at
   // call time, never starts an agent while its working directory is changing.
@@ -1056,102 +943,13 @@ const App: React.FC = () => {
     },
     []
   );
-  const createEpicTitleRef = useRef<HTMLInputElement>(null);
-  const createEpicProjectPickerRef = useRef<HTMLDivElement>(null);
-  const [epicMenuOpenId, setEpicMenuOpenId] = useState<string | null>(null);
-  const [epicRenameId, setEpicRenameId] = useState<string | null>(null);
-  const [epicRepoPickerOpen, setEpicRepoPickerOpen] = useState(false);
-  // One epic git action (commit/PR/status) at a time *per epic*, keyed by epic
-  // id: the epic view's buttons disable while that epic's action runs, and
-  // every other epic stays free to start its own. The ref mirrors the state so
-  // a click-time guard sees a just-started action before React re-renders.
-  const [epicGitBusy, setEpicGitBusy] = useState<Record<string, EpicGitBusyEntry>>({});
-  const epicGitBusyRef = useRef<Record<string, EpicGitBusyEntry>>({});
-  const markEpicGitBusy = useCallback((epicId: string, kind: EpicGitBusyKind | null, workspaceKey?: string) => {
-    const next = { ...epicGitBusyRef.current };
-    if (kind) next[epicId] = { kind, workspaceKey };
-    else delete next[epicId];
-    epicGitBusyRef.current = next;
-    setEpicGitBusy(next);
-  }, []);
-  const anyEpicGitBusy = Object.keys(epicGitBusy).length > 0;
-  // Message dialog shown before an epic's commit & push. An empty message
-  // hands the write back to the epic message model.
-  const [epicCommitDialog, setEpicCommitDialog] = useState<EpicCommitDialogState | null>(null);
-  // Base-branch and message picker shown before opening an epic's pull
-  // request. Holds the origin branches fetched for the picker, the user's
-  // current selection, and their optional hand-written title/description.
-  // The dialog opens before origin has answered, so the branch list starts
-  // empty and loading while the base branch comes from local git.
-  const [epicPrBaseDialog, setEpicPrBaseDialog] = useState<EpicPrBaseDialogState | null>(null);
-  const epicPrBaseDialogInstanceRef = useRef(0);
-  const [epicSettleDialog, setEpicSettleDialog] = useState<EpicSettleDialogState | null>(null);
-  const [epicPrBaseBranchPickerOpen, setEpicPrBaseBranchPickerOpen] = useState(false);
-  const epicPrBaseBranchPickerRef = useRef<HTMLDivElement>(null);
-  // Escape dismisses any epic-action dialog, matching the create-epic modal.
-  // An open base-branch dropdown closes first before the dialog itself.
-  useEffect(() => {
-    if (!epicCommitDialog && !epicPrBaseDialog && !epicSettleDialog) {
-      return undefined;
-    }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      if (epicPrBaseBranchPickerOpen) {
-        setEpicPrBaseBranchPickerOpen(false);
-        return;
-      }
-      setEpicCommitDialog(null);
-      setEpicPrBaseDialog(null);
-      setEpicSettleDialog(null);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [
-    epicCommitDialog,
-    epicPrBaseDialog,
-    epicPrBaseBranchPickerOpen,
-    epicSettleDialog,
-  ]);
-
-  // Click-outside for the Create PR base-branch Tailwind dropdown.
-  useEffect(() => {
-    if (!epicPrBaseBranchPickerOpen) return undefined;
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!epicPrBaseBranchPickerRef.current?.contains(target)) {
-        setEpicPrBaseBranchPickerOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handlePointerDown);
-    return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [epicPrBaseBranchPickerOpen]);
-
-  // Reset the branch picker whenever the Create PR dialog is dismissed.
-  useEffect(() => {
-    if (!epicPrBaseDialog) setEpicPrBaseBranchPickerOpen(false);
-  }, [epicPrBaseDialog]);
-  // Live workspace status behind the epic git buttons: the active commit mode
-  // greys out when it has no work it can perform. PR lifecycle is kept in the
-  // persisted epic instead so URL-only refreshes and workspace reads do not
-  // create competing caches.
-  const [epicGitStatuses, setEpicGitStatuses] = useState<
-    Record<
-      string,
-      {
-        hasChangesToCommit: boolean;
-        hasUnpushedCommits: boolean;
-      }
-    >
-  >({});
   // Shell-wide guard: the workspace project/branch pickers and cloud actions
-  // stand down while any repository work is in flight, epic git included.
-  const repositoryOperationBusy = gitBusy || cloudBusy || anyEpicGitBusy;
+  // stand down while any repository work is in flight.
+  const repositoryOperationBusy = gitBusy || cloudBusy;
   useEffect(() => {
     if (!repositoryOperationBusy) return;
     setProjectPickerOpen(false);
     setBranchPickerOpen(false);
-    setEpicRepoPickerOpen(false);
   }, [repositoryOperationBusy]);
   const [providerUpdateState, setProviderUpdateState] = useState<ProviderUpdateState | null>(null);
   const [providerUpdatesChecking, setProviderUpdatesChecking] = useState(false);
@@ -1184,8 +982,6 @@ const App: React.FC = () => {
   const goalMenuRef = useRef<HTMLDivElement>(null);
   const projectMenuRef = useRef<HTMLDivElement>(null);
   const threadItemMenuRef = useRef<HTMLDivElement>(null);
-  const epicMenuRef = useRef<HTMLDivElement>(null);
-  const epicRepoPickerRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
   // `/btw` side-question runs, routed to a thread's btwExchanges instead of
   // its transcript. Kept separate from runOutputMessages so aside runs never
@@ -1333,7 +1129,6 @@ const App: React.FC = () => {
   const threadViewContext = useCallback(
     (thread: Thread | undefined) => {
       const project = thread ? (findProjectById({ projects, noProject }, thread.projectId) ?? null) : null;
-      const epic = thread?.epicId ? epics.find((candidate) => candidate.id === thread.epicId) : undefined;
       const workspacePending = Boolean(thread && workspaceSetupThreadIds[thread.id]);
       const workspaceRemoving = Boolean(thread && workspaceRemovalThreadIds[thread.id]);
       const workspaceUnavailable = workspacePending || workspaceRemoving;
@@ -1351,15 +1146,14 @@ const App: React.FC = () => {
           ? [projectPath, `~/.grok/sessions/${encodeURIComponent(projectPath)}/${grokSessionId}`]
           : [projectPath]
         : [];
-      return { project, epic, workspacePending, workspaceRemoving, workspaceUnavailable, projectPath, mediaBaseDirs };
+      return { project, workspacePending, workspaceRemoving, workspaceUnavailable, projectPath, mediaBaseDirs };
     },
-    [epics, noProject, projects, workspaceRemovalThreadIds, workspaceSetupThreadIds]
+    [noProject, projects, workspaceRemovalThreadIds, workspaceSetupThreadIds]
   );
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
   const selectedThreadContext = threadViewContext(selectedThread);
   const selectedThreadProject = selectedThreadContext.project;
-  const selectedThreadEpic = selectedThreadContext.epic;
   const selectedThreadWorkspacePending = selectedThreadContext.workspacePending;
   const selectedThreadWorkspaceRemoving = selectedThreadContext.workspaceRemoving;
   const selectedThreadWorkspaceUnavailable = selectedThreadContext.workspaceUnavailable;
@@ -1441,25 +1235,6 @@ const App: React.FC = () => {
     }
     return latestProjectId;
   }, [threads]);
-  // The project the user last sent a message in (a thread's last user message
-  // is its latest, so only that one is checked per thread). Presets the
-  // create-epic modal's project picker.
-  const lastMessagedProjectId = useMemo(() => {
-    let latestProjectId: string | null = null;
-    let latestTs = -Infinity;
-    for (const thread of threads) {
-      for (let i = thread.messages.length - 1; i >= 0; i--) {
-        if (thread.messages[i].role !== 'user') continue;
-        const ts = new Date(thread.messages[i].ts).getTime();
-        if (ts > latestTs) {
-          latestTs = ts;
-          latestProjectId = thread.projectId;
-        }
-        break;
-      }
-    }
-    return latestProjectId;
-  }, [threads]);
   // May be the No project pseudo-project (the user's current choice, or the
   // only option before any project is added).
   const defaultNewThreadProject =
@@ -1468,11 +1243,6 @@ const App: React.FC = () => {
     projects[0] ??
     noProject ??
     null;
-  // Same default for things that need a real repository (epics).
-  const defaultRepositoryProject =
-    defaultNewThreadProject && !isNoProjectId(defaultNewThreadProject.id)
-      ? defaultNewThreadProject
-      : (projects[0] ?? null);
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
   // empty composer.
@@ -1792,7 +1562,6 @@ const App: React.FC = () => {
         };
       }
       const parsedQuery = parseSearchQuery(trimmedQuery);
-      const epicNameById = new Map(epics.map((epic) => [epic.id, epic.name]));
       const scored = base
         .map((thread) => {
           const project = projectById.get(thread.projectId);
@@ -1800,8 +1569,7 @@ const App: React.FC = () => {
           const entry = getThreadSearchEntry(
             thread,
             projectName,
-            project?.path ?? '',
-            thread.epicId ? (epicNameById.get(thread.epicId) ?? '') : ''
+            project?.path ?? ''
           );
           return { thread, projectName, score: scoreThreadSearchEntry(entry, parsedQuery) };
         })
@@ -1879,7 +1647,6 @@ const App: React.FC = () => {
     chatMentionThreadLimit,
     durangoChatSearch,
     enabledProviderIdSet,
-    epics,
     projects,
     selectedThreadId,
     threads,
@@ -2210,6 +1977,73 @@ const App: React.FC = () => {
 
   const runningAgentCount = useMemo(() => threads.filter((t) => t.status === 'running').length, [threads]);
 
+  // Sidebar v2 (Settings → Experimental): flat Pinned / Recent / Snoozed /
+  // Settled lists, and the threads waiting on a question or approval.
+  // Settings → Cosmetics → Text size zooms the whole window.
+  const uiScale = useOrionStore((state) => state.appearanceSettings?.uiScale ?? defaultAppearanceSettings.uiScale);
+  useEffect(() => {
+    window.orion?.setZoomFactor?.(uiScale);
+  }, [uiScale]);
+  const sidebarV2Enabled = sidebarV2Settings?.enabled ?? defaultSidebarV2Settings.enabled;
+  const sidebarV2Views = sidebarV2Settings?.views ?? defaultSidebarV2Settings.views;
+  const sidebarV2Lists = useMemo(
+    () =>
+      sidebarV2ThreadLists(
+        sidebarV2Enabled ? threads : [],
+        (thread) => childThreadIds.has(thread.id),
+        compareRecentThreadOrder
+      ),
+    [childThreadIds, sidebarV2Enabled, threads]
+  );
+  const runningThreadIds = useStableIdList(
+    threads.filter((thread) => thread.status === 'running').map((thread) => thread.id)
+  );
+  // A question or approval wakes a snoozed thread (its run ending does so in
+  // the store's updateThread).
+  const wakeThreadForAttention = useCallback(
+    (threadId: string) => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((candidate) => candidate.id === threadId);
+      if (!thread?.snoozedAt) return;
+      const onScreen = isAgentsPanelVisible(state) && state.paneThreadIds.includes(threadId);
+      updateThread(threadId, {
+        snoozedAt: undefined,
+        ...(onScreen ? {} : { wokeAt: new Date().toISOString(), wokeReason: 'attention' as const }),
+      });
+    },
+    [updateThread]
+  );
+  const threadsNeedingInput = useThreadsNeedingInput(sidebarV2Enabled, runningThreadIds, wakeThreadForAttention);
+  const setSidebarV2ViewVisible = useCallback(
+    (view: keyof SidebarV2Settings['views'], visible: boolean) =>
+      setSidebarV2Settings({ views: { ...useOrionStore.getState().sidebarV2Settings.views, [view]: visible } }),
+    [setSidebarV2Settings]
+  );
+  const snoozeThread = useCallback(
+    (threadId: string) =>
+      updateThread(threadId, { snoozedAt: new Date().toISOString(), wokeAt: undefined, wokeReason: undefined }),
+    [updateThread]
+  );
+  const unsnoozeThread = useCallback(
+    (threadId: string) => updateThread(threadId, { snoozedAt: undefined }),
+    [updateThread]
+  );
+  const settleThread = useCallback(
+    (threadId: string) =>
+      updateThread(threadId, {
+        settledAt: new Date().toISOString(),
+        snoozedAt: undefined,
+        wokeAt: undefined,
+        wokeReason: undefined,
+        finishedUnseenAt: undefined,
+      }),
+    [updateThread]
+  );
+  const unsettleThread = useCallback(
+    (threadId: string) => updateThread(threadId, { settledAt: undefined }),
+    [updateThread]
+  );
+
   const projectThreadsByProject = useMemo(() => {
     const grouped = new Map<string, Thread[]>();
     for (const thread of threads) {
@@ -2225,61 +2059,6 @@ const App: React.FC = () => {
     return grouped;
   }, [childThreadIds, threads]);
 
-  const epicsEnabled = epicsSettings?.enabled ?? defaultEpicsSettings.enabled;
-  const epicPromptGitMessages = epicsSettings?.promptGitMessages ?? defaultEpicsSettings.promptGitMessages;
-
-  const activeEpics = useMemo(() => epics.filter((epic) => !epic.settledAt), [epics]);
-
-  const archivedEpics = useMemo(
-    () =>
-      epics
-        .filter((epic) => epic.settledAt)
-        .sort((a, b) => new Date(b.settledAt ?? 0).getTime() - new Date(a.settledAt ?? 0).getTime()),
-    [epics]
-  );
-
-  const threadsByEpic = useMemo(() => {
-    const grouped = new Map<string, Thread[]>();
-    // No Epics UI renders while the feature is off, so skip the grouping work.
-    if (!epicsEnabled) return grouped;
-    for (const thread of threads) {
-      // Top-level rows only; children render nested under their parent.
-      if (!thread.epicId || childThreadIds.has(thread.id)) continue;
-      const epicThreads = grouped.get(thread.epicId);
-      if (epicThreads) epicThreads.push(thread);
-      else grouped.set(thread.epicId, [thread]);
-    }
-    for (const epicThreads of grouped.values()) {
-      epicThreads.sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime());
-    }
-    return grouped;
-  }, [childThreadIds, epicsEnabled, threads]);
-
-  // Epics that still have a live agent: any thread grouped under the epic —
-  // including hidden subagent children — that is running or has a tracked run.
-  // Children spawned before epic inheritance carry no epicId, so resolve
-  // through the parent chain. Drives disabling commit/PR/settle for the epic.
-  const runningAgentEpicIds = useMemo(() => {
-    const running = new Set<string>();
-    if (!epicsEnabled) return running;
-    const threadsById = new Map(threads.map((thread) => [thread.id, thread]));
-    const epicIdForThread = (thread: Thread): string | undefined => {
-      const seen = new Set<string>();
-      let current: Thread | undefined = thread;
-      while (current && !seen.has(current.id)) {
-        if (current.epicId) return current.epicId;
-        seen.add(current.id);
-        current = current.parentThreadId ? threadsById.get(current.parentThreadId) : undefined;
-      }
-      return undefined;
-    };
-    for (const thread of threads) {
-      if (thread.status !== 'running' && !activeRunsByThread[thread.id]) continue;
-      const epicId = epicIdForThread(thread);
-      if (epicId) running.add(epicId);
-    }
-    return running;
-  }, [activeRunsByThread, epicsEnabled, threads]);
   const runningThreadCount = useMemo(
     () =>
       restartToUpdateConfirmOpen
@@ -2288,54 +2067,7 @@ const App: React.FC = () => {
     [activeRunsByThread, restartToUpdateConfirmOpen, threads]
   );
 
-  const projectForGitRoot = useCallback(
-    (gitRoot: string | undefined, preferredProjectId?: string) => {
-      if (!gitRoot) return null;
-      const normalizedRoot = normalizeRepositoryPath(gitRoot);
-      const belongsToRoot = (project: Project) => {
-        const normalizedProjectPath = normalizeRepositoryPath(project.path);
-        return normalizedProjectPath === normalizedRoot || normalizedProjectPath.startsWith(`${normalizedRoot}/`);
-      };
-      const preferredProject = preferredProjectId
-        ? projects.find((project) => project.id === preferredProjectId)
-        : null;
-      if (preferredProject && belongsToRoot(preferredProject)) return preferredProject;
-      return projects.find(belongsToRoot) ?? null;
-    },
-    [projects]
-  );
-
-  // A claimed epic must stay bound to its claimed repository, so the claimed
-  // gitRoot outranks the picked repository everywhere (see
-  // projectForEpicRepository in the store and the epic git handlers). If that
-  // repository was removed from Orion, return null instead of silently
-  // redirecting new work into another project.
-  const projectForEpic = useCallback(
-    (epic: Epic) => {
-      if (epic.gitRoot) {
-        return projectForGitRoot(epic.gitRoot, epic.repositoryProjectId);
-      }
-
-      const selectedRepository = epic.repositoryProjectId
-        ? projects.find((project) => project.id === epic.repositoryProjectId)
-        : null;
-      if (selectedRepository) return selectedRepository;
-
-      const lastThread = threadsByEpic.get(epic.id)?.[0];
-      const lastProject = lastThread ? projects.find((p) => p.id === lastThread.projectId) : undefined;
-      return lastProject ?? defaultRepositoryProject;
-    },
-    [defaultRepositoryProject, projectForGitRoot, projects, threadsByEpic]
-  );
-
-  const selectedEpic = epicsEnabled ? (epics.find((epic) => epic.id === selectedEpicId) ?? null) : null;
-
-  // The store retargets selectedProjectId to an epic's repository. Do not
-  // apply the generic new-thread fallback while an epic is selected: an
-  // unbound epic must leave repository controls hidden instead of exposing a
-  // stale project. Gate on the resolved epic, not the persisted id, so a
-  // leftover id cannot hide the controls once Epics is turned off.
-  const activeThreadProject = selectedThreadProject ?? (selectedEpic ? selectedProject : defaultNewThreadProject);
+  const activeThreadProject = selectedThreadProject ?? defaultNewThreadProject;
   const activeIsNoProject = isNoProjectId(activeThreadProject?.id);
 
   // The directory the repository controls act on: the selected thread's
@@ -2350,56 +2082,12 @@ const App: React.FC = () => {
     const workingDirChanged = previousActiveWorkingDirRef.current !== activeWorkingDir;
     previousActiveWorkingDirRef.current = activeWorkingDir;
     // Keep the editor mounted only while it still belongs to the active
-    // thread/epic. Leaving Code preserves any open-file state; reopening it
+    // thread. Leaving Code preserves any open-file state; reopening it
     // goes through handleSetActiveTab, which switches the workspace root.
     if (activeTab === 'code' && (activeWorkspaceUnavailable || workingDirChanged)) {
       setActiveTab('agents');
     }
   }, [activeWorkspaceUnavailable, activeWorkingDir, activeTab, setActiveTab]);
-
-  const selectedEpicThreadRows = useMemo(
-    () => (selectedEpic ? epicThreadRows(threads, selectedEpic.id) : []),
-    [selectedEpic, threads]
-  );
-  const selectedEpicHasRunningAgents = selectedEpic ? runningAgentEpicIds.has(selectedEpic.id) : false;
-  const selectedEpicRepositoryProject = selectedEpic?.repositoryProjectId
-    ? (projects.find((project) => project.id === selectedEpic.repositoryProjectId) ?? null)
-    : null;
-  const selectedEpicClaimedProject = selectedEpic
-    ? projectForGitRoot(selectedEpic.gitRoot, selectedEpic.repositoryProjectId)
-    : null;
-  const selectedEpicRepositories = useMemo(
-    () =>
-      (selectedEpic?.repositories ?? []).map((repository) => ({
-        repository,
-        project: projects.find((project) => project.id === repository.projectId) ?? null,
-      })),
-    [projects, selectedEpic]
-  );
-  const selectedEpicGitStatus = selectedEpic ? epicGitStatuses[selectedEpic.id] : undefined;
-  // Fail open until the first status arrives. In commit-only mode, an
-  // unpushed commit is not actionable because this button deliberately cannot
-  // push it; only fresh workspace changes can produce another local commit.
-  const selectedEpicHasActionableCommitWork = epicHasActionableCommitWork(
-    selectedEpicGitStatus,
-    Boolean(selectedEpic?.commitWithoutPush)
-  );
-  const selectedEpicPrStatus = epicPrStatus(selectedEpic);
-  const selectedEpicPrBadge = !selectedEpicPrStatus
-    ? null
-    : {
-        modifier: selectedEpicPrStatus,
-        label:
-          selectedEpicPrStatus === 'merged'
-            ? 'PR merged'
-            : selectedEpicPrStatus === 'closed'
-              ? 'PR closed'
-              : // Distinguish a confirmed-open PR from one we've only just
-                // created and not yet read back.
-                selectedEpic?.prState
-                ? 'PR open'
-                : 'PR created',
-      };
 
   // Models eligible for the hidden text-generation turns. Orion can't delegate
   // to itself, the Claude Code CLI pseudo-model is an interactive terminal, and
@@ -2422,7 +2110,7 @@ const App: React.FC = () => {
       ),
     [enabledProviderIdSet, utilityCandidateModels]
   );
-  // The model behind thread titles and epic commit/PR messages: the Settings
+  // The model behind thread titles and commit/PR messages: the Settings
   // pick when it's installed and its provider is enabled, else the first
   // usable model in UTILITY_MODEL_PREFERENCE, else none.
   const resolvedUtilityModelId = useMemo(() => {
@@ -3014,7 +2702,7 @@ const App: React.FC = () => {
     setActiveRemoteMachineId(machineId);
   }, []);
   // Sidebar navigation always returns to this machine — including re-clicking
-  // the already-selected thread/project/epic, which the deselection effect
+  // the already-selected thread/project, which the deselection effect
   // below (it only sees value changes) would otherwise miss.
   const selectThreadFromSidebar = useCallback(
     (id: string | null) => {
@@ -3029,17 +2717,6 @@ const App: React.FC = () => {
       selectProject(id);
     },
     [selectProject]
-  );
-  const [epicSelectionNonce, setEpicSelectionNonce] = useState(0);
-  const selectEpicFromSidebar = useCallback(
-    (id: string | null) => {
-      setActiveRemoteMachineId(null);
-      // Every click into an epic restarts its status poll (and PR lookup),
-      // even when the epic id is unchanged, e.g. returning from a thread.
-      if (id) setEpicSelectionNonce((n) => n + 1);
-      selectEpic(id);
-    },
-    [selectEpic]
   );
   const openSavedViewFromSidebar = useCallback(
     (id: string) => {
@@ -3065,11 +2742,11 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!remoteMachinesVisible) setActiveRemoteMachineId(null);
   }, [remoteMachinesVisible]);
-  // Local navigation leaves the remote view: picking a thread, project, epic,
+  // Local navigation leaves the remote view: picking a thread, project,
   // or saved view on this machine means the user is done with the remote one.
   useEffect(() => {
     setActiveRemoteMachineId(null);
-  }, [selectedThreadId, selectedProjectId, selectedEpicId, activeSavedViewId]);
+  }, [selectedThreadId, selectedProjectId, activeSavedViewId]);
 
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
@@ -3544,24 +3221,18 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (
-      !projectPickerOpen &&
       !branchPickerOpen &&
       !threadSearchOpen &&
       !threadMenuOpen &&
       !goalMenuOpen &&
       !openWithOpen &&
-      !epicRepoPickerOpen &&
       projectMenuOpenId === null &&
-      threadItemMenuKey === null &&
-      epicMenuOpenId === null
+      threadItemMenuKey === null
     )
       return undefined;
 
     const handlePointerDown = (event: MouseEvent) => {
       const target = event.target as Node;
-      if (projectPickerOpen && !projectPickerRef.current?.contains(target)) {
-        setProjectPickerOpen(false);
-      }
       if (branchPickerOpen && !branchPickerRef.current?.contains(target)) {
         setBranchPickerOpen(false);
       }
@@ -3583,17 +3254,10 @@ const App: React.FC = () => {
       if (threadItemMenuKey !== null && !threadItemMenuRef.current?.contains(target)) {
         setThreadItemMenuKey(null);
       }
-      if (epicMenuOpenId !== null && !epicMenuRef.current?.contains(target)) {
-        setEpicMenuOpenId(null);
-      }
-      if (epicRepoPickerOpen && !epicRepoPickerRef.current?.contains(target)) {
-        setEpicRepoPickerOpen(false);
-      }
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
-        setProjectPickerOpen(false);
         setBranchPickerOpen(false);
         setThreadSearchOpen(false);
         setThreadMenuOpen(false);
@@ -3601,8 +3265,6 @@ const App: React.FC = () => {
         setOpenWithOpen(false);
         setProjectMenuOpenId(null);
         setThreadItemMenuKey(null);
-        setEpicMenuOpenId(null);
-        setEpicRepoPickerOpen(false);
       }
     };
 
@@ -3614,24 +3276,17 @@ const App: React.FC = () => {
     };
   }, [
     branchPickerOpen,
-    projectPickerOpen,
     threadMenuOpen,
     goalMenuOpen,
     threadSearchOpen,
     openWithOpen,
     projectMenuOpenId,
     threadItemMenuKey,
-    epicMenuOpenId,
-    epicRepoPickerOpen,
   ]);
 
   useEffect(() => {
     setThreadMenuOpen(false);
   }, [selectedThreadId]);
-
-  useEffect(() => {
-    setEpicRepoPickerOpen(false);
-  }, [selectedEpicId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -4209,7 +3864,6 @@ const App: React.FC = () => {
             modelId: nativeModelId ?? parent.modelId,
             hiddenFromRecent: true,
             accessMode: parent.accessMode,
-            epicId: parent.epicId,
             select: false,
             subagent: {
               id: subagentId,
@@ -4457,6 +4111,7 @@ const App: React.FC = () => {
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
         });
+        void adoptAgentWorkspace(tracked.threadId, tracked.messageId);
         if (discardableShellTasks.length > 0) {
           const count = discardableShellTasks.length;
           const content = `Claude finished its response. ${count === 1 ? 'A background shell process is' : `${count} background shell processes are`} still running as ${count === 1 ? 'a monitor' : 'monitors'}, but ${count === 1 ? 'it does' : 'they do'} not keep the turn open. Stop ${count === 1 ? 'it' : 'them'} here when ${count === 1 ? 'it is' : 'they are'} no longer needed.`;
@@ -4643,28 +4298,41 @@ const App: React.FC = () => {
 
   // Add a project. Keep this stable because it crosses the memoized transcript
   // boundary and App also renders on every composer edit.
+  // Add a project: the folder the user typed in the project picker (`path`,
+  // created if missing), or one chosen in the system folder dialog. Keep this
+  // stable because it crosses the memoized transcript boundary and App also
+  // renders on every composer edit.
   const handleAddProject = useCallback(
-    async (options?: { createInitialThread?: boolean; expectedGitRoot?: string }) => {
+    async (options?: { path?: string; createInitialThread?: boolean }) => {
       if (!window.orion || repositoryOperationBusy) return;
-      const dir = await window.orion.openDirectory();
-      if (!dir) return;
-
-      if (options?.expectedGitRoot) {
-        const selectedRepository = await window.orion.getGitState(dir);
-        const selectedRoot = selectedRepository.ok ? selectedRepository.root : undefined;
-        if (
-          !selectedRoot ||
-          normalizeRepositoryPath(selectedRoot) !== normalizeRepositoryPath(options.expectedGitRoot)
-        ) {
-          toast.error('That folder belongs to a different repository', {
-            description: `Select ${options.expectedGitRoot}`,
-          });
+      let dir: string | null;
+      if (options?.path) {
+        const resolved = await window.orion.resolveProjectDirectory?.(options.path, { create: true });
+        if (!resolved) return;
+        if (!resolved.ok) {
+          toast.error('Couldn’t add that folder', { description: resolved.error });
           return;
         }
+        if (resolved.created) toast.success(`Created ${resolved.path}`);
+        dir = resolved.path;
+      } else {
+        dir = await window.orion.openDirectory();
       }
+      if (!dir) return;
+      const folder = dir;
 
-      const name = await window.orion.basename(dir);
-      const projectId = addProject({ name, path: dir });
+      // Adding a folder that is already a project just switches to it.
+      const existing = useOrionStore
+        .getState()
+        .projects.find((project) => normalizeRepositoryPath(project.path) === normalizeRepositoryPath(folder));
+      let projectId: string;
+      if (existing) {
+        projectId = existing.id;
+        selectProject(projectId);
+      } else {
+        const name = await window.orion.basename(dir);
+        projectId = addProject({ name, path: dir });
+      }
 
       // Also set workspace to this project
       setWorkspacePath(dir);
@@ -4676,7 +4344,7 @@ const App: React.FC = () => {
       setActiveTab('agents');
       return projectId;
     },
-    [addProject, createThread, repositoryOperationBusy, setActiveTab, setWorkspacePath]
+    [addProject, createThread, repositoryOperationBusy, selectProject, setActiveTab, setWorkspacePath]
   );
 
   // Settings → Skills hands a skill to the Code tab: its folder becomes the
@@ -4743,10 +4411,40 @@ const App: React.FC = () => {
   };
 
   const handleNewAgent = () => {
-    const projectId = defaultNewThreadProject?.id;
+    // Sidebar v2 starts the new agent where the most recent thread ran; the
+    // project picker in the new thread changes it.
+    const projectId = sidebarV2Enabled
+      ? (findProjectById({ projects, noProject }, latestThreadProjectId)?.id ?? defaultNewThreadProject?.id)
+      : defaultNewThreadProject?.id;
     if (!projectId) {
       void handleAddProject();
       return;
+    }
+    openNewAgentIn(projectId);
+  };
+
+  // A fresh composer in a project. Sidebar v2 reuses an untouched draft there
+  // rather than stacking empty threads at the top of the flat list.
+  const openNewAgentIn = (projectId: string) => {
+    if (sidebarV2Enabled) {
+      const draft = useOrionStore
+        .getState()
+        .threads.find(
+          (thread) =>
+            thread.projectId === projectId &&
+            thread.messages.length === 0 &&
+            thread.status !== 'running' &&
+            thread.modelId !== claudeCodeCliModelId &&
+            !thread.parentThreadId &&
+            !thread.subagent &&
+            !thread.settledAt &&
+            !thread.snoozedAt
+        );
+      if (draft) {
+        selectThread(draft.id);
+        setActiveTab('agents');
+        return;
+      }
     }
 
     handleCreateThread(projectId);
@@ -4843,7 +4541,7 @@ const App: React.FC = () => {
     try {
       const result = await window.orion.commitAndPush({
         projectPath: activeWorkingDir,
-        // Same message model the epic commit uses, so navbar commits get a
+        // The text-generation model, so navbar commits get a
         // written message instead of "Update 5 files".
         ...resolveUtilityTurn(),
       });
@@ -5030,8 +4728,8 @@ const App: React.FC = () => {
         accessMode: 'full-access',
         // Keep the thread in the same directory the Deploy button acted on:
         // the selected thread's Durango workspace, or the project itself.
-        ...(selectedThreadEpic ? { epicId: selectedThreadEpic.id } : {}),
-        durangoWorkspace: activeDurangoWorkspace,
+        // A fresh thread can start inside a workspace the agent made itself.
+        durangoWorkspace: activeDurangoWorkspace ? { ...activeDurangoWorkspace, adopted: undefined } : null,
       });
       updateThread(threadId, deploymentThreadReasoningPatch);
       setActiveTab('agents');
@@ -5057,7 +4755,6 @@ const App: React.FC = () => {
     },
     [
       activeDurangoWorkspace,
-      selectedThreadEpic,
       activeThreadProject?.id,
       createThread,
       deploymentThreadReasoningPatch,
@@ -5169,1105 +4866,6 @@ const App: React.FC = () => {
     const id = createThread(projectId);
     setActiveTab('agents');
     return id;
-  };
-
-  const openCreateEpicModal = useCallback(() => {
-    setNewEpicName('');
-    setNewEpicDescription('');
-    const initialProject =
-      projects.find((project) => project.id === lastMessagedProjectId) ?? defaultRepositoryProject;
-    setNewEpicProjectIds(initialProject ? [initialProject.id] : []);
-    setEpicsSectionOpen(true);
-    setCreateEpicOpen(true);
-  }, [defaultRepositoryProject, lastMessagedProjectId, projects]);
-
-  const closeCreateEpicModal = useCallback(() => {
-    setCreateEpicOpen(false);
-    setNewEpicName('');
-    setNewEpicDescription('');
-    setNewEpicProjectIds([]);
-    setCreateEpicProjectPickerIndex(null);
-  }, []);
-
-  const handleCreateEpic = () => {
-    const trimmed = newEpicName.trim();
-    if (!trimmed) return;
-    const description = newEpicDescription.trim();
-    const epicProjects = newEpicProjectIds
-      .map((projectId) => projects.find((project) => project.id === projectId))
-      .filter((project): project is Project => Boolean(project));
-    const epicProject = epicProjects[0] ?? null;
-    addEpic(trimmed, {
-      ...(description ? { description } : {}),
-      ...(epicProject ? { repositoryProjectId: epicProject.id } : {}),
-      ...(epicProjects.length > 0 ? { repositoryProjectIds: epicProjects.map((project) => project.id) } : {}),
-    });
-    closeCreateEpicModal();
-    setActiveTab('agents');
-  };
-
-  useEffect(() => {
-    if (!createEpicOpen) return;
-    const id = window.setTimeout(() => createEpicTitleRef.current?.focus(), 0);
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return;
-      e.preventDefault();
-      // Close an open dropdown first; only dismiss the modal when none are open.
-      if (createEpicProjectPickerIndex !== null) {
-        setCreateEpicProjectPickerIndex(null);
-        return;
-      }
-      closeCreateEpicModal();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => {
-      window.clearTimeout(id);
-      window.removeEventListener('keydown', onKeyDown);
-    };
-  }, [closeCreateEpicModal, createEpicOpen, createEpicProjectPickerIndex]);
-
-  // Click-outside for create-epic Tailwind dropdowns.
-  useEffect(() => {
-    if (createEpicProjectPickerIndex === null) return undefined;
-    const handlePointerDown = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!createEpicProjectPickerRef.current?.contains(target)) {
-        setCreateEpicProjectPickerIndex(null);
-      }
-    };
-    document.addEventListener('mousedown', handlePointerDown);
-    return () => document.removeEventListener('mousedown', handlePointerDown);
-  }, [createEpicProjectPickerIndex]);
-
-  const handleCreateThreadForEpic = async (epic: Epic) => {
-    const project = projectForEpic(epic);
-    let projectId = project?.id;
-    if (!project) {
-      if (epic.gitRoot) {
-        toast.info('Select the claimed repository to re-add it to Durango Code', {
-          description: epic.gitRoot,
-        });
-      }
-      projectId = await handleAddProject({
-        createInitialThread: false,
-        expectedGitRoot: epic.gitRoot,
-      });
-      if (!projectId) return;
-    }
-    setCollapsedEpics((prev) => (prev[epic.id] ? { ...prev, [epic.id]: false } : prev));
-    // Same anti-spam rule as handleCreateThread: reuse an untouched draft
-    // thread already under this epic.
-    if (
-      selectedThread &&
-      selectedThread.epicId === epic.id &&
-      selectedThread.projectId === projectId &&
-      selectedThread.modelId !== claudeCodeCliModelId &&
-      selectedThread.messages.length === 0 &&
-      !chatInput.trim() &&
-      chatAttachments.length === 0
-    ) {
-      setActiveTab('agents');
-      return selectedThread.id;
-    }
-    const id = createThread(projectId, undefined, { epicId: epic.id });
-    setActiveTab('agents');
-    return id;
-  };
-
-  // Shared setup for the epic git handlers: the directory the epic's git
-  // actions act on — the claimed gitRoot, then the picked project.
-  // projectPath stays optional so each caller can word its own toast.
-  //
-  // The epic shares its repository with everything else, so main must still
-  // refuse a drifted checkout or a branch another epic claimed.
-  const claimedBranchesForEpic = (epicId: string) =>
-    epics
-      .filter((candidate) => candidate.id !== epicId)
-      .flatMap((candidate) => {
-        const repositoryClaims = candidate.repositories?.flatMap((repository) =>
-          repository.gitRoot && repository.gitBranch
-            ? [{ gitRoot: repository.gitRoot, branch: repository.gitBranch, epicName: candidate.name }]
-            : []
-        );
-        if (repositoryClaims?.length) return repositoryClaims;
-        return candidate.gitRoot && candidate.gitBranch
-          ? [{ gitRoot: candidate.gitRoot, branch: candidate.gitBranch, epicName: candidate.name }]
-          : [];
-      });
-
-  const resolveEpicGitTarget = (epic: Epic) => {
-    const primaryRepository = epic.repositories?.[0];
-    const projectId = primaryRepository?.projectId ?? epic.repositoryProjectId;
-    const project = projectId
-      ? (projects.find((candidate) => candidate.id === projectId) ?? null)
-      : null;
-    return {
-      project,
-      projectPath: epic.gitRoot ?? project?.path,
-      claim: {
-        expectedGitRoot: epic.gitRoot,
-        expectedBranch: epic.gitBranch,
-        claimedBranches: claimedBranchesForEpic(epic.id),
-      },
-    };
-  };
-
-  // Claimed epics lock by their canonical Git root rather than the selected
-  // project folder, because multiple folders can share one checkout and
-  // index. Before the first action returns that root, serialize unclaimed
-  // epics under one conservative wildcard key, which also waits for claimed
-  // shared-checkout work because the unknown root could be that same checkout.
-  const epicGitWorkspaceKey = (epic: Epic) => {
-    if ((epic.repositories?.length ?? 0) > 1) {
-      return UNCLAIMED_EPIC_GIT_WORKSPACE_KEY;
-    }
-    if (epic.gitRoot) {
-      return `git:${normalizeRepositoryPath(epic.gitRoot)}`;
-    }
-    return resolveEpicGitTarget(epic).projectPath ? UNCLAIMED_EPIC_GIT_WORKSPACE_KEY : undefined;
-  };
-
-  // Click-time guard for one epic's git actions. Shell git/cloud work still
-  // blocks them — it can touch the same checkout — as does an epic sharing this
-  // one's workspace, but an unrelated epic's in-flight commit or PR does not.
-  const epicOperationBusy = (epic: Epic) =>
-    gitBusy || cloudBusy || epicGitWorkspaceBusy(epic.id, epicGitWorkspaceKey(epic), epicGitBusyRef.current);
-
-  const claimEpicGitTarget = (epic: Epic, result: { gitRoot?: string; branch?: string }) => {
-    if (!result.gitRoot || !result.branch) return;
-    updateEpic(epic.id, { gitRoot: result.gitRoot, gitBranch: result.branch });
-  };
-
-  // Keeps the selected epic's git-button status fresh: fetched on selection
-  // and after every epic git action (the epic's busy kind clearing re-runs the
-  // effect), plus a light local-only poll while the view stays open so agent
-  // work re-enables "Commit & push". The PR state lookup hits the provider, so it
-  // runs only on the initial fetch, not on every poll tick.
-  const refreshEpicGitStatus = async (epic: Epic, options?: { includePr?: boolean }) => {
-    if (!window.orion?.epicGitStatus) return;
-    if ((epic.repositories?.length ?? 0) > 1) {
-      const results = await Promise.all(
-        epic.repositories!.map((repository) =>
-          window.orion!.epicGitStatus!({
-            projectPath: repository.projectPath,
-            ...(options?.includePr && repository.prUrl ? { prUrl: repository.prUrl } : {}),
-          }).catch(() => null)
-        )
-      );
-      const successful = results.filter((result) => result?.ok);
-      if (successful.length === 0) return;
-      return {
-        ok: true,
-        hasChangesToCommit: successful.some((result) => result?.hasChangesToCommit),
-        hasUnpushedCommits: successful.some((result) => result?.hasUnpushedCommits),
-      };
-    }
-    const { projectPath } = resolveEpicGitTarget(epic);
-    if (!projectPath) return;
-    try {
-      const result = await window.orion.epicGitStatus({
-        projectPath,
-        ...(options?.includePr && epic.prUrl ? { prUrl: epic.prUrl } : {}),
-      });
-      return result.ok ? result : undefined;
-    } catch {
-      // Keep the last known status; the buttons fail open without one.
-      return undefined;
-    }
-  };
-
-  // Order every PR lookup when it starts. A later request immediately
-  // supersedes an earlier one for the same epic, regardless of which network
-  // response completes first.
-  const epicPrLookupOrderRef = useRef(0);
-  const latestEpicPrLookupOrderRef = useRef<Map<string, number>>(new Map());
-
-  // Opening a PR is the one moment Orion knows the user is looking at
-  // it, so the next focus refreshes without waiting on any throttle. Only a
-  // hint: a teammate can merge, or the user can merge from elsewhere entirely,
-  // which is why the background interval remains what actually catches merges.
-  // Lives outside the poll effect so it survives that effect restarting.
-  const epicPrRefreshArmedRef = useRef(false);
-  const openEpicPrUrl = useCallback((prUrl: string) => {
-    epicPrRefreshArmedRef.current = true;
-    void window.orion?.openExternalUrl?.(prUrl);
-  }, []);
-  const beginEpicPrLookup = (epicId: string, expectedPrUrl: string): EpicPrLookupRequest => {
-    const order = ++epicPrLookupOrderRef.current;
-    latestEpicPrLookupOrderRef.current.set(epicId, order);
-    return {
-      expectedPrUrl,
-      order,
-      startedAt: new Date().toISOString(),
-    };
-  };
-
-  const persistEpicPrLookup = (epicId: string, state: 'OPEN' | 'CLOSED' | 'MERGED', request: EpicPrLookupRequest) => {
-    const currentEpic = useOrionStore.getState().epics.find((epic) => epic.id === epicId);
-    if (
-      !currentEpic ||
-      currentEpic.prUrl !== request.expectedPrUrl ||
-      latestEpicPrLookupOrderRef.current.get(epicId) !== request.order
-    ) {
-      return;
-    }
-    // A tick that only confirms the state we already hold must not touch the
-    // store: updateEpic allocates a new epics array, which re-renders all of
-    // App and re-serializes the persisted blob. Steady-state polling is then
-    // free, so the refresh interval can stay short. This makes prStateCheckedAt
-    // mean "when this state became known" rather than "when we last polled" —
-    // nothing reads it, and the former is the more useful of the two.
-    if (currentEpic.prState === state) return;
-    updateEpic(epicId, {
-      prState: state,
-      // Record the accepted request's start time rather than its completion
-      // time, which could make an older slow request appear newer in storage.
-      prStateCheckedAt: request.startedAt,
-    });
-  };
-
-  const selectedEpicGitPollKey = selectedEpic
-    ? JSON.stringify([
-        selectedEpic.id,
-        selectedEpic.prUrl ?? null,
-        resolveEpicGitTarget(selectedEpic).projectPath ?? null,
-      ])
-    : null;
-  // Only the selected epic's own git action pauses its status poll and names
-  // the in-progress label; work running in an unrelated epic leaves this view
-  // alone. The button guard also stands down for an epic sharing this one's
-  // checkout, matching the click-time guard.
-  const selectedEpicGitBusy = selectedEpic ? (epicGitBusy[selectedEpic.id]?.kind ?? null) : null;
-  const selectedEpicOperationBusy =
-    gitBusy ||
-    cloudBusy ||
-    (selectedEpic ? epicGitWorkspaceBusy(selectedEpic.id, epicGitWorkspaceKey(selectedEpic), epicGitBusy) : false);
-
-  useEffect(() => {
-    if (!selectedEpic || selectedEpicGitBusy || activeWorkspaceUnavailable) {
-      return;
-    }
-    let cancelled = false;
-    let refreshTimer: number | undefined;
-    const run = async (includePr: boolean) => {
-      const prLookup = includePr && selectedEpic.prUrl ? beginEpicPrLookup(selectedEpic.id, selectedEpic.prUrl) : null;
-      const result = await refreshEpicGitStatus(selectedEpic, { includePr });
-      if (cancelled) return;
-      if (result) {
-        setEpicGitStatuses((current) => ({
-          ...current,
-          [selectedEpic.id]: {
-            hasChangesToCommit: Boolean(result.hasChangesToCommit),
-            hasUnpushedCommits: Boolean(result.hasUnpushedCommits),
-          },
-        }));
-        // Mirror into the store so the sidebar icon agrees with the badge.
-        if (result.pr?.state && prLookup) {
-          persistEpicPrLookup(selectedEpic.id, result.pr.state, prLookup);
-        }
-      }
-      refreshTimer = window.setTimeout(() => void run(false), 5000);
-    };
-    void run(true);
-    return () => {
-      cancelled = true;
-      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
-    };
-    // refreshEpicGitStatus is recreated every render; depending on it would
-    // refire the effect every render and defeat the refresh loop.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedEpicGitPollKey, selectedEpicGitBusy, activeWorkspaceUnavailable, epicSelectionNonce]);
-
-  // The sidebar and archive both colour epic icons by PR state, so include
-  // settled epics as well as active ones. Merged PRs are immutable and need no
-  // further network reads; excluding them keeps the archive cheap after its
-  // initial migration from epics that predate persisted prState.
-  const epicPrTargets = useMemo(() => {
-    if (!epicsEnabled) return [];
-    const projectPathsById = new Map(projects.map((project) => [project.id, project.path]));
-    return epics.flatMap((epic) => {
-      if (!epic.prUrl || epic.prState === 'MERGED') return [];
-      const projectPath =
-        epic.gitRoot ?? (epic.repositoryProjectId ? projectPathsById.get(epic.repositoryProjectId) : undefined);
-      return [
-        {
-          epicId: epic.id,
-          prUrl: epic.prUrl,
-          ...(projectPath ? { projectPath } : {}),
-        },
-      ];
-    });
-  }, [epics, epicsEnabled, projects]);
-  const epicPrTargetsRef = useRef(epicPrTargets);
-  epicPrTargetsRef.current = epicPrTargets;
-  const hasEpicPrTargets = epicPrTargets.length > 0;
-
-  useEffect(() => {
-    if (!hasEpicPrTargets || !window.orion?.epicPrStates) return;
-    let cancelled = false;
-    let inFlight = false;
-    let pendingFocus = false;
-    let timer: number | undefined;
-    let lastLookupAt = 0;
-
-    const run = async (reason: EpicPrRefreshReason = 'tick') => {
-      if (cancelled) return;
-      if (inFlight) {
-        // A focus can be the return from a just-merged PR. Keep it pending so
-        // the current batch cannot swallow the armed, immediate refresh.
-        if (reason === 'focus') pendingFocus = true;
-        return;
-      }
-      if (timer !== undefined) {
-        window.clearTimeout(timer);
-        timer = undefined;
-      }
-      // Do not wake up periodically while hidden. Focus catches up using its
-      // own shorter throttle below.
-      if (document.hidden) return;
-      // Focus is the highest-signal moment — the user may have just merged in
-      // the browser — and having opened this PR from Orion first is stronger
-      // still, so that skips the throttle entirely.
-      const armed = reason === 'focus' && epicPrRefreshArmedRef.current;
-      const minElapsed = armed ? 0 : reason === 'focus' ? EPIC_PR_STATE_FOCUS_REFRESH_MS : EPIC_PR_STATE_REFRESH_MS;
-      const elapsed = Date.now() - lastLookupAt;
-      if (lastLookupAt > 0 && elapsed < minElapsed) {
-        // Reschedule at the background cadence, never at the focus one: a focus
-        // arriving just after a tick must not convert the loop into a 15s poll.
-        timer = window.setTimeout(() => void run(), Math.max(0, EPIC_PR_STATE_REFRESH_MS - elapsed));
-        return;
-      }
-      // Spend the arm only now that this refresh is definitely going ahead: a
-      // focus that returned early above must leave it for the next one.
-      if (armed) epicPrRefreshArmedRef.current = false;
-      inFlight = true;
-      lastLookupAt = Date.now();
-      try {
-        const requestedTargets = epicPrTargetsRef.current;
-        const lookupRequests = new Map(
-          requestedTargets.map((target) => [target.epicId, beginEpicPrLookup(target.epicId, target.prUrl)])
-        );
-        const result = await window.orion.epicPrStates({
-          epics: requestedTargets,
-        });
-        if (cancelled) return;
-        const knownById = new Map(useOrionStore.getState().epics.map((epic) => [epic.id, epic]));
-        for (const entry of result.states ?? []) {
-          if (!knownById.has(entry.epicId)) continue;
-          const request = lookupRequests.get(entry.epicId);
-          if (request) persistEpicPrLookup(entry.epicId, entry.state, request);
-        }
-      } catch {
-        // Offline or gh unavailable: keep the persisted colours.
-      } finally {
-        inFlight = false;
-      }
-      if (cancelled) return;
-      if (pendingFocus) {
-        pendingFocus = false;
-        void run('focus');
-        return;
-      }
-      // Always reschedule off the latest run so a focus-triggered refresh
-      // replaces the pending tick instead of stacking a second chain.
-      if (timer !== undefined) window.clearTimeout(timer);
-      timer = window.setTimeout(() => void run(), EPIC_PR_STATE_REFRESH_MS);
-    };
-
-    void run();
-    const onFocus = () => void run('focus');
-    window.addEventListener('focus', onFocus);
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-      window.removeEventListener('focus', onFocus);
-    };
-    // updateEpic is a stable store action; target changes are read from a ref
-    // and do not restart the timer or duplicate a whole batch lookup.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasEpicPrTargets]);
-
-  // Click-time recheck that no agent grouped under the epic — including
-  // descendant subagent threads — is still running. The rendered disabled
-  // state can lag a just-started run, and the sidebar Settle menu reuses the
-  // same guard. The ref can lag until the next render while the output map is
-  // updated synchronously, so merge both views (same as handleDeleteEpic).
-  const epicHasRunningAgents = (epicId: string) => {
-    const state = useOrionStore.getState();
-    const runsByThread = new Map<string, string>(Object.entries(activeRunsByThreadRef.current));
-    for (const [runId, tracked] of runOutputMessages.current) {
-      runsByThread.set(tracked.threadId, runId);
-    }
-    const epicThreadIds = new Set(
-      state.threads.filter((thread) => thread.epicId === epicId).map((thread) => thread.id)
-    );
-    let foundChild = true;
-    while (foundChild) {
-      foundChild = false;
-      for (const thread of state.threads) {
-        if (thread.parentThreadId && epicThreadIds.has(thread.parentThreadId) && !epicThreadIds.has(thread.id)) {
-          epicThreadIds.add(thread.id);
-          foundChild = true;
-        }
-      }
-    }
-    return state.threads.some(
-      (thread) => epicThreadIds.has(thread.id) && (thread.status === 'running' || runsByThread.has(thread.id))
-    );
-  };
-
-  const epicCommitBlocked = (epic: Epic) =>
-    epicOperationBusy(epic) || !window.orion?.epicCommitAndPush;
-
-  // "Commit & push" with the message prompt on: run the same click-time guards
-  // the commit itself runs, then let the user write the message (or leave it
-  // empty for the epic message model).
-  const openEpicCommitDialog = (epic: Epic) => {
-    if (epicCommitBlocked(epic)) return;
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before committing');
-      return;
-    }
-    if (!resolveEpicGitTarget(epic).projectPath) {
-      toast.error('Select a repository for this epic before committing');
-      return;
-    }
-    setEpicCommitDialog({ epic, message: '' });
-  };
-
-  const handleEpicCommitAndPush = async (epic: Epic, message = '') => {
-    if (epicCommitBlocked(epic) || !window.orion?.epicCommitAndPush) {
-      return;
-    }
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before committing');
-      return;
-    }
-    const { project, projectPath, claim } = resolveEpicGitTarget(epic);
-    if (!projectPath) {
-      toast.error('Select a repository for this epic before committing');
-      return;
-    }
-
-    let committed = false;
-    // Read the tick fresh at call time — it may have been toggled after the
-    // dialog opened, and a PR needs a push, so commit-only suppresses auto-PR.
-    const skipPush = Boolean(
-      useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id)?.commitWithoutPush
-    );
-    markEpicGitBusy(epic.id, 'commit', epicGitWorkspaceKey(epic));
-    try {
-      const trimmedMessage = message.trim();
-      const result = await window.orion.epicCommitAndPush({
-        epicId: epic.id,
-        projectPath,
-        // A hand-written message needs no model turn.
-        ...(trimmedMessage ? { modelId: null } : resolveUtilityTurn()),
-        epicName: epic.name,
-        ...(trimmedMessage ? { message: trimmedMessage } : {}),
-        ...(skipPush ? { skipPush: true } : {}),
-        ...claim,
-      });
-      if (result.ok || result.committed) {
-        claimEpicGitTarget(epic, result);
-      }
-      if (result.ok) {
-        committed = true;
-        toast.success(
-          skipPush
-            ? `Committed on ${result.branch ?? 'branch'} (not pushed)`
-            : `Committed and pushed ${result.branch ?? 'branch'}`,
-          {
-            description: result.message?.split('\n')[0],
-          }
-        );
-        if (result.mirrorWarning) toast.warning(result.mirrorWarning);
-        // Refresh only when the shell is showing the repository just committed.
-        if (projectPath === activeWorkingDir || (project && activeThreadProject?.id === project.id)) {
-          await refreshGitState();
-        }
-      } else if (result.aborted) {
-        toast.info(
-          result.committed
-            ? 'Push aborted — the commit was created and remains local'
-            : 'Commit aborted'
-        );
-      } else {
-        toast.error(result.error ?? 'Commit and push failed');
-      }
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Commit and push failed');
-    } finally {
-      markEpicGitBusy(epic.id, null);
-    }
-
-    // "Auto create PR on commit": a successful commit carries straight on into
-    // the pull request, so the user can start the commit and navigate away.
-    // Runs after the busy marker clears — the PR's own guards read it.
-    if (committed && !skipPush) await runEpicAutoPr(epic.id);
-  };
-
-  // Follow-up PR for an epic whose auto-create-PR tick is on. Reads the epic
-  // back from the store: the commit just claimed its repository and branch,
-  // and the tick may have been toggled while the commit was in flight.
-  const runEpicAutoPr = async (epicId: string) => {
-    const epic = useOrionStore.getState().epics.find((candidate) => candidate.id === epicId);
-    if (!epic?.autoPrAfterCommit) return;
-    // Nothing to open: the push already updated this epic's existing pull
-    // request. A closed one still gets a replacement, matching the button.
-    if (epic.prUrl && epic.prState !== 'CLOSED') return;
-    // Unattended by design, so the base-branch dialog is skipped even when
-    // message prompts are on — the PR takes the promptless button's base.
-    await createEpicPrWithoutPrompt(epic);
-  };
-
-  const epicCreatePrBlocked = (epic: Epic) =>
-    epicOperationBusy(epic) || !window.orion?.epicCreatePr;
-
-  // The epic's repository checkout: its checked-out branch is the default
-  // base a PR should merge back into.
-  const resolveEpicSourceProjectPath = (epic: Epic) => {
-    const project = epic.repositoryProjectId
-      ? (projects.find((candidate) => candidate.id === epic.repositoryProjectId) ?? null)
-      : null;
-    return epic.gitRoot ?? project?.path;
-  };
-
-  const resolveEpicRecordedSourceBranch = (epic: Epic) =>
-    epic.repositories?.[0]?.sourceBranch ?? '';
-
-  // Step one of Create PR: fetch the branches on origin and work out which one
-  // to merge into by default — the branch checked out in the epic's real
-  // repository, whenever origin has a branch by that name — falling back to
-  // the remote default branch.
-  const resolveEpicPrBaseOptions = async (epic: Epic) => {
-    if (!window.orion?.epicListRemoteBranches) return null;
-    const { projectPath } = resolveEpicGitTarget(epic);
-    if (!projectPath) return null;
-    const result = await window.orion.epicListRemoteBranches({
-      projectPath,
-      ...(() => {
-        const sourceProjectPath = resolveEpicSourceProjectPath(epic);
-        return sourceProjectPath ? { sourceProjectPath } : {};
-      })(),
-    });
-    if (!result.ok) {
-      return { error: result.error ?? 'Could not list the branches on origin' };
-    }
-    // The PR's head branch cannot be its own base.
-    const branches = (result.branches ?? []).filter((name) => name !== result.currentBranch);
-    if (branches.length === 0) {
-      return { error: 'No branches found on origin to use as the PR base' };
-    }
-    const defaultBranch = result.defaultBranch && branches.includes(result.defaultBranch) ? result.defaultBranch : '';
-    const recordedSourceBranch = resolveEpicRecordedSourceBranch(epic);
-    if (recordedSourceBranch && !branches.includes(recordedSourceBranch)) {
-      return { error: `The selected source branch ${recordedSourceBranch} is not available on origin.` };
-    }
-    const sourceBranch = recordedSourceBranch ||
-      (result.sourceBranch && branches.includes(result.sourceBranch) ? result.sourceBranch : '');
-    return {
-      branches,
-      defaultBranch,
-      sourceBranch,
-      baseBranch: sourceBranch || defaultBranch || branches[0],
-    };
-  };
-
-  // Only touch the exact dialog invocation that started a load. The same epic
-  // can be closed and reopened while an earlier request is still in flight.
-  const patchEpicPrBaseDialog = (
-    instanceId: number,
-    patch: (current: NonNullable<typeof epicPrBaseDialog>) => Partial<NonNullable<typeof epicPrBaseDialog>>
-  ) =>
-    setEpicPrBaseDialog((current) =>
-      current && current.instanceId === instanceId ? { ...current, ...patch(current) } : current
-    );
-
-  // The base branch as local git alone can answer it: no network, so it lands
-  // in the just-opened dialog within milliseconds. Origin's list corrects it
-  // moments later if it names a branch origin does not have.
-  const preloadEpicPrLocalBase = async (epic: Epic, instanceId: number) => {
-    if (!window.orion?.epicLocalPrBase) return;
-    const { projectPath } = resolveEpicGitTarget(epic);
-    if (!projectPath) return;
-    const sourceProjectPath = resolveEpicSourceProjectPath(epic);
-    try {
-      const result = await window.orion.epicLocalPrBase({
-        projectPath,
-        ...(sourceProjectPath ? { sourceProjectPath } : {}),
-      });
-      if (!result.ok) return;
-      // The PR's head branch cannot be its own base.
-      const usable = (name?: string | null) => (name && name !== result.currentBranch ? name : '');
-      const sourceBranch = usable(resolveEpicRecordedSourceBranch(epic) || result.sourceBranch);
-      const defaultBranch = usable(result.defaultBranch);
-      patchEpicPrBaseDialog(instanceId, (current) =>
-        // Origin already answered — its list is the authoritative one.
-        current.branches.length > 0 || current.baseBranch
-          ? {}
-          : {
-              sourceBranch,
-              defaultBranch,
-              baseBranch: sourceBranch || defaultBranch,
-            }
-      );
-    } catch {
-      // The picker still fills from origin.
-    }
-  };
-
-  // Origin's branch list, for the picker of an already-open dialog.
-  const loadEpicPrRemoteBranches = async (epic: Epic, instanceId: number) => {
-    markEpicGitBusy(epic.id, 'pr-branches', epicGitWorkspaceKey(epic));
-    try {
-      const options = await resolveEpicPrBaseOptions(epic);
-      if (!options) {
-        patchEpicPrBaseDialog(instanceId, () => ({ branchesLoading: false }));
-        return;
-      }
-      if ('error' in options) {
-        patchEpicPrBaseDialog(instanceId, () => ({
-          branchesLoading: false,
-          branchesError: options.error,
-        }));
-        return;
-      }
-      patchEpicPrBaseDialog(instanceId, () => ({
-        ...options,
-        branchesLoading: false,
-        branchesError: '',
-      }));
-    } catch (error) {
-      patchEpicPrBaseDialog(instanceId, () => ({
-        branchesLoading: false,
-        branchesError: error instanceof Error ? error.message : 'Could not list the branches on origin',
-      }));
-    } finally {
-      markEpicGitBusy(epic.id, null);
-    }
-  };
-
-  // "Create PR" with the message prompt on. Listing origin's branches is a
-  // network round trip, so the dialog opens first — with the base branch local
-  // git already knows — and the picker fills itself while the user reads it.
-  const openEpicPrBaseDialog = (epic: Epic) => {
-    if (epicCreatePrBlocked(epic) || !window.orion?.epicListRemoteBranches) return;
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
-      return;
-    }
-    const { projectPath } = resolveEpicGitTarget(epic);
-    if (!projectPath) {
-      toast.error('Select a repository for this epic before opening a PR');
-      return;
-    }
-
-    setEpicPrBaseBranchPickerOpen(false);
-    const instanceId = ++epicPrBaseDialogInstanceRef.current;
-    setEpicPrBaseDialog({
-      instanceId,
-      epic,
-      branches: [],
-      branchesLoading: true,
-      branchesError: '',
-      defaultBranch: '',
-      sourceBranch: '',
-      baseBranch: '',
-      message: '',
-    });
-    void preloadEpicPrLocalBase(epic, instanceId);
-    void loadEpicPrRemoteBranches(epic, instanceId);
-  };
-
-  // "Create PR" with the message prompt off: no dialog, and the PR targets the
-  // branch checked out in the epic's real repository. If origin cannot be
-  // reached, an empty base lets main fall back to the remote default branch.
-  const createEpicPrWithoutPrompt = async (epic: Epic) => {
-    if (epicCreatePrBlocked(epic)) return;
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
-      return;
-    }
-    const { projectPath } = resolveEpicGitTarget(epic);
-    if (!projectPath) {
-      toast.error('Select a repository for this epic before opening a PR');
-      return;
-    }
-
-    let baseBranch = '';
-    markEpicGitBusy(epic.id, 'pr-branches', epicGitWorkspaceKey(epic));
-    try {
-      const options = await resolveEpicPrBaseOptions(epic);
-      if (options && 'error' in options) {
-        toast.error(options.error);
-        return;
-      }
-      if (options) baseBranch = options.baseBranch;
-    } catch {
-      // Fall through to the remote default branch.
-    } finally {
-      markEpicGitBusy(epic.id, null);
-    }
-    await handleEpicCreatePr(epic, baseBranch);
-  };
-
-  const handleEpicCreatePr = async (epic: Epic, baseBranch: string, message = '') => {
-    if (epicCreatePrBlocked(epic)) {
-      return;
-    }
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before opening a PR');
-      return;
-    }
-    const { projectPath, claim } = resolveEpicGitTarget(epic);
-    if (!projectPath) {
-      toast.error('Select a repository for this epic before opening a PR');
-      return;
-    }
-
-    markEpicGitBusy(epic.id, 'pr', epicGitWorkspaceKey(epic));
-    try {
-      const trimmedMessage = message.trim();
-      const result = await window.orion.epicCreatePr({
-        epicId: epic.id,
-        projectPath,
-        // A hand-written title and description need no model turn.
-        ...(trimmedMessage ? { modelId: null } : resolveUtilityTurn()),
-        epicName: epic.name,
-        baseBranch,
-        ...(trimmedMessage ? { message: trimmedMessage } : {}),
-        ...claim,
-      });
-      if (result.ok) {
-        claimEpicGitTarget(epic, result);
-        const url = result.url;
-        if (url) {
-          updateEpic(epic.id, {
-            prUrl: url,
-            prState: 'OPEN',
-            prStateCheckedAt: new Date().toISOString(),
-          });
-        }
-        toast.success(
-          result.alreadyExists ? 'A pull request for this branch is already open' : 'Pull request opened',
-          url
-            ? {
-                action: {
-                  label: 'Open',
-                  onClick: () => openEpicPrUrl(url),
-                },
-              }
-            : undefined
-        );
-        if (result.mirrorWarning) toast.warning(result.mirrorWarning);
-      } else if (result.aborted) {
-        toast.info('Opening the pull request was aborted');
-      } else {
-        toast.error(result.error ?? 'Could not open a pull request');
-      }
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Could not open a pull request');
-    } finally {
-      markEpicGitBusy(epic.id, null);
-    }
-  };
-
-  const updateEpicRepository = (
-    epicId: string,
-    projectId: string,
-    updates: Partial<EpicRepository>
-  ) => {
-    const latest = useOrionStore.getState().epics.find((candidate) => candidate.id === epicId);
-    if (!latest?.repositories) return;
-    const repositories = latest.repositories.map((repository) =>
-      repository.projectId === projectId ? { ...repository, ...updates } : repository
-    );
-    const primary = repositories[0];
-    updateEpic(epicId, {
-      repositories,
-      ...(primary
-        ? {
-            repositoryProjectId: primary.projectId,
-            gitRoot: primary.gitRoot,
-            gitBranch: primary.gitBranch,
-            prUrl: primary.prUrl,
-            prState: primary.prState,
-            prStateCheckedAt: primary.prStateCheckedAt,
-          }
-        : {}),
-    });
-  };
-
-  const commitEpicRepository = async (
-    epic: Epic,
-    repository: EpicRepository
-  ): Promise<EpicRepositoryActionResult> => {
-    if (!window.orion?.epicCommitAndPush) return 'failed';
-    const project = projects.find((candidate) => candidate.id === repository.projectId);
-    const projectPath = repository.projectPath ?? project?.path;
-    if (!projectPath) return 'failed';
-    const skipPush = Boolean(
-      useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id)?.commitWithoutPush
-    );
-    const result = await window.orion.epicCommitAndPush({
-      epicId: epic.id,
-      projectPath,
-      ...resolveUtilityTurn(),
-      epicName: `${epic.name} (${project?.name ?? repository.projectId})`,
-      ...(skipPush ? { skipPush: true } : {}),
-      expectedGitRoot: repository.gitRoot,
-      expectedBranch: repository.gitBranch,
-      claimedBranches: claimedBranchesForEpic(epic.id),
-    });
-    if (result.ok || result.committed) {
-      updateEpicRepository(epic.id, repository.projectId, {
-        ...(result.branch ? { gitBranch: result.branch } : {}),
-      });
-    }
-    if (!result.ok) {
-      if (result.aborted) {
-        toast.info(
-          `${project?.name ?? 'Project'}: ${result.committed ? 'push aborted; commit remains local' : 'commit aborted'}`
-        );
-        return 'aborted';
-      }
-      toast.error(`${project?.name ?? 'Project'}: ${result.error ?? 'Commit and push failed'}`);
-      return 'failed';
-    }
-    toast.success(
-      `${project?.name ?? 'Project'}: ${skipPush ? 'committed' : 'committed and pushed'}`,
-      { description: result.message?.split('\n')[0] }
-    );
-    if (result.mirrorWarning) toast.warning(result.mirrorWarning);
-    return 'completed';
-  };
-
-  const createEpicRepositoryPr = async (
-    epic: Epic,
-    repository: EpicRepository
-  ): Promise<EpicRepositoryActionResult> => {
-    if (!window.orion?.epicCreatePr) return 'failed';
-    const project = projects.find((candidate) => candidate.id === repository.projectId);
-    const projectPath = repository.projectPath ?? project?.path;
-    if (!projectPath) return 'failed';
-    const result = await window.orion.epicCreatePr({
-      epicId: epic.id,
-      projectPath,
-      ...resolveUtilityTurn(),
-      epicName: `${epic.name} (${project?.name ?? repository.projectId})`,
-      baseBranch: repository.sourceBranch ?? '',
-      expectedGitRoot: repository.gitRoot,
-      expectedBranch: repository.gitBranch,
-      claimedBranches: claimedBranchesForEpic(epic.id),
-    });
-    if (!result.ok) {
-      if (result.aborted) {
-        toast.info(`${project?.name ?? 'Project'}: opening the pull request was aborted`);
-        return 'aborted';
-      }
-      toast.error(`${project?.name ?? 'Project'}: ${result.error ?? 'Could not open a pull request'}`);
-      return 'failed';
-    }
-    updateEpicRepository(epic.id, repository.projectId, {
-      ...(result.branch ? { gitBranch: result.branch } : {}),
-      ...(result.url
-        ? {
-            prUrl: result.url,
-            prState: 'OPEN',
-            prStateCheckedAt: new Date().toISOString(),
-          }
-        : {}),
-    });
-    toast.success(
-      `${project?.name ?? 'Project'}: ${result.alreadyExists ? 'pull request already open' : 'pull request opened'}`,
-      result.url
-        ? { action: { label: 'Open', onClick: () => openEpicPrUrl(result.url!) } }
-        : undefined
-    );
-    return 'completed';
-  };
-
-  const runMultiRepositoryAction = async (
-    epic: Epic,
-    kind: 'commit' | 'pr',
-    repository?: EpicRepository
-  ) => {
-    if (kind === 'commit' ? epicCommitBlocked(epic) : epicCreatePrBlocked(epic)) return;
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error(`Agents are still running in this epic — wait for them to finish before ${kind === 'commit' ? 'committing' : 'opening pull requests'}`);
-      return;
-    }
-    let targets = repository ? [repository] : (epic.repositories ?? []);
-    if (targets.length === 0) return;
-    markEpicGitBusy(epic.id, kind, UNCLAIMED_EPIC_GIT_WORKSPACE_KEY);
-    try {
-      if (kind === 'commit' && window.orion?.epicGitStatus) {
-        const statuses = await Promise.all(
-          targets.map(async (target) => {
-            try {
-              const status = await window.orion!.epicGitStatus!({
-                projectPath: target.projectPath,
-              });
-              return status.ok ? status : null;
-            } catch {
-              return null;
-            }
-          })
-        );
-        const beforePreflight = targets.length;
-        targets = targets.filter((_, index) => {
-          const status = statuses[index];
-          return !status || status.hasChangesToCommit || (!epic.commitWithoutPush && status.hasUnpushedCommits);
-        });
-        if (targets.length === 0) {
-          toast.info(beforePreflight === 1 ? 'This project is already clean and fully pushed' : 'All projects are already clean and fully pushed');
-          return;
-        }
-      }
-      let completed = 0;
-      for (const target of targets) {
-        const result = kind === 'commit'
-          ? await commitEpicRepository(epic, target)
-          : await createEpicRepositoryPr(epic, target);
-        if (result === 'aborted') break;
-        if (result === 'completed') {
-          completed += 1;
-          if (kind === 'commit') {
-            // Match the single-project flow: read the setting and repository
-            // state after the push, then carry straight on into a promptless PR.
-            const latestEpic = useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id);
-            const latestRepository = latestEpic?.repositories?.find(
-              (candidate) => candidate.projectId === target.projectId
-            );
-            if (
-              latestEpic &&
-              latestRepository &&
-              epicRepositoryShouldAutoCreatePr(latestEpic, latestRepository)
-            ) {
-              await createEpicRepositoryPr(latestEpic, latestRepository);
-            }
-          }
-        }
-      }
-      if (targets.length > 1 && completed === targets.length) {
-        toast.success(
-          kind === 'commit'
-            ? `Committed${epic.commitWithoutPush ? '' : ' and pushed'} all ${targets.length} projects`
-            : `Opened pull requests for all ${targets.length} projects`
-        );
-      }
-    } finally {
-      markEpicGitBusy(epic.id, null);
-    }
-  };
-
-  const handleRemoveThreadFromEpic = (threadId: string) => {
-    const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
-    if (!thread?.epicId) return;
-    updateThread(thread.id, { epicId: undefined });
-  };
-
-  // Confirms and deletes an epic. Its threads survive and just lose their
-  // epicId.
-  const handleDeleteEpic = (epic: Epic) => {
-    if (repositoryOperationBusy) {
-      toast.error('Wait for the current repository operation to finish before deleting this epic');
-      return;
-    }
-    if (!confirm(`Delete epic "${epic.name}"? Its threads are kept — they just leave this group.`)) {
-      return;
-    }
-    deleteEpic(epic.id);
-  };
-
-  const handleSettleEpic = async (epic: Epic) => {
-    if (epicOperationBusy(epic)) return;
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
-      return;
-    }
-
-    // Git and PR state only shapes the warning. It never blocks settlement:
-    // archiving an epic is a user choice, even when its work has not been
-    // committed, pushed, or opened as a pull request.
-    let status;
-    markEpicGitBusy(epic.id, 'settle', epicGitWorkspaceKey(epic));
-    const prLookup = epic.prUrl ? beginEpicPrLookup(epic.id, epic.prUrl) : null;
-    try {
-      status = await refreshEpicGitStatus(epic, { includePr: true });
-    } finally {
-      markEpicGitBusy(epic.id, null);
-    }
-    if (status?.pr?.state && prLookup) {
-      persistEpicPrLookup(epic.id, status.pr.state, prLookup);
-    }
-
-    if (status) {
-      setEpicGitStatuses((current) => ({
-        ...current,
-        [epic.id]: {
-          hasChangesToCommit: Boolean(status.hasChangesToCommit),
-          hasUnpushedCommits: Boolean(status.hasUnpushedCommits),
-        },
-      }));
-    }
-
-    const warnings: string[] = [];
-    if (status?.hasChangesToCommit) {
-      warnings.push('This workspace has uncommitted changes. The epic will be archived without committing them.');
-    }
-    if (status?.hasUnpushedCommits) {
-      warnings.push('This workspace has commits that have not been pushed. Settling will not publish them.');
-    }
-    if (!epic.prUrl) {
-      warnings.push('This epic has no pull request. It will be archived without one.');
-    } else if (status?.pr?.state === 'OPEN') {
-      warnings.push(
-        'Its pull request is still open. Settling only archives the epic in Durango Code; it will not merge or close the pull request.'
-      );
-    } else if (!status?.pr) {
-      warnings.push(
-        'Durango Code could not verify the pull request state. Settling will not merge or close the pull request.'
-      );
-    }
-    if (!status) {
-      warnings.push(
-        'Durango Code could not inspect the workspace. Any work that has not been committed or pushed will remain unpublished.'
-      );
-    }
-
-    // A run may have started while the status request was in flight.
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
-      return;
-    }
-
-    const confirmSettle = epicsSettings?.confirmSettle ?? defaultEpicsSettings.confirmSettle;
-    if (confirmSettle || warnings.length > 0) {
-      setEpicSettleDialog({ epic, warnings });
-      return;
-    }
-    settleEpic(epic.id);
-    toast.success(`Settled ${epic.name}`);
-  };
-
-  const handleRestoreEpic = (epic: Epic) => {
-    unsettleEpic(epic.id);
-  };
-
-  const confirmEpicSettlement = (epic: Epic) => {
-    setEpicSettleDialog(null);
-    // The dialog can stay open while a new run starts, so the sole settlement
-    // blocker gets one final click-time check.
-    if (epicHasRunningAgents(epic.id)) {
-      toast.error('Agents are still running in this epic — wait for them to finish before settling it');
-      return;
-    }
-    const currentEpic = useOrionStore.getState().epics.find((candidate) => candidate.id === epic.id);
-    if (!currentEpic || currentEpic.settledAt) return;
-    settleEpic(epic.id);
-    toast.success(`Settled ${currentEpic.name}`);
   };
 
   const attachFiles = useCallback(
@@ -6746,8 +5344,7 @@ const App: React.FC = () => {
           workingDir,
           updateThread,
           expectedTitle,
-          getStoredThreadTitle,
-          thread.epicId
+          getStoredThreadTitle
         );
       }
 
@@ -6786,7 +5383,6 @@ const App: React.FC = () => {
       const startup = window.orion.runAgentTurn({
         runId,
         threadId,
-        epicId: thread.epicId,
         projectPath: workingDir,
         prompt: agentPrompt,
         modelId: model.id,
@@ -6985,14 +5581,12 @@ const App: React.FC = () => {
       const title =
         request.title || (roleMeta ? `${roleMeta.label}: ${promptSlice}` : `${model.label}: ${promptSlice}`);
 
-      // Background spawn: never touch the user's selection (thread, project,
-      // or epic view) — restoring it after the fact loses the epic overview,
-      // which no selection field of a thread spawn round-trips.
+      // Background spawn: never touch the user's selection (thread or
+      // project).
       const childThreadId = state.createThread(projectId, title, {
         parentThreadId: request.threadId,
         modelId: model.id,
         hiddenFromRecent: true,
-        epicId: driverThread.epicId,
         select: false,
         // Persisted on the thread so stop/delete/reload can still resolve the
         // driver's blocked spawn_subagent call.
@@ -7322,7 +5916,6 @@ const App: React.FC = () => {
         .runAgentTurn({
           runId,
           threadId,
-          epicId: thread.epicId,
           projectPath: workingDir,
           prompt,
           modelId: model.id,
@@ -7420,8 +6013,7 @@ const App: React.FC = () => {
           workingDir,
           updateThread,
           expectedTitle,
-          getStoredThreadTitle,
-          thread.epicId
+          getStoredThreadTitle
         );
       }
 
@@ -7446,7 +6038,6 @@ const App: React.FC = () => {
         .runAgentTurn({
           runId,
           threadId,
-          epicId: thread.epicId,
           projectPath: workingDir,
           prompt: goalAction.objective || 'Resume the goal.',
           modelId: model.id,
@@ -7583,7 +6174,6 @@ const App: React.FC = () => {
         .runAgentTurn({
           runId,
           threadId,
-          epicId: thread.epicId,
           projectPath: workingDir,
           prompt: review.instructions || reviewLabel,
           modelId: model.id,
@@ -7732,7 +6322,6 @@ const App: React.FC = () => {
           .codexGoalCommand({
             sessionId,
             threadId: selectedThreadId,
-            epicId: selectedThread.epicId,
             projectPath: workingDir,
             action: 'get',
           })
@@ -7780,7 +6369,6 @@ const App: React.FC = () => {
           .codexGoalCommand({
             sessionId,
             threadId: selectedThreadId,
-            epicId: selectedThread.epicId,
             projectPath: workingDir,
             action: 'pause',
           })
@@ -7810,7 +6398,6 @@ const App: React.FC = () => {
             .codexGoalCommand({
               sessionId,
               threadId: selectedThreadId,
-              epicId: selectedThread.epicId,
               projectPath: workingDir,
               action: 'clear',
             })
@@ -8078,8 +6665,7 @@ const App: React.FC = () => {
           selectedThreadProjectPath ?? '',
           updateThread,
           expectedTitle,
-          getStoredThreadTitle,
-          currentThread.epicId
+          getStoredThreadTitle
         );
       }
       return;
@@ -8744,50 +7330,11 @@ const App: React.FC = () => {
       command: RemoteCommandRequest['command'],
       canPrepare: () => boolean,
       claimStart: () => Promise<boolean>
-    ) => Promise<{ ok: boolean; threadId?: string; threadTitle?: string; epicId?: string; error?: string }>
+    ) => Promise<{ ok: boolean; threadId?: string; threadTitle?: string; error?: string }>
   >(async () => ({ ok: false, error: 'Remote commands are unavailable.' }));
   useLayoutEffect(() => {
     remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
       const state = useOrionStore.getState();
-      if (command.kind === 'createEpic') {
-        const name = (command.name ?? '').trim();
-        if (!name) return { ok: false, error: 'Epic title is required.' };
-        if (!(state.epicsSettings?.enabled ?? defaultEpicsSettings.enabled)) {
-          return { ok: false, error: 'Enable Epics in Settings on the host first.' };
-        }
-        const projectIds = [...new Set(command.projectIds ?? [])];
-        if (projectIds.some((projectId) => !state.projects.some((project) => project.id === projectId))) {
-          return { ok: false, error: 'One or more selected projects are no longer available on the host.' };
-        }
-        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
-          return { ok: false, error: 'The remote create Epic command expired or was cancelled.' };
-        }
-        // Claiming yields to main. Recheck the authoritative store immediately
-        // before the mutation so a project removal or Settings change cannot
-        // race the remote dialog's stale snapshot.
-        const latest = useOrionStore.getState();
-        if (!(latest.epicsSettings?.enabled ?? defaultEpicsSettings.enabled)) {
-          return { ok: false, error: 'Enable Epics in Settings on the host first.' };
-        }
-        if (projectIds.some((projectId) => !latest.projects.some((project) => project.id === projectId))) {
-          return { ok: false, error: 'One or more selected projects are no longer available on the host.' };
-        }
-        const description = command.description?.trim();
-        const epicId = latest.addEpic(name, {
-          ...(description ? { description } : {}),
-          ...(projectIds[0] ? { repositoryProjectId: projectIds[0] } : {}),
-          ...(projectIds.length > 0 ? { repositoryProjectIds: projectIds } : {}),
-        });
-        setEpicsSectionOpen(true);
-        if (!(await flushOrionStoreSave())) {
-          return {
-            ok: false,
-            epicId,
-            error: 'The remote command created the Epic, but its workspace state could not be saved.',
-          };
-        }
-        return { ok: true, epicId };
-      }
       if (command.kind === 'runTurn') {
         const promptText = (command.prompt ?? '').trim();
         if (!promptText) return { ok: false, error: 'Empty prompt.' };
@@ -8881,9 +7428,6 @@ const App: React.FC = () => {
           const project = findProjectById(state, command.projectId);
           if (!project) return { ok: false, error: 'Project not found on this machine.' };
           threadId = state.createThread(project.id, undefined, {
-            ...(command.epicId && state.epics.some((epic) => epic.id === command.epicId)
-              ? { epicId: command.epicId }
-              : {}),
             ...(command.modelId && agentModelsRef.current.some((model) => model.id === command.modelId)
               ? { modelId: command.modelId }
               : {}),
@@ -9109,7 +7653,7 @@ const App: React.FC = () => {
     if (!window.orion?.onRemoteCommandRequest) return undefined;
     const unsubscribe = window.orion.onRemoteCommandRequest((request) => {
       void (async () => {
-        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; epicId?: string; error?: string };
+        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; error?: string };
         const canPrepare = () => Date.now() < request.expiresAt;
         let claimPromise: Promise<boolean> | null = null;
         const claimStart = () => {
@@ -9126,9 +7670,7 @@ const App: React.FC = () => {
           // Main serves remote snapshots and transcripts from disk. Do not
           // expose a successful mutation until the exact thread state the
           // controller will immediately read has crossed that boundary.
-          if (request.command.kind !== 'createEpic') {
-            outcome = await persistSuccessfulRemoteCommand(outcome, flushOrionThreadsSave);
-          }
+          outcome = await persistSuccessfulRemoteCommand(outcome, flushOrionThreadsSave);
         } catch (error) {
           outcome = { ok: false, error: error instanceof Error ? error.message : String(error) };
         }
@@ -9424,26 +7966,10 @@ const App: React.FC = () => {
     ]
   );
 
-  const settingsEpicActionsRef = useRef({ handleDeleteEpic, handleRestoreEpic });
-  useLayoutEffect(() => {
-    settingsEpicActionsRef.current = { handleDeleteEpic, handleRestoreEpic };
-  });
-  const stableSettingsEpicActions = useMemo(
-    () => ({
-      handleDeleteEpic: (...args: Parameters<typeof handleDeleteEpic>) =>
-        settingsEpicActionsRef.current.handleDeleteEpic(...args),
-      handleRestoreEpic: (...args: Parameters<typeof handleRestoreEpic>) =>
-        settingsEpicActionsRef.current.handleRestoreEpic(...args),
-    }),
-    []
-  );
-
   const settingsPageModel: SettingsPageProps = {
     notificationSettings,
     setNotificationSettings,
     setTextGenerationSettings,
-    setEpicsSettings,
-    epicsSettings,
     splitViewSettings,
     setSplitViewSettings,
     savedViews,
@@ -9506,9 +8032,6 @@ const App: React.FC = () => {
     accountIdentity,
     accountEmailRevealed,
     accountInitials,
-    epicsEnabled,
-    epicPromptGitMessages,
-    archivedEpics,
     utilityCandidateModels,
     utilityProviders,
     resolvedUtilityModelId,
@@ -9524,42 +8047,10 @@ const App: React.FC = () => {
     handleStartAccountAuth,
     handleSignOutAccount,
     handleAuthenticateProvider,
-    openEpicPrUrl,
-    ...stableSettingsEpicActions,
     formatCheckedTime,
     formatBytes,
-    epicPrStatus,
   };
 
-  const appDialogsModel: AppDialogsModel = {
-    projects,
-    createEpicOpen,
-    newEpicName,
-    setNewEpicName,
-    newEpicDescription,
-    setNewEpicDescription,
-    newEpicProjectIds,
-    setNewEpicProjectIds,
-    setCreateEpicProjectPickerIndex,
-    createEpicProjectPickerIndex,
-    createEpicTitleRef,
-    createEpicProjectPickerRef,
-    closeCreateEpicModal,
-    handleCreateEpic,
-    epicCommitDialog,
-    setEpicCommitDialog,
-    handleEpicCommitAndPush,
-    epicPrBaseDialog,
-    setEpicPrBaseDialog,
-    setEpicPrBaseBranchPickerOpen,
-    epicPrBaseBranchPickerOpen,
-    epicPrBaseBranchPickerRef,
-    handleEpicCreatePr,
-    epicSettleDialog,
-    setEpicSettleDialog,
-    confirmEpicSettlement,
-  };
-  const hasOpenDialog = Boolean(epicCommitDialog || epicPrBaseDialog || epicSettleDialog || createEpicOpen);
 
   // Keep the memoized sidebar detached from composer typing. These wrappers
   // retain stable identities while their targets advance only after a render
@@ -9567,19 +8058,13 @@ const App: React.FC = () => {
   const agentsSidebarActionsRef = useRef({
     handleNewAgent,
     handleCreateThread,
-    handleCreateThreadForEpic,
-    handleRemoveThreadFromEpic,
-    handleDeleteEpic,
-    handleSettleEpic,
+    openNewAgentIn,
   });
   useLayoutEffect(() => {
     agentsSidebarActionsRef.current = {
       handleNewAgent,
       handleCreateThread,
-      handleCreateThreadForEpic,
-      handleRemoveThreadFromEpic,
-      handleDeleteEpic,
-      handleSettleEpic,
+      openNewAgentIn,
     };
   });
   const stableAgentsSidebarActions = useMemo(
@@ -9588,14 +8073,6 @@ const App: React.FC = () => {
         agentsSidebarActionsRef.current.handleNewAgent(...args),
       handleCreateThread: (...args: Parameters<typeof handleCreateThread>) =>
         agentsSidebarActionsRef.current.handleCreateThread(...args),
-      handleCreateThreadForEpic: (...args: Parameters<typeof handleCreateThreadForEpic>) =>
-        agentsSidebarActionsRef.current.handleCreateThreadForEpic(...args),
-      handleRemoveThreadFromEpic: (...args: Parameters<typeof handleRemoveThreadFromEpic>) =>
-        agentsSidebarActionsRef.current.handleRemoveThreadFromEpic(...args),
-      handleDeleteEpic: (...args: Parameters<typeof handleDeleteEpic>) =>
-        agentsSidebarActionsRef.current.handleDeleteEpic(...args),
-      handleSettleEpic: (...args: Parameters<typeof handleSettleEpic>) =>
-        agentsSidebarActionsRef.current.handleSettleEpic(...args),
     }),
     []
   );
@@ -9621,9 +8098,6 @@ const App: React.FC = () => {
     setSavedViewsSectionOpen,
     updateThread,
     branchThread,
-    selectedEpicId,
-    renameEpic,
-    selectEpic: selectEpicFromSidebar,
     renameProject,
     selectProject: selectProjectFromSidebar,
     threadSearchOpen,
@@ -9648,18 +8122,9 @@ const App: React.FC = () => {
     pinnedAgentsOpen,
     setPinnedAgentsShowAll,
     pinnedAgentsShowAll,
-    setEpicsSectionOpen,
-    epicsSectionOpen,
-    collapsedEpics,
-    setCollapsedEpics,
-    epicMenuOpenId,
-    setEpicMenuOpenId,
-    epicRenameId,
-    setEpicRenameId,
     threadSearchRef,
     projectMenuRef,
     threadItemMenuRef,
-    epicMenuRef,
     selectedProject,
     sortedProjects,
     recentAgentsTargetProject,
@@ -9669,20 +8134,13 @@ const App: React.FC = () => {
     unpinThread,
     runningAgentCount,
     projectThreadsByProject,
-    epicsEnabled,
-    activeEpics,
-    threadsByEpic,
-    runningAgentEpicIds,
-    projectForGitRoot,
     deleteThreadWithRuntime,
     removeProjectWithRuntimes,
     handleAddProject,
     ...stableAgentsSidebarActions,
-    openCreateEpicModal,
     renderThreadCliBadge,
     renderThreadStatusDot,
     sidebarFooterProps,
-    epicPrStatus,
     remoteMachinesVisible,
     machinesSectionOpen,
     setMachinesSectionOpen,
@@ -9691,6 +8149,103 @@ const App: React.FC = () => {
     selectRemoteMachine,
     localMachineName: remoteControlState?.machineName ?? 'This machine',
   };
+
+  const sidebarV2ModelLabel = useCallback(
+    (thread: Thread) => findAgentModel(agentModelsRef.current, thread.modelId)?.label ?? null,
+    []
+  );
+  // Snoozing or settling the open thread takes it off screen too: the main
+  // view moves to a fresh composer in the same project, where sending starts
+  // a new thread.
+  const putAwayThread = useCallback((threadId: string, putAway: (threadId: string) => void) => {
+    const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+    putAway(threadId);
+    if (thread && useOrionStore.getState().selectedThreadId === threadId) {
+      agentsSidebarActionsRef.current.openNewAgentIn(thread.projectId);
+    }
+  }, []);
+  const snoozeThreadFromSidebar = useCallback(
+    (threadId: string) => putAwayThread(threadId, snoozeThread),
+    [putAwayThread, snoozeThread]
+  );
+  const settleThreadFromSidebar = useCallback(
+    (threadId: string) => putAwayThread(threadId, settleThread),
+    [putAwayThread, settleThread]
+  );
+  const sidebarV2Actions = useMemo<SidebarV2Actions>(
+    () => ({
+      selectThread: selectThreadFromSidebar,
+      setActiveTab,
+      updateThread,
+      branchThread,
+      pinThread,
+      unpinThread,
+      snoozeThread: snoozeThreadFromSidebar,
+      unsnoozeThread,
+      settleThread: settleThreadFromSidebar,
+      unsettleThread,
+      deleteThreadWithRuntime,
+      modelLabel: sidebarV2ModelLabel,
+      renderThreadCliBadge,
+    }),
+    [
+      branchThread,
+      deleteThreadWithRuntime,
+      pinThread,
+      selectThreadFromSidebar,
+      setActiveTab,
+      settleThreadFromSidebar,
+      sidebarV2ModelLabel,
+      snoozeThreadFromSidebar,
+      unpinThread,
+      unsettleThread,
+      unsnoozeThread,
+      updateThread,
+    ]
+  );
+  const localMachineName = remoteControlState?.machineName ?? 'This machine';
+  const sidebarV2ExtraSections = useMemo(
+    () =>
+      sidebarV2Enabled && (remoteMachinesVisible || savedViews.length > 0) ? (
+        <MachinesAndSavedViews
+          setActiveTab={setActiveTab}
+          savedViews={savedViews}
+          activeSavedViewId={activeSavedViewId}
+          threadTitlesById={threadTitlesById}
+          openSavedView={openSavedViewFromSidebar}
+          deleteSavedView={deleteSavedView}
+          savedViewsSectionOpen={savedViewsSectionOpen}
+          setSavedViewsSectionOpen={setSavedViewsSectionOpen}
+          remoteMachinesVisible={remoteMachinesVisible}
+          machinesSectionOpen={machinesSectionOpen}
+          setMachinesSectionOpen={setMachinesSectionOpen}
+          remoteMachines={remoteMachines}
+          activeRemoteMachineId={activeRemoteMachineId}
+          selectRemoteMachine={selectRemoteMachine}
+          localMachineName={localMachineName}
+        />
+      ) : null,
+    [
+      activeRemoteMachineId,
+      activeSavedViewId,
+      deleteSavedView,
+      localMachineName,
+      machinesSectionOpen,
+      openSavedViewFromSidebar,
+      remoteMachines,
+      remoteMachinesVisible,
+      savedViews,
+      savedViewsSectionOpen,
+      selectRemoteMachine,
+      setActiveTab,
+      sidebarV2Enabled,
+      threadTitlesById,
+    ]
+  );
+  const handleSidebarV2AddProject = useCallback(() => {
+    if (repositoryOperationBusy) return;
+    openAddProjectPicker();
+  }, [openAddProjectPicker, repositoryOperationBusy]);
 
   // The main view's unit of display. paneThreadIds is authoritative; falling
   // back to the selected thread only matters for a store written before the
@@ -10212,6 +8767,115 @@ const App: React.FC = () => {
           ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
           : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`;
 
+  // Above the composer's top-right corner: the branch picker with Commit and
+  // Push, or the thread's Durango workspace when it has one. Its menus open
+  // upward so they never fall off the bottom of the window.
+  const composerGitBar =
+    activeTab === 'agents' && selectedThread && activeThreadProject && !activeIsNoProject ? (
+      <div className="composer-git-bar">
+        {activeDurangoWorkspace && (
+          <DurangoWorkspaceControl
+            workspace={activeDurangoWorkspace}
+            disabled={repositoryOperationBusy || activeWorkspaceUnavailable}
+            onRemove={() => void handleRemoveThreadWorkspace(selectedThread.id)}
+          />
+        )}
+        {!activeDurangoWorkspace && (
+          <div className="shell-branch-control" ref={branchPickerRef}>
+            <button
+              type="button"
+              className="shell-branch-trigger"
+              onClick={() => {
+                if (activeWorkspaceUnavailable) return;
+                const opening = !branchPickerOpen;
+                setBranchPickerOpen(opening);
+                // The list can be stale (branch switched or created in a
+                // terminal since the last read) — re-read on open.
+                if (opening) void refreshGitState();
+              }}
+              disabled={activeWorkspaceUnavailable || gitLoading || repositoryOperationBusy || !gitState?.ok}
+              title={gitState?.error ?? gitState?.root ?? 'Git state'}
+              aria-haspopup="menu"
+              aria-expanded={branchPickerOpen && !repositoryOperationBusy}
+            >
+              <GitBranch size={14} />
+              <span className="truncate">
+                {gitLoading
+                  ? 'Git...'
+                  : (gitState?.currentBranch ??
+                    (gitState?.detachedHead ? `Detached @ ${gitState.detachedHead}` : 'Local'))}
+              </span>
+              <ChevronDown size={13} className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`} />
+            </button>
+            {branchPickerOpen && !repositoryOperationBusy && !activeWorkspaceUnavailable && (
+              <div className="shell-branch-picker" role="menu">
+                {creatingBranch ? (
+                  <div className="branch-picker-item branch-picker-create-row">
+                    <Plus size={13} />
+                    <InlineRenameInput
+                      className="thread-rename-input"
+                      initialValue=""
+                      onSubmit={(name) => {
+                        setCreatingBranch(false);
+                        void handleCreateBranch(name);
+                      }}
+                      onCancel={() => setCreatingBranch(false)}
+                    />
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="branch-picker-item"
+                    onClick={() => setCreatingBranch(true)}
+                    disabled={repositoryOperationBusy || !gitState?.ok}
+                  >
+                    <Plus size={13} /> New branch
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="branch-picker-item"
+                  onClick={() => {
+                    setBranchPickerOpen(false);
+                    void handleCommitAndPush();
+                  }}
+                  disabled={repositoryOperationBusy || !gitState?.ok || !gitState.currentBranch}
+                  title="git add . && git commit && git push"
+                >
+                  <GitCommit size={13} /> Commit and Push
+                </button>
+                <div className="project-picker-divider" />
+                {gitState?.hasUncommittedChanges && (
+                  <div className="branch-picker-note">Commit local changes before switching branches.</div>
+                )}
+                {gitState?.branches.map((branch) => (
+                  <button
+                    key={branch.name}
+                    type="button"
+                    className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
+                    onClick={() => handleCheckoutBranch(branch.name)}
+                    disabled={branch.current || gitState.hasUncommittedChanges || repositoryOperationBusy}
+                    title={
+                      gitState.hasUncommittedChanges && !branch.current
+                        ? 'Unavailable with uncommitted changes'
+                        : branch.name
+                    }
+                  >
+                    <GitBranch size={13} />
+                    <span className="truncate">{branch.name}</span>
+                    {branch.current && <Check size={13} />}
+                  </button>
+                ))}
+                {gitState?.branches.length === 0 && (
+                  <div className="branch-picker-empty">{gitState?.error ?? 'No branches found'}</div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    ) : null;
+
   // The composer belongs to the focused pane: one thread takes input at a
   // time and clicking any pane moves it there. Built once, outside the pane
   // loop, so a six-way split never duplicates the picker/mention machinery.
@@ -10227,6 +8891,7 @@ const App: React.FC = () => {
         onSelect={selectThread}
         split={threadPanes.length > 1}
       />
+      {composerGitBar}
       <div
         className={`composer-shell${composerThreadDropActive ? ' thread-drop-target' : ''}`}
         onDragOver={handleComposerThreadDragOver}
@@ -11039,6 +9704,21 @@ const App: React.FC = () => {
       onDrop={handleRootDrop}
     >
       <Toaster position="top-center" richColors closeButton />
+      <ProjectPickerModal
+        open={projectPickerOpen && !repositoryOperationBusy}
+        initialView={projectPickerView}
+        projects={sortedProjects}
+        selectedProjectId={activeThreadProject?.id ?? null}
+        onSelect={projectPickerView === 'projects' ? handleChangeSelectedThreadProject : undefined}
+        onAddProjectPath={(path) => void handleAddProject({ path })}
+        onAddProjectWithDialog={() => void handleAddProject()}
+        onRemoveProject={(project) => {
+          if (confirm(`Remove "${project.name}" and its threads? Files on disk are not affected.`)) {
+            void removeProjectWithRuntimes(project.id);
+          }
+        }}
+        onClose={closeProjectPicker}
+      />
       <ImageLightbox />
       {draggingFiles && (
         <div className="file-drop-overlay">
@@ -11059,6 +9739,52 @@ const App: React.FC = () => {
 
         <div className="shell-main-chrome">
           <div className="shell-title-group">
+            {activeTab === 'agents' && activeThreadProject && (
+              <>
+                <div className="shell-project-control shell-breadcrumb-project" ref={projectPickerRef}>
+                  <button
+                    type="button"
+                    className="shell-project-trigger"
+                    onClick={() => {
+                      if (repositoryOperationBusy || activeWorkspaceUnavailable) return;
+                      if (selectedThread && !canChangeSelectedThreadProject) return;
+                      openProjectPicker();
+                    }}
+                    disabled={
+                      repositoryOperationBusy ||
+                      activeWorkspaceUnavailable ||
+                      (!!selectedThread && !canChangeSelectedThreadProject)
+                    }
+                    title={
+                      repositoryOperationBusy
+                        ? 'Repository operation in progress'
+                        : activeWorkspaceUnavailable
+                          ? 'Wait for the thread’s Durango workspace to become available'
+                          : selectedThread && !canChangeSelectedThreadProject
+                            ? selectedThread.durangoWorkspace
+                              ? 'Project is locked to the thread’s Durango workspace'
+                              : 'Project is locked after an agent runs'
+                            : activeIsNoProject
+                              ? 'Not tied to a project'
+                              : activeThreadProject.path
+                    }
+                    aria-haspopup="dialog"
+                  >
+                    {activeIsNoProject ? (
+                      <MessageSquare size={14} />
+                    ) : (
+                      <ProjectBadge project={activeThreadProject} size={16} />
+                    )}
+                    <span className="truncate">{activeThreadProject.name}</span>
+                    {(!selectedThread || canChangeSelectedThreadProject) && (
+                      <ChevronDown size={13} className={`project-pill-chevron ${projectPickerOpen ? 'open' : ''}`} />
+                    )}
+                  </button>
+                </div>
+                {/* T3-style breadcrumb: project / thread. */}
+                {selectedThread && <span className="shell-breadcrumb-separator">/</span>}
+              </>
+            )}
             {activeTab === 'agents' && selectedThread ? (
               <div className="thread-title-menu shell-thread-title-menu" ref={threadMenuRef}>
                 {threadRenameKey === `shell:${selectedThread.id}` ? (
@@ -11196,222 +9922,7 @@ const App: React.FC = () => {
                 <span className="shell-subtitle truncate">{shellSubtitle}</span>
               </>
             )}
-            {activeTab === 'agents' && activeThreadProject && (
-              <>
-                <span className="shell-title-divider" />
-                <div className="shell-project-control" ref={projectPickerRef}>
-                  <button
-                    type="button"
-                    className="shell-project-trigger"
-                    onClick={() => {
-                      if (repositoryOperationBusy || activeWorkspaceUnavailable) return;
-                      if (selectedThread && !canChangeSelectedThreadProject) return;
-                      setProjectPickerOpen((open) => !open);
-                    }}
-                    disabled={
-                      repositoryOperationBusy ||
-                      activeWorkspaceUnavailable ||
-                      (!!selectedThread && !canChangeSelectedThreadProject)
-                    }
-                    title={
-                      repositoryOperationBusy
-                        ? 'Repository operation in progress'
-                        : activeWorkspaceUnavailable
-                          ? 'Wait for the thread’s Durango workspace to become available'
-                          : selectedThread && !canChangeSelectedThreadProject
-                            ? selectedThread.durangoWorkspace
-                              ? 'Project is locked to the thread’s Durango workspace'
-                              : 'Project is locked after an agent runs'
-                            : activeIsNoProject
-                              ? 'Not tied to a project'
-                              : activeThreadProject.path
-                    }
-                    aria-haspopup="menu"
-                    aria-expanded={projectPickerOpen && !repositoryOperationBusy}
-                  >
-                    {activeIsNoProject ? (
-                      <MessageSquare size={14} />
-                    ) : (
-                      <ProjectIcon projectPath={activeThreadProject.path} size={14} />
-                    )}
-                    <span className="truncate">{activeThreadProject.name}</span>
-                    {(!selectedThread || canChangeSelectedThreadProject) && (
-                      <ChevronDown size={13} className={`project-pill-chevron ${projectPickerOpen ? 'open' : ''}`} />
-                    )}
-                  </button>
-                  {projectPickerOpen &&
-                    !repositoryOperationBusy &&
-                    !activeWorkspaceUnavailable &&
-                    (!selectedThread || canChangeSelectedThreadProject) && (
-                      <div className="shell-project-picker" role="menu">
-                        <button
-                          type="button"
-                          className={`project-picker-item ${activeIsNoProject ? 'selected' : ''}`}
-                          onClick={() => handleChangeSelectedThreadProject(NO_PROJECT_ID)}
-                          title="Chat with an agent outside of any project"
-                        >
-                          <MessageSquare size={13} />
-                          <span className="truncate">No project</span>
-                          {activeIsNoProject && <Check size={13} />}
-                        </button>
-                        {projects.length > 0 && <div className="project-picker-divider" />}
-                        {projects.map((option) => (
-                          <button
-                            key={option.id}
-                            type="button"
-                            className={`project-picker-item ${option.id === activeThreadProject.id ? 'selected' : ''}`}
-                            onClick={() => handleChangeSelectedThreadProject(option.id)}
-                            title={option.path}
-                          >
-                            <ProjectIcon projectPath={option.path} size={13} />
-                            <span className="truncate">{option.name}</span>
-                            {option.id === activeThreadProject.id && <Check size={13} />}
-                          </button>
-                        ))}
-                        <div className="project-picker-divider" />
-                        <button
-                          type="button"
-                          className="project-picker-item"
-                          onClick={() => {
-                            setProjectPickerOpen(false);
-                            void handleAddProject();
-                          }}
-                        >
-                          <Plus size={13} /> Add project
-                        </button>
-                        {activeThreadProject && !activeIsNoProject && projects.length > 1 && (
-                          <button
-                            type="button"
-                            className="project-picker-item danger"
-                            onClick={() => {
-                              setProjectPickerOpen(false);
-                              if (confirm(`Remove project "${activeThreadProject.name}"?`)) {
-                                void removeProjectWithRuntimes(activeThreadProject.id);
-                              }
-                            }}
-                          >
-                            <Trash2 size={13} /> Remove project
-                          </button>
-                        )}
-                      </div>
-                    )}
-                </div>
 
-                {/* A thread working in a Durango workspace shows it instead of a
-                    branch picker: the workspace is a detached checkout that
-                    holds a change, not a branch to switch. */}
-                {activeDurangoWorkspace && selectedThread && (
-                  <DurangoWorkspaceControl
-                    workspace={activeDurangoWorkspace}
-                    disabled={repositoryOperationBusy || activeWorkspaceUnavailable}
-                    onRemove={() => void handleRemoveThreadWorkspace(selectedThread.id)}
-                  />
-                )}
-
-                {/* A No project chat has no repository: no branch, source control or cloud. */}
-                {!activeIsNoProject && (
-                  <>
-                    {!activeDurangoWorkspace && (
-                    <div className="shell-branch-control" ref={branchPickerRef}>
-                      <button
-                        type="button"
-                        className="shell-branch-trigger"
-                        onClick={() => {
-                          if (activeWorkspaceUnavailable) return;
-                          const opening = !branchPickerOpen;
-                          setBranchPickerOpen(opening);
-                          // The list can be stale (branch switched or created in a
-                          // terminal since the last read) — re-read on open.
-                          if (opening) void refreshGitState();
-                        }}
-                        disabled={activeWorkspaceUnavailable || gitLoading || repositoryOperationBusy || !gitState?.ok}
-                        title={gitState?.error ?? gitState?.root ?? 'Git state'}
-                        aria-haspopup="menu"
-                        aria-expanded={branchPickerOpen && !repositoryOperationBusy}
-                      >
-                        <GitBranch size={14} />
-                        <span className="truncate">
-                          {gitLoading
-                            ? 'Git...'
-                            : (gitState?.currentBranch ??
-                              (gitState?.detachedHead ? `Detached @ ${gitState.detachedHead}` : 'Local'))}
-                        </span>
-                        <ChevronDown size={13} className={`project-pill-chevron ${branchPickerOpen ? 'open' : ''}`} />
-                      </button>
-                      {branchPickerOpen && !repositoryOperationBusy && !activeWorkspaceUnavailable && (
-                        <div className="shell-branch-picker" role="menu">
-                          {creatingBranch ? (
-                            <div className="branch-picker-item branch-picker-create-row">
-                              <Plus size={13} />
-                              <InlineRenameInput
-                                className="thread-rename-input"
-                                initialValue=""
-                                onSubmit={(name) => {
-                                  setCreatingBranch(false);
-                                  void handleCreateBranch(name);
-                                }}
-                                onCancel={() => setCreatingBranch(false)}
-                              />
-                            </div>
-                          ) : (
-                            <button
-                              type="button"
-                              className="branch-picker-item"
-                              onClick={() => setCreatingBranch(true)}
-                              disabled={repositoryOperationBusy || !gitState?.ok}
-                            >
-                              <Plus size={13} /> New branch
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            className="branch-picker-item"
-                            onClick={() => {
-                              setBranchPickerOpen(false);
-                              void handleCommitAndPush();
-                            }}
-                            disabled={repositoryOperationBusy || !gitState?.ok || !gitState.currentBranch}
-                            title="git add . && git commit && git push"
-                          >
-                            <GitCommit size={13} /> Commit and Push
-                          </button>
-                          <div className="project-picker-divider" />
-                          {gitState?.hasUncommittedChanges && (
-                            <div className="branch-picker-note">Commit local changes before switching branches.</div>
-                          )}
-                          {gitState?.branches.map((branch) => (
-                            <button
-                              key={branch.name}
-                              type="button"
-                              className={`branch-picker-item ${branch.current ? 'selected' : ''}`}
-                              onClick={() => handleCheckoutBranch(branch.name)}
-                              disabled={branch.current || gitState.hasUncommittedChanges || repositoryOperationBusy}
-                              title={
-                                gitState.hasUncommittedChanges && !branch.current
-                                  ? 'Unavailable with uncommitted changes'
-                                  : branch.name
-                              }
-                            >
-                              <GitBranch size={13} />
-                              <span className="truncate">{branch.name}</span>
-                              {branch.current && <Check size={13} />}
-                            </button>
-                          ))}
-                          {gitState?.branches.length === 0 && (
-                            <div className="branch-picker-empty">{gitState?.error ?? 'No branches found'}</div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                    )}
-
-                    {/* Source control, cloud pull/deploy/open, and GitHub mirror
-                        actions are hidden for now; their handlers stay wired for a
-                        later home. */}
-                  </>
-                )}
-              </>
-            )}
             {activeTab === 'agents' && selectedThread && (
               <span className={`status-dot shell-status-dot ${selectedThread.status}`} />
             )}
@@ -11565,7 +10076,29 @@ const App: React.FC = () => {
           {activeTab === 'agents' && (
             <>
               {/* Sidebar: Projects + Threads */}
-              <AgentsSidebar {...agentsSidebarModel} />
+              {sidebarV2Enabled ? (
+                <SidebarV2
+                  actions={sidebarV2Actions}
+                  projects={projects}
+                  noProject={noProject}
+                  selectedThreadId={selectedThreadId}
+                  paneThreadIds={paneThreadIds}
+                  threadsByView={sidebarV2Lists}
+                  views={sidebarV2Views}
+                  setViewVisible={setSidebarV2ViewVisible}
+                  attentionThreadIds={threadsNeedingInput}
+                  selectProject={stableAgentsSidebarActions.handleCreateThread}
+                  handleNewAgent={stableAgentsSidebarActions.handleNewAgent}
+                  handleAddProject={handleSidebarV2AddProject}
+                  threadSearchOpen={threadSearchOpen}
+                  setThreadSearchOpen={setThreadSearchOpen}
+                  threadSearchRef={threadSearchRef}
+                  extraSections={sidebarV2ExtraSections}
+                  sidebarFooterProps={sidebarFooterProps}
+                />
+              ) : (
+                <AgentsSidebar {...agentsSidebarModel} />
+              )}
 
               {/* Remote machine view (remote control): replaces the local
                   thread panel while a paired machine is selected. The local
@@ -11600,530 +10133,7 @@ const App: React.FC = () => {
                     </span>
                   </div>
                 )}
-                {threadPanes.length === 0 && selectedEpic ? (
-                  <div className="epic-view">
-                    <div className="epic-view-header">
-                      <div
-                        className={`epic-view-icon ${
-                          selectedEpicPrStatus ? `epic-view-icon--${selectedEpicPrStatus}` : ''
-                        }`}
-                      >
-                        <SquareKanban size={24} />
-                      </div>
-                      <div className="epic-view-heading">
-                        <h2 className="epic-view-title">{selectedEpic.name}</h2>
-                        <div className="epic-view-meta">
-                          {(selectedEpicRepositoryProject || selectedEpicClaimedProject) && (
-                            <span
-                              className="epic-view-project"
-                              title={
-                                selectedEpic.gitRoot ??
-                                selectedEpicRepositoryProject?.path ??
-                                selectedEpicClaimedProject?.path
-                              }
-                            >
-                              <ProjectIcon
-                                projectPath={
-                                  selectedEpic.gitRoot ??
-                                  selectedEpicRepositoryProject?.path ??
-                                  selectedEpicClaimedProject!.path
-                                }
-                                size={13}
-                              />
-                              {selectedEpicRepositoryProject?.name ?? selectedEpicClaimedProject?.name}
-                            </span>
-                          )}
-                          <span>
-                            {selectedEpicThreadRows.length === 1
-                              ? '1 thread'
-                              : `${selectedEpicThreadRows.length} threads`}
-                          </span>
-                          <span>Created {formatShortTime(new Date(selectedEpic.createdAt))}</span>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="epic-view-description-block">
-                      <label className="epic-view-description-label" htmlFor="epic-description">
-                        Description
-                      </label>
-                      <EpicDescriptionEditor
-                        key={selectedEpic.id}
-                        epicId={selectedEpic.id}
-                        initialValue={selectedEpic.description ?? ''}
-                        onCommit={(epicId, description) => updateEpic(epicId, { description })}
-                      />
-                    </div>
-
-                    <div className="epic-view-repository-block">
-                      <label className="epic-view-description-label" id="epic-repository-label">
-                        Repository
-                      </label>
-                      {selectedEpic.gitRoot ? (
-                        <div className="epic-view-repository-claimed" title={selectedEpic.gitRoot}>
-                          <GitBranch size={14} />
-                          <span>
-                            {selectedEpicClaimedProject?.name ?? selectedEpic.gitRoot}
-                            {selectedEpic.gitBranch ? ` · ${selectedEpic.gitBranch}` : ''}
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="epic-view-repository-picker" ref={epicRepoPickerRef}>
-                          <button
-                            type="button"
-                            id="epic-repository"
-                            className="epic-view-repository-trigger"
-                            disabled={selectedEpicOperationBusy || projects.length === 0}
-                            onClick={() => {
-                              if (selectedEpicOperationBusy) return;
-                              setEpicRepoPickerOpen((open) => !open);
-                            }}
-                            aria-haspopup="menu"
-                            aria-expanded={epicRepoPickerOpen && !selectedEpicOperationBusy}
-                            aria-labelledby="epic-repository-label"
-                            title={
-                              selectedEpicRepositoryProject?.path ??
-                              (projects.length === 0 ? 'Add a project first' : 'Choose the repository for this epic')
-                            }
-                          >
-                            {selectedEpicRepositoryProject ? (
-                              <>
-                                <ProjectIcon projectPath={selectedEpicRepositoryProject.path} size={14} />
-                                <span className="truncate">{selectedEpicRepositoryProject.name}</span>
-                              </>
-                            ) : (
-                              <span className="epic-view-repository-placeholder truncate">
-                                {projects.length === 0 ? 'No projects available' : 'Select repository…'}
-                              </span>
-                            )}
-                            <ChevronDown
-                              size={14}
-                              className={`project-pill-chevron ${epicRepoPickerOpen ? 'open' : ''}`}
-                            />
-                          </button>
-                          {epicRepoPickerOpen &&
-                            !selectedEpicOperationBusy &&
-                            projects.length > 0 && (
-                              <div
-                                className="shell-project-picker epic-view-repository-menu"
-                                role="menu"
-                                aria-labelledby="epic-repository-label"
-                              >
-                                {projects.map((option) => {
-                                  const selected = option.id === selectedEpic.repositoryProjectId;
-                                  return (
-                                    <button
-                                      key={option.id}
-                                      type="button"
-                                      role="menuitemradio"
-                                      aria-checked={selected}
-                                      className={`project-picker-item ${selected ? 'selected' : ''}`}
-                                      onClick={() => {
-                                        setEpicRepoPickerOpen(false);
-                                        updateEpic(selectedEpic.id, {
-                                          repositoryProjectId: option.id,
-                                        });
-                                      }}
-                                      title={option.path}
-                                    >
-                                      <ProjectIcon projectPath={option.path} size={13} />
-                                      <span className="truncate">{option.name}</span>
-                                      {selected && <Check size={13} />}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            )}
-                        </div>
-                      )}
-                      {selectedEpicRepositories.length > 1 && (
-                        <div className="mt-2 flex w-full flex-col gap-2">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              type="button"
-                              className="btn"
-                              disabled={selectedEpicOperationBusy || activeWorkspaceUnavailable || selectedEpicHasRunningAgents}
-                              onClick={() => void runMultiRepositoryAction(selectedEpic, 'commit')}
-                            >
-                              <GitCommit size={14} />
-                              {selectedEpicGitBusy === 'commit'
-                                ? 'Committing projects…'
-                                : selectedEpic.commitWithoutPush
-                                  ? 'Commit all projects'
-                                  : 'Commit & push all projects'}
-                            </button>
-                            <button
-                              type="button"
-                              className="btn secondary"
-                              disabled={selectedEpicOperationBusy || activeWorkspaceUnavailable || selectedEpicHasRunningAgents}
-                              onClick={() => void runMultiRepositoryAction(selectedEpic, 'pr')}
-                            >
-                              <GitPullRequest size={14} />
-                              {selectedEpicGitBusy === 'pr' ? 'Opening PRs…' : 'Create PRs for all'}
-                            </button>
-                          </div>
-                          <label
-                            className={`inline-flex w-fit items-center gap-1.5 select-none group ${
-                              selectedEpic.commitWithoutPush ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
-                            }`}
-                            title={
-                              selectedEpic.commitWithoutPush
-                                ? 'A pull request needs a push — untick “Only commit” first'
-                                : 'Open a pull request for each project as soon as its commit & push succeeds'
-                            }
-                          >
-                            <input
-                              type="checkbox"
-                              className="peer sr-only"
-                              disabled={Boolean(selectedEpic.commitWithoutPush)}
-                              checked={Boolean(selectedEpic.autoPrAfterCommit)}
-                              onChange={(e) =>
-                                updateEpic(selectedEpic.id, {
-                                  autoPrAfterCommit: e.target.checked,
-                                })
-                              }
-                            />
-                            <span
-                              className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
-                              aria-hidden
-                            >
-                              <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
-                            </span>
-                            <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
-                              Auto create PR on commit
-                            </span>
-                          </label>
-                          {selectedEpicRepositories.map(({ repository, project }) => (
-                            <div
-                              key={repository.projectId}
-                              className="flex items-center gap-3 rounded-[var(--radius-sm)] border border-[var(--border-default)] bg-[var(--bg-elevated)] px-3 py-2"
-                            >
-                              <ProjectIcon projectPath={repository.projectPath} size={15} />
-                              <div className="min-w-0 flex-1">
-                                <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
-                                  {project?.name ?? repository.projectPath}
-                                </div>
-                                <div className="truncate text-[11px] text-[var(--text-muted)]" title={repository.projectPath}>
-                                  {repository.gitBranch ?? 'Branch pending'}
-                                </div>
-                              </div>
-                              {repository.prUrl ? (
-                                <button
-                                  type="button"
-                                  className="btn secondary"
-                                  onClick={() => openEpicPrUrl(repository.prUrl!)}
-                                >
-                                  <SquareArrowOutUpRight size={13} />
-                                  View PR
-                                </button>
-                              ) : (
-                                <button
-                                  type="button"
-                                  className="btn secondary"
-                                  disabled={selectedEpicOperationBusy || selectedEpicHasRunningAgents}
-                                  onClick={() => void runMultiRepositoryAction(selectedEpic, 'pr', repository)}
-                                >
-                                  <GitPullRequest size={13} />
-                                  Create PR
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                className="btn secondary"
-                                disabled={selectedEpicOperationBusy || selectedEpicHasRunningAgents}
-                                onClick={() => void runMultiRepositoryAction(selectedEpic, 'commit', repository)}
-                              >
-                                <GitCommit size={13} />
-                                {selectedEpic.commitWithoutPush ? 'Commit' : 'Commit & push'}
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      <span className="epic-view-repository-hint">
-                        {selectedEpic.gitRoot
-                          ? 'This epic is locked to its claimed repository and feature branch.'
-                          : 'Choose the repository explicitly before using git actions.'}
-                      </span>
-                    </div>
-
-                    <div className="epic-view-actions">
-                      {selectedEpicRepositories.length <= 1 && (
-                      <>
-                      <div className="flex flex-col items-start gap-1.5">
-                        <button
-                          type="button"
-                          className="btn"
-                          disabled={
-                            selectedEpicOperationBusy ||
-                            activeWorkspaceUnavailable ||
-                            (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
-                            !selectedEpicHasActionableCommitWork ||
-                            selectedEpicHasRunningAgents
-                          }
-                          onClick={() => {
-                            if (epicPromptGitMessages) openEpicCommitDialog(selectedEpic);
-                            else void handleEpicCommitAndPush(selectedEpic);
-                          }}
-                          title={
-                            selectedEpicHasRunningAgents
-                              ? 'Agents are still running in this epic — wait for them to finish before committing'
-                              : !selectedEpicHasActionableCommitWork
-                                ? selectedEpic.commitWithoutPush && selectedEpicGitStatus?.hasUnpushedCommits
-                                  ? 'Nothing new to commit — earlier commits remain local'
-                                  : 'Nothing to commit — the workspace is clean and fully pushed'
-                                : selectedEpic.commitWithoutPush
-                                  ? epicPromptGitMessages
-                                    ? 'Stage all changes, write or generate a commit message, then commit without pushing'
-                                    : 'Stage all changes, generate a commit message, then commit without pushing'
-                                  : epicPromptGitMessages
-                                    ? 'Stage all changes, write or generate a commit message, then commit and push'
-                                    : 'Stage all changes, generate a commit message, then commit and push'
-                          }
-                        >
-                          <GitCommit size={14} />
-                          {selectedEpicGitBusy === 'commit'
-                            ? 'Committing…'
-                            : selectedEpic.commitWithoutPush
-                              ? 'Commit'
-                              : 'Commit & push'}
-                        </button>
-                        <label
-                          className={`inline-flex items-center gap-1.5 select-none group ${
-                            selectedEpic.commitWithoutPush ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
-                          }`}
-                          title={
-                            selectedEpic.commitWithoutPush
-                              ? 'A pull request needs a push — untick “Only commit” first'
-                              : selectedEpicPrBadge && selectedEpicPrBadge.modifier !== 'closed'
-                                ? 'This epic already has a pull request — the push updates it, so no new PR is opened'
-                                : 'Open the pull request as soon as commit & push succeeds, with a generated title and description into your project’s current branch — start the commit and navigate away'
-                          }
-                        >
-                          <input
-                            type="checkbox"
-                            className="peer sr-only"
-                            disabled={Boolean(selectedEpic.commitWithoutPush)}
-                            checked={Boolean(selectedEpic.autoPrAfterCommit)}
-                            onChange={(e) =>
-                              updateEpic(selectedEpic.id, {
-                                autoPrAfterCommit: e.target.checked,
-                              })
-                            }
-                          />
-                          <span
-                            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
-                            aria-hidden
-                          >
-                            <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
-                          </span>
-                          <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
-                            Auto create PR on commit
-                          </span>
-                        </label>
-                        <label
-                          className={`inline-flex items-center gap-1.5 select-none group ${
-                            selectedEpicOperationBusy ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
-                          }`}
-                          title={
-                            selectedEpicOperationBusy
-                              ? 'Wait for the current git action to finish before changing commit mode'
-                              : 'Commit stays local — nothing is pushed until this is unticked'
-                          }
-                        >
-                          <input
-                            type="checkbox"
-                            className="peer sr-only"
-                            disabled={selectedEpicOperationBusy}
-                            checked={Boolean(selectedEpic.commitWithoutPush)}
-                            onChange={(e) =>
-                              updateEpic(selectedEpic.id, {
-                                commitWithoutPush: e.target.checked,
-                              })
-                            }
-                          />
-                          <span
-                            className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded border border-[var(--border-default)] bg-[var(--bg-elevated)] transition-colors peer-checked:border-[var(--accent)] peer-checked:bg-[var(--accent)] peer-checked:[&_svg]:opacity-100 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-[var(--accent)] group-hover:border-[var(--text-muted)]"
-                            aria-hidden
-                          >
-                            <Check size={10} strokeWidth={3} className="text-white opacity-0 transition-opacity" />
-                          </span>
-                          <span className="text-[11px] leading-none text-[var(--text-muted)] group-hover:text-[var(--text-secondary)] transition-colors">
-                            Only commit (don’t push)
-                          </span>
-                        </label>
-                      </div>
-                      {selectedEpicPrBadge && (
-                        <button
-                          type="button"
-                          className={`btn epic-view-pr-state epic-view-pr-state--${selectedEpicPrBadge.modifier}`}
-                          onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
-                          title={
-                            selectedEpicPrBadge.modifier === 'merged'
-                              ? 'The pull request is merged — settle the epic to archive it'
-                              : 'This epic already has a pull request — click to view it'
-                          }
-                        >
-                          {selectedEpicPrBadge.modifier === 'merged' ? (
-                            <GitMerge size={14} />
-                          ) : selectedEpicPrBadge.modifier === 'closed' ? (
-                            <GitPullRequestClosed size={14} />
-                          ) : (
-                            <GitPullRequest size={14} />
-                          )}
-                          {selectedEpicPrBadge.label}
-                        </button>
-                      )}
-                      {(!selectedEpicPrBadge || selectedEpicPrBadge.modifier === 'closed') && (
-                        <button
-                          type="button"
-                          className="btn"
-                          disabled={
-                            selectedEpicOperationBusy ||
-                            activeWorkspaceUnavailable ||
-                            (!selectedEpicRepositoryProject && !selectedEpic.gitRoot) ||
-                            selectedEpicHasRunningAgents
-                          }
-                          onClick={() => {
-                            if (epicPromptGitMessages) openEpicPrBaseDialog(selectedEpic);
-                            else void createEpicPrWithoutPrompt(selectedEpic);
-                          }}
-                          title={
-                            selectedEpicHasRunningAgents
-                              ? 'Agents are still running in this epic — wait for them to finish before opening a PR'
-                              : selectedEpicPrBadge?.modifier === 'closed'
-                                ? 'Open a replacement pull request for this branch'
-                                : epicPromptGitMessages
-                                  ? 'Choose a base branch and optionally write the title and description, then open a pull request'
-                                  : 'Open a pull request into your project’s current branch with a generated title and description'
-                          }
-                        >
-                          <GitPullRequest size={14} />
-                          {selectedEpicGitBusy === 'pr'
-                            ? 'Opening PR…'
-                            : selectedEpicGitBusy === 'pr-branches'
-                              ? 'Loading branches…'
-                              : selectedEpicPrBadge?.modifier === 'closed'
-                                ? 'Create replacement PR'
-                                : 'Create PR'}
-                        </button>
-                      )}
-                      </>
-                      )}
-                      <button
-                        type="button"
-                        className="btn epic-view-settle"
-                        disabled={!!selectedEpicGitBusy || selectedEpicHasRunningAgents}
-                        onClick={() => void handleSettleEpic(selectedEpic)}
-                        title={
-                          selectedEpicHasRunningAgents
-                            ? 'Agents are still running in this epic — wait for them to finish before settling it'
-                            : 'Archive this epic; uncommitted work or pull request state will be explained before settling'
-                        }
-                      >
-                        <Archive size={14} />
-                        Settle
-                      </button>
-                    </div>
-
-                    {selectedEpicGitBusy && (
-                      <div className="epic-view-status">
-                        <span className="working-dots" aria-hidden="true">
-                          <span />
-                          <span />
-                          <span />
-                        </span>
-                        {selectedEpicGitBusy === 'commit'
-                          ? selectedEpic.commitWithoutPush
-                            ? 'Staging all changes and writing a commit message, then committing…'
-                            : 'Staging all changes and writing a commit message, then pushing…'
-                          : selectedEpicGitBusy === 'pr-branches'
-                            ? 'Fetching the branches on origin…'
-                            : selectedEpicGitBusy === 'settle'
-                              ? 'Checking the workspace and pull request state…'
-                              : 'Writing the PR message and opening the pull request…'}
-                        {(selectedEpicGitBusy === 'commit' || selectedEpicGitBusy === 'pr') &&
-                          window.orion?.epicAbortGitOperation && (
-                            <button
-                              type="button"
-                              className="btn"
-                              onClick={() =>
-                                void window.orion
-                                  .epicAbortGitOperation({ epicId: selectedEpic.id })
-                                  .catch(() => {})
-                              }
-                              title={
-                                selectedEpicGitBusy === 'commit'
-                                  ? 'Abort this commit — a commit that already landed stays local; the push is cancelled'
-                                  : 'Abort opening this pull request'
-                              }
-                            >
-                              Abort
-                            </button>
-                          )}
-                      </div>
-                    )}
-
-                    {selectedEpic.prUrl && (
-                      <button
-                        type="button"
-                        className="epic-view-pr-link"
-                        onClick={() => openEpicPrUrl(selectedEpic.prUrl as string)}
-                        title="Open the pull request in your browser"
-                      >
-                        <GitPullRequest size={13} />
-                        <span className="truncate">{selectedEpic.prUrl}</span>
-                        <SquareArrowOutUpRight size={12} />
-                      </button>
-                    )}
-
-                    <div className="epic-view-threads">
-                      <div className="epic-view-threads-header">
-                        <span>Threads</span>
-                        <button
-                          type="button"
-                          className="sidebar-section-action"
-                          title="New thread"
-                          aria-label="New thread"
-                          onClick={() => handleCreateThreadForEpic(selectedEpic)}
-                        >
-                          <Plus size={14} />
-                        </button>
-                      </div>
-                      {selectedEpicThreadRows.length === 0 ? (
-                        <div className="epic-view-empty">No threads yet — spawn one to start working this epic.</div>
-                      ) : (
-                        <div className="threads-list epic-view-threads-list">
-                          {selectedEpicThreadRows.map(({ thread, depth }) => (
-                            <div
-                              key={thread.id}
-                              className={`thread-item${depth > 0 ? ' epic-view-thread-child' : ''}`}
-                              style={depth > 0 ? { paddingLeft: 8 + Math.min(depth, 6) * 16 } : undefined}
-                              onClick={() => selectThread(thread.id)}
-                            >
-                              {renderThreadStatusDot(thread)}
-                              <span className="thread-title">
-                                {depth > 0 && (
-                                  <span className="epic-view-thread-branch" title="Child thread" aria-label="Child thread">
-                                    <GitBranch size={11} aria-hidden />
-                                  </span>
-                                )}
-                                {renderThreadCliBadge(thread)}
-                                <span className="thread-title-text" title={thread.title}>{thread.title}</span>
-                              </span>
-                              <span className="thread-project-tag thread-meta">
-                                {projects.find((p) => p.id === thread.projectId)?.name}
-                              </span>
-                              <span className="thread-time thread-meta">
-                                {formatShortTime(getThreadActivityTime(thread))}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ) : threadPanes.length === 0 ? (
+                {threadPanes.length === 0 ? (
                   <div className="empty-state">
                     <div className="empty-state-icon">
                       <Bot size={30} />
@@ -12166,7 +10176,6 @@ const App: React.FC = () => {
                                 <TerminalView
                                   key={pane.thread.id}
                                   threadId={pane.thread.id}
-                                  epicId={pane.thread.epicId}
                                   projectPath={pane.projectPath ?? ''}
                                   accessMode={pane.thread.accessMode ?? 'full-access'}
                                   focused={pane.focused}
@@ -12185,10 +10194,8 @@ const App: React.FC = () => {
                             <ChatTranscript
                               threadId={pane.thread.id}
                               projectName={pane.project?.name}
-                              projects={projects}
                               canChangeProject={pane.canChangeProject}
-                              onSelectProject={handleChangeSelectedThreadProject}
-                              onAddProject={handleAddProject}
+                              onOpenProjectPicker={openProjectPicker}
                               agentModels={agentModels}
                               mediaBaseDirs={pane.mediaBaseDirs}
                               isSending={pane.isSending}
@@ -12230,12 +10237,6 @@ const App: React.FC = () => {
             />
           )}
         </div>
-      )}
-
-      {hasOpenDialog && (
-        <React.Suspense fallback={null}>
-          <AppDialogs model={appDialogsModel} />
-        </React.Suspense>
       )}
     </div>
   );

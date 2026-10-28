@@ -1,9 +1,15 @@
 // See the Electron documentation for details on how to use preload scripts:
 // https://www.electronjs.org/docs/latest/tutorial/process-model#preload-scripts
 
-const { contextBridge, ipcRenderer, webUtils } = require('electron');
+const { contextBridge, ipcRenderer, webFrame, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('orion', {
+  // Settings → Cosmetics → Text size: zooms the whole window.
+  setZoomFactor: (factor) => {
+    if (typeof factor === 'number' && Number.isFinite(factor) && factor >= 0.5 && factor <= 2) {
+      webFrame.setZoomFactor(factor);
+    }
+  },
   // App persistence
   loadStore: () => ipcRenderer.invoke('storage:load'),
   saveStore: (value) => ipcRenderer.invoke('storage:save', value),
@@ -20,6 +26,9 @@ contextBridge.exposeInMainWorld('orion', {
 
   // Dialog
   openDirectory: () => ipcRenderer.invoke('dialog:openDirectory'),
+  browseDirectories: (requestedPath) => ipcRenderer.invoke('fs:browseDirectories', requestedPath),
+  resolveProjectDirectory: (inputPath, options) =>
+    ipcRenderer.invoke('fs:resolveProjectDirectory', inputPath, options),
   getNoProjectDir: () => ipcRenderer.invoke('app:getNoProjectDir'),
 
   // File system
@@ -48,20 +57,12 @@ contextBridge.exposeInMainWorld('orion', {
   checkoutGitBranch: (input) => ipcRenderer.invoke('git:checkoutBranch', input),
   commitAndPush: (input) => ipcRenderer.invoke('git:commitAndPush', input),
 
-  // Epics (sidebar Epics section)
-  epicCommitAndPush: (input) => ipcRenderer.invoke('epic:commitAndPush', input),
-  epicCreatePr: (input) => ipcRenderer.invoke('epic:createPr', input),
-  epicAbortGitOperation: (input) => ipcRenderer.invoke('epic:abortGitOperation', input),
-  epicLocalPrBase: (input) => ipcRenderer.invoke('epic:localPrBase', input),
-  epicListRemoteBranches: (input) => ipcRenderer.invoke('epic:listRemoteBranches', input),
-  epicGitStatus: (input) => ipcRenderer.invoke('epic:gitStatus', input),
-  epicPrStates: (input) => ipcRenderer.invoke('epic:prStates', input),
-
   // Bundled durango-code CLI and Durango workspaces (docs/workspaces.md)
   durangoCliStatus: () => ipcRenderer.invoke('durangoCli:status'),
   durangoCliSignIn: () => ipcRenderer.invoke('durangoCli:signIn'),
   inspectDurangoWorkspaceProject: (input) => ipcRenderer.invoke('durangoWorkspace:inspect', input),
   createDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:create', input),
+  findDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:find', input),
   removeDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:remove', input),
   durangoWorkspaceStatus: (input) => ipcRenderer.invoke('durangoWorkspace:status', input),
   landDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:land', input),
@@ -274,7 +275,6 @@ contextBridge.exposeInMainWorld('orion', {
   remoteFetchSnapshot: (input) => ipcRenderer.invoke('remote:fetchSnapshot', input),
   remoteFetchThread: (input) => ipcRenderer.invoke('remote:fetchThread', input),
   remoteRunTurn: (input) => ipcRenderer.invoke('remote:runTurn', input),
-  remoteCreateEpic: (input) => ipcRenderer.invoke('remote:createEpic', input),
   remoteStopTurn: (input) => ipcRenderer.invoke('remote:stopTurn', input),
   remoteRendererReady: () => ipcRenderer.invoke('remote:rendererReady'),
   remoteClaimCommand: (input) => ipcRenderer.invoke('remote:claimCommand', input),

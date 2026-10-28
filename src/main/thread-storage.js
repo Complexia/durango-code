@@ -37,7 +37,6 @@ const metadataFor = (thread, serialized = JSON.stringify(thread)) => ({
   id: thread.id,
   hash: crypto.createHash('sha256').update(serialized).digest('hex'),
   projectId: typeof thread.projectId === 'string' ? thread.projectId : null,
-  epicId: typeof thread.epicId === 'string' ? thread.epicId : null,
   parentThreadId: typeof thread.parentThreadId === 'string' ? thread.parentThreadId : null,
   subagent: thread.subagent === true,
   title: typeof thread.title === 'string' ? thread.title : '',

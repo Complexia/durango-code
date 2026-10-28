@@ -1,6 +1,6 @@
 import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { MessageSquare, Search, SquareKanban } from 'lucide-react';
-import { type Epic, type Message, type Project, type Thread, useOrionStore } from '../store';
+import { MessageSquare, Search } from 'lucide-react';
+import { type Message, type Project, type Thread, useOrionStore } from '../store';
 import { ProjectIcon } from './ProjectIcon';
 import { formatShortTime, getThreadActivityTime } from './time';
 
@@ -81,7 +81,7 @@ const fuzzyNameScore = (name: string, token: string) => {
   return best >= 0.5 ? Math.round(12 + 23 * best) : 0;
 };
 
-/** How well one query token matches a short name (title, project, epic): 0–100. */
+/** How well one query token matches a short name (title, project): 0–100. */
 const scoreNameToken = (name: string, token: string) => {
   if (!name) return 0;
   if (name === token) return 100;
@@ -145,10 +145,8 @@ export type ThreadSearchEntry = {
   thread: Thread;
   projectName: string;
   projectPath: string;
-  epicName: string;
   title: string;
   project: string;
-  epic: string;
   /** Path, model and status: matched like transcript text, at half weight. */
   meta: string;
   /** Normalized text per message, index-aligned with thread.messages. */
@@ -158,7 +156,6 @@ export type ThreadSearchEntry = {
 type CachedThreadSearchEntry = {
   projectName: string;
   projectPath: string;
-  epicName: string;
   entry: ThreadSearchEntry;
 };
 
@@ -170,16 +167,13 @@ const threadEntryCache = new WeakMap<Thread, CachedThreadSearchEntry>();
 const buildThreadSearchSummary = (
   thread: Thread,
   projectName: string,
-  projectPath: string,
-  epicName: string
+  projectPath: string
 ): ThreadSearchEntry => ({
   thread,
   projectName,
   projectPath,
-  epicName,
   title: normalizeSearchText(thread.title),
   project: normalizeSearchText(projectName),
-  epic: normalizeSearchText(epicName),
   meta: normalizeSearchText(`${projectPath} ${thread.modelId} ${thread.status}`),
   body: [],
 });
@@ -187,23 +181,17 @@ const buildThreadSearchSummary = (
 export const getThreadSearchEntry = (
   thread: Thread,
   projectName: string,
-  projectPath: string,
-  epicName = ''
+  projectPath: string
 ): ThreadSearchEntry => {
   const cached = threadEntryCache.get(thread);
-  if (
-    cached &&
-    cached.projectName === projectName &&
-    cached.projectPath === projectPath &&
-    cached.epicName === epicName
-  ) {
+  if (cached && cached.projectName === projectName && cached.projectPath === projectPath) {
     return cached.entry;
   }
   const entry: ThreadSearchEntry = {
-    ...buildThreadSearchSummary(thread, projectName, projectPath, epicName),
+    ...buildThreadSearchSummary(thread, projectName, projectPath),
     body: thread.messages.map(normalizedMessageText),
   };
-  threadEntryCache.set(thread, { projectName, projectPath, epicName, entry });
+  threadEntryCache.set(thread, { projectName, projectPath, entry });
   return entry;
 };
 
@@ -215,8 +203,7 @@ export const scoreThreadSearchEntry = (entry: ThreadSearchEntry, query: string |
   for (const token of tokens) {
     let best = Math.max(
       scoreNameToken(entry.title, token),
-      scoreNameToken(entry.project, token) * 0.4,
-      scoreNameToken(entry.epic, token) * 0.4
+      scoreNameToken(entry.project, token) * 0.4
     );
     if (best < BODY_MATCH_WORD) {
       best = Math.max(best, scoreBodyToken(entry.body, token), scoreBodyToken([entry.meta], token) * 0.5);
@@ -236,7 +223,6 @@ export const compareThreadSearchResults = (
   getThreadActivityTime(b.entry.thread).getTime() - getThreadActivityTime(a.entry.thread).getTime();
 
 type ProjectSearchEntry = { project: Project; name: string; folder: string; path: string };
-type EpicSearchEntry = { epic: Epic; name: string; description: string; projects: string };
 
 const buildProjectSearchEntry = (project: Project): ProjectSearchEntry => {
   const path = normalizeSearchText(project.path);
@@ -248,21 +234,7 @@ const buildProjectSearchEntry = (project: Project): ProjectSearchEntry => {
   };
 };
 
-const buildEpicSearchEntry = (epic: Epic, projectById: Map<string, Project>): EpicSearchEntry => {
-  const projectIds = new Set([
-    ...(epic.repositories ?? []).map((repository) => repository.projectId),
-    ...(epic.repositoryProjectId ? [epic.repositoryProjectId] : []),
-  ]);
-  const projectNames = [...projectIds].map((id) => projectById.get(id)?.name ?? '');
-  return {
-    epic,
-    name: normalizeSearchText(epic.name),
-    description: normalizeSearchText(epic.description ?? ''),
-    projects: normalizeSearchText(projectNames.join(' ')),
-  };
-};
-
-// Projects and epics are what the user names when they type a bare name, so a
+// Projects are what the user names when they type a bare name, so a
 // name hit ranks them just above a thread whose title matches equally well.
 const ENTITY_NAME_WEIGHT = 1.15;
 
@@ -274,21 +246,6 @@ const scoreProjectSearchEntry = (entry: ProjectSearchEntry, query: SearchQuery, 
       scoreNameToken(entry.folder, token) * 0.9
     );
     if (best < BODY_MATCH_WORD) best = Math.max(best, scoreBodyToken([entry.path], token));
-    if (best === 0) return 0;
-    score += best;
-  }
-  if (query.tokens.length > 1 && entry.name.includes(query.phrase)) score += 40;
-  return score + recencyBonus(activityMs);
-};
-
-const scoreEpicSearchEntry = (entry: EpicSearchEntry, query: SearchQuery, activityMs: number) => {
-  let score = 0;
-  for (const token of query.tokens) {
-    let best = Math.max(
-      scoreNameToken(entry.name, token) * ENTITY_NAME_WEIGHT,
-      scoreNameToken(entry.projects, token) * 0.4
-    );
-    if (best < BODY_MATCH_WORD) best = Math.max(best, scoreBodyToken([entry.description], token));
     if (best === 0) return 0;
     score += best;
   }
@@ -356,7 +313,6 @@ const highlightMatches = (text: string, tokens: readonly string[]): React.ReactN
 
 type SearchResult =
   | { kind: 'project'; key: string; score: number; project: Project; threadCount: number }
-  | { kind: 'epic'; key: string; score: number; epic: Epic; threadCount: number }
   | { kind: 'thread'; key: string; score: number; entry: ThreadSearchEntry };
 
 const projectNameFor = (project: Project | undefined) => project?.name ?? 'Unknown project';
@@ -398,21 +354,19 @@ export const warmSearchIndex = () => {
   // Hover and focus can arrive together; share one pending pass.
   if (searchIndexWarmup) return;
   searchIndexWarmup = (function* () {
-    const { threads, projects, epics } = useOrionStore.getState();
+    const { threads, projects } = useOrionStore.getState();
     const projectById = new Map(projects.map((project) => [project.id, project]));
-    const epicNameById = new Map(epics.map((epic) => [epic.id, epic.name]));
     for (const thread of threads) {
       const project = projectById.get(thread.projectId);
       const projectName = projectNameFor(project);
       const projectPath = project?.path ?? '';
-      const epicName = thread.epicId ? (epicNameById.get(thread.epicId) ?? '') : '';
       const cached = threadEntryCache.get(thread);
-      if (!cached || cached.projectName !== projectName || cached.projectPath !== projectPath || cached.epicName !== epicName) {
+      if (!cached || cached.projectName !== projectName || cached.projectPath !== projectPath) {
         for (const message of thread.messages) {
           normalizedMessageText(message);
           yield;
         }
-        getThreadSearchEntry(thread, projectName, projectPath, epicName);
+        getThreadSearchEntry(thread, projectName, projectPath);
       }
       yield;
     }
@@ -438,25 +392,20 @@ export const warmSearchIndex = () => {
 
 export type SidebarSearchPanelProps = {
   projects: Project[];
-  /** Epics shown in the sidebar; empty while Epics are turned off. */
-  epics: Epic[];
   onSelectThread: (threadId: string) => void;
   onSelectProject: (projectId: string) => void;
-  onSelectEpic: (epicId: string) => void;
 };
 
 /**
  * The sidebar search popover: input, keyboard navigation and ranked results
- * across projects, epics and threads. It owns its query, so typing re-renders
+ * across projects and threads. It owns its query, so typing re-renders
  * only this panel rather than the application shell, and it is mounted only
  * while open, so live transcript changes cost nothing while search is closed.
  */
 export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
   projects,
-  epics,
   onSelectThread,
   onSelectProject,
-  onSelectEpic,
 }: SidebarSearchPanelProps) {
   const [query, setQuery] = useState('');
   // Scoring runs against the deferred copy, so the input never waits on it.
@@ -469,9 +418,8 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
   const hasQuery = parsedQuery.tokens.length > 0;
 
   const projectById = useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects]);
-  const epicById = useMemo(() => new Map(epics.map((epic) => [epic.id, epic])), [epics]);
 
-  // Per project/epic: newest thread activity (for recency) and thread count.
+  // Per project: newest thread activity (for recency) and thread count.
   const threadStats = useMemo(() => {
     const stats = new Map<string, { activityMs: number; count: number }>();
     const bump = (key: string, activityMs: number) => {
@@ -486,16 +434,11 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
     for (const thread of threads) {
       const activityMs = getThreadActivityTime(thread).getTime();
       bump(`project:${thread.projectId}`, activityMs);
-      if (thread.epicId) bump(`epic:${thread.epicId}`, activityMs);
     }
     return stats;
   }, [threads]);
 
   const projectEntries = useMemo(() => projects.map(buildProjectSearchEntry), [projects]);
-  const epicEntries = useMemo(
-    () => epics.map((epic) => buildEpicSearchEntry(epic, projectById)),
-    [epics, projectById]
-  );
 
   const threadEntries = useMemo(() => {
     const candidates = hasQuery
@@ -507,10 +450,9 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
     const buildEntry = hasQuery ? getThreadSearchEntry : buildThreadSearchSummary;
     return candidates.map((thread) => {
       const project = projectById.get(thread.projectId);
-      const epicName = thread.epicId ? (epicById.get(thread.epicId)?.name ?? '') : '';
-      return buildEntry(thread, projectNameFor(project), project?.path ?? '', epicName);
+      return buildEntry(thread, projectNameFor(project), project?.path ?? '');
     });
-  }, [epicById, hasQuery, projectById, threads]);
+  }, [hasQuery, projectById, threads]);
 
   const results = useMemo<SearchResult[]>(() => {
     if (!hasQuery) {
@@ -532,19 +474,6 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
         });
       }
     }
-    for (const entry of epicEntries) {
-      const stats = threadStats.get(`epic:${entry.epic.id}`);
-      const score = scoreEpicSearchEntry(entry, parsedQuery, stats?.activityMs ?? NaN);
-      if (score > 0) {
-        matches.push({
-          kind: 'epic',
-          key: `epic:${entry.epic.id}`,
-          score,
-          epic: entry.epic,
-          threadCount: stats?.count ?? 0,
-        });
-      }
-    }
     const threadMatches: Extract<SearchResult, { kind: 'thread' }>[] = [];
     for (const entry of threadEntries) {
       const score = scoreThreadSearchEntry(entry, parsedQuery);
@@ -553,7 +482,7 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
     threadMatches.sort(compareThreadSearchResults);
     matches.push(...threadMatches.slice(0, THREAD_RESULT_LIMIT));
     return matches.sort((a, b) => b.score - a.score).slice(0, RESULT_LIMIT);
-  }, [epicEntries, hasQuery, parsedQuery, projectEntries, threadEntries, threadStats]);
+  }, [hasQuery, parsedQuery, projectEntries, threadEntries, threadStats]);
 
   useEffect(() => setActiveIndex(0), [parsedQuery]);
 
@@ -566,7 +495,6 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
   const activate = (result: SearchResult | undefined) => {
     if (!result) return;
     if (result.kind === 'project') onSelectProject(result.project.id);
-    else if (result.kind === 'epic') onSelectEpic(result.epic.id);
     else onSelectThread(result.entry.thread.id);
   };
 
@@ -596,8 +524,8 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
           value={query}
           onChange={(event) => setQuery(event.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Search projects, epics, threads..."
-          aria-label="Search projects, epics and threads"
+          placeholder="Search projects, threads..."
+          aria-label="Search projects and threads"
         />
       </div>
       <div className={`thread-search-results ${stale ? 'stale' : ''}`} ref={listRef} role="listbox">
@@ -630,22 +558,6 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
             );
           }
 
-          if (result.kind === 'epic') {
-            return (
-              <button key={result.key} {...common} className={`thread-search-result compact ${active ? 'active' : ''}`}>
-                <span className="thread-search-row">
-                  <SquareKanban size={13} className="thread-search-kind-icon" />
-                  <span className="thread-search-title">{highlightMatches(result.epic.name, tokens)}</span>
-                  <span className="thread-search-kind">Epic</span>
-                </span>
-                <span className="thread-search-meta">
-                  {result.threadCount} {result.threadCount === 1 ? 'thread' : 'threads'}
-                  {result.epic.description ? ` · ${flattenText(result.epic.description)}` : ''}
-                </span>
-              </button>
-            );
-          }
-
           const { entry } = result;
           return (
             <button key={result.key} {...common} className={`thread-search-result ${active ? 'active' : ''}`}>
@@ -654,8 +566,7 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
                 <span className="thread-search-title">{highlightMatches(entry.thread.title, tokens)}</span>
               </span>
               <span className="thread-search-meta">
-                {entry.projectName}
-                {entry.epicName ? ` · ${entry.epicName}` : ''} · {formatShortTime(getThreadActivityTime(entry.thread))}
+                {entry.projectName} · {formatShortTime(getThreadActivityTime(entry.thread))}
               </span>
               <span className="thread-search-excerpt">
                 {highlightMatches(getThreadSearchExcerpt(entry, parsedQuery), tokens)}

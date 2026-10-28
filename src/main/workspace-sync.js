@@ -12,7 +12,7 @@ import { isOrionRepoRemoteUrl } from './source-control.js';
 const execFileAsync = promisify(execFile);
 
 // Workspace sync engine (contract: orion-web/docs/workspace-sync.md). Mirrors
-// the local workspace — projects, epics, threads with full transcripts, token
+// the local workspace — projects, threads with full transcripts, token
 // usage, and (optionally) code as Durango Cloud repos — to Durango Code web.
 // The user-facing name is "Share coding work with Durango": Durango Code web
 // generates the work digests that Durango Chat's memory uses from each
@@ -84,7 +84,7 @@ const publishFailures = new Map();
 // must not reuse that inaccessible repository id.
 const repoLinkOwners = new Map();
 let syncOwnerId = null;
-let totals = { projects: 0, epics: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
+let totals = { projects: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
 
 const readThreadIndex = async () => {
   if (deps.readThreadsIndex) return deps.readThreadsIndex();
@@ -167,7 +167,7 @@ const resetAccountScopedState = (ownerId) => {
   knownThreadStates = new Map();
   pushedBranchStates.clear();
   publishFailures.clear();
-  totals = { projects: 0, epics: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
+  totals = { projects: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
   status = {
     ...status,
     lastSyncAt: null,
@@ -499,7 +499,6 @@ const threadPayload = async (thread, transcriptHash, options = {}) => {
   return {
     id: thread.id,
     projectId: thread.projectId ?? null,
-    epicId: thread.epicId ?? null,
     parentThreadId: thread.parentThreadId ?? null,
     title: typeof thread.title === 'string' ? thread.title : '',
     // The desktop's transient statuses map onto the synced vocabulary.
@@ -519,7 +518,6 @@ const threadPayload = async (thread, transcriptHash, options = {}) => {
 
 const syncSnapshot = async (token, storeState, threads, { ownerId, generation, signal }) => {
   const projects = Array.isArray(storeState?.projects) ? storeState.projects : [];
-  const epics = Array.isArray(storeState?.epics) ? storeState.epics : [];
 
   // Resolve each project's cloud repo link so the web UI can cross-link the
   // synced code. Cheap local git config reads; failures just leave it null.
@@ -540,33 +538,17 @@ const syncSnapshot = async (token, storeState, threads, { ownerId, generation, s
     projectPayloads.push({ id: project.id, name: project.name ?? '', path: project.path ?? '', repoId });
   }
 
-  const epicPayloads = epics
-    .filter((epic) => typeof epic?.id === 'string')
-    .map((epic) => ({
-      id: epic.id,
-      projectId: epic.repositoryProjectId ?? null,
-      name: epic.name ?? '',
-      description: epic.description ?? '',
-      gitBranch: epic.gitBranch ?? null,
-      prUrl: epic.prUrl ?? null,
-      prState: epic.prState ?? null,
-      createdAt: epic.createdAt ?? null,
-      settledAt: epic.settledAt ?? null,
-    }));
-
   ensureCurrentSync(generation, signal);
   await api(token, '/api/sync/snapshot', {
     method: 'POST',
     signal,
     body: JSON.stringify({
       projects: projectPayloads,
-      epics: epicPayloads,
       threadIds: threads.map((thread) => thread.id),
       complete: true,
     }),
   });
   totals.projects = projectPayloads.length;
-  totals.epics = epicPayloads.length;
 };
 
 const syncThreads = async (token, threadIndex, { generation, signal }) => {

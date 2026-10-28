@@ -44,16 +44,16 @@ const WorkspacesSettings = React.memo(function WorkspacesSettings() {
       <div className="settings-group">
         <div className="setting-row">
           <div className="setting-label">
-            <div className="setting-label-title">Create a workspace for each new thread</div>
+            <div className="setting-label-title">Create a workspace before each new thread starts</div>
             <div className="setting-label-desc">
-              In repositories with a durango.toml, a new thread&apos;s first message creates its own workspace (
-              <code>durango-code ws new</code>): an instant copy of the repository with its dependencies and its own
-              port block, so parallel threads never edit the same checkout. The agent works and opens its change from
-              there. Threads that already ran keep their directory. Remove a workspace from the thread once its change
-              has landed.
+              In repositories with a durango.toml, agents create their own workspace (<code>durango-code ws new</code>
+              , the bundled durango-workspaces skill) once they start changing code: an instant copy of the repository
+              with its dependencies and its own port block, so parallel threads never edit the same checkout. Questions
+              and quick look-ups get an answer right away. Turn this on to have Durango Code create one before every
+              new thread&apos;s first message instead. Threads that already ran keep their directory.
             </div>
           </div>
-          <label className="provider-toggle" title="Create a workspace for each new thread">
+          <label className="provider-toggle" title="Create a workspace before each new thread starts">
             <input
               type="checkbox"
               checked={settings.enabled}

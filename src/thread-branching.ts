@@ -42,8 +42,7 @@ const branchCopy = (
   id: string,
   createdAt: string,
   parentThreadId?: string,
-  inheritedChild = false,
-  inheritedEpicId?: string
+  inheritedChild = false
 ): Thread => {
   const agentSessionIds = inheritedSessions(source);
   const pendingForkProviders = Object.keys(agentSessionIds) as ProviderId[];
@@ -77,7 +76,6 @@ const branchCopy = (
     // origin preserves the useful role/model label while allowing the branch
     // to select a model and send follow-up turns like any Orion subagent.
     inheritedSubagent: source.subagent ?? source.inheritedSubagent,
-    epicId: source.epicId ?? inheritedEpicId,
     // Forked sessions are recorded under the source's cwd, so a branch keeps
     // working in the source thread's Durango workspace (or its project).
     durangoWorkspace: source.durangoWorkspace,
@@ -187,8 +185,7 @@ export const createThreadBranchFamily = (
         childId,
         child.createdAt,
         copiedParent.id,
-        true,
-        copiedParent.epicId
+        true
       );
       copies.push(copiedChild);
       copyChildren(child.id, copiedChild);

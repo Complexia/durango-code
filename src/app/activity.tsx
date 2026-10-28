@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { BookOpen, Bot, Check, ChevronDown, FilePen, Globe, ListChecks, Search, Terminal, Wrench, X } from 'lucide-react';
+import { BookOpen, Bot, Brain, Check, ChevronDown, ChevronRight, FilePen, Globe, ListChecks, Search, Terminal, Wrench, X } from 'lucide-react';
 import { type AgentActivity, type BtwExchange, type Message, type ThreadGoal, type TurnTokenStats } from '../store';
 
 export const formatRunDuration = (startedAt?: string, completedAt?: string) => {
@@ -23,7 +23,7 @@ export const AgentActivityIcon: React.FC<{ activity: AgentActivity }> = ({ activ
   if (activity.kind === 'search') return <Search size={15} />;
   if (activity.kind === 'fetch') return <Globe size={15} />;
   if (activity.kind === 'task') return <Bot size={15} />;
-  if (activity.type === 'thought') return <Bot size={15} />;
+  if (activity.type === 'thought') return <Brain size={15} />;
   if (activity.type === 'command' || activity.kind === 'execute') return <Terminal size={15} />;
   if (activity.type === 'error') return <X size={15} />;
   if (activity.type === 'result') return <Check size={15} />;
@@ -219,7 +219,7 @@ export const useFloatingCardDrag = (
 // Floating, movable "Tasks" card pinned over the chat area. Only rendered
 // when the current agent turn streamed a plan (grok ACP task list) — simple
 // turns that never emit tasks never show it. Mirrors the same plan activity
-// that lives inside the Agent steps card, so it needs no extra plumbing.
+// that lives inside the run's step list, so it needs no extra plumbing.
 export const FloatingTasksCard: React.FC<{
   activity: AgentActivity;
   runStatus?: Message['status'];
@@ -365,6 +365,10 @@ const AgentActivityRow: React.FC<{
   // The detail line already previews a single-argument call (a path, a
   // command); repeating it verbatim as the input block is noise.
   const showInput = rowExpanded && !!activity.input && activity.input !== activity.detail;
+  // "Command - git log" over a detail line that says "git log" again reads as
+  // one step: show the command once.
+  const title = activity.title.replace(/^Command - /, '');
+  const detailRepeatsTitle = !rowExpanded && !!activity.detail && activity.detail.trim() === title.trim();
 
   if (activity.type === 'plan') {
     return (
@@ -410,7 +414,7 @@ const AgentActivityRow: React.FC<{
       </span>
       <span className="agent-tool-text">
         <span className="agent-tool-title-line">
-          <span className="agent-tool-title">{activity.title}</span>
+          <span className="agent-tool-title">{title}</span>
           {activity.diff && (
             <span className="agent-tool-chip diff" title={activity.diff.path}>
               <span className="diff-add">+{activity.diff.additions}</span>
@@ -424,7 +428,7 @@ const AgentActivityRow: React.FC<{
             <span className="agent-tool-chip waiting">needs approval</span>
           )}
         </span>
-        {activity.detail && (
+        {activity.detail && !detailRepeatsTitle && (
           <span className={`agent-tool-detail${rowExpanded ? ' expanded' : ''}`}>
             {rowExpanded ? activity.detail : collapsedDetailPreview(activity)}
           </span>
@@ -465,23 +469,21 @@ const AgentActivityRow: React.FC<{
       </span>
       {expandable && (
         <span className="agent-tool-chevron">
-          <ChevronDown size={13} />
+          <ChevronRight size={14} />
         </span>
       )}
     </div>
   );
 });
 
+// A run's steps as a flat list (T3 Code style): one row per step, no card.
+// Expandable rows open in place to show the call and its output.
 export const AgentActivityCard: React.FC<{
   activities: AgentActivity[];
   runStatus?: Message['status'];
   runRunning?: boolean;
 }> = ({ activities, runStatus, runRunning = runStatus === 'running' }) => {
-  const [expanded, setExpanded] = useState(false);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(() => new Set());
-  // Collapsed view tracks the newest steps so the card shows what the agent
-  // is doing now, not what it did first.
-  const visibleActivities = expanded ? activities : activities.slice(-4);
 
   const toggleRow = useCallback(
     (id: string) =>
@@ -497,31 +499,16 @@ export const AgentActivityCard: React.FC<{
   if (activities.length === 0) return null;
 
   return (
-    <div className={`agent-tools-card ${expanded ? 'expanded' : ''}`}>
-      <button
-        className="agent-tools-header"
-        onClick={() => setExpanded((current) => !current)}
-        title={expanded ? 'Collapse agent steps' : 'Expand agent steps'}
-      >
-        <span className="agent-tools-header-label">
-          <Bot size={13} />
-          Agent steps ({activities.length})
-        </span>
-        <span className="agent-tools-header-chevron">
-          <ChevronDown size={14} />
-        </span>
-      </button>
-      <div className="agent-tools-list">
-        {visibleActivities.map((activity) => (
-          <AgentActivityRow
-            key={activity.id}
-            activity={activity}
-            runRunning={runRunning}
-            rowExpanded={isExpandableActivity(activity) && expandedRows.has(activity.id)}
-            onToggle={toggleRow}
-          />
-        ))}
-      </div>
+    <div className="agent-steps">
+      {activities.map((activity) => (
+        <AgentActivityRow
+          key={activity.id}
+          activity={activity}
+          runRunning={runRunning}
+          rowExpanded={isExpandableActivity(activity) && expandedRows.has(activity.id)}
+          onToggle={toggleRow}
+        />
+      ))}
     </div>
   );
 };
@@ -593,29 +580,4 @@ export const useRunTicker = (enabled: boolean) => {
     const id = window.setInterval(() => setTick((value) => value + 1), 1000);
     return () => window.clearInterval(id);
   }, [enabled]);
-};
-
-// Live run status docked to the bottom of the chat area, so the user always
-// sees what the agent is doing right now without scrolling back up to the
-// top of the running message.
-export const PinnedRunStatus: React.FC<{ message: Message }> = ({ message }) => {
-  useRunTicker(true);
-  const duration = formatRunDuration(message.startedAt, message.completedAt);
-  const latestActivity = message.activities?.length
-    ? message.activities[message.activities.length - 1]
-    : undefined;
-  // Prefer whichever activity is blocked on approval — that's the state the
-  // user can act on — over whatever streamed last.
-  const waitingActivity = message.activities?.find((activity) => activity.status === 'waiting');
-  const runningLabel = waitingActivity
-    ? `Waiting for approval · ${waitingActivity.title}`
-    : latestActivity?.title ?? message.statusText ?? 'Working on it...';
-
-  return (
-    <div className="agent-status-line running pinned">
-      <span className="working-dots" aria-hidden="true"><span /><span /><span /></span>
-      <span>{runningLabel}</span>
-      {duration && <span className="agent-status-elapsed">{duration}</span>}
-    </div>
-  );
 };

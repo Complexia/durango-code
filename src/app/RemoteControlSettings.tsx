@@ -457,7 +457,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                 </div>
                 <button
                   type="button"
-                  className="archived-epic-action danger"
+                  className="settings-item-action danger"
                   title="Revoke this device — it can no longer control this machine"
                   disabled={busyId === device.id}
                   onClick={() => void handleRevokeDevice(device.id)}
@@ -507,7 +507,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                 {machine.status === 'connected' ? (
                   <button
                     type="button"
-                    className="archived-epic-action"
+                    className="settings-item-action"
                     title="Disconnect"
                     disabled={busyId === machine.id}
                     onClick={() => void handleDisconnectMachine(machine.id)}
@@ -517,7 +517,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                 ) : (
                   <button
                     type="button"
-                    className="archived-epic-action"
+                    className="settings-item-action"
                     title="Connect now"
                     disabled={busyId === machine.id}
                     onClick={() => void handleConnectMachine(machine.id)}
@@ -527,7 +527,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                 )}
                 <button
                   type="button"
-                  className="archived-epic-action danger"
+                  className="settings-item-action danger"
                   title="Remove this machine"
                   disabled={busyId === machine.id}
                   onClick={() => void handleRemoveMachine(machine.id)}

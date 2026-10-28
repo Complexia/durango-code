@@ -5,7 +5,7 @@ import { renderToString } from 'react-dom/server';
 import type { Thread } from '../src/store';
 
 // Keep fixtures in memory: no app persistence or real thread data is touched.
-const state = { threads: [] as Thread[], projects: [], epics: [] };
+const state = { threads: [] as Thread[], projects: [] };
 mock.module(new URL('../src/store.ts', import.meta.url).pathname, () => ({
   useOrionStore: Object.assign((selector: (value: typeof state) => unknown) => selector(state), {
     getState: () => state,
@@ -39,7 +39,7 @@ const makeHistory = (count: number, messages: number) => Array.from({ length: co
 
 state.threads = makeHistory(200, 100);
 const renderRecent = () => renderToString(
-  <SidebarSearchPanel projects={[]} epics={[]} onSelectThread={() => {}} onSelectProject={() => {}} onSelectEpic={() => {}} />
+  <SidebarSearchPanel projects={[]} onSelectThread={() => {}} onSelectProject={() => {}} />
 );
 const html = renderRecent();
 assert.equal((html.match(/role="option"/g) ?? []).length, 12);

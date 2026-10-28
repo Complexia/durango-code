@@ -3,11 +3,13 @@ import { Folder } from 'lucide-react';
 
 export const projectIconCache = new Map<string, string | null>();
 export const projectIconRequestCache = new Map<string, Promise<string | null>>();
-export const ProjectIcon: React.FC<{ projectPath: string; size?: number; className?: string }> = ({
-  projectPath,
-  size = 14,
-  className,
-}) => {
+export const ProjectIcon: React.FC<{
+  projectPath: string;
+  size?: number;
+  className?: string;
+  /** Shown when the project has no icon of its own (default: a folder). */
+  fallback?: React.ReactNode;
+}> = ({ projectPath, size = 14, className, fallback }) => {
   const [iconUrl, setIconUrl] = useState<string | null | undefined>(
     () => projectIconCache.get(projectPath)
   );
@@ -70,5 +72,6 @@ export const ProjectIcon: React.FC<{ projectPath: string; size?: number; classNa
     );
   }
 
+  if (fallback !== undefined) return <>{fallback}</>;
   return <Folder size={size} className={className} />;
 };

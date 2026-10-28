@@ -2,7 +2,7 @@
 
 Drive one Orion instance from another. If machine **A** enables remote control
 and pairs with machine **B**, then B can view and drive A's workspace — A's
-projects, epics, and threads, with turns actually running on A. The
+projects and threads, with turns actually running on A. The
 relationship is one-directional per pairing: B controlling A grants A nothing,
 unless A separately pairs the other way.
 
@@ -27,8 +27,8 @@ press **Pair**.
 The host now appears in the sidebar under **Machines**, alongside "This
 machine". Selecting it replaces the main panel with that machine's workspace:
 its projects and threads, a read-only transcript, and a composer that starts or
-continues turns *on the host*. Selecting "This machine" — or any local thread,
-project, or epic — returns to local work.
+continues turns *on the host*. Selecting "This machine" — or any local thread
+or project — returns to local work.
 
 Both machines must be signed in to the **same Orion account** the whole time.
 Signing out on either end drops every session immediately and stops the
@@ -137,7 +137,7 @@ rather than silently losing pairings. Development builds store them
 unencrypted (the stock Electron signature can't match the keychain ACL), same
 tradeoff the account token already makes.
 
-**What a controller can do.** Read the host's project/epic/thread list, read a
+**What a controller can do.** Read the host's project/thread list, read a
 thread's transcript, start a turn, and stop a turn. There is no filesystem,
 shell, or settings access over the wire. Turns are executed by the *host's own
 renderer* through the same code path as a local user action

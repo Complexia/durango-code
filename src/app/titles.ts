@@ -49,8 +49,7 @@ export const tryGenerateBetterTitle = async (
   projectPath: string,
   update: (id: string, updates: { title: string }) => void,
   expectedTitle: string,
-  getCurrentTitle: (id: string) => string | undefined,
-  epicId?: string
+  getCurrentTitle: (id: string) => string | undefined
 ) => {
   if (!window.orion?.generateThreadTitle || !turn.modelId) return;
   try {
@@ -59,7 +58,6 @@ export const tryGenerateBetterTitle = async (
       prompt,
       ...turn,
       projectPath,
-      ...(epicId ? { epicId } : {}),
     });
     if (title && typeof title === 'string') {
       const cleaned = title.replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '').trim().split(/[\n\r]/)[0].trim();

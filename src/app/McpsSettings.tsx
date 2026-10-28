@@ -441,7 +441,7 @@ const OrionMcpsSection = React.memo(function OrionMcpsSection() {
                   ) : (
                     <button
                       type="button"
-                      className="archived-epic-action"
+                      className="settings-item-action"
                       title={server.auth === 'oauth' ? 'Sign in again and test' : 'Test connection'}
                       disabled={busy}
                       onClick={() => void handleReconnect(server)}
@@ -451,7 +451,7 @@ const OrionMcpsSection = React.memo(function OrionMcpsSection() {
                   )}
                   <button
                     type="button"
-                    className="archived-epic-action danger"
+                    className="settings-item-action danger"
                     title="Disconnect this MCP"
                     disabled={busy}
                     onClick={() => void handleRemove(server)}

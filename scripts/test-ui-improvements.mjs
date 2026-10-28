@@ -1,22 +1,16 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
-  epicHasActionableCommitWork,
-  epicRepositoryShouldAutoCreatePr,
-} from '../src/app/epicGit.ts';
-import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
   clampSidebarWidth,
 } from '../src/app/sidebarResize.ts';
 
-const [appSource, chatSource, mainSource, preloadSource, dialogsSource, storeSource, sidebarSource] = await Promise.all([
+const [appSource, chatSource, mainSource, preloadSource, sidebarSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/app/chat.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/main.js', import.meta.url), 'utf8'),
   readFile(new URL('../src/preload.js', import.meta.url), 'utf8'),
-  readFile(new URL('../src/app/AppDialogs.tsx', import.meta.url), 'utf8'),
-  readFile(new URL('../src/store.ts', import.meta.url), 'utf8'),
   readFile(new URL('../src/app/AgentsSidebar.tsx', import.meta.url), 'utf8'),
 ]);
 
@@ -27,71 +21,6 @@ const section = (source, start, end) => {
   assert.notEqual(endIndex, -1, `Missing section end: ${end}`);
   return source.slice(startIndex, endIndex);
 };
-
-assert.equal(
-  epicHasActionableCommitWork(undefined, true),
-  true,
-  'commit stays available until the first workspace status arrives'
-);
-assert.equal(
-  epicHasActionableCommitWork(
-    { hasChangesToCommit: true, hasUnpushedCommits: true },
-    true
-  ),
-  true,
-  'commit-only remains available when there are fresh changes to commit'
-);
-assert.equal(
-  epicHasActionableCommitWork(
-    { hasChangesToCommit: false, hasUnpushedCommits: true },
-    true
-  ),
-  false,
-  'commit-only must not offer an action when only unpushed commits remain'
-);
-assert.equal(
-  epicHasActionableCommitWork(
-    { hasChangesToCommit: false, hasUnpushedCommits: true },
-    false
-  ),
-  true,
-  'commit-and-push remains available to retry an earlier failed push'
-);
-assert.equal(
-  epicHasActionableCommitWork(
-    { hasChangesToCommit: false, hasUnpushedCommits: false },
-    false
-  ),
-  false,
-  'a clean, fully pushed workspace has no actionable commit work'
-);
-
-assert.equal(
-  epicRepositoryShouldAutoCreatePr({ autoPrAfterCommit: true }, {}),
-  true,
-  'a pushed multi-project repository without a PR must continue into PR creation'
-);
-assert.equal(
-  epicRepositoryShouldAutoCreatePr(
-    { autoPrAfterCommit: true },
-    { prUrl: 'https://example.test/pull/1', prState: 'OPEN' }
-  ),
-  false,
-  'an existing open repository PR must not be recreated after a push'
-);
-assert.equal(
-  epicRepositoryShouldAutoCreatePr(
-    { autoPrAfterCommit: true },
-    { prUrl: 'https://example.test/pull/1', prState: 'CLOSED' }
-  ),
-  true,
-  'a closed repository PR must allow the multi-project flow to create a replacement'
-);
-assert.equal(
-  epicRepositoryShouldAutoCreatePr({ autoPrAfterCommit: true, commitWithoutPush: true }, {}),
-  false,
-  'commit-only mode must suppress multi-project auto-PR creation'
-);
 
 assert.equal(
   clampSidebarWidth(400, 1200),
@@ -132,71 +61,6 @@ assert.match(
 );
 
 assert.match(
-  dialogsSource,
-  /newEpicProjectIds\.length < projects\.length[\s\S]*Add another project/,
-  'the Epic dialog must let the user add another unique project picker'
-);
-assert.match(
-  dialogsSource,
-  /aria-label=\{`Remove project \$\{index \+ 1\}`\}/,
-  'every Epic project selection, including the last one, must be removable'
-);
-assert.match(
-  storeSource,
-  /repositories\?: EpicRepository\[\]/,
-  'Epic persistence must retain all repositories'
-);
-assert.match(
-  appSource,
-  /Commit & push all projects[\s\S]*Create PRs for all[\s\S]*runMultiRepositoryAction/,
-  'the Epic view must expose batch and per-project repository actions'
-);
-const multiRepositoryActions = section(
-  appSource,
-  '                      {selectedEpicRepositories.length > 1 && (',
-  '                      <span className="epic-view-repository-hint">'
-);
-assert.match(
-  multiRepositoryActions,
-  /checked=\{Boolean\(selectedEpic\.autoPrAfterCommit\)\}[\s\S]*Auto create PR on commit/,
-  'the multi-project Epic view must expose the persisted auto-create-PR checkbox'
-);
-assert.match(
-  appSource,
-  /epicRepositoryShouldAutoCreatePr\(latestEpic, latestRepository\)[\s\S]*createEpicRepositoryPr\(latestEpic, latestRepository\)/,
-  'a successful multi-project commit must continue into PR creation when enabled'
-);
-assert.match(
-  appSource,
-  /result === 'aborted'\) break/,
-  'a user-aborted repository operation must stop the remaining batch'
-);
-assert.match(
-  appSource,
-  /epic\.repositories\?\.length \?\? 0\) > 1[\s\S]*return UNCLAIMED_EPIC_GIT_WORKSPACE_KEY/,
-  'multi-repository actions must use the conservative shared-checkout lock'
-);
-assert.match(
-  appSource,
-  /claimedBranches: claimedBranchesForEpic\(epic\.id\)/,
-  'per-repository actions must enforce cross-Epic branch claims'
-);
-assert.match(
-  appSource,
-  /kind === 'commit' && window\.orion\?\.epicGitStatus[\s\S]*status\.hasChangesToCommit[\s\S]*status\.hasUnpushedCommits/,
-  'batch commits must preflight and skip clean, fully-pushed repositories'
-);
-assert.match(
-  appSource,
-  /baseBranch: repository\.sourceBranch \?\? ''/,
-  'each repository pull request must target its recorded source branch'
-);
-assert.match(
-  appSource,
-  /epic-view-actions[\s\S]*selectedEpicRepositories\.length <= 1/,
-  'legacy primary-only git controls must be hidden for multi-project Epics'
-);
-assert.match(
   sidebarSource,
   /useSidebarResize\(\{[\s\S]*storageKey: AGENTS_SIDEBAR_STORAGE_KEY[\s\S]*className="sidebar agents-sidebar" ref=\{sidebarRef\}[\s\S]*<SidebarFooter \{\.\.\.sidebarFooterProps\} \/>\s*\{sidebarResizeHandle\}/,
   'the Agents sidebar must be drag-resizable through the shared sidebar resize hook'
@@ -204,8 +68,8 @@ assert.match(
 
 // Durango workspaces replace Rifts (docs/workspaces.md).
 // The store only mentions Rift fields to drop them from persisted state.
-for (const [name, source] of Object.entries({ appSource, mainSource, preloadSource, dialogsSource, sidebarSource })) {
-  assert.doesNotMatch(source, /riftPath|riftStatus|epicCreateRift|riftsSettings/, `no Rift code may remain in ${name}`);
+for (const [name, source] of Object.entries({ appSource, mainSource, preloadSource, sidebarSource })) {
+  assert.doesNotMatch(source, /riftPath|riftStatus|riftsSettings/, `no Rift code may remain in ${name}`);
 }
 const turnStart = section(
   appSource,
@@ -256,17 +120,6 @@ assert.match(
   preloadSource,
   /discardClaudeBackgroundShellTasks/,
   'The Claude shell-discard action must be exposed through the preload boundary'
-);
-
-const epicActions = section(
-  appSource,
-  '                    <div className="epic-view-actions">',
-  '                      {selectedEpicPrBadge && ('
-);
-assert.match(
-  epicActions,
-  /disabled=\{selectedEpicOperationBusy\}[\s\S]*checked=\{Boolean\(selectedEpic\.commitWithoutPush\)\}/,
-  'commit-only mode must be frozen while the selected epic operation is busy'
 );
 
 const cloudDeployPrecheck = section(

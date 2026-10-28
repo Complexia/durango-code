@@ -359,7 +359,6 @@ export type RemoteControlState = {
 export type RemoteThreadMeta = {
   id: string;
   projectId: string;
-  epicId: string | null;
   parentThreadId: string | null;
   subagent: boolean;
   title: string;
@@ -373,18 +372,7 @@ export type RemoteThreadMeta = {
 export type RemoteSnapshot = {
   machine: { id: string; name: string };
   capturedAt: string;
-  features?: {
-    epics: boolean;
-  };
   projects: Array<{ id: string; name: string; path: string }>;
-  epics: Array<{
-    id: string;
-    name: string;
-    description: string;
-    repositoryProjectId: string | null;
-    createdAt: string | null;
-    settledAt: string | null;
-  }>;
   threads: RemoteThreadMeta[];
 };
 
@@ -403,14 +391,10 @@ export type RemoteCommandRequest = {
   /** Main-process startup deadline, checked around renderer-side preparation. */
   expiresAt: number;
   command: {
-    kind: 'runTurn' | 'stopTurn' | 'createEpic';
+    kind: 'runTurn' | 'stopTurn';
     prompt?: string;
-    name?: string;
-    description?: string;
-    projectIds?: string[];
     threadId?: string;
     projectId?: string;
-    epicId?: string;
     modelId?: string;
     accessMode?: 'read-only' | 'workspace-write' | 'full-access';
     /**
@@ -691,7 +675,6 @@ type OrionWorkspaceSyncStatus = {
   backfillDone: boolean;
   counts: {
     projects: number;
-    epics: number;
     threads: number;
     transcriptsUploaded: number;
     codePushes: number;
@@ -777,7 +760,23 @@ type OrionCodexBrowserIntegrationStatus = {
         | { ok: true; sessions: Array<ImportedSessionTranscript | null> }
         | { ok: false; error: string }
       >;
+      /** Zooms the whole window (Settings → Cosmetics → Text size). */
+      setZoomFactor?: (factor: number) => void;
       openDirectory: () => Promise<string | null>;
+      /** Lists the directories in a typed path (project picker's Add project view). */
+      browseDirectories?: (requestedPath: string) => Promise<{
+        requestedPath: string;
+        homeDir: string;
+        directoryPath: string;
+        parentPath: string | null;
+        exists: boolean;
+        entries: Array<{ name: string; fullPath: string }>;
+      }>;
+      /** Resolves a typed folder path to an absolute one, creating it when asked. */
+      resolveProjectDirectory?: (
+        inputPath: string,
+        options?: { create?: boolean }
+      ) => Promise<{ ok: true; path: string; created: boolean } | { ok: false; error: string }>;
       /** Creates (if needed) and returns the working directory for agents run without a project. */
       getNoProjectDir?: () => Promise<string>;
       readDirectory: (dirPath: string) => Promise<Array<{
@@ -901,123 +900,6 @@ type OrionCodexBrowserIntegrationStatus = {
           error?: string;
         };
       }>;
-      epicCommitAndPush: (input: {
-        epicId: string;
-        projectPath: string;
-        modelId?: string | null;
-        reasoningEffort?: string | null;
-        epicName?: string;
-        /** Commit message written by the user; empty means the model writes it. */
-        message?: string;
-        /** Commit locally but skip the push (epic "Only commit" tickbox). */
-        skipPush?: boolean;
-        expectedGitRoot?: string;
-        expectedBranch?: string;
-        claimedBranches?: Array<{
-          gitRoot: string;
-          branch: string;
-          sourceBranch?: string;
-          epicName?: string;
-        }>;
-      }) => Promise<{
-        ok: boolean;
-        gitRoot?: string;
-        branch?: string;
-        message?: string;
-        /** The commit landed locally even though a later step (normally push) failed. */
-        committed?: boolean;
-        /** False when skipPush left the commit local. */
-        pushed?: boolean;
-        /** The user aborted the operation mid-flight. */
-        aborted?: boolean;
-        mirrorWarning?: string;
-        error?: string;
-      }>;
-      epicCreatePr: (input: {
-        epicId: string;
-        projectPath: string;
-        modelId?: string | null;
-        reasoningEffort?: string | null;
-        epicName?: string;
-        /** Base branch the PR merges into; defaults to the remote default branch. */
-        baseBranch?: string;
-        /**
-         * PR message written by the user — first line is the title, the rest is
-         * the description. Empty means the model writes both.
-         */
-        message?: string;
-        expectedGitRoot?: string;
-        expectedBranch?: string;
-        claimedBranches?: Array<{
-          gitRoot: string;
-          branch: string;
-          epicName?: string;
-        }>;
-      }) => Promise<{
-        ok: boolean;
-        url?: string;
-        title?: string;
-        gitRoot?: string;
-        branch?: string;
-        baseBranch?: string;
-        alreadyExists?: boolean;
-        /** The user aborted the operation mid-flight. */
-        aborted?: boolean;
-        /** A commit landed before the abort and remains local. */
-        committed?: boolean;
-        mirrorWarning?: string;
-        error?: string;
-      }>;
-      /** Abort the epic's in-flight commit-and-push or open-PR operation. */
-      epicAbortGitOperation: (input: { epicId: string }) => Promise<{
-        ok: boolean;
-        kind?: 'commit' | 'pr';
-      }>;
-      /** Local-git answer for the PR base picker's first paint — no network. */
-      epicLocalPrBase: (input: {
-        projectPath: string;
-        /** The epic's source repository checkout, when it differs from projectPath. */
-        sourceProjectPath?: string;
-      }) => Promise<{
-        ok: boolean;
-        gitRoot?: string;
-        currentBranch?: string | null;
-        sourceBranch?: string | null;
-        /** origin/HEAD as recorded locally; may be stale. */
-        defaultBranch?: string;
-        error?: string;
-      }>;
-      epicListRemoteBranches: (input: {
-        projectPath: string;
-        /** The epic's source repository checkout, when it differs from projectPath. */
-        sourceProjectPath?: string;
-      }) => Promise<{
-        ok: boolean;
-        gitRoot?: string;
-        currentBranch?: string | null;
-        /** Branch checked out in sourceProjectPath — the preferred PR base. */
-        sourceBranch?: string | null;
-        defaultBranch?: string;
-        branches?: string[];
-        error?: string;
-      }>;
-      epicGitStatus: (input: { projectPath: string; prUrl?: string }) => Promise<{
-        ok: boolean;
-        gitRoot?: string;
-        branch?: string;
-        hasChangesToCommit?: boolean;
-        hasUnpushedCommits?: boolean;
-        pr?: { state: 'OPEN' | 'CLOSED' | 'MERGED'; url: string };
-        error?: string;
-      }>;
-      epicPrStates: (input: {
-        epics: Array<{ epicId: string; prUrl: string; projectPath?: string }>;
-      }) => Promise<{
-        ok: boolean;
-        /** Only epics whose lookup succeeded; the rest keep their known state. */
-        states?: Array<{ epicId: string; state: 'OPEN' | 'CLOSED' | 'MERGED' }>;
-        error?: string;
-      }>;
       durangoCliStatus?: () => Promise<DurangoCliStatus>;
       durangoCliSignIn?: () => Promise<{
         ok: boolean;
@@ -1042,6 +924,12 @@ type OrionCodexBrowserIntegrationStatus = {
         hints?: string[];
         configErrors?: string[];
         cliSignedIn?: boolean;
+        error?: string;
+      }>;
+      /** A workspace an agent made itself, looked up by name in the project's repository. */
+      findDurangoWorkspace?: (input: { projectPath: string; name: string }) => Promise<{
+        ok: boolean;
+        workspace?: import('./store').ThreadDurangoWorkspace | null;
         error?: string;
       }>;
       removeDurangoWorkspace?: (input: {
@@ -1321,7 +1209,6 @@ type OrionCodexBrowserIntegrationStatus = {
       runAgentTurn: (input: {
         runId?: string;
         threadId: string;
-        epicId?: string;
         projectPath: string;
         prompt: string;
         modelId: string;
@@ -1431,7 +1318,6 @@ type OrionCodexBrowserIntegrationStatus = {
       /** Claude Code CLI embedded terminal (one PTY per thread, lives in main). */
       terminalEnsure: (input: {
         threadId: string;
-        epicId?: string;
         projectPath: string;
         accessMode: 'read-only' | 'workspace-write' | 'full-access';
         /** Resume this CLI session instead of starting fresh (--resume). */
@@ -1480,7 +1366,6 @@ type OrionCodexBrowserIntegrationStatus = {
         /** Reasoning tier for the hidden turn; null falls back to the cheapest. */
         reasoningEffort?: string | null;
         projectPath?: string;
-        epicId?: string;
       }) => Promise<string>;
       findProjectIcon: (projectPath: string) => Promise<string | null>;
       listOpenWithApps: () => Promise<Array<{ id: string; name: string; icon: string | null }>>;
@@ -1563,7 +1448,6 @@ type OrionCodexBrowserIntegrationStatus = {
       codexGoalCommand: (input: {
         sessionId: string;
         threadId: string;
-        epicId?: string;
         projectPath: string;
         action: 'pause' | 'clear' | 'get';
       }) => Promise<{ ok: boolean; goal?: import('./store').ThreadGoal | null; error?: string }>;
@@ -1649,7 +1533,6 @@ type OrionCodexBrowserIntegrationStatus = {
         machineId: string;
         threadId?: string;
         projectId?: string;
-        epicId?: string;
         modelId?: string;
         accessMode?: 'read-only' | 'workspace-write' | 'full-access';
         reasoningEffort?:
@@ -1668,12 +1551,6 @@ type OrionCodexBrowserIntegrationStatus = {
         claudeContextWindow?: '200k' | '1m';
         prompt: string;
       }) => Promise<{ ok: boolean; threadId?: string; error?: string }>;
-      remoteCreateEpic?: (input: {
-        machineId: string;
-        name: string;
-        description?: string;
-        projectIds?: string[];
-      }) => Promise<{ ok: boolean; epicId?: string; error?: string }>;
       remoteStopTurn?: (input: {
         machineId: string;
         threadId: string;
@@ -1684,7 +1561,6 @@ type OrionCodexBrowserIntegrationStatus = {
         commandId: string;
         ok: boolean;
         threadId?: string;
-        epicId?: string;
         error?: string;
       }) => Promise<{ ok: boolean }>;
       onRemoteState?: (cb: (state: RemoteControlState) => void) => () => void;

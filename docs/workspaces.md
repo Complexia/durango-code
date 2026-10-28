@@ -1,23 +1,38 @@
 # Durango workspaces
 
-Durango Code gives each new thread in a Durango repository its own Durango
-workspace, so parallel agents never edit the same checkout. A workspace is what
-`durango-code ws new` makes: a detached git worktree of the repository's base
-checkout under `~/.durango/ws/<repo>/<name>`, copy-on-write clones of its
+Threads in a Durango repository (one with a `durango.toml`) do their work in a
+Durango workspace, so parallel agents never edit the same checkout. A workspace
+is what `durango-code ws new` makes: a detached git worktree of the repository's
+base checkout under `~/.durango/ws/<repo>/<name>`, copy-on-write clones of its
 `node_modules` and `target` directories, and a private port block in
-`.durango/ws.env`. The app drives the same CLI agents use, so a workspace the
-app made and one an agent made with the CLI are interchangeable.
+`.durango/ws.env`. Agents and the app drive the same CLI, so a workspace the app
+made and one an agent made are interchangeable.
 
-Workspaces replace Rifts (per-epic copy-on-write clones), which were removed.
-Persisted epics lose their Rift pointers on load; any `.rifts/` directories they
-created stay on disk untouched.
+Workspaces replace Rifts (copy-on-write clones), which were removed, as were
+the Epics that owned them. Any `.rifts/` directories they created stay on disk
+untouched.
 
 ## When a thread gets one
 
-On a thread's first turn, before the agent starts, when all of these hold:
+**The agent creates it** when the task starts changing things, following the
+bundled `durango-workspaces` skill (`assets/bundled-skills/durango-workspaces`,
+installed into the agent's skills on first launch). A question or a quick
+look-up is answered straight away from the project directory; only work that
+edits, installs, runs dev servers or opens a change makes a workspace first.
 
-- **Settings → Workspaces → Create a workspace for each new thread** is on (the
-  default);
+When a turn ran `durango-code ws new <name>` successfully, the app attaches
+that workspace to the thread (`adoptAgentWorkspace` in `src/App.tsx`, the
+`durangoWorkspace:find` IPC), marked `adopted`: the header shows it with Land
+and Run dev server, and deleting the thread cleans it up as below. The thread's
+sessions were recorded in the project directory, so its later turns keep
+running there and the agent works in the workspace by path; a fresh session in
+the thread is told where it is in a `[Durango workspace]` prompt block.
+
+**Settings → Workspaces → Create a workspace before each new thread starts**
+(off by default; stores from before agents made their own were switched off
+once) restores the older behaviour: on a thread's first turn, before the agent
+starts, the app creates the workspace when
+
 - the thread's project is inside the main checkout of a git repository with a
   `durango.toml` at its root (a project that is itself a worktree does not
   qualify);
@@ -31,8 +46,9 @@ in a `[Durango workspace]` prompt block, so project instructions that say
 created (dependency clones can take a few seconds) the composer says so; if
 creation fails the turn does not start and the error says why.
 
-Branches and subagents share their source thread's workspace: their sessions
-are forks of sessions recorded there. The deployment agent's thread works where
+Branches and subagents share their source thread's workspace: branches' sessions
+are forks of sessions recorded there; subagents start fresh sessions, so they
+run inside an adopted workspace directly. The deployment agent's thread works where
 the Deploy button acted (the selected thread's workspace, or the project).
 Claude Code CLI (terminal) threads and No project chats work in the project
 directory.

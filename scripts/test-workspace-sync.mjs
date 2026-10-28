@@ -55,18 +55,6 @@ const storeState = {
     { id: 'proj-git', name: 'E2E Git Project', path: repoDir },
     { id: 'proj-plain', name: 'Plain Folder', path: '/tmp/does-not-exist-orion-e2e' },
   ],
-  epics: [
-    {
-      id: 'epic-e2e',
-      name: 'E2E epic',
-      description: 'end to end',
-      repositoryProjectId: 'proj-git',
-      gitBranch: 'orion/e2e',
-      prUrl: 'https://github.com/x/y/pull/9',
-      prState: 'MERGED',
-      createdAt: '2026-07-20T00:00:00Z',
-    },
-  ],
 };
 
 const threadsData = {
@@ -74,7 +62,6 @@ const threadsData = {
     {
       id: 'thread-claude',
       projectId: 'proj-git',
-      epicId: 'epic-e2e',
       title: 'Claude thread',
       status: 'done',
       modelId: 'claude:claude-fable-5',
@@ -185,7 +172,6 @@ const state = await (
   })
 ).json();
 assert(state.projects.length === 2, 'server has 2 projects');
-assert(state.epics.length === 1, 'server has 1 epic');
 assert(
   state.threads.length === 2 && state.threads.every((thread) => thread.transcriptHash),
   'server confirmed both transcripts'

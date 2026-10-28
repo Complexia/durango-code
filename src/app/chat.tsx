@@ -1,12 +1,11 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, FileText, Folder, MessageSquare, Plus, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
+import { Brain, Check, ChevronDown, ChevronRight, CircleCheck, Copy, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import { isNoProjectId, NO_PROJECT_ID, type BtwExchange, type ChangedFileSummary, type LinkedBoardTask, type Message, type Project, type Thread, useOrionStore } from '../store';
+import { isNoProjectId, type BtwExchange, type LinkedBoardTask, type Message, type Thread, useOrionStore } from '../store';
 import type { AgentModel } from '../agentCatalog';
 import { SessionImportCard } from './SessionImport';
 import { agentProviders } from '../agentCatalog';
-import { ProjectIcon } from './ProjectIcon';
-import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, formatTurnStats, PinnedRunStatus, useRunTicker } from './activity';
+import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
 import {
   MarkdownBaseDirContext,
@@ -43,102 +42,6 @@ export const CopyMessageButton: React.FC<{ text: string; className?: string }> =
     >
       {copied ? <Check size={14} /> : <Copy size={14} />}
     </button>
-  );
-};
-
-export const changedFileStatusLabels: Record<ChangedFileSummary['status'], string> = {
-  added: 'A',
-  copied: 'C',
-  conflicted: '!',
-  deleted: 'D',
-  modified: 'M',
-  renamed: 'R',
-  untracked: 'U',
-};
-
-// Long change lists collapse to the first few files; a toggle reveals the rest.
-export const CHANGED_FILES_COLLAPSED_LIMIT = 10;
-
-export const ChangedFilesCard: React.FC<{ files: ChangedFileSummary[] }> = ({ files }) => {
-  const [expanded, setExpanded] = useState(false);
-  // Header totals always cover every file, even while the list is collapsed.
-  const totals = files.reduce(
-    (sum, file) => ({
-      additions: sum.additions + file.additions,
-      deletions: sum.deletions + file.deletions,
-    }),
-    { additions: 0, deletions: 0 }
-  );
-  const collapsible = files.length > CHANGED_FILES_COLLAPSED_LIMIT;
-  const visibleFiles =
-    collapsible && !expanded ? files.slice(0, CHANGED_FILES_COLLAPSED_LIMIT) : files;
-  const groups = visibleFiles.reduce<Array<{ directory: string; files: ChangedFileSummary[] }>>(
-    (result, file) => {
-      const lastSlash = file.path.lastIndexOf('/');
-      const directory = lastSlash >= 0 ? file.path.slice(0, lastSlash) : '.';
-      const existing = result.find((group) => group.directory === directory);
-      if (existing) {
-        existing.files.push(file);
-      } else {
-        result.push({ directory, files: [file] });
-      }
-      return result;
-    },
-    []
-  );
-
-  return (
-    <div className="changed-files-card">
-      <div className="changed-files-header">
-        <span>Changed files ({files.length})</span>
-        <span className="changed-files-totals">
-          <span className="diff-add">+{totals.additions}</span>
-          <span>/</span>
-          <span className="diff-delete">-{totals.deletions}</span>
-        </span>
-      </div>
-      {files.length === 0 ? (
-        <div className="changed-files-empty">No files changed.</div>
-      ) : (
-        <div className="changed-files-list">
-          {groups.map((group) => (
-            <div key={group.directory} className="changed-files-group">
-              <div className="changed-files-directory" title={group.directory}>
-                <Folder size={15} />
-                <span>{group.directory}</span>
-              </div>
-              {group.files.map((file) => {
-                const name = file.path.split('/').pop() ?? file.path;
-                return (
-                  <div key={file.path} className="changed-file-row" title={file.path}>
-                    <span className={`changed-file-status ${file.status}`}>
-                      {changedFileStatusLabels[file.status]}
-                    </span>
-                    <FileText size={14} />
-                    <span className="changed-file-name">{name}</span>
-                    <span className="changed-file-counts">
-                      <span className="diff-add">+{file.additions}</span>
-                      <span>/</span>
-                      <span className="diff-delete">-{file.deletions}</span>
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          ))}
-          {collapsible && (
-            <button
-              className="changed-files-show-more"
-              onClick={() => setExpanded((current) => !current)}
-            >
-              {expanded
-                ? 'Show fewer'
-                : `Show all ${files.length} files (${files.length - CHANGED_FILES_COLLAPSED_LIMIT} more)`}
-            </button>
-          )}
-        </div>
-      )}
-    </div>
   );
 };
 
@@ -380,6 +283,119 @@ export const ProviderAuthPrompt: React.FC<{
   );
 };
 
+// "Working for 5s" while the run is live: its own ticking component, so the
+// memoized message around it doesn't re-render every second.
+const RunElapsed: React.FC<{ startedAt?: string; completedAt?: string; running: boolean }> = ({
+  startedAt,
+  completedAt,
+  running,
+}) => {
+  useRunTicker(running);
+  const duration = formatRunDuration(startedAt, completedAt);
+  return <>{duration || '0s'}</>;
+};
+
+/**
+ * One agent turn, as in T3 Code: no cards. A plain "Working for 5s" line
+ * heads the live turn with its steps listed flat underneath; once it ends the
+ * line reads "Worked for 8s ›" and the steps fold away behind it, leaving the
+ * final answer. Stops, failures and background waits keep their status line.
+ */
+const AgentRunMessage: React.FC<{
+  message: Message;
+  runRunning?: boolean;
+  btwExchanges: BtwExchange[];
+  renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
+  onAuthenticateProvider?: (providerId: string) => void;
+  authenticatingProviderId?: string | null;
+}> = ({ message, runRunning, btwExchanges, renderBtwAside, onAuthenticateProvider, authenticatingProviderId }) => {
+  const isRunning = message.status === 'running';
+  const [stepsOpen, setStepsOpen] = useState(false);
+  const hasContent = message.content.trim().length > 0;
+  const activities = message.activities ?? [];
+  const showStatusText = !!message.statusText && !isRunning && message.statusText !== 'Finished.';
+  const segments = buildAgentRunSegments(message.content, activities, btwExchanges);
+  // Folded: only what came after the last step (the answer). With no steps
+  // there is nothing to fold.
+  const lastStepIndex = segments.reduce((last, segment, index) => (segment.kind === 'activities' ? index : last), -1);
+  const foldable = !isRunning && lastStepIndex >= 0;
+  const folded = foldable && !stepsOpen;
+  const visibleSegments = folded ? segments.slice(lastStepIndex + 1) : segments;
+  const lastSegment = segments.at(-1);
+  // Between steps (or before the first), say the agent is thinking.
+  const thinking =
+    isRunning &&
+    (!lastSegment ||
+      (lastSegment.kind === 'activities' &&
+        !lastSegment.activities.some((activity) => activity.status === 'running' || activity.status === 'waiting')));
+
+  return (
+    <div className={`message agent agent-run ${message.status ?? ''}`}>
+      {(isRunning || message.startedAt) && (
+        <div className="agent-run-header">
+          {foldable ? (
+            <button
+              type="button"
+              className="agent-run-header-toggle"
+              onClick={() => setStepsOpen((open) => !open)}
+              aria-expanded={stepsOpen}
+              title={stepsOpen ? 'Hide the steps' : 'Show the steps'}
+            >
+              Worked for <RunElapsed startedAt={message.startedAt} completedAt={message.completedAt} running={false} />
+              <ChevronRight size={14} className={`agent-run-header-chevron${stepsOpen ? ' open' : ''}`} />
+            </button>
+          ) : (
+            <span>
+              {isRunning ? 'Working for ' : 'Worked for '}
+              <RunElapsed startedAt={message.startedAt} completedAt={message.completedAt} running={isRunning} />
+            </span>
+          )}
+        </div>
+      )}
+      {showStatusText && (
+        <div className="agent-status-line">
+          <span>{message.statusText}</span>
+        </div>
+      )}
+      {visibleSegments.map((segment, index) =>
+        segment.kind === 'activities' ? (
+          <AgentActivityCard
+            key={segment.activities[0].id}
+            activities={segment.activities}
+            runStatus={message.status}
+            runRunning={runRunning}
+          />
+        ) : segment.kind === 'btw' ? (
+          <React.Fragment key={`btw-${segment.exchange.id}`}>{renderBtwAside?.(segment.exchange)}</React.Fragment>
+        ) : segment.text.trim() ? (
+          <StreamingMarkdownContent key={`text-${index}`} content={segment.text} />
+        ) : null
+      )}
+      {thinking && (
+        <div className="agent-tool-row thinking">
+          <span className="agent-tool-icon">
+            <Brain size={15} />
+          </span>
+          <span className="agent-tool-text">
+            <span className="agent-tool-title">Thinking</span>
+          </span>
+        </div>
+      )}
+      {message.error &&
+        (message.authProviderId && onAuthenticateProvider ? (
+          <ProviderAuthPrompt
+            providerId={message.authProviderId}
+            onAuthenticate={onAuthenticateProvider}
+            busy={authenticatingProviderId === message.authProviderId}
+          />
+        ) : (
+          <div className="agent-error">{message.error}</div>
+        ))}
+      {hasContent && !isRunning && <CopyMessageButton text={message.content} />}
+    </div>
+  );
+};
+
 export type ChatMessageProps = {
   message: Message;
   /** Whether work owned by this turn is still live, including background agents. */
@@ -412,7 +428,6 @@ export const ChatMessage = React.memo(function ChatMessage({
   const attachments = message.attachments ?? [];
   const messageTasks = message.linkedTasks ?? [];
   const isAgentRun = message.role === 'agent' && message.kind === 'agent-run';
-  const isRunning = isAgentRun && message.status === 'running';
   const backgroundIntervention = message.claudeBackgroundIntervention;
 
   if (message.kind === 'claude-background-intervention' && backgroundIntervention) {
@@ -462,59 +477,15 @@ export const ChatMessage = React.memo(function ChatMessage({
   }
 
   if (isAgentRun) {
-    const duration = formatRunDuration(message.startedAt, message.completedAt);
-    const hasContent = message.content.trim().length > 0;
-    const statsSummary = message.stats ? formatTurnStats(message.stats) : '';
-
     return (
-      <div className={`message agent agent-run ${message.status ?? ''}`}>
-        {!isRunning && (
-          <div className="agent-response-divider">
-            <span>
-              Response{duration && ` · worked for ${duration}`}
-              {statsSummary && <span className="agent-response-stats"> · {statsSummary}</span>}
-            </span>
-            {hasContent && <CopyMessageButton text={message.content} className="in-divider" />}
-          </div>
-        )}
-        {message.statusText && !isRunning && (
-          <div className="agent-status-line">
-            <span>{message.statusText}</span>
-          </div>
-        )}
-        {buildAgentRunSegments(message.content, message.activities ?? [], btwExchanges).map((segment, index) =>
-          segment.kind === 'activities' ? (
-            <AgentActivityCard
-              key={segment.activities[0].id}
-              activities={segment.activities}
-              runStatus={message.status}
-              runRunning={runRunning}
-            />
-          ) : segment.kind === 'btw' ? (
-            <React.Fragment key={`btw-${segment.exchange.id}`}>
-              {renderBtwAside?.(segment.exchange)}
-            </React.Fragment>
-          ) : segment.text.trim() ? (
-            <StreamingMarkdownContent key={`text-${index}`} content={segment.text} />
-          ) : null
-        )}
-        {!hasContent &&
-          isRunning &&
-          !message.activities?.length && (
-            <div className="agent-empty-output">Waiting for the agent to produce output...</div>
-          )}
-        {!isRunning && message.changedFiles && <ChangedFilesCard files={message.changedFiles} />}
-        {message.error &&
-          (message.authProviderId && onAuthenticateProvider ? (
-            <ProviderAuthPrompt
-              providerId={message.authProviderId}
-              onAuthenticate={onAuthenticateProvider}
-              busy={authenticatingProviderId === message.authProviderId}
-            />
-          ) : (
-            <div className="agent-error">{message.error}</div>
-          ))}
-      </div>
+      <AgentRunMessage
+        message={message}
+        runRunning={runRunning}
+        btwExchanges={btwExchanges}
+        renderBtwAside={renderBtwAside}
+        onAuthenticateProvider={onAuthenticateProvider}
+        authenticatingProviderId={authenticatingProviderId}
+      />
     );
   }
 
@@ -588,45 +559,16 @@ export const ChatMessage = React.memo(function ChatMessage({
 
 export const AgentsWelcome: React.FC<{
   projectName?: string | null;
-  /** When provided (and changing is allowed), the project name becomes a dropdown. */
-  projects?: Project[];
   selectedProjectId?: string | null;
   canChangeProject?: boolean;
-  onSelectProject?: (projectId: string) => void;
-  onAddProject?: () => void;
+  /** When provided (and changing is allowed), the project name opens the project picker. */
+  onOpenProjectPicker?: () => void;
   /** Enables the Claude Code / Codex import card above the heading. */
   agentModels?: AgentModel[];
-}> = ({
-  projectName,
-  projects,
-  selectedProjectId,
-  canChangeProject,
-  onSelectProject,
-  onAddProject,
-  agentModels,
-}) => {
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const pickerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!pickerOpen) return;
-    const handlePointerDown = (event: MouseEvent) => {
-      if (!pickerRef.current?.contains(event.target as Node)) setPickerOpen(false);
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setPickerOpen(false);
-    };
-    document.addEventListener('mousedown', handlePointerDown);
-    document.addEventListener('keydown', handleKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', handlePointerDown);
-      document.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [pickerOpen]);
-
+}> = ({ projectName, selectedProjectId, canChangeProject, onOpenProjectPicker, agentModels }) => {
   // Always interactive when changing is allowed: "No project" is an option
   // even before any project has been added.
-  const interactive = !!canChangeProject && !!onSelectProject;
+  const interactive = !!canChangeProject && !!onOpenProjectPicker;
   const noProject = isNoProjectId(selectedProjectId);
 
   return (
@@ -638,70 +580,17 @@ export const AgentsWelcome: React.FC<{
       <h2>
         {noProject ? 'What should we work on' : 'What should we build in'}{' '}
         {interactive ? (
-          <span className="agents-welcome-project" ref={pickerRef}>
+          <span className="agents-welcome-project">
             <button
               type="button"
               className="agents-welcome-project-trigger"
-              onClick={() => setPickerOpen((open) => !open)}
-              aria-haspopup="menu"
-              aria-expanded={pickerOpen}
+              onClick={onOpenProjectPicker}
+              aria-haspopup="dialog"
               title="Change project"
             >
               <strong>{noProject ? 'without a project' : (projectName ?? 'this project')}</strong>
-              <ChevronDown
-                size={18}
-                className={`agents-welcome-project-chevron ${pickerOpen ? 'open' : ''}`}
-              />
+              <ChevronDown size={18} className="agents-welcome-project-chevron" />
             </button>
-            {pickerOpen && (
-              <div className="shell-project-picker agents-welcome-project-picker" role="menu">
-                <button
-                  type="button"
-                  className={`project-picker-item ${noProject ? 'selected' : ''}`}
-                  onClick={() => {
-                    setPickerOpen(false);
-                    onSelectProject!(NO_PROJECT_ID);
-                  }}
-                  title="Chat with an agent outside of any project"
-                >
-                  <MessageSquare size={13} />
-                  <span className="truncate">No project</span>
-                  {noProject && <Check size={13} />}
-                </button>
-                {(projects?.length ?? 0) > 0 && <div className="project-picker-divider" />}
-                {(projects ?? []).map((option) => (
-                  <button
-                    key={option.id}
-                    type="button"
-                    className={`project-picker-item ${option.id === selectedProjectId ? 'selected' : ''}`}
-                    onClick={() => {
-                      setPickerOpen(false);
-                      onSelectProject!(option.id);
-                    }}
-                    title={option.path}
-                  >
-                    <ProjectIcon projectPath={option.path} size={13} />
-                    <span className="truncate">{option.name}</span>
-                    {option.id === selectedProjectId && <Check size={13} />}
-                  </button>
-                ))}
-                {onAddProject && (
-                  <>
-                    <div className="project-picker-divider" />
-                    <button
-                      type="button"
-                      className="project-picker-item"
-                      onClick={() => {
-                        setPickerOpen(false);
-                        onAddProject();
-                      }}
-                    >
-                      <Plus size={13} /> Add project
-                    </button>
-                  </>
-                )}
-              </div>
-            )}
           </span>
         ) : (
           <strong>{noProject ? 'without a project' : (projectName ?? 'this project')}</strong>
@@ -729,11 +618,9 @@ export type PaneChatRefs = {
 export type ChatTranscriptProps = {
   threadId: string;
   projectName?: string | null;
-  /** Welcome-screen project dropdown (only used while the thread is empty). */
-  projects?: Project[];
+  /** Welcome-screen project picker (only used while the thread is empty). */
   canChangeProject?: boolean;
-  onSelectProject?: (projectId: string) => void;
-  onAddProject?: () => void;
+  onOpenProjectPicker?: () => void;
   /** Models available for imported Claude Code / Codex threads (welcome screen). */
   agentModels?: AgentModel[];
   mediaBaseDirs: string[];
@@ -770,10 +657,8 @@ export type ChatTranscriptProps = {
 export const ChatTranscript = React.memo(function ChatTranscript({
   threadId,
   projectName,
-  projects,
   canChangeProject,
-  onSelectProject,
-  onAddProject,
+  onOpenProjectPicker,
   agentModels,
   mediaBaseDirs,
   isSending,
@@ -824,17 +709,6 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     };
   }, [latestAgentRun]);
 
-  const runningAgentMessage = useMemo(() => {
-    const messages = thread?.messages;
-    if (!messages) return null;
-    for (let index = messages.length - 1; index >= 0; index--) {
-      const message = messages[index];
-      if (message.role === 'agent' && message.kind === 'agent-run' && message.status === 'running') {
-        return message;
-      }
-    }
-    return null;
-  }, [thread?.messages]);
 
   const { btwAsidesByAnchor, leadingBtwAsides, trailingBtwAsides } = useMemo(() => {
     const byAnchor = new Map<string, BtwExchange[]>();
@@ -1033,11 +907,9 @@ export const ChatTranscript = React.memo(function ChatTranscript({
             {thread.messages.length === 0 && (
               <AgentsWelcome
                 projectName={projectName}
-                projects={projects}
                 selectedProjectId={thread.projectId}
                 canChangeProject={canChangeProject}
-                onSelectProject={onSelectProject}
-                onAddProject={onAddProject}
+                onOpenProjectPicker={onOpenProjectPicker}
                 agentModels={agentModels}
               />
             )}
@@ -1147,7 +1019,6 @@ export const ChatTranscript = React.memo(function ChatTranscript({
         />
       )}
 
-      {runningAgentMessage && <PinnedRunStatus message={runningAgentMessage} />}
     </div>
   );
 });

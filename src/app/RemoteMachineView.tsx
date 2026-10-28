@@ -7,14 +7,13 @@ import {
   RefreshCw,
   Send,
   Square,
-  SquareKanban,
 } from 'lucide-react';
 import type { Thread } from '../store';
 import type { RemoteEvent, RemoteSnapshot, RemoteThreadMeta } from '../types';
 import { createLatestOperationGate } from './remote-operation-gate';
 import { formatShortTime } from './time';
 
-// Read-and-drive view of a paired machine's workspace: its projects, epics,
+// Read-and-drive view of a paired machine's workspace: its projects
 // and threads, a simplified transcript, and a composer that starts/continues
 // turns on the remote host. Truth lives on the host — this component only
 // mirrors host snapshots and refreshes when the host pushes change events, so
@@ -342,10 +341,6 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
     }
     return map;
   }, [visibleThreads]);
-  const epicById = React.useMemo(
-    () => new Map((snapshot?.epics ?? []).map((epic) => [epic.id, epic])),
-    [snapshot]
-  );
   const selectedMeta = visibleThreads.find((candidate) => candidate.id === selectedThreadId) ?? null;
   const liveStatus = thread?.status ?? selectedMeta?.status;
   const running = liveStatus === 'running';
@@ -429,25 +424,21 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
                   </button>
                 </div>
                 {!collapsed &&
-                  projectThreads.map((meta) => {
-                    const epic = meta.epicId ? epicById.get(meta.epicId) : undefined;
-                    return (
-                      <button
-                        key={meta.id}
-                        type="button"
-                        className={`remote-thread-item${selectedThreadId === meta.id ? ' selected' : ''}`}
-                        onClick={() => selectThread(meta)}
-                        title={epic ? `${meta.title}\nEpic: ${epic.name}` : meta.title}
-                      >
-                        <span className={`remote-thread-dot ${meta.status}`} />
-                        <span className="truncate">{meta.title}</span>
-                        {epic && <SquareKanban size={11} className="remote-thread-epic-icon" />}
-                        <span className="remote-thread-time">
-                          {meta.updatedAt ? formatShortTime(new Date(meta.updatedAt)) : ''}
-                        </span>
-                      </button>
-                    );
-                  })}
+                  projectThreads.map((meta) => (
+                    <button
+                      key={meta.id}
+                      type="button"
+                      className={`remote-thread-item${selectedThreadId === meta.id ? ' selected' : ''}`}
+                      onClick={() => selectThread(meta)}
+                      title={meta.title}
+                    >
+                      <span className={`remote-thread-dot ${meta.status}`} />
+                      <span className="truncate">{meta.title}</span>
+                      <span className="remote-thread-time">
+                        {meta.updatedAt ? formatShortTime(new Date(meta.updatedAt)) : ''}
+                      </span>
+                    </button>
+                  ))}
               </div>
             );
           })}
