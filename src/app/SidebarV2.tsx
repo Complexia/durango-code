@@ -83,7 +83,7 @@ export type SidebarV2Model = {
   views: SidebarV2ViewsSettings;
   setViewVisible: (view: SidebarV2View, visible: boolean) => void;
   /** Threads with a question or approval waiting on the user. */
-  attentionThreadIds: ReadonlySet<string>;
+  attentionThreadIds: ReadonlyMap<string, number>;
   /** A project picked in search: v2 starts a new thread there. */
   selectProject: (id: string) => void;
   handleNewAgent: () => void;

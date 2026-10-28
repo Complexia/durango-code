@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Thread } from '../store';
+import { getThreadActivityTime } from './time';
 
 export type SidebarV2View = 'pinned' | 'recent' | 'snoozed' | 'settled';
 export type SidebarV2ViewsSettings = Record<SidebarV2View, boolean>;
@@ -51,6 +52,32 @@ export const sidebarV2ThreadLists = (
 };
 
 /**
+ * Where a thread sits in sidebar v2's Recent list: newest event first. A
+ * thread moves up when it is created or sent a message, when its run ends,
+ * and when it starts needing the user (`attentionSince`); streaming output
+ * doesn't move it. So the thread you just started stays on top, and another
+ * one only passes it by finishing or asking for you.
+ */
+export const sidebarV2RecentRank = (thread: Thread, attentionSince?: number) => {
+  const time = (value?: string) => {
+    const parsed = value ? Date.parse(value) : NaN;
+    return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+  };
+  const last = thread.messages.at(-1);
+  return Math.max(
+    getThreadActivityTime(thread).getTime(),
+    thread.status === 'running' ? Number.NEGATIVE_INFINITY : time(last?.completedAt),
+    time(thread.wokeAt),
+    time(thread.unpinnedAt),
+    attentionSince ?? Number.NEGATIVE_INFINITY
+  );
+};
+
+export const compareSidebarV2Recent =
+  (attentionSince: ReadonlyMap<string, number>) => (a: Thread, b: Thread) =>
+    sidebarV2RecentRank(b, attentionSince.get(b.id)) - sidebarV2RecentRank(a, attentionSince.get(a.id));
+
+/**
  * How long a thread's agents have worked: the sum of its runs, from start to
  * completion (a run still going counts up to `now`).
  */
@@ -85,7 +112,8 @@ const fetchPendingInput = async (threadId: string) => {
 };
 
 /**
- * Threads with a question or approval waiting on the user. Agents announce a
+ * Threads with a question or approval waiting on the user, each with when it
+ * started waiting (for the Recent order). Agents announce a
  * new (or answered) request with a `user-input` turn event; the pending list
  * itself lives in the main process, so it is re-read for that thread. Running
  * threads are checked once on mount to pick up requests from before a reload.
@@ -97,8 +125,8 @@ export const useThreadsNeedingInput = (
   enabled: boolean,
   runningThreadIds: string[],
   onAttention: (threadId: string) => void
-): ReadonlySet<string> => {
-  const [pending, setPending] = useState<ReadonlySet<string>>(() => new Set());
+): ReadonlyMap<string, number> => {
+  const [pending, setPending] = useState<ReadonlyMap<string, number>>(() => new Map());
   const onAttentionRef = useRef(onAttention);
   onAttentionRef.current = onAttention;
   const generationRef = useRef(new Map<string, number>());
@@ -106,7 +134,7 @@ export const useThreadsNeedingInput = (
 
   useEffect(() => {
     if (!enabled) {
-      setPending((current) => (current.size ? new Set() : current));
+      setPending((current) => (current.size ? new Map() : current));
       return undefined;
     }
     let disposed = false;
@@ -122,8 +150,8 @@ export const useThreadsNeedingInput = (
       if (disposed || generationRef.current.get(threadId) !== generation) return;
       setPending((current) => {
         if (current.has(threadId) === waiting) return current;
-        const next = new Set(current);
-        if (waiting) next.add(threadId);
+        const next = new Map(current);
+        if (waiting) next.set(threadId, Date.now());
         else next.delete(threadId);
         return next;
       });

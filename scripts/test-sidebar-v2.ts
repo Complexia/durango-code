@@ -14,7 +14,8 @@ Object.assign(globalThis, {
   window: { addEventListener() {}, localStorage: { getItem: () => null }, orion: bridge },
 });
 const { useOrionStore, defaultSidebarV2Settings } = await import('../src/store');
-const { formatWorkedDuration, sidebarV2ThreadLists, threadSidebarTone, threadWorkedMs } = await import('../src/app/threadLists');
+const { compareSidebarV2Recent, formatWorkedDuration, sidebarV2ThreadLists, threadSidebarTone, threadWorkedMs } =
+  await import('../src/app/threadLists');
 const { projectMonogram } = await import('../src/app/ProjectBadge');
 
 const store = useOrionStore.getState;
@@ -112,6 +113,46 @@ assert.deepEqual(
   }
 );
 assert.ok(lists.snoozed[0].pinnedAt, 'a snoozed pinned thread stays pinned');
+
+// Recent is newest event first: the thread you just started sits above
+// threads still running from before, and another thread passes it only by
+// finishing or by asking for you. Streaming doesn't reorder running threads.
+const iso = (minute: number) => new Date(Date.UTC(2026, 9, 28, 0, minute)).toISOString();
+const runningFrom = (id: string, minute: number) =>
+  make(id, {
+    status: 'running',
+    createdAt: iso(minute),
+    messages: [
+      { id: `${id}-u`, role: 'user', content: 'go', ts: iso(minute) },
+      { id: `${id}-r`, role: 'agent', kind: 'agent-run', content: '', ts: iso(minute), status: 'running', startedAt: iso(minute) },
+    ],
+  });
+const finishedAt = (id: string, started: number, completed: number) => {
+  const run = runningFrom(id, started);
+  return {
+    ...run,
+    status: 'done' as const,
+    messages: [run.messages[0], { ...run.messages[1], status: 'done', completedAt: iso(completed) }],
+  };
+};
+const order = (list: typeof threads, attention = new Map<string, number>()) =>
+  [...list].sort(compareSidebarV2Recent(attention)).map((entry) => entry.id);
+const blankDraft = make('draft', { createdAt: iso(30), messages: [] });
+assert.deepEqual(
+  order([runningFrom('older', 10), runningFrom('old', 20), blankDraft, finishedAt('done', 0, 5)]),
+  ['draft', 'old', 'older', 'done'],
+  'a new thread goes on top of threads already working'
+);
+assert.deepEqual(
+  order([runningFrom('newest', 30), finishedAt('just-finished', 10, 40), runningFrom('older', 20)]),
+  ['just-finished', 'newest', 'older'],
+  'finishing moves a thread above the newest one'
+);
+assert.deepEqual(
+  order([runningFrom('newest', 30), runningFrom('asking', 10)], new Map([['asking', Date.parse(iso(35))]])),
+  ['asking', 'newest'],
+  'needing the user moves a thread above the newest one'
+);
 
 // The row's number is how long the thread's agents worked, summed over runs.
 const runThread = {

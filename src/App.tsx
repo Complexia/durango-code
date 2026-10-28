@@ -117,7 +117,7 @@ import { CodeWorkspace } from './app/CodeWorkspace';
 import { AgentsSidebar, type AgentsSidebarModel, MachinesAndSavedViews, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
 import { ProjectPickerModal, type ProjectPickerView } from './app/ProjectPickerModal';
-import { sidebarV2ThreadLists, useStableIdList, useThreadsNeedingInput } from './app/threadLists';
+import { compareSidebarV2Recent, sidebarV2ThreadLists, useStableIdList, useThreadsNeedingInput } from './app/threadLists';
 import { ThreadPane } from './app/ThreadPane';
 import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
@@ -1993,29 +1993,6 @@ const App: React.FC = () => {
   }, [uiScale]);
   const sidebarV2Enabled = sidebarV2Settings?.enabled ?? defaultSidebarV2Settings.enabled;
   const sidebarV2Views = sidebarV2Settings?.views ?? defaultSidebarV2Settings.views;
-  // A blank draft (nothing sent, nothing typed) is just the composer the
-  // Agents panel opens with nothing else to show; it joins the list once used.
-  // CLI threads keep their conversation in the terminal, so they always show.
-  const sidebarV2Lists = useMemo(
-    () =>
-      sidebarV2ThreadLists(
-        sidebarV2Enabled
-          ? threads.filter(
-              (thread) =>
-                thread.messages.length > 0 ||
-                thread.status === 'running' ||
-                thread.modelId === claudeCodeCliModelId ||
-                !!thread.pinnedAt ||
-                !!thread.snoozedAt ||
-                !!thread.settledAt ||
-                typedDraftThreadIds.has(thread.id)
-            )
-          : [],
-        (thread) => childThreadIds.has(thread.id),
-        compareRecentThreadOrder
-      ),
-    [childThreadIds, sidebarV2Enabled, threads, typedDraftThreadIds]
-  );
   const runningThreadIds = useStableIdList(
     threads.filter((thread) => thread.status === 'running').map((thread) => thread.id)
   );
@@ -2035,6 +2012,29 @@ const App: React.FC = () => {
     [updateThread]
   );
   const threadsNeedingInput = useThreadsNeedingInput(sidebarV2Enabled, runningThreadIds, wakeThreadForAttention);
+  // A blank draft (nothing sent, nothing typed) is just the composer the
+  // Agents panel opens with nothing else to show; it joins the list once used.
+  // CLI threads keep their conversation in the terminal, so they always show.
+  const sidebarV2Lists = useMemo(
+    () =>
+      sidebarV2ThreadLists(
+        sidebarV2Enabled
+          ? threads.filter(
+              (thread) =>
+                thread.messages.length > 0 ||
+                thread.status === 'running' ||
+                thread.modelId === claudeCodeCliModelId ||
+                !!thread.pinnedAt ||
+                !!thread.snoozedAt ||
+                !!thread.settledAt ||
+                typedDraftThreadIds.has(thread.id)
+            )
+          : [],
+        (thread) => childThreadIds.has(thread.id),
+        compareSidebarV2Recent(threadsNeedingInput)
+      ),
+    [childThreadIds, sidebarV2Enabled, threads, threadsNeedingInput, typedDraftThreadIds]
+  );
   const setSidebarV2ViewVisible = useCallback(
     (view: keyof SidebarV2Settings['views'], visible: boolean) =>
       setSidebarV2Settings({ views: { ...useOrionStore.getState().sidebarV2Settings.views, [view]: visible } }),
