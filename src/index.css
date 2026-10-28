@@ -6,7 +6,7 @@
 :root {
   --sidebar-width: 280px;
   /* The agents column: transcript, agent switcher, composer and branch bar. */
-  --chat-column-width: 980px;
+  --chat-column-width: 820px;
   --shell-height: 58px;
   --bg-base: #101012;
   --bg-raised: #141416;
@@ -3316,7 +3316,7 @@ body {
 
 .chat-container {
   min-height: 100%;
-  padding: 24px 20px 12px;
+  padding: 24px 32px 12px;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -4867,7 +4867,7 @@ body {
 }
 
 .chat-input-area {
-  padding: 12px 20px 18px;
+  padding: 12px 32px 18px;
   background: linear-gradient(180deg, transparent, rgb(20 20 22 / 90%));
   position: relative;
   flex-shrink: 0;

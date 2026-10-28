@@ -95,6 +95,12 @@ export const defaultDeploymentSettings: DeploymentSettings = {
 export type SidebarV2Settings = {
   enabled: boolean;
   views: { pinned: boolean; recent: boolean; snoozed: boolean; settled: boolean };
+  /**
+   * Set once the threads from before sidebar v2 were settled. The first time
+   * it is turned on, every listed thread except pinned ones is settled so the
+   * sidebar starts empty instead of holding the whole history.
+   */
+  settledExistingAt?: string;
 };
 
 /** Settings → Cosmetics. */
@@ -113,6 +119,17 @@ export const defaultSidebarV2Settings: SidebarV2Settings = {
   enabled: false,
   views: { pinned: true, recent: true, snoozed: false, settled: false },
 };
+
+/**
+ * Settles every thread sidebar v2 would list (not pinned, snoozed, settled or
+ * running), as if the user had clicked Settle on each.
+ */
+const settleThreadsForSidebarV2 = (threads: Thread[], at: string): Thread[] =>
+  threads.map((thread) =>
+    thread.pinnedAt || thread.snoozedAt || thread.settledAt || thread.status === 'running'
+      ? thread
+      : { ...thread, settledAt: at, wokeAt: undefined, wokeReason: undefined, finishedUnseenAt: undefined }
+  );
 
 /**
  * Durango workspaces (docs/workspaces.md): an isolated checkout per thread.
@@ -1643,8 +1660,8 @@ export const useOrionStore = create<OrionState>()(
         })),
 
       setSidebarV2Settings: (updates) =>
-        set((state) => ({
-          sidebarV2Settings: {
+        set((state) => {
+          const sidebarV2Settings: SidebarV2Settings = {
             ...defaultSidebarV2Settings,
             ...state.sidebarV2Settings,
             ...updates,
@@ -1653,8 +1670,14 @@ export const useOrionStore = create<OrionState>()(
               ...state.sidebarV2Settings?.views,
               ...updates.views,
             },
-          },
-        })),
+          };
+          if (!sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return { sidebarV2Settings };
+          const at = new Date().toISOString();
+          return {
+            sidebarV2Settings: { ...sidebarV2Settings, settledExistingAt: at },
+            threads: settleThreadsForSidebarV2(state.threads, at),
+          };
+        }),
 
       createThread: (projectId, title, options) => {
         // Inherit model + settings from the most recently used thread in the
@@ -2682,11 +2705,21 @@ useOrionStore.subscribe((state, previous) => {
 // throttle-window later: the store file stops embedding threads on its first
 // post-hydration save, so until this flush runs the transcripts exist only in
 // memory and a crash would lose them.
+//
+// Stores that turned sidebar v2 on before the first-switch settle existed get
+// it once here rather than in `merge`: thread edits made during hydration are
+// never saved, while this one goes through the saver like a user's.
+const settleThreadsFromBeforeSidebarV2 = () => {
+  const { sidebarV2Settings, setSidebarV2Settings } = useOrionStore.getState();
+  if (threadsPersistenceBlocked || !sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return;
+  setSidebarV2Settings({});
+};
 useOrionStore.persist.onFinishHydration(() => {
   if (!loadedThreadsFromStorage && !threadsPersistenceBlocked) {
     for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
     pendingThreadOrder = true;
   }
+  settleThreadsFromBeforeSidebarV2();
   flushThreadsSave();
 });
 if (useOrionStore.persist.hasHydrated()) {
@@ -2694,6 +2727,7 @@ if (useOrionStore.persist.hasHydrated()) {
     for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
     pendingThreadOrder = true;
   }
+  settleThreadsFromBeforeSidebarV2();
   flushThreadsSave();
 }
 

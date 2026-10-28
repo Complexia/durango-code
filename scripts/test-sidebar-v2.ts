@@ -66,6 +66,23 @@ store().updateThread(onScreen, { settledAt: new Date().toISOString() });
 store().updateThread(onScreen, { status: 'running' });
 assert.equal(thread(onScreen).settledAt, undefined, 'running again unsettles');
 
+// Turning sidebar v2 on the first time settles the threads from before it,
+// except pinned ones (and running or snoozed ones); later toggles don't.
+const old = store().createThread(projectId, 'Old', { select: false });
+const pinned = store().createThread(projectId, 'Pinned', { select: false });
+store().updateThread(pinned, { pinnedAt: new Date().toISOString() });
+store().setSidebarV2Settings({ enabled: true });
+assert.ok(store().sidebarV2Settings.settledExistingAt);
+assert.ok(thread(old).settledAt, 'an existing thread is settled');
+assert.equal(thread(pinned).settledAt, undefined, 'a pinned thread stays');
+assert.equal(thread(onScreen).settledAt, undefined, 'a running thread stays');
+assert.equal(thread(background).settledAt, undefined, 'a snoozed thread stays snoozed');
+store().setSidebarV2Settings({ enabled: false });
+const later = store().createThread(projectId, 'Later', { select: false });
+store().setSidebarV2Settings({ enabled: true });
+assert.equal(thread(later).settledAt, undefined, 'only the first switch settles');
+store().setSidebarV2Settings({ enabled: false });
+
 // Lists: settled beats snoozed beats pinned; children never appear. Every
 // active thread (pinned or not) is in `active`, which Recent shows when
 // pinned threads aren't grouped; snoozing or settling keeps the pin.
