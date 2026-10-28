@@ -364,6 +364,7 @@ const AgentRunMessage: React.FC<{
             activities={segment.activities}
             runStatus={message.status}
             runRunning={runRunning}
+            live={isRunning && index === visibleSegments.length - 1}
           />
         ) : segment.kind === 'btw' ? (
           <React.Fragment key={`btw-${segment.exchange.id}`}>{renderBtwAside?.(segment.exchange)}</React.Fragment>
@@ -372,12 +373,12 @@ const AgentRunMessage: React.FC<{
         ) : null
       )}
       {thinking && (
-        <div className="agent-tool-row thinking">
-          <span className="agent-tool-icon">
-            <Brain size={15} />
-          </span>
-          <span className="agent-tool-text">
-            <span className="agent-tool-title">Thinking</span>
+        <div className="work-row thinking">
+          <span className="work-row-line">
+            <span className="work-row-icon">
+              <Brain size={14} />
+            </span>
+            <span className="work-row-label live">Thinking</span>
           </span>
         </div>
       )}

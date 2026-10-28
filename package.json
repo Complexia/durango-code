@@ -38,6 +38,7 @@
     "test:code-tab": "node --no-warnings --experimental-strip-types scripts/test-code-tab.mjs",
     "test:no-project": "bun scripts/test-no-project.ts",
     "test:sidebar-v2": "bun scripts/test-sidebar-v2.ts",
+    "test:work-log": "bun scripts/test-work-log.tsx",
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",

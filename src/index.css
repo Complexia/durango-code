@@ -4000,22 +4000,6 @@ body {
   transition: background var(--transition-fast);
 }
 
-.agent-tool-row.expandable {
-  cursor: pointer;
-}
-
-.agent-tool-chevron {
-  display: flex;
-  align-items: center;
-  padding-top: 2px;
-  color: var(--text-muted);
-  transition: transform var(--transition-base);
-}
-
-.agent-tool-row.open .agent-tool-chevron {
-  transform: rotate(90deg);
-}
-
 .agent-tool-row:hover {
   background: rgb(255 255 255 / 2.5%);
 }
@@ -4050,33 +4034,6 @@ body {
   color: #cfcfcf;
   font-size: 12px;
   line-height: 1.35;
-}
-
-.agent-tool-detail {
-  color: #7f7f7f;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 11px;
-  line-height: 1.35;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-tool-detail.expanded {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  text-overflow: clip;
-  line-height: 1.5;
-  user-select: text;
-  cursor: text;
-}
-
-.agent-tool-title-line {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex-wrap: wrap;
 }
 
 .agent-tool-chip {
@@ -4152,19 +4109,10 @@ body {
   cursor: text;
 }
 
-.agent-tool-row.running .agent-tool-output {
-  border-color: rgb(77 141 255 / 18%);
-}
-
 .agent-tool-output.input {
   color: #b0b0b0;
   background: rgb(255 255 255 / 3%);
   max-height: 260px;
-}
-
-.agent-tool-row.expandable:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: -1px;
 }
 
 .agent-tool-sources {
@@ -8420,8 +8368,8 @@ body {
 .agent-steps {
   display: flex;
   flex-direction: column;
-  gap: 1px;
-  margin: 4px 0 12px;
+  gap: 2px;
+  margin: 2px 0 10px;
 }
 .message.agent-run .agent-tool-row {
   grid-template-columns: 20px minmax(0, 1fr) auto;
@@ -8450,14 +8398,116 @@ body {
 .message.agent-run .agent-tool-row.running .agent-tool-title {
   color: var(--text-primary);
 }
-.message.agent-run .agent-tool-detail {
+/* Steps as T3 Code's work log: muted one-line rows, a stretch of steps folded
+   into one summary line, the agent's own text left as the only full-contrast
+   prose. */
+.work-group {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.work-group-rows {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-height: min(18rem, 50vh);
+  overflow-y: auto;
+  padding-left: 22px;
+}
+.work-row {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.work-row-line,
+.work-group-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  min-height: 26px;
+  padding: 0 4px;
+  margin: 0 -4px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
   color: var(--text-muted);
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--transition-fast);
+}
+.work-row-line:disabled {
+  cursor: default;
+}
+.work-row-line:not(:disabled):hover,
+.work-group-summary:hover {
+  color: var(--text-secondary);
+}
+.work-row-line:focus-visible,
+.work-group-summary:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.work-row-icon {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  opacity: 0.85;
+}
+.work-row-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.work-row-label.code {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12.5px;
+}
+.work-row.failed .work-row-icon,
+.work-row-failed {
+  flex-shrink: 0;
+  color: var(--danger);
+}
+.work-row-diff {
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: 4px;
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
-.message.agent-run .agent-tool-chevron {
-  padding-top: 3px;
+.work-group-chevron {
+  flex-shrink: 0;
+  opacity: 0.7;
+  transition: transform var(--transition-base);
 }
-.message.agent-run .agent-tool-row.thinking .agent-tool-title {
+.work-group-summary.open .work-group-chevron {
+  transform: rotate(90deg);
+}
+.work-row-details {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  margin: 0 0 6px 22px;
+  cursor: auto;
+}
+.work-row-thought {
+  max-height: 18rem;
+  overflow-y: auto;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  user-select: text;
+}
+.work-row-label.live {
   background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-primary) 50%, var(--text-muted) 100%);
   background-size: 200% 100%;
   -webkit-background-clip: text;
@@ -8470,5 +8520,5 @@ body {
   to { background-position: -100% 0; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .message.agent-run .agent-tool-row.thinking .agent-tool-title { animation: none; color: var(--text-secondary); }
+  .work-row-label.live { animation: none; color: var(--text-secondary); }
 }
