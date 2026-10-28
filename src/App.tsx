@@ -1249,6 +1249,10 @@ const App: React.FC = () => {
   const composerDraftKey = selectedThreadId ?? null;
   const composerDraftsRef = useRef(new Map<string, { text: string; attachments: FileAttachment[] }>());
   const composerDraftKeyRef = useRef<string | null>(composerDraftKey);
+  // Empty threads whose composer has been typed into (or given an attachment)
+  // this session. Sidebar v2 lists a blank draft only once it is in here, so
+  // the fresh composer opened after a snooze or settle stays out of the list.
+  const [typedDraftThreadIds, setTypedDraftThreadIds] = useState<ReadonlySet<string>>(() => new Set());
 
   useEffect(() => {
     // Skip the render where the key just changed: chatInput still holds the
@@ -1258,6 +1262,9 @@ const App: React.FC = () => {
       text: chatInput,
       attachments: chatAttachments,
     });
+    if (chatInput.trim() || chatAttachments.length > 0) {
+      setTypedDraftThreadIds((prev) => (prev.has(composerDraftKey) ? prev : new Set(prev).add(composerDraftKey)));
+    }
   }, [chatInput, chatAttachments, composerDraftKey]);
 
   useEffect(() => {
@@ -1986,14 +1993,28 @@ const App: React.FC = () => {
   }, [uiScale]);
   const sidebarV2Enabled = sidebarV2Settings?.enabled ?? defaultSidebarV2Settings.enabled;
   const sidebarV2Views = sidebarV2Settings?.views ?? defaultSidebarV2Settings.views;
+  // A blank draft (nothing sent, nothing typed) is just the composer the
+  // Agents panel opens with nothing else to show; it joins the list once used.
+  // CLI threads keep their conversation in the terminal, so they always show.
   const sidebarV2Lists = useMemo(
     () =>
       sidebarV2ThreadLists(
-        sidebarV2Enabled ? threads : [],
+        sidebarV2Enabled
+          ? threads.filter(
+              (thread) =>
+                thread.messages.length > 0 ||
+                thread.status === 'running' ||
+                thread.modelId === claudeCodeCliModelId ||
+                !!thread.pinnedAt ||
+                !!thread.snoozedAt ||
+                !!thread.settledAt ||
+                typedDraftThreadIds.has(thread.id)
+            )
+          : [],
         (thread) => childThreadIds.has(thread.id),
         compareRecentThreadOrder
       ),
-    [childThreadIds, sidebarV2Enabled, threads]
+    [childThreadIds, sidebarV2Enabled, threads, typedDraftThreadIds]
   );
   const runningThreadIds = useStableIdList(
     threads.filter((thread) => thread.status === 'running').map((thread) => thread.id)
@@ -8303,6 +8324,20 @@ const App: React.FC = () => {
   ]);
   const splitFull = threadPanes.length >= MAX_THREAD_PANES;
 
+  // With nothing open the Agents panel shows a fresh composer, not a "Select
+  // a thread" placeholder. New-agent reuses an untouched draft (sidebar v2),
+  // so closing or deleting the last thread doesn't stack empty ones.
+  const showsEmptyAgentsPanel =
+    storeHydrated &&
+    activeTab === 'agents' &&
+    !settingsOpen &&
+    !activeRemoteMachine &&
+    threadPanes.length === 0 &&
+    !!defaultNewThreadProject;
+  useEffect(() => {
+    if (showsEmptyAgentsPanel) agentsSidebarActionsRef.current.handleNewAgent();
+  }, [showsEmptyAgentsPanel]);
+
   // Threads dragged out of the sidebar land here as an extra pane. Other drags
   // (image files, text) fall through to the shell's own handlers untouched.
   const [threadDropActive, setThreadDropActive] = useState(false);
@@ -10146,18 +10181,18 @@ const App: React.FC = () => {
                   </div>
                 )}
                 {threadPanes.length === 0 ? (
-                  <div className="empty-state">
-                    <div className="empty-state-icon">
-                      <Bot size={30} />
+                  // The effect above opens a fresh composer within a frame, so
+                  // the panel stays blank meanwhile; the placeholder is only
+                  // for when there is no project to start a thread in.
+                  storeHydrated && !defaultNewThreadProject && (
+                    <div className="empty-state">
+                      <div className="empty-state-icon">
+                        <Bot size={30} />
+                      </div>
+                      <div className="empty-state-title">Select a thread</div>
+                      <div className="text-xs text-[#6b6b74]">Pick a conversation or start a new one</div>
                     </div>
-                    <div className="empty-state-title">Select a thread</div>
-                    <div className="text-xs text-[#6b6b74]">Pick a conversation or start a new one</div>
-                    {defaultNewThreadProject && (
-                      <button onClick={() => handleCreateThread(defaultNewThreadProject.id)} className="btn mt-2">
-                        <Plus size={15} /> Start new thread
-                      </button>
-                    )}
-                  </div>
+                  )
                 ) : (
                   <div className={`thread-panes count-${threadPanes.length}`}>
                     {threadPanes.map((pane) => {
