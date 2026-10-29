@@ -6599,6 +6599,10 @@ const App: React.FC = () => {
       return;
     }
 
+    // Sending to a snoozed thread wakes it at once, rather than when the run
+    // it starts ends (or right away for a follow-up queued mid-run).
+    if (selectedThread.snoozedAt) unsnoozeThread(selectedThreadId);
+
     // Claude Code CLI thread: the composer feeds the embedded terminal —
     // the draft is delivered to the TUI exactly as if typed there (so claude
     // slash commands like /compact work too). Nothing goes through runTurn.
