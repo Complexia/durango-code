@@ -53,6 +53,7 @@ import {
 } from '../agentCatalog';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
+import { FxConnectionsPanel } from './FxConnectionsPanel';
 import { DurangoDispatchSettings } from './DurangoDispatchSettings';
 import SkillsSettings from './SkillsSettings';
 import McpsSettings from './McpsSettings';
@@ -252,6 +253,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
   } = props;
   const [computerUseSubtab, setComputerUseSubtab] = React.useState<'permissions' | 'browser-use'>('permissions');
   const [skillsAndMcpsSubtab, setSkillsAndMcpsSubtab] = React.useState<'skills' | 'mcps'>('skills');
+  // The fx row's Install button opens fx's options and starts the install
+  // in its setup card.
+  const [fxInstallOnOpen, setFxInstallOnOpen] = React.useState(false);
+  const clearFxInstallOnOpen = React.useCallback(() => setFxInstallOnOpen(false), []);
   const configuredCodexBrowserMode = providerSettings.codex?.options?.browserUseMode;
   const codexBrowserMode: BrowserUseMode =
     configuredCodexBrowserMode === 'disabled' ||
@@ -998,7 +1003,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   const status = providerStatusById.get(provider.id);
                   const providerEnabled = normalizedProviderSettings[provider.id as ProviderId]?.enabled !== false;
                   const authenticated = status?.auth?.authenticated === true;
-                  const canAuthenticate = status?.installed !== false && status?.auth?.status !== 'missing';
+                  // fx connects several providers from its own options panel.
+                  const canAuthenticate =
+                    provider.id !== 'fx' && status?.installed !== false && status?.auth?.status !== 'missing';
                   const version = status?.currentVersion ? status.currentVersion.replace(/^v/i, '') : null;
                   const hasUpdate = !!status?.updateAvailable;
 
@@ -1012,7 +1019,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   } else if (authenticated) {
                     const raw = status?.auth?.detail || 'Authenticated';
                     subtitle =
-                      provider.id === 'opencode'
+                      provider.id === 'opencode' || provider.id === 'fx'
                         ? raw
                         : /authenticated/i.test(raw)
                           ? raw
@@ -1088,6 +1095,19 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                             <ChevronDown size={14} />
                           </button>
 
+                          {provider.id === 'fx' && status?.installed === false && (
+                            <button
+                              type="button"
+                              className="provider-auth-button compact"
+                              onClick={() => {
+                                setFxInstallOnOpen(true);
+                                setExpandedProviderOptions((prev) => ({ ...prev, fx: true }));
+                              }}
+                            >
+                              Install
+                            </button>
+                          )}
+
                           {canAuthenticate && (
                             <button
                               type="button"
@@ -1114,6 +1134,16 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
 
                       {optionsExpanded && optionDefs.length > 0 && (
                         <div className="provider-options">
+                          {provider.id === 'fx' && (
+                            <FxConnectionsPanel
+                              options={optionValues}
+                              setOptions={(patch) => setProviderOptions('fx', patch)}
+                              accountAuthenticated={accountState.authenticated}
+                              onSignInToDurango={() => void handleStartAccountAuth()}
+                              installOnOpen={fxInstallOnOpen}
+                              onInstallStarted={clearFxInstallOnOpen}
+                            />
+                          )}
                           {optionDefs.map((option) => {
                             if (option.type === 'boolean') {
                               const checked = optionValues[option.key] === true;

@@ -619,7 +619,7 @@ export type OpenFile = {
   diskRevision?: number;
 };
 
-export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'muse' | 'opencode';
+export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'fx' | 'muse' | 'opencode';
 
 export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
 export type BrowserUseMode = 'disabled' | 'extension' | 'mcp';
@@ -654,6 +654,10 @@ export type ProviderRuntimeOptions = {
   browserAutoConnect?: boolean;
   /** codex: disabled, signed-in Chrome extension, or signed-in Chrome through chrome-devtools MCP */
   browserUseMode?: BrowserUseMode;
+  /** fx: bill models without a connected subscription to Durango usage credits (default on) */
+  fxDurangoInference?: boolean;
+  /** fx: billed provider tried first when no subscription serves the model */
+  fxBilledProvider?: 'durango' | 'gateway';
   /** any provider: extra CLI flags appended to every run */
   extraArgs?: string;
 };
@@ -669,6 +673,7 @@ export const defaultProviderSettings: ProviderSettings = {
   claude: { enabled: true },
   cursor: { enabled: true },
   kimi: { enabled: true },
+  fx: { enabled: true },
   muse: { enabled: true },
   opencode: { enabled: true },
 };

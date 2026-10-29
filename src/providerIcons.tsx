@@ -70,6 +70,24 @@ export const KimiBrandIcon = ({ size = 24, className, ...props }: ProviderIconPr
   </svg>
 );
 
+/** fx (Vercel Labs) wordmark: an italic f beside an x */
+export const FxBrandIcon = ({ size = 24, className, ...props }: ProviderIconProps) => (
+  <svg
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={2.2}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    {...iconProps(size, className)}
+    {...props}
+  >
+    <path d="M12.5 4.5c-1.9-.7-3.6.2-4 2.2L6.4 18.2c-.4 2-2 2.8-3.9 2.1" />
+    <path d="M5 10h6" />
+    <path d="M13.5 10.5l6.5 8M20 10.5l-6.5 8" />
+  </svg>
+);
+
 /** Meta / Muse Code mark (Meta infinity-loop logo) */
 export const MuseBrandIcon = ({ size = 24, className, ...props }: ProviderIconProps) => (
   <svg viewBox="0 0 24 24" fill="currentColor" {...iconProps(size, className)} {...props}>

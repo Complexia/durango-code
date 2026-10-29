@@ -438,6 +438,19 @@ type OrionCloudSyncStatus = 'synced' | 'ahead' | 'behind' | 'diverged' | 'unknow
 type OrionCloudAppStatus = 'queued' | 'building' | 'deployed' | 'failed';
 
 /** An Orion Cloud app: the repo built on Railway and hosted at `url`. */
+/** Model providers fx can route to (Settings → Providers → fx). */
+type OrionFxConnections = {
+  installed: boolean;
+  /** Signed in to a Durango account (usage credits). */
+  durango: boolean;
+  /** ChatGPT subscription signed in through `fx login codex`. */
+  codex: boolean;
+  /** Grok subscription signed in through `fx login grok`. */
+  grok: boolean;
+  gateway: boolean;
+  gatewaySource: 'api-key' | 'fx' | null;
+};
+
 type OrionCloudApp = {
   slug: string;
   url: string;
@@ -1039,7 +1052,7 @@ type OrionCodexBrowserIntegrationStatus = {
       saveImageAttachment?: NonNullable<Window['orion']>['saveAttachment'];
       listAgentModels: (input?: { force?: boolean }) => Promise<Array<{
         id: string;
-        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'muse' | 'opencode';
+        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'fx' | 'muse' | 'opencode';
         providerLabel: string;
         label: string;
         slug: string;
@@ -1155,6 +1168,15 @@ type OrionCodexBrowserIntegrationStatus = {
       onProviderAuthenticated: (
         callback: (event: { providerId: string }) => void
       ) => () => void;
+      getFxConnections: () => Promise<{
+        ok: boolean;
+        error?: string;
+        connections?: OrionFxConnections;
+      }>;
+      installFx: () => Promise<{ ok: boolean; path?: string; version?: string; error?: string }>;
+      connectFx: (target: 'codex' | 'grok' | 'vercel') => Promise<{ ok: boolean; error?: string }>;
+      disconnectFx: (target: 'codex' | 'grok' | 'vercel') => Promise<{ ok: boolean; error?: string }>;
+      setFxGatewayApiKey: (key: string | null) => Promise<{ ok: boolean; error?: string }>;
       getAccountSession: () => Promise<OrionAccountState>;
       startAccountAuth: () => Promise<{
         ok: boolean;

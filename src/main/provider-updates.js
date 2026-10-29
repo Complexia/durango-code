@@ -3,6 +3,7 @@ import os from 'node:os';
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { loginShell, resolveCommandPath, runShellCommand, shellQuote } from './shell-env.js';
+import { readFxConnections } from './fx-provider.js';
 
 export const providerUpdaterConfigs = [
   {
@@ -58,6 +59,18 @@ export const providerUpdaterConfigs = [
     verifyAfterUpdate: true,
     authCommands: [['login']],
     statusCommand: ['provider', 'list'],
+  },
+  {
+    id: 'fx',
+    label: 'fx',
+    command: 'fx',
+    latestVersionUrl: 'https://releases.fx.sh/latest.txt',
+    updateCommands: [['upgrade']],
+    probeUpdateCommand: false,
+    versionEnv: { FX_AUTO_UPGRADE: '0' },
+    verifyAfterUpdate: true,
+    // fx connects several model providers (Settings → Providers → fx);
+    // status comes from getFxAuthStatus and sign-in from that panel.
   },
   {
     id: 'muse',
@@ -348,6 +361,28 @@ export const getMuseAuthStatus = async () => {
   }
 };
 
+// fx is ready when any route can serve a model: the Durango account (usage
+// credits), a ChatGPT or Grok subscription signed in through fx, or Vercel
+// AI Gateway credentials.
+export const getFxAuthStatus = async () => {
+  const connections = await readFxConnections();
+  const names = [
+    connections.durango && 'Durango credits',
+    connections.codex && 'ChatGPT',
+    connections.grok && 'Grok',
+    connections.gateway && 'Vercel AI Gateway',
+  ].filter(Boolean);
+  return {
+    authenticated: names.length > 0,
+    status: names.length > 0 ? 'authenticated' : 'unauthenticated',
+    label: names.length > 0 ? 'Ready' : 'No model provider',
+    detail:
+      names.length > 0
+        ? `Ready — ${names.join(' · ')}`
+        : 'Sign in to Durango or connect a provider in fx options.',
+  };
+};
+
 export const getProviderAuthStatus = async (config) => {
   if (!(await resolveCommandPath(config.command))) {
     return {
@@ -360,6 +395,10 @@ export const getProviderAuthStatus = async (config) => {
 
   if (config.id === 'muse') {
     return getMuseAuthStatus();
+  }
+
+  if (config.id === 'fx') {
+    return getFxAuthStatus();
   }
 
   if (!config.statusCommand) {

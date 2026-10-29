@@ -5504,7 +5504,7 @@ const App: React.FC = () => {
         providerOptions: normalizedProviderSettings[model.providerId]?.options,
         // These native providers consume attachments directly as well as
         // retaining the text/path context for later file and crop tools.
-        ...(['kimi', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
+        ...(['kimi', 'fx', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
           ? { attachments: turnAttachments } : {}),
         ...(model.providerId === 'codex'
           ? {

@@ -814,6 +814,12 @@ export const providerJsonAdapters = {
     reasoning: () => '',
     activities: () => [],
   },
+  // fx turns only run over ACP; its driver handles every message.
+  fx: {
+    text: () => '',
+    reasoning: () => '',
+    activities: () => [],
+  },
   muse: {
     text: extractMuseTextFromJsonEvent,
     reasoning: extractMuseReasoningFromJsonEvent,
@@ -849,4 +855,4 @@ export const isTerminalJsonEvent = (providerId, value) =>
   (providerId === 'muse' && value?.payload_type === 'run.terminal.completed');
 
 export const sendsJsonEvents = (providerId) =>
-  ['claude', 'codex', 'cursor', 'grok', 'kimi', 'muse', 'opencode'].includes(providerId);
+  ['claude', 'codex', 'cursor', 'grok', 'kimi', 'fx', 'muse', 'opencode'].includes(providerId);

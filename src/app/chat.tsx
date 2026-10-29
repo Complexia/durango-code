@@ -252,7 +252,7 @@ export const PROVIDER_AUTH_ERROR_PATTERNS: RegExp[] = [
   /\bunauthenticated\b/i,
   /\b401\b[^\n]{0,40}unauthorized/i,
   /unauthorized[^\n]{0,40}\b401\b/i,
-  /run\s+`?(codex|cursor-agent|grok|opencode|claude|kimi|muse)\s+(auth\s+)?login/i,
+  /run\s+`?(codex|cursor-agent|grok|opencode|claude|kimi|muse|fx)\s+(auth\s+)?login/i,
   /please (log ?in|sign ?in)/i,
 ];
 

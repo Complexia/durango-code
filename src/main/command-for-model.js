@@ -304,6 +304,14 @@ export const commandForModel = (model, input) => {
     return ['kimi', ...extraArgs, 'acp'];
   }
 
+  if (model.providerId === 'fx') {
+    // fx always speaks ACP (`fx acp`): the route (provider + model), cwd,
+    // session resume and permission mode travel over the dialog, and its
+    // startup provider and credentials in the environment (prepareFxLaunch).
+    // Global flags such as --add-dir must precede `acp`.
+    return ['fx', ...extraArgs, 'acp'];
+  }
+
   // OpenCode's JSONL stream carries the session id, text deltas, reasoning,
   // and completed tool calls. Its run command resumes with --session and can
   // fork that session natively, keeping branched Orion threads isolated.

@@ -65,6 +65,7 @@
     "test:app-updater": "electron scripts/test-app-updater.mjs",
     "test:agent-models": "node --no-warnings scripts/test-agent-models.mjs",
     "test:opencode-provider": "electron scripts/test-opencode-provider.mjs",
+    "test:fx-provider": "node scripts/run-electron-test.mjs scripts/test-fx-provider.mjs",
     "test:source-control": "node --no-warnings scripts/test-source-control.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",

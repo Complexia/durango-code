@@ -2,6 +2,7 @@ import {
   ClaudeBrandIcon,
   CodexBrandIcon,
   CursorBrandIcon,
+  FxBrandIcon,
   GrokBrandIcon,
   KimiBrandIcon,
   MuseBrandIcon,
@@ -17,6 +18,7 @@ export type AgentProviderId =
   | 'claude'
   | 'cursor'
   | 'kimi'
+  | 'fx'
   | 'muse'
   | 'opencode';
 
@@ -524,6 +526,19 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       placeholder: '--add-dir /path',
     },
   ],
+  // fx turns run over `fx acp`; global flags (--add-dir, --context-limit)
+  // must precede the subcommand. Routing (subscriptions, Durango credits,
+  // Vercel AI Gateway) has its own panel in Settings → Providers → fx.
+  fx: [
+    {
+      key: 'extraArgs',
+      label: 'Extra CLI flags',
+      description:
+        'Inserted before the `acp` subcommand on every fx invocation (e.g. --add-dir, --context-limit). Quotes are respected.',
+      type: 'string',
+      placeholder: '--add-dir /path',
+    },
+  ],
   // Muse turns run over `muse exec` (headless JSONL); flags land between
   // `exec` and the prompt argument.
   muse: [
@@ -545,7 +560,8 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
 // steer: deliver the message INTO the running turn without interrupting it —
 // the same behavior as typing while Claude Code works. This needs a live
 // mid-turn input channel: Claude folds the message into its persistent SDK
-// session, while Codex uses app-server's native turn/steer. The other
+// session, Codex uses app-server's native turn/steer, and fx takes a
+// steering session/prompt over its ACP dialog. The other
 // harnesses run one-shot per turn or hold a single-prompt ACP dialog, so a
 // follow-up cannot reach the running turn — it queues and sends when that
 // turn finishes. Steer must never kill the running process; that is Stop's job.
@@ -557,6 +573,7 @@ export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; 
   claude: { queue: true, steer: true },
   cursor: { queue: true, steer: false },
   kimi: { queue: true, steer: false },
+  fx: { queue: true, steer: true },
   muse: { queue: true, steer: false },
   opencode: { queue: true, steer: false },
 };
@@ -567,6 +584,7 @@ export const agentProviders: AgentProvider[] = [
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },
   { id: 'claude', label: 'Claude', icon: ClaudeBrandIcon },
   { id: 'kimi', label: 'Kimi', icon: KimiBrandIcon },
+  { id: 'fx', label: 'fx', icon: FxBrandIcon },
   { id: 'muse', label: 'Muse', icon: MuseBrandIcon },
   { id: 'cursor', label: 'Cursor', icon: CursorBrandIcon },
   { id: 'opencode', label: 'OpenCode', icon: OpenCodeBrandIcon },
@@ -768,6 +786,31 @@ export const fallbackAgentModels: AgentModel[] = [
     slug: 'kimi-code/k3-256k',
     shortcut: '⌘6',
   },
+  // fx models are Durango catalog ids; each turn routes to a connected
+  // subscription first, then Durango credits or Vercel AI Gateway. Mirrors
+  // fxFallbackModels in src/main/fx-provider.js; Durango's live catalog
+  // replaces this block when signed in.
+  ...([
+    ['anthropic/claude-sonnet-5.5', 'Claude Sonnet 5.5'],
+    ['openai/gpt-6-astra', 'GPT-6 Astra'],
+    ['anthropic/claude-opus-5.5', 'Claude Opus 5.5'],
+    ['openai/gpt-6.1-sol', 'GPT-6.1 Sol'],
+    ['x-ai/grok-4.7', 'Grok 4.7'],
+    ['google/gemini-3.8-flash', 'Gemini 3.8 Flash'],
+    ['moonshotai/kimi-k3', 'Kimi K3'],
+    ['openai/gpt-6-luna', 'GPT-6 Luna'],
+    ['anthropic/claude-haiku-5.5', 'Claude Haiku 5.5'],
+  ] as const).map(
+    ([slug, label], index): AgentModel => ({
+      id: `fx:${slug}`,
+      providerId: 'fx',
+      providerLabel: 'fx',
+      label,
+      slug,
+      shortcut: `⌘${index + 1}`,
+      ...(index < 5 ? { favorite: true } : {}),
+    })
+  ),
   // Muse Wonder (Full is subscription-only), then Muse Spark, which ships in
   // two tiers per generation: standard, and a discounted "contributor" tier
   // whose sessions Meta may use for product improvement. Mirrors

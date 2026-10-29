@@ -57,6 +57,8 @@ import { createCompletedCodexQuestions } from './main/codex-questions.js';
 import { commandForModel } from './main/command-for-model.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
+import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteerableRunDrivers, steerFxRun } from './main/fx-driver.js';
+import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
@@ -646,6 +648,40 @@ const durangoClient = durangoMock
       isPackaged: () => app.isPackaged,
     });
 setDurangoToolsClient(durangoClient);
+// fx's own Vercel AI Gateway key, saved from Settings → Providers → fx. Stored
+// like the Durango key (safeStorage-encrypted in packaged builds) and only
+// handed to fx processes whose route is AI Gateway.
+const fxGatewayKeyFilePath = () => path.join(app.getPath('userData'), 'fx-gateway-key.json');
+const readFxGatewayApiKey = async () => {
+  try {
+    return decryptAccountToken(JSON.parse(await fs.readFile(fxGatewayKeyFilePath(), 'utf8')).key) || null;
+  } catch {
+    return null;
+  }
+};
+const writeFxGatewayApiKey = async (key) => {
+  const target = fxGatewayKeyFilePath();
+  if (!key) {
+    await fs.rm(target, { force: true });
+    return;
+  }
+  if (app.isPackaged && !canUseSafeStorage()) {
+    throw new Error('Secure storage is unavailable, so the key cannot be saved.');
+  }
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  const temporary = `${target}.${crypto.randomBytes(8).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify({ key: encryptAccountToken(key) }), { mode: 0o600 });
+    await fs.rename(temporary, target);
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+};
+configureFxProvider({
+  getDurangoCredentials: () => durangoCredentials.get(),
+  isDurangoSignedIn: async () => !durangoMock && Boolean(await readAccountSession()),
+  readGatewayApiKey: readFxGatewayApiKey,
+});
 const durangoProfileMemory = createProfileMemoryCache({ getClient: () => durangoClient });
 // Lazily connect an already-signed-in user (startup) or a fresh sign-in, off
 // the critical path; tools mint on demand anyway if this fails.
@@ -4318,6 +4354,68 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
   return result;
 });
 
+// fx connections (Settings → Providers → fx): subscription logins run fx's
+// own browser sign-in, detached like other provider logins.
+const fxLoginTargets = new Set(['codex', 'grok', 'vercel']);
+ipcMain.handle('fx:getConnections', async () => {
+  try {
+    return { ok: true, connections: await readFxConnections() };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+ipcMain.handle('fx:install', async (event) => {
+  const result = await installFx();
+  if (result.ok) {
+    invalidateAgentModelsCache();
+    if (!event.sender.isDestroyed()) event.sender.send('providers:authenticated', { providerId: 'fx' });
+  }
+  return result;
+});
+ipcMain.handle('fx:connect', async (event, target) => {
+  if (!fxLoginTargets.has(target)) return { ok: false, error: `Unknown fx connection: ${target}` };
+  try {
+    const child = spawn(loginShell, ['-lc', `fx login ${target}`], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', FX_AUTO_UPGRADE: '0' },
+    });
+    const sender = event.sender;
+    child.once('exit', (code) => {
+      if (code !== 0) return;
+      invalidateAgentModelsCache();
+      if (!sender.isDestroyed()) sender.send('providers:authenticated', { providerId: 'fx' });
+    });
+    child.once('error', () => {});
+    child.unref();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+ipcMain.handle('fx:disconnect', async (_event, target) => {
+  if (!fxLoginTargets.has(target)) return { ok: false, error: `Unknown fx connection: ${target}` };
+  try {
+    await runShellCommand(`fx logout ${target} </dev/null`, 15000, { FX_AUTO_UPGRADE: '0' });
+    invalidateAgentModelsCache();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: getProcessErrorMessage(error) };
+  }
+});
+ipcMain.handle('fx:setGatewayApiKey', async (_event, key) => {
+  const value = typeof key === 'string' ? key.trim() : '';
+  if (value && (value.length > 512 || /\s/.test(value))) {
+    return { ok: false, error: 'That does not look like an AI Gateway API key.' };
+  }
+  try {
+    await writeFxGatewayApiKey(value || null);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+
 ipcMain.handle('account:getSession', async () => verifyAccountSession());
 
 ipcMain.handle('account:startAuth', async () => {
@@ -4636,7 +4734,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     // One spawn of the provider CLI. If resuming a prior session fails before
     // producing output, close() falls back to a single fresh attempt.
-    const useAcp = model.providerId === 'grok' || model.providerId === 'kimi';
+    const useAcp =
+      model.providerId === 'grok' || model.providerId === 'kimi' || model.providerId === 'fx';
     // Codex goal runs (/goal) are driven over `codex app-server` JSON-RPC —
     // the goal runtime auto-continues turns only inside a live app-server.
     const useCodexGoal =
@@ -4691,6 +4790,27 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         });
       } catch (error) {
         if (!startupController.signal.aborted) throw error;
+      }
+      if (startupController.signal.aborted) {
+        const aborted = startingAgentRuns.get(runId);
+        return aborted?.abortError ? { ok: false, error: aborted.abortError } : { ok: true, runId };
+      }
+    }
+    // fx chooses its route (subscription first, then the billed provider) and
+    // credentials before the process starts: its ACP initialize already
+    // needs a usable startup provider.
+    let fxLaunch = null;
+    if (model.providerId === 'fx') {
+      try {
+        fxLaunch = await prepareFxLaunch({
+          slug: model.slug,
+          providerOptions: input.providerOptions,
+          accessMode: input.accessMode || 'full-access',
+        });
+      } catch (error) {
+        if (!startupController.signal.aborted) {
+          return { ok: false, error: error?.message ?? String(error) };
+        }
       }
       if (startupController.signal.aborted) {
         const aborted = startingAgentRuns.get(runId);
@@ -4819,6 +4939,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             NO_COLOR: '1',
             ...(openCodeConfig ? { OPENCODE_CONFIG_CONTENT: openCodeConfig } : {}),
             ...(museConfigRoot ? { XDG_CONFIG_HOME: museConfigRoot } : {}),
+            ...(fxLaunch ? fxLaunch.env : {}),
           }),
           // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
           // take no input.
@@ -5060,6 +5181,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
       codexSteerableRunDrivers.delete(runId);
+      fxSteerableRunDrivers.delete(runId);
       codexAppServerLease?.release();
       codexAppServerLease = null;
       orionMcp?.release();
@@ -5300,7 +5422,35 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     };
 
     const acpDriver =
-      model.providerId === 'kimi'
+      model.providerId === 'fx'
+        ? createFxAcpDriver({
+            child,
+            cwd: input.projectPath,
+            promptText: input.prompt,
+            attachments: input.attachments,
+            resumeSessionId,
+            accessMode: input.accessMode || 'full-access',
+            routes: fxLaunch?.routes ?? [],
+            mcpServers: orionAcpMcpServers(orionMcp),
+            callbacks: {
+              ...sharedDriverCallbacks,
+              onNotice: (notice) => {
+                if (finalized) return;
+                emitAgentEvent(event.sender, {
+                  runId,
+                  threadId: input.threadId,
+                  type: 'chunk',
+                  chunk: notice,
+                });
+              },
+              onTurnEnd: (result) => {
+                const stats = fxStatsFromPromptResult(result);
+                if (stats) runStats = stats;
+                finishDriverRun();
+              },
+            },
+          })
+        : model.providerId === 'kimi'
         ? createKimiAcpDriver({
             child,
             cwd: input.projectPath,
@@ -5418,6 +5568,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           })
         : null;
     if (useCodexGoal && acpDriver) codexGoalRunDrivers.set(runId, acpDriver);
+    if (model.providerId === 'fx' && acpDriver) fxSteerableRunDrivers.set(runId, acpDriver);
     if (useCodexAppServer && !useCodexGoal && !useCodexReview && acpDriver) {
       codexSteerableRunDrivers.set(runId, acpDriver);
     }
@@ -5527,6 +5678,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         finalized = true;
         clearFinalizeTimers();
         codexSteerableRunDrivers.delete(runId);
+        fxSteerableRunDrivers.delete(runId);
         await acpDriver?.dispose?.();
         codexSpawnWatcher?.stop();
         kimiSpawnWatcher?.stop();
@@ -5561,6 +5713,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         finalized = true;
         clearFinalizeTimers();
         codexSteerableRunDrivers.delete(runId);
+        fxSteerableRunDrivers.delete(runId);
         await acpDriver?.dispose?.();
         codexSpawnWatcher?.stop();
         kimiSpawnWatcher?.stop();
@@ -5619,11 +5772,12 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 });
 
 // Deliver a message into the provider's active turn. Codex has a native
-// turn/steer RPC; Claude interrupts its blocking SDK loop and immediately
-// continues it. False preserves the message as an ordinary queued follow-up.
+// turn/steer RPC, fx a steering session/prompt; Claude interrupts its
+// blocking SDK loop and immediately continues it. False preserves the message as an ordinary queued follow-up.
 ipcMain.handle('agent:steerTurn', async (_event, runId, text, attachments) => {
   if (typeof runId !== 'string' || typeof text !== 'string' || !text) return false;
   if (await steerCodexAppServerRun(runId, text, attachments)) return true;
+  if (await steerFxRun(runId, text, attachments)) return true;
   return await steerClaudeSdkRun(runId, text, attachments);
 });
 
@@ -5689,6 +5843,7 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
   stoppedAgentRuns.add(runId);
   await codexSteerableRunDrivers.get(runId)?.dispose?.();
   codexSteerableRunDrivers.delete(runId);
+  fxSteerableRunDrivers.delete(runId);
   // Stopping a goal run = pausing the goal: ask the app-server to record the
   // pause (so the stored goal matches reality and /goal resume works) before
   // the process goes down.
@@ -6464,6 +6619,11 @@ const runOneShotAgentText = async (
   // execution.
   if (model.providerId === 'kimi') {
     return (await kimiPlanModeOneShot(model, prompt, cwd, { signal, threadId })) || '';
+  }
+  // fx turns only run over ACP; its ask mode with every permission denied
+  // keeps the hidden turn read-only.
+  if (model.providerId === 'fx') {
+    return (await fxReadOnlyOneShot(model, prompt, cwd, { signal, threadId })) || '';
   }
 
   // Reuse the command builder but force read-only access for the hidden turn.

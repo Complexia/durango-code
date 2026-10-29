@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { checkCommandAvailable, execFileAsync, shellPathSyncPromise } from './shell-env.js';
+import { fxFallbackModels, listFxModels } from './fx-provider.js';
 
 // Canonical low→high order of every reasoning tier any harness advertises.
 export const reasoningEffortTiers = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
@@ -511,6 +512,7 @@ export const agentModels = [
   },
   claudeCodeCliModel,
   ...kimiFallbackModels,
+  ...fxFallbackModels,
   ...museFallbackModels,
   ...cursorFallbackModels,
   ...openCodeFallbackModels,
@@ -1054,13 +1056,15 @@ export const spliceProviderModels = (models, providerId, replacements) => {
 
 // One live reader per provider. Codex, Grok, Claude and Muse parse the
 // catalog their CLI already caches on disk (no spawn, no auth); Cursor, Kimi
-// and OpenCode have to spawn their CLI. A reader returns [] when it cannot
-// discover anything, which keeps that provider's previous block.
+// and OpenCode have to spawn their CLI; fx lists Durango's chat catalog. A
+// reader returns [] when it cannot discover anything, which keeps that
+// provider's previous block.
 export const agentModelDiscoverers = {
   grok: listGrokModels,
   codex: listCodexModels,
   claude: listClaudeModels,
   kimi: listKimiModels,
+  fx: listFxModels,
   muse: listMuseModels,
   cursor: listCursorAgentModels,
   opencode: listOpenCodeModels,
@@ -1071,6 +1075,7 @@ const providerCommands = {
   codex: 'codex',
   claude: 'claude',
   kimi: 'kimi',
+  fx: 'fx',
   muse: 'muse',
   cursor: 'cursor-agent',
   opencode: 'opencode',

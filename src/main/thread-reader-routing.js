@@ -1,4 +1,4 @@
-const mcpBridgeProviderIds = new Set(['codex', 'cursor', 'grok', 'kimi', 'muse', 'opencode']);
+const mcpBridgeProviderIds = new Set(['codex', 'cursor', 'grok', 'kimi', 'fx', 'muse', 'opencode']);
 
 // Tools served by Durango Code's own `orion` MCP server (in-process for
 // Claude, the bridge shim for everyone else).
