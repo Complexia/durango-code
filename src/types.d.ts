@@ -423,6 +423,8 @@ export type RemoteCommandRequest = {
      */
     durangoDispatch?: {
       id: string;
+      /** Started from a chat, or with Run in Durango Code on a task. */
+      origin?: 'chat' | 'tasks';
       taskId: string | null;
       sourceUrl: string | null;
       requestedAccessMode: 'ask' | 'auto-edit' | null;
@@ -642,7 +644,7 @@ type DurangoChatSummary = {
 
 type DurangoErrorCode = 'not_signed_in' | 'not_connected' | 'network' | 'api';
 
-/** Settings → Durango → "Allow Durango Chat to start agents on this Mac". */
+/** Settings → Durango → "Allow Durango Chat and Tasks to start agents on this Mac". */
 type DurangoDispatchSettingsInput = {
   enabled: boolean;
   /** null = every project. */

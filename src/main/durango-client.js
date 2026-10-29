@@ -364,8 +364,10 @@ const normalizeDispatch = (dispatch) => {
   const source = dispatch.sourceChat && typeof dispatch.sourceChat === 'object' ? dispatch.sourceChat : null;
   return {
     id: dispatch.id,
+    origin: dispatch.origin === 'tasks' ? 'tasks' : 'chat',
     prompt: str(dispatch.prompt),
     taskId: optional(dispatch.taskId),
+    taskUrl: optional(dispatch.taskUrl),
     project: { id: optional(project.id), name: optional(project.name), repoId: optional(project.repoId) },
     modelId: optional(dispatch.modelId),
     accessMode: dispatch.accessMode === 'ask' || dispatch.accessMode === 'auto-edit' ? dispatch.accessMode : null,

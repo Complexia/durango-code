@@ -195,7 +195,7 @@ export type DurangoSettings = {
    * DURANGO_TASKS=0 env var does the same).
    */
   useDurangoTasks: boolean;
-  /** "Allow Durango Chat to start agents on this Mac" (main: durango-dispatch.js). */
+  /** "Allow Durango Chat and Tasks to start agents on this Mac" (main: durango-dispatch.js). */
   dispatch: DurangoDispatchSettings;
 };
 

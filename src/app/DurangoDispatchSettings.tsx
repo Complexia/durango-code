@@ -9,7 +9,7 @@ import type { AgentModel, AgentProvider } from '../agentCatalog';
 import { SelectMenu } from './SelectMenu';
 import { accessModeOptions } from './promptContext';
 
-// Settings → Durango: "Allow Durango Chat to start agents on this Mac"
+// Settings → Durango: "Allow Durango Chat and Tasks to start agents on this Mac"
 // (merge plan Phase 5; main: src/main/durango-dispatch.js) and the Durango
 // Tasks rollback switch.
 
@@ -24,15 +24,15 @@ const statusText = (state: DurangoDispatchState | null, authenticated: boolean) 
       : '';
   switch (state.status) {
     case 'listening':
-      return `Waiting for agents from Durango Chat${running}`;
+      return `Waiting for agents from Durango Chat and Tasks${running}`;
     case 'busy':
-      return `At the limit of agents from chat${running}`;
+      return `At the limit of agents from Durango${running}`;
     case 'offline':
       return 'Offline — will reconnect when this Mac is back online.';
     case 'paused':
       return 'Paused while this Mac sleeps.';
     case 'no_window':
-      return 'Open a Durango Code window to run agents from chat.';
+      return 'Open a Durango Code window to run agents from Durango.';
     case 'error':
       return `Can't reach Durango: ${state.lastError ?? 'unknown error'} Retrying…`;
     case 'signed_out':
@@ -88,16 +88,17 @@ export const DurangoDispatchSettings: React.FC<{
     <>
       <div className="setting-row">
         <div className="setting-label">
-          <div className="setting-label-title">Allow Durango Chat to start agents on this Mac</div>
+          <div className="setting-label-title">Allow Durango Chat and Tasks to start agents on this Mac</div>
           <div className="setting-label-desc">
-            Off by default. When on, you can ask Durango Chat to fix or build something and confirm
-            it there; this Mac picks it up, starts a new thread in the matching project, and reports
-            the result back to the chat. You get a notification for every agent started this way.
+            Off by default. When on, you can ask Durango Chat to fix or build something, or press Run
+            in Durango Code on a task in Durango Tasks; this Mac picks it up, starts a new thread in
+            the matching project, and reports the result back. You get a notification for every agent
+            started this way.
             {authenticated && state?.enabled ? ` ${statusText(state, authenticated)}` : ''}
             {!authenticated && ' Requires signing in to your Durango account.'}
           </div>
         </div>
-        <label className="provider-toggle" title="Let Durango Chat start agents on this Mac">
+        <label className="provider-toggle" title="Let Durango Chat and Tasks start agents on this Mac">
           <input
             type="checkbox"
             checked={dispatch.enabled}
@@ -112,15 +113,15 @@ export const DurangoDispatchSettings: React.FC<{
         <>
           <div className="setting-row">
             <div className="setting-label">
-              <div className="setting-label-title">Access for agents started from chat</div>
+              <div className="setting-label-title">Access for agents started from Durango</div>
               <div className="setting-label-desc">
-                The most an agent started from Durango Chat may do. Chat can ask for less, never more.
+                The most an agent started from Durango Chat or Tasks may do. Durango can ask for less, never more.
                 Prompts from chat can quote chat history or memory, so Read only is safest: the
                 agent investigates and proposes changes without editing files.
               </div>
             </div>
             <SelectMenu
-              label="Access for agents started from chat"
+              label="Access for agents started from Durango"
               value={dispatch.accessMode}
               options={accessOptions}
               onChange={(value) => setDispatch({ accessMode: value as DispatchSettings['accessMode'] })}
@@ -131,12 +132,12 @@ export const DurangoDispatchSettings: React.FC<{
             <div className="setting-label">
               <div className="setting-label-title">Default model</div>
               <div className="setting-label-desc">
-                Used when Durango Chat doesn't pick one. The project's usual model is the one its most
+                Used when Durango doesn't pick one. The project's usual model is the one its most
                 recent thread used.
               </div>
             </div>
             <SelectMenu
-              label="Default model for agents started from chat"
+              label="Default model for agents started from Durango"
               value={dispatch.modelId ?? ''}
               options={modelOptions}
               onChange={(value) => setDispatch({ modelId: value || null })}
@@ -147,11 +148,11 @@ export const DurangoDispatchSettings: React.FC<{
             <div className="setting-label">
               <div className="setting-label-title">Agents at a time</div>
               <div className="setting-label-desc">
-                How many agents from chat may run at once. Others wait in Durango Chat until one finishes.
+                How many agents from Durango may run at once. Others wait in Durango until one finishes.
               </div>
             </div>
             <SelectMenu
-              label="Agents from chat at a time"
+              label="Agents from Durango at a time"
               value={String(dispatch.maxConcurrent)}
               options={[
                 { value: '1', label: '1 at a time' },

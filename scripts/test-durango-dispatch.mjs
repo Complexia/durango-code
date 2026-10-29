@@ -317,7 +317,7 @@ try {
     assert.match(missing.error, /no project matching "nope"/);
     const blocked = resolveDispatchProject({ project: { repoId: 'repo_secret' } }, projects, ['p1']);
     assert.equal(blocked.ok, false);
-    assert.match(blocked.error, /"secret" is not allowed to run agents from Durango Chat on this Mac/);
+    assert.match(blocked.error, /"secret" is not allowed to run agents from Durango on this Mac/);
     const none = resolveDispatchProject({ project: { id: null, name: null, repoId: null } }, projects);
     assert.equal(none.ok, false);
     assert.match(none.error, /did not say which project/);
@@ -341,6 +341,10 @@ try {
       '[Started from Durango Chat: https://durango.sh/c/abc]\n\nfix it'
     );
     assert.equal(buildDispatchPrompt({ prompt: 'x', sourceChat: null }), '[Started from Durango Chat]\n\nx');
+    assert.equal(
+      buildDispatchPrompt({ origin: 'tasks', prompt: 'Work on it', taskUrl: 'https://durango.sh/tasks?task=t1', sourceChat: null }),
+      '[Started from Durango Tasks: https://durango.sh/tasks?task=t1]\n\nWork on it'
+    );
   });
 
   // ======================================================================================
@@ -503,7 +507,7 @@ try {
     assert.equal(calls.starts.length, 0);
     assert.equal(reports('disp_missing')[0].status, 'failed');
     assert.match(reports('disp_missing')[0].error, /no project matching "nope"/);
-    assert.match(reports('disp_blocked')[0].error, /not allowed to run agents from Durango Chat/);
+    assert.match(reports('disp_blocked')[0].error, /not allowed to run agents from Durango on this Mac/);
     const registration = server.requests.find((request) => request.path === '/api/v1/code/machines');
     assert.deepEqual(registration.body.projects.map((project) => project.id), ['p1', 'p2'], 'only allowlisted projects are advertised');
     worker.stop();
@@ -596,7 +600,7 @@ try {
       json: { dispatch: { id: 'd', prompt: 'p', taskId: null, project: { id: null, name: 'x', repoId: null }, modelId: '', accessMode: 'weird', sourceChat: null, createdAt: 'now' } },
     }));
     const { dispatch } = await client.claimDispatch({ machineId: 'm' });
-    assert.deepEqual(dispatch, { id: 'd', prompt: 'p', taskId: null, project: { id: null, name: 'x', repoId: null }, modelId: null, accessMode: null, sourceChat: null, createdAt: 'now' });
+    assert.deepEqual(dispatch, { id: 'd', origin: 'chat', prompt: 'p', taskId: null, taskUrl: null, project: { id: null, name: 'x', repoId: null }, modelId: null, accessMode: null, sourceChat: null, createdAt: 'now' });
     server.on('POST', '/api/v1/code/dispatches/x', () => ({ status: 409, json: durangoErrorBody('Another machine claimed this dispatch.', 'claimed_elsewhere') }));
     await assert.rejects(client.reportDispatch('x', { status: 'running' }), (error) => error instanceof DurangoError && error.status === 409 && error.apiCode === 'claimed_elsewhere');
   });

@@ -62,7 +62,12 @@ import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, 
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { DurangoError, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
 import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
-import { createDispatchWorker, normalizeDispatchSettings } from './main/durango-dispatch.js';
+import {
+  createDispatchWorker,
+  dispatchSourceLabel,
+  dispatchSourceUrl,
+  normalizeDispatchSettings,
+} from './main/durango-dispatch.js';
 import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } from './main/durango-tools.js';
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsBatch, readThreadsHead, readThreadsIndex, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
@@ -3653,7 +3658,7 @@ const notifyDispatchStarted = ({ dispatch, project, threadId }) => {
   if (!Notification.isSupported()) return;
   const firstLine = String(dispatch?.prompt ?? '').trim().split('\n')[0] ?? '';
   const notification = new Notification({
-    title: `Durango Chat started an agent in ${project?.name ?? 'a project'}`,
+    title: `${dispatchSourceLabel(dispatch)} started an agent in ${project?.name ?? 'a project'}`,
     body: firstLine.length > 140 ? `${firstLine.slice(0, 139)}…` : firstLine,
   });
   dispatchNotifications.add(notification);
@@ -3700,11 +3705,12 @@ const dispatchWorker = createDispatchWorker({
       prompt: prompt.slice(0, 200_000),
       ...(modelId ? { modelId } : {}),
       accessMode,
-      source: { machineId: 'durango-chat', machineName: 'Durango Chat' },
+      source: { machineId: 'durango-chat', machineName: dispatchSourceLabel(dispatch) },
       durangoDispatch: {
         id: dispatch.id,
+        origin: dispatch.origin === 'tasks' ? 'tasks' : 'chat',
         taskId: dispatch.taskId,
-        sourceUrl: dispatch.sourceChat?.url ?? null,
+        sourceUrl: dispatchSourceUrl(dispatch),
         requestedAccessMode: dispatch.accessMode,
       },
     }),

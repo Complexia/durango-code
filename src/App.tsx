@@ -7554,7 +7554,7 @@ const App: React.FC = () => {
             promptText
               .split('\n')
               .map((line) => line.trim())
-              .find((line) => line && !/^\[Started from Durango Chat/.test(line)) ?? '';
+              .find((line) => line && !/^\[Started from Durango (Chat|Tasks)/.test(line)) ?? '';
           let title = firstLine.length > 60 ? `${firstLine.slice(0, 59).trimEnd()}…` : firstLine;
           let linkNote = '';
           if (dispatch.taskId && window.orion?.linkBoardTask) {
@@ -7583,12 +7583,15 @@ const App: React.FC = () => {
           const accessLabel =
             accessModeOptions.find((option) => option.value === requestedAccessMode)?.label ?? 'Read only';
           const askedForEdits = dispatch.requestedAccessMode === 'auto-edit' && requestedAccessMode === 'read-only';
+          const fromTasks = dispatch.origin === 'tasks';
           addMessageToThread(threadId, {
             role: 'system',
             content:
-              `Started remotely from Durango Chat${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
-              `Access: ${accessLabel}${askedForEdits ? ' (this Mac\'s limit for agents started from chat)' : ''}. ` +
-              'The prompt came from your chat and may quote chat or memory content; review the changes before you ship them.' +
+              `Started remotely from ${fromTasks ? 'Durango Tasks' : 'Durango Chat'}${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
+              `Access: ${accessLabel}${askedForEdits ? ' (this Mac\'s limit for agents started from Durango)' : ''}. ` +
+              (fromTasks
+                ? 'The prompt came from the task; review the changes before you ship them.'
+                : 'The prompt came from your chat and may quote chat or memory content; review the changes before you ship them.') +
               linkNote,
           });
         }

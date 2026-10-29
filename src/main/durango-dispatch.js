@@ -3,7 +3,7 @@ import { DurangoError } from './durango-client.js';
 // Dispatch worker: runs agents that the user started from Durango Chat
 // (merge plan Phase 5, contracts §7 "Dispatch").
 //
-// Off by default ("Allow Durango Chat to start agents on this Mac" in
+// Off by default ("Allow Durango Chat and Tasks to start agents on this Mac" in
 // Settings → Durango). While it is on and the user is signed in, this
 // machine registers itself (`POST /api/v1/code/machines`, allowlisted
 // projects only) and long-polls `POST /api/v1/code/dispatches/claim`. A
@@ -79,7 +79,7 @@ export const resolveDispatchProject = (dispatch, projects, allowedProjectIds = n
   if (!wanted.repoId && !wanted.id && !nameKey(wanted.name)) {
     return {
       ok: false,
-      error: 'Durango Chat did not say which project to use. Name the project and start the agent again.',
+      error: `${dispatchSourceLabel(dispatch)} did not say which project to use. Name the project and start the agent again.`,
     };
   }
   const list = Array.isArray(projects) ? projects : [];
@@ -97,7 +97,7 @@ export const resolveDispatchProject = (dispatch, projects, allowedProjectIds = n
   if (!isProjectAllowed(match.id, allowedProjectIds)) {
     return {
       ok: false,
-      error: `"${match.name}" is not allowed to run agents from Durango Chat on this Mac. Allow it in Durango Code → Settings → Durango.`,
+      error: `"${match.name}" is not allowed to run agents from Durango on this Mac. Allow it in Durango Code → Settings → Durango.`,
     };
   }
   return { ok: true, project: match };
@@ -118,10 +118,18 @@ export const buildMachinePayload = ({ machineId, name, platform, projects, allow
     })),
 });
 
-/** The thread's first prompt: a provenance header, then what the user asked in chat. */
+/** Where a dispatch was started: Run in Durango Code on a task, or a chat. */
+export const dispatchSourceLabel = (dispatch) => (dispatch?.origin === 'tasks' ? 'Durango Tasks' : 'Durango Chat');
+
+/** The page the run was started from (the task, or the chat). */
+export const dispatchSourceUrl = (dispatch) =>
+  (dispatch?.origin === 'tasks' ? dispatch?.taskUrl : dispatch?.sourceChat?.url) ?? null;
+
+/** The thread's first prompt: a provenance header, then what the user asked. */
 export const buildDispatchPrompt = (dispatch) => {
-  const url = dispatch?.sourceChat?.url;
-  const header = url ? `[Started from Durango Chat: ${url}]` : '[Started from Durango Chat]';
+  const label = dispatchSourceLabel(dispatch);
+  const url = dispatchSourceUrl(dispatch);
+  const header = url ? `[Started from ${label}: ${url}]` : `[Started from ${label}]`;
   return `${header}\n\n${String(dispatch?.prompt ?? '').trim()}`;
 };
 
