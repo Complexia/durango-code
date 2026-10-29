@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import type { ProviderRuntimeOptions } from '../store';
 import { SelectMenu } from './SelectMenu';
+import { installFx, useFxInstall } from './fxInstall';
 
 type FxConnections = NonNullable<Awaited<ReturnType<Window['orion']['getFxConnections']>>['connections']>;
 type FxLoginTarget = 'codex' | 'grok' | 'vercel';
@@ -35,8 +36,8 @@ export const FxConnectionsPanel = ({
   onInstallStarted,
 }: FxConnectionsPanelProps) => {
   const [connections, setConnections] = useState<FxConnections | null>(null);
-  const [busyTarget, setBusyTarget] = useState<FxLoginTarget | 'key' | 'install' | null>(null);
-  const [installError, setInstallError] = useState<string | null>(null);
+  const [busyTarget, setBusyTarget] = useState<FxLoginTarget | 'key' | null>(null);
+  const { installing, error: installError } = useFxInstall();
   const [gatewayKeyDraft, setGatewayKeyDraft] = useState('');
 
   const refresh = useCallback(async () => {
@@ -60,19 +61,7 @@ export const FxConnectionsPanel = ({
   }, [refresh, accountAuthenticated]);
 
   const install = useCallback(async () => {
-    setBusyTarget('install');
-    setInstallError(null);
-    try {
-      const result = await window.orion.installFx();
-      if (result.ok) {
-        toast.success(result.version ? `Installed fx ${result.version}` : 'Installed fx');
-        await refresh();
-      } else {
-        setInstallError(result.error ?? 'Could not install fx');
-      }
-    } finally {
-      setBusyTarget(null);
-    }
+    if (await installFx()) await refresh();
   }, [refresh]);
 
   useEffect(() => {
@@ -147,11 +136,11 @@ export const FxConnectionsPanel = ({
 
   return (
     <>
-      {(!installed || busyTarget === 'install') && (
+      {(!installed || installing) && (
         <div className="mb-2 flex items-center gap-4 rounded-lg border border-white/10 bg-white/[0.03] px-4 py-3">
           <span className="provider-option-text">
             <span className="provider-option-label">
-              {busyTarget === 'install' ? 'Installing fx…' : 'fx isn’t installed'}
+              {installing ? 'Installing fx…' : 'fx isn’t installed'}
             </span>
             <span className="provider-option-description">
               {installError
@@ -162,10 +151,10 @@ export const FxConnectionsPanel = ({
           <button
             type="button"
             className="provider-auth-button account-primary-button ml-auto shrink-0"
-            disabled={busyTarget !== null}
+            disabled={installing}
             onClick={() => void install()}
           >
-            {busyTarget === 'install' ? 'Installing…' : installError ? 'Try again' : 'Install fx'}
+            {installing ? 'Installing…' : installError ? 'Try again' : 'Install fx'}
           </button>
         </div>
       )}

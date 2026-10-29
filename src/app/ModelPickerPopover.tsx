@@ -1,6 +1,7 @@
 import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Check, Play, Search } from 'lucide-react';
+import { Check, Download, Loader2, Play, Search } from 'lucide-react';
 import type { AgentModel, AgentProvider, AgentProviderId } from '../agentCatalog';
+import { installFx, useFxInstall } from './fxInstall';
 
 type ModelPickerPopoverProps = {
   /** Provider tabs on the left rail, in order. */
@@ -54,6 +55,19 @@ export const ModelPickerPopover = ({
       );
     });
   }, [activeProviderId, models, search]);
+
+  // fx is the one provider Durango Code can install itself: while its CLI is
+  // missing, its tab offers the install and its rows install then select.
+  const fxInstall = useFxInstall();
+  const fxMissing =
+    activeProviderId === 'fx' &&
+    models.some((model) => model.providerId === 'fx') &&
+    models.every((model) => model.providerId !== 'fx' || model.available === false);
+  const installThenSelect = async (model?: AgentModel) => {
+    if (await installFx()) {
+      if (model) onSelect(model);
+    }
+  };
 
   // Keep the selected row in view when the popover opens on a long list. This
   // scrolls the list box by hand rather than with scrollIntoView, which walks
@@ -273,18 +287,42 @@ export const ModelPickerPopover = ({
           />
         </div>
         <div className="model-list" ref={listRef}>
+          {fxMissing && (
+            <div className="mx-1 mb-1.5 mt-1 flex items-center gap-3 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2.5">
+              <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                <span className="text-[13px] font-medium text-[var(--text-primary,#e5e5e5)]">
+                  {fxInstall.installing ? 'Installing fx…' : 'fx isn’t installed'}
+                </span>
+                <span className="text-xs leading-snug text-[var(--text-secondary,#a3a3a3)]">
+                  {fxInstall.error
+                    ? `Install failed: ${fxInstall.error}`
+                    : 'Install it to run these models on your ChatGPT or Grok subscription, or on Durango credits.'}
+                </span>
+              </span>
+              <button
+                type="button"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-white/90 px-2.5 py-1.5 text-xs font-medium text-neutral-900 transition hover:bg-white disabled:cursor-default disabled:opacity-60"
+                disabled={fxInstall.installing}
+                onClick={() => void installThenSelect()}
+              >
+                {fxInstall.installing ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+                {fxInstall.installing ? 'Installing' : fxInstall.error ? 'Try again' : 'Install fx'}
+              </button>
+            </div>
+          )}
           {visibleModels.map((model) => {
             const ProviderIcon =
               providers.find((provider) => provider.id === model.providerId)?.icon ?? Play;
             const selected = selectedModelId === model.id;
+            const installable = fxMissing && model.providerId === 'fx';
             return (
               <button
                 key={model.id}
                 ref={selected ? selectedRowRef : undefined}
                 className={`model-row ${selected ? 'selected' : ''}`}
-                onClick={() => onSelect(model)}
-                disabled={model.available === false}
-                title={model.unavailableReason ?? model.slug}
+                onClick={() => (installable ? void installThenSelect(model) : onSelect(model))}
+                disabled={installable ? fxInstall.installing : model.available === false}
+                title={installable ? 'Install fx and use this model' : model.unavailableReason ?? model.slug}
               >
                 <ProviderIcon size={18} />
                 <span className="model-row-text">
