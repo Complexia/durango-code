@@ -14,9 +14,15 @@ import { getThreadsDirectoryPath, getThreadsFilePath } from './paths.js';
 const MANIFEST_VERSION = 2;
 const MANIFEST_FILE = 'manifest.json';
 const LEGACY_BACKUP_FILE = 'orion-threads.v1-backup.json';
-const DEFAULT_PAGE_BYTES = 4 * 1024 * 1024;
-const MAX_REQUESTED_PAGE_BYTES = 8 * 1024 * 1024;
+// Bounded IPC responses: one carrying the whole corpus made Electron's main
+// process retain multi-gigabyte PartitionAlloc/Mojo regions after hydration.
+const MAX_BATCH_BYTES = 8 * 1024 * 1024;
 const PAGE_ENVELOPE_BYTES = 512;
+const MAX_HEAD_THREADS = 500;
+const MAX_BATCH_IDS = 1000;
+// Transcript files read at once. Reads are I/O bound; hashing and the IPC
+// response stay sequential in manifest order.
+const READ_CONCURRENCY = 16;
 let initializingStorage = false;
 
 const threadFileName = (id, hash) =>
@@ -33,6 +39,19 @@ const assertThread = (thread) => {
   return thread;
 };
 
+const latestTime = (...values) => {
+  let latest = null;
+  let latestMs = Number.NEGATIVE_INFINITY;
+  for (const value of values) {
+    const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+    if (Number.isFinite(ms) && ms > latestMs) {
+      latest = value;
+      latestMs = ms;
+    }
+  }
+  return latest;
+};
+
 const metadataFor = (thread, serialized = JSON.stringify(thread)) => ({
   id: thread.id,
   hash: crypto.createHash('sha256').update(serialized).digest('hex'),
@@ -45,6 +64,16 @@ const metadataFor = (thread, serialized = JSON.stringify(thread)) => ({
   createdAt: thread.createdAt ?? null,
   updatedAt: Array.isArray(thread.messages) ? thread.messages.at(-1)?.ts ?? thread.createdAt ?? null : thread.createdAt ?? null,
   messageCount: Array.isArray(thread.messages) ? thread.messages.length : 0,
+  // What the sidebar sorts by, so startup can load the rows it shows first
+  // (readThreadsHead) without opening every transcript.
+  activityAt: latestTime(
+    thread.createdAt,
+    Array.isArray(thread.messages) ? thread.messages.at(-1)?.ts : null,
+    Array.isArray(thread.messages) ? thread.messages.at(-1)?.completedAt : null,
+    thread.wokeAt,
+    thread.unpinnedAt
+  ),
+  pinnedAt: typeof thread.pinnedAt === 'string' ? thread.pinnedAt : null,
 });
 
 const parseManifest = (value) => {
@@ -257,12 +286,14 @@ const scheduleVersionCleanup = (previous, updated) => {
 
 export const readThreadsIndex = async () => (await ensureManifest()) ?? emptyManifest();
 
-const readEntry = async (entry) => {
+// The verified on-disk JSON of one transcript. The hash proves the bytes are
+// exactly what a patch wrote, so callers can hand them on without parsing.
+const readEntryRaw = async (entry) => {
   const readVersion = async (candidate) => {
     const value = await fs.readFile(threadPath(candidate.id, candidate.hash), 'utf8');
     const actualHash = crypto.createHash('sha256').update(value).digest('hex');
     if (actualHash !== candidate.hash) throw new Error(`Stored Orion thread ${candidate.id} failed its checksum.`);
-    return assertThread(JSON.parse(value));
+    return value;
   };
   try {
     return await readVersion(entry);
@@ -276,6 +307,35 @@ const readEntry = async (entry) => {
     if (!replacement || replacement.hash === entry.hash) throw error;
     return readVersion(replacement);
   }
+};
+
+const readEntry = async (entry) => assertThread(JSON.parse(await readEntryRaw(entry)));
+
+// Reads entries in order with several files in flight. `accept` sees each
+// result in order and returns false to stop; reads started past that point
+// are discarded.
+const readRawInOrder = async (entries, accept = () => true) => {
+  const raws = [];
+  const inFlight = [];
+  let next = 0;
+  const fill = () => {
+    while (inFlight.length < READ_CONCURRENCY && next < entries.length) {
+      inFlight.push(readEntryRaw(entries[next]));
+      next += 1;
+    }
+  };
+  fill();
+  try {
+    while (inFlight.length > 0) {
+      const raw = await inFlight.shift();
+      if (!accept(raw, raws.length)) break;
+      raws.push(raw);
+      fill();
+    }
+  } finally {
+    for (const pending of inFlight) pending.catch(() => {});
+  }
+  return raws;
 };
 
 export const readThreadById = async (id) => {
@@ -308,90 +368,93 @@ export const readAllThreads = async () => {
   return threads;
 };
 
-// Startup hydration deliberately reads bounded pages. Returning the entire
-// transcript corpus through one IPC response caused Electron's main process
-// to retain multi-gigabyte PartitionAlloc/Mojo regions after deserializing a
-// comparatively modest history file.
-export const readThreadsPage = async ({ offset = 0, revision, maxBytes = DEFAULT_PAGE_BYTES } = {}) => {
-  if (!Number.isInteger(offset) || offset < 0) throw new Error('Invalid Orion threads page offset.');
-  if (revision !== undefined && (!Number.isInteger(revision) || revision < 0)) {
-    throw new Error('Invalid Orion threads page revision.');
-  }
-  const requestedBytes = Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : DEFAULT_PAGE_BYTES;
-  const pageBytes = Math.min(Math.max(requestedBytes, PAGE_ENVELOPE_BYTES * 2), MAX_REQUESTED_PAGE_BYTES);
+const sortTime = (entry) => {
+  const ms = Date.parse(entry.activityAt ?? entry.updatedAt ?? entry.createdAt ?? '');
+  return Number.isFinite(ms) ? ms : Number.NEGATIVE_INFINITY;
+};
+
+// Startup hydration loads in two steps so the window is usable at once. The
+// head is what the first frame shows: the first `count` threads in stored
+// order, the `count` most recently active ones (the sidebar's order), every
+// pinned one, the `ids` the renderer names (selected thread, panes, saved
+// views) with their parents, and every subagent thread under any of those.
+// The renderer then loads the rest in the background with readThreadsBatch.
+// Both return JSON text assembled from the verified file bytes: parsing each
+// transcript here only to serialize it again for IPC was most of the cost.
+export const readThreadsHead = async ({ count = 0, ids = [] } = {}) => {
   const manifest = await ensureManifest();
-  if (!manifest) {
-    return {
-      version: MANIFEST_VERSION,
-      present: false,
-      stale: false,
-      revision: 0,
-      offset: 0,
-      total: 0,
-      threads: [],
-      nextOffset: null,
-    };
+  if (!manifest) return JSON.stringify({ version: MANIFEST_VERSION, present: false, order: [], threads: [] });
+  const entries = manifest.entries;
+  const limit = Math.min(Math.max(Number.isInteger(count) ? count : 0, 0), MAX_HEAD_THREADS);
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const children = new Map();
+  for (const entry of entries) {
+    if (!entry.parentThreadId) continue;
+    const siblings = children.get(entry.parentThreadId) ?? [];
+    siblings.push(entry.id);
+    children.set(entry.parentThreadId, siblings);
   }
 
-  const manifestRevision = manifest.revision ?? 0;
-  if (revision !== undefined && revision !== manifestRevision) {
-    return {
-      version: MANIFEST_VERSION,
-      present: true,
-      stale: true,
-      revision: manifestRevision,
-      offset: 0,
-      total: manifest.entries.length,
-      threads: [],
-      nextOffset: 0,
-    };
-  }
-  if (offset > manifest.entries.length) throw new Error('Invalid Orion threads page offset.');
-
-  const threads = [];
-  const contentBudget = pageBytes - PAGE_ENVELOPE_BYTES;
-  let contentBytes = 0;
-  let cursor = offset;
-  while (cursor < manifest.entries.length) {
-    const thread = await readEntry(manifest.entries[cursor]);
-    const threadBytes = Buffer.byteLength(JSON.stringify(thread), 'utf8');
-    const separatorBytes = threads.length > 0 ? 1 : 0;
-    if (threads.length > 0 && contentBytes + separatorBytes + threadBytes > contentBudget) break;
-    // An individual transcript can exceed the target. Return it alone rather
-    // than making one large agent response prevent every transcript from
-    // hydrating; the response is still bounded by one record, never the corpus.
-    threads.push(thread);
-    contentBytes += separatorBytes + threadBytes;
-    cursor += 1;
-  }
-
-  // A write may commit while this page is being read. Never return a page
-  // labelled with the old revision if any entry could have been replaced.
-  const latest = await ensureManifest();
-  const latestRevision = latest?.revision ?? 0;
-  if (!latest || latestRevision !== manifestRevision) {
-    return {
-      version: MANIFEST_VERSION,
-      present: Boolean(latest),
-      stale: true,
-      revision: latestRevision,
-      offset: 0,
-      total: latest?.entries.length ?? 0,
-      threads: [],
-      nextOffset: 0,
-    };
-  }
-
-  return {
-    version: MANIFEST_VERSION,
-    present: true,
-    stale: false,
-    revision: manifestRevision,
-    offset,
-    total: manifest.entries.length,
-    threads,
-    nextOffset: cursor < manifest.entries.length ? cursor : null,
+  const selected = new Set();
+  const roots = [];
+  const add = (id) => {
+    if (selected.has(id) || !byId.has(id)) return;
+    selected.add(id);
+    roots.push(id);
   };
+  for (const entry of entries.slice(0, limit)) add(entry.id);
+  for (const entry of [...entries].sort((a, b) => sortTime(b) - sortTime(a)).slice(0, limit)) add(entry.id);
+  for (const entry of entries) if (entry.pinnedAt) add(entry.id);
+  for (const id of Array.isArray(ids) ? ids : []) {
+    if (typeof id !== 'string') continue;
+    // A named subagent thread needs its parents for the breadcrumb and nesting.
+    let current = byId.get(id);
+    for (let depth = 0; current && depth < entries.length; depth += 1) {
+      add(current.id);
+      current = current.parentThreadId ? byId.get(current.parentThreadId) : undefined;
+    }
+  }
+  while (roots.length > 0) {
+    for (const childId of children.get(roots.pop()) ?? []) add(childId);
+  }
+
+  const raws = await readRawInOrder(entries.filter((entry) => selected.has(entry.id)));
+  return `{"version":${MANIFEST_VERSION},"present":true,"order":${JSON.stringify(
+    entries.map((entry) => entry.id)
+  )},"threads":[${raws.join(',')}]}`;
+};
+
+// The rest of the transcripts, by id, in responses of about `maxBytes`.
+// `consumed` says how many of `ids` this response covered (ids no longer
+// stored are skipped), so the caller continues from there. One transcript
+// larger than the budget is returned alone rather than blocking the rest.
+export const readThreadsBatch = async ({ ids = [], maxBytes = MAX_BATCH_BYTES } = {}) => {
+  if (!Array.isArray(ids) || ids.length > MAX_BATCH_IDS) throw new Error('Invalid Orion threads batch.');
+  const requestedBytes = Number.isFinite(maxBytes) ? Math.trunc(maxBytes) : MAX_BATCH_BYTES;
+  const budget =
+    Math.min(Math.max(requestedBytes, PAGE_ENVELOPE_BYTES * 2), MAX_BATCH_BYTES) - PAGE_ENVELOPE_BYTES;
+  const manifest = await ensureManifest();
+  const byId = new Map((manifest?.entries ?? []).map((entry) => [entry.id, entry]));
+  const wanted = [];
+  const positions = [];
+  ids.forEach((id, index) => {
+    const entry = typeof id === 'string' ? byId.get(id) : undefined;
+    if (!entry) return;
+    wanted.push(entry);
+    positions.push(index);
+  });
+
+  let bytes = 0;
+  const raws = await readRawInOrder(wanted, (raw, taken) => {
+    const size = Buffer.byteLength(raw, 'utf8') + (taken > 0 ? 1 : 0);
+    if (taken > 0 && bytes + size > budget) return false;
+    bytes += size;
+    return true;
+  });
+  // Ids up to the last one returned are covered, including any unknown ids
+  // between them; with everything returned, the whole request is.
+  const consumed = raws.length === wanted.length ? ids.length : positions[raws.length];
+  return `{"version":${MANIFEST_VERSION},"consumed":${consumed},"threads":[${raws.join(',')}]}`;
 };
 
 export const writeThreadsPatch = async (patch) => {

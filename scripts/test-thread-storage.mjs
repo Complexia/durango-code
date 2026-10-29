@@ -14,7 +14,8 @@ try {
     readAllThreads,
     readThreadById,
     readThreadsIndex,
-    readThreadsPage,
+    readThreadsBatch,
+    readThreadsHead,
     writeThreadsPatch,
     writeThreadsPatchSync,
   } = await import('../src/main/thread-storage.js');
@@ -116,55 +117,75 @@ try {
     deletes: [],
     order: [second.id, third.id, fourth.id, fifth.id, oversized.id],
   });
-  const packedPage = await readThreadsPage({ revision: pagedManifest.revision, maxBytes: 2_048 });
-  assert.ok(packedPage.threads.length > 1, 'small transcripts should share a page');
-  assert.ok(Buffer.byteLength(JSON.stringify(packedPage), 'utf8') <= 2_048, 'packed pages must honor their byte target');
-  const pagedThreads = [];
-  let sawOversizedPage = false;
-  let pageOffset = 0;
-  while (pageOffset !== null) {
-    const page = await readThreadsPage({
-      offset: pageOffset,
-      revision: pagedManifest.revision,
-      maxBytes: 1_024,
-    });
-    assert.equal(page.present, true);
-    assert.equal(page.stale, false);
-    assert.equal(page.revision, pagedManifest.revision);
-    assert.equal(page.offset, pageOffset);
-    assert.ok(page.threads.length > 0, 'every non-terminal page must make progress');
+  const allIds = [second.id, third.id, fourth.id, fifth.id, oversized.id];
+  const packed = JSON.parse(await readThreadsBatch({ ids: allIds, maxBytes: 2_048 }));
+  assert.ok(packed.threads.length > 1, 'small transcripts should share a batch');
+  assert.ok(Buffer.byteLength(JSON.stringify(packed), 'utf8') <= 2_048, 'packed batches must honor their byte target');
+  const batchedThreads = [];
+  let sawOversizedBatch = false;
+  for (let index = 0; index < allIds.length; ) {
+    const batch = JSON.parse(await readThreadsBatch({ ids: allIds.slice(index), maxBytes: 1_024 }));
+    assert.ok(batch.consumed > 0 && batch.threads.length > 0, 'every batch must make progress');
     assert.ok(
-      page.threads.length === 1 || Buffer.byteLength(JSON.stringify(page), 'utf8') <= 1_024,
-      'a page may exceed its target only for one individually oversized thread'
+      batch.threads.length === 1 || Buffer.byteLength(JSON.stringify(batch), 'utf8') <= 1_024,
+      'a batch may exceed its target only for one individually oversized thread'
     );
-    if (page.threads[0]?.id === oversized.id) {
-      assert.equal(page.threads.length, 1, 'an oversized transcript must be isolated to its own page');
-      sawOversizedPage = true;
+    if (batch.threads[0]?.id === oversized.id) {
+      assert.equal(batch.threads.length, 1, 'an oversized transcript must be isolated to its own batch');
+      sawOversizedBatch = true;
     }
-    pagedThreads.push(...page.threads);
-    pageOffset = page.nextOffset;
+    batchedThreads.push(...batch.threads);
+    index += batch.consumed;
   }
-  assert.equal(sawOversizedPage, true, 'an individually oversized transcript must not block hydration');
-  assert.deepEqual(pagedThreads, [second, third, fourth, fifth, oversized], 'paged reads must preserve manifest order');
-  const terminalPage = await readThreadsPage({
-    offset: pagedManifest.entries.length,
-    revision: pagedManifest.revision,
+  assert.equal(sawOversizedBatch, true, 'an individually oversized transcript must not block loading');
+  assert.deepEqual(batchedThreads, [second, third, fourth, fifth, oversized], 'batches must keep the requested order');
+  const sparse = JSON.parse(await readThreadsBatch({ ids: ['thread-gone', fifth.id, 'thread-missing'] }));
+  assert.deepEqual(sparse.threads, [fifth], 'ids no longer stored are skipped');
+  assert.equal(sparse.consumed, 3, 'skipped ids still count as covered');
+  await assert.rejects(readThreadsBatch({ ids: 'nope' }), /threads batch/);
+
+  // The head: the first `count` stored, the most recently active, the named
+  // ids with their parents, and everything nested under any of those.
+  const parent = { ...second, id: 'thread-parent', title: 'Parent', messages: [] , createdAt: '2026-07-01T00:00:00.000Z' };
+  const child = { ...second, id: 'thread-child', parentThreadId: parent.id, subagent: true };
+  const grandchild = { ...second, id: 'thread-grandchild', parentThreadId: child.id, subagent: true };
+  const recent = {
+    ...second,
+    id: 'thread-recent',
+    messages: [{ role: 'user', content: 'new', ts: '2026-09-01T00:00:00.000Z' }],
+  };
+  const pinned = { ...second, id: 'thread-pinned', pinnedAt: '2026-08-05T00:00:00.000Z', createdAt: '2026-01-01T00:00:00.000Z', messages: [] };
+  const headOrder = [...allIds, parent.id, child.id, grandchild.id, recent.id, pinned.id];
+  await writeThreadsPatch({
+    version: 2,
+    upserts: [parent, child, grandchild, recent, pinned],
+    deletes: [],
+    order: headOrder,
   });
-  assert.deepEqual(terminalPage.threads, []);
-  assert.equal(terminalPage.nextOffset, null, 'an offset at the end is a valid empty terminal page');
-  const stalePage = await readThreadsPage({ revision: pagedManifest.revision - 1 });
-  assert.equal(stalePage.stale, true, 'a mismatched revision must restart hydration without returning threads');
-  assert.deepEqual(stalePage.threads, []);
-  await assert.rejects(readThreadsPage({ offset: 99 }), /page offset/);
+  const head = JSON.parse(await readThreadsHead({ count: 1, ids: [grandchild.id] }));
+  assert.equal(head.present, true);
+  assert.deepEqual(head.order, headOrder, 'the head carries the full stored order');
+  assert.deepEqual(
+    head.threads.map((thread) => thread.id),
+    [second.id, parent.id, child.id, grandchild.id, recent.id, pinned.id],
+    'the head holds the first, the most recent, pinned, and named threads with their family, in stored order'
+  );
+  assert.deepEqual(head.threads[0], second, 'head transcripts arrive intact');
+  const parentHead = JSON.parse(await readThreadsHead({ count: 0, ids: [parent.id] }));
+  assert.deepEqual(
+    parentHead.threads.map((thread) => thread.id),
+    [parent.id, child.id, grandchild.id, pinned.id],
+    'a named thread brings every subagent thread under it'
+  );
 
   await fs.writeFile(path.join(getThreadsDirectoryPath(), 'manifest.json'), '{broken', 'utf8');
   await assert.rejects(readAllThreads(), 'a corrupt v2 manifest must fail closed instead of reviving stale v1 data');
   await clearThreadsStorage();
-  const absentPage = await readThreadsPage();
-  assert.equal(absentPage.present, false, 'absent storage must remain distinct from a failed read');
-  assert.equal(absentPage.nextOffset, null);
+  const absentHead = JSON.parse(await readThreadsHead({ count: 10 }));
+  assert.equal(absentHead.present, false, 'absent storage must remain distinct from a failed read');
+  assert.deepEqual(absentHead.threads, []);
 
-  console.log('Thread storage migration, paging, and incremental persistence checks passed.');
+  console.log('Thread storage migration, startup loading, and incremental persistence checks passed.');
 } finally {
   await fs.rm(testDataDir, { recursive: true, force: true });
   app.quit();

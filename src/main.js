@@ -65,7 +65,7 @@ import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
 import { createDispatchWorker, normalizeDispatchSettings } from './main/durango-dispatch.js';
 import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } from './main/durango-tools.js';
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
-import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsIndex, readThreadsPage, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
+import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsBatch, readThreadsHead, readThreadsIndex, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import {
   configureAgentModelsCache,
@@ -883,7 +883,11 @@ if (started) {
 // immediately; seed it from the installed app's store on first run.
 if (!app.isPackaged) {
   const liveUserData = app.getPath('userData');
-  const devUserData = devUserDataPath(liveUserData);
+  // ORION_DEV_USER_DATA points a dev run at its own profile (for example a
+  // copy of a large real one, to measure startup) without touching either.
+  const devUserData = process.env.ORION_DEV_USER_DATA
+    ? path.resolve(process.env.ORION_DEV_USER_DATA)
+    : devUserDataPath(liveUserData);
   try {
     mkdirSync(devUserData, { recursive: true });
     // Seed only a brand-new dev profile — BOTH files absent. An existing dev
@@ -1010,15 +1014,19 @@ const createWindow = () => {
   // DevTools can still be opened manually from the Electron menu when needed.
 };
 
+// First-party skills install in the background; only the skills list and
+// agent runs (whose CLI reads the skills folder at launch) wait for them.
+let bundledSkillsReady = Promise.resolve();
+// Remote control initializes after the window opens (see whenReady).
+let remoteControlReady = Promise.resolve();
+
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
-  try {
-    await ensureBundledSkills();
-  } catch (error) {
-    console.error('Could not install bundled agent skills', error);
-  }
+  bundledSkillsReady = ensureBundledSkills()
+    .then(() => {})
+    .catch((error) => console.error('Could not install bundled agent skills', error));
   // Reinforce the internal app name (helps in some dev launch scenarios). It
   // must stay "Orion": see ./main/app-identity.js.
   app.setName(INTERNAL_APP_NAME);
@@ -1066,8 +1074,11 @@ app.whenReady().then(async () => {
   });
 
   // Remote control (opt-in): lets paired Orion instances on the same account
-  // view and drive this one. Same seeding strategy as workspace sync.
-  await initRemoteControl({
+  // view and drive this one. Same seeding strategy as workspace sync. Its
+  // startup reconcile refreshes the account over the network, so the window
+  // opens without it; the remote IPC handlers and the account publish below
+  // wait for it instead.
+  remoteControlReady = initRemoteControl({
     readSession: () => readAccountSession(),
     readStoreState: () => readPersistedStoreState(),
     readThreadsIndex,
@@ -1083,7 +1094,7 @@ app.whenReady().then(async () => {
     deregisterRelayDevice,
     mintRelayTicket,
     getAppVersion: () => app.getVersion(),
-  });
+  }).catch((error) => console.error('Could not start remote control', error));
   addAgentEventListener((event) => forwardAgentEventToRemote(event));
   // Durango Chat dispatch (off by default). Seed from the persisted store so
   // an enabled worker resumes before the renderer hydrates; the renderer
@@ -1102,7 +1113,8 @@ app.whenReady().then(async () => {
       dispatchWorker.accountChanged(signedIn);
     })
     .catch((error) => console.error('Could not start Durango Chat dispatch', error));
-  void readPersistedStoreState()
+  void remoteControlReady
+    .then(() => readPersistedStoreState())
     .then((state) =>
       state?.remoteControlSettings
         ? configureRemoteControl({
@@ -1238,6 +1250,7 @@ app.whenReady().then(async () => {
   });
 
   createWindow();
+  await remoteControlReady;
 
   const startupAuthUrl = process.argv.find((arg) => isDesktopAuthCallbackUrl(arg));
   if (startupAuthUrl) {
@@ -1515,14 +1528,22 @@ ipcMain.handle('storage:save', async (_event, value) => {
   }
 });
 
-// Keep each startup response bounded. A single response containing every
-// transcript made Electron's main process retain the large IPC backing
-// allocations long after hydration completed.
-ipcMain.handle('storage:loadThreadsPage', async (_event, input) => {
+// Startup transcript hydration (thread-storage.js): the head the first frame
+// shows, then the rest in bounded background batches. Both arrive as JSON text.
+ipcMain.handle('storage:loadThreadsHead', async (_event, input) => {
   try {
-    return { ok: true, value: JSON.stringify(await readThreadsPage(input)) };
+    return { ok: true, value: await readThreadsHead(input) };
   } catch (error) {
-    console.error('storage:loadThreadsPage error', error);
+    console.error('storage:loadThreadsHead error', error);
+    return { ok: false };
+  }
+});
+
+ipcMain.handle('storage:loadThreadsBatch', async (_event, input) => {
+  try {
+    return { ok: true, value: await readThreadsBatch(input) };
+  } catch (error) {
+    console.error('storage:loadThreadsBatch error', error);
     return { ok: false };
   }
 });
@@ -1556,21 +1577,28 @@ ipcMain.handle('sync:getState', () => getWorkspaceSyncStatus());
 
 // Remote control surface. The engine no-ops while disabled or signed out;
 // every mutating handler re-checks the live account session inside the
-// engine, so a stale renderer can never act on a signed-out machine.
-ipcMain.handle('remote:getState', () => getRemoteControlState());
-ipcMain.handle('remote:configure', (_event, value) => configureRemoteControl(value));
-ipcMain.handle('remote:startPairing', () => startRemotePairing());
-ipcMain.handle('remote:cancelPairing', () => cancelRemotePairing());
-ipcMain.handle('remote:revokeDevice', (_event, input) => revokeRemoteDevice(input));
-ipcMain.handle('remote:relayDeregister', () => deregisterRelayMachine());
-ipcMain.handle('remote:pair', (_event, input) => pairWithRemoteHost(input));
-ipcMain.handle('remote:removeMachine', (_event, input) => removeRemoteMachine(input));
-ipcMain.handle('remote:connectMachine', (_event, input) => connectRemoteMachine(input));
-ipcMain.handle('remote:disconnectMachine', (_event, input) => disconnectRemoteMachine(input));
-ipcMain.handle('remote:fetchSnapshot', (_event, input) => fetchRemoteSnapshot(input));
-ipcMain.handle('remote:fetchThread', (_event, input) => fetchRemoteThread(input));
-ipcMain.handle('remote:runTurn', (_event, input) => runRemoteTurn(input));
-ipcMain.handle('remote:stopTurn', (_event, input) => stopRemoteTurn(input));
+// engine, so a stale renderer can never act on a signed-out machine. Calls
+// wait for the engine's startup, which no longer holds up the window.
+const afterRemoteControlInit =
+  (handler) =>
+  async (...args) => {
+    await remoteControlReady;
+    return handler(...args);
+  };
+ipcMain.handle('remote:getState', afterRemoteControlInit(() => getRemoteControlState()));
+ipcMain.handle('remote:configure', afterRemoteControlInit((_event, value) => configureRemoteControl(value)));
+ipcMain.handle('remote:startPairing', afterRemoteControlInit(() => startRemotePairing()));
+ipcMain.handle('remote:cancelPairing', afterRemoteControlInit(() => cancelRemotePairing()));
+ipcMain.handle('remote:revokeDevice', afterRemoteControlInit((_event, input) => revokeRemoteDevice(input)));
+ipcMain.handle('remote:relayDeregister', afterRemoteControlInit(() => deregisterRelayMachine()));
+ipcMain.handle('remote:pair', afterRemoteControlInit((_event, input) => pairWithRemoteHost(input)));
+ipcMain.handle('remote:removeMachine', afterRemoteControlInit((_event, input) => removeRemoteMachine(input)));
+ipcMain.handle('remote:connectMachine', afterRemoteControlInit((_event, input) => connectRemoteMachine(input)));
+ipcMain.handle('remote:disconnectMachine', afterRemoteControlInit((_event, input) => disconnectRemoteMachine(input)));
+ipcMain.handle('remote:fetchSnapshot', afterRemoteControlInit((_event, input) => fetchRemoteSnapshot(input)));
+ipcMain.handle('remote:fetchThread', afterRemoteControlInit((_event, input) => fetchRemoteThread(input)));
+ipcMain.handle('remote:runTurn', afterRemoteControlInit((_event, input) => runRemoteTurn(input)));
+ipcMain.handle('remote:stopTurn', afterRemoteControlInit((_event, input) => stopRemoteTurn(input)));
 // Registered only after the renderer has installed onRemoteCommandRequest.
 // did-start-loading/destroyed clear this authority until the next mount.
 ipcMain.handle('remote:rendererReady', (event) => markRemoteCommandRendererReady(event.sender));
@@ -4461,6 +4489,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (path.resolve(input.projectPath) === getNoProjectDirectoryPath()) {
       await fs.mkdir(input.projectPath, { recursive: true });
     }
+    await bundledSkillsReady;
     const workspaceError = await validateAgentWorkspace(input.projectPath);
     if (workspaceError) {
       return { ok: false, error: workspaceError };
@@ -6792,7 +6821,10 @@ ipcMain.handle('openWith:open', async (_event, input) => {
 
 // --- Agent skills (Settings → Skills) -----------------------------------------
 
-ipcMain.handle('skills:list', async () => listSkills());
+ipcMain.handle('skills:list', async () => {
+  await bundledSkillsReady;
+  return listSkills();
+});
 
 ipcMain.handle('skills:import', async (event, input) =>
   importSkills({

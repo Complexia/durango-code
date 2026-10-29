@@ -5,8 +5,126 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Durango Code</title>
     <link rel="icon" type="image/png" href="/icon.png" />
+    <style>
+      /* Boot skeleton: painted with the first frame, before the bundle loads,
+         and faded out by App once the store has hydrated (removeBootSkeleton).
+         Plain CSS on purpose: Tailwind and index.css arrive with the bundle. */
+      html, body { margin: 0; background: #101012; }
+      #boot-skeleton {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: flex;
+        flex-direction: column;
+        background: #101012;
+        transition: opacity 160ms cubic-bezier(0.22, 1, 0.36, 1);
+        --boot-sidebar: 280px;
+      }
+      #boot-skeleton.boot-done { opacity: 0; pointer-events: none; }
+      .boot-shell {
+        height: 58px;
+        flex-shrink: 0;
+        display: grid;
+        grid-template-columns: var(--boot-sidebar) minmax(0, 1fr);
+        background: linear-gradient(180deg, #141416 0%, #111113 100%);
+        -webkit-app-region: drag;
+      }
+      .boot-shell-side {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 0 12px 0 116px;
+        border-right: 1px solid rgb(255 255 255 / 8%);
+        color: #f0f0f1;
+        font: 750 17px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+      .boot-shell-side img { width: 28px; height: 28px; border-radius: 4px; }
+      .boot-body { flex: 1; min-height: 0; display: flex; }
+      .boot-sidebar {
+        width: var(--boot-sidebar);
+        flex-shrink: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 12px 12px;
+        box-sizing: border-box;
+        background: #141416;
+        border-right: 1px solid rgb(255 255 255 / 5.5%);
+        overflow: hidden;
+      }
+      .boot-main {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 40px 32px 24px;
+        box-sizing: border-box;
+      }
+      .boot-column { width: 100%; max-width: 820px; flex: 1; display: flex; flex-direction: column; gap: 14px; }
+      .boot-bar {
+        height: 12px;
+        border-radius: 6px;
+        background: linear-gradient(90deg, rgb(255 255 255 / 4.5%) 0%, rgb(255 255 255 / 8%) 50%, rgb(255 255 255 / 4.5%) 100%);
+        background-size: 200% 100%;
+        animation: boot-shimmer 1.4s ease-in-out infinite;
+      }
+      .boot-row { display: flex; flex-direction: column; justify-content: center; gap: 9px; height: 64px; padding: 0 10px; }
+      .boot-row .boot-bar:first-child { width: 38%; height: 9px; }
+      .boot-search { height: 32px; border-radius: 8px; margin-bottom: 6px; }
+      .boot-footer { margin-top: auto; height: 34px; border-radius: 8px; }
+      .boot-message { height: 64px; border-radius: 12px; }
+      .boot-message.user { align-self: flex-end; width: 46%; height: 40px; }
+      .boot-composer { margin-top: auto; height: 104px; border-radius: 18px; }
+      @keyframes boot-shimmer {
+        0% { background-position: 100% 0; }
+        100% { background-position: -100% 0; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-bar { animation: none; }
+      }
+    </style>
   </head>
   <body>
+    <div id="boot-skeleton" aria-hidden="true">
+      <div class="boot-shell">
+        <div class="boot-shell-side"><img src="/icon.png" alt="" draggable="false" />Code</div>
+        <div></div>
+      </div>
+      <div class="boot-body">
+        <div class="boot-sidebar">
+          <div class="boot-bar boot-search"></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 72%"></div></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 58%"></div></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 80%"></div></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 64%"></div></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 76%"></div></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 52%"></div></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 68%"></div></div>
+          <div class="boot-row"><div class="boot-bar"></div><div class="boot-bar" style="width: 60%"></div></div>
+          <div class="boot-bar boot-footer"></div>
+        </div>
+        <div class="boot-main">
+          <div class="boot-column">
+            <div class="boot-bar boot-message user"></div>
+            <div class="boot-bar boot-message"></div>
+            <div class="boot-bar boot-message" style="width: 82%"></div>
+            <div class="boot-bar boot-composer"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      // Match the sidebar width the app will restore (useSidebarResize).
+      try {
+        var stored = Number(localStorage.getItem('orion.agentsSidebarWidth'));
+        if (stored > 0) {
+          var available = Math.max(240, window.innerWidth - 320);
+          var width = Math.round(Math.min(Math.max(240, Math.min(640, available)), Math.max(240, stored)));
+          document.getElementById('boot-skeleton').style.setProperty('--boot-sidebar', width + 'px');
+        }
+      } catch (error) {}
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/renderer.tsx"></script>
   </body>

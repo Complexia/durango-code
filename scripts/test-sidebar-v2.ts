@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 const bridge = {
   loadStore: async () => null,
   // Never answers: these checks run against a fresh, unhydrated store.
-  loadThreadsPage: () => new Promise(() => {}),
+  loadThreadsHead: () => new Promise(() => {}),
   saveStore: async () => true,
   getNoProjectDir: async () => '/tmp/no-project',
 };

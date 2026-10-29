@@ -1117,6 +1117,10 @@ let cachedAgentModels = null;
 let cachedAgentModelsAt = 0;
 let agentModelsCacheGeneration = 0;
 const agentModelsListeners = new Set();
+// CLI availability as of the last probe (persisted with the model cache), and
+// whether this launch has probed yet; see listAgentModelsWithAvailability.
+const lastKnownCommandAvailability = new Map();
+let availabilityProbedOnce = false;
 
 export const onAgentModelsChanged = (listener) => {
   agentModelsListeners.add(listener);
@@ -1153,6 +1157,14 @@ const loadAgentModelsDiskCache = async (filePath) => {
     discoveredProviderModels = sanitizeProviderBlocks(parsed.providers);
     cachedAgentModels = buildAgentModels(discoveredProviderModels);
     cachedAgentModelsAt = Math.min(Number(parsed.savedAt) || 0, Date.now());
+    const knownCommands = new Set(Object.values(providerCommands));
+    for (const [command, available] of Object.entries(
+      parsed.availability && typeof parsed.availability === 'object' ? parsed.availability : {}
+    )) {
+      if (knownCommands.has(command) && typeof available === 'boolean') {
+        lastKnownCommandAvailability.set(command, available);
+      }
+    }
   } catch {}
 };
 
@@ -1162,7 +1174,12 @@ const saveAgentModelsDiskCache = async (providers) => {
   try {
     await fs.writeFile(
       tempPath,
-      JSON.stringify({ version: AGENT_MODELS_DISK_CACHE_VERSION, savedAt: Date.now(), providers })
+      JSON.stringify({
+        version: AGENT_MODELS_DISK_CACHE_VERSION,
+        savedAt: Date.now(),
+        providers,
+        availability: Object.fromEntries(lastKnownCommandAvailability),
+      })
     );
     await fs.rename(tempPath, agentModelsCacheFile);
   } catch {
@@ -1232,17 +1249,48 @@ export const getAgentModels = async ({ fresh = false } = {}) => {
   return refreshAgentModels();
 };
 
+const probeCommandAvailability = async (commands) => {
+  const availability = new Map(
+    await Promise.all(commands.map(async (command) => [command, await checkCommandAvailable(command)]))
+  );
+  const changed = [...availability].some(([command, available]) => lastKnownCommandAvailability.get(command) !== available);
+  for (const [command, available] of availability) lastKnownCommandAvailability.set(command, available);
+  // Saved alongside a discovered catalog only, never as a catalog of its own.
+  if (changed && Object.keys(discoveredProviderModels).length > 0) {
+    void saveAgentModelsDiskCache(discoveredProviderModels);
+  }
+  return { availability, changed };
+};
+
 // Shared by the agent:listModels IPC and the remote-control `models` request.
 // Availability is probed once per provider CLI (not per model), and the
-// internal `command` field never leaves the main process.
+// internal `command` field never leaves the main process. Probing waits for
+// the login shell's PATH and spawns a shell per CLI, so a plain request at
+// startup answers from the last launch's availability (saved with the model
+// cache) and probes in the background, telling windows to refetch if a CLI
+// appeared or went away.
 export const listAgentModelsWithAvailability = async ({ fresh = false } = {}) => {
   const models = await getAgentModels({ fresh });
   const uniqueCommands = [...new Set(models.map((model) => model.command).filter(Boolean))];
-  const availability = new Map(
-    await Promise.all(
-      uniqueCommands.map(async (command) => [command, await checkCommandAvailable(command)])
-    )
-  );
+  let availability;
+  if (!fresh && !availabilityProbedOnce && uniqueCommands.every((command) => lastKnownCommandAvailability.has(command))) {
+    availability = new Map(uniqueCommands.map((command) => [command, lastKnownCommandAvailability.get(command)]));
+    availabilityProbedOnce = true;
+    void probeCommandAvailability(uniqueCommands)
+      .then(({ changed }) => {
+        if (!changed) return;
+        for (const listener of agentModelsListeners) {
+          try {
+            listener(cachedAgentModels);
+          } catch {}
+        }
+      })
+      .catch(() => {});
+  } else {
+    availabilityProbedOnce = true;
+    const probe = await probeCommandAvailability(uniqueCommands);
+    availability = probe.availability;
+  }
 
   return models.map(({ command, ...model }) => {
     // Pseudo-models (Orion orchestrator) have no CLI to probe.

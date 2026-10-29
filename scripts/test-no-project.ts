@@ -10,8 +10,8 @@ const deferred = <T>() => {
   const promise = new Promise<T>((done) => { resolve = done; });
   return { promise, resolve };
 };
-const transcriptPage = deferred<{ ok: boolean; value: string }>();
-const pageRequested = deferred<void>();
+const transcriptHead = deferred<{ ok: boolean; value: string }>();
+const headRequested = deferred<void>();
 const existingProject = { id: 'repository', name: 'Existing project', path: '/tmp/existing' };
 // Epics were removed; a store written before then must drop them on save.
 const retiredEpic = { id: 'epic', name: 'Retired epic', createdAt: '2026-09-01T00:00:00Z' };
@@ -35,9 +35,9 @@ const writes: string[] = [];
 let directoryRequests = 0;
 const bridge = {
   loadStore: async () => savedValue,
-  loadThreadsPage: async () => {
-    pageRequested.resolve();
-    return transcriptPage.promise;
+  loadThreadsHead: async () => {
+    headRequested.resolve();
+    return transcriptHead.promise;
   },
   saveStore: async (value: string) => {
     writes.push(value);
@@ -55,7 +55,7 @@ Object.assign(globalThis, {
 });
 const { useOrionStore, flushOrionStoreSave, findProjectById, isNoProjectId, NO_PROJECT_ID } =
   await import('../src/store');
-await pageRequested.promise;
+await headRequested.promise;
 
 // Execute the actual startup effect with the real persisted store. Keeping
 // hydration pending beyond the save debounce reproduces the former data loss.
@@ -90,10 +90,7 @@ const hydrated = new Promise<void>((resolve) => {
     resolve();
   });
 });
-transcriptPage.resolve({ ok: true, value: JSON.stringify({
-  version: 2, present: true, stale: false, revision: 1,
-  offset: 0, total: 0, threads: [], nextOffset: null,
-}) });
+transcriptHead.resolve({ ok: true, value: JSON.stringify({ version: 2, present: true, order: [], threads: [] }) });
 await hydrated;
 await Promise.resolve();
 assert.equal(directoryRequests, 1, 'The disposed effect must not initialize after hydration');

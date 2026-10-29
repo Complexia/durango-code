@@ -113,6 +113,7 @@ import {
 } from './agentCatalog';
 import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
 import orionIconUrl from '../assets/icon.png';
+import { removeBootSkeleton } from './app/bootSkeleton';
 import { CodeWorkspace } from './app/CodeWorkspace';
 import { AgentsSidebar, type AgentsSidebarModel, MachinesAndSavedViews, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
@@ -2604,6 +2605,10 @@ const App: React.FC = () => {
     }
     return useOrionStore.persist.onFinishHydration(() => setStoreHydrated(true));
   }, []);
+  useEffect(() => {
+    // Runs after the hydrated frame commits: the real sidebar is underneath.
+    if (storeHydrated) removeBootSkeleton();
+  }, [storeHydrated]);
   useEffect(() => {
     // Never push pre-hydration defaults: work sharing defaults to on, and a
     // user who turned it off must not get a single sync call at startup.

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { createJSONStorage, persist, type StateStorage } from 'zustand/middleware';
+import { persist, type PersistStorage, type StorageValue } from 'zustand/middleware';
 import { agentModelSuccessors } from './agentCatalog';
 import { createThreadBranchFamily } from './thread-branching';
 import { defaultWorkspaceSyncConsentSettings, migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent';
@@ -965,153 +965,150 @@ const cancelQueuedThreadsSave = () => {
   }
 };
 
-type PersistedThreadsPage = {
-  version: 2;
-  present: boolean;
-  stale: boolean;
-  revision: number;
-  offset: number;
-  total: number;
-  threads: Thread[];
-  nextOffset: number | null;
+// Startup hydration is split so the window is usable at once: the store
+// hydrates with the head (the threads the first frame shows — see
+// readThreadsHead in main/thread-storage.js) and the remaining transcripts
+// load in the background afterwards (backfillThreads below). Thread
+// persistence is patch-based — upserts of changed threads, explicit deletes,
+// and an order in which unknown ids keep their place — so saving while the
+// older transcripts are still loading never touches them on disk.
+type PersistedThreadsHead = { version: 2; present: boolean; order: string[]; threads: Thread[] };
+type PersistedThreadsBatch = { version: 2; consumed: number; threads: Thread[] };
+
+const THREADS_HEAD_COUNT = 60;
+const THREADS_BATCH_BYTES = 8 * 1024 * 1024;
+const THREADS_BATCH_IDS = 500;
+
+// Set by hydration when the head left transcripts on disk; cleared once
+// they are in the store (or storage is cleared).
+let threadsBackfill: { order: string[]; pendingIds: string[] } | null = null;
+let threadsBackfillGeneration = 0;
+// Threads deleted while the backfill runs must not come back with it.
+const threadsDeletedDuringBackfill = new Set<string>();
+let threadsSavedDuringBackfill = false;
+let applyingThreadsBackfill = false;
+const threadsCompleteListeners = new Set<() => void>();
+
+/** True once every stored transcript is in the store (always, for a fresh or legacy store). */
+export const allThreadsLoaded = () => threadsBackfill === null;
+/** Runs `listener` once every stored transcript is in the store; returns an unsubscribe. */
+export const onAllThreadsLoaded = (listener: () => void) => {
+  if (allThreadsLoaded() && useOrionStore.persist.hasHydrated()) {
+    listener();
+    return () => {};
+  }
+  threadsCompleteListeners.add(listener);
+  return () => {
+    threadsCompleteListeners.delete(listener);
+  };
+};
+const notifyAllThreadsLoaded = () => {
+  for (const listener of [...threadsCompleteListeners]) {
+    threadsCompleteListeners.delete(listener);
+    listener();
+  }
 };
 
-const THREADS_PAGE_BYTES = 4 * 1024 * 1024;
-const THREADS_HYDRATION_ATTEMPTS = 3;
+// The ids hydration itself checks threads against (merge below): they must
+// be in the head or the selection, panes and saved views would be dropped.
+const threadIdsNamedByStore = (state: Record<string, unknown>) => {
+  const ids = new Set<string>();
+  const addAll = (value: unknown) => {
+    if (!Array.isArray(value)) return;
+    for (const id of value) if (typeof id === 'string') ids.add(id);
+  };
+  if (typeof state.selectedThreadId === 'string') ids.add(state.selectedThreadId);
+  addAll(state.paneThreadIds);
+  if (Array.isArray(state.savedViews)) {
+    for (const view of state.savedViews) addAll((view as { threadIds?: unknown } | null)?.threadIds);
+  }
+  return [...ids];
+};
 
-// Graft the separately-persisted threads back into the persisted state so the
-// persist middleware — including its crash-recovery merge — sees one combined
-// snapshot. Pages keep the main-process IPC allocation bounded; the manifest
-// revision prevents a concurrent save from producing a mixed snapshot. With
-// no threads file yet (pre-split builds), the store value's own embedded
-// threads are used as-is and the first threads save migrates them out.
-const withThreadsGrafted = async (value: string | null): Promise<string | null> => {
-  if (!window.orion.loadThreadsPage) return value;
-  let storedThreads: Thread[] | null = null;
+const parseStorageValue = (value: string | null) =>
+  value === null ? null : (JSON.parse(value) as StorageValue<unknown>);
+
+// Graft the head of the separately-persisted threads into the persisted
+// state so the persist middleware — including its crash-recovery merge —
+// sees one combined snapshot. With no threads directory yet (pre-split
+// builds), the store value's own embedded threads are used as-is and the
+// first threads save migrates them out.
+const withThreadsGrafted = async (value: string | null): Promise<StorageValue<unknown> | null> => {
+  if (!window.orion.loadThreadsHead) return parseStorageValue(value);
+  // A lost/corrupt store file must not take the transcripts with it.
+  let parsed: { state: Record<string, unknown>; version?: number };
   try {
-    for (let attempt = 0; attempt < THREADS_HYDRATION_ATTEMPTS; attempt += 1) {
-      const threads: Thread[] = [];
-      let offset = 0;
-      let revision: number | undefined;
-      let total: number | undefined;
-      let retry = false;
-
-      while (true) {
-        const result = await window.orion.loadThreadsPage({
-          offset,
-          revision,
-          maxBytes: THREADS_PAGE_BYTES,
-        });
-        if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread page read failed.');
-        const page = JSON.parse(result.value) as PersistedThreadsPage;
-        if (
-          page?.version !== 2 ||
-          typeof page.present !== 'boolean' ||
-          typeof page.stale !== 'boolean' ||
-          !Number.isInteger(page.revision) ||
-          !Number.isInteger(page.offset) ||
-          !Number.isInteger(page.total) ||
-          !Array.isArray(page.threads) ||
-          (page.nextOffset !== null && !Number.isInteger(page.nextOffset))
-        ) {
-          throw new Error('Invalid thread page response.');
-        }
-        if (page.stale) {
-          retry = true;
-          break;
-        }
-        if (!page.present) {
-          if (offset !== 0 || page.threads.length !== 0 || page.nextOffset !== null) {
-            throw new Error('Invalid absent thread page response.');
-          }
-          return value;
-        }
-        if (
-          page.offset !== offset ||
-          page.revision < 0 ||
-          page.total < 0 ||
-          (revision !== undefined && page.revision !== revision) ||
-          (total !== undefined && page.total !== total)
-        ) {
-          throw new Error('Inconsistent thread page response.');
-        }
-        revision = page.revision;
-        total = page.total;
-        threads.push(...page.threads);
-
-        if (page.nextOffset === null) {
-          if (threads.length !== total) throw new Error('Incomplete thread page response.');
-          storedThreads = threads;
-          break;
-        }
-        if (
-          page.nextOffset <= offset ||
-          page.nextOffset > total ||
-          page.nextOffset - offset !== page.threads.length
-        ) {
-          throw new Error('Invalid next thread page offset.');
-        }
-        offset = page.nextOffset;
-      }
-
-      if (storedThreads !== null) break;
-      if (!retry) throw new Error('Thread hydration did not complete.');
+    const candidate = value === null ? null : JSON.parse(value);
+    parsed =
+      candidate &&
+      typeof candidate === 'object' &&
+      !Array.isArray(candidate) &&
+      candidate.state &&
+      typeof candidate.state === 'object' &&
+      !Array.isArray(candidate.state)
+        ? candidate
+        : { state: {}, version: 1 };
+  } catch {
+    // The settings envelope is expendable; the separately persisted
+    // transcripts are not. Rebuild a minimal envelope rather than letting
+    // hydration flush an empty thread list over the valid threads files.
+    parsed = { state: {}, version: 1 };
+  }
+  try {
+    const result = await window.orion.loadThreadsHead({
+      count: THREADS_HEAD_COUNT,
+      ids: threadIdsNamedByStore(parsed.state),
+    });
+    if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread head read failed.');
+    const head = JSON.parse(result.value) as PersistedThreadsHead;
+    if (
+      head?.version !== 2 ||
+      typeof head.present !== 'boolean' ||
+      !Array.isArray(head.order) ||
+      !Array.isArray(head.threads)
+    ) {
+      throw new Error('Invalid thread head response.');
     }
-    if (storedThreads === null) throw new Error('Thread storage changed repeatedly during hydration.');
+    if (!head.present) return parseStorageValue(value);
     loadedThreadsFromStorage = true;
-    // A lost/corrupt store file must not take the transcripts with it.
-    let parsed: { state: Record<string, unknown>; version?: number };
-    try {
-      const candidate = value === null ? null : JSON.parse(value);
-      parsed =
-        candidate &&
-        typeof candidate === 'object' &&
-        !Array.isArray(candidate) &&
-        candidate.state &&
-        typeof candidate.state === 'object' &&
-        !Array.isArray(candidate.state)
-          ? candidate
-          : { state: {}, version: 1 };
-    } catch {
-      // The settings envelope is expendable; the separately persisted
-      // transcripts are not. Rebuild a minimal envelope rather than returning
-      // the malformed value and letting hydration flush an empty thread list
-      // over the valid threads file.
-      parsed = { state: {}, version: 1 };
-    }
-    parsed.state = { ...parsed.state, threads: storedThreads };
-    return JSON.stringify(parsed);
+    const loadedIds = new Set(head.threads.map((thread) => thread.id));
+    const pendingIds = head.order.filter((id) => !loadedIds.has(id));
+    threadsBackfill = pendingIds.length > 0 ? { order: head.order, pendingIds } : null;
+    parsed.state = { ...parsed.state, threads: head.threads };
+    return parsed;
   } catch (error) {
     console.error('Failed to hydrate Orion threads', error);
     // Hydrating without the real transcript snapshot is survivable, but
     // persisting over it is not.
     threadsPersistenceBlocked = true;
-    return value;
+    return parseStorageValue(value);
   }
 };
 
-const orionStorage: StateStorage = {
+// Objects in, objects out: zustand's createJSONStorage would make the
+// grafted transcripts take a stringify and a second parse on every launch.
+const orionStorage: PersistStorage<unknown> = {
   getItem: async (name) => {
     if (typeof window === 'undefined' || !window.orion?.loadStore) {
-      return memoryStorage.get(name) ?? null;
+      return parseStorageValue(memoryStorage.get(name) ?? null);
     }
 
-    const value = await withThreadsGrafted(await window.orion.loadStore());
-    if (value !== null) {
-      memoryStorage.set(name, value);
-      return value;
-    }
+    const stored = await window.orion.loadStore();
+    if (stored !== null) memoryStorage.set(name, stored);
+    const value = await withThreadsGrafted(stored);
+    if (value !== null) return value;
 
     const legacyValue = window.localStorage.getItem(name);
     if (legacyValue !== null) {
       memoryStorage.set(name, legacyValue);
       await window.orion.saveStore(legacyValue);
-      return legacyValue;
+      return parseStorageValue(legacyValue);
     }
 
     return null;
   },
-  setItem: async (name, value) => {
+  setItem: async (name, storageValue) => {
+    const value = JSON.stringify(storageValue);
     memoryStorage.set(name, value);
     pendingStoreValue = value;
 
@@ -1145,6 +1142,13 @@ const orionStorage: StateStorage = {
     // An explicit clear discards whatever unreadable file blocked
     // persistence — new activity may persist fresh snapshots again.
     threadsPersistenceBlocked = false;
+    // Transcripts still loading belong to the storage being cleared.
+    if (threadsBackfill) {
+      threadsBackfill = null;
+      threadsBackfillGeneration += 1;
+      threadsDeletedDuringBackfill.clear();
+      notifyAllThreadsLoaded();
+    }
 
     if (typeof window === 'undefined' || !window.orion?.clearStore) {
       return;
@@ -1190,6 +1194,94 @@ const migrateLegacyLinkedTask = (thread: Thread): Thread => {
   };
   delete migrated.linkedTask;
   return migrated;
+};
+
+// Agent runs can't survive an app restart — the CLI processes die with
+// the app — so any thread or message rehydrated as 'running' is a
+// leftover from the previous session. Left alone it pins the run
+// status bar forever, because the run-event handler only flips
+// messages tracked by runs started in this session.
+//
+// A Claude turn can finish while its background tasks keep working:
+// the message persists as 'done' captioned "Waiting on … background
+// task(s) …" (waitingOnBackgroundStatusText in App.tsx — keep this
+// pattern in sync) with the thread 'running'. Those tasks died with
+// the app, so the wait can never settle — rewrite the caption
+// alongside the status flip. Only while the thread is still
+// 'running', though: every resolution path (a background-settled
+// event or the synthetic follow-up turn finishing) flips the thread
+// off 'running' but leaves the old caption behind as history, and
+// history must not be rebranded as a restart casualty. The first
+// alternation of the pattern matches captions persisted by older
+// builds ("Waiting on N background agents…").
+const restoreThreadFromPreviousRun = (thread: Thread, restartedAt: string): Thread => {
+  const waitingOnBackground = WAITING_ON_BACKGROUND_CAPTION;
+  // Threads used to carry a single board task; they now carry a list.
+  thread = migrateLegacyLinkedTask(thread);
+  // Epics were removed; drop the grouping older builds persisted.
+  if ('epicId' in thread) {
+    const { epicId: _epicId, ...rest } = thread as Thread & { epicId?: unknown };
+    thread = rest;
+  }
+  const waitUnresolved = thread.status === 'running';
+  const stale =
+    waitUnresolved || thread.messages.some((message) => message.status === 'running');
+  if (!stale) return thread;
+  // Only a currently live wait may be rebranded. Every resolution
+  // path (a background-settled event or a synthetic follow-up turn)
+  // appends a newer agent-run message after the waiting one, while a
+  // resolved wait can keep its historical "Waiting on …" caption. So
+  // the wait is live only when the thread's newest agent-run message
+  // is the one carrying the caption; a captioned message behind a
+  // newer turn — including the running foreground or synthetic turn
+  // that made this thread 'running' — is history from a wait that
+  // already resolved and must not be relabeled as a restart casualty.
+  const lastAgentRun = waitUnresolved
+    ? [...thread.messages].reverse().find((message) => message.kind === 'agent-run')
+    : undefined;
+  const liveWaitId =
+    lastAgentRun &&
+    lastAgentRun.status !== 'running' &&
+    lastAgentRun.statusText != null &&
+    waitingOnBackground.test(lastAgentRun.statusText)
+      ? lastAgentRun.id
+      : undefined;
+  return {
+    ...thread,
+    status: waitUnresolved ? 'idle' : thread.status,
+    messages: thread.messages.map((message) => {
+      if (
+        message.kind === 'claude-background-intervention' &&
+        message.claudeBackgroundIntervention &&
+        (message.claudeBackgroundIntervention.status === 'pending' ||
+          message.claudeBackgroundIntervention.status === 'stopping')
+      ) {
+        return {
+          ...message,
+          claudeBackgroundIntervention: {
+            ...message.claudeBackgroundIntervention,
+            status: 'settled' as const,
+            error: undefined,
+          },
+        };
+      }
+      if (message.status === 'running') {
+        return {
+          ...message,
+          status: 'stopped' as const,
+          completedAt: message.completedAt ?? restartedAt,
+          statusText: 'Interrupted by app restart.',
+        };
+      }
+      if (message.id === liveWaitId) {
+        return {
+          ...message,
+          statusText: 'Background tasks interrupted by app restart.',
+        };
+      }
+      return message;
+    }),
+  };
 };
 
 // Opening a thread already on screen just moves focus to its pane. Opening any
@@ -2299,7 +2391,7 @@ export const useOrionStore = create<OrionState>()(
     }),
     {
       name: 'orion-storage',
-      storage: createJSONStorage(() => orionStorage),
+      storage: orionStorage,
       version: 1,
       // `threads` is deliberately absent: the persist middleware stringifies
       // this partialized state on EVERY store update, and threads hold every
@@ -2450,93 +2542,9 @@ export const useOrionStore = create<OrionState>()(
         if (merged.textGenerationSettings.modelId) {
           merged.textGenerationSettings.modelId = upgradeModelId(merged.textGenerationSettings.modelId);
         }
-        // Agent runs can't survive an app restart — the CLI processes die with
-        // the app — so any thread or message rehydrated as 'running' is a
-        // leftover from the previous session. Left alone it pins the run
-        // status bar forever, because the run-event handler only flips
-        // messages tracked by runs started in this session.
+        // Leftovers of the previous session's runs (restoreThreadFromPreviousRun).
         const restartedAt = new Date().toISOString();
-        // A Claude turn can finish while its background tasks keep working:
-        // the message persists as 'done' captioned "Waiting on … background
-        // task(s) …" (waitingOnBackgroundStatusText in App.tsx — keep this
-        // pattern in sync) with the thread 'running'. Those tasks died with
-        // the app, so the wait can never settle — rewrite the caption
-        // alongside the status flip. Only while the thread is still
-        // 'running', though: every resolution path (a background-settled
-        // event or the synthetic follow-up turn finishing) flips the thread
-        // off 'running' but leaves the old caption behind as history, and
-        // history must not be rebranded as a restart casualty. The first
-        // alternation of the pattern matches captions persisted by older
-        // builds ("Waiting on N background agents…").
-        const waitingOnBackground = WAITING_ON_BACKGROUND_CAPTION;
-        merged.threads = merged.threads.map((thread) => {
-          // Threads used to carry a single board task; they now carry a list.
-          thread = migrateLegacyLinkedTask(thread);
-          // Epics were removed; drop the grouping older builds persisted.
-          if ('epicId' in thread) {
-            const { epicId: _epicId, ...rest } = thread as Thread & { epicId?: unknown };
-            thread = rest;
-          }
-          const waitUnresolved = thread.status === 'running';
-          const stale =
-            waitUnresolved || thread.messages.some((message) => message.status === 'running');
-          if (!stale) return thread;
-          // Only a currently live wait may be rebranded. Every resolution
-          // path (a background-settled event or a synthetic follow-up turn)
-          // appends a newer agent-run message after the waiting one, while a
-          // resolved wait can keep its historical "Waiting on …" caption. So
-          // the wait is live only when the thread's newest agent-run message
-          // is the one carrying the caption; a captioned message behind a
-          // newer turn — including the running foreground or synthetic turn
-          // that made this thread 'running' — is history from a wait that
-          // already resolved and must not be relabeled as a restart casualty.
-          const lastAgentRun = waitUnresolved
-            ? [...thread.messages].reverse().find((message) => message.kind === 'agent-run')
-            : undefined;
-          const liveWaitId =
-            lastAgentRun &&
-            lastAgentRun.status !== 'running' &&
-            lastAgentRun.statusText != null &&
-            waitingOnBackground.test(lastAgentRun.statusText)
-              ? lastAgentRun.id
-              : undefined;
-          return {
-            ...thread,
-            status: waitUnresolved ? 'idle' : thread.status,
-            messages: thread.messages.map((message) => {
-              if (
-                message.kind === 'claude-background-intervention' &&
-                message.claudeBackgroundIntervention &&
-                (message.claudeBackgroundIntervention.status === 'pending' ||
-                  message.claudeBackgroundIntervention.status === 'stopping')
-              ) {
-                return {
-                  ...message,
-                  claudeBackgroundIntervention: {
-                    ...message.claudeBackgroundIntervention,
-                    status: 'settled' as const,
-                    error: undefined,
-                  },
-                };
-              }
-              if (message.status === 'running') {
-                return {
-                  ...message,
-                  status: 'stopped' as const,
-                  completedAt: message.completedAt ?? restartedAt,
-                  statusText: 'Interrupted by app restart.',
-                };
-              }
-              if (message.id === liveWaitId) {
-                return {
-                  ...message,
-                  statusText: 'Background tasks interrupted by app restart.',
-                };
-              }
-              return message;
-            }),
-          };
-        });
+        merged.threads = merged.threads.map((thread) => restoreThreadFromPreviousRun(thread, restartedAt));
         // Panes must reference threads that survived to this launch, and stores
         // written before the split view shipped carry no pane list at all —
         // rebuild it from the selected thread so those users reopen on the
@@ -2632,6 +2640,7 @@ export const flushOrionThreadsSave = async (): Promise<boolean> => {
   for (const id of patch.deletes) pendingThreadDeletes.delete(id);
   pendingThreadOrder = false;
   threadsInFlightPatch = patch;
+  if (threadsBackfill) threadsSavedDuringBackfill = true;
   const save = (async () => {
     try {
       const saved = await window.orion.saveThreads(patch);
@@ -2668,6 +2677,8 @@ const flushThreadsSave = () => {
 
 useOrionStore.subscribe((state, previous) => {
   if (state.threads === previous.threads || !useOrionStore.persist.hasHydrated()) return;
+  // Backfilled transcripts are exactly what is on disk already.
+  if (applyingThreadsBackfill) return;
   if (state.threads.length === previous.threads.length) {
     let sameOrder = true;
     let changed = false;
@@ -2704,11 +2715,113 @@ useOrionStore.subscribe((state, previous) => {
     if (!currentIds.has(thread.id)) {
       pendingThreadUpserts.delete(thread.id);
       pendingThreadDeletes.add(thread.id);
+      if (threadsBackfill) threadsDeletedDuringBackfill.add(thread.id);
     }
   }
   pendingThreadOrder = true;
   scheduleThreadsSave();
 });
+
+// Slot the backfilled transcripts back where they are stored, around the
+// threads already in memory (which keep their own order, including threads
+// created since launch).
+const mergeBackfilledThreads = (current: Thread[], loaded: Thread[], order: string[]) => {
+  const position = new Map(order.map((id, index) => [id, index]));
+  const currentIds = new Set(current.map((thread) => thread.id));
+  const additions = loaded
+    .filter((thread) => !currentIds.has(thread.id) && !threadsDeletedDuringBackfill.has(thread.id))
+    .sort((a, b) => (position.get(a.id) ?? 0) - (position.get(b.id) ?? 0));
+  if (additions.length === 0) return current;
+  const threads: Thread[] = [];
+  let next = 0;
+  for (const thread of current) {
+    const at = position.get(thread.id);
+    if (at !== undefined) {
+      while (next < additions.length && position.get(additions[next].id)! < at) threads.push(additions[next++]);
+    }
+    threads.push(thread);
+  }
+  while (next < additions.length) threads.push(additions[next++]);
+  return threads;
+};
+
+// App's interrupted-run recovery only sees the threads hydration loaded.
+const restoreBackfilledThread = (thread: Thread, restartedAt: string): Thread => {
+  const restored = restoreThreadFromPreviousRun(thread, restartedAt);
+  if (!restored.btwExchanges?.some((exchange) => exchange.status === 'running')) return restored;
+  return {
+    ...restored,
+    btwExchanges: restored.btwExchanges.map((exchange) =>
+      exchange.status === 'running'
+        ? { ...exchange, status: 'error' as const, error: 'Interrupted before Durango Code received the answer.' }
+        : exchange
+    ),
+  };
+};
+
+const BACKFILL_ATTEMPTS = 3;
+
+// Load the transcripts hydration left on disk, then add them in one update.
+// Runs after the first frame; nothing waits on it.
+const backfillThreads = async () => {
+  const backfill = threadsBackfill;
+  if (!backfill || !window.orion?.loadThreadsBatch) return;
+  const generation = threadsBackfillGeneration;
+  const loaded: Thread[] = [];
+  let index = 0;
+  let failures = 0;
+  while (index < backfill.pendingIds.length) {
+    if (generation !== threadsBackfillGeneration) return;
+    try {
+      const ids = backfill.pendingIds.slice(index, index + THREADS_BATCH_IDS);
+      const result = await window.orion.loadThreadsBatch({ ids, maxBytes: THREADS_BATCH_BYTES });
+      if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread batch read failed.');
+      const batch = JSON.parse(result.value) as PersistedThreadsBatch;
+      if (
+        batch?.version !== 2 ||
+        !Array.isArray(batch.threads) ||
+        !Number.isInteger(batch.consumed) ||
+        batch.consumed < 1 ||
+        batch.consumed > ids.length
+      ) {
+        throw new Error('Invalid thread batch response.');
+      }
+      loaded.push(...batch.threads);
+      index += batch.consumed;
+      failures = 0;
+    } catch (error) {
+      failures += 1;
+      if (failures >= BACKFILL_ATTEMPTS) {
+        // Saving stays safe without them (patches never touch threads that
+        // aren't in memory); they come back on the next launch.
+        console.error('Could not load older Orion threads', error);
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500 * failures));
+    }
+  }
+  if (generation !== threadsBackfillGeneration) return;
+  const restartedAt = new Date().toISOString();
+  const restored = loaded.map((thread) => restoreBackfilledThread(thread, restartedAt));
+  applyingThreadsBackfill = true;
+  try {
+    useOrionStore.setState((state) => ({
+      threads: mergeBackfilledThreads(state.threads, restored, backfill.order),
+    }));
+  } finally {
+    applyingThreadsBackfill = false;
+  }
+  threadsBackfill = null;
+  threadsDeletedDuringBackfill.clear();
+  // A save made meanwhile stored the partial order; the old threads kept
+  // their place behind it, but write the real one back.
+  if (threadsSavedDuringBackfill) {
+    threadsSavedDuringBackfill = false;
+    pendingThreadOrder = true;
+    scheduleThreadsSave();
+  }
+  notifyAllThreadsLoaded();
+};
 
 // Materialize the threads file as soon as hydration lands rather than a
 // throttle-window later: the store file stops embedding threads on its first
@@ -2717,28 +2830,25 @@ useOrionStore.subscribe((state, previous) => {
 //
 // Stores that turned sidebar v2 on before the first-switch settle existed get
 // it once here rather than in `merge`: thread edits made during hydration are
-// never saved, while this one goes through the saver like a user's.
+// never saved, while this one goes through the saver like a user's. It
+// settles every thread, so it waits for the backfill.
 const settleThreadsFromBeforeSidebarV2 = () => {
   const { sidebarV2Settings, setSidebarV2Settings } = useOrionStore.getState();
   if (threadsPersistenceBlocked || !sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return;
   setSidebarV2Settings({});
 };
-useOrionStore.persist.onFinishHydration(() => {
+const finishThreadsHydration = () => {
   if (!loadedThreadsFromStorage && !threadsPersistenceBlocked) {
     for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
     pendingThreadOrder = true;
   }
-  settleThreadsFromBeforeSidebarV2();
+  onAllThreadsLoaded(settleThreadsFromBeforeSidebarV2);
   flushThreadsSave();
-});
-if (useOrionStore.persist.hasHydrated()) {
-  if (!loadedThreadsFromStorage && !threadsPersistenceBlocked) {
-    for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
-    pendingThreadOrder = true;
-  }
-  settleThreadsFromBeforeSidebarV2();
-  flushThreadsSave();
-}
+  if (threadsBackfill) void backfillThreads();
+  else notifyAllThreadsLoaded();
+};
+useOrionStore.persist.onFinishHydration(finishThreadsHydration);
+if (useOrionStore.persist.hasHydrated()) finishThreadsHydration();
 
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
