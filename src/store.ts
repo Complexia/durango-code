@@ -385,6 +385,15 @@ export type QueuedMessage = {
  * thread's agent session. It has the thread's full context but never joins
  * the thread — the main session and transcript are untouched.
  */
+export type UserAction = {
+  /** Id the agent resolves it by (`ua_…`). */
+  id: string;
+  /** One instruction, as the agent wrote it (Markdown). */
+  action: string;
+  url?: string;
+  requestedAt: string;
+};
+
 export type BtwExchange = {
   id: string;
   question: string;
@@ -544,6 +553,13 @@ export type Thread = {
   btwExchanges?: BtwExchange[];
   /** Kanban cards on the Orion web board driving/driven by this thread, in link order. */
   linkedTasks?: LinkedBoardTask[];
+  /**
+   * Things the agent asked the user to do outside the chat (request_user_action),
+   * oldest first. While any is pending the thread reads as needing the user and
+   * the actions stay pinned above the composer, until the agent or the user
+   * resolves them.
+   */
+  userActions?: UserAction[];
   /**
    * Set when Durango Chat started this thread (Phase 5 dispatch). The
    * outcome is reported back to the chat once the first run settles.

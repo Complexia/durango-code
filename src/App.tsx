@@ -118,7 +118,17 @@ import { CodeWorkspace } from './app/CodeWorkspace';
 import { AgentsSidebar, type AgentsSidebarModel, MachinesAndSavedViews, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
 import { ProjectPickerModal, type ProjectPickerView } from './app/ProjectPickerModal';
-import { compareSidebarV2Recent, sidebarV2ThreadLists, useStableIdList, useThreadsNeedingInput } from './app/threadLists';
+import {
+  compareSidebarV2Recent,
+  mergeAttentionSince,
+  pendingUserActions,
+  sidebarRootThread,
+  sidebarV2ThreadLists,
+  threadsAwaitingUserAction,
+  useStableIdList,
+  useThreadsNeedingInput,
+} from './app/threadLists';
+import { UserActionCards } from './app/UserActions';
 import { ThreadPane } from './app/ThreadPane';
 import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
@@ -507,6 +517,8 @@ const threadShellSignature = (thread: Thread): string => {
     JSON.stringify(thread.inheritedSubagent ?? null),
     JSON.stringify(thread.goal ?? null),
     JSON.stringify(thread.linkedTasks ?? null),
+    // Pinned user actions (request_user_action) and their row tint.
+    JSON.stringify(thread.userActions ?? null),
     // Composer chips for @-attached MCP servers.
     (thread.mcpServerIds ?? []).join(','),
     // The header's workspace pill and run directory; an agent can attach its
@@ -1154,6 +1166,15 @@ const App: React.FC = () => {
 
   const selectedThread = threads.find((t) => t.id === selectedThreadId);
   const selectedThreadContext = threadViewContext(selectedThread);
+  // Pinned above the composer (its own and its subagents'). Keyed by content
+  // so streaming output doesn't re-render the cards every token.
+  const selectedThreadUserActionsNow = selectedThreadId ? pendingUserActions(threads, selectedThreadId) : [];
+  const selectedThreadUserActionsKey = JSON.stringify(selectedThreadUserActionsNow);
+  const selectedThreadUserActions = useMemo(
+    () => selectedThreadUserActionsNow,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selectedThreadUserActionsKey]
+  );
   const selectedThreadProject = selectedThreadContext.project;
   const selectedThreadWorkspacePending = selectedThreadContext.workspacePending;
   const selectedThreadWorkspaceRemoving = selectedThreadContext.workspaceRemoving;
@@ -2013,6 +2034,58 @@ const App: React.FC = () => {
     [updateThread]
   );
   const threadsNeedingInput = useThreadsNeedingInput(sidebarV2Enabled, runningThreadIds, wakeThreadForAttention);
+  // Threads with an action pending on the user (request_user_action) need
+  // them too, running or not, until the action is resolved. Keyed by content
+  // so streaming output doesn't hand the sidebar a new map every token.
+  const awaitingUserAction = threadsAwaitingUserAction(threads);
+  const awaitingUserActionKey = [...awaitingUserAction].map(([id, since]) => `${id}:${since}`).join(',');
+  const attentionThreadIds = useMemo(
+    () => mergeAttentionSince(threadsNeedingInput, awaitingUserAction),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [threadsNeedingInput, awaitingUserActionKey]
+  );
+  // request_user_action / resolve_user_action from any run. Asking pins the
+  // action on the thread and, like a question, brings the thread the sidebar
+  // lists (a subagent's driver) back from Snoozed or Settled.
+  useEffect(() => {
+    if (!window.orion?.onUserAction) return undefined;
+    return window.orion.onUserAction((request) => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((candidate) => candidate.id === request.threadId);
+      if (!thread) return;
+      const current = thread.userActions ?? [];
+      if (request.type === 'resolve') {
+        const remaining = request.id ? current.filter((action) => action.id !== request.id) : [];
+        if (remaining.length !== current.length) {
+          updateThread(thread.id, { userActions: remaining.length ? remaining : undefined });
+        }
+        return;
+      }
+      const now = new Date().toISOString();
+      updateThread(thread.id, {
+        userActions: [
+          ...current.filter((action) => action.id !== request.id),
+          { id: request.id, action: request.action, ...(request.url ? { url: request.url } : {}), requestedAt: now },
+        ],
+      });
+      const root = sidebarRootThread(state.threads, thread);
+      if (!root.snoozedAt && !root.settledAt) return;
+      const onScreen = isAgentsPanelVisible(state) && state.paneThreadIds.includes(root.id);
+      updateThread(root.id, {
+        snoozedAt: undefined,
+        settledAt: undefined,
+        ...(onScreen ? {} : { wokeAt: now, wokeReason: 'attention' as const }),
+      });
+    });
+  }, [updateThread]);
+  const markUserActionDone = useCallback(
+    (threadId: string, actionId: string) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const remaining = (thread?.userActions ?? []).filter((action) => action.id !== actionId);
+      updateThread(threadId, { userActions: remaining.length ? remaining : undefined });
+    },
+    [updateThread]
+  );
   // A blank draft (nothing sent, nothing typed) is just the composer the
   // Agents panel opens with nothing else to show; it joins the list once used.
   // CLI threads keep their conversation in the terminal, so they always show.
@@ -2032,9 +2105,9 @@ const App: React.FC = () => {
             )
           : [],
         (thread) => childThreadIds.has(thread.id),
-        compareSidebarV2Recent(threadsNeedingInput)
+        compareSidebarV2Recent(attentionThreadIds)
       ),
-    [childThreadIds, sidebarV2Enabled, threads, threadsNeedingInput, typedDraftThreadIds]
+    [attentionThreadIds, childThreadIds, sidebarV2Enabled, threads, typedDraftThreadIds]
   );
   const setSidebarV2ViewVisible = useCallback(
     (view: keyof SidebarV2Settings['views'], visible: boolean) =>
@@ -8940,6 +9013,11 @@ const App: React.FC = () => {
   // loop, so a six-way split never duplicates the picker/mention machinery.
   const composerNode = selectedThread ? (
     <div className="chat-input-area">
+      <UserActionCards
+        actions={selectedThreadUserActions}
+        currentThreadId={selectedThread.id}
+        onDone={markUserActionDone}
+      />
       <CodexQuestions
         threadId={selectedThread.id}
         onAsyncAnswer={answerAsyncQuestion}
@@ -10145,7 +10223,7 @@ const App: React.FC = () => {
                   threadsByView={sidebarV2Lists}
                   views={sidebarV2Views}
                   setViewVisible={setSidebarV2ViewVisible}
-                  attentionThreadIds={threadsNeedingInput}
+                  attentionThreadIds={attentionThreadIds}
                   selectProject={stableAgentsSidebarActions.handleCreateThread}
                   handleNewAgent={stableAgentsSidebarActions.handleNewAgent}
                   handleAddProject={handleSidebarV2AddProject}

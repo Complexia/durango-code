@@ -2,7 +2,8 @@
 // Orion MCP bridge shim: a dependency-free stdio MCP server that provider
 // CLIs (codex, cursor, grok, kimi) spawn as the `orion` MCP server. It
 // exposes the spawn_subagent/stop_subagent/read_thread tools plus the Durango
-// Chat tools (search_chats, read_chat, recall_memory, remember) and forwards
+// Chat tools (search_chats, read_chat, recall_memory, remember) and the
+// user-action tools (request_user_action, resolve_user_action), and forwards
 // calls to the
 // Orion desktop app over a local socket; the app runs the subagent as a
 // visible subthread and returns its final report. Claude runs use the
@@ -207,6 +208,50 @@ const rememberTool = {
   },
 };
 
+// User actions, served by the desktop app (src/main/user-actions.js), which
+// pins them on the thread. Descriptions and schemas mirror user-actions.js
+// exactly; scripts/test-durango-tools.mjs keeps them in sync.
+const requestUserActionTool = {
+  name: 'request_user_action',
+  description:
+    'Ask the user to do something only they can do outside this chat, such as signing in or authorizing in a browser window you opened (npm login, OAuth, a CLI device code), approving a prompt on their machine, or pasting a value you cannot get yourself. Durango Code marks the thread as needing the user, brings it back from Snoozed, and pins the action above the composer until it is resolved, so it does not get lost in your replies. It returns at once: keep working on anything that does not depend on it. Write the action as one clear instruction (what to do, where, and any code to enter). Call resolve_user_action with the returned action_id as soon as you see it is done, or the user tells you it is.',
+  // Only changes how Durango Code presents the thread.
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        description:
+          'What the user should do, as one clear instruction, e.g. "Finish the npm login in the browser tab that opened (code ABCD-1234)."',
+      },
+      url: {
+        type: 'string',
+        description: 'Link the user should open for it, if any (shown as an Open button)',
+      },
+    },
+    required: ['action'],
+    additionalProperties: false,
+  },
+};
+
+const resolveUserActionTool = {
+  name: 'resolve_user_action',
+  description:
+    'Clear an action you asked the user for with request_user_action, once it is done (you saw it succeed, or the user said so) or no longer needed. Without action_id, clears every action pending on this thread.',
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action_id: {
+        type: 'string',
+        description: 'The action_id request_user_action returned; omit to clear every pending action on this thread',
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
 const tools = [
   spawnSubagentTool,
   stopSubagentTool,
@@ -215,6 +260,8 @@ const tools = [
   readChatTool,
   recallMemoryTool,
   rememberTool,
+  requestUserActionTool,
+  resolveUserActionTool,
 ];
 const toolNames = new Set(tools.map((tool) => tool.name));
 

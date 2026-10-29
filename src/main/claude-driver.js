@@ -17,6 +17,7 @@ import {
   runDurangoTool,
 } from './durango-tools.js';
 import { orionBuiltinToolNamesForAccessMode } from './thread-reader-routing.js';
+import { USER_ACTION_MAX_CHARS, USER_ACTION_TOOL_DESCRIPTIONS, USER_ACTION_TOOL_INPUT_SCHEMAS, runUserActionTool } from './user-actions.js';
 import { claudeEffortForCli, claudeModelArgForContextWindow, defaultClaudeContextWindow, defaultClaudeReasoningEffort, parseExtraArgs } from './models.js';
 import { finalizingAgentRuns, startingAgentRuns } from './run-registry.js';
 import { execFileAsync, resolveCommandPath } from './shell-env.js';
@@ -106,6 +107,12 @@ export const CLAUDE_BACKGROUND_WAIT_TIP = [
   '# Background commands (Durango Code)',
   'When you start a background Bash command (run_in_background) and will wait for its result before you are done, such as a build, deploy, release, test run or a wait-until loop, call mcp__orion__wait_for_background_tasks with its task id right after starting it. Durango Code then keeps the thread Working until it finishes and you are re-invoked. Without it, ending your turn shows the thread as finished while you are still waiting. Skip it for work you leave running (dev servers, watchers).',
   'Make a background command exit as soon as its work is done: a pipeline only ends when every part has, so never feed a prompt from a pipeline padded with a long `sleep`, and give polling loops a stop condition.',
+].join('\n');
+
+// Same reason: say when to reach for request_user_action (user-actions.js).
+export const CLAUDE_USER_ACTION_TIP = [
+  '# Actions only the user can take (Durango Code)',
+  'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it, and call mcp__orion__resolve_user_action with the returned action_id as soon as it is done.',
 ].join('\n');
 
 // In-process MCP server offered to every Claude SDK session (not only
@@ -294,6 +301,46 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
           };
         },
         // Only changes how Durango Code presents this thread's own turn.
+        { annotations: { readOnlyHint: true } }
+      ),
+      // User actions (user-actions.js). Mirrored in mcp-bridge-shim.cjs;
+      // test-durango-tools.mjs keeps them in sync.
+      tool(
+        'request_user_action',
+        USER_ACTION_TOOL_DESCRIPTIONS.request_user_action,
+        {
+          action: z
+            .string()
+            .max(USER_ACTION_MAX_CHARS)
+            .describe(USER_ACTION_TOOL_INPUT_SCHEMAS.request_user_action.properties.action.description),
+          url: z.string().optional().describe(USER_ACTION_TOOL_INPUT_SCHEMAS.request_user_action.properties.url.description),
+        },
+        async (args) =>
+          durangoToolResult(
+            await runUserActionTool('request_user_action', args, {
+              getSender: () => session.sender,
+              threadId: session.threadId,
+            })
+          ),
+        // Only changes how Durango Code presents this thread.
+        { annotations: { readOnlyHint: true } }
+      ),
+      tool(
+        'resolve_user_action',
+        USER_ACTION_TOOL_DESCRIPTIONS.resolve_user_action,
+        {
+          action_id: z
+            .string()
+            .optional()
+            .describe(USER_ACTION_TOOL_INPUT_SCHEMAS.resolve_user_action.properties.action_id.description),
+        },
+        async (args) =>
+          durangoToolResult(
+            await runUserActionTool('resolve_user_action', args, {
+              getSender: () => session.sender,
+              threadId: session.threadId,
+            })
+          ),
         { annotations: { readOnlyHint: true } }
       ),
       // Durango Chat tools (durango-tools.js). Mirrored in mcp-bridge-shim.cjs
@@ -1692,7 +1739,7 @@ export const createClaudeSdkSession = ({
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          append: [CLAUDE_BACKGROUND_WAIT_TIP, ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : [])].join('\n\n'),
+          append: [CLAUDE_BACKGROUND_WAIT_TIP, CLAUDE_USER_ACTION_TIP, ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : [])].join('\n\n'),
         },
         // Match the CLI's behavior: without this the SDK loads no user or
         // project settings — no CLAUDE.md, no skills, no MCP servers.

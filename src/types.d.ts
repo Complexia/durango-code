@@ -1455,6 +1455,13 @@ type OrionCodexBrowserIntegrationStatus = {
       onSubagentSpawnRequest(callback: (request: SubagentSpawnRequest) => void): () => void;
       reportSubagentStopResult(payload: { stopId: string; ok: boolean; result: string }): Promise<void>;
       onSubagentStopRequest(callback: (request: SubagentStopRequest) => void): () => void;
+      onUserAction?: (
+        callback: (
+          request:
+            | { type: 'request'; threadId: string; id: string; action: string; url?: string }
+            | { type: 'resolve'; threadId: string; id?: string }
+        ) => void
+      ) => () => void;
       onFileChange?: (cb: (data: { path: string; exists: boolean; mtimeMs: number | null }) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;

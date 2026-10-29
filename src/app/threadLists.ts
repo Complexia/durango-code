@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { WAITING_ON_BACKGROUND_CAPTION, type Message, type Thread } from '../store';
+import { WAITING_ON_BACKGROUND_CAPTION, type Message, type Thread, type UserAction } from '../store';
 import { getThreadActivityTime } from './time';
 
 export type SidebarV2View = 'pinned' | 'recent' | 'snoozed' | 'settled';
@@ -7,7 +7,8 @@ export type SidebarV2ViewsSettings = Record<SidebarV2View, boolean>;
 
 /**
  * How a sidebar v2 row is tinted: yellow while the thread needs the user (a
- * question or approval is waiting, or its run failed), green when its run
+ * question, an approval or an action it asked for is waiting, or its run
+ * failed), green when its run
  * finished and it hasn't been opened since. Snoozed threads that wake up keep
  * the tone they woke with until they are opened.
  */
@@ -192,6 +193,72 @@ export const useThreadsNeedingInput = (
   }, [enabled]);
 
   return pending;
+};
+
+/**
+ * The thread the sidebar lists for `thread`: itself, or for a subagent the
+ * driver thread it runs under (subagent rows are hidden).
+ */
+export const sidebarRootThread = (threads: Thread[], thread: Thread) => {
+  const byId = new Map(threads.map((candidate) => [candidate.id, candidate]));
+  let root = thread;
+  const seen = new Set([root.id]);
+  while (root.parentThreadId) {
+    const parent = byId.get(root.parentThreadId);
+    if (!parent || seen.has(parent.id)) break;
+    seen.add(parent.id);
+    root = parent;
+  }
+  return root;
+};
+
+/**
+ * Sidebar threads with an action pending on the user (request_user_action),
+ * from the thread itself or one of its subagents, each with when the newest
+ * action was asked for (for the Recent order).
+ */
+export const threadsAwaitingUserAction = (threads: Thread[]): Map<string, number> => {
+  const awaiting = new Map<string, number>();
+  for (const thread of threads) {
+    if (!thread.userActions?.length) continue;
+    const since = Math.max(...thread.userActions.map((action) => Date.parse(action.requestedAt) || 0));
+    const rootId = sidebarRootThread(threads, thread).id;
+    awaiting.set(rootId, Math.max(awaiting.get(rootId) ?? Number.NEGATIVE_INFINITY, since));
+  }
+  return awaiting;
+};
+
+/** Both "needs the user" sources in one map, keeping the later time per thread. */
+export const mergeAttentionSince = (...sources: ReadonlyMap<string, number>[]): ReadonlyMap<string, number> => {
+  const nonEmpty = sources.filter((source) => source.size > 0);
+  if (nonEmpty.length <= 1) return nonEmpty[0] ?? sources[0] ?? new Map();
+  const merged = new Map<string, number>();
+  for (const source of nonEmpty) {
+    for (const [id, since] of source) merged.set(id, Math.max(merged.get(id) ?? Number.NEGATIVE_INFINITY, since));
+  }
+  return merged;
+};
+
+export type PendingUserAction = UserAction & { threadId: string; threadTitle: string };
+
+/** Actions pending on `threadId` and its subagents (at any depth), oldest first. */
+export const pendingUserActions = (threads: Thread[], threadId: string): PendingUserAction[] => {
+  const ids = new Set([threadId]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const thread of threads) {
+      if (thread.parentThreadId && ids.has(thread.parentThreadId) && !ids.has(thread.id)) {
+        ids.add(thread.id);
+        grew = true;
+      }
+    }
+  }
+  return threads
+    .filter((thread) => ids.has(thread.id) && thread.userActions?.length)
+    .flatMap((thread) =>
+      (thread.userActions ?? []).map((action) => ({ ...action, threadId: thread.id, threadTitle: thread.title }))
+    )
+    .sort((a, b) => Date.parse(a.requestedAt) - Date.parse(b.requestedAt));
 };
 
 /** Stable Set identity for an id list, so memoized consumers don't churn. */

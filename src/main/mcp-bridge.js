@@ -9,6 +9,7 @@ import mcpBridgeShimSource from '../mcp-bridge-shim.cjs?raw';
 import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
 import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
+import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
 import {
   acpOrionMcpServers,
   museOrionMcpServers,
@@ -187,6 +188,10 @@ export const handleMcpBridgeConnection = (socket) => {
           ({ ok, text }) => reply(ok, text),
           (error) => reply(false, `Durango request failed: ${error?.message ?? error}`)
         );
+        continue;
+      }
+      if (USER_ACTION_TOOL_NAMES.includes(message.tool)) {
+        void runUserActionTool(message.tool, args, session).then(({ ok, text }) => reply(ok, text));
         continue;
       }
       reply(false, `Unknown tool: ${message.tool}`);

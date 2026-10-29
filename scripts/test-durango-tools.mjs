@@ -37,6 +37,12 @@ import {
   isRequiredThreadReaderBridgeMissing,
 } from '../src/main/thread-reader-routing.js';
 import { createOrionMcpServer } from '../src/main/claude-driver.js';
+import {
+  USER_ACTION_TOOL_DESCRIPTIONS,
+  USER_ACTION_TOOL_INPUT_SCHEMAS,
+  USER_ACTION_TOOL_NAMES,
+  runUserActionTool,
+} from '../src/main/user-actions.js';
 import { handleMcpBridgeConnection, mcpBridgeSessions } from '../src/main/mcp-bridge.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
 
@@ -270,6 +276,10 @@ try {
       assert.equal(isPreapprovedOrionTool(name, mode), true, `${name} in ${mode}`);
     }
   }
+  for (const name of USER_ACTION_TOOL_NAMES) {
+    assert.ok(ORION_BUILTIN_TOOL_NAMES.includes(name));
+    assert.equal(isPreapprovedOrionTool(name, 'read-only'), true, `${name} in read-only`);
+  }
   assert.equal(isPreapprovedOrionTool('remember', 'read-only'), false);
   assert.equal(isPreapprovedOrionTool('remember', 'workspace-write'), true);
   assert.equal(isPreapprovedOrionTool('bash', 'full-access'), false);
@@ -301,6 +311,50 @@ try {
   assert.equal(claudeRemember.isError, true, 'the session access mode reaches the tool');
   const claudeSearch = await registered.find((entry) => entry.name === 'search_chats').handler({ query: 'deploy' });
   assert.match(claudeSearch.content[0].text, /futuremail deploy checklist/);
+
+  for (const name of USER_ACTION_TOOL_NAMES) {
+    const entry = registered.find((candidate) => candidate.name === name);
+    assert.ok(entry, `Claude registers ${name}`);
+    assert.equal(entry.description, USER_ACTION_TOOL_DESCRIPTIONS[name]);
+    assert.deepEqual(Object.keys(entry.schema).sort(), Object.keys(USER_ACTION_TOOL_INPUT_SCHEMAS[name].properties).sort());
+  }
+  const claudeAction = await registered.find((entry) => entry.name === 'request_user_action').handler({ action: 'Log in' });
+  assert.equal(claudeAction.isError, true, 'no window: the agent is told to ask in its reply');
+  assert.match(claudeAction.content[0].text, /Ask in your reply/);
+
+  // --- User actions reach the renderer -------------------------------------------------------
+  const sent = [];
+  const fakeSender = { isDestroyed: () => false, send: (channel, payload) => sent.push({ channel, payload }) };
+  const requested = await runUserActionTool(
+    'request_user_action',
+    { action: '  Finish the npm login in the browser.  ', url: 'https://www.npmjs.com/login' },
+    { getSender: () => fakeSender, threadId: 'thread-1' }
+  );
+  assert.equal(requested.ok, true);
+  assert.equal(sent[0].channel, 'agent:userAction');
+  assert.equal(sent[0].payload.type, 'request');
+  assert.equal(sent[0].payload.threadId, 'thread-1');
+  assert.equal(sent[0].payload.action, 'Finish the npm login in the browser.');
+  assert.equal(sent[0].payload.url, 'https://www.npmjs.com/login');
+  assert.match(requested.text, new RegExp(sent[0].payload.id));
+  const badUrl = await runUserActionTool(
+    'request_user_action',
+    { action: 'x', url: 'javascript:alert(1)' },
+    { getSender: () => fakeSender, threadId: 'thread-1' }
+  );
+  assert.equal(badUrl.ok, false);
+  assert.equal(sent.length, 1, 'rejected requests are not shown');
+  const empty = await runUserActionTool('request_user_action', { action: ' ' }, { getSender: () => fakeSender, threadId: 'thread-1' });
+  assert.equal(empty.ok, false);
+  const resolved = await runUserActionTool(
+    'resolve_user_action',
+    { action_id: sent[0].payload.id },
+    { getSender: () => fakeSender, threadId: 'thread-1' }
+  );
+  assert.equal(resolved.ok, true);
+  assert.deepEqual(sent[1].payload, { type: 'resolve', threadId: 'thread-1', id: sent[0].payload.id });
+  await runUserActionTool('resolve_user_action', {}, { getSender: () => fakeSender, threadId: 'thread-1' });
+  assert.deepEqual(sent[2].payload, { type: 'resolve', threadId: 'thread-1' });
 
   // --- Bridge shim advertises identical tools and forwards calls ------------------------------
   const shimPath = path.join(testRoot, 'shim.cjs');
@@ -342,7 +396,16 @@ try {
       assert.equal(tool.description, DURANGO_TOOL_DESCRIPTIONS[name], `${name} description matches durango-tools.js`);
       assert.deepEqual(tool.inputSchema, DURANGO_TOOL_INPUT_SCHEMAS[name], `${name} schema matches durango-tools.js`);
     }
+    for (const name of USER_ACTION_TOOL_NAMES) {
+      const tool = shimTools.find((candidate) => candidate.name === name);
+      assert.ok(tool, `shim lists ${name}`);
+      assert.equal(tool.description, USER_ACTION_TOOL_DESCRIPTIONS[name], `${name} description matches user-actions.js`);
+      assert.deepEqual(tool.inputSchema, USER_ACTION_TOOL_INPUT_SCHEMAS[name], `${name} schema matches user-actions.js`);
+    }
     assert.deepEqual(shimTools.map((tool) => tool.name), ORION_BUILTIN_TOOL_NAMES);
+    const shimAction = await call('tools/call', { name: 'request_user_action', arguments: { action: 'Log in' } });
+    assert.equal(shimAction.result.isError, true, 'the bridge routes user actions (no window here)');
+    assert.match(shimAction.result.content[0].text, /Ask in your reply/);
     const search = await call('tools/call', { name: 'search_chats', arguments: { query: 'onboarding' } });
     assert.equal(search.result.isError, false);
     assert.match(search.result.content[0].text, /Onboarding copy ideas/);

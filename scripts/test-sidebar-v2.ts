@@ -14,8 +14,17 @@ Object.assign(globalThis, {
   window: { addEventListener() {}, localStorage: { getItem: () => null }, orion: bridge },
 });
 const { useOrionStore, defaultSidebarV2Settings } = await import('../src/store');
-const { compareSidebarV2Recent, formatWorkedDuration, sidebarV2ThreadLists, threadSidebarTone, threadWorkedMs, workStartedAt } =
-  await import('../src/app/threadLists');
+const {
+  compareSidebarV2Recent,
+  formatWorkedDuration,
+  mergeAttentionSince,
+  pendingUserActions,
+  sidebarV2ThreadLists,
+  threadSidebarTone,
+  threadWorkedMs,
+  threadsAwaitingUserAction,
+  workStartedAt,
+} = await import('../src/app/threadLists');
 const { projectMonogram } = await import('../src/app/ProjectBadge');
 
 const store = useOrionStore.getState;
@@ -190,6 +199,35 @@ assert.equal(workStart('w3'), Date.parse('2026-10-28T01:00:00.000Z'), 'a wake-up
 assert.equal(formatWorkedDuration(7_000), '7s');
 assert.equal(formatWorkedDuration(38 * 60_000), '38m');
 assert.equal(formatWorkedDuration(125 * 60_000), '2h 5m');
+
+// Actions the agent asked the user for (request_user_action) flag the thread
+// the sidebar lists, a subagent's driver included, until resolved.
+const action = (id: string, requestedAt: string) => ({ id, action: `Do ${id}`, requestedAt });
+const actionThreads = [
+  make('driver', {}),
+  make('sub', { parentThreadId: 'driver', userActions: [action('ua_sub', '2026-10-28T02:00:00.000Z')] }),
+  make('subsub', { parentThreadId: 'sub', userActions: [action('ua_deep', '2026-10-28T01:00:00.000Z')] }),
+  make('solo', { userActions: [action('ua_a', '2026-10-28T03:00:00.000Z'), action('ua_b', '2026-10-28T00:30:00.000Z')] }),
+  make('quiet', {}),
+];
+const awaiting = threadsAwaitingUserAction(actionThreads);
+assert.deepEqual([...awaiting.keys()].sort(), ['driver', 'solo'], 'subagent actions flag their driver');
+assert.equal(awaiting.get('driver'), Date.parse('2026-10-28T02:00:00.000Z'), 'newest action counts');
+assert.equal(awaiting.get('solo'), Date.parse('2026-10-28T03:00:00.000Z'));
+assert.deepEqual(
+  pendingUserActions(actionThreads, 'driver').map((pending) => [pending.threadId, pending.id]),
+  [['subsub', 'ua_deep'], ['sub', 'ua_sub']],
+  'the driver shows its subagents\' actions, oldest first'
+);
+assert.deepEqual(pendingUserActions(actionThreads, 'quiet'), []);
+const questions = new Map([['quiet', 5], ['solo', 1]]);
+const merged = mergeAttentionSince(questions, awaiting);
+assert.equal(merged.get('quiet'), 5);
+assert.equal(merged.get('solo'), Date.parse('2026-10-28T03:00:00.000Z'), 'the later time wins');
+const none = new Map<string, number>();
+assert.equal(mergeAttentionSince(none, new Map()), none, 'empty sources keep their identity');
+assert.equal(mergeAttentionSince(none, awaiting), awaiting);
+assert.equal(threadSidebarTone(make('running', { status: 'running' }), merged.has('solo')), 'attention', 'running threads tint too');
 
 // Monograms match T3 Code's.
 assert.equal(projectMonogram('durango'), 'DO');

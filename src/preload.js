@@ -203,6 +203,12 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('orchestration:spawnRequest', listener);
     return () => ipcRenderer.removeListener('orchestration:spawnRequest', listener);
   },
+  // request_user_action / resolve_user_action from any agent run.
+  onUserAction: (callback) => {
+    const listener = (_event, request) => callback(request);
+    ipcRenderer.on('agent:userAction', listener);
+    return () => ipcRenderer.removeListener('agent:userAction', listener);
+  },
   reportSubagentStopResult: (payload) =>
     ipcRenderer.invoke('orchestration:subagentStopResult', payload),
   onSubagentStopRequest: (callback) => {
