@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Brain, Check, ChevronDown, ChevronRight, CircleCheck, Copy, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { isNoProjectId, type BtwExchange, type LinkedBoardTask, type Message, type Thread, useOrionStore } from '../store';
 import type { AgentModel } from '../agentCatalog';
 import { SessionImportCard } from './SessionImport';
 import { agentProviders } from '../agentCatalog';
-import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, useRunTicker } from './activity';
+import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, ThinkingRow, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
 import {
   MarkdownBaseDirContext,
@@ -375,6 +375,7 @@ const AgentRunMessage: React.FC<{
             runStatus={message.status}
             runRunning={runRunning}
             live={isRunning && index === visibleSegments.length - 1}
+            thinking={thinking && index === visibleSegments.length - 1}
           />
         ) : segment.kind === 'btw' ? (
           <React.Fragment key={`btw-${segment.exchange.id}`}>{renderBtwAside?.(segment.exchange)}</React.Fragment>
@@ -382,16 +383,7 @@ const AgentRunMessage: React.FC<{
           <StreamingMarkdownContent key={`text-${index}`} content={segment.text} />
         ) : null
       )}
-      {thinking && (
-        <div className="work-row thinking">
-          <span className="work-row-line">
-            <span className="work-row-icon">
-              <Brain size={14} />
-            </span>
-            <span className="work-row-label live">Thinking</span>
-          </span>
-        </div>
-      )}
+      {thinking && !lastSegment && <ThinkingRow />}
       {message.error &&
         (message.authProviderId && onAuthenticateProvider ? (
           <ProviderAuthPrompt

@@ -56,7 +56,7 @@ const done: Message = {
 const doneHtml = renderToStaticMarkup(<ChatMessage message={done} runRunning={false} />);
 assert.match(doneHtml, /Worked for/);
 
-// --- A live turn: only the step running now --------------------------------------------------
+// --- A live turn: earlier steps stay put, the running step takes Thinking's place ------------
 const live: Message = {
   ...done,
   id: 'run-live',
@@ -69,8 +69,24 @@ const live: Message = {
   ],
 };
 const liveHtml = renderToStaticMarkup(<ChatMessage message={live} runRunning />);
-assert.match(liveHtml, /work-row-label code live">git status --short/, 'the running step shows alone, shimmering');
-assert.doesNotMatch(liveHtml, /Read src\/store\.ts/, 'earlier steps fold away while one runs');
+assert.match(liveHtml, /work-row-label code live">git status --short/, 'the running step shimmers');
+assert.match(liveHtml, /Read …\/src\/app\/activity\.tsx/, 'the step before it stays where it was');
+assert.doesNotMatch(liveHtml, />Thinking</, 'the running step replaces the Thinking line');
+
+// Between steps the summary and Thinking share the steps column, so the next step swaps in
+// for Thinking without moving the summary above it.
+const between: Message = {
+  ...live,
+  id: 'run-between',
+  activities: [{ ...read, contentOffset: 20 }, { ...read2, contentOffset: 20 }, { ...command, contentOffset: 20 }],
+};
+const betweenHtml = renderToStaticMarkup(<ChatMessage message={between} runRunning />);
+assert.match(betweenHtml, /<div class="agent-steps">.*Read 2 files and ran 1 command.*>Thinking<\/span><\/span><\/div><\/div>/s, 'Thinking ends the steps column');
+const nextStep = renderToStaticMarkup(
+  <ChatMessage message={{ ...between, activities: [...between.activities!, { ...command, id: 'c2', contentOffset: 20, status: 'running', output: undefined }] }} runRunning />
+);
+assert.match(nextStep, /Read 2 files and ran 1 command/, 'the summary line keeps its text while the next step runs');
+assert.doesNotMatch(nextStep, />Thinking</);
 
 // --- Expanded steps (Worked for › opened): a summary line, not every row --------------------
 const stretch = renderToStaticMarkup(

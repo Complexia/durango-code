@@ -666,8 +666,10 @@ const ActivityGroup: React.FC<{
     </div>
   );
 
-  // Live: only the step happening now (one awaiting approval first), as in T3
-  // Code; clicking it shows the whole stretch.
+  // Live: the steps before it stay as they were (their summary line, or the
+  // one step), and the step happening now (one awaiting approval first) takes
+  // the Thinking line's place beneath them, so nothing above it jumps when a
+  // step starts or ends.
   if (live) {
     const current =
       activities.findLast((activity) => activity.status === 'waiting') ??
@@ -681,17 +683,40 @@ const ActivityGroup: React.FC<{
         </div>
       );
     }
+    const earlier = activities.filter((activity) => activity !== current);
     return (
-      <div className="work-group live">
-        <AgentActivityRow
-          activity={current}
-          runRunning={runRunning}
-          live
-          open={openRows.has(current.id)}
-          onToggle={activities.length > 1 ? () => setExpanded(true) : toggleRow}
-          expandable={activities.length > 1 || undefined}
-        />
-      </div>
+      <>
+        {earlier.length === 1 && (
+          <div className="work-group">
+            <AgentActivityRow
+              activity={earlier[0]}
+              runRunning={runRunning}
+              open={openRows.has(earlier[0].id)}
+              onToggle={toggleRow}
+            />
+          </div>
+        )}
+        {earlier.length > 1 && (
+          <div className="work-group">
+            <WorkGroupSummary
+              label={summarizeActivities(earlier)}
+              action={groupAction(earlier)}
+              failed={earlier.some(activityFailed)}
+              expanded={false}
+              onToggle={() => setExpanded(true)}
+            />
+          </div>
+        )}
+        <div className="work-group live">
+          <AgentActivityRow
+            activity={current}
+            runRunning={runRunning}
+            live
+            open={openRows.has(current.id)}
+            onToggle={toggleRow}
+          />
+        </div>
+      </>
     );
   }
 
@@ -748,7 +773,9 @@ export const AgentActivityCard: React.FC<{
   runRunning?: boolean;
   /** This stretch is where the run is working right now. */
   live?: boolean;
-}> = ({ activities, runStatus, runRunning = runStatus === 'running', live = false }) => {
+  /** The agent is between steps: end the stretch with the Thinking line. */
+  thinking?: boolean;
+}> = ({ activities, runStatus, runRunning = runStatus === 'running', live = false, thinking = false }) => {
   const [openRows, toggleRow] = useToggleSet();
   if (activities.length === 0) return null;
   const chunks = chunkActivities(activities);
@@ -776,9 +803,22 @@ export const AgentActivityCard: React.FC<{
           />
         )
       )}
+      {thinking && <ThinkingRow />}
     </div>
   );
 };
+
+/** "Thinking" in the live step's place, so a starting step replaces it in place. */
+export const ThinkingRow: React.FC = () => (
+  <div className="work-row thinking">
+    <span className="work-row-line">
+      <span className="work-row-icon">
+        <Brain size={14} />
+      </span>
+      <span className="work-row-label live">Thinking</span>
+    </span>
+  </div>
+);
 
 // Split an agent run into chronological segments: text that streamed before
 // an activity renders before it, text after it renders after. Activities
