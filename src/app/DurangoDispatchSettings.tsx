@@ -115,7 +115,8 @@ export const DurangoDispatchSettings: React.FC<{
             <div className="setting-label">
               <div className="setting-label-title">Access for agents started from Durango</div>
               <div className="setting-label-desc">
-                The most an agent started from Durango Chat or Tasks may do. Durango can ask for less, never more.
+                What an agent started from Durango Chat or Tasks may do. Tasks runs get this level; Durango can
+                ask for less, never more. Claude asks before every Bash command in Workspace write.
                 Prompts from chat can quote chat history or memory, so Read only is safest: the
                 agent investigates and proposes changes without editing files.
               </div>

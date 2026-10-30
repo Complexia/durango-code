@@ -327,7 +327,8 @@ try {
     assert.equal(clampDispatchAccessMode('ask', 'full-access'), 'read-only');
     assert.equal(clampDispatchAccessMode('auto-edit', 'read-only'), 'read-only');
     assert.equal(clampDispatchAccessMode('auto-edit', 'workspace-write'), 'workspace-write');
-    assert.equal(clampDispatchAccessMode('auto-edit', 'full-access'), 'workspace-write', 'chat cannot ask for full access');
+    assert.equal(clampDispatchAccessMode('auto-edit', 'full-access'), 'full-access', 'auto-edit gets the Mac limit');
+    assert.equal(clampDispatchAccessMode('ask', 'workspace-write'), 'read-only');
     assert.equal(clampDispatchAccessMode(null, 'workspace-write'), 'workspace-write');
     assert.equal(clampDispatchAccessMode(null, 'bogus'), 'read-only');
     assert.equal(normalizeDispatchSettings({}).accessMode, 'read-only', 'default is the most conservative mode');

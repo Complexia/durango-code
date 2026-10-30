@@ -18,11 +18,12 @@ import { DurangoError } from './durango-client.js';
 // projects, and never while signed out.
 
 export const DISPATCH_ACCESS_MODES = ['read-only', 'workspace-write', 'full-access'];
-const ACCESS_RANK = { 'read-only': 0, 'workspace-write': 1, 'full-access': 2 };
 // Durango Chat's confirmation card offers "ask" (ask before editing) and
-// "auto-edit". Durango Code has no per-edit approval prompt, so "ask" runs
-// Read only: the agent can investigate and propose, not change files.
-const REQUESTED_ACCESS = { ask: 'read-only', 'auto-edit': 'workspace-write' };
+// "auto-edit"; Tasks always sends "auto-edit". Durango Code has no per-edit
+// approval prompt, so "ask" runs Read only: the agent can investigate and
+// propose, not change files. "auto-edit" runs with this Mac's limit, so
+// choosing Full access in Settings is what a Tasks run gets (Workspace write
+// makes Claude ask before every Bash command, which no one is there to answer).
 
 export const DISPATCH_SUMMARY_MAX_CHARS = 2_000;
 export const DISPATCH_ERROR_MAX_CHARS = 1_000;
@@ -56,11 +57,10 @@ export const normalizeDispatchSettings = (raw) => {
   };
 };
 
-/** The more conservative of what Durango Chat asked for and this Mac's ceiling. */
+/** "ask" runs Read only; anything else runs with this Mac's limit. */
 export const clampDispatchAccessMode = (requested, ceiling) => {
   const limit = DISPATCH_ACCESS_MODES.includes(ceiling) ? ceiling : defaultDispatchSettings.accessMode;
-  const wanted = REQUESTED_ACCESS[requested] ?? limit;
-  return ACCESS_RANK[wanted] <= ACCESS_RANK[limit] ? wanted : limit;
+  return requested === 'ask' ? 'read-only' : limit;
 };
 
 export const isProjectAllowed = (projectId, allowedProjectIds) =>
