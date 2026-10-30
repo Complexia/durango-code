@@ -41,7 +41,13 @@ const bridge = {
   loadStore: async () =>
     JSON.stringify({
       version: 1,
-      state: { projects: [project], selectedThreadId: 'fresh', composerDrafts: savedDrafts },
+      state: {
+        projects: [project],
+        selectedThreadId: 'fresh',
+        composerDrafts: savedDrafts,
+        // Already settled, so the first-switch settle writes nothing here.
+        sidebarV2Settings: { enabled: true, version: 2, settledExistingAt: '2026-10-01T00:00:00.000Z' },
+      },
     }),
   saveStore: async (value: string) => {
     storeSaves.push(value);

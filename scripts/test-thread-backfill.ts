@@ -41,7 +41,15 @@ const batchGate = deferred<void>();
 const saves: Array<{ upserts: Array<{ id: string }>; deletes: string[]; order: string[] }> = [];
 const bridge = {
   loadStore: async () =>
-    JSON.stringify({ version: 1, state: { projects: [project], selectedThreadId: 'selected-old' } }),
+    JSON.stringify({
+      version: 1,
+      state: {
+        projects: [project],
+        selectedThreadId: 'selected-old',
+        // Already settled, so the first-switch settle stays out of these saves.
+        sidebarV2Settings: { enabled: true, version: 2, settledExistingAt: '2026-10-01T00:00:00.000Z' },
+      },
+    }),
   saveStore: async () => true,
   loadThreadsHead: async (input: { count?: number; ids?: string[] }) => {
     headRequests.push(input);

@@ -28,7 +28,31 @@ const {
 const { projectMonogram } = await import('../src/app/ProjectBadge');
 
 const store = useOrionStore.getState;
-assert.equal(store().sidebarV2Settings.enabled, false, 'sidebar v2 is opt-in');
+assert.equal(store().sidebarV2Settings.enabled, true, 'sidebar v2 is on by default');
+assert.equal(store().sidebarV2Settings.settledExistingAt, undefined, 'a fresh store has not settled yet');
+
+// Stores from when sidebar v2 was opt-in turn it on once, keeping whether
+// they already settled; a later "off" sticks.
+const merge = useOrionStore.persist.getOptions().merge!;
+const mergedSidebar = (persisted: Record<string, unknown>) =>
+  (merge(persisted, store()) as ReturnType<typeof store>).sidebarV2Settings;
+const views = { ...defaultSidebarV2Settings.views, settled: true };
+assert.equal(mergedSidebar({}).enabled, true, 'a store from before sidebar v2 gets it');
+assert.deepEqual(mergedSidebar({ sidebarV2Settings: { enabled: false, views } }), {
+  enabled: true,
+  version: 2,
+  views: { ...views, pinned: false },
+});
+assert.equal(
+  mergedSidebar({ sidebarV2Settings: { enabled: false, views, settledExistingAt: 'then' } }).settledExistingAt,
+  'then',
+  'a store that settled before does not settle again'
+);
+assert.equal(mergedSidebar({ sidebarV2Settings: { enabled: false, version: 2, views } }).enabled, false);
+assert.equal(mergedSidebar({ sidebarV2Settings: { enabled: true, version: 2, views } }).enabled, true);
+
+// The rest runs as a store that had it off and never settled.
+useOrionStore.setState({ sidebarV2Settings: { ...defaultSidebarV2Settings, enabled: false } });
 assert.deepEqual(store().sidebarV2Settings.views, defaultSidebarV2Settings.views);
 assert.equal(store().sidebarV2Settings.views.pinned, false, 'the Pinned list starts off');
 store().setSidebarV2Settings({ views: { ...defaultSidebarV2Settings.views, settled: true } });

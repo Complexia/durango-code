@@ -53,6 +53,7 @@ import {
   isAgentsPanelVisible,
   isNoProjectId,
   MAX_THREAD_PANES,
+  settleThreadsForSidebarV2,
   STEERED_RUN_CAPTION,
   type AgentActivity,
   type BtwExchange,
@@ -300,6 +301,8 @@ const formatBytes = (bytes: number | null | undefined) => {
 };
 
 const THREADS_VISIBLE_LIMIT = 5;
+// Sidebar v2's first-switch settle covers the threads from before this launch.
+const APP_LAUNCHED_AT = Date.now();
 
 type AgentRunStartupResult = { ok: boolean; runId?: string; error?: string };
 type ThreadTurnStartResult =
@@ -2101,6 +2104,7 @@ const App: React.FC = () => {
     window.orion?.setZoomFactor?.(uiScale);
   }, [uiScale]);
   const sidebarV2Enabled = sidebarV2Settings?.enabled ?? defaultSidebarV2Settings.enabled;
+  const sidebarV2Settled = !!sidebarV2Settings?.settledExistingAt;
   const sidebarV2Views = sidebarV2Settings?.views ?? defaultSidebarV2Settings.views;
   const runningThreadIds = useStableIdList(
     threads.filter((thread) => thread.status === 'running').map((thread) => thread.id)
@@ -2194,11 +2198,22 @@ const App: React.FC = () => {
   // A blank draft (nothing sent, nothing typed) is just the composer the
   // Agents panel opens with nothing else to show; it joins the list once used.
   // CLI threads keep their conversation in the terminal, so they always show.
+  // Until the first-switch settle runs (once every thread has loaded), the
+  // lists show the threads from before this launch as it will leave them, so
+  // the history never flashes into Recent on the launch that turns sidebar v2
+  // on.
   const sidebarV2Lists = useMemo(
     () =>
       sidebarV2ThreadLists(
         sidebarV2Enabled
-          ? threads.filter(
+          ? (sidebarV2Settled
+              ? threads
+              : threads.map((thread) =>
+                  Date.parse(thread.createdAt) < APP_LAUNCHED_AT
+                    ? settleThreadsForSidebarV2([thread], new Date(APP_LAUNCHED_AT).toISOString())[0]
+                    : thread
+                )
+            ).filter(
               (thread) =>
                 thread.messages.length > 0 ||
                 thread.status === 'running' ||
@@ -2212,7 +2227,7 @@ const App: React.FC = () => {
         (thread) => childThreadIds.has(thread.id),
         compareSidebarV2Recent(attentionThreadIds)
       ),
-    [attentionThreadIds, childThreadIds, sidebarV2Enabled, threads, typedDraftThreadIds]
+    [attentionThreadIds, childThreadIds, sidebarV2Enabled, sidebarV2Settled, threads, typedDraftThreadIds]
   );
   const setSidebarV2ViewVisible = useCallback(
     (view: keyof SidebarV2Settings['views'], visible: boolean) =>

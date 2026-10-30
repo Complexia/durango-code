@@ -89,11 +89,16 @@ export const defaultDeploymentSettings: DeploymentSettings = {
 
 /**
  * Sidebar v2 (Settings → Experimental): one flat thread list with snooze and
- * settle instead of project groups. `views` are the lists toggled from its
- * header menu.
+ * settle instead of project groups, on by default. `views` are the lists
+ * toggled from its header menu.
  */
 export type SidebarV2Settings = {
   enabled: boolean;
+  /**
+   * 2 since sidebar v2 is the default: stores from before then (where it was
+   * opt-in) are switched on once, and a later "off" sticks.
+   */
+  version?: number;
   views: { pinned: boolean; recent: boolean; snoozed: boolean; settled: boolean };
   /**
    * Set once the threads from before sidebar v2 were settled. The first time
@@ -116,7 +121,8 @@ export const defaultAppearanceSettings: AppearanceSettings = {
 };
 
 export const defaultSidebarV2Settings: SidebarV2Settings = {
-  enabled: false,
+  enabled: true,
+  version: 2,
   views: { pinned: false, recent: true, snoozed: false, settled: false },
 };
 
@@ -124,7 +130,7 @@ export const defaultSidebarV2Settings: SidebarV2Settings = {
  * Settles every thread sidebar v2 would list (not pinned, snoozed, settled or
  * running), as if the user had clicked Settle on each.
  */
-const settleThreadsForSidebarV2 = (threads: Thread[], at: string): Thread[] =>
+export const settleThreadsForSidebarV2 = (threads: Thread[], at: string): Thread[] =>
   threads.map((thread) =>
     thread.pinnedAt || thread.snoozedAt || thread.settledAt || thread.status === 'running'
       ? thread
@@ -2582,10 +2588,14 @@ export const useOrionStore = create<OrionState>()(
         };
         merged.appearanceSettings = { ...defaultAppearanceSettings, ...merged.appearanceSettings };
         // The Pinned group starts off on every launch; turning it on lasts
-        // until the app quits.
+        // until the app quits. Stores from when sidebar v2 was opt-in turn it
+        // on once; those that never had it on get the first-switch settle
+        // once all threads have loaded (settleThreadsFromBeforeSidebarV2).
+        const persistedSidebarV2 = (persisted as Partial<OrionState> | undefined)?.sidebarV2Settings;
         merged.sidebarV2Settings = {
           ...defaultSidebarV2Settings,
           ...merged.sidebarV2Settings,
+          ...(persistedSidebarV2 && (persistedSidebarV2.version ?? 1) < 2 ? { enabled: true, version: 2 } : {}),
           views: { ...defaultSidebarV2Settings.views, ...merged.sidebarV2Settings?.views, pinned: false },
         };
         // Durango merge: work sharing defaults to Full. Pre-Durango stores
@@ -2925,13 +2935,18 @@ const backfillThreads = async () => {
 // post-hydration save, so until this flush runs the transcripts exist only in
 // memory and a crash would lose them.
 //
-// Stores that turned sidebar v2 on before the first-switch settle existed get
-// it once here rather than in `merge`: thread edits made during hydration are
-// never saved, while this one goes through the saver like a user's. It
-// settles every thread, so it waits for the backfill.
+// Stores with sidebar v2 on but never settled (a fresh install, an update
+// from when it was opt-in, or one that turned it on before the first-switch
+// settle existed) get it once here rather than in `merge`: thread edits made
+// during hydration are never saved, while this one goes through the saver
+// like a user's. It settles every thread, so it waits for the backfill; until
+// then App shows the lists as they will be after it.
 const settleThreadsFromBeforeSidebarV2 = () => {
   const { sidebarV2Settings, setSidebarV2Settings } = useOrionStore.getState();
-  if (threadsPersistenceBlocked || !sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return;
+  // Only over every stored thread: after a failed or cancelled backfill it
+  // waits for a launch that loads them all.
+  if (threadsPersistenceBlocked || threadsBackfillIncomplete) return;
+  if (!sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return;
   setSidebarV2Settings({});
 };
 const pruneOrphanComposerDrafts = () => {
