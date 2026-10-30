@@ -132,7 +132,8 @@ import {
 } from './main/workspace-sync.js';
 import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
-import { bundledCliEntry, bundledCliVersion, ensureCliSignedIn, installBundledCliShims, readCliCredential } from './main/bundled-cli.js';
+import { bundledCliBinDir, bundledCliEntry, bundledCliVersion, ensureCliSignedIn, installBundledCliShims, readCliCredential } from './main/bundled-cli.js';
+import { installGitCredentialHelper } from './main/git-credential-helper.js';
 import {
   createDurangoWorkspace,
   durangoWorkspaceStatus,
@@ -901,6 +902,7 @@ const handleDesktopAuthCallback = async (rawUrl) => {
     await publishAccountState(session);
     void readRepositorySession().catch(() => {});
     warmDurangoKey();
+    void installDurangoGitCredentials();
     const [window] = BrowserWindow.getAllWindows();
     if (window) {
       if (window.isMinimized()) window.restore();
@@ -1079,6 +1081,7 @@ app.whenReady().then(async () => {
   startShellPathSync();
   startLegacyMcpCleanup();
   void installBundledCli();
+  void installDurangoGitCredentials();
 
   // Seed the model catalog from the last discovery so the first picker render
   // and first turn never wait on provider CLIs, then revalidate it in the
@@ -2527,6 +2530,18 @@ const installBundledCli = () => {
       return null;
     });
   return bundledCliBinDirPromise;
+};
+
+// `git pull` / `git push` to Durango Source from any terminal answer with the
+// CLI's sign-in (src/main/git-credential-helper.js), so the CLI is signed in
+// along with the app rather than on first use. Packaged builds only: a dev
+// build's Electron lives in a checkout that can disappear.
+const installDurangoGitCredentials = async () => {
+  if (!app.isPackaged) return;
+  await installGitCredentialHelper({ binDir: bundledCliBinDir() }).catch((error) =>
+    console.error('Could not register the Durango Source git credential helper', error)
+  );
+  await signInBundledCli();
 };
 
 const signInBundledCli = () =>

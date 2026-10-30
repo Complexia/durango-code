@@ -67,6 +67,7 @@
     "test:opencode-provider": "electron scripts/test-opencode-provider.mjs",
     "test:fx-provider": "node scripts/run-electron-test.mjs scripts/test-fx-provider.mjs",
     "test:source-control": "node --no-warnings scripts/test-source-control.mjs",
+    "test:git-credential-helper": "node --no-warnings scripts/test-git-credential-helper.mjs",
     "publish": "electron-forge publish",
     "lint": "echo \"No linting configured\"",
     "postinstall": "node -e \"const fs=require('fs');try{for(const d of fs.readdirSync('node_modules/node-pty/prebuilds')){try{fs.chmodSync('node_modules/node-pty/prebuilds/'+d+'/spawn-helper',0o755)}catch{}}}catch{}\""
