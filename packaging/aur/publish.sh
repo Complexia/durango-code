@@ -13,7 +13,7 @@ chmod 755 "$work"
 pacman -Sy --noconfirm --needed git openssh >/dev/null
 
 # Checksum the exact file the package will download.
-curl -fsSL -o "$work/durango-code.deb" "https://code.durango.sh/api/download/linux?version=${version}"
+curl -fsSL -o "$work/durango-code.deb" "https://durango.sh/api/download/linux?version=${version}"
 sha256="$(sha256sum "$work/durango-code.deb" | cut -d' ' -f1)"
 
 mkdir -p ~/.ssh

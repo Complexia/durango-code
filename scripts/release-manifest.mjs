@@ -8,9 +8,9 @@
 //   releases/latest/<os>-<arch>.json                  newest stable build per platform
 //   releases/latest.json                              legacy, macOS only (see below)
 //
-// orion-next (code.durango.sh /api/download and /api/update) reads the
-// per-platform pointers. releases/latest.json keeps its old macOS-only shape
-// for orion-next deploys that predate the pointers.
+// durango.sh (/api/download and /api/update) reads the per-platform
+// pointers. releases/latest.json keeps its old macOS-only shape for readers
+// that predate the pointers.
 
 import path from 'node:path';
 
@@ -101,8 +101,8 @@ export const buildPlatformManifest = ({ version, osName, arch, releasedAt, artif
     signed,
     notarized: osName === 'macos' && signed,
     download: formats.download,
-    // `update` is the first update format, for orion-next deploys that
-    // predate `updates`.
+    // `update` is the first update format, for readers that predate
+    // `updates`.
     update: formats.updates[0],
     updates: formats.updates,
     // One line per change (scripts/release-notes.mjs); the update feed passes

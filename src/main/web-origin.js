@@ -1,21 +1,26 @@
-// Durango Code web origins. code.durango.sh is canonical after the rebrand;
-// orioncode.xyz is the same orion-next service and keeps serving its APIs
-// indefinitely (contracts.md §2), so credentials minted against it stay valid.
-export const DEFAULT_PACKAGED_WEB_URL = 'https://code.durango.sh';
+// Durango web origin. durango.sh serves everything the desktop talks to over
+// HTTP: desktop sign-in, repositories, plans, sync, relay tickets, the Durango
+// API (/api/v1) and the update/download feeds. Development defaults to the
+// local Durango dev server (chat/local-stack.sh, :3000).
+export const DEFAULT_PACKAGED_WEB_URL = 'https://durango.sh';
 export const DEFAULT_DEV_WEB_URL = 'http://localhost:3000';
 // Update feeds are per platform: <base>/macos, <base>/windows, <base>/linux.
-export const DEFAULT_UPDATE_FEED_BASE_URL = 'https://code.durango.sh/api/update';
+export const DEFAULT_UPDATE_FEED_BASE_URL = 'https://durango.sh/api/update';
 
-const LEGACY_WEB_ORIGIN_ALIASES = Object.freeze({
-  'https://orioncode.xyz': 'https://code.durango.sh',
-  'https://www.orioncode.xyz': 'https://code.durango.sh',
+// Origins that served the same API (and the same Postgres-backed tokens)
+// before it moved into durango.sh. Credentials saved under them are still
+// valid, so they are reused rather than minted again.
+const RETIRED_WEB_ORIGINS = Object.freeze({
+  'https://code.durango.sh': DEFAULT_PACKAGED_WEB_URL,
+  'https://orioncode.xyz': DEFAULT_PACKAGED_WEB_URL,
+  'https://www.orioncode.xyz': DEFAULT_PACKAGED_WEB_URL,
 });
 
-/** Origin of `value` with legacy aliases folded onto the canonical origin. */
+/** Origin of `value`, with retired origins folded onto durango.sh. */
 export const canonicalWebOrigin = (value) => {
   try {
     const origin = new URL(String(value ?? '')).origin;
-    return LEGACY_WEB_ORIGIN_ALIASES[origin] ?? origin;
+    return RETIRED_WEB_ORIGINS[origin] ?? origin;
   } catch {
     return null;
   }

@@ -61,7 +61,7 @@ The deploy script bumps the app version, builds a macOS DMG and ZIP, verifies th
 The public website downloads the DMG from `manifest.downloads.macos.<arch>`. The app updater uses the ZIP from `manifest.updates.macos.<arch>` through:
 
 ```text
-https://orioncode.xyz/api/update/macos/<arch>/latest-mac.yml
+https://durango.sh/api/update/macos/<arch>/latest-mac.yml
 ```
 
 Useful overrides:

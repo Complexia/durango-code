@@ -77,7 +77,7 @@ export const waitForAppUpdateStagedForInstall = (timeoutMs = APP_UPDATE_STAGE_TI
   });
 };
 
-// code.durango.sh sends `releaseNotes` as a Markdown list (one change per
+// durango.sh sends `releaseNotes` as a Markdown list (one change per
 // line). electron-updater passes it through as a string, or as
 // [{ version, note }] from providers that collect several releases.
 export const normalizeReleaseNotes = (releaseNotes) => {
@@ -106,9 +106,8 @@ export const getAppIconPath = () => {
 const UPDATE_FEED_PLATFORMS = { darwin: 'macos', win32: 'windows', linux: 'linux' };
 
 export const getAppUpdateFeedUrl = () => {
-  // code.durango.sh serves the same feed as the legacy orioncode.xyz host,
-  // which keeps answering already-installed builds. ORION_UPDATE_FEED_URL
-  // replaces the whole platform feed, as the macOS default did before.
+  // durango.sh serves the feed (/api/update/<platform>/<arch>).
+  // ORION_UPDATE_FEED_URL replaces the whole platform feed.
   const baseUrl = process.env.ORION_UPDATE_FEED_URL
     || `${DEFAULT_UPDATE_FEED_BASE_URL}/${UPDATE_FEED_PLATFORMS[process.platform] ?? 'macos'}`;
   const arch = process.arch === 'x64' ? 'x64' : 'arm64';

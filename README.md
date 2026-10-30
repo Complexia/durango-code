@@ -41,10 +41,11 @@ npm install
 npm run start
 ```
 
-Desktop login targets the Durango Code web origin: development (`npm run start`)
-defaults to `http://localhost:3000`, packaged builds default to
-`https://code.durango.sh` (`orioncode.xyz` remains a legacy alias of the same service). Set `ORION_WEB_URL` to override either (the origin
-must have Clerk and the desktop auth routes configured).
+Desktop login, repositories, sync, plans, the Durango API and the update feed all
+live on one web origin: development (`npm run start`) defaults to
+`http://localhost:3000` (the local Durango dev server), packaged builds default to
+`https://durango.sh`. Set `DURANGO_URL` (or the older `ORION_WEB_URL`) to override
+either (the origin must have Clerk and the desktop auth routes configured).
 
 ## Build
 
@@ -76,7 +77,7 @@ Because CI builds the tagged commit, the release refuses to start with uncommitt
 R2 layout (see [scripts/release-manifest.mjs](scripts/release-manifest.mjs)): every build writes only its own platform's keys, so the Mac and CI builds never overwrite each other.
 
 - `releases/v<version>/<os>/<arch>/`: artifacts plus that build's `manifest.json`
-- `releases/latest/<os>-<arch>.json`: the newest stable build per platform, read by code.durango.sh's `/api/download/<os>` and `/api/update/<os>/<arch>/` feeds
+- `releases/latest/<os>-<arch>.json`: the newest stable build per platform, read by durango.sh's `/api/download/<os>` and `/api/update/<os>/<arch>/` feeds
 - `releases/latest.json`: the older macOS-only manifest, still written by macOS releases
 
 Stable releases also update the Arch Linux package [`durango-code-bin`](https://aur.archlinux.org/packages/durango-code-bin) on the AUR: the workflow's `aur` job fills [packaging/aur/PKGBUILD](packaging/aur/PKGBUILD) with the version and the checksum of the published `.deb` and pushes it with the `AUR_SSH_PRIVATE_KEY` secret ([packaging/aur/publish.sh](packaging/aur/publish.sh)).

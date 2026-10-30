@@ -47,8 +47,8 @@ export const createRepositoryCredentials = ({ readSession, readStored, writeStor
       const session = await readSession();
       const stored = cached ?? await serialize(readStored);
       if (version !== generation) throw new Error('Durango account changed. Try again.');
-      // A credential minted on the legacy orioncode.xyz origin stays valid on
-      // code.durango.sh (same service), so it is reused rather than re-minted.
+      // A credential minted on a retired origin (code.durango.sh) stays valid
+      // on durango.sh (same tokens), so it is reused rather than re-minted.
       if (isSameWebOrigin(stored?.origin, base) && stored.token && (!session?.user || stored.user?.id === session.user.id)) {
         cached = stored;
         return { token: stored.token, user: stored.user, expiresAt: null };

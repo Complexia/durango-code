@@ -49,7 +49,7 @@ const globalHelpers = async (host) =>
 
 try {
   await fs.mkdir(configDir, { recursive: true });
-  await fs.writeFile(path.join(configDir, 'credentials.json'), JSON.stringify({ 'https://code.durango.sh': { token } }));
+  await fs.writeFile(path.join(configDir, 'credentials.json'), JSON.stringify({ 'https://durango.sh': { token } }));
   await fs.writeFile(
     systemConfig,
     `[credential]\n\thelper = "!f() { test \\"$1\\" = get && echo username=stale && echo password=stale-keychain; }; f"\n`

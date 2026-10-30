@@ -15,18 +15,18 @@ Merge plan: Phase 2.2 in the epic's `durango-merge-plan.md` and `contracts.md`
 | Window, `index.html`, About panel, macOS app menu | `Durango Code` ("About / Hide / Quit Durango Code"). |
 | Copy | "Durango Code" for the app, "Durango Cloud" for Orion Cloud, "Durango account" for the account, and "Sign in to your Durango account". |
 | Orchestrator pseudo-model label | `Durango Code` (the id `orion:orchestrator` and slug `orion` are unchanged). |
-| Web origin (packaged default for `ORION_WEB_URL`) | `https://code.durango.sh`. Dev still uses `http://localhost:3000`. |
-| Update feed (default for `ORION_UPDATE_FEED_URL`) | `https://code.durango.sh/api/update/macos`. |
-| MCP OAuth client metadata | `client_name: "Durango Code"`, `client_uri: "https://code.durango.sh"`. |
+| Web origin (packaged default for `DURANGO_URL` / `ORION_WEB_URL`) | `https://durango.sh` (was `https://code.durango.sh` until the Durango Code web app merged into durango.sh). Dev uses `http://localhost:3000`. |
+| Update feed (default for `ORION_UPDATE_FEED_URL`) | `https://durango.sh/api/update/macos`. |
+| MCP OAuth client metadata | `client_name: "Durango Code"`, `client_uri: "https://durango.sh"`. |
 | Icons | `assets/icon.{png,icns,ico}` and `public/icon.png` come from `assets-source/durango-code-icon.png` (a copy of `durango-chat/andromedus/public/assets/durango-code-icon.png`). The iconset is in `assets-source/durango-code.iconset`. The old Orion sources stay in `assets-source/` for reference. |
 | Bundled skill `use-orion-cli` | Same directory and skill name. The content is synced from `orion-cli/SKILL.md` (the Durango Code CLI `durango-code`, with `orion-cli` as an alias). The skill installs only once per machine, so existing users keep their copy. |
 | Release artifacts | `Durango-Code-<version>-<os>-<arch>.<ext>` (see below). |
 
 ### Legacy hosts stay accepted
 
-- **Web:** `orioncode.xyz` serves the same orion-next.
-  - `src/main/web-origin.js` treats `https://orioncode.xyz` as an alias of `https://code.durango.sh`.
-  - A repository credential (`orion_pat_…`) minted against the old origin is reused, not re-minted.
+- **Web:** the APIs once served by `orioncode.xyz` and `code.durango.sh` now live on `durango.sh`, against the same tokens.
+  - `src/main/web-origin.js` treats both retired origins as `https://durango.sh` when comparing a saved credential's origin.
+  - A repository credential (`orion_pat_…`) or Durango key minted against a retired origin is reused, not re-minted.
 - **Git:** `git.durango.sh` and `git.orioncode.xyz` are one alias group (`src/main/source-control.js`).
   - Remotes on either host classify as Durango Cloud remotes.
   - `verifyOrionGitRemote` accepts an existing clone whose `origin` points at the alias of the host that Cloud advertises.
@@ -153,7 +153,7 @@ The probe runs the unsigned dev Electron. Before release, verify a real in-place
 
 - Squirrel.Mac (through electron-updater) installs an update into the running bundle's location. Existing installs keep the `/Applications/Orion.app` path and show the new name inside. Only fresh downloads are named `Durango Code.app`.
 - The update zip contains `Durango Code.app`. Squirrel picks the bundle by bundle id, so the name does not matter.
-- Already-installed builds keep polling `https://orioncode.xyz/api/update/macos/<arch>/`. New builds poll `https://code.durango.sh/api/update/macos/<arch>/`. Both hosts are the same orion-next, which reads `releases/latest.json`.
+- Builds poll `https://durango.sh/api/update/<os>/<arch>/`. Older builds poll `https://code.durango.sh/…` or `https://orioncode.xyz/…`; they only find updates while those hosts keep answering the update feed.
 
 `scripts/deploy.mjs` handles naming and the manifest:
 
@@ -162,7 +162,7 @@ The probe runs the unsigned dev Electron. Before release, verify a real in-place
 - The manifest's `product` field is now `Durango Code`, but no route reads it.
 - It finds `out/Durango Code-darwin-<arch>/Durango Code.app` for signing and notarization checks.
 
-orion-next's `app/api/download/macos` and `app/api/update/macos/[arch]/latest-mac.yml` read only `version`, `releasedAt`, `key`, `fileName`, `size` and `sha512`, and don't parse artifact names. They stay compatible. One cosmetic follow-up is for orion-web: their fallback download filename is still `Orion-macos.zip`. It applies only when `fileName` is missing, which deploy.mjs never produces.
+The web app's `/api/download/macos` and `/api/update/macos/[arch]/latest-mac.yml` read only `version`, `releasedAt`, `key`, `fileName`, `size` and `sha512`, and don't parse artifact names. They stay compatible. One cosmetic follow-up is for orion-web: their fallback download filename is still `Orion-macos.zip`. It applies only when `fileName` is missing, which deploy.mjs never produces.
 
 ## Legacy bundle file name (1.0.149)
 

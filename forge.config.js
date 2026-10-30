@@ -175,7 +175,7 @@ module.exports = {
           bin: linuxExecutableName,
           productName: 'Durango Code',
           genericName: 'Agentic IDE',
-          homepage: 'https://code.durango.sh',
+          homepage: 'https://durango.sh/code',
           icon: path.join(__dirname, 'assets', 'icon.png'),
           categories: ['Development'],
           // Desktop sign-in returns through orion://auth/callback.

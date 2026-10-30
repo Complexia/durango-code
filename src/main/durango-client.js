@@ -1,9 +1,10 @@
-import { isSameWebOrigin } from './web-origin.js';
+import { DEFAULT_PACKAGED_WEB_URL, isSameWebOrigin } from './web-origin.js';
 
 // Durango (durango.sh) access for the desktop: a scoped `dgo_` API key minted
-// through Durango Code web (contracts.md §8) and a small client for the
-// Durango public API (contracts.md §7): chats/memory, Durango Tasks, and the
-// dispatch endpoints the Durango Chat dispatch worker polls.
+// with the desktop session (/api/desktop-auth/durango-key, contracts.md §8)
+// and a small client for the Durango public API (/api/v1, contracts.md §7):
+// chats/memory, Durango Tasks, and the dispatch endpoints the Durango Chat
+// dispatch worker polls. Both live on the desktop's web origin (web-origin.js).
 //
 // The key is a device credential like the repository token: only the main
 // process ever sees it, it is stored next to the account session (safeStorage
@@ -12,12 +13,11 @@ import { isSameWebOrigin } from './web-origin.js';
 // dispatch worker, src/main/durango-dispatch.js), and every failure surfaces
 // as a typed DurangoError.
 
-export const DEFAULT_DURANGO_URL = 'https://durango.sh';
-export const DEFAULT_DEV_DURANGO_URL = 'http://localhost:3100';
+export const DEFAULT_DURANGO_URL = DEFAULT_PACKAGED_WEB_URL;
 export const DURANGO_REQUEST_TIMEOUT_MS = 15_000;
 const MINT_TIMEOUT_MS = 20_000;
 const REVOKE_TIMEOUT_MS = 10_000;
-// Durango Code web allows 10 mints per user per hour (429 + Retry-After).
+// Durango allows 10 mints per user per hour (429 + Retry-After).
 // After a failed mint, callers get the same error without a new request until
 // the cooldown ends, so nothing (startup warm-up, tool calls, @chat search)
 // can re-mint in a loop.
@@ -37,9 +37,9 @@ const retryAfterMs = (response) => {
 /**
  * Error codes:
  * - `not_signed_in`: no desktop account session (or it expired / was revoked).
- * - `not_connected`: signed in, but no usable Durango key (the web service
- *   cannot mint one yet, or Durango rejects the device's key).
- * - `network`: Durango or Durango Code web is unreachable or timed out.
+ * - `not_connected`: signed in, but no usable Durango key (Durango cannot
+ *   mint one yet, or rejects the device's key).
+ * - `network`: Durango is unreachable or timed out.
  * - `api`: Durango answered with an error (bad request, not found, …).
  */
 export class DurangoError extends Error {
@@ -74,8 +74,8 @@ const readJson = async (response) => {
   }
 };
 
-// Durango's /api/v1 envelope is `{ error: { message, type, code } }`; Durango
-// Code web answers `{ error: "message" }`. Accept both.
+// Durango's /api/v1 envelope is `{ error: { message, type, code } }`; the
+// desktop-auth routes answer `{ error: "message" }`. Accept both.
 const errorMessageFrom = (data) => {
   if (typeof data?.error === 'string') return data.error;
   if (typeof data?.error?.message === 'string') return data.error.message;
@@ -84,19 +84,13 @@ const errorMessageFrom = (data) => {
 const errorCodeFrom = (data) =>
   typeof data?.error?.code === 'string' ? data.error.code : typeof data?.code === 'string' ? data.code : null;
 
-/** `DURANGO_URL` (dev override) > server-advertised origin > build default. */
-export const resolveDurangoBaseUrl = ({ override, advertised, isPackaged }) => {
-  const candidates = [override, advertised, isPackaged ? DEFAULT_DURANGO_URL : DEFAULT_DEV_DURANGO_URL];
-  for (const candidate of candidates) {
-    if (typeof candidate !== 'string' || !candidate.trim()) continue;
-    try {
-      const url = new URL(candidate.trim());
-      const allowed = isPackaged && !override ? ['https:'] : ['https:', 'http:'];
-      if (!allowed.includes(url.protocol) || url.username || url.password) continue;
-      return url.origin;
-    } catch {}
+/** Origin of the desktop's web URL; the Durango API is served from it. */
+export const resolveDurangoBaseUrl = (webOrigin) => {
+  try {
+    return new URL(String(webOrigin)).origin;
+  } catch {
+    return DEFAULT_DURANGO_URL;
   }
-  return isPackaged ? DEFAULT_DURANGO_URL : DEFAULT_DEV_DURANGO_URL;
 };
 
 /**
@@ -112,8 +106,6 @@ export const createDurangoCredentials = ({
   webOrigin,
   deviceName,
   getDeviceId = async () => null,
-  durangoUrlOverride = () => process.env.DURANGO_URL,
-  isPackaged = () => false,
   fetchImpl = fetch,
   now = () => Date.now(),
 }) => {
@@ -129,14 +121,7 @@ export const createDurangoCredentials = ({
   };
   const changed = () => new DurangoError('not_signed_in', 'The Durango account changed. Try again.');
 
-  const withBaseUrl = (stored) => ({
-    ...stored,
-    baseUrl: resolveDurangoBaseUrl({
-      override: durangoUrlOverride(),
-      advertised: stored.durangoBaseUrl,
-      isPackaged: isPackaged(),
-    }),
-  });
+  const withBaseUrl = (stored) => ({ ...stored, baseUrl: resolveDurangoBaseUrl(webOrigin()) });
 
   const revoke = async (credential, session) => {
     if (!credential?.keyId || !session?.token) return;
@@ -169,7 +154,7 @@ export const createDurangoCredentials = ({
     const deviceId = await Promise.resolve(getDeviceId()).catch(() => null);
     let response;
     try {
-      // orion-next labels the key "Durango Code · <deviceName>" (contracts §8).
+      // Durango labels the key "Durango Code · <deviceName>" (contracts §8).
       response = await fetchImpl(new URL('/api/desktop-auth/durango-key', base), {
         method: 'POST',
         headers: { authorization: `Bearer ${session.token}`, 'content-type': 'application/json' },
@@ -181,7 +166,7 @@ export const createDurangoCredentials = ({
         redirect: 'error',
       });
     } catch (error) {
-      throw blockMinting(version, networkError('Durango Code web', error), MINT_NETWORK_COOLDOWN_MS);
+      throw blockMinting(version, networkError('Durango', error), MINT_NETWORK_COOLDOWN_MS);
     }
     const data = await readJson(response);
     if (response.status === 401) throw notSignedIn();
@@ -203,9 +188,9 @@ export const createDurangoCredentials = ({
         new DurangoError(
           'not_connected',
           response.status === 404
-            ? 'Durango Code web cannot connect this device to Durango Chat yet.'
+            ? 'Durango cannot connect this device to Durango Chat yet.'
             : response.status === 503 && /not_configured/.test(JSON.stringify(data ?? ''))
-              ? 'the Durango Chat connection is not enabled on Durango Code web yet.'
+              ? 'the Durango Chat connection is not enabled on Durango yet.'
               : errorMessageFrom(data) || `Could not connect Durango Code to Durango Chat (${response.status}).`,
           { status: response.status }
         ),
@@ -213,13 +198,12 @@ export const createDurangoCredentials = ({
       );
     }
     if (typeof data?.key !== 'string' || !/^dgo_\S+$/.test(data.key) || typeof data?.keyId !== 'string' || !data.keyId) {
-      throw new DurangoError('not_connected', 'Durango Code web returned an invalid Durango key.');
+      throw new DurangoError('not_connected', 'Durango returned an invalid Durango key.');
     }
     const credential = {
       origin: base,
       key: data.key,
       keyId: data.keyId,
-      durangoBaseUrl: typeof data.durangoBaseUrl === 'string' ? data.durangoBaseUrl : null,
       createdAt: new Date().toISOString(),
     };
     await serialize(async () => {
@@ -243,8 +227,8 @@ export const createDurangoCredentials = ({
     const operation = (async () => {
       const stored = cached ?? (await serialize(readStored));
       if (version !== generation) throw changed();
-      // A key minted through the legacy orioncode.xyz origin is the same
-      // service's key, so it is reused (web-origin.js alias groups).
+      // A key minted through a retired origin (code.durango.sh) is still
+      // valid on durango.sh, so it is reused (web-origin.js).
       if (stored?.key && stored?.keyId && isSameWebOrigin(stored.origin, new URL(webOrigin()).origin)) {
         cached = stored;
         return withBaseUrl(stored);
@@ -385,7 +369,7 @@ export const createDurangoClient = ({
   fetchImpl = fetch,
   timeoutMs = DURANGO_REQUEST_TIMEOUT_MS,
   isPackaged = () => false,
-  durangoUrlOverride = () => process.env.DURANGO_URL,
+  webOrigin = () => DEFAULT_DURANGO_URL,
 }) => {
   const chatUrls = createChatUrlMemory();
   const request = async (method, apiPath, { query, body, timeout = timeoutMs, signal, headers: extraHeaders } = {}) => {
@@ -446,16 +430,13 @@ export const createDurangoClient = ({
 
   const baseUrl = async () => {
     const credential = await credentials.peek().catch(() => null);
-    return (
-      credential?.baseUrl ??
-      resolveDurangoBaseUrl({ override: durangoUrlOverride(), advertised: null, isPackaged: isPackaged() })
-    );
+    return credential?.baseUrl ?? resolveDurangoBaseUrl(webOrigin());
   };
 
   return {
     /** Durango origin for links (`/tasks`, chats); never mints a key. */
     baseUrl,
-    // --- Durango Tasks (contracts §7, drop-in for orion-next /api/tasks*) ----
+    // --- Durango Tasks (contracts §7) -----------------------------------------
     async listTasks({ status, projectName, q } = {}) {
       const data = await request('GET', '/tasks', { query: { status, projectName, q } });
       return {
@@ -568,9 +549,7 @@ export const createDurangoClient = ({
       const known = chatUrls.get(chatId);
       if (known) return known;
       const credential = await credentials.peek().catch(() => null);
-      const base =
-        credential?.baseUrl ??
-        resolveDurangoBaseUrl({ override: durangoUrlOverride(), advertised: null, isPackaged: isPackaged() });
+      const base = credential?.baseUrl ?? resolveDurangoBaseUrl(webOrigin());
       const id = str(chatId).trim();
       return new URL(id ? `/c/${encodeURIComponent(id)}` : '/chats', base).toString();
     },

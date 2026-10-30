@@ -20,9 +20,13 @@ import path from 'node:path';
 export const CLI_ALIASES = ['durango-code', 'ds', 'durango-source', 'orion-cli'];
 
 /** The CLI's default origin (cli/orion/src/config.ts DEFAULT_ORIGIN). */
-export const CLI_DEFAULT_ORIGIN = 'https://code.durango.sh';
-/** Origins the CLI treats as the same backend (config.ts EQUIVALENT_ORIGINS). */
-const CLI_EQUIVALENT_ORIGINS = [CLI_DEFAULT_ORIGIN, 'https://orioncode.xyz'];
+export const CLI_DEFAULT_ORIGIN = 'https://durango.sh';
+/**
+ * Origins the CLI treats as the same backend (config.ts EQUIVALENT_ORIGINS):
+ * durango.sh plus the retired code.durango.sh / orioncode.xyz, whose saved
+ * tokens durango.sh still accepts.
+ */
+const CLI_EQUIVALENT_ORIGINS = [CLI_DEFAULT_ORIGIN, 'https://code.durango.sh', 'https://orioncode.xyz'];
 
 const cliPackageRoots = () => {
   // Tests run main modules outside the app bundle.

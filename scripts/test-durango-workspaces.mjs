@@ -118,21 +118,23 @@ try {
 
   // --- CLI sign-in -----------------------------------------------------------------
   assert.equal(await cli.readCliCredential(), null);
-  assert.equal(cli.cliUsesOrigin('https://code.durango.sh/'), true);
+  assert.equal(cli.cliUsesOrigin('https://durango.sh/'), true);
+  assert.equal(cli.cliUsesOrigin('https://code.durango.sh/'), true, 'the retired origin is the same backend');
   assert.equal(cli.cliUsesOrigin('http://localhost:3001'), false);
   const devSignIn = await cli.ensureCliSignedIn({ readSession: async () => null, origin: 'http://localhost:3001' });
   assert.equal(devSignIn.signedIn, false, 'a dev build never writes a credential the CLI would not use');
-  const signedOut = await cli.ensureCliSignedIn({ readSession: async () => null, origin: 'https://code.durango.sh' });
+  const signedOut = await cli.ensureCliSignedIn({ readSession: async () => null, origin: 'https://durango.sh' });
   assert.equal(signedOut.needsSignIn, true);
   const credentials = path.join(process.env.HOME, '.config', 'durango-code', 'credentials.json');
   await fs.mkdir(path.dirname(credentials), { recursive: true });
-  // As if `durango-code login` had run; the value is never sent anywhere.
+  // As if an older `durango-code login` had run against the retired origin;
+  // the value is never sent anywhere.
   await fs.writeFile(credentials, JSON.stringify({ 'https://code.durango.sh': { token: 'fake', user: null } }));
   const existing = await cli.ensureCliSignedIn({
     readSession: async () => {
       throw new Error('an existing CLI sign-in must not mint another token');
     },
-    origin: 'https://code.durango.sh',
+    origin: 'https://durango.sh',
   });
   assert.deepEqual([existing.signedIn, existing.created], [true, false]);
 

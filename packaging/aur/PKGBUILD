@@ -9,7 +9,7 @@ pkgver=1.0.151
 pkgrel=1
 pkgdesc='Agentic IDE: run Claude Code, Codex, Grok, Kimi and Cursor side by side'
 arch=('x86_64')
-url='https://code.durango.sh'
+url='https://durango.sh/code'
 license=('MIT')
 depends=('gtk3' 'nss' 'libnotify' 'xdg-utils' 'at-spi2-core' 'libdrm' 'mesa' 'libxcb' 'alsa-lib')
 optdepends=(
@@ -19,7 +19,7 @@ optdepends=(
 provides=('durango-code')
 conflicts=('durango-code')
 options=('!strip' '!debug')
-source=("durango-code-${pkgver}.deb::https://code.durango.sh/api/download/linux?version=${pkgver}")
+source=("durango-code-${pkgver}.deb::https://durango.sh/api/download/linux?version=${pkgver}")
 sha256sums=('ae816f473979332aa94c1539b5264ecf4adb9396db1d2f1daee1235c91f07e4d')
 
 package() {

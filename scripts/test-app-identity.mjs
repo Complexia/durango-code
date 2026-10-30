@@ -87,16 +87,18 @@ const pathsSource = read('src/main/paths.js');
 for (const literal of ["'orion-store.json'", "'orion-threads.json'", "'orion-threads'", "'orion-account-session.json'", "'orion-attachment'", "appProtocol = 'orion'"]) {
   assert.ok(pathsSource.includes(literal), `paths.js keeps ${literal}`);
 }
-// Web origin: code.durango.sh is canonical, orioncode.xyz is the same service.
+// Web origin: durango.sh; credentials saved under the retired code.durango.sh
+// and orioncode.xyz origins still count as durango.sh's.
 const webOrigin = await import('../src/main/web-origin.js');
-assert.equal(webOrigin.DEFAULT_PACKAGED_WEB_URL, 'https://code.durango.sh');
+assert.equal(webOrigin.DEFAULT_PACKAGED_WEB_URL, 'https://durango.sh');
 assert.equal(webOrigin.DEFAULT_DEV_WEB_URL, 'http://localhost:3000');
-assert.equal(webOrigin.DEFAULT_UPDATE_FEED_BASE_URL, 'https://code.durango.sh/api/update');
-assert.equal(webOrigin.isSameWebOrigin('https://orioncode.xyz', 'https://code.durango.sh/'), true);
-assert.equal(webOrigin.isSameWebOrigin('https://code.durango.sh', 'https://code.durango.sh'), true);
-assert.equal(webOrigin.isSameWebOrigin('http://localhost:3000', 'https://code.durango.sh'), false);
-assert.equal(webOrigin.isSameWebOrigin('https://orioncode.xyz.evil.example', 'https://code.durango.sh'), false);
-assert.equal(webOrigin.isSameWebOrigin(undefined, 'https://code.durango.sh'), false);
+assert.equal(webOrigin.DEFAULT_UPDATE_FEED_BASE_URL, 'https://durango.sh/api/update');
+assert.equal(webOrigin.isSameWebOrigin('https://code.durango.sh', 'https://durango.sh/'), true);
+assert.equal(webOrigin.isSameWebOrigin('https://orioncode.xyz', 'https://durango.sh/'), true);
+assert.equal(webOrigin.isSameWebOrigin('https://durango.sh', 'https://durango.sh'), true);
+assert.equal(webOrigin.isSameWebOrigin('http://localhost:3000', 'https://durango.sh'), false);
+assert.equal(webOrigin.isSameWebOrigin('https://orioncode.xyz.evil.example', 'https://durango.sh'), false);
+assert.equal(webOrigin.isSameWebOrigin(undefined, 'https://durango.sh'), false);
 
 console.log('app identity: path logic and packaging config OK');
 

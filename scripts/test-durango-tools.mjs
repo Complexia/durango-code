@@ -64,7 +64,7 @@ const fixture = ({ mintResponses = [], apiResponses = [] } = {}) => {
       state.mints += 1;
       const next = mintResponses.shift();
       if (next) return typeof next === 'function' ? next() : next;
-      return json({ key: `dgo_key${state.mints}`, keyId: `key_${state.mints}`, durangoBaseUrl: 'https://durango.example' }, { status: 201 });
+      return json({ key: `dgo_key${state.mints}`, keyId: `key_${state.mints}` }, { status: 201 });
     }
     const next = apiResponses.shift();
     if (!next) throw new Error(`unexpected request ${target}`);
@@ -75,30 +75,28 @@ const fixture = ({ mintResponses = [], apiResponses = [] } = {}) => {
     readStored: async () => state.stored,
     writeStored: async (value) => { state.stored = value; },
     removeStored: async () => { state.stored = null; },
-    webOrigin: () => 'https://code.example',
+    webOrigin: () => 'https://durango.example/',
     deviceName: 'test-mac',
     getDeviceId: async () => 'device-1',
-    durangoUrlOverride: () => undefined,
-    isPackaged: () => true,
     fetchImpl,
   });
-  const client = createDurangoClient({ credentials, readSession: async () => state.session, fetchImpl, isPackaged: () => true, durangoUrlOverride: () => undefined });
+  const client = createDurangoClient({ credentials, readSession: async () => state.session, fetchImpl, isPackaged: () => true, webOrigin: () => 'https://durango.example/' });
   return { state, credentials, client };
 };
 
 try {
   // --- Base URL resolution ---------------------------------------------------------
-  assert.equal(resolveDurangoBaseUrl({ override: 'http://localhost:3100/', advertised: 'https://durango.sh', isPackaged: false }), 'http://localhost:3100');
-  assert.equal(resolveDurangoBaseUrl({ override: undefined, advertised: 'https://durango.sh/x', isPackaged: true }), 'https://durango.sh');
-  assert.equal(resolveDurangoBaseUrl({ override: undefined, advertised: 'http://evil.example', isPackaged: true }), 'https://durango.sh', 'packaged builds never accept a plain-http advertised origin');
-  assert.equal(resolveDurangoBaseUrl({ override: undefined, advertised: null, isPackaged: false }), 'http://localhost:3100');
+  // The Durango API lives on the desktop's web origin.
+  assert.equal(resolveDurangoBaseUrl('http://localhost:3000/'), 'http://localhost:3000');
+  assert.equal(resolveDurangoBaseUrl('https://durango.sh/x?y=1'), 'https://durango.sh');
+  assert.equal(resolveDurangoBaseUrl('not a url'), 'https://durango.sh');
 
   // --- Mint once, store, reuse; contracts §8 request shape ---------------------------
   {
     const { state, client } = fixture({
       apiResponses: [
         (url, init) => {
-          assert.equal(url.origin, 'https://durango.example', 'uses the server-advertised Durango origin');
+          assert.equal(url.origin, 'https://durango.example', 'uses the web origin for the Durango API');
           assert.equal(url.pathname, '/api/v1/chats');
           assert.equal(url.searchParams.get('q'), 'billing');
           assert.equal(url.searchParams.get('limit'), '5');
@@ -188,7 +186,7 @@ try {
   {
     let release;
     const held = new Promise((resolve) => { release = resolve; });
-    const { state, credentials } = fixture({ mintResponses: [async () => { await held; return json({ key: 'dgo_raced', keyId: 'raced', durangoBaseUrl: null }, { status: 201 }); }] });
+    const { state, credentials } = fixture({ mintResponses: [async () => { await held; return json({ key: 'dgo_raced', keyId: 'raced' }, { status: 201 }); }] });
     const inflight = credentials.get();
     await new Promise((resolve) => setImmediate(resolve));
     await credentials.clear();

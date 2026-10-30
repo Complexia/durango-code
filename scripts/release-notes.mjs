@@ -1,7 +1,7 @@
 // What changed in a Durango Code release: the subjects of the commits under
 // this directory since the previous release tag, or the lines of a file passed
 // with --notes-file. deploy.mjs bakes them into the build (the app's "What's
-// new" notice and Settings) and into the release manifest, which code.durango.sh
+// new" notice and Settings) and into the release manifest, which durango.sh
 // serves as `releaseNotes` in the update feed (the update button's hover card).
 
 import { spawnSync } from 'node:child_process';

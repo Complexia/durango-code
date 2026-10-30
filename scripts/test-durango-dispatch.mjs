@@ -89,7 +89,7 @@ const credentials = {
     return { key: 'dgo_test', keyId: 'key_1', baseUrl: base };
   },
 };
-const client = createDurangoClient({ credentials, readSession: async () => session.value, isPackaged: () => false, durangoUrlOverride: () => undefined });
+const client = createDurangoClient({ credentials, readSession: async () => session.value, isPackaged: () => false, webOrigin: () => base });
 
 const wireTask = (overrides = {}) => ({
   id: 'jd7task1',

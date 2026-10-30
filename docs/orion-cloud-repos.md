@@ -87,9 +87,10 @@ deployment, and legacy publishing:
 
 ## Local development
 
-Run Orion Web locally (see its README: docker Postgres + MinIO, then
-`bun run dev`) and start the desktop app with:
+Run Durango (durango.sh's web app, which serves the repository APIs) locally on
+:3000 and start the desktop app; development builds default to
+`http://localhost:3000`. Point it elsewhere with:
 
 ```bash
-ORION_WEB_URL=http://localhost:3000 bun run start
+DURANGO_URL=http://localhost:3000 bun run start
 ```

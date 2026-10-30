@@ -13,8 +13,8 @@ durango-code status --json
 durango-code open
 ```
 
-`DURANGO_CODE_ORIGIN` selects the Durango Code web origin (default
-`https://code.durango.sh`). `DURANGO_CODE_TOKEN` overrides saved credentials for
+`DURANGO_CODE_ORIGIN` selects the Durango web origin (default
+`https://durango.sh`). `DURANGO_CODE_TOKEN` overrides saved credentials for
 CI and agent runs. `DURANGO_CODE_CONFIG_DIR` selects the local credential
 directory (default `~/.config/durango-code`). `DURANGO_CODE_NO_UPDATE_CHECK=1`
 skips the daily version check. The legacy `ORION_ORIGIN`, `ORION_TOKEN`,

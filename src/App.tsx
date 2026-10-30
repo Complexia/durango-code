@@ -390,12 +390,12 @@ const cloudAppHost = (url: string) => {
   }
 };
 
-/** Billing page on whichever Orion Web this desktop talks to. */
+/** Plan and usage settings on whichever Durango this desktop talks to. */
 const cloudBillingUrl = (repoWebUrl: string | null | undefined) => {
   try {
-    return new URL('/repos/billing', repoWebUrl ?? 'https://code.durango.sh').toString();
+    return new URL('/settings?tab=usage', repoWebUrl ?? 'https://durango.sh').toString();
   } catch {
-    return 'https://code.durango.sh/repos/billing';
+    return 'https://durango.sh/settings?tab=usage';
   }
 };
 

@@ -28,7 +28,7 @@ const execFileAsync = promisify(execFile);
 export const GIT_CREDENTIAL_HELPER_NAME = 'git-credential-durango';
 
 /** CLI origins whose saved token Durango Source accepts (cli/orion/src/config.ts EQUIVALENT_ORIGINS). */
-const CLI_ORIGINS = ['https://code.durango.sh', 'https://orioncode.xyz'];
+const CLI_ORIGINS = ['https://durango.sh', 'https://code.durango.sh', 'https://orioncode.xyz'];
 
 // Runs on Electron's own Node (ELECTRON_RUN_AS_NODE), so it has no imports
 // beyond Node builtins. Mirrors bundled-cli.js readCliCredential.

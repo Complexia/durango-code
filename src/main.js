@@ -378,12 +378,13 @@ const randomBase64Url = (byteLength = 32) => base64Url(crypto.randomBytes(byteLe
 
 const sha256Base64Url = (value) => base64Url(crypto.createHash('sha256').update(value).digest());
 
-const getOrionWebUrl = () => {
-  // Packaged builds talk to the live site (code.durango.sh; orioncode.xyz is
-  // a legacy alias of the same service); development defaults to the local
-  // Durango Code web dev server. ORION_WEB_URL overrides either.
+const getDurangoWebUrl = () => {
+  // Packaged builds talk to durango.sh; development defaults to the local
+  // Durango dev server. DURANGO_URL (or the older ORION_WEB_URL) overrides
+  // either. Every HTTP API the desktop uses, the Durango API included, lives
+  // on this one origin.
   const defaultWebUrl = app.isPackaged ? DEFAULT_PACKAGED_WEB_URL : DEFAULT_DEV_WEB_URL;
-  const rawUrl = process.env.ORION_WEB_URL || defaultWebUrl;
+  const rawUrl = process.env.DURANGO_URL || process.env.ORION_WEB_URL || defaultWebUrl;
   const url = new URL(rawUrl);
   url.hash = '';
   url.search = '';
@@ -392,7 +393,7 @@ const getOrionWebUrl = () => {
 
 const remotePairingProofRequest = async (method, body, token, { signal } = {}) => {
   const { response, data } = await fetchRemotePairingProofJson({
-    url: new URL('/api/desktop-auth/remote-pairing-proof', getOrionWebUrl()),
+    url: new URL('/api/desktop-auth/remote-pairing-proof', getDurangoWebUrl()),
     method,
     token,
     body,
@@ -434,7 +435,7 @@ const getOrionRelayUrl = () => {
 };
 
 /**
- * Bearer-authed call to the relay APIs on orion-next. The desktop account
+ * Bearer-authed call to the relay APIs on durango.sh. The desktop account
  * token authenticates THESE calls and never leaves this function: what comes
  * back is a short-lived relay ticket, and that is all the relay ever sees.
  */
@@ -442,7 +443,7 @@ const relayApiRequest = async (apiPath, body, { signal, method, allowNotFound = 
   const session = await readAccountSession();
   if (!session?.token) throw new Error('Sign in to your Durango account first.');
   const { response, data } = await fetchRelayApiJson({
-    url: new URL(apiPath, getOrionWebUrl()),
+    url: new URL(apiPath, getDurangoWebUrl()),
     method,
     token: session.token,
     body,
@@ -575,7 +576,7 @@ const writeAccountSession = async (session) => {
 
 const repositoryCredentials = createRepositoryCredentials({
   readSession: () => readAccountSession(),
-  origin: () => getOrionWebUrl().toString(),
+  origin: () => getDurangoWebUrl().toString(),
   deviceName: `Durango Code · ${os.hostname()}`.slice(0, 100),
   readStored: async () => {
     try {
@@ -623,7 +624,7 @@ const getDurangoDeviceId = () => {
 };
 const durangoCredentials = createDurangoCredentials({
   readSession: () => readAccountSession(),
-  webOrigin: () => getOrionWebUrl().toString(),
+  webOrigin: () => getDurangoWebUrl().toString(),
   deviceName: os.hostname().slice(0, 80),
   getDeviceId: () => getDurangoDeviceId(),
   isPackaged: () => app.isPackaged,
@@ -656,6 +657,7 @@ const durangoClient = durangoMock
       credentials: durangoCredentials,
       readSession: () => readAccountSession(),
       isPackaged: () => app.isPackaged,
+      webOrigin: () => getDurangoWebUrl().toString(),
     });
 setDurangoToolsClient(durangoClient);
 // fx's own Vercel AI Gateway key, saved from Settings → Providers → fx. Stored
@@ -773,7 +775,7 @@ const verifyAccountSession = async () => {
   }
 
   try {
-    const response = await fetch(new URL('/api/desktop-auth/session', getOrionWebUrl()), {
+    const response = await fetch(new URL('/api/desktop-auth/session', getDurangoWebUrl()), {
       method: 'GET',
       headers: {
         authorization: `Bearer ${session.token}`,
@@ -810,7 +812,7 @@ const verifyAccountSession = async () => {
 };
 
 const buildDesktopAuthUrl = (state, codeChallenge) => {
-  const url = new URL('/desktop/authorize', getOrionWebUrl());
+  const url = new URL('/desktop/authorize', getDurangoWebUrl());
   url.searchParams.set('state', state);
   url.searchParams.set('redirect_uri', `${appProtocol}://auth/callback`);
   url.searchParams.set('code_challenge', codeChallenge);
@@ -845,7 +847,7 @@ const isDesktopAuthCallbackUrl = (rawUrl) => {
 };
 
 const exchangeDesktopAuthCode = async ({ code, state, codeVerifier }) => {
-  const response = await fetch(new URL('/api/desktop-auth/exchange', getOrionWebUrl()), {
+  const response = await fetch(new URL('/api/desktop-auth/exchange', getDurangoWebUrl()), {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -1104,7 +1106,7 @@ app.whenReady().then(async () => {
   // restart without waiting for the renderer to hydrate; the renderer re-pushes
   // the settings over sync:configure on hydration and every change.
   initWorkspaceSync({
-    getWebUrl: () => getOrionWebUrl(),
+    getWebUrl: () => getDurangoWebUrl(),
     readSession: () => readAccountSession(),
     readStoreState: () => readPersistedStoreState(),
     readThreadsIndex,
@@ -2590,7 +2592,7 @@ const installDurangoGitCredentials = async () => {
 };
 
 const signInBundledCli = () =>
-  ensureCliSignedIn({ readSession: () => readAccountSession(), origin: getOrionWebUrl().toString() }).catch((error) => ({
+  ensureCliSignedIn({ readSession: () => readAccountSession(), origin: getDurangoWebUrl().toString() }).catch((error) => ({
     ok: false,
     signedIn: false,
     error: error?.message || String(error),
@@ -2722,10 +2724,10 @@ const cloudErrorMessage = (error) => {
   if (error?.status === 403) return error?.data?.error || 'Your Durango Cloud token does not have permission for this operation. Check Settings > Access tokens.';
   if (error?.status === 404) {
     // A real "repo not found" comes back as JSON from the git API; a bare 404
-    // (HTML page) means this Orion Web deployment doesn't have the API at all.
+    // (HTML page) means this Durango deployment doesn't have the API at all.
     return error?.data?.error
       ? 'Cloud repository not found. It may have been deleted.'
-      : `Durango Cloud at ${getOrionWebUrl().host} does not support repositories yet. Deploy the latest Durango Code web, or point ORION_WEB_URL at a server that has it.`;
+      : `Durango Cloud at ${getDurangoWebUrl().host} does not support repositories yet. Deploy the latest Durango, or point DURANGO_URL at a server that has it.`;
   }
   if (error?.message?.includes('fetch failed')) return 'Could not reach Durango Cloud.';
   return error?.stderr?.toString().trim() || error?.message || String(error);
@@ -2738,7 +2740,7 @@ const cloudGitApiRequest = async (apiPath, { method = 'GET', body, signal } = {}
     error.needsAuth = true;
     throw error;
   }
-  const response = await fetch(new URL(apiPath, getOrionWebUrl()), {
+  const response = await fetch(new URL(apiPath, getDurangoWebUrl()), {
     method,
     signal,
     headers: {
@@ -2772,7 +2774,7 @@ const verifyOrionGitRemote = async ({ gitRoot, token, signal }) => {
   const [{ stdout }, { stdout: pushUrls }, connection] = await Promise.all([
     execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', 'origin']),
     execFileAsync('git', ['-C', gitRoot, 'remote', 'get-url', '--push', '--all', 'origin']),
-    getCloudGitConnection({ baseUrl: getOrionWebUrl(), token, signal }),
+    getCloudGitConnection({ baseUrl: getDurangoWebUrl(), token, signal }),
   ]);
   const actual = stdout.trim().replace(/\/+$/, '');
   const expected = expectedOrionGitRemote(connection?.gitHttpUrl, link.repoId);
@@ -2865,7 +2867,7 @@ const sanitizeCloudRepoName = (value) =>
     .replace(/^[-.]+/, '')
     .slice(0, 100);
 
-const cloudRepoWebUrl = (repoId) => new URL(`/repos/${repoId}`, getOrionWebUrl()).toString();
+const cloudRepoWebUrl = (repoId) => new URL(`/repos/${repoId}`, getDurangoWebUrl()).toString();
 
 const ensureInitialSourceControlCommit = async (gitRoot, session) => {
   const hasHead = await commandSucceeds('git', ['-C', gitRoot, 'rev-parse', '--verify', 'HEAD']);
@@ -2949,7 +2951,7 @@ const createAvailableEmptyCloudRepo = async ({ gitRoot, name, defaultBranch, tok
         gitRoot,
         name: candidate,
         defaultBranch,
-        baseUrl: getOrionWebUrl(),
+        baseUrl: getDurangoWebUrl(),
         token,
       });
       return { repo, previousLink, created: true };
@@ -3022,7 +3024,7 @@ const convertGithubSourceControl = async ({ projectPath, state, session }) => {
     token: session.token,
   });
   const connection = await getCloudGitConnection({
-    baseUrl: getOrionWebUrl(), token: session.token,
+    baseUrl: getDurangoWebUrl(), token: session.token,
   });
   const cloneUrl = expectedOrionGitRemote(connection?.gitHttpUrl, provisioned.repo.id);
   if (!connection?.gitHttpUrl || !isOrionRepoRemoteUrl(cloneUrl, provisioned.repo.id)) {
@@ -3221,7 +3223,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
           const pushed = await pushRepo({
             gitRoot,
             repoId: link.repoId,
-            baseUrl: getOrionWebUrl(),
+            baseUrl: getDurangoWebUrl(),
             token: session.token,
           });
           if (!pushed.ok) throw new Error(pushed.error || 'Could not seed the Durango Cloud repository.');
@@ -3231,7 +3233,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
             const published = await publishRepo({
               gitRoot,
               name,
-              baseUrl: getOrionWebUrl(),
+              baseUrl: getDurangoWebUrl(),
               token: session.token,
             });
             if (!published.ok) throw new Error(published.error || 'Could not seed the Durango Cloud repository.');
@@ -3240,7 +3242,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
           } catch (error) {
             if (error?.status !== 409) throw error;
             repo = await findOwnedCloudRepo({
-              baseUrl: getOrionWebUrl(),
+              baseUrl: getDurangoWebUrl(),
               token: session.token,
               name,
             });
@@ -3249,7 +3251,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
             const pushed = await pushRepo({
               gitRoot,
               repoId: repo.id,
-              baseUrl: getOrionWebUrl(),
+              baseUrl: getDurangoWebUrl(),
               token: session.token,
             });
             if (!pushed.ok) throw new Error(pushed.error || 'Could not update the Durango Cloud repository.');
@@ -3257,7 +3259,7 @@ ipcMain.handle('git:changeSourceControlToOrion', async (_event, input) => {
         }
 
         const connection = await getCloudGitConnection({
-          baseUrl: getOrionWebUrl(),
+          baseUrl: getDurangoWebUrl(),
           token: session.token,
         });
         const gitHttpUrl = String(connection?.gitHttpUrl ?? '').replace(/\/+$/, '');
@@ -3334,7 +3336,7 @@ ipcMain.handle('cloud:getState', async (_event, projectPath) => {
     const gitRoot = await getGitRoot(projectPath);
     const state = await getCloudState({
       gitRoot,
-      baseUrl: getOrionWebUrl(),
+      baseUrl: getDurangoWebUrl(),
       token: session.token,
     });
     return {
@@ -3368,7 +3370,7 @@ ipcMain.handle('cloud:publish', async (_event, input) => {
         const result = await pushRepo({
           gitRoot,
           repoId: existing.repoId,
-          baseUrl: getOrionWebUrl(),
+          baseUrl: getDurangoWebUrl(),
           token: session.token,
         });
         return { ...result, alreadyLinked: true, webUrl: cloudRepoWebUrl(existing.repoId) };
@@ -3385,7 +3387,7 @@ ipcMain.handle('cloud:publish', async (_event, input) => {
     const result = await publishRepo({
       gitRoot,
       name,
-      baseUrl: getOrionWebUrl(),
+      baseUrl: getDurangoWebUrl(),
       token: session.token,
     });
     return { ...result, webUrl: result.repo ? cloudRepoWebUrl(result.repo.id) : null };
@@ -3408,7 +3410,7 @@ ipcMain.handle('cloud:push', async (_event, projectPath) => {
     return await pushRepo({
       gitRoot,
       repoId: link.repoId,
-      baseUrl: getOrionWebUrl(),
+      baseUrl: getDurangoWebUrl(),
       token: session.token,
     });
   } catch (error) {
@@ -3430,7 +3432,7 @@ ipcMain.handle('cloud:pull', async (_event, projectPath) => {
     const pulled = await pullRepo({
       gitRoot,
       repoId: link.repoId,
-      baseUrl: getOrionWebUrl(),
+      baseUrl: getDurangoWebUrl(),
       token: session.token,
     });
     const sourceState = await getGitStateForPath(gitRoot);
@@ -3551,14 +3553,14 @@ ipcMain.handle('cloud:deploy', async (_event, projectPath) => {
       : await pushRepo({
           gitRoot,
           repoId: link.repoId,
-          baseUrl: getOrionWebUrl(),
+          baseUrl: getDurangoWebUrl(),
           token: session.token,
         });
     if (!pushed.ok) return pushed;
 
     const app = await deployApp({
       repoId: link.repoId,
-      baseUrl: getOrionWebUrl(),
+      baseUrl: getDurangoWebUrl(),
       token: session.token,
     });
     return { ok: true, app };
@@ -3597,7 +3599,7 @@ ipcMain.handle('cloud:getAppState', async (_event, projectPath) => {
       ok: true,
       app: await getAppState({
         repoId: link.repoId,
-        baseUrl: getOrionWebUrl(),
+        baseUrl: getDurangoWebUrl(),
         token: session.token,
       }),
     };
@@ -3619,7 +3621,7 @@ ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
 
     const app = await getAppState({
       repoId: link.repoId,
-      baseUrl: getOrionWebUrl(),
+      baseUrl: getDurangoWebUrl(),
       token: session.token,
     });
     if (!app?.url) return { ok: false, error: 'This project has no deployed app yet.' };
@@ -3634,7 +3636,7 @@ ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
 
 // --- Linked tasks: Durango Tasks (legacy: the Durango Code web board) ----------
 // src/main/board-tasks.js. DURANGO_TASKS=0, or turning off "Use Durango Tasks"
-// in Settings → Durango, falls back to orion-next /api/tasks*.
+// in Settings → Durango, falls back to the legacy board's /api/tasks*.
 
 const requireAccountToken = async () => {
   const session = await readAccountSession();
@@ -3646,7 +3648,7 @@ const boardTasks = createBoardTasks({
   useDurango: () => durangoTasksEnabled({ setting: useDurangoTasksSetting }),
   durango: durangoClient,
   readToken: requireAccountToken,
-  webOrigin: () => getOrionWebUrl(),
+  webOrigin: () => getDurangoWebUrl(),
   attachmentDir: () => getAttachmentDirectoryPath(),
   sanitizeName: sanitizeAttachmentName,
   legacyErrorMessage: cloudErrorMessage,

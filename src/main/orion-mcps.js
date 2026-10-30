@@ -295,7 +295,7 @@ class OrionOAuthProvider {
   get clientMetadata() {
     return {
       client_name: 'Durango Code',
-      client_uri: 'https://code.durango.sh',
+      client_uri: 'https://durango.sh',
       redirect_uris: [String(this.redirectUrl)],
       grant_types: this.grantTypes,
       response_types: ['code'],

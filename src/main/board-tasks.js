@@ -4,8 +4,8 @@ import { DurangoError } from './durango-client.js';
 
 // Linked tasks for the composer's task picker (`tasks:*` IPC). Durango Tasks
 // (durango.sh/tasks, `/api/v1/tasks*` with the device's Durango key,
-// contracts §7) replaced the Durango Code web board (orion-next
-// `/api/tasks*` with the desktop session). The legacy path stays for
+// contracts §7) replaced the Durango Code web board (`/api/tasks*` on the
+// same origin, with the desktop session). The legacy path stays for
 // rollback: `DURANGO_TASKS=0` (or the Settings toggle) switches back.
 //
 // Both paths return the same IPC shapes, so the renderer (TaskPickerPopover,
@@ -156,7 +156,7 @@ export const createBoardTasks = ({
     },
   };
 
-  // --- Legacy Durango Code web board (orion-next /api/tasks*) ----------------------
+  // --- Legacy Durango Code web board (/api/tasks*) ---------------------------------
 
   const legacyRequest = async (token, apiPath, options = {}) => {
     const response = await fetchImpl(new URL(apiPath, webOrigin()), {
