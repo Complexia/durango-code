@@ -41,7 +41,11 @@ export const defaultDispatchSettings = Object.freeze({
   accessMode: 'read-only',
   /** null = the project's usual model (inherited from its last thread). */
   modelId: null,
-  maxConcurrent: 1,
+  /**
+   * Dispatched runs at a time; null = no limit. Replaces maxConcurrent (1 | 2,
+   * default 1) under a new key so existing installs move to no limit.
+   */
+  maxRunning: null,
 });
 
 export const normalizeDispatchSettings = (raw) => {
@@ -53,7 +57,7 @@ export const normalizeDispatchSettings = (raw) => {
       : null,
     accessMode: DISPATCH_ACCESS_MODES.includes(value.accessMode) ? value.accessMode : defaultDispatchSettings.accessMode,
     modelId: typeof value.modelId === 'string' && value.modelId.trim() ? value.modelId.trim() : null,
-    maxConcurrent: value.maxConcurrent === 2 ? 2 : 1,
+    maxRunning: Number.isInteger(value.maxRunning) && value.maxRunning > 0 ? value.maxRunning : null,
   };
 };
 
@@ -222,9 +226,10 @@ export const createDispatchWorker = ({
     slotWaiters = [];
     for (const resolve of waiters) resolve();
   };
+  const atLimit = () => settings.maxRunning !== null && running.size >= settings.maxRunning;
   const waitForSlot = (signal) =>
     new Promise((resolve) => {
-      if (signal?.aborted || running.size < settings.maxConcurrent) return resolve();
+      if (signal?.aborted || !atLimit()) return resolve();
       slotWaiters.push(resolve);
       signal?.addEventListener('abort', resolve, { once: true });
     });
@@ -438,7 +443,7 @@ export const createDispatchWorker = ({
         await sleep(WINDOW_RECHECK_MS, signal);
         continue;
       }
-      if (running.size >= settings.maxConcurrent) {
+      if (atLimit()) {
         setStatus('busy', null);
         await waitForSlot(signal);
         continue;
@@ -515,7 +520,7 @@ export const createDispatchWorker = ({
       signedIn,
       status,
       lastError,
-      maxConcurrent: settings.maxConcurrent,
+      maxRunning: settings.maxRunning,
       running: [...running.values()].map((entry) => ({
         dispatchId: entry.dispatch.id,
         threadId: entry.threadId,
@@ -535,7 +540,7 @@ export const createDispatchWorker = ({
       if (lifecycleChanged || !loopPromise) {
         restart();
       } else {
-        if (settings.maxConcurrent > previous.maxConcurrent) wakeSlotWaiters();
+        if (settings.maxRunning !== previous.maxRunning) wakeSlotWaiters();
         // Projects or the allowlist changed: re-register now (no-op when the
         // payload is unchanged) instead of after the current long-poll.
         if (shouldRun()) void register().catch((error) => log('registration failed', error?.message ?? error));

@@ -333,7 +333,10 @@ try {
     assert.equal(clampDispatchAccessMode(null, 'bogus'), 'read-only');
     assert.equal(normalizeDispatchSettings({}).accessMode, 'read-only', 'default is the most conservative mode');
     assert.equal(normalizeDispatchSettings({}).enabled, false, 'off by default');
-    assert.equal(normalizeDispatchSettings({ maxConcurrent: 5 }).maxConcurrent, 1);
+    assert.equal(normalizeDispatchSettings({}).maxRunning, null, 'no limit by default');
+    assert.equal(normalizeDispatchSettings({ maxConcurrent: 1 }).maxRunning, null, 'the old 1/2 setting is dropped');
+    assert.equal(normalizeDispatchSettings({ maxRunning: 4 }).maxRunning, 4);
+    assert.equal(normalizeDispatchSettings({ maxRunning: 0 }).maxRunning, null);
   });
 
   await test('dispatch prompt carries the Durango Chat provenance header', () => {
@@ -425,7 +428,7 @@ try {
     });
     server.always('POST', '/api/v1/code/dispatches/disp_1', () => ({ json: { ok: true } }));
     const { worker, calls } = makeWorker();
-    worker.configure({ settings: { enabled: true, accessMode: 'workspace-write', modelId: 'claude:claude-fable-5-1' }, projects });
+    worker.configure({ settings: { enabled: true, accessMode: 'workspace-write', modelId: 'claude:claude-fable-5-1', maxRunning: 1 }, projects });
     assert.equal(server.requests.length, 0, 'never polls while signed out');
     worker.accountChanged(true);
     // The server logs the report before answering; the notification follows the answer.
@@ -442,7 +445,7 @@ try {
     assert.equal(calls.notifications.length, 1);
     assert.equal(calls.notifications[0].project.name, 'futuremail');
     assert.equal(worker.getState().running.length, 1);
-    // maxConcurrent 1: no further claims while the run is active.
+    // maxRunning 1: no further claims while the run is active.
     const claimsWhileBusy = claimsSoFar().length;
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(claimsSoFar().length, claimsWhileBusy, 'at the concurrency limit the loop stops claiming');
@@ -467,6 +470,27 @@ try {
     assert.equal(claimsSoFar().length, after, 'no claims after sign-out');
     assert.equal(worker.getState().status, 'signed_out');
     worker.stop();
+  });
+
+  await test('no limit by default: claiming continues while runs are active', async () => {
+    let claims = 0;
+    server.always('POST', '/api/v1/code/machines', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/claim', async () => {
+      claims += 1;
+      if (claims <= 3) return { json: { dispatch: dispatchWire({ id: `disp_n${claims}` }) } };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { json: { dispatch: null } };
+    });
+    for (const n of [1, 2, 3]) server.always('POST', `/api/v1/code/dispatches/disp_n${n}`, () => ({ json: { ok: true } }));
+    const { worker, calls } = makeWorker();
+    worker.configure({ settings: { enabled: true }, projects });
+    worker.accountChanged(true);
+    await waitUntil(() => calls.starts.length === 3 && claims > 3, 'three runs started and still claiming');
+    assert.equal(worker.getState().running.length, 3);
+    assert.equal(worker.getState().maxRunning, null);
+    assert.notEqual(worker.getState().status, 'busy');
+    worker.stop();
+    await worker.idle();
   });
 
   await test('claim errors back off exponentially; machine_not_registered re-registers', async () => {

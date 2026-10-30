@@ -665,7 +665,8 @@ type DurangoDispatchSettingsInput = {
   accessMode: 'read-only' | 'workspace-write' | 'full-access';
   /** null = the project's usual model. */
   modelId: string | null;
-  maxConcurrent: 1 | 2;
+  /** null = no limit. */
+  maxRunning: number | null;
 };
 
 type DurangoDispatchState = {
@@ -673,7 +674,7 @@ type DurangoDispatchState = {
   signedIn: boolean;
   status: 'off' | 'signed_out' | 'paused' | 'offline' | 'no_window' | 'busy' | 'listening' | 'error';
   lastError: string | null;
-  maxConcurrent: number;
+  maxRunning: number | null;
   running: Array<{ dispatchId: string; threadId: string | null; projectName: string | null }>;
 };
 

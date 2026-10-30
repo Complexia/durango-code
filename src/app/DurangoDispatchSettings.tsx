@@ -149,17 +149,20 @@ export const DurangoDispatchSettings: React.FC<{
             <div className="setting-label">
               <div className="setting-label-title">Agents at a time</div>
               <div className="setting-label-desc">
-                How many agents from Durango may run at once. Others wait in Durango until one finishes.
+                How many agents from Durango may run at once. With a limit, others wait in Durango until
+                one finishes.
               </div>
             </div>
             <SelectMenu
               label="Agents from Durango at a time"
-              value={String(dispatch.maxConcurrent)}
+              value={dispatch.maxRunning === null ? 'none' : String(dispatch.maxRunning)}
               options={[
+                { value: 'none', label: 'No limit' },
                 { value: '1', label: '1 at a time' },
                 { value: '2', label: '2 at a time' },
+                { value: '4', label: '4 at a time' },
               ]}
-              onChange={(value) => setDispatch({ maxConcurrent: value === '2' ? 2 : 1 })}
+              onChange={(value) => setDispatch({ maxRunning: value === 'none' ? null : Number(value) })}
             />
           </div>
 

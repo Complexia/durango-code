@@ -211,8 +211,8 @@ export type DurangoDispatchSettings = {
   accessMode: Thread['accessMode'];
   /** Model for dispatched runs when Durango Chat names none; null = the project's usual model. */
   modelId: string | null;
-  /** Dispatched runs at a time on this Mac. */
-  maxConcurrent: 1 | 2;
+  /** Dispatched runs at a time on this Mac; null = no limit. */
+  maxRunning: number | null;
 };
 
 export const defaultDurangoDispatchSettings: DurangoDispatchSettings = {
@@ -220,7 +220,7 @@ export const defaultDurangoDispatchSettings: DurangoDispatchSettings = {
   allowedProjectIds: null,
   accessMode: 'read-only',
   modelId: null,
-  maxConcurrent: 1,
+  maxRunning: null,
 };
 
 export const defaultDurangoSettings: DurangoSettings = {
