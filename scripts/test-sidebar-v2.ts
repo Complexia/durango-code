@@ -195,6 +195,49 @@ const workStart = (id: string) => workStartedAt(waitThread, waitThread.find((mes
 assert.equal(workStart('w1'), Date.parse('2026-10-28T00:10:00.000Z'), 'a run counts from the user message');
 assert.equal(workStart('w2'), Date.parse('2026-10-28T00:10:00.000Z'), 'the turn after a background wait too');
 assert.equal(workStart('w3'), Date.parse('2026-10-28T01:00:00.000Z'), 'a wake-up after a finished turn starts afresh');
+// A subagent that finishes during a turn leaves that turn "Finished.", and
+// Claude Code re-invokes the model straight after to deliver its result.
+const reinvokedThread = [
+  { id: 'u1', role: 'user', content: 'do this end to end', ts: '2026-10-30T11:23:59.511Z' },
+  { id: 'r1', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-30T11:23:59.496Z', status: 'done',
+    statusText: 'Waiting on 3 background tasks: Inventory orion-next API and jobs, Survey Rust services…',
+    startedAt: '2026-10-30T11:23:59.496Z', completedAt: '2026-10-30T11:24:03.799Z' },
+  { id: 'r2', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-30T11:30:10.630Z', status: 'done',
+    statusText: 'Finished.', startedAt: '2026-10-30T11:30:10.630Z', completedAt: '2026-10-30T11:30:38.977Z' },
+  { id: 'r3', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-30T11:30:39.715Z', status: 'running',
+    startedAt: '2026-10-30T11:30:39.715Z' },
+] as typeof base.messages;
+assert.equal(
+  workStartedAt(reinvokedThread, reinvokedThread[3]),
+  Date.parse('2026-10-30T11:23:59.496Z'),
+  'a turn re-invoked right after one finished continues its work'
+);
+const slowFollowUp = [...reinvokedThread.slice(0, 3), { ...reinvokedThread[3], startedAt: '2026-10-30T11:31:30.000Z' }];
+assert.equal(
+  workStartedAt(slowFollowUp, slowFollowUp[3]),
+  Date.parse('2026-10-30T11:23:59.496Z'),
+  'also when the re-invoked turn is slow to stream its first output'
+);
+// A steer splits the run around the user's message; it doesn't start new work.
+const steeredThread = [
+  { id: 'u1', role: 'user', content: 'migrate it', ts: '2026-10-30T10:00:00.000Z' },
+  { id: 's1', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-30T10:00:01.000Z', status: 'done',
+    statusText: 'Steered — the agent continues below.', startedAt: '2026-10-30T10:00:01.000Z',
+    completedAt: '2026-10-30T10:05:00.000Z' },
+  { id: 'u2', role: 'user', content: 'use Rust', ts: '2026-10-30T10:05:00.000Z', steer: true },
+  { id: 's2', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-30T10:05:00.000Z', status: 'running',
+    startedAt: '2026-10-30T10:05:00.000Z' },
+  { id: 'u3', role: 'user', content: 'now land it', ts: '2026-10-30T11:00:00.000Z' },
+  { id: 's3', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-30T11:00:00.000Z', status: 'running',
+    startedAt: '2026-10-30T11:00:00.000Z' },
+] as typeof base.messages;
+assert.equal(workStartedAt(steeredThread, steeredThread[3]), Date.parse('2026-10-30T10:00:00.000Z'), 'a steer keeps the timer');
+assert.equal(
+  workStartedAt([...steeredThread.slice(0, 2), { ...steeredThread[2], steer: undefined }, steeredThread[3]], steeredThread[3]),
+  Date.parse('2026-10-30T10:00:00.000Z'),
+  'an unflagged steer from an older build too'
+);
+assert.equal(workStartedAt(steeredThread, steeredThread[5]), Date.parse('2026-10-30T11:00:00.000Z'), 'a new prompt resets it');
 
 assert.equal(formatWorkedDuration(7_000), '7s');
 assert.equal(formatWorkedDuration(38 * 60_000), '38m');

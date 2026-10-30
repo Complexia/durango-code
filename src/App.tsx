@@ -53,6 +53,7 @@ import {
   isAgentsPanelVisible,
   isNoProjectId,
   MAX_THREAD_PANES,
+  STEERED_RUN_CAPTION,
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
@@ -7110,7 +7111,7 @@ const App: React.FC = () => {
       updateThreadMessage(threadId, splitMessage.id, {
         status: 'done',
         completedAt: new Date().toISOString(),
-        statusText: 'Steered — the agent continues below.',
+        statusText: STEERED_RUN_CAPTION,
       });
     }
     if (prepared.tasksToInject.length > 0) {
@@ -7128,6 +7129,7 @@ const App: React.FC = () => {
       role: 'user',
       content: prepared.userContent,
       attachments: prepared.turnAttachments,
+      steer: true,
       ...(prepared.tasksToInject.length > 0
         ? {
             linkedTasks: prepared.tasksToInject.map((task) => ({

@@ -371,6 +371,8 @@ export type Message = {
   };
   /** Board-task chips shown on the user message whose turn sent those tasks to the agent. */
   linkedTasks?: Array<Pick<LinkedBoardTask, 'id' | 'title' | 'description'>>;
+  /** A user message steered into a running turn (⌘⏎): it doesn't start new work. */
+  steer?: boolean;
 };
 
 /**
@@ -379,6 +381,9 @@ export type Message = {
  * sync). The thread stays Working until the follow-up turn.
  */
 export const WAITING_ON_BACKGROUND_CAPTION = /^Waiting on (\d+ background (?:agents?|tasks?)|background task)\b.*…$/;
+
+/** The caption of a run bubble closed where a steer split it (App.tsx); the run goes on below. */
+export const STEERED_RUN_CAPTION = 'Steered — the agent continues below.';
 
 export type QueuedMessage = {
   id: string;

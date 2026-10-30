@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { WAITING_ON_BACKGROUND_CAPTION, type Message, type Thread, type UserAction } from '../store';
+import { STEERED_RUN_CAPTION, WAITING_ON_BACKGROUND_CAPTION, type Message, type Thread, type UserAction } from '../store';
 import { getThreadActivityTime } from './time';
 
 export type SidebarV2View = 'pinned' | 'recent' | 'snoozed' | 'settled';
@@ -78,12 +78,36 @@ export const compareSidebarV2Recent =
   (attentionSince: ReadonlyMap<string, number>) => (a: Thread, b: Thread) =>
     sidebarV2RecentRank(b, attentionSince.get(b.id)) - sidebarV2RecentRank(a, attentionSince.get(a.id));
 
+// Claude Code re-invokes the model right after a turn that ended while a
+// background task's notification was still queued (the task finished during
+// the turn, so the turn didn't end "Waiting on…"). A run that starts this soon
+// after the previous one finished continues its work. The run starts when the
+// model's first output streams in, which takes longer on a large uncached
+// context, hence the slack; a scheduled wake-up is normally much later.
+const FOLLOW_UP_TURN_GAP_MS = 2 * 60_000;
+
+// Whether the run after `earlier` (starting at `nextStart`) is the same work:
+// the turn ended waiting on background tasks, was split by a steer, or was
+// re-invoked straight after it ended.
+const workContinuesAfter = (earlier: Message, nextStart: number) => {
+  const caption = earlier.statusText ?? '';
+  if (WAITING_ON_BACKGROUND_CAPTION.test(caption) || caption === STEERED_RUN_CAPTION) return true;
+  const completedAt = earlier.completedAt ? Date.parse(earlier.completedAt) : Number.NaN;
+  return nextStart - completedAt <= FOLLOW_UP_TURN_GAP_MS;
+};
+
+// A user message steered into a running turn. Older builds didn't flag it;
+// the bubble the steer split shows it.
+const isSteer = (messages: Message[], index: number) =>
+  messages[index].steer === true || messages[index - 1]?.statusText === STEERED_RUN_CAPTION;
+
 /**
  * When the work leading up to `message` (an agent run) began: the user's
- * message before it. Turns the agent was re-invoked for while it waited on
- * background tasks (the thread stayed Working) count as the same stretch, so
- * a release that finishes in a follow-up turn still counts from the request.
- * A run that follows one that finished outright (a scheduled wake-up) starts
+ * prompt before it. Turns the agent was re-invoked for while it waited on
+ * background tasks (the thread stayed Working), turns re-invoked right after
+ * they ended, and steered messages count as the same stretch, so a release
+ * that finishes in a follow-up turn still counts from the request. A run that
+ * starts well after one that finished outright (a scheduled wake-up) starts
  * its own stretch.
  */
 export const workStartedAt = (messages: Message[], message: Message) => {
@@ -91,10 +115,13 @@ export const workStartedAt = (messages: Message[], message: Message) => {
   let since = Date.parse(message.startedAt ?? message.ts);
   for (let i = index - 1; i >= 0; i -= 1) {
     const earlier = messages[i];
-    if (earlier.role === 'user') return Math.min(since, Date.parse(earlier.ts));
+    if (earlier.role === 'user') {
+      if (isSteer(messages, i)) continue;
+      return Math.min(since, Date.parse(earlier.ts));
+    }
     if (earlier.kind !== 'agent-run') continue;
-    if (!WAITING_ON_BACKGROUND_CAPTION.test(earlier.statusText ?? '')) break;
-    since = Date.parse(earlier.startedAt ?? earlier.ts);
+    if (!workContinuesAfter(earlier, since)) break;
+    since = Math.min(since, Date.parse(earlier.startedAt ?? earlier.ts));
   }
   return since;
 };
