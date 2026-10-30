@@ -2078,11 +2078,29 @@ const App: React.FC = () => {
       });
     });
   }, [updateThread]);
+  // Done on a pinned action also tells the agent that asked, so it doesn't sit
+  // waiting for the user to say so: it steers the running turn, or starts a
+  // turn when the thread is idle (steerWithContent queues when it can't steer).
+  const steerWithContentRef = useRef<(threadId: string, promptText: string) => Promise<void>>(
+    async () => {}
+  );
   const markUserActionDone = useCallback(
     (threadId: string, actionId: string) => {
-      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const threads = useOrionStore.getState().threads;
+      const thread = threads.find((candidate) => candidate.id === threadId);
+      const done = thread?.userActions?.find((action) => action.id === actionId);
       const remaining = (thread?.userActions ?? []).filter((action) => action.id !== actionId);
       updateThread(threadId, { userActions: remaining.length ? remaining : undefined });
+      if (!thread || !done) return;
+      // A provider-native subagent's transcript is read-only; its driver
+      // thread is the one that can take the message.
+      let target: Thread | undefined = thread;
+      while (target?.subagent) {
+        const parentId: string | undefined = target.parentThreadId;
+        target = parentId ? threads.find((candidate) => candidate.id === parentId) : undefined;
+      }
+      if (!target) return;
+      void steerWithContentRef.current(target.id, `Done: ${done.action}`);
     },
     [updateThread]
   );
@@ -7232,6 +7250,10 @@ const App: React.FC = () => {
   const steerQueuedMessageRef = useRef<(threadId: string, queuedId: string) => Promise<void>>(
     async () => {}
   );
+  useLayoutEffect(() => {
+    steerWithContentRef.current = (threadId: string, promptText: string) =>
+      steerWithContent(threadId, promptText, []);
+  });
   useLayoutEffect(() => {
     steerQueuedMessageRef.current = async (threadId: string, queuedId: string) => {
       if (!steerTargetForThread(threadId)) return;

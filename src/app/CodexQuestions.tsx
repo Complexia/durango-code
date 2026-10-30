@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Check, MessageCircleQuestion } from 'lucide-react';
 
 export type CodexQuestionRequest = {
   providerId?: 'codex' | 'claude';
@@ -63,52 +64,74 @@ const QuestionCard = ({
 
   return (
     <div className="codex-question-card">
-      {request.detail && <pre className="agent-request-detail">{request.detail}</pre>}
-      {request.questions.map((question) => (
-        <div key={question.id} className="codex-question">
-          <strong>{question.header}</strong>
-          <label htmlFor={`codex-question-${request.requestId}-${question.id}`}>{question.question}</label>
-          {!!question.options?.length && !question.isSecret && (
-            <div className="codex-question-options" role="group" aria-label={question.header}>
-              {question.options.map((option) => (
-                <button
-                  key={option.label}
-                  type="button"
-                  aria-pressed={answers[question.id]?.includes(option.label) ?? false}
-                  disabled={sending}
-                  onClick={() => {
-                    if (!question.multiSelect) setCustomAnswers((current) => ({ ...current, [question.id]: '' }));
-                    setAnswers((current) => ({ ...current, [question.id]: question.multiSelect
-                      ? (current[question.id]?.includes(option.label)
-                        ? current[question.id].filter((value) => value !== option.label)
-                        : [...(current[question.id] ?? []), option.label])
-                      : [option.label] }));
-                  }}
-                >
-                  <span>{option.label}</span>
-                  <small>{option.description}</small>
-                </button>
-              ))}
+      <div className="codex-question-body">
+        {request.detail && <pre className="agent-request-detail">{request.detail}</pre>}
+        {request.questions.map((question) => (
+          <div key={question.id} className="codex-question">
+            <div className="codex-question-header">
+              <MessageCircleQuestion size={13} aria-hidden="true" />
+              <span>{question.header}</span>
+              {question.multiSelect && <small>Choose any</small>}
             </div>
-          )}
-          {question.allowCustom !== false && <input
-            id={`codex-question-${request.requestId}-${question.id}`}
-            type={question.isSecret ? 'password' : 'text'}
-            autoComplete="off"
-            placeholder="Your answer…"
-            value={customAnswers[question.id] ?? ''}
-            disabled={sending}
-            onChange={(event) => {
-              if (!question.multiSelect) setAnswers((current) => ({ ...current, [question.id]: [] }));
-              setCustomAnswers((current) => ({ ...current, [question.id]: event.target.value }));
-            }}
-          />}
-        </div>
-      ))}
-      {error && <p role="alert">{error}</p>}
-      <button type="button" className="codex-question-submit" disabled={sending || !complete} onClick={() => void submit()}>
-        {sending ? 'Sending…' : 'Send answers'}
-      </button>
+            <label htmlFor={`codex-question-${request.requestId}-${question.id}`}>{question.question}</label>
+            {!!question.options?.length && !question.isSecret && (
+              <div className="codex-question-options" role="group" aria-label={question.header}>
+                {question.options.map((option) => {
+                  const selected = answers[question.id]?.includes(option.label) ?? false;
+                  return (
+                    <button
+                      key={option.label}
+                      type="button"
+                      aria-pressed={selected}
+                      disabled={sending}
+                      onClick={() => {
+                        if (!question.multiSelect) setCustomAnswers((current) => ({ ...current, [question.id]: '' }));
+                        setAnswers((current) => ({ ...current, [question.id]: question.multiSelect
+                          ? (current[question.id]?.includes(option.label)
+                            ? current[question.id].filter((value) => value !== option.label)
+                            : [...(current[question.id] ?? []), option.label])
+                          : [option.label] }));
+                      }}
+                    >
+                      <span className={`codex-question-mark${question.multiSelect ? ' multi' : ''}`} aria-hidden="true">
+                        {selected && <Check size={10} strokeWidth={3} />}
+                      </span>
+                      <span className="codex-question-option-text">
+                        <span>{option.label}</span>
+                        {option.description && <small>{option.description}</small>}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {question.allowCustom !== false && <input
+              id={`codex-question-${request.requestId}-${question.id}`}
+              type={question.isSecret ? 'password' : 'text'}
+              autoComplete="off"
+              placeholder={question.options?.length && !question.isSecret ? 'Or type your own answer…' : 'Your answer…'}
+              value={customAnswers[question.id] ?? ''}
+              disabled={sending}
+              onChange={(event) => {
+                if (!question.multiSelect) setAnswers((current) => ({ ...current, [question.id]: [] }));
+                setCustomAnswers((current) => ({ ...current, [question.id]: event.target.value }));
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void submit();
+                }
+              }}
+            />}
+          </div>
+        ))}
+      </div>
+      <div className="codex-question-footer">
+        {error && <p role="alert">{error}</p>}
+        <button type="button" className="codex-question-submit" disabled={sending || !complete} onClick={() => void submit()}>
+          {sending ? 'Sending…' : request.questions.length > 1 ? 'Send answers' : 'Send answer'}
+        </button>
+      </div>
     </div>
   );
 };
