@@ -65,7 +65,7 @@ export const AgentFamilySwitcher: React.FC<{
   split?: boolean;
 }> = ({ currentThread, threads, onSelect, split = false }) => {
   const [expandedRootId, setExpandedRootId] = useState<string | null>(null);
-  // Whole strip open/closed — independent of the "show N more" list truncation.
+  // Whole strip open/closed. Closing it also resets the "show N more" truncation.
   // null = untouched by the user: open in the full view, closed in a split pane.
   const [sectionOpenState, setSectionOpenState] = useState<boolean | null>(null);
   const sectionOpen = sectionOpenState ?? !split;
@@ -195,7 +195,11 @@ export const AgentFamilySwitcher: React.FC<{
       <button
         type="button"
         className="agent-switcher-label"
-        onClick={() => setSectionOpenState(!sectionOpen)}
+        onClick={() => {
+          // Reopening starts truncated again, like the untouched default.
+          if (sectionOpen) setExpandedRootId(null);
+          setSectionOpenState(!sectionOpen);
+        }}
         aria-expanded={sectionOpen}
         title={sectionOpen ? 'Collapse subagents' : 'Expand subagents'}
       >
