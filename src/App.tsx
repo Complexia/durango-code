@@ -4712,6 +4712,15 @@ const App: React.FC = () => {
             !hasComposerDraft(thread.id)
         );
       if (draft) {
+        // Restamp it as new: Recent ranks an empty thread by createdAt, so a
+        // draft left from hours ago would otherwise open below newer threads.
+        const now = new Date();
+        updateThread(draft.id, {
+          createdAt: now.toISOString(),
+          ...(isDefaultTitle(draft.title)
+            ? { title: `Thread ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` }
+            : {}),
+        });
         selectThread(draft.id);
         setActiveTab('agents');
         return;
