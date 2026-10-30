@@ -18,9 +18,11 @@ import {
   createReadStream,
   existsSync,
   mkdirSync,
+  renameSync,
   unwatchFile,
   watch as watchFsPath,
   watchFile,
+  writeFileSync,
 } from 'node:fs';
 import { Readable } from 'node:stream';
 import os from 'node:os';
@@ -274,6 +276,12 @@ let threadsSaveQueue = Promise.resolve();
 let threadsWriteSeq = 0;
 let threadsCommittedSeq = 0;
 let threadsSyncSnapshot = null; // { seq, patch } from the latest sync flush
+// The store file gets the same treatment: its unload flush writes
+// synchronously, so a queued or in-flight async save of an older snapshot
+// must neither overwrite it nor survive it.
+let storageWriteSeq = 0;
+let storageCommittedSeq = 0;
+let storageSyncSnapshot = null; // { seq, value } from the latest sync flush
 // A BrowserWindow can exist while its renderer is still loading or has
 // crashed/reloaded before installing the remote-command subscription. Only a
 // renderer that explicitly announces readiness may receive a command.
@@ -1551,13 +1559,26 @@ ipcMain.handle('storage:save', async (_event, value) => {
   // Chain on the settled queue (.catch first): a failed write must not leave
   // the queue permanently rejected, or every later save would skip its write
   // callback and fail with the stale error even after storage recovers.
+  const seq = ++storageWriteSeq;
   const save = storageSaveQueue.catch(() => {}).then(async () => {
+    if (seq <= storageCommittedSeq) return; // superseded by the sync flush
     const storagePath = getStorageFilePath();
     const tempPath = `${storagePath}.${process.pid}.tmp`;
     const sanitized = sanitizeStoreValue(value) ?? value;
     await fs.mkdir(path.dirname(storagePath), { recursive: true });
     await fs.writeFile(tempPath, sanitized, 'utf-8');
     await fs.rename(tempPath, storagePath);
+    if (seq >= storageCommittedSeq) {
+      storageCommittedSeq = seq;
+      return;
+    }
+    // The sync flush committed a newer snapshot while this rename was in
+    // flight and may have been overwritten by it — reinstall the newer one.
+    const snapshot = storageSyncSnapshot;
+    if (snapshot && snapshot.seq > seq) {
+      await fs.writeFile(tempPath, snapshot.value, 'utf-8');
+      await fs.rename(tempPath, storagePath);
+    }
   });
   storageSaveQueue = save;
 
@@ -1715,15 +1736,39 @@ ipcMain.on('storage:saveThreadsSync', (event, value) => {
   }
 });
 
+// Quit-time store flush (see storage:saveThreadsSync): settings and unsent
+// composer drafts changed within the save debounce would otherwise be lost.
+ipcMain.on('storage:saveSync', (event, value) => {
+  try {
+    const seq = ++storageWriteSeq;
+    const storagePath = getStorageFilePath();
+    const sanitized = sanitizeStoreValue(value) ?? value;
+    mkdirSync(path.dirname(storagePath), { recursive: true });
+    const tempPath = `${storagePath}.${process.pid}.sync.tmp`;
+    writeFileSync(tempPath, sanitized, 'utf-8');
+    renameSync(tempPath, storagePath);
+    storageCommittedSeq = seq;
+    storageSyncSnapshot = { seq, value: sanitized };
+    event.returnValue = true;
+  } catch (error) {
+    console.error('storage:saveSync error', error);
+    event.returnValue = false;
+  }
+});
+
 ipcMain.handle('storage:clear', async () => {
   // Clear participates in both save queues so an older pending write cannot
   // recreate either file after this handler reports success. Threads also
   // take a sequence number because the unload-time synchronous flush can
   // jump the async queue.
   const threadsSeq = ++threadsWriteSeq;
-  const clearStorage = storageSaveQueue.catch(() => {}).then(() =>
-    fs.rm(getStorageFilePath(), { force: true })
-  );
+  const storageSeq = ++storageWriteSeq;
+  const clearStorage = storageSaveQueue.catch(() => {}).then(async () => {
+    if (storageSeq <= storageCommittedSeq) return;
+    await fs.rm(getStorageFilePath(), { force: true });
+    storageCommittedSeq = Math.max(storageCommittedSeq, storageSeq);
+    if (storageSyncSnapshot && storageSyncSnapshot.seq < storageSeq) storageSyncSnapshot = null;
+  });
   storageSaveQueue = clearStorage;
 
   const clearThreads = threadsSaveQueue.catch(() => {}).then(async () => {

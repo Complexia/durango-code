@@ -56,6 +56,7 @@ import {
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
+  type ComposerDraft,
   type FileAttachment,
   type LinkedBoardTask,
   type Message,
@@ -1338,23 +1339,34 @@ const App: React.FC = () => {
     null;
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
-  // empty composer.
+  // empty composer. Non-empty ones are also saved with the store
+  // (composerDrafts), so they survive a restart.
   const composerDraftKey = selectedThreadId ?? null;
-  const composerDraftsRef = useRef(new Map<string, { text: string; attachments: FileAttachment[] }>());
-  const composerDraftKeyRef = useRef<string | null>(composerDraftKey);
+  const composerDraftsRef = useRef(new Map<string, ComposerDraft>());
+  // Starts unset so the swap effect below restores the first thread's draft
+  // even when the store hydrated before this first render; otherwise the save
+  // effect would overwrite that saved draft with the empty composer.
+  const composerDraftKeyRef = useRef<string | null>(null);
+  const rememberComposerDraft = (threadId: string, draft: ComposerDraft) => {
+    composerDraftsRef.current.set(threadId, draft);
+    useOrionStore.getState().setComposerDraft(threadId, draft);
+  };
+  const hasComposerDraft = (threadId: string) => {
+    const draft =
+      composerDraftsRef.current.get(threadId) ?? useOrionStore.getState().composerDrafts[threadId];
+    return !!draft && (!!draft.text.trim() || draft.attachments.length > 0);
+  };
   // Empty threads whose composer has been typed into (or given an attachment)
-  // this session. Sidebar v2 lists a blank draft only once it is in here, so
-  // the fresh composer opened after a snooze or settle stays out of the list.
+  // this session, or that came back from the last one with a saved draft.
+  // Sidebar v2 lists a blank draft only once it is in here, so the fresh
+  // composer opened after a snooze or settle stays out of the list.
   const [typedDraftThreadIds, setTypedDraftThreadIds] = useState<ReadonlySet<string>>(() => new Set());
 
   useEffect(() => {
     // Skip the render where the key just changed: chatInput still holds the
     // previous project's draft until the swap effect below runs.
     if (!composerDraftKey || composerDraftKeyRef.current !== composerDraftKey) return;
-    composerDraftsRef.current.set(composerDraftKey, {
-      text: chatInput,
-      attachments: chatAttachments,
-    });
+    rememberComposerDraft(composerDraftKey, { text: chatInput, attachments: chatAttachments });
     if (chatInput.trim() || chatAttachments.length > 0) {
       setTypedDraftThreadIds((prev) => (prev.has(composerDraftKey) ? prev : new Set(prev).add(composerDraftKey)));
     }
@@ -1364,7 +1376,10 @@ const App: React.FC = () => {
     const prevKey = composerDraftKeyRef.current;
     if (prevKey === composerDraftKey) return;
     composerDraftKeyRef.current = composerDraftKey;
-    const draft = composerDraftKey ? composerDraftsRef.current.get(composerDraftKey) : undefined;
+    const draft = composerDraftKey
+      ? (composerDraftsRef.current.get(composerDraftKey) ??
+        useOrionStore.getState().composerDrafts[composerDraftKey])
+      : undefined;
     setChatInput(draft?.text ?? '');
     setChatAttachments(draft?.attachments ?? []);
     // The restored draft has no caret yet, so no mention token can be active.
@@ -2783,6 +2798,13 @@ const App: React.FC = () => {
   useEffect(() => {
     // Runs after the hydrated frame commits: the real sidebar is underneath.
     if (storeHydrated) removeBootSkeleton();
+  }, [storeHydrated]);
+  // Drafts saved by the last session list their threads again, like ones
+  // typed into this session.
+  useEffect(() => {
+    if (!storeHydrated) return;
+    const savedDraftIds = Object.keys(useOrionStore.getState().composerDrafts);
+    if (savedDraftIds.length > 0) setTypedDraftThreadIds((prev) => new Set([...prev, ...savedDraftIds]));
   }, [storeHydrated]);
   useEffect(() => {
     // Never push pre-hydration defaults: work sharing defaults to on, and a
@@ -4655,7 +4677,8 @@ const App: React.FC = () => {
   };
 
   // A fresh composer in a project. Sidebar v2 reuses an untouched draft there
-  // rather than stacking empty threads at the top of the flat list.
+  // (nothing sent, nothing typed) rather than stacking empty threads at the
+  // top of the flat list.
   const openNewAgentIn = (projectId: string) => {
     if (sidebarV2Enabled) {
       const draft = useOrionStore
@@ -4669,7 +4692,8 @@ const App: React.FC = () => {
             !thread.parentThreadId &&
             !thread.subagent &&
             !thread.settledAt &&
-            !thread.snoozedAt
+            !thread.snoozedAt &&
+            !hasComposerDraft(thread.id)
         );
       if (draft) {
         selectThread(draft.id);
@@ -6762,8 +6786,8 @@ const App: React.FC = () => {
       setChatAttachments((current) => [...attachments, ...current]);
       return;
     }
-    const draft = composerDraftsRef.current.get(threadId);
-    composerDraftsRef.current.set(threadId, {
+    const draft = composerDraftsRef.current.get(threadId) ?? useOrionStore.getState().composerDrafts[threadId];
+    rememberComposerDraft(threadId, {
       text: [promptText, draft?.text ?? ''].filter(Boolean).join('\n\n'),
       attachments: [...attachments, ...(draft?.attachments ?? [])],
     });

@@ -39,6 +39,7 @@
     "test:no-project": "bun scripts/test-no-project.ts",
     "test:sidebar-v2": "bun scripts/test-sidebar-v2.ts",
     "test:thread-backfill": "bun scripts/test-thread-backfill.ts",
+    "test:composer-drafts": "bun scripts/test-composer-drafts.ts && bun scripts/test-composer-drafts.ts --failed-backfill && bun scripts/test-composer-drafts.ts --cleared-backfill",
     "test:work-log": "bun scripts/test-work-log.tsx",
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",

@@ -13,6 +13,8 @@ contextBridge.exposeInMainWorld('orion', {
   // App persistence
   loadStore: () => ipcRenderer.invoke('storage:load'),
   saveStore: (value) => ipcRenderer.invoke('storage:save', value),
+  // Blocking quit-time flush, like saveThreadsSync below.
+  saveStoreSync: (value) => ipcRenderer.sendSync('storage:saveSync', value),
   loadThreadsHead: (input) => ipcRenderer.invoke('storage:loadThreadsHead', input),
   loadThreadsBatch: (input) => ipcRenderer.invoke('storage:loadThreadsBatch', input),
   saveThreads: (value) => ipcRenderer.invoke('storage:saveThreads', value),

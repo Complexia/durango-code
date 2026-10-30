@@ -742,6 +742,8 @@ type OrionCodexBrowserIntegrationStatus = {
     orion: {
       loadStore: () => Promise<string | null>;
       saveStore: (value: string) => Promise<boolean>;
+      /** Blocking quit-time flush — see preload. */
+      saveStoreSync?: (value: string) => boolean;
       /** Startup transcripts the first frame shows, as JSON text. ok:false suppresses thread persistence. */
       loadThreadsHead?: (input?: { count?: number; ids?: string[] }) => Promise<{ ok: boolean; value?: string }>;
       /** The remaining transcripts by id, in bounded batches, as JSON text. */

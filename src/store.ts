@@ -327,6 +327,12 @@ export type FileAttachment = {
   size: number;
 };
 
+/** What the user typed into a thread's composer but has not sent yet. */
+export type ComposerDraft = {
+  text: string;
+  attachments: FileAttachment[];
+};
+
 export type Message = {
   id: string;
   role: 'user' | 'agent' | 'system';
@@ -773,6 +779,14 @@ interface OrionState {
    */
   paneThreadIds: string[];
 
+  /**
+   * Unsent composer text and attachments by thread id, so a restart brings
+   * them back. Only non-empty drafts are kept. They live here rather than on
+   * the thread so typing doesn't churn `threads` (and every transcript save)
+   * on each keystroke.
+   */
+  composerDrafts: Record<string, ComposerDraft>;
+
   // Saved views (splits the user can return to)
   savedViews: SavedView[];
   /**
@@ -858,6 +872,8 @@ interface OrionState {
   deleteSavedView: (id: string) => void;
   setSplitViewSettings: (updates: Partial<SplitViewSettings>) => void;
   updateThread: (id: string, updates: Partial<Thread>) => void;
+  /** Remember (or, when empty, forget) a thread's unsent composer draft. */
+  setComposerDraft: (threadId: string, draft: ComposerDraft) => void;
   deleteThread: (id: string) => void;
   addMessageToThread: (threadId: string, message: Omit<Message, 'id' | 'ts'>) => string;
   appendToThreadMessage: (threadId: string, messageId: string, chunk: string) => void;
@@ -902,6 +918,7 @@ interface OrionState {
 }
 
 const memoryStorage = new Map<string, string>();
+const ORION_STORE_NAME = 'orion-storage';
 
 // Streaming agent runs update the store many times per second, and zustand's
 // persist middleware serializes the whole store on every update. Debounce the
@@ -954,6 +971,26 @@ export const flushOrionStoreSave = async (): Promise<boolean> => {
 
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
+    // Like the threads flush below: an async save started here races app
+    // teardown, and the store carries unsent composer drafts typed (or
+    // cleared by a send) moments before quitting. Block on a synchronous
+    // write of the newest snapshot when one isn't known to be on disk.
+    const unsaved = pendingStoreValue !== null || storeSaveFlush !== null;
+    const latest = memoryStorage.get(ORION_STORE_NAME);
+    if (unsaved && latest !== undefined && window.orion?.saveStoreSync) {
+      if (storeSaveTimer !== null) {
+        clearTimeout(storeSaveTimer);
+        storeSaveTimer = null;
+      }
+      try {
+        if (window.orion.saveStoreSync(latest)) {
+          pendingStoreValue = null;
+          return;
+        }
+      } catch (error) {
+        console.warn('Failed to persist orion-storage on unload', error);
+      }
+    }
     void flushOrionStoreSave();
   });
 }
@@ -1007,6 +1044,9 @@ let threadsBackfillGeneration = 0;
 // Threads deleted while the backfill runs must not come back with it.
 const threadsDeletedDuringBackfill = new Set<string>();
 let threadsSavedDuringBackfill = false;
+// Set when the backfill gave up on some stored transcripts: they are still on
+// disk, so the store holds less than every thread that exists.
+let threadsBackfillIncomplete = false;
 let applyingThreadsBackfill = false;
 const threadsCompleteListeners = new Set<() => void>();
 
@@ -1168,6 +1208,9 @@ const orionStorage: PersistStorage<unknown> = {
       threadsBackfill = null;
       threadsBackfillGeneration += 1;
       threadsDeletedDuringBackfill.clear();
+      // Cancelled, not loaded: draft pruning must not run (and write the
+      // store back) on the strength of it.
+      threadsBackfillIncomplete = true;
       notifyAllThreadsLoaded();
     }
 
@@ -1502,6 +1545,7 @@ export const useOrionStore = create<OrionState>()(
       selectedProjectId: null,
       selectedThreadId: null,
       paneThreadIds: [],
+      composerDrafts: {},
       savedViews: [],
       activeSavedViewId: null,
       splitViewSettings: defaultSplitViewSettings,
@@ -1672,6 +1716,11 @@ export const useOrionStore = create<OrionState>()(
           // Saved views lose the threads that went with the project.
           const threads = state.threads.filter((thread) => thread.projectId !== id);
           const savedViews = pruneSavedViews(state.savedViews, threads);
+          const removedThreadIds = state.threads
+            .filter((thread) => thread.projectId === id && thread.id in state.composerDrafts)
+            .map((thread) => thread.id);
+          const composerDrafts = removedThreadIds.length > 0 ? { ...state.composerDrafts } : state.composerDrafts;
+          for (const threadId of removedThreadIds) delete composerDrafts[threadId];
           const panes = panesAfterRemoval(
             state,
             (paneId) => state.threads.find((thread) => thread.id === paneId)?.projectId === id
@@ -1693,6 +1742,7 @@ export const useOrionStore = create<OrionState>()(
             activeSavedViewId: savedViews.some((view) => view.id === state.activeSavedViewId)
               ? state.activeSavedViewId
               : null,
+            composerDrafts,
             expandedProjects: state.expandedProjects.filter((pid) => pid !== id),
             workspacePath: wasWorkspaceProject ? fallbackProject?.path ?? null : state.workspacePath,
             openFiles: wasWorkspaceProject ? [] : state.openFiles,
@@ -2054,11 +2104,24 @@ export const useOrionStore = create<OrionState>()(
           };
         }),
 
+      setComposerDraft: (threadId, draft) =>
+        set((state) => {
+          const current = state.composerDrafts[threadId];
+          if (!draft.text.trim() && draft.attachments.length === 0) {
+            if (!current) return state;
+            const { [threadId]: _removed, ...composerDrafts } = state.composerDrafts;
+            return { composerDrafts };
+          }
+          if (current?.text === draft.text && current.attachments === draft.attachments) return state;
+          return { composerDrafts: { ...state.composerDrafts, [threadId]: draft } };
+        }),
+
       deleteThread: (id) =>
         set((state) => {
           // A deleted thread leaves every saved view it appeared in; a view
           // left with one thread goes with it.
           const threads = state.threads.filter((thread) => thread.id !== id);
+          const { [id]: _removedDraft, ...composerDrafts } = state.composerDrafts;
           const savedViews = pruneSavedViews(state.savedViews, threads);
           const panes = panesAfterRemoval(state, (paneId) => paneId === id);
           const focusedPaneThread = panes.selectedThreadId
@@ -2068,6 +2131,7 @@ export const useOrionStore = create<OrionState>()(
             threads,
             ...panes,
             selectedProjectId: focusedPaneThread?.projectId ?? state.selectedProjectId,
+            composerDrafts: id in state.composerDrafts ? composerDrafts : state.composerDrafts,
             savedViews,
             activeSavedViewId: savedViews.some((view) => view.id === state.activeSavedViewId)
               ? state.activeSavedViewId
@@ -2411,7 +2475,7 @@ export const useOrionStore = create<OrionState>()(
       closeAllFiles: () => set({ openFiles: [], activeFilePath: null }),
     }),
     {
-      name: 'orion-storage',
+      name: ORION_STORE_NAME,
       storage: orionStorage,
       version: 1,
       // `threads` is deliberately absent: the persist middleware stringifies
@@ -2426,6 +2490,7 @@ export const useOrionStore = create<OrionState>()(
         selectedProjectId: state.selectedProjectId,
         selectedThreadId: state.selectedThreadId,
         paneThreadIds: state.paneThreadIds,
+        composerDrafts: state.composerDrafts,
         savedViews: state.savedViews,
         activeSavedViewId: state.activeSavedViewId,
         splitViewSettings: {
@@ -2589,6 +2654,11 @@ export const useOrionStore = create<OrionState>()(
         // A split whose focused thread is gone reopens on its leftmost pane
         // rather than throwing the rest away.
         if (!merged.selectedThreadId) merged.selectedThreadId = merged.paneThreadIds[0] ?? null;
+        // Stores written before drafts were saved have none. Drafts of threads
+        // deleted since are dropped once every transcript has loaded
+        // (pruneOrphanComposerDrafts); the head loaded here may be partial.
+        merged.composerDrafts =
+          merged.composerDrafts && typeof merged.composerDrafts === 'object' ? merged.composerDrafts : {};
         // Saved views outlive their threads on disk, so they get the same
         // treatment: drop dead ids, and drop any view that is no longer a
         // split. Stores written before saved views existed have none.
@@ -2816,6 +2886,7 @@ const backfillThreads = async () => {
         // Saving stays safe without them (patches never touch threads that
         // aren't in memory); they come back on the next launch.
         console.error('Could not load older Orion threads', error);
+        threadsBackfillIncomplete = true;
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 500 * failures));
@@ -2858,12 +2929,25 @@ const settleThreadsFromBeforeSidebarV2 = () => {
   if (threadsPersistenceBlocked || !sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return;
   setSidebarV2Settings({});
 };
+const pruneOrphanComposerDrafts = () => {
+  // A thread that failed to load is not a deleted one; its draft waits for a
+  // launch that reads it.
+  if (threadsPersistenceBlocked || threadsBackfillIncomplete) return;
+  const { threads, composerDrafts } = useOrionStore.getState();
+  const liveThreadIds = new Set(threads.map((thread) => thread.id));
+  const orphanIds = Object.keys(composerDrafts).filter((id) => !liveThreadIds.has(id));
+  if (orphanIds.length === 0) return;
+  const kept = { ...composerDrafts };
+  for (const id of orphanIds) delete kept[id];
+  useOrionStore.setState({ composerDrafts: kept });
+};
 const finishThreadsHydration = () => {
   if (!loadedThreadsFromStorage && !threadsPersistenceBlocked) {
     for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
     pendingThreadOrder = true;
   }
   onAllThreadsLoaded(settleThreadsFromBeforeSidebarV2);
+  onAllThreadsLoaded(pruneOrphanComposerDrafts);
   flushThreadsSave();
   if (threadsBackfill) void backfillThreads();
   else notifyAllThreadsLoaded();
