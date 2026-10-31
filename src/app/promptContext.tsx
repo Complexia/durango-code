@@ -308,7 +308,7 @@ export const parseModelMentions = (text: string, models: AgentModel[]): ModelMen
 export const buildModelMentionsContext = (mentions: ModelMention[]) =>
   [
     '[Model mentions]',
-    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it with the `spawn_subagent` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt. The task runs as a visible Durango Code subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list.',
+    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it with the `spawn_subagent` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt (plus effort: "<level>" when the user asks for a reasoning level). The task runs as a visible Durango Code subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list.',
     ...mentions.map((mention) => `- @${mention.token} → ${mention.label} (${mention.modelId})`),
     '[/Model mentions]',
   ].join('\n');

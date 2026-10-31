@@ -293,6 +293,7 @@ export type SubagentSpawnRequest = {
   prompt: string;
   title?: string;
   role?: string;
+  effort?: string;       // reasoning effort value or label — renderer validates per model
 };
 
 // A running orchestrator agent asked main to stop one of its spawned

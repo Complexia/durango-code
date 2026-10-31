@@ -5865,6 +5865,31 @@ const App: React.FC = () => {
         return;
       }
 
+      // A requested effort must be one the model's own picker offers (value
+      // or label), so the child never stores a level its composer can't show.
+      // Without one the child keeps the effort createThread inherits.
+      let reasoningPatch: ThreadReasoningPatch = {};
+      const wantedEffort = request.effort?.trim().toLowerCase();
+      if (wantedEffort) {
+        const options = reasoningOptionsForModel(model);
+        const option = options.find(
+          (candidate) =>
+            candidate.value.toLowerCase() === wantedEffort || candidate.label.toLowerCase() === wantedEffort
+        );
+        if (!option) {
+          report(
+            false,
+            options.length > 0
+              ? `${model.label} does not support effort "${request.effort}". Available: ${options
+                  .map((candidate) => candidate.value)
+                  .join(', ')}`
+              : `${model.label} has no reasoning effort setting; spawn it without \`effort\``
+          );
+          return;
+        }
+        reasoningPatch = threadReasoningPatchForModel(model, option.value);
+      }
+
       const promptSlice = request.prompt.trim().slice(0, 44);
       const roleMeta = orchestrationRoleMeta.find((meta) => meta.id === request.role);
       const title =
@@ -5886,6 +5911,7 @@ const App: React.FC = () => {
         // ...and in the driver's directory, so they work on the same tree.
         durangoWorkspace: driverThread.durangoWorkspace ?? null,
       });
+      if (Object.keys(reasoningPatch).length > 0) state.updateThread(childThreadId, reasoningPatch);
 
       // The spawnId was persisted at creation so the completion watcher can't
       // miss a fast run. Async start failures set the thread status to

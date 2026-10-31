@@ -43,7 +43,7 @@ import {
   USER_ACTION_TOOL_NAMES,
   runUserActionTool,
 } from '../src/main/user-actions.js';
-import { handleMcpBridgeConnection, mcpBridgeSessions } from '../src/main/mcp-bridge.js';
+import { handleMcpBridgeConnection, mcpBridgeSessions, pendingSubagentSpawns } from '../src/main/mcp-bridge.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-durango-tools-'));
@@ -429,6 +429,38 @@ try {
   assert.equal(written[0].ok, false);
   assert.match(written[0].text, /Durango Chat is unavailable/);
   mcpBridgeSessions.delete('tok2');
+
+  // spawn_subagent forwards an optional effort to the renderer and rejects a non-string one.
+  const spawnSchema = registered.find((entry) => entry.name === 'spawn_subagent').schema;
+  assert.ok(spawnSchema.effort, 'Claude spawn_subagent takes effort');
+  assert.match(shimSource, /effort: \{\s*type: 'string'/, 'shim spawn_subagent takes effort');
+  const spawnRequests = [];
+  const spawnSocket = new EventEmitter();
+  const spawnWritten = [];
+  spawnSocket.write = (data) => spawnWritten.push(JSON.parse(data));
+  mcpBridgeSessions.set('tok3', {
+    getSender: () => ({ isDestroyed: () => false, send: (channel, payload) => spawnRequests.push({ channel, payload }) }),
+    threadId: 't',
+    projectPath: testRoot,
+    accessMode: 'read-only',
+  });
+  handleMcpBridgeConnection(spawnSocket);
+  spawnSocket.emit(
+    'data',
+    Buffer.from(
+      `${JSON.stringify({ id: 1, token: 'tok3', tool: 'spawn_subagent', args: { model: 'gpt-6.1-sol', prompt: 'review', effort: 'high' } })}\n` +
+        `${JSON.stringify({ id: 2, token: 'tok3', tool: 'spawn_subagent', args: { model: 'gpt-6.1-sol', prompt: 'review', effort: 3 } })}\n`
+    )
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(spawnRequests.length, 1);
+  assert.equal(spawnRequests[0].channel, 'orchestration:spawnRequest');
+  assert.equal(spawnRequests[0].payload.effort, 'high');
+  assert.equal(spawnWritten.length, 1);
+  assert.equal(spawnWritten[0].id, 2);
+  assert.match(spawnWritten[0].text, /optional string `effort`/);
+  pendingSubagentSpawns.delete(spawnRequests[0].payload.spawnId);
+  mcpBridgeSessions.delete('tok3');
 
   console.log('durango tools: ok');
 } catch (error) {

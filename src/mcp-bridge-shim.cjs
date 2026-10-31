@@ -56,6 +56,12 @@ const spawnSubagentTool = {
         description:
           'Orchestration role this delegation fulfils: computerUse | exploring | implementation | imageVideoGen',
       },
+      effort: {
+        type: 'string',
+        // Keep in step with SPAWN_SUBAGENT_EFFORT_DESCRIPTION in main/claude-driver.js.
+        description:
+          'Reasoning effort for the subagent, e.g. "low", "medium", "high", "xhigh" or "max" (the levels the model supports in its effort picker). Omit to keep the default: the effort this thread last used for that provider.',
+      },
     },
     required: ['model', 'prompt'],
     additionalProperties: false,

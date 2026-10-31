@@ -126,6 +126,10 @@ export const CLAUDE_USER_ACTION_TIP = [
   'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it, and call mcp__orion__resolve_user_action with the returned action_id as soon as it is done. When the user clicks Done on it, you get a message starting with "Done:". If they reply instead, you get one starting with "Not done:" followed by what they want instead; follow it rather than asking again.',
 ].join('\n');
 
+// Mirrored in mcp-bridge-shim.cjs's spawn_subagent schema; keep in step.
+const SPAWN_SUBAGENT_EFFORT_DESCRIPTION =
+  'Reasoning effort for the subagent, e.g. "low", "medium", "high", "xhigh" or "max" (the levels the model supports in its effort picker). Omit to keep the default: the effort this thread last used for that provider.';
+
 // In-process MCP server offered to every Claude SDK session (not only
 // orchestrator ones — @-mentions can request delegation from any thread).
 // The tool asks the renderer to spawn a subthread on another model and
@@ -148,6 +152,10 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
             .string()
             .optional()
             .describe('Orchestration role this delegation fulfils: computerUse | exploring | implementation | imageVideoGen'),
+          effort: z
+            .string()
+            .optional()
+            .describe(SPAWN_SUBAGENT_EFFORT_DESCRIPTION),
         },
         async (args) => {
           const resultText = await requestSubagentSpawn(

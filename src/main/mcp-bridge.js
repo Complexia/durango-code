@@ -56,6 +56,7 @@ export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessM
         prompt: String(args.prompt ?? ''),
         ...(args.title ? { title: String(args.title) } : {}),
         ...(args.role ? { role: String(args.role) } : {}),
+        ...(args.effort ? { effort: String(args.effort) } : {}),
       });
     } catch {
       pendingSubagentSpawns.delete(spawnId);
@@ -150,6 +151,10 @@ export const handleMcpBridgeConnection = (socket) => {
           !args.prompt.trim()
         ) {
           reply(false, 'spawn_subagent requires string `model` and `prompt` arguments.');
+          continue;
+        }
+        if (args.effort !== undefined && typeof args.effort !== 'string') {
+          reply(false, 'spawn_subagent takes an optional string `effort` argument.');
           continue;
         }
         void requestSubagentSpawn(session, args).then((text) => reply(true, text));
