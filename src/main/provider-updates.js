@@ -1,6 +1,6 @@
 import path from 'node:path';
 import os from 'node:os';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { loginShell, resolveCommandPath, runShellCommand, shellQuote } from './shell-env.js';
 import { readFxConnections } from './fx-provider.js';
@@ -20,7 +20,14 @@ export const providerUpdaterConfigs = [
     label: 'Claude Code',
     command: 'claude',
     packageName: '@anthropic-ai/claude-code',
+    // npm can publish a release before the native installer's channel
+    // manifest moves to it. `claude update` on a native install follows the
+    // manifest, so comparing against npm flagged an update that `claude
+    // update` reported as already current, forever. See
+    // readClaudeLatestVersion.
+    readLatestVersion: (commandPath) => readClaudeLatestVersion(commandPath),
     updateCommands: [['update']],
+    verifyAfterUpdate: true,
     authCommands: [['auth', 'login']],
     statusCommand: ['auth', 'status'],
   },
@@ -295,6 +302,40 @@ export const readRemoteLatestVersion = async (url, versionPattern) => {
   } catch {
     return null;
   }
+};
+
+// The native installer (claude.ai/install.sh) keeps each release under
+// <data>/claude/versions/<version> and links the `claude` command to it;
+// `claude update` then follows the release manifest of the configured channel
+// (autoUpdatesChannel in settings.json, "latest" unless set to "stable").
+// npm installs update through npm, where the same channels are dist-tags.
+export const CLAUDE_RELEASES_URL = 'https://downloads.claude.ai/claude-code-releases';
+
+export const readClaudeUpdateChannel = async () => {
+  const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  try {
+    const settings = JSON.parse(await readFile(path.join(configDir, 'settings.json'), 'utf8'));
+    return settings?.autoUpdatesChannel === 'stable' ? 'stable' : 'latest';
+  } catch {
+    return 'latest';
+  }
+};
+
+export const isNativeClaudeInstall = async (commandPath) => {
+  try {
+    const versionsDir = path.dirname(await realpath(commandPath));
+    return path.basename(versionsDir) === 'versions' && path.basename(path.dirname(versionsDir)) === 'claude';
+  } catch {
+    return false;
+  }
+};
+
+export const readClaudeLatestVersion = async (commandPath) => {
+  const channel = await readClaudeUpdateChannel();
+  if (await isNativeClaudeInstall(commandPath)) {
+    return readRemoteLatestVersion(`${CLAUDE_RELEASES_URL}/${channel}`);
+  }
+  return readNpmLatestVersion(`@anthropic-ai/claude-code@${channel}`);
 };
 
 export const parseJsonFromOutput = (output) => {
@@ -581,23 +622,12 @@ export const checkProviderUpdate = async (config, enabledProviderIds = null) => 
     }
   }
 
-  if (config.packageName) {
-    const latestVersion = await readNpmLatestVersion(config.packageName);
-    const updateAvailable =
-      enabled && currentVersion && latestVersion
-        ? compareVersionStrings(currentVersion, latestVersion) < 0
-        : false;
-
-    return {
-      ...withCurrentVersion,
-      latestVersion,
-      updateAvailable,
-      status: latestVersion ? (updateAvailable ? 'available' : 'current') : 'unknown',
-    };
-  }
-
-  if (config.latestVersionUrl) {
-    const latestVersion = await readRemoteLatestVersion(config.latestVersionUrl, config.versionPattern);
+  if (config.readLatestVersion || config.packageName || config.latestVersionUrl) {
+    const latestVersion = config.readLatestVersion
+      ? await config.readLatestVersion(commandPath)
+      : config.packageName
+        ? await readNpmLatestVersion(config.packageName)
+        : await readRemoteLatestVersion(config.latestVersionUrl, config.versionPattern);
     const updateAvailable =
       enabled && currentVersion && latestVersion
         ? compareVersionStrings(currentVersion, latestVersion) < 0

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import {
   checkProviderUpdate,
+  isNativeClaudeInstall,
   providerUpdaterConfigs,
+  readClaudeUpdateChannel,
   readCliVersion,
   updateProviderTool,
 } from '../src/main/provider-updates.js';
@@ -30,6 +32,50 @@ assert.equal(
   false,
   'the managed Muse update should not invoke the launcher once before progress tracking starts'
 );
+
+const claudeConfig = providerUpdaterConfigs.find((config) => config.id === 'claude');
+assert.ok(claudeConfig?.readLatestVersion, 'Claude Code should resolve its latest version from its install source');
+assert.equal(
+  claudeConfig.verifyAfterUpdate,
+  true,
+  'a Claude Code update that leaves the version unchanged should not report success'
+);
+
+const claudeFixtureDir = await mkdtemp(path.join(os.tmpdir(), 'orion-claude-install-'));
+const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+try {
+  const versionsDir = path.join(claudeFixtureDir, 'share', 'claude', 'versions');
+  const binDir = path.join(claudeFixtureDir, 'bin');
+  await mkdir(versionsDir, { recursive: true });
+  await mkdir(binDir, { recursive: true });
+  await writeFile(path.join(versionsDir, '2.1.314'), '#!/bin/sh\n', 'utf8');
+  await symlink(path.join(versionsDir, '2.1.314'), path.join(binDir, 'claude'));
+  await writeFile(path.join(claudeFixtureDir, 'npm-claude'), '#!/bin/sh\n', 'utf8');
+  assert.equal(
+    await isNativeClaudeInstall(path.join(binDir, 'claude')),
+    true,
+    'a claude command linked into claude/versions is a native install'
+  );
+  assert.equal(
+    await isNativeClaudeInstall(path.join(claudeFixtureDir, 'npm-claude')),
+    false,
+    'other claude commands are package-manager installs'
+  );
+
+  process.env.CLAUDE_CONFIG_DIR = path.join(claudeFixtureDir, 'config');
+  assert.equal(await readClaudeUpdateChannel(), 'latest', 'the channel defaults to latest');
+  await mkdir(process.env.CLAUDE_CONFIG_DIR, { recursive: true });
+  await writeFile(
+    path.join(process.env.CLAUDE_CONFIG_DIR, 'settings.json'),
+    JSON.stringify({ autoUpdatesChannel: 'stable' }),
+    'utf8'
+  );
+  assert.equal(await readClaudeUpdateChannel(), 'stable', 'autoUpdatesChannel selects the stable channel');
+} finally {
+  if (previousClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
+  await rm(claudeFixtureDir, { recursive: true });
+}
 
 const streamAdapterSource = (await readFile(
   new URL('../src/main/stream-adapters.js', import.meta.url),
