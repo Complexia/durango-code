@@ -2,6 +2,7 @@ import path from 'node:path';
 import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from './claude-input.js';
 import { withClaudeEnv } from './claude-env.js';
 import { CLAUDE_CHROME_BROWSER_TIPS, claudeChromeLeaseHooks } from './claude-chrome.js';
+import { claudeForegroundWaitHooks } from './claude-foreground-wait.js';
 import { existsSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
@@ -105,9 +106,19 @@ export const WAIT_FOR_BACKGROUND_TASKS_DESCRIPTION =
 // The tool is usually deferred (only its name is listed), so say when to use it.
 export const CLAUDE_BACKGROUND_WAIT_TIP = [
   '# Background commands (Durango Code)',
+  'Never wait in the foreground. Anything that can run for more than a couple of minutes (a deploy, a release, a long build or test run, a loop that polls until something finishes) goes in the background: a foreground command blocks the thread with no progress and no way to steer you until it exits, so Durango Code refuses foreground Bash calls with a timeout over 5 minutes, and polling loops or blocking TaskOutput waits over 2.',
   'When you start a background Bash command (run_in_background) and will wait for its result before you are done, such as a build, deploy, release, test run or a wait-until loop, call mcp__orion__wait_for_background_tasks with its task id right after starting it. Durango Code then keeps the thread Working until it finishes and you are re-invoked. Without it, ending your turn shows the thread as finished while you are still waiting. Skip it for work you leave running (dev servers, watchers).',
   'Make a background command exit as soon as its work is done: a pipeline only ends when every part has, so never feed a prompt from a pipeline padded with a long `sleep`, and give polling loops a stop condition.',
 ].join('\n');
+
+// SDK hooks are one object per session; join each event's matchers.
+const mergeClaudeHooks = (...sets) => {
+  const merged = {};
+  for (const set of sets) {
+    for (const [event, matchers] of Object.entries(set)) merged[event] = [...(merged[event] ?? []), ...matchers];
+  }
+  return merged;
+};
 
 // Same reason: say when to reach for request_user_action (user-actions.js).
 export const CLAUDE_USER_ACTION_TIP = [
@@ -1745,10 +1756,12 @@ export const createClaudeSdkSession = ({
         // project settings — no CLAUDE.md, no skills, no MCP servers.
         settingSources: ['user', 'project', 'local'],
         mcpServers: { orion: orionMcpServer },
-        // Serializes Claude in Chrome across Orion's Claude threads.
-        ...(chromeEnabled
-          ? {
-              hooks: claudeChromeLeaseHooks(session, {
+        // Refuses long foreground waits, and serializes Claude in Chrome
+        // across Orion's Claude threads.
+        hooks: mergeClaudeHooks(
+          claudeForegroundWaitHooks(),
+          chromeEnabled
+            ? claudeChromeLeaseHooks(session, {
                 emitActivity: (activity) => {
                   const turn = session.activeTurns[0];
                   if (!turn) return;
@@ -1756,9 +1769,9 @@ export const createClaudeSdkSession = ({
                     runId: turn.runId, threadId: session.threadId, type: 'activity', activity,
                   });
                 },
-              }),
-            }
-          : {}),
+              })
+            : {}
+        ),
         ...(sdkOptions.ultracode ? { settings: JSON.stringify({ ultracode: true }) } : {}),
         ...(sdkOptions.accessMode === 'full-access'
           ? { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }

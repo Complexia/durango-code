@@ -52,6 +52,7 @@
     "test:remote-view-races": "node --no-warnings --experimental-strip-types scripts/test-remote-view-races.mjs",
     "test:steering": "node scripts/run-electron-test.mjs scripts/test-steering.mjs",
     "test:claude-chrome": "node --no-warnings scripts/test-claude-chrome.mjs",
+    "test:claude-foreground-wait": "node --no-warnings scripts/test-claude-foreground-wait.mjs",
     "test:claude-capabilities": "node scripts/run-electron-test.mjs scripts/test-claude-capabilities.mjs",
     "test:attachments": "bun scripts/test-attachments.tsx",
     "test:image-lightbox": "bun scripts/test-image-lightbox.tsx",

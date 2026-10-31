@@ -88,7 +88,11 @@ for what they asked.
   with the reason). Exit 3 is a conflict: the workspace was rebased onto the new
   `main`; resolve the listed files and run `land` again.
 - Landing then deploys the affected targets in the background;
-  `durango-code deploys --watch` follows them. Report the outcome.
+  `durango-code deploys --watch` follows them and exits once nothing is
+  deploying. Deploys can take many minutes (container images upload from this
+  machine), so run `deploys --watch` (or the `deploys retry` you are waiting on)
+  as a background command and wait for it to exit; never wait in the foreground
+  or poll a deploy log in a foreground loop. Report the outcome.
 - `durango-code land --all` lands every open change, oldest first;
   `durango-code land <id> <id>…` lands specific ones; `land --cancel <id>` takes
   one off the train. Never deploy any other way.
