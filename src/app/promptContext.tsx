@@ -261,6 +261,8 @@ export type ModelMention = {
   slug: string;
   label: string;
   token: string;
+  /** Named in plain text ("have gpt-6.1-sol review this") rather than @-mentioned. */
+  bare?: boolean;
 };
 
 export const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -276,40 +278,122 @@ export const modelMentionToken = (model: AgentModel, models: AgentModel[]) =>
     ? model.id
     : model.slug;
 
-// Scan the user's original text for model mention tokens against the catalog.
-// The token must not continue into a longer slug/id-like value (so
-// "@gpt-5.4-mini" never also matches "@gpt-5.4").
+// A mention must not continue into a longer slug/id-like value or path (so
+// "@gpt-5.4-mini" never also matches "@gpt-5.4"); a sentence's closing period
+// may follow it.
+const mentionEnd = '(?![A-Za-z0-9_:/\\\\-]|\\.[A-Za-z0-9])';
+
+// Model family words that make a plain-text name unmistakably a model. A name
+// without one (or its provider's name) can be ordinary software talk: PHP's
+// "Composer 2.5", Apache "Spark 1.3", "K3".
+const modelFamilyWords = new Set([
+  'claude', 'opus', 'sonnet', 'haiku', 'fable', 'gpt', 'grok', 'gemini', 'kimi',
+  'deepseek', 'glm', 'mimo', 'nemotron', 'qwen', 'llama', 'mistral',
+]);
+
+// The names a model can go by in plain text: its slug, id and label, the label
+// without the provider's name ("Opus 5.5" for "Claude Opus 5.5") and with it
+// ("Kimi K3"). Only versioned names that carry a model family or the provider's
+// name count, so everyday words ("auto") and other software never match.
+const bareModelNames = (model: AgentModel) => {
+  const provider = model.providerLabel.trim().toLowerCase();
+  const names = [model.slug, model.id, model.label];
+  if (provider && model.label.toLowerCase().startsWith(`${provider} `)) {
+    const rest = model.label.slice(provider.length + 1).trim();
+    if (/^[A-Za-z]/.test(rest)) names.push(rest);
+  } else if (provider) {
+    names.push(`${provider} ${model.label}`);
+  }
+  const named = (word: string) => modelFamilyWords.has(word) || word === provider;
+  return [...new Set(names.map((name) => name.trim().toLowerCase()))]
+    .filter(
+      (name) =>
+        /[a-z]/.test(name) && /\d/.test(name) && name.split(/[^a-z0-9]+/).some(named)
+    )
+    .sort((a, b) => b.length - a.length);
+};
+
+// Spaces, hyphens and underscores are interchangeable in a bare name, so
+// "gpt 6.1 sol", "GPT-6.1 Sol" and "gpt-6.1-sol" all name the same model.
+const bareNamePattern = (name: string) =>
+  name.split(/[\s_-]+/).filter(Boolean).map(escapeRegExp).join('[\\s_-]+');
+
+const matchSpans = (text: string, pattern: RegExp) =>
+  [...text.matchAll(pattern)].map(
+    (match): [number, number] => [match.index, match.index + match[0].length]
+  );
+
+// Scan the user's original text for models it mentions: @-mention tokens, and
+// model names written as plain text ("have gpt-6.1-sol review this"). A name
+// found only inside a longer one ("Grok 4.7" in "Grok 4.7 Fast") mentions the
+// longer model alone.
 export const parseModelMentions = (text: string, models: AgentModel[]): ModelMention[] => {
-  if (!text.includes('@')) return [];
-  const mentions: ModelMention[] = [];
+  const found: Array<{ mention: ModelMention; spans: Array<[number, number]> }> = [];
   for (const model of models) {
     // The Orion orchestrator is not a delegation target — "@orion" is never a mention.
     if (model.providerId === 'orion') continue;
     const token = modelMentionToken(model, models);
-    const pattern = new RegExp(
-      `(?:^|\\s)@${escapeRegExp(token)}(?![A-Za-z0-9._:/-])`,
-      'i'
+    const tagged = matchSpans(
+      text,
+      new RegExp(`(?<=^|\\s)@${escapeRegExp(token)}${mentionEnd}`, 'gi')
     );
-    if (pattern.test(text)) {
-      mentions.push({
+    const names = bareModelNames(model);
+    const bare =
+      names.length > 0
+        ? matchSpans(
+            text,
+            new RegExp(
+              `(?<![A-Za-z0-9._:/\\\\@-])(?:${names.map(bareNamePattern).join('|')})${mentionEnd}`,
+              'gi'
+            )
+          )
+        : [];
+    if (tagged.length === 0 && bare.length === 0) continue;
+    found.push({
+      mention: {
         modelId: model.id,
         providerId: model.providerId,
         slug: model.slug,
         label: model.label,
         token,
-      });
-    }
+        ...(tagged.length === 0 ? { bare: true } : {}),
+      },
+      spans: [...tagged, ...bare],
+    });
   }
-  return mentions;
+  // One sweep over every span, longest first among equal starts: a span lies
+  // inside a longer name when an earlier span reaches at least as far. Spans
+  // identical to it (two providers' same name) don't count.
+  const spans = found
+    .flatMap(({ spans }, index) => spans.map(([start, end]) => ({ start, end, index })))
+    .sort((a, b) => a.start - b.start || b.end - a.end);
+  const standsAlone = new Set<number>();
+  let reach = -1;
+  for (let group = 0; group < spans.length; ) {
+    const { start, end } = spans[group];
+    let next = group;
+    for (; next < spans.length && spans[next].start === start && spans[next].end === end; next += 1) {
+      if (reach < end) standsAlone.add(spans[next].index);
+    }
+    reach = Math.max(reach, end);
+    group = next;
+  }
+  return found
+    .filter(({ mention }, index) => !mention.bare || standsAlone.has(index))
+    .map(({ mention }) => mention);
 };
 
-// Context block prepended when the user @-mentions models, on any thread —
-// mentions work when talking to a specific model too, not just Orion.
+// Context block prepended when the user mentions models, by @-mention or by
+// name, on any thread — mentions work when talking to a specific model too,
+// not just Orion.
 export const buildModelMentionsContext = (mentions: ModelMention[]) =>
   [
     '[Model mentions]',
-    'The user referenced these models with @-mentions. When asked to use a mentioned model, delegate that work to it with the `spawn_subagent` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt (plus effort: "<level>" when the user asks for a reasoning level). The task runs as a visible Durango Code subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list.',
-    ...mentions.map((mention) => `- @${mention.token} → ${mention.label} (${mention.modelId})`),
+    'The user referenced these models in their message, with an @-mention or by name. When asked to use a mentioned model (for example "review this with gpt-6.1-sol"), delegate that work to it with the `spawn_subagent` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__spawn_subagent, orion.spawn_subagent, or a plugin-prefixed equivalent), passing model: "<modelId>" and a self-contained prompt (plus effort: "<level>" when the user asks for a reasoning level). The task runs as a visible Durango Code subthread and the call returns its final report — integrate that into your work. Do NOT hunt for or invoke that model\'s CLI yourself unless no `spawn_subagent` tool is genuinely present in your tool list. A model named without an @ may only be under discussion; delegate only when the user asks for work from it.',
+    ...mentions.map(
+      (mention) =>
+        `- ${mention.bare ? '' : '@'}${mention.token} → ${mention.label} (${mention.modelId})`
+    ),
     '[/Model mentions]',
   ].join('\n');
 

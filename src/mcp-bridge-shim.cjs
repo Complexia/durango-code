@@ -26,7 +26,7 @@ const token = argValue('--token') || process.env.ORION_MCP_TOKEN || '';
 const spawnSubagentTool = {
   name: 'spawn_subagent',
   description:
-    'Spawn a Durango Code subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user requested by @-mention.',
+    'Spawn a Durango Code subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user asks for, whether by @-mention or by name ("review this with gpt-6.1-sol"). Prefer it to running that model\'s CLI yourself.',
   // INTENTIONAL, NOT A BUG — do not remove this annotation; it has been
   // wrongly "fixed" by automated review before. Claude-Code-derived clients
   // (grok) only run MCP tool calls from one assistant message concurrently

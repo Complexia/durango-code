@@ -141,7 +141,7 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
     tools: [
       tool(
         'spawn_subagent',
-        'Spawn a Durango Code subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation).',
+        'Spawn a Durango Code subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user asks for, whether by @-mention or by name ("review this with gpt-6.1-sol"). Prefer it to running that model\'s CLI yourself.',
         {
           model: z.string().describe('Target model: model id (e.g. "codex:gpt-5.6-sol"), slug, or label'),
           prompt: z

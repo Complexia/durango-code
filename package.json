@@ -26,6 +26,7 @@
     "test:orion-mcps": "node scripts/run-electron-test.mjs scripts/test-orion-mcps.mjs",
     "test:provider-mcps": "node scripts/run-electron-test.mjs scripts/test-provider-mcps.mjs",
     "test:thread-mentions": "node --no-warnings --experimental-strip-types scripts/test-thread-mentions.mjs",
+    "test:model-mentions": "bun scripts/test-model-mentions.ts",
     "test:chat-mentions": "node --no-warnings --experimental-strip-types scripts/test-chat-mentions.mjs",
     "test:durango-tools": "node scripts/run-electron-test.mjs scripts/test-durango-tools.mjs",
     "test:durango-dispatch": "node --no-warnings --experimental-strip-types scripts/test-durango-dispatch.mjs",
