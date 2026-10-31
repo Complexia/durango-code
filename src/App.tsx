@@ -7961,19 +7961,40 @@ const App: React.FC = () => {
             ? { ok: true, threadId }
             : { ok: false, ...(createdThread ? {} : { threadId }), error: result.error };
         }
-        // Durango Chat dispatch (main: durango-dispatch.js): a fresh thread
-        // only. Link the chat's task first so this turn carries its context
-        // and the card's status automation follows the run, and leave a
-        // visible note that the thread was started remotely.
-        const dispatch = command.durangoDispatch && createdThread && thread ? command.durangoDispatch : null;
+        // Durango dispatch (main: durango-dispatch.js): a fresh thread, or a
+        // follow-up in an existing one (from the API / Durango MCP). For a
+        // fresh thread, link the chat's task first so this turn carries its
+        // context and the card's status automation follows the run. Either
+        // way, leave a visible note that the turn came from outside.
+        const dispatch =
+          command.durangoDispatch && thread && (createdThread || command.durangoDispatch.followUp)
+            ? command.durangoDispatch
+            : null;
+        const dispatchSource =
+          dispatch?.sourceLabel ?? (dispatch?.origin === 'tasks' ? 'Durango Tasks' : 'Durango Chat');
+        // A follow-up's outcome is its own run, not the thread's first one.
+        const dispatchRunOffset =
+          dispatch && !createdThread
+            ? thread!.messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length
+            : 0;
         let dispatchLinkedTaskId: string | null = null;
-        if (dispatch) {
+        if (dispatch && !createdThread) {
+          const accessLabel =
+            accessModeOptions.find((option) => option.value === (requestedAccessMode ?? thread!.accessMode))?.label ??
+            'Read only';
+          addMessageToThread(threadId, {
+            role: 'system',
+            content:
+              `Follow-up sent remotely from ${dispatchSource}${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
+              `Access: ${accessLabel}. Review the changes before you ship them.`,
+          });
+        } else if (dispatch) {
           const project = findProjectById(useOrionStore.getState(), thread!.projectId);
           const firstLine =
             promptText
               .split('\n')
               .map((line) => line.trim())
-              .find((line) => line && !/^\[Started from Durango (Chat|Tasks)/.test(line)) ?? '';
+              .find((line) => line && !/^\[(Started|Sent) from /.test(line)) ?? '';
           let title = firstLine.length > 60 ? `${firstLine.slice(0, 59).trimEnd()}…` : firstLine;
           let linkNote = '';
           if (dispatch.taskId && window.orion?.linkBoardTask) {
@@ -8002,15 +8023,16 @@ const App: React.FC = () => {
           const accessLabel =
             accessModeOptions.find((option) => option.value === requestedAccessMode)?.label ?? 'Read only';
           const askedForEdits = dispatch.requestedAccessMode === 'auto-edit' && requestedAccessMode === 'read-only';
-          const fromTasks = dispatch.origin === 'tasks';
           addMessageToThread(threadId, {
             role: 'system',
             content:
-              `Started remotely from ${fromTasks ? 'Durango Tasks' : 'Durango Chat'}${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
+              `Started remotely from ${dispatchSource}${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
               `Access: ${accessLabel}${askedForEdits ? ' (this Mac\'s limit for agents started from Durango)' : ''}. ` +
-              (fromTasks
+              (dispatch.origin === 'tasks'
                 ? 'The prompt came from the task; review the changes before you ship them.'
-                : 'The prompt came from your chat and may quote chat or memory content; review the changes before you ship them.') +
+                : dispatch.origin === 'api'
+                  ? 'The prompt came from an app connected to your Durango account; review the changes before you ship them.'
+                  : 'The prompt came from your chat and may quote chat or memory content; review the changes before you ship them.') +
               linkNote,
           });
         }
@@ -8059,6 +8081,7 @@ const App: React.FC = () => {
               id: dispatch.id,
               sourceUrl: dispatch.sourceUrl,
               startedAt: new Date().toISOString(),
+              ...(dispatchRunOffset ? { runOffset: dispatchRunOffset } : {}),
             },
           });
         }

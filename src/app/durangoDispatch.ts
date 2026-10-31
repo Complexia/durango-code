@@ -13,8 +13,9 @@ export const dispatchSummaryText = (content: string, max = DISPATCH_SUMMARY_MAX_
 
 /**
  * How a dispatched thread's run ended, or null while it is still running (or
- * has not started). Only the first run counts: later turns are the user's own
- * follow-ups.
+ * has not started). Only the dispatched run counts: the thread's first run,
+ * or for a follow-up dispatch the run at `runOffset` (the runs it already had).
+ * Later turns are the user's own.
  */
 export const durangoDispatchOutcome = (
   thread: Pick<Thread, 'status' | 'messages' | 'durangoDispatch'>
@@ -24,8 +25,8 @@ export const durangoDispatchOutcome = (
   if (thread.status === 'running') return null;
   const runs = thread.messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run');
   // The run message exists before `durangoDispatch` is stamped, so take the
-  // thread's first run rather than filtering by time.
-  const run = runs[0] ?? null;
+  // run by position rather than filtering by time.
+  const run = runs[dispatch.runOffset ?? 0] ?? null;
   if (!run) {
     // Start failures before any run message (rare): report the thread error.
     if (thread.status === 'error') return { outcome: 'failed', error: 'The agent failed to start.' };

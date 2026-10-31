@@ -436,14 +436,19 @@ export type RemoteCommandRequest = {
     claudeContextWindow?: '200k' | '1m';
     source?: { machineId: string; machineName: string };
     /**
-     * Set when Durango Chat started this run (dispatch worker in main): the
-     * renderer creates the thread exactly like a remote runTurn, links the
-     * task, and adds a visible "started remotely" note.
+     * Set when Durango started this run (dispatch worker in main): the
+     * renderer creates the thread exactly like a remote runTurn (or, for a
+     * follow-up, runs a turn in `threadId`), links the task, and adds a
+     * visible "started remotely" note.
      */
     durangoDispatch?: {
       id: string;
-      /** Started from a chat, or with Run in Durango Code on a task. */
-      origin?: 'chat' | 'tasks';
+      /** Started from a chat, with Run in Durango Code on a task, or through the API (Durango MCP). */
+      origin?: 'chat' | 'tasks' | 'api';
+      /** Who sent it, for the thread's note ("Durango Chat", "Grok (MCP) via Durango"). */
+      sourceLabel?: string;
+      /** Continue `threadId` instead of starting a thread. */
+      followUp?: boolean;
       taskId: string | null;
       sourceUrl: string | null;
       requestedAccessMode: 'ask' | 'auto-edit' | null;

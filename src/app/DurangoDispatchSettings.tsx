@@ -90,10 +90,11 @@ export const DurangoDispatchSettings: React.FC<{
         <div className="setting-label">
           <div className="setting-label-title">Allow Durango Chat and Tasks to start agents on this Mac</div>
           <div className="setting-label-desc">
-            Off by default. When on, you can ask Durango Chat to fix or build something, or press Run
-            in Durango Code on a task in Durango Tasks; this Mac picks it up, starts a new thread in
-            the matching project, and reports the result back. You get a notification for every agent
-            started this way.
+            Off by default. When on, you can ask Durango Chat to fix or build something, press Run in
+            Durango Code on a task in Durango Tasks, or use an app connected to your Durango account
+            through the Durango MCP server; this Mac picks it up, starts a new thread in the matching
+            project (or continues the thread a follow-up names), and reports the result back. You get
+            a notification for every agent started this way.
             {authenticated && state?.enabled ? ` ${statusText(state, authenticated)}` : ''}
             {!authenticated && ' Requires signing in to your Durango account.'}
           </div>

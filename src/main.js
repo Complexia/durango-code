@@ -3813,17 +3813,27 @@ const dispatchWorker = createDispatchWorker({
   isSignedIn: isDispatchSignedIn,
   isOnline: () => net.isOnline(),
   canStart: () => Boolean(remoteCommandRenderer && !remoteCommandRenderer.isDestroyed()),
-  startRun: ({ dispatch, project, prompt, accessMode, modelId }) =>
+  getThread: async (threadId) => {
+    const thread = await readThreadById(threadId);
+    if (!thread) return undefined;
+    return {
+      projectId: typeof thread.projectId === 'string' ? thread.projectId : null,
+      accessMode: typeof thread.accessMode === 'string' ? thread.accessMode : undefined,
+    };
+  },
+  startRun: ({ dispatch, project, threadId, prompt, accessMode, modelId }) =>
     requestDispatchRendererCommand({
       kind: 'runTurn',
-      projectId: project.id,
+      ...(threadId ? { threadId } : { projectId: project.id }),
       prompt: prompt.slice(0, 200_000),
       ...(modelId ? { modelId } : {}),
       accessMode,
       source: { machineId: 'durango-chat', machineName: dispatchSourceLabel(dispatch) },
       durangoDispatch: {
         id: dispatch.id,
-        origin: dispatch.origin === 'tasks' ? 'tasks' : 'chat',
+        origin: dispatch.origin === 'tasks' || dispatch.origin === 'api' ? dispatch.origin : 'chat',
+        sourceLabel: dispatchSourceLabel(dispatch),
+        followUp: Boolean(threadId),
         taskId: dispatch.taskId,
         sourceUrl: dispatchSourceUrl(dispatch),
         requestedAccessMode: dispatch.accessMode,

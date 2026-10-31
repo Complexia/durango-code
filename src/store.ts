@@ -588,13 +588,15 @@ export type Thread = {
    */
   userActions?: UserAction[];
   /**
-   * Set when Durango Chat started this thread (Phase 5 dispatch). The
-   * outcome is reported back to the chat once the first run settles.
+   * Set when Durango started this thread (Phase 5 dispatch) or sent it a
+   * follow-up. The outcome is reported back once that run settles.
    */
   durangoDispatch?: {
     id: string;
     sourceUrl: string | null;
     startedAt: string;
+    /** Follow-up: agent runs the thread had before this one (absent = its first run). */
+    runOffset?: number;
     /** Set once the outcome went back to Durango Chat. */
     reportedAt?: string;
   };

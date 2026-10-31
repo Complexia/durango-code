@@ -16,10 +16,13 @@ import {
   DISPATCH_SUMMARY_MAX_CHARS,
   buildDispatchPrompt,
   buildMachinePayload,
+  capThreadAccessMode,
   clampDispatchAccessMode,
   createDispatchWorker,
+  dispatchSourceLabel,
   normalizeDispatchSettings,
   resolveDispatchProject,
+  resolveFollowUpProject,
 } from '../src/main/durango-dispatch.js';
 import { durangoDispatchOutcome, dispatchSummaryText } from '../src/app/durangoDispatch.ts';
 
@@ -302,6 +305,7 @@ try {
         { id: 'p1', name: 'futuremail', repoId: 'repo_fm' },
         { id: 'p2', name: 'Billing', repoId: null },
       ],
+      capabilities: ['thread-follow-up'],
     });
     assert.equal(buildMachinePayload({ machineId: 'd', name: '', platform: 'darwin', projects }).projects.length, 3, 'null allowlist = all projects');
     assert.equal(buildMachinePayload({ machineId: 'd', name: '  ', platform: '', projects: [] }).name, 'Mac');
@@ -539,6 +543,63 @@ try {
     await worker.idle();
   });
 
+  await test('API runs: labelled with the key, follow-ups say "Sent from"', () => {
+    assert.equal(dispatchSourceLabel({ origin: 'api', sourceLabel: 'Grok (MCP)' }), 'Grok (MCP) via Durango');
+    assert.equal(dispatchSourceLabel({ origin: 'api', sourceLabel: null }), 'the Durango API');
+    assert.equal(buildDispatchPrompt({ origin: 'api', sourceLabel: 'Grok (MCP)', prompt: 'Fix it', sourceChat: null }), '[Started from Grok (MCP) via Durango]\n\nFix it');
+    assert.equal(buildDispatchPrompt({ origin: 'api', sourceLabel: 'Grok (MCP)', threadId: 't1', prompt: 'Add a test', sourceChat: null }), '[Sent from Grok (MCP) via Durango]\n\nAdd a test');
+  });
+
+  await test('follow-up without an access mode keeps the thread\'s, capped by this Mac\'s limit', () => {
+    assert.equal(capThreadAccessMode('workspace-write', 'full-access'), 'workspace-write');
+    assert.equal(capThreadAccessMode('full-access', 'read-only'), 'read-only');
+    assert.equal(capThreadAccessMode('read-only', 'full-access'), 'read-only');
+    assert.equal(capThreadAccessMode(undefined, 'full-access'), 'read-only', 'unknown thread access = read-only');
+  });
+
+  await test('follow-up project: the thread must be here and its project allowlisted', () => {
+    assert.match(resolveFollowUpProject({}, undefined, projects, null).error, /not on this Mac/);
+    assert.equal(resolveFollowUpProject({}, 'p2', projects, ['p1', 'p2']).project.id, 'p2');
+    assert.match(resolveFollowUpProject({}, 'p3', projects, ['p1']).error, /"secret" is not allowed/);
+    assert.deepEqual(resolveFollowUpProject({}, null, projects, null), { ok: true, project: null }, 'a thread without a project, all projects allowed');
+    assert.match(resolveFollowUpProject({}, null, projects, ['p1']).error, /This thread is not allowed/);
+  });
+
+  await test('follow-up dispatch continues its thread with the thread\'s model; a missing thread fails', async () => {
+    let claims = 0;
+    server.always('POST', '/api/v1/code/machines', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/claim', async () => {
+      claims += 1;
+      if (claims === 1) return { json: { dispatch: dispatchWire({ id: 'disp_follow', origin: 'api', sourceLabel: 'Grok (MCP)', threadId: 'thread-7', taskId: null, sourceChat: null, project: {}, accessMode: 'ask', prompt: 'Now add tests' }) } };
+      if (claims === 2) return { json: { dispatch: dispatchWire({ id: 'disp_gone', origin: 'api', threadId: 'thread-gone', taskId: null, sourceChat: null, project: {} }) } };
+      if (claims === 3) return { json: { dispatch: dispatchWire({ id: 'disp_keep', origin: 'api', threadId: 'thread-7', taskId: null, sourceChat: null, project: {}, accessMode: null, prompt: 'Keep going' }) } };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { json: { dispatch: null } };
+    });
+    server.always('POST', '/api/v1/code/dispatches/disp_follow', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/disp_gone', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/disp_keep', () => ({ json: { ok: true } }));
+    const { worker, calls } = makeWorker({
+      startResult: { ok: true, threadId: 'thread-7' },
+      deps: { getThread: async (threadId) => (threadId === 'thread-7' ? { projectId: 'p1', accessMode: 'workspace-write' } : undefined) },
+    });
+    worker.configure({ settings: { enabled: true, accessMode: 'full-access', modelId: 'claude:claude-fable-5-1' }, projects });
+    worker.accountChanged(true);
+    await waitUntil(() => reports('disp_follow').length && reports('disp_gone').length && reports('disp_keep').length, 'follow-up reports');
+    assert.equal(calls.starts.length, 2);
+    assert.equal(calls.starts[1].accessMode, 'workspace-write', 'no access mode: the thread keeps its own');
+    assert.equal(calls.starts[0].threadId, 'thread-7');
+    assert.equal(calls.starts[0].project.id, 'p1');
+    assert.equal(calls.starts[0].modelId, null, 'keeps the thread\'s model instead of the default for new runs');
+    assert.equal(calls.starts[0].accessMode, 'read-only', 'ask runs read-only');
+    assert.match(calls.starts[0].prompt, /^\[Sent from Grok \(MCP\) via Durango\]\n\nNow add tests$/);
+    assert.deepEqual(reports('disp_follow')[0], { status: 'running', codeThreadId: 'thread-7', machineId: 'device-uuid-1' });
+    assert.equal(reports('disp_gone')[0].status, 'failed');
+    assert.match(reports('disp_gone')[0].error, /not on this Mac/);
+    worker.stop();
+    await worker.idle();
+  });
+
   await test('renderer start failure → failed; heartbeat 409 (cancelled in chat) stops the run', async () => {
     // Start failure.
     {
@@ -625,7 +686,14 @@ try {
       json: { dispatch: { id: 'd', prompt: 'p', taskId: null, project: { id: null, name: 'x', repoId: null }, modelId: '', accessMode: 'weird', sourceChat: null, createdAt: 'now' } },
     }));
     const { dispatch } = await client.claimDispatch({ machineId: 'm' });
-    assert.deepEqual(dispatch, { id: 'd', origin: 'chat', prompt: 'p', taskId: null, taskUrl: null, project: { id: null, name: 'x', repoId: null }, modelId: null, accessMode: null, sourceChat: null, createdAt: 'now' });
+    assert.deepEqual(dispatch, { id: 'd', origin: 'chat', prompt: 'p', taskId: null, taskUrl: null, project: { id: null, name: 'x', repoId: null }, modelId: null, accessMode: null, sourceChat: null, threadId: null, sourceLabel: null, createdAt: 'now' });
+    server.on('POST', '/api/v1/code/dispatches/claim', () => ({
+      json: { dispatch: { id: 'd2', origin: 'api', prompt: 'more', project: {}, threadId: 'thread-9', sourceLabel: 'Grok (MCP)' } },
+    }));
+    const { dispatch: followUp } = await client.claimDispatch({ machineId: 'm' });
+    assert.equal(followUp.origin, 'api');
+    assert.equal(followUp.threadId, 'thread-9');
+    assert.equal(followUp.sourceLabel, 'Grok (MCP)');
     server.on('POST', '/api/v1/code/dispatches/x', () => ({ status: 409, json: durangoErrorBody('Another machine claimed this dispatch.', 'claimed_elsewhere') }));
     await assert.rejects(client.reportDispatch('x', { status: 'running' }), (error) => error instanceof DurangoError && error.status === 409 && error.apiCode === 'claimed_elsewhere');
   });
@@ -644,6 +712,13 @@ try {
     assert.match(durangoDispatchOutcome({ status: 'idle', messages: [run({ status: 'stopped' })], durangoDispatch: dispatch }).error, /Stopped in Durango Code/);
     assert.match(durangoDispatchOutcome({ status: 'idle', messages: [run({ status: 'stopped', statusText: 'Interrupted by app restart.' })], durangoDispatch: dispatch }).error, /quit before/);
     assert.equal(durangoDispatchOutcome({ status: 'done', messages: [run({ status: 'done' })], durangoDispatch: { ...dispatch, reportedAt: 'x' } }), null, 'reported once');
+    // A follow-up counts its own run, not the thread's earlier ones.
+    const followUp = { ...dispatch, runOffset: 1 };
+    assert.equal(durangoDispatchOutcome({ status: 'idle', messages: [run({ status: 'done', content: 'Old.' })], durangoDispatch: followUp }), null, 'its run has not started');
+    assert.deepEqual(
+      durangoDispatchOutcome({ status: 'done', messages: [run({ status: 'done', content: 'Old.' }), run({ status: 'done', content: 'Tests added.' })], durangoDispatch: followUp }),
+      { outcome: 'finished', summary: 'Tests added.' }
+    );
     const summary = dispatchSummaryText('a'.repeat(100) + 'THE END', 20);
     assert.equal(summary.length, 20);
     assert.ok(summary.startsWith('…') && summary.endsWith('THE END'), 'keeps the conclusion at the end');

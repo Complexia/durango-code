@@ -372,7 +372,7 @@ const normalizeDispatch = (dispatch) => {
   const source = dispatch.sourceChat && typeof dispatch.sourceChat === 'object' ? dispatch.sourceChat : null;
   return {
     id: dispatch.id,
-    origin: dispatch.origin === 'tasks' ? 'tasks' : 'chat',
+    origin: dispatch.origin === 'tasks' || dispatch.origin === 'api' ? dispatch.origin : 'chat',
     prompt: str(dispatch.prompt),
     taskId: optional(dispatch.taskId),
     taskUrl: optional(dispatch.taskUrl),
@@ -383,6 +383,10 @@ const normalizeDispatch = (dispatch) => {
       source && typeof source.threadId === 'string'
         ? { threadId: source.threadId, messageId: optional(source.messageId), url: optional(source.url) }
         : null,
+    /** Follow-up: continue this thread instead of starting one. */
+    threadId: optional(dispatch.threadId),
+    /** Who started an `api` run (the API key's name, e.g. "Grok (MCP)"). */
+    sourceLabel: optional(dispatch.sourceLabel),
     createdAt: optional(dispatch.createdAt),
   };
 };
@@ -525,7 +529,7 @@ export const createDurangoClient = ({
       return Buffer.from(await response.arrayBuffer());
     },
     // --- Dispatch: agents started from Durango Chat (contracts §7) -----------
-    async registerMachine({ machineId, name, platform, projects }) {
+    async registerMachine({ machineId, name, platform, projects, capabilities }) {
       await request('POST', '/code/machines', {
         body: {
           machineId,
@@ -536,6 +540,7 @@ export const createDurangoClient = ({
             name: project.name,
             repoId: project.repoId ?? null,
           })),
+          ...(Array.isArray(capabilities) ? { capabilities } : {}),
         },
       });
       return { ok: true };

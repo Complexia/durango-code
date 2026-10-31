@@ -9,7 +9,10 @@ import { DurangoError } from './durango-client.js';
 // projects only) and long-polls `POST /api/v1/code/dispatches/claim`. A
 // claimed dispatch is resolved to a local project and handed to the renderer
 // through the same command bridge remote control uses for `runTurn`, so the
-// renderer stays the authority over threads. Status goes back to Durango:
+// renderer stays the authority over threads. A dispatch that names a thread
+// (`threadId`, a follow-up from the API / Durango MCP) continues that thread
+// instead; this machine advertises the "thread-follow-up" capability so
+// Durango only sends follow-ups to builds that understand them. Status goes back to Durango:
 // `running` (repeated as the lease heartbeat), then `finished` with the
 // agent's final response or `failed` with the reason.
 //
@@ -24,6 +27,9 @@ export const DISPATCH_ACCESS_MODES = ['read-only', 'workspace-write', 'full-acce
 // propose, not change files. "auto-edit" runs with this Mac's limit, so
 // choosing Full access in Settings is what a Tasks run gets (Workspace write
 // makes Claude ask before every Bash command, which no one is there to answer).
+
+/** What this build can do beyond new threads (agentDispatchPolicy.MACHINE_CAPABILITIES on Durango). */
+export const DISPATCH_CAPABILITIES = ['thread-follow-up'];
 
 export const DISPATCH_SUMMARY_MAX_CHARS = 2_000;
 export const DISPATCH_ERROR_MAX_CHARS = 1_000;
@@ -67,6 +73,16 @@ export const clampDispatchAccessMode = (requested, ceiling) => {
   return requested === 'ask' ? 'read-only' : limit;
 };
 
+/**
+ * A follow-up sent without an access mode (`accessMode: null`) keeps the
+ * thread's own access, never above this Mac's limit.
+ */
+export const capThreadAccessMode = (current, ceiling) => {
+  const limit = DISPATCH_ACCESS_MODES.includes(ceiling) ? ceiling : defaultDispatchSettings.accessMode;
+  const own = DISPATCH_ACCESS_MODES.includes(current) ? current : defaultDispatchSettings.accessMode;
+  return DISPATCH_ACCESS_MODES.indexOf(own) <= DISPATCH_ACCESS_MODES.indexOf(limit) ? own : limit;
+};
+
 export const isProjectAllowed = (projectId, allowedProjectIds) =>
   allowedProjectIds === null || allowedProjectIds === undefined || allowedProjectIds.includes(projectId);
 
@@ -107,6 +123,26 @@ export const resolveDispatchProject = (dispatch, projects, allowedProjectIds = n
   return { ok: true, project: match };
 };
 
+/**
+ * The local project a follow-up runs in: the thread's own project, which must
+ * be allowlisted. `threadProjectId` is undefined when the thread is not on
+ * this Mac, null for a thread without a project.
+ */
+export const resolveFollowUpProject = (dispatch, threadProjectId, projects, allowedProjectIds = null) => {
+  if (threadProjectId === undefined) {
+    return { ok: false, error: 'That Durango Code thread is not on this Mac.' };
+  }
+  const project = (Array.isArray(projects) ? projects : []).find((candidate) => candidate.id === threadProjectId) ?? null;
+  const allowed = project ? isProjectAllowed(project.id, allowedProjectIds) : allowedProjectIds === null || allowedProjectIds === undefined;
+  if (!allowed) {
+    return {
+      ok: false,
+      error: `${project ? `"${project.name}"` : 'This thread'} is not allowed to run agents from Durango on this Mac. Allow it in Durango Code → Settings → Durango.`,
+    };
+  }
+  return { ok: true, project };
+};
+
 /** `POST /api/v1/code/machines` body. Only allowlisted projects are advertised. */
 export const buildMachinePayload = ({ machineId, name, platform, projects, allowedProjectIds = null }) => ({
   machineId,
@@ -120,20 +156,32 @@ export const buildMachinePayload = ({ machineId, name, platform, projects, allow
       name: String(project.name).slice(0, 200),
       repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null,
     })),
+  capabilities: DISPATCH_CAPABILITIES,
 });
 
-/** Where a dispatch was started: Run in Durango Code on a task, or a chat. */
-export const dispatchSourceLabel = (dispatch) => (dispatch?.origin === 'tasks' ? 'Durango Tasks' : 'Durango Chat');
+/**
+ * Where a dispatch was started: Run in Durango Code on a task, a chat, or the
+ * API (labelled with the key's name, e.g. "Grok (MCP)").
+ */
+export const dispatchSourceLabel = (dispatch) => {
+  if (dispatch?.origin === 'tasks') return 'Durango Tasks';
+  if (dispatch?.origin === 'api') {
+    const label = String(dispatch?.sourceLabel ?? '').trim().slice(0, 80);
+    return label ? `${label} via Durango` : 'the Durango API';
+  }
+  return 'Durango Chat';
+};
 
 /** The page the run was started from (the task, or the chat). */
 export const dispatchSourceUrl = (dispatch) =>
   (dispatch?.origin === 'tasks' ? dispatch?.taskUrl : dispatch?.sourceChat?.url) ?? null;
 
-/** The thread's first prompt: a provenance header, then what the user asked. */
+/** The turn's prompt: a provenance header, then what the user asked. */
 export const buildDispatchPrompt = (dispatch) => {
   const label = dispatchSourceLabel(dispatch);
   const url = dispatchSourceUrl(dispatch);
-  const header = url ? `[Started from ${label}: ${url}]` : `[Started from ${label}]`;
+  const verb = dispatch?.threadId ? 'Sent from' : 'Started from';
+  const header = url ? `[${verb} ${label}: ${url}]` : `[${verb} ${label}]`;
   return `${header}\n\n${String(dispatch?.prompt ?? '').trim()}`;
 };
 
@@ -167,7 +215,9 @@ const isAbort = (error) =>
  * - getMachineName(): string|Promise<string>
  * - platform: string
  * - isSignedIn(): Promise<boolean>
- * - startRun({ dispatch, project, prompt, accessMode, modelId }): Promise<{ ok, threadId?, threadTitle?, error? }>
+ * - startRun({ dispatch, project, threadId, prompt, accessMode, modelId }): Promise<{ ok, threadId?, threadTitle?, error? }>
+ *     threadId set = a follow-up in that thread (project may be null)
+ * - getThread(threadId): Promise<{ projectId: string|null, accessMode?: string }|undefined>   undefined = no such thread here
  * - stopRun(threadId, reason): Promise<void>     cancelled from Durango Chat
  * - notify({ dispatch, project, threadId }): void
  * - isOnline(): boolean
@@ -181,6 +231,7 @@ export const createDispatchWorker = ({
   platform = process.platform,
   isSignedIn,
   startRun,
+  getThread = async () => undefined,
   stopRun = async () => {},
   notify = () => {},
   isOnline = () => true,
@@ -312,7 +363,7 @@ export const createDispatchWorker = ({
     release(entry);
     if (entry.threadId) {
       try {
-        await stopRun(entry.threadId, 'Cancelled from Durango Chat.');
+        await stopRun(entry.threadId, `Cancelled from ${dispatchSourceLabel(entry.dispatch)}.`);
       } catch (error) {
         log('could not stop a cancelled dispatch', error?.message ?? error);
       }
@@ -353,21 +404,35 @@ export const createDispatchWorker = ({
         await fail(entry, 'The dispatch had an empty prompt.');
         return;
       }
-      const resolved = resolveDispatchProject(dispatch, projects, settings.allowedProjectIds);
+      const followUpThreadId = dispatch.threadId || null;
+      const followUpThread = followUpThreadId ? await getThread(followUpThreadId).catch(() => undefined) : null;
+      const resolved = followUpThreadId
+        ? resolveFollowUpProject(
+            dispatch,
+            followUpThread ? (followUpThread.projectId ?? null) : undefined,
+            projects,
+            settings.allowedProjectIds
+          )
+        : resolveDispatchProject(dispatch, projects, settings.allowedProjectIds);
       if (!resolved.ok) {
         await fail(entry, resolved.error);
         return;
       }
       entry.project = resolved.project;
-      const accessMode = clampDispatchAccessMode(dispatch.accessMode, settings.accessMode);
+      const accessMode =
+        followUpThread && !dispatch.accessMode
+          ? capThreadAccessMode(followUpThread.accessMode, settings.accessMode)
+          : clampDispatchAccessMode(dispatch.accessMode, settings.accessMode);
       let result;
       try {
         result = await startRun({
           dispatch,
           project: resolved.project,
+          threadId: followUpThreadId,
           prompt: buildDispatchPrompt(dispatch),
           accessMode,
-          modelId: dispatch.modelId ?? settings.modelId ?? null,
+          // A follow-up keeps its thread's model unless the caller named one.
+          modelId: dispatch.modelId ?? (followUpThreadId ? null : settings.modelId) ?? null,
         });
       } catch (error) {
         result = { ok: false, error: error?.message ?? String(error) };
