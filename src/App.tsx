@@ -2175,8 +2175,10 @@ const App: React.FC = () => {
   const steerWithContentRef = useRef<(threadId: string, promptText: string) => Promise<void>>(
     async () => {}
   );
-  const markUserActionDone = useCallback(
-    (threadId: string, actionId: string) => {
+  // Reply does the same with what the user wrote instead ("Not done:"), for
+  // when the ask is wrong or they want the agent to go another way.
+  const answerUserAction = useCallback(
+    (threadId: string, actionId: string, reply?: string) => {
       const threads = useOrionStore.getState().threads;
       const thread = threads.find((candidate) => candidate.id === threadId);
       const done = thread?.userActions?.find((action) => action.id === actionId);
@@ -2191,9 +2193,16 @@ const App: React.FC = () => {
         target = parentId ? threads.find((candidate) => candidate.id === parentId) : undefined;
       }
       if (!target) return;
-      void steerWithContentRef.current(target.id, `Done: ${done.action}`);
+      void steerWithContentRef.current(
+        target.id,
+        reply === undefined ? `Done: ${done.action}` : `Not done: ${done.action}\n\n${reply}`
+      );
     },
     [updateThread]
+  );
+  const markUserActionDone = useCallback(
+    (threadId: string, actionId: string) => answerUserAction(threadId, actionId),
+    [answerUserAction]
   );
   // A blank draft (nothing sent, nothing typed) is just the composer the
   // Agents panel opens with nothing else to show; it joins the list once used.
@@ -9195,6 +9204,7 @@ const App: React.FC = () => {
         actions={selectedThreadUserActions}
         currentThreadId={selectedThread.id}
         onDone={markUserActionDone}
+        onReply={answerUserAction}
       />
       <CodexQuestions
         threadId={selectedThread.id}
