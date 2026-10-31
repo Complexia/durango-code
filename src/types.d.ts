@@ -1486,10 +1486,30 @@ type OrionCodexBrowserIntegrationStatus = {
       onUserAction?: (
         callback: (
           request:
-            | { type: 'request'; threadId: string; id: string; action: string; url?: string }
+            | {
+                type: 'request';
+                threadId: string;
+                id: string;
+                action: string;
+                url?: string;
+                check?: string;
+                cwd?: string;
+                autoWatch?: boolean;
+              }
             | { type: 'resolve'; threadId: string; id?: string }
+            | { type: 'detected' | 'watch-stopped'; threadId: string; id: string }
+            | { type: 'undelivered'; threadId: string; texts: string[] }
         ) => void
       ) => () => void;
+      notifyAgentTurn?: (input: {
+        threadId: string;
+        runId?: string;
+        providerId?: string;
+        text: string;
+        notice?: { title: string; detail?: string };
+      }) => Promise<boolean>;
+      watchUserAction?: (input: { threadId: string; id: string; check: string; cwd?: string }) => Promise<boolean>;
+      unwatchUserAction?: (input: { threadId: string; id: string }) => Promise<boolean>;
       onFileChange?: (cb: (data: { path: string; exists: boolean; mtimeMs: number | null }) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;

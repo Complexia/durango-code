@@ -217,6 +217,10 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('agent:userAction', listener);
     return () => ipcRenderer.removeListener('agent:userAction', listener);
   },
+  // Tells an agent a user action is done without interrupting it.
+  notifyAgentTurn: (input) => ipcRenderer.invoke('agent:notifyTurn', input),
+  watchUserAction: (input) => ipcRenderer.invoke('agent:watchUserAction', input),
+  unwatchUserAction: (input) => ipcRenderer.invoke('agent:unwatchUserAction', input),
   reportSubagentStopResult: (payload) =>
     ipcRenderer.invoke('orchestration:subagentStopResult', payload),
   onSubagentStopRequest: (callback) => {

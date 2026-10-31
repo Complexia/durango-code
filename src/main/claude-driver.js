@@ -18,7 +18,13 @@ import {
   runDurangoTool,
 } from './durango-tools.js';
 import { orionBuiltinToolNamesForAccessMode } from './thread-reader-routing.js';
-import { USER_ACTION_MAX_CHARS, USER_ACTION_TOOL_DESCRIPTIONS, USER_ACTION_TOOL_INPUT_SCHEMAS, runUserActionTool } from './user-actions.js';
+import {
+  USER_ACTION_CHECK_MAX_CHARS,
+  USER_ACTION_MAX_CHARS,
+  USER_ACTION_TOOL_DESCRIPTIONS,
+  USER_ACTION_TOOL_INPUT_SCHEMAS,
+  runUserActionTool,
+} from './user-actions.js';
 import { claudeEffortForCli, claudeModelArgForContextWindow, defaultClaudeContextWindow, defaultClaudeReasoningEffort, parseExtraArgs } from './models.js';
 import { finalizingAgentRuns, startingAgentRuns } from './run-registry.js';
 import { execFileAsync, resolveCommandPath } from './shell-env.js';
@@ -123,7 +129,7 @@ const mergeClaudeHooks = (...sets) => {
 // Same reason: say when to reach for request_user_action (user-actions.js).
 export const CLAUDE_USER_ACTION_TIP = [
   '# Actions only the user can take (Durango Code)',
-  'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it, and call mcp__orion__resolve_user_action with the returned action_id as soon as it is done. When the user clicks Done on it, you get a message starting with "Done:". If they reply instead, you get one starting with "Not done:" followed by what they want instead; follow it rather than asking again.',
+  'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). If a command tells when it is done (`npm whoami`, `gh auth status`), pass it as `check` and Durango Code watches it for you. Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it; when you run out of such work, end your turn instead of waiting or polling. You are told when it is done without being interrupted: at your next tool call, or in a new turn if you have ended yours. That message starts with "Done:"; if the user replied instead, it starts with "Not done:" followed by what they want instead, so follow it rather than asking again. Call mcp__orion__resolve_user_action with the returned action_id if you see it is done before you are told.',
 ].join('\n');
 
 // Mirrored in mcp-bridge-shim.cjs's spawn_subagent schema; keep in step.
@@ -333,12 +339,19 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
             .max(USER_ACTION_MAX_CHARS)
             .describe(USER_ACTION_TOOL_INPUT_SCHEMAS.request_user_action.properties.action.description),
           url: z.string().optional().describe(USER_ACTION_TOOL_INPUT_SCHEMAS.request_user_action.properties.url.description),
+          check: z
+            .string()
+            .max(USER_ACTION_CHECK_MAX_CHARS)
+            .optional()
+            .describe(USER_ACTION_TOOL_INPUT_SCHEMAS.request_user_action.properties.check.description),
         },
         async (args) =>
           durangoToolResult(
             await runUserActionTool('request_user_action', args, {
               getSender: () => session.sender,
               threadId: session.threadId,
+              projectPath: session.projectPath,
+              accessMode: session.accessMode,
             })
           ),
         // Only changes how Durango Code presents this thread.
@@ -952,11 +965,16 @@ export const finalizeClaudeTurn = async (session, resultMessage) => {
   // summarization below — advertise the gap so a racing steer can wait for
   // the real outcome (agent:isRunFinalizing).
   finalizingAgentRuns.add(turn.runId);
+  session.finalizingTurns = (session.finalizingTurns ?? 0) + 1;
   try {
     await finalizeClaudeTurnInner(session, resultMessage, turn);
   } finally {
     finalizingAgentRuns.delete(turn.runId);
+    session.finalizingTurns -= 1;
   }
+  // Answered while this turn ran but no tool call came after. Only now: a
+  // turn opened before the `done` above would read as finished by it.
+  flushClaudeUserActionNotices(session);
 };
 
 export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
@@ -1450,6 +1468,18 @@ export const endClaudeSession = (session, error) => {
   if (session.ended) return;
   session.ended = true;
   session.userInputs?.cancelAll();
+  // Answers the model never got go back to the renderer, which sends them as
+  // ordinary messages. Stop (disposed) drops them with the rest of the work.
+  const undeliveredUserActions = session.userActionInbox?.splice(0) ?? [];
+  if (undeliveredUserActions.length > 0 && !session.disposed && !session.sender?.isDestroyed?.()) {
+    try {
+      session.sender?.send('agent:userAction', {
+        type: 'undelivered',
+        threadId: session.threadId,
+        texts: undeliveredUserActions.map((notice) => notice.text),
+      });
+    } catch {}
+  }
   session.resolveEnded?.();
   const terminating = terminatingClaudeSdkSessions.get(session.threadId);
   if (terminating) {
@@ -1652,6 +1682,8 @@ export const createClaudeSdkSession = ({
     // Task notifications that arrived while no turn was active; flushed as
     // activities into the next turn that opens.
     pendingTaskNotifications: [],
+    // Answered user actions not yet delivered (notifyClaudeSession).
+    userActionInbox: [],
     // Exact foreground owner whose interrupted result is a hidden steering
     // boundary. Cleared as soon as its continuation is reserved, or by
     // session teardown so a lost handoff still settles the renderer.
@@ -1764,10 +1796,12 @@ export const createClaudeSdkSession = ({
         // project settings — no CLAUDE.md, no skills, no MCP servers.
         settingSources: ['user', 'project', 'local'],
         mcpServers: { orion: orionMcpServer },
-        // Refuses long foreground waits, and serializes Claude in Chrome
-        // across Orion's Claude threads.
+        // Refuses long foreground waits, delivers answered user actions at
+        // the next tool call, and serializes Claude in Chrome across Orion's
+        // Claude threads.
         hooks: mergeClaudeHooks(
           claudeForegroundWaitHooks(),
+          claudeUserActionHooks(session),
           chromeEnabled
             ? claudeChromeLeaseHooks(session, {
                 emitActivity: (activity) => {
@@ -1987,6 +2021,95 @@ const openClaudeBackgroundTurn = (session, runId, command) => {
   });
   flushPendingClaudeTaskNotifications(session, turn);
   return turn;
+};
+
+// User actions the user answered (Done, Reply) or a `check` saw done
+// (user-actions.js) reach the model without interrupting it, unlike a steer:
+// while it works, at its next tool call as PostToolUse context; otherwise in
+// a turn of their own, opened at once on an idle session or as soon as the
+// current turn ends. Notices are { text, activity }: the activity marks in
+// the receiving turn where the model learned it.
+export const claudeUserActionNoticeText = (notices) =>
+  [
+    `[Durango Code] ${notices.length === 1 ? 'The user answered an action you asked them for' : 'The user answered actions you asked them for'}. This reached you without interrupting your work; act on it when it fits.`,
+    ...notices.map((notice) => notice.text),
+  ].join('\n\n');
+
+const emitClaudeUserActionNotices = (session, turn, notices) => {
+  for (const notice of notices) {
+    if (!notice.activity) continue;
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity: notice.activity,
+    });
+  }
+};
+
+// Mid-steer the interrupted turn has left activeTurns but its continuation
+// is not pushed yet; the continuation's end flushes instead. A finishing
+// turn has left activeTurns too but not emitted `done` yet; it flushes once
+// it has.
+export const flushClaudeUserActionNotices = (session) => {
+  if (
+    !session.userActionInbox?.length ||
+    session.activeTurns.length > 0 ||
+    session.pendingSteerBoundary ||
+    session.finalizingTurns > 0 ||
+    session.ended ||
+    session.disposed ||
+    !session.query
+  ) {
+    return false;
+  }
+  const notices = session.userActionInbox.splice(0);
+  const turn = openClaudeBackgroundTurn(
+    session,
+    session.backgroundRunId ?? crypto.randomUUID(),
+    'claude — the user answered'
+  );
+  emitClaudeUserActionNotices(session, turn, notices);
+  session.pushUserMessage(claudeUserActionNoticeText(notices));
+  return true;
+};
+
+// Subagents' tool calls fire the same hooks (with agent_id): the notice is
+// for the main loop, which asked.
+export const claudeUserActionHooks = (session) => {
+  const postToolUse = async (input) => {
+    if (input?.agent_id || !session.userActionInbox?.length) return { continue: true };
+    const turn = session.activeTurns[0];
+    if (!turn) return { continue: true };
+    const notices = session.userActionInbox.splice(0);
+    emitClaudeUserActionNotices(session, turn, notices);
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext: claudeUserActionNoticeText(notices),
+      },
+    };
+  };
+  return { PostToolUse: [{ hooks: [postToolUse] }] };
+};
+
+/**
+ * Hands a user-action notice to the thread's live Claude session. With
+ * `runId` (the renderer's running run) the session must own that run, so a
+ * Claude session left from before the thread switched provider never takes
+ * it. False when no session takes it: the renderer then sends it as an
+ * ordinary message.
+ */
+export const notifyClaudeSession = (threadId, notice, { runId } = {}) => {
+  const session = claudeSdkSessions.get(threadId);
+  if (!session || session.ended || session.disposed || !session.query) return false;
+  if (runId && session.backgroundRunId !== runId && !session.activeTurns.some((turn) => turn.runId === runId)) {
+    return false;
+  }
+  session.userActionInbox ??= [];
+  session.userActionInbox.push(notice);
+  flushClaudeUserActionNotices(session);
+  return true;
 };
 
 export const steerClaudeSdkRun = async (runId, text, attachments) => {

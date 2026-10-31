@@ -409,6 +409,16 @@ export type UserAction = {
   action: string;
   url?: string;
   requestedAt: string;
+  /** Command that exits 0 once the action is done (request_user_action `check`). */
+  check?: string;
+  /** Where `check` runs: the agent's working directory. */
+  checkCwd?: string;
+  /**
+   * Whether Durango Code runs `check` on a schedule. Starts on in Full
+   * access; otherwise the user starts it from the card. Off again when the
+   * watch gives up.
+   */
+  watching?: boolean;
 };
 
 export type BtwExchange = {

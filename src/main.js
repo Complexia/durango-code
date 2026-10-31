@@ -48,7 +48,8 @@ import { getWhatsNew, markWhatsNewSeen } from './main/whats-new.js';
 import { browseDirectories, resolveProjectDirectory } from './main/project-browse.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
-import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
+import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, notifyClaudeSession, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
+import { unwatchUserActions, watchUserAction } from './main/user-actions.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
@@ -5847,6 +5848,43 @@ ipcMain.handle('agent:steerTurn', async (_event, runId, text, attachments) => {
   if (await steerCodexAppServerRun(runId, text, attachments)) return true;
   if (await steerFxRun(runId, text, attachments)) return true;
   return await steerClaudeSdkRun(runId, text, attachments);
+});
+
+// A user action answered or seen done (user-actions.js): tell the agent
+// without interrupting it. Codex and fx fold a steer in at their next model
+// boundary; Claude gets it at its next tool call or in a turn of its own.
+// `runId` is the thread's running run, which must own the delivery; with
+// none, only a Claude thread (`providerId`) can be re-invoked from here.
+// `notice` becomes an activity on the run that receives it. False: nothing
+// took it, and the renderer sends it as an ordinary message.
+ipcMain.handle('agent:notifyTurn', async (event, { threadId, runId, providerId, text, notice } = {}) => {
+  if (typeof threadId !== 'string' || typeof text !== 'string' || !text) return false;
+  const activity = {
+    key: `user-action-${crypto.randomUUID()}`,
+    type: 'result',
+    title: typeof notice?.title === 'string' ? notice.title : 'The user answered',
+    ...(typeof notice?.detail === 'string' ? { detail: notice.detail } : {}),
+    status: 'done',
+  };
+  if (typeof runId === 'string' && runId) {
+    if ((await steerCodexAppServerRun(runId, text, [])) || (await steerFxRun(runId, text, []))) {
+      emitAgentEvent(event.sender, { runId, threadId, type: 'activity', activity });
+      return true;
+    }
+    return notifyClaudeSession(threadId, { text, activity }, { runId });
+  }
+  return providerId === 'claude' && notifyClaudeSession(threadId, { text, activity });
+});
+
+// Watching a user action's `check` (user-actions.js). The renderer decides
+// which actions are watched and re-arms them after a restart.
+ipcMain.handle('agent:watchUserAction', (event, { threadId, id, check, cwd } = {}) =>
+  watchUserAction({ threadId, id, check, cwd, getSender: () => event.sender })
+);
+ipcMain.handle('agent:unwatchUserAction', (_event, { threadId, id } = {}) => {
+  if (typeof threadId !== 'string' && typeof id !== 'string') return false;
+  unwatchUserActions({ threadId, id });
+  return true;
 });
 
 ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => {

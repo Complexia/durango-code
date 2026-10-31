@@ -41,7 +41,11 @@ import {
   USER_ACTION_TOOL_DESCRIPTIONS,
   USER_ACTION_TOOL_INPUT_SCHEMAS,
   USER_ACTION_TOOL_NAMES,
+  isWatchingUserAction,
+  runUserActionCheck,
   runUserActionTool,
+  unwatchUserActions,
+  watchUserAction,
 } from '../src/main/user-actions.js';
 import { handleMcpBridgeConnection, mcpBridgeSessions, pendingSubagentSpawns } from '../src/main/mcp-bridge.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
@@ -353,6 +357,145 @@ try {
   assert.deepEqual(sent[1].payload, { type: 'resolve', threadId: 'thread-1', id: sent[0].payload.id });
   await runUserActionTool('resolve_user_action', {}, { getSender: () => fakeSender, threadId: 'thread-1' });
   assert.deepEqual(sent[2].payload, { type: 'resolve', threadId: 'thread-1' });
+
+  // --- A `check` can tell when the action is done ------------------------------------------
+  sent.length = 0;
+  const watchedRequest = await runUserActionTool(
+    'request_user_action',
+    { action: 'Finish npm login', check: ' npm whoami ' },
+    { getSender: () => fakeSender, threadId: 'thread-1', projectPath: testRoot, accessMode: 'full-access' }
+  );
+  assert.equal(watchedRequest.ok, true);
+  assert.equal(sent[0].payload.check, 'npm whoami');
+  assert.equal(sent[0].payload.cwd, testRoot, 'the check runs where the agent works');
+  assert.equal(sent[0].payload.autoWatch, true, 'Full access watches at once');
+  assert.match(watchedRequest.text, /runs `npm whoami` every few seconds/);
+  assert.match(watchedRequest.text, /without being interrupted/);
+  const askedRequest = await runUserActionTool(
+    'request_user_action',
+    { action: 'Finish npm login', check: 'npm whoami' },
+    { getSender: () => fakeSender, threadId: 'thread-1', projectPath: testRoot, accessMode: 'workspace-write' }
+  );
+  assert.equal(sent[1].payload.autoWatch, false, 'other access modes leave starting the watch to the user');
+  assert.match(askedRequest.text, /the user starts that/);
+  const plainRequest = await runUserActionTool('request_user_action', { action: 'x' }, { getSender: () => fakeSender, threadId: 'thread-1' });
+  assert.equal(plainRequest.ok, true);
+  assert.equal('check' in sent[2].payload, false, 'no check, no watch fields');
+  const longCheck = await runUserActionTool(
+    'request_user_action',
+    { action: 'x', check: 'x'.repeat(501) },
+    { getSender: () => fakeSender, threadId: 'thread-1' }
+  );
+  assert.equal(longCheck.ok, false);
+  assert.equal(sent.length, 3, 'a rejected check is not shown');
+
+  assert.equal(await runUserActionCheck('exit 0', testRoot), true);
+  assert.equal(await runUserActionCheck('exit 3', testRoot), false);
+  assert.equal(await runUserActionCheck('read answer', testRoot, { timeoutMs: 2_000 }), false, 'a prompting check fails instead of hanging');
+  // A check that ignores SIGTERM still settles at its timeout, and its whole
+  // process group is killed.
+  const pidFile = path.join(testRoot, 'check.pid');
+  const stubbornStart = Date.now();
+  assert.equal(
+    await runUserActionCheck(`trap '' TERM; echo $$ > '${pidFile}'; while :; do sleep 0.1; done`, testRoot, { timeoutMs: 300 }),
+    false
+  );
+  assert.ok(Date.now() - stubbornStart < 1_500, 'a timed-out check settles at once');
+  const stubbornPid = Number((await fs.readFile(pidFile, 'utf8')).trim());
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (let i = 0; i < 60 && alive(stubbornPid); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(alive(stubbornPid), false, 'a check that ignores SIGTERM is killed');
+  // The shell dies of SIGTERM but leaves a descendant that ignores it.
+  const orphanPidFile = path.join(testRoot, 'orphan.pid');
+  assert.equal(
+    await runUserActionCheck(
+      `sh -c 'trap "" TERM; echo $$ > "${orphanPidFile}"; while :; do sleep 0.1; done' & wait`,
+      testRoot,
+      { timeoutMs: 500 }
+    ),
+    false
+  );
+  const orphanPid = Number((await fs.readFile(orphanPidFile, 'utf8')).trim());
+  for (let i = 0; i < 60 && alive(orphanPid); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(alive(orphanPid), false, "a descendant that outlives the shell's SIGTERM is killed");
+  const abortCheck = new AbortController();
+  const abortedRun = runUserActionCheck('sleep 30', testRoot, { signal: abortCheck.signal });
+  setTimeout(() => abortCheck.abort(), 50);
+  assert.equal(await abortedRun, false, 'aborting ends a running check');
+  const realRoot = await fs.realpath(testRoot);
+  assert.equal(await runUserActionCheck(`test "$(pwd -P)" = '${realRoot}'`, testRoot), true, 'the check runs in cwd');
+
+  const waitFor = async (predicate, what) => {
+    for (let i = 0; i < 200 && !predicate(); i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(predicate(), what);
+  };
+  sent.length = 0;
+  let checks = 0;
+  const delays = { firstDelayMs: 1, maxDelayMs: 4, maxMs: 60_000 };
+  assert.equal(
+    watchUserAction(
+      { threadId: 'thread-1', id: 'ua_watch', check: 'npm whoami', cwd: testRoot, getSender: () => fakeSender },
+      { ...delays, runCheck: async () => (checks += 1) >= 3 }
+    ),
+    true
+  );
+  assert.equal(
+    watchUserAction({ threadId: 'thread-1', id: 'ua_watch', check: 'npm whoami', getSender: () => fakeSender }, delays),
+    true,
+    'watching twice keeps one watch'
+  );
+  await waitFor(() => sent.length > 0, 'a passing check reports the action done');
+  assert.deepEqual(sent[0].payload, { type: 'detected', threadId: 'thread-1', id: 'ua_watch' });
+  assert.equal(checks, 3, 'failing checks are retried until one passes');
+  assert.equal(isWatchingUserAction('ua_watch'), false);
+
+  sent.length = 0;
+  watchUserAction(
+    { threadId: 'thread-1', id: 'ua_give_up', check: 'false', getSender: () => fakeSender },
+    { firstDelayMs: 1, maxDelayMs: 2, maxMs: 0, runCheck: async () => false }
+  );
+  await waitFor(() => sent.length > 0, 'a watch gives up eventually');
+  assert.deepEqual(sent[0].payload, { type: 'watch-stopped', threadId: 'thread-1', id: 'ua_give_up' });
+
+  sent.length = 0;
+  let resolvedChecks = 0;
+  watchUserAction(
+    { threadId: 'thread-1', id: 'ua_resolved', check: 'false', getSender: () => fakeSender },
+    { firstDelayMs: 1, maxDelayMs: 1, runCheck: async () => ((resolvedChecks += 1), false) }
+  );
+  watchUserAction(
+    { threadId: 'thread-2', id: 'ua_other', check: 'false', getSender: () => fakeSender },
+    { firstDelayMs: 60_000, runCheck: async () => false }
+  );
+  await waitFor(() => resolvedChecks > 0, 'the watch runs');
+  await runUserActionTool('resolve_user_action', {}, { getSender: () => fakeSender, threadId: 'thread-1' });
+  assert.equal(isWatchingUserAction('ua_resolved'), false, 'resolving every action stops their watches');
+  assert.equal(isWatchingUserAction('ua_other'), true, "another thread's watch keeps going");
+  const checksAtResolve = resolvedChecks;
+  let runningSignal;
+  watchUserAction(
+    { threadId: 'thread-3', id: 'ua_running', check: 'sleep 30', getSender: () => fakeSender },
+    { firstDelayMs: 1, runCheck: (_check, _cwd, { signal }) => ((runningSignal = signal), new Promise(() => {})) }
+  );
+  await waitFor(() => runningSignal, 'the check starts');
+  unwatchUserActions({ id: 'ua_running' });
+  assert.equal(runningSignal.aborted, true, 'stopping a watch ends its running check');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(resolvedChecks, checksAtResolve, 'a stopped watch runs no more checks');
+  assert.equal(sent.filter((entry) => entry.payload.type !== 'resolve').length, 0, 'a stopped watch reports nothing');
+  unwatchUserActions({ threadId: 'thread-1', id: 'ua_other' });
+  assert.equal(isWatchingUserAction('ua_other'), true, "a thread can't stop another thread's watch by its id");
+  await runUserActionTool('resolve_user_action', { action_id: 'ua_other' }, { getSender: () => fakeSender, threadId: 'thread-1' });
+  assert.equal(isWatchingUserAction('ua_other'), true, "resolving another thread's action id leaves its watch alone");
+  unwatchUserActions({ threadId: 'thread-2', id: 'ua_other' });
+  assert.equal(isWatchingUserAction('ua_other'), false);
 
   // --- Bridge shim advertises identical tools and forwards calls ------------------------------
   const shimPath = path.join(testRoot, 'shim.cjs');

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, ExternalLink, Hand, MessageSquareReply, SendHorizontal } from 'lucide-react';
+import { Check, CircleDashed, Eye, ExternalLink, Hand, MessageSquareReply, SendHorizontal } from 'lucide-react';
 import { MarkdownContent } from './markdown';
 import type { PendingUserAction } from './threadLists';
 
@@ -9,18 +9,22 @@ import type { PendingUserAction } from './threadLists';
  * messages. It stays until the agent resolves it or the user marks it done;
  * the agent may keep working meanwhile. Reply clears it too and sends the
  * agent what the user wrote instead (the ask may be wrong, or they want
- * something else done).
+ * something else done). Neither interrupts the agent. An action with a
+ * `check` command can be watched: Durango Code runs it until it succeeds and
+ * then marks the action done itself.
  */
 export const UserActionCards = React.memo(function UserActionCards({
   actions,
   currentThreadId,
   onDone,
   onReply,
+  onWatch,
 }: {
   actions: PendingUserAction[];
   currentThreadId: string;
   onDone: (threadId: string, actionId: string) => void;
   onReply: (threadId: string, actionId: string, reply: string) => void;
+  onWatch: (threadId: string, actionId: string, watching: boolean) => void;
 }) {
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
   const [reply, setReply] = useState('');
@@ -52,6 +56,37 @@ export const UserActionCards = React.memo(function UserActionCards({
                 {action.threadId !== currentThreadId && (
                   <div className="mt-0.5 truncate text-[11.5px] text-[var(--text-secondary)]">
                     From subagent {action.threadTitle}
+                  </div>
+                )}
+                {action.check && (
+                  <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[11.5px] text-[var(--text-secondary)]">
+                    {action.watching ? (
+                      <>
+                        <CircleDashed size={12} className="shrink-0 animate-spin text-amber-300 [animation-duration:3s]" />
+                        <span className="min-w-0 truncate">
+                          Checking <code className="font-mono text-[11px]">{action.check}</code> until it succeeds
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => onWatch(action.threadId, action.id, false)}
+                          className="shrink-0 rounded px-1 text-[var(--text-secondary)] underline-offset-2 hover:text-[var(--text-primary)] hover:underline"
+                        >
+                          Stop
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        title={`Run this every few seconds in ${action.checkCwd ?? 'the project'} and mark the action done when it succeeds`}
+                        onClick={() => onWatch(action.threadId, action.id, true)}
+                        className="inline-flex min-w-0 items-center gap-1 rounded-md border border-white/15 px-2 py-0.5 text-[11.5px] text-[var(--text-primary)] hover:bg-white/[0.06]"
+                      >
+                        <Eye size={12} className="shrink-0" />
+                        <span className="min-w-0 truncate">
+                          Watch with <code className="font-mono text-[11px]">{action.check}</code>
+                        </span>
+                      </button>
+                    )}
                   </div>
                 )}
               </div>

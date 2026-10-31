@@ -727,6 +727,36 @@ const waitingOnBackgroundStatusText = (tasks: string[]): string => {
   return `Waiting on ${tasks.length} background tasks: ${shown}${more > 0 ? ` (+${more} more)` : ''}…`;
 };
 
+// Caption of a turn that ended with actions still pending on the user
+// (request_user_action), from the thread or its subagents: the agent stopped
+// on purpose and is re-invoked once they are answered. Back to "Finished."
+// when the last one is.
+const WAITING_ON_USER_PREFIX = 'Waiting on you: ';
+const waitingOnUserStatusText = (threadId: string): string | undefined => {
+  const pending = pendingUserActions(useOrionStore.getState().threads, threadId);
+  if (pending.length === 0) return undefined;
+  const first = pending[0].action.replace(/\s+/g, ' ').trim();
+  const clipped = first.length > 80 ? `${first.slice(0, 79)}…` : first;
+  return `${WAITING_ON_USER_PREFIX}${clipped}${pending.length > 1 ? ` (+${pending.length - 1} more)` : ''}`;
+};
+// Pending actions count a thread's subagents, so the caption can sit on any
+// ancestor of the thread whose action went: settle each one up the chain.
+const settleWaitingOnUserCaptions = (threadId: string) => {
+  const state = useOrionStore.getState();
+  const seen = new Set<string>();
+  let thread = state.threads.find((candidate) => candidate.id === threadId);
+  while (thread && !seen.has(thread.id)) {
+    seen.add(thread.id);
+    if (pendingUserActions(state.threads, thread.id).length > 0) return;
+    const lastRun = [...thread.messages].reverse().find((message) => message.role === 'agent');
+    if (lastRun?.status === 'done' && lastRun.statusText?.startsWith(WAITING_ON_USER_PREFIX)) {
+      state.updateThreadMessage(thread.id, lastRun.id, { statusText: 'Finished.' });
+    }
+    const parentId = thread.parentThreadId;
+    thread = parentId ? state.threads.find((candidate) => candidate.id === parentId) : undefined;
+  }
+};
+
 const compareRecentThreadOrder = (a: Thread, b: Thread) => {
   const aRunning = a.status === 'running';
   const bRunning = b.status === 'running';
@@ -2135,50 +2165,13 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [threadsNeedingInput, awaitingUserActionKey]
   );
-  // request_user_action / resolve_user_action from any run. Asking pins the
-  // action on the thread and, like a question, brings the thread the sidebar
-  // lists (a subagent's driver) back from Snoozed or Settled.
-  useEffect(() => {
-    if (!window.orion?.onUserAction) return undefined;
-    return window.orion.onUserAction((request) => {
-      const state = useOrionStore.getState();
-      const thread = state.threads.find((candidate) => candidate.id === request.threadId);
-      if (!thread) return;
-      const current = thread.userActions ?? [];
-      if (request.type === 'resolve') {
-        const remaining = request.id ? current.filter((action) => action.id !== request.id) : [];
-        if (remaining.length !== current.length) {
-          updateThread(thread.id, { userActions: remaining.length ? remaining : undefined });
-        }
-        return;
-      }
-      const now = new Date().toISOString();
-      updateThread(thread.id, {
-        userActions: [
-          ...current.filter((action) => action.id !== request.id),
-          { id: request.id, action: request.action, ...(request.url ? { url: request.url } : {}), requestedAt: now },
-        ],
-      });
-      const root = sidebarRootThread(state.threads, thread);
-      if (!root.snoozedAt && !root.settledAt) return;
-      const onScreen = isAgentsPanelVisible(state) && state.paneThreadIds.includes(root.id);
-      updateThread(root.id, {
-        snoozedAt: undefined,
-        settledAt: undefined,
-        ...(onScreen ? {} : { wokeAt: now, wokeReason: 'attention' as const }),
-      });
-    });
-  }, [updateThread]);
-  // Done on a pinned action also tells the agent that asked, so it doesn't sit
-  // waiting for the user to say so: it steers the running turn, or starts a
-  // turn when the thread is idle (steerWithContent queues when it can't steer).
-  const steerWithContentRef = useRef<(threadId: string, promptText: string) => Promise<void>>(
-    async () => {}
-  );
-  // Reply does the same with what the user wrote instead ("Not done:"), for
-  // when the ask is wrong or they want the agent to go another way.
+  // Done, Reply, or a `check` seeing it done: clears the action and tells the
+  // agent that asked without interrupting it (agent:notifyTurn): at its next
+  // tool call while it works, or in a turn of its own once it is idle. Only
+  // when no live run or session takes it does it go as an ordinary message,
+  // queued behind the running turn or sent at once.
   const answerUserAction = useCallback(
-    (threadId: string, actionId: string, reply?: string) => {
+    (threadId: string, actionId: string, answer: { reply?: string; detected?: boolean } = {}) => {
       const threads = useOrionStore.getState().threads;
       const thread = threads.find((candidate) => candidate.id === threadId);
       const done = thread?.userActions?.find((action) => action.id === actionId);
@@ -2193,17 +2186,156 @@ const App: React.FC = () => {
         target = parentId ? threads.find((candidate) => candidate.id === parentId) : undefined;
       }
       if (!target) return;
-      void steerWithContentRef.current(
-        target.id,
-        reply === undefined ? `Done: ${done.action}` : `Not done: ${done.action}\n\n${reply}`
-      );
+      const targetId = target.id;
+      const providerId = findAgentModel(agentModels, target.modelId ?? defaultAgentModelId)?.providerId;
+      settleWaitingOnUserCaptions(threadId);
+      const { reply, detected } = answer;
+      const text =
+        reply !== undefined
+          ? `Not done: ${done.action}\n\n${reply}`
+          : detected && done.check
+            ? `Done: ${done.action}\n\n(Durango Code saw \`${done.check}\` succeed.)`
+            : `Done: ${done.action}`;
+      const notice =
+        reply !== undefined
+          ? { title: 'You replied instead of marking it done', detail: `${done.action}\n\n${reply}` }
+          : detected && done.check
+            ? { title: `Done: \`${done.check}\` succeeded`, detail: done.action }
+            : { title: 'You marked it done', detail: done.action };
+      // In order with steers, and cancelled with them by Stop: a fallback
+      // queued after Stop would start the stopped agent again.
+      void steeringCoordinatorRef.current.enqueue(targetId, async (cancelled) => {
+        let accepted = false;
+        try {
+          accepted =
+            (await window.orion?.notifyAgentTurn?.({
+              threadId: targetId,
+              runId: activeRunsByThreadRef.current[targetId],
+              providerId,
+              text,
+              notice,
+            })) === true;
+        } catch {
+          accepted = false;
+        }
+        if (accepted || cancelled()) return;
+        pinThreadToBottom(targetId);
+        queueMessageToThread(targetId, { text });
+      });
     },
-    [updateThread]
+    [agentModels, pinThreadToBottom, queueMessageToThread, updateThread]
   );
+  const answerUserActionRef = useRef(answerUserAction);
+  useLayoutEffect(() => {
+    answerUserActionRef.current = answerUserAction;
+  });
   const markUserActionDone = useCallback(
     (threadId: string, actionId: string) => answerUserAction(threadId, actionId),
     [answerUserAction]
   );
+  const replyToUserAction = useCallback(
+    (threadId: string, actionId: string, reply: string) => answerUserAction(threadId, actionId, { reply }),
+    [answerUserAction]
+  );
+  const setUserActionWatching = useCallback(
+    (threadId: string, actionId: string, watching: boolean) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      if (!thread?.userActions?.some((action) => action.id === actionId)) return;
+      updateThread(threadId, {
+        userActions: thread.userActions.map((action) => (action.id === actionId ? { ...action, watching } : action)),
+      });
+    },
+    [updateThread]
+  );
+  // request_user_action / resolve_user_action from any run. Asking pins the
+  // action on the thread and, like a question, brings the thread the sidebar
+  // lists (a subagent's driver) back from Snoozed or Settled.
+  useEffect(() => {
+    if (!window.orion?.onUserAction) return undefined;
+    return window.orion.onUserAction((request) => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((candidate) => candidate.id === request.threadId);
+      if (!thread) return;
+      const current = thread.userActions ?? [];
+      if (request.type === 'detected') {
+        // A check that finished just as the user stopped watching it.
+        if (!current.some((action) => action.id === request.id && action.watching)) return;
+        answerUserActionRef.current(thread.id, request.id, { detected: true });
+        return;
+      }
+      if (request.type === 'watch-stopped') {
+        setUserActionWatching(thread.id, request.id, false);
+        return;
+      }
+      if (request.type === 'undelivered') {
+        // The agent's session ended before it saw these answers.
+        for (const text of request.texts) queueMessageToThread(thread.id, { text });
+        return;
+      }
+      if (request.type === 'resolve') {
+        const remaining = request.id ? current.filter((action) => action.id !== request.id) : [];
+        if (remaining.length !== current.length) {
+          updateThread(thread.id, { userActions: remaining.length ? remaining : undefined });
+          if (remaining.length === 0) settleWaitingOnUserCaptions(thread.id);
+        }
+        return;
+      }
+      const now = new Date().toISOString();
+      updateThread(thread.id, {
+        userActions: [
+          ...current.filter((action) => action.id !== request.id),
+          {
+            id: request.id,
+            action: request.action,
+            ...(request.url ? { url: request.url } : {}),
+            requestedAt: now,
+            ...(request.check
+              ? { check: request.check, checkCwd: request.cwd, watching: request.autoWatch === true }
+              : {}),
+          },
+        ],
+      });
+      const root = sidebarRootThread(state.threads, thread);
+      if (!root.snoozedAt && !root.settledAt) return;
+      const onScreen = isAgentsPanelVisible(state) && state.paneThreadIds.includes(root.id);
+      updateThread(root.id, {
+        snoozedAt: undefined,
+        settledAt: undefined,
+        ...(onScreen ? {} : { wokeAt: now, wokeReason: 'attention' as const }),
+      });
+    });
+  }, [queueMessageToThread, setUserActionWatching, updateThread]);
+  // Keep the main process watching exactly the actions whose `check` is on
+  // (it holds only timers, so this also re-arms them after a restart), and
+  // stop the watch once an action is answered, resolved or deleted.
+  const watchedUserActionsKey = threads
+    .flatMap((thread) =>
+      (thread.userActions ?? [])
+        .filter((action) => action.check && action.watching)
+        .map((action) => `${thread.id}:${action.id}`)
+    )
+    .join(',');
+  const watchedUserActionsRef = useRef(new Map<string, { threadId: string; id: string }>());
+  useEffect(() => {
+    const watched = watchedUserActionsRef.current;
+    const wanted = new Map<string, { threadId: string; id: string; check: string; cwd?: string }>();
+    for (const thread of useOrionStore.getState().threads) {
+      for (const action of thread.userActions ?? []) {
+        if (!action.check || !action.watching) continue;
+        wanted.set(`${thread.id}:${action.id}`, { threadId: thread.id, id: action.id, check: action.check, cwd: action.checkCwd });
+      }
+    }
+    for (const [key, entry] of watched) {
+      if (wanted.has(key)) continue;
+      watched.delete(key);
+      void window.orion?.unwatchUserAction?.({ threadId: entry.threadId, id: entry.id });
+    }
+    for (const [key, entry] of wanted) {
+      if (watched.has(key)) continue;
+      watched.set(key, { threadId: entry.threadId, id: entry.id });
+      void window.orion?.watchUserAction?.(entry);
+    }
+  }, [watchedUserActionsKey]);
   // A blank draft (nothing sent, nothing typed) is just the composer the
   // Agents panel opens with nothing else to show; it joins the list once used.
   // CLI threads keep their conversation in the terminal, so they always show.
@@ -4386,7 +4518,9 @@ const App: React.FC = () => {
         updateThreadMessage(tracked.threadId, tracked.messageId, {
           status: 'done',
           completedAt: new Date().toISOString(),
-          statusText: waiting ? waitingOnBackgroundStatusText(waitingOn) : 'Finished.',
+          statusText: waiting
+            ? waitingOnBackgroundStatusText(waitingOn)
+            : (waitingOnUserStatusText(tracked.threadId) ?? 'Finished.'),
           changedFiles: event.changedFiles ?? [],
           ...(event.stats ? { stats: event.stats } : {}),
         });
@@ -7441,10 +7575,6 @@ const App: React.FC = () => {
     async () => {}
   );
   useLayoutEffect(() => {
-    steerWithContentRef.current = (threadId: string, promptText: string) =>
-      steerWithContent(threadId, promptText, []);
-  });
-  useLayoutEffect(() => {
     steerQueuedMessageRef.current = async (threadId: string, queuedId: string) => {
       if (!steerTargetForThread(threadId)) return;
       const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
@@ -9230,7 +9360,8 @@ const App: React.FC = () => {
         actions={selectedThreadUserActions}
         currentThreadId={selectedThread.id}
         onDone={markUserActionDone}
-        onReply={answerUserAction}
+        onReply={replyToUserAction}
+        onWatch={setUserActionWatching}
       />
       <CodexQuestions
         threadId={selectedThread.id}

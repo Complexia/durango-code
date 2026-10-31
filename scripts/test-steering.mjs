@@ -8,13 +8,16 @@ import {
   CLAUDE_SESSION_IDLE_EVICT_MS,
   claudeBackgroundRunSessions,
   claudeSdkSessions,
+  claudeUserActionHooks,
   createClaudeTurnState,
   discardClaudeBackgroundShellTasks,
   discardableClaudeBackgroundShellTasks,
   endClaudeSession,
   evictIdleClaudeSdkSessions,
   finalizeClaudeTurn,
+  flushClaudeUserActionNotices,
   handleClaudeSessionMessage,
+  notifyClaudeSession,
   pendingClaudeBackgroundTasks,
   runClaudeBackgroundCheckIn,
   setClaudeBackgroundTasksAwaited,
@@ -99,6 +102,19 @@ assert.ok(
   stopThreadTree.indexOf('cancelPendingSteers(threadIds);') >= 0 &&
     stopThreadTree.indexOf('cancelPendingSteers(threadIds);') < stopThreadTree.indexOf('clearActiveRun(runId);'),
   'Stop must invalidate pending steers before clearing active run ownership'
+);
+
+const answerUserActionSource = section(appSource, '  const answerUserAction = useCallback(', '  const answerUserActionRef = useRef(');
+assert.match(
+  answerUserActionSource,
+  /steeringCoordinatorRef\.current\.enqueue\(targetId, async \(cancelled\) =>[\s\S]*notifyAgentTurn[\s\S]*if \(accepted \|\| cancelled\(\)\) return;[\s\S]*queueMessageToThread/,
+  'A user-action answer that falls back to a queued message must not outlive Stop'
+);
+assert.doesNotMatch(answerUserActionSource, /steerAgentTurn|steerWithContent/, 'Answering a user action never steers');
+assert.match(
+  section(appSource, "      if (request.type === 'detected') {", "      if (request.type === 'watch-stopped') {"),
+  /action\.id === request\.id && action\.watching/,
+  'A detection for an action the user stopped watching is ignored'
 );
 
 const coordinator = createThreadSteeringCoordinator();
@@ -891,6 +907,99 @@ checkIn.session.activeTurns.splice(0);
 if (checkIn.session.backgroundSettleTimer) clearTimeout(checkIn.session.backgroundSettleTimer);
 claudeSdkSessions.delete(checkIn.session.threadId);
 claudeBackgroundRunSessions.delete('run-check-in');
+
+// A user action answered while the agent works reaches it at its next tool
+// call or once the turn ends, never through an interrupt.
+const doneNotice = (title) => ({
+  text: `Done: ${title}`,
+  activity: { key: `ua-${title}`, type: 'result', title: 'You marked it done', detail: title, status: 'done' },
+});
+const busyUserAction = createSession({ threadId: 'thread-user-action-busy', runId: 'run-user-action-busy' });
+busyUserAction.session.userActionInbox = [];
+claudeSdkSessions.set(busyUserAction.session.threadId, busyUserAction.session);
+assert.equal(notifyClaudeSession('thread-user-action-busy', doneNotice('npm login')), true);
+assert.equal(busyUserAction.interruptCount, 0, 'Done never interrupts a working agent');
+assert.equal(busyUserAction.pushed.length, 0, 'Nothing is pushed into a working turn');
+const [userActionHook] = claudeUserActionHooks(busyUserAction.session).PostToolUse[0].hooks;
+assert.deepEqual(
+  await userActionHook({ agent_id: 'subagent-1', tool_name: 'Bash' }),
+  { continue: true },
+  "A subagent's tool call does not take the main loop's notice"
+);
+const delivered = await userActionHook({ tool_name: 'Bash' });
+assert.equal(delivered.hookSpecificOutput.hookEventName, 'PostToolUse');
+assert.match(delivered.hookSpecificOutput.additionalContext, /without interrupting/);
+assert.match(delivered.hookSpecificOutput.additionalContext, /Done: npm login/);
+assert.deepEqual(
+  busyUserAction.events.filter((event) => event.type === 'activity').map((event) => [event.runId, event.activity.detail]),
+  [['run-user-action-busy', 'npm login']],
+  'The receiving turn shows where the agent learned it'
+);
+assert.deepEqual(await userActionHook({ tool_name: 'Read' }), { continue: true }, 'A notice is delivered once');
+
+notifyClaudeSession('thread-user-action-busy', doneNotice('gh auth'));
+busyUserAction.session.resultsOwed = 0;
+await finalizeClaudeTurn(busyUserAction.session, { usage: { input_tokens: 2, output_tokens: 1 } });
+assert.equal(busyUserAction.events.at(-3)?.type, 'done', 'The turn still finishes first');
+assert.equal(busyUserAction.events.at(-2)?.type, 'started', 'A notice left at turn end opens a turn of its own');
+assert.equal(busyUserAction.events.at(-2)?.background, true);
+assert.equal(busyUserAction.events.at(-1)?.activity?.detail, 'gh auth');
+assert.equal(busyUserAction.pushed.length, 1);
+assert.match(busyUserAction.pushed[0], /Done: gh auth/);
+assert.equal(busyUserAction.session.activeTurns.length, 1);
+assert.equal(busyUserAction.session.resultsOwed, 1);
+
+const idleUserAction = createSession({ threadId: 'thread-user-action-idle', runId: 'run-user-action-idle', retained: true });
+clearTimeout(idleUserAction.session.backgroundSettleTimer);
+idleUserAction.session.backgroundSettleTimer = null;
+idleUserAction.session.resultsOwed = 0;
+claudeSdkSessions.set(idleUserAction.session.threadId, idleUserAction.session);
+assert.equal(notifyClaudeSession('thread-user-action-idle', doneNotice('device code')), true);
+assert.equal(idleUserAction.events[0]?.type, 'started', 'An idle agent is re-invoked at once');
+assert.equal(idleUserAction.events[0]?.runId, 'run-user-action-idle', 'It continues the retained run');
+assert.match(idleUserAction.pushed[0], /Done: device code/);
+
+const steeringUserAction = createSession({ threadId: 'thread-user-action-steer', runId: 'run-user-action-steer' });
+steeringUserAction.session.userActionInbox = [];
+steeringUserAction.session.pendingSteerBoundary = steeringUserAction.session.activeTurns.shift();
+claudeSdkSessions.set(steeringUserAction.session.threadId, steeringUserAction.session);
+notifyClaudeSession('thread-user-action-steer', doneNotice('approve'));
+assert.equal(steeringUserAction.pushed.length, 0, "Mid-steer, the notice waits for the steer's continuation");
+assert.equal(steeringUserAction.session.userActionInbox.length, 1);
+
+assert.equal(notifyClaudeSession('thread-without-session', doneNotice('x')), false, 'No live session: the renderer sends it');
+assert.equal(
+  notifyClaudeSession('thread-user-action-busy', doneNotice('x'), { runId: 'run-of-another-provider' }),
+  false,
+  "A Claude session that doesn't own the running run never takes the notice"
+);
+
+const finishingUserAction = createSession({ threadId: 'thread-user-action-finishing', runId: 'run-user-action-finishing' });
+finishingUserAction.session.userActionInbox = [];
+finishingUserAction.session.activeTurns.shift();
+finishingUserAction.session.finalizingTurns = 1;
+claudeSdkSessions.set(finishingUserAction.session.threadId, finishingUserAction.session);
+notifyClaudeSession('thread-user-action-finishing', doneNotice('token'));
+assert.equal(finishingUserAction.pushed.length, 0, 'A turn still finishing is not overtaken by a new one');
+finishingUserAction.session.finalizingTurns = 0;
+assert.equal(flushClaudeUserActionNotices(finishingUserAction.session), true, 'It goes out once the turn has finished');
+assert.match(finishingUserAction.pushed[0], /Done: token/);
+
+const endedUserAction = createSession({ threadId: 'thread-user-action-ended', runId: 'run-user-action-ended' });
+endedUserAction.session.userActionInbox = [];
+claudeSdkSessions.set(endedUserAction.session.threadId, endedUserAction.session);
+notifyClaudeSession('thread-user-action-ended', doneNotice('sign in'));
+endClaudeSession(endedUserAction.session, new Error('crashed'));
+assert.deepEqual(
+  endedUserAction.events.find((event) => event.type === 'undelivered'),
+  { type: 'undelivered', threadId: 'thread-user-action-ended', texts: ['Done: sign in'] },
+  'A session that dies before delivering hands the answer back to the renderer'
+);
+for (const { session } of [busyUserAction, idleUserAction, steeringUserAction, finishingUserAction]) {
+  session.activeTurns.splice(0);
+  if (session.backgroundSettleTimer) clearTimeout(session.backgroundSettleTimer);
+  claudeSdkSessions.delete(session.threadId);
+}
 
 assert.match(
   claudeDriverSource,

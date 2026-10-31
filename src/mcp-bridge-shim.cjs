@@ -220,7 +220,7 @@ const rememberTool = {
 const requestUserActionTool = {
   name: 'request_user_action',
   description:
-    'Ask the user to do something only they can do outside this chat, such as signing in or authorizing in a browser window you opened (npm login, OAuth, a CLI device code), approving a prompt on their machine, or pasting a value you cannot get yourself. Durango Code marks the thread as needing the user, brings it back from Snoozed, and pins the action above the composer until it is resolved, so it does not get lost in your replies. It returns at once: keep working on anything that does not depend on it. Write the action as one clear instruction (what to do, where, and any code to enter). Call resolve_user_action with the returned action_id as soon as you see it is done. When the user marks it done in Durango Code, the action is cleared and you get a message starting with "Done:" that repeats it, so you need not ask them to tell you. If they reply instead, the action is cleared and you get a message starting with "Not done:" that repeats it, followed by what they said: the ask may be wrong or they may want something else, so follow their reply rather than asking again.',
+    'Ask the user to do something only they can do outside this chat, such as signing in or authorizing in a browser window you opened (npm login, OAuth, a CLI device code), approving a prompt on their machine, or pasting a value you cannot get yourself. Durango Code marks the thread as needing the user, brings it back from Snoozed, and pins the action above the composer until it is resolved, so it does not get lost in your replies. It returns at once: keep working on anything that does not depend on it, and do not wait or poll for it. Write the action as one clear instruction (what to do, where, and any code to enter). If a command can tell when it is done (`npm whoami`, `gh auth status`), pass it as `check`: Durango Code runs it every few seconds and marks the action done as soon as it succeeds. You are told when the action is done without being interrupted: at your next tool call while you work, or in a new turn if you have ended yours (the thread shows as waiting on the user meanwhile). The message starts with "Done:" and repeats the action, so you need not ask the user to tell you. If the user replies instead, it starts with "Not done:", repeats the action and gives what they said: the ask may be wrong or they may want something else, so follow their reply rather than asking again. Call resolve_user_action with the returned action_id if you see it is done before you are told.',
   // Only changes how Durango Code presents the thread.
   annotations: { readOnlyHint: true },
   inputSchema: {
@@ -234,6 +234,11 @@ const requestUserActionTool = {
       url: {
         type: 'string',
         description: 'Link the user should open for it, if any (shown as an Open button)',
+      },
+      check: {
+        type: 'string',
+        description:
+          'Shell command that exits 0 once the action is done and fails until then, e.g. "npm whoami" or "gh auth status". It runs in the thread\'s directory without a terminal, so it must not prompt. Leave it out if no command can tell.',
       },
     },
     required: ['action'],
