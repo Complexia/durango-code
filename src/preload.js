@@ -88,6 +88,7 @@ contextBridge.exposeInMainWorld('orion', {
   listMcps: () => ipcRenderer.invoke('mcps:list'),
   setMcpEnabled: (input) => ipcRenderer.invoke('mcps:setEnabled', input),
   listOrionMcps: () => ipcRenderer.invoke('orionMcps:list'),
+  listAccountConnectors: () => ipcRenderer.invoke('accountConnectors:list'),
   addOrionMcp: (input) => ipcRenderer.invoke('orionMcps:add', input),
   updateOrionMcp: (input) => ipcRenderer.invoke('orionMcps:update', input),
   removeOrionMcp: (input) => ipcRenderer.invoke('orionMcps:remove', input),

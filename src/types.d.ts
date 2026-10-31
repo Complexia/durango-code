@@ -190,6 +190,24 @@ export type OrionMcpsListResult = {
   error?: string;
 };
 
+/** A connector from the Durango account (durango.sh Settings → Connectors), loaded as an MCP server. */
+export type AccountConnectorEntry = {
+  id: string;
+  kind: string;
+  name: string;
+  /** MCP server name agents see (mcp__<serverName>__*). */
+  serverName: string;
+};
+
+export type AccountConnectorsListResult = {
+  ok: boolean;
+  signedIn: boolean;
+  connectors: AccountConnectorEntry[];
+  /** durango.sh Settings → Connectors, where they're added and removed. */
+  manageUrl?: string;
+  error?: string;
+};
+
 /** Where a provider-configured MCP server comes from. */
 export type ProviderMcpSource = {
   id: string;
@@ -1003,6 +1021,7 @@ type OrionCodexBrowserIntegrationStatus = {
       listMcps?: () => Promise<McpsListResult>;
       setMcpEnabled?: (input: { id: string; enabled: boolean }) => Promise<{ ok: boolean; error?: string }>;
       listOrionMcps?: () => Promise<OrionMcpsListResult>;
+      listAccountConnectors?: () => Promise<AccountConnectorsListResult>;
       /** Signs in through the browser when the server requires OAuth, then lists its tools. */
       addOrionMcp?: (input: AddOrionMcpInput) => Promise<{
         ok: boolean;

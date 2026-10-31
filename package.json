@@ -24,6 +24,7 @@
     "test:skills": "electron scripts/test-skills.mjs",
     "test:mcps": "electron scripts/test-mcps.mjs",
     "test:orion-mcps": "node scripts/run-electron-test.mjs scripts/test-orion-mcps.mjs",
+    "test:account-connectors": "node --no-warnings scripts/test-account-connectors.mjs",
     "test:provider-mcps": "node scripts/run-electron-test.mjs scripts/test-provider-mcps.mjs",
     "test:thread-mentions": "node --no-warnings --experimental-strip-types scripts/test-thread-mentions.mjs",
     "test:model-mentions": "bun scripts/test-model-mentions.ts",

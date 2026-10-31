@@ -92,7 +92,8 @@ import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvi
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { deleteSkill, ensureBundledSkills, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
 import { listMcps, readMcpRuntimeConfig, setMcpEnabled } from './main/mcps.js';
-import { addOrionMcp, cancelOrionMcpSignIn, claudeOrionMcpServers, listOrionMcps, museOrionMcpServers, reconnectOrionMcp, removeOrionMcp, resolveOrionMcpsForRun, updateOrionMcp, withCodexOrionMcps } from './main/orion-mcps.js';
+import { addOrionMcp, cancelOrionMcpSignIn, claudeOrionMcpServers, listOrionMcps, museOrionMcpServers, reconnectOrionMcp, removeOrionMcp, reservedNicknames, resolveOrionMcpsForRun, updateOrionMcp, withCodexOrionMcps } from './main/orion-mcps.js';
+import { createAccountConnectors } from './main/account-connectors.js';
 import { assertOpenCodeMcpNamesAvailable, listProviderMcps, shareProviderMcp, withoutClaudeNativeMcps, withoutCodexNativeMcps } from './main/provider-mcps.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
@@ -696,6 +697,13 @@ configureFxProvider({
   readGatewayApiKey: readFxGatewayApiKey,
 });
 const durangoProfileMemory = createProfileMemoryCache({ getClient: () => durangoClient });
+// MCP servers from the Durango account (durango.sh Settings → Connectors),
+// added to runs next to Durango Code's own MCP servers while signed in.
+const accountConnectors = createAccountConnectors({
+  getClient: () => durangoClient,
+  isSignedIn: async () => durangoMock || Boolean(await readAccountSession()),
+  reservedNames: reservedNicknames,
+});
 // Lazily connect an already-signed-in user (startup) or a fresh sign-in, off
 // the critical path; tools mint on demand anyway if this fails.
 const warmDurangoKey = () => {
@@ -718,6 +726,7 @@ const clearAccountSession = async ({ preserveRepository = false } = {}) => {
     ? Promise.resolve()
     : durangoCredentials.clear({ revokeRemote: true, session: inMemoryAccountSession });
   durangoProfileMemory.clear();
+  accountConnectors.clear();
   inMemoryAccountSession = null;
   // Authorization ends when sign-out begins, not after the session file has
   // finished being removed. This synchronously closes remote listeners and
@@ -908,6 +917,7 @@ const handleDesktopAuthCallback = async (rawUrl) => {
     // A key left over from an expired session is revoked with the new one.
     await durangoCredentials.clear({ revokeRemote: true, session }).catch(() => {});
     durangoProfileMemory.clear();
+    accountConnectors.clear();
     await writeAccountSession(session);
     repositoryCredentials.resume();
     await publishAccountState(session);
@@ -4718,6 +4728,12 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         return { ok: false, error: error.message };
       }
     }
+    // Connectors from the Durango account join Durango Code's own servers.
+    // Best effort: they never make a turn fail, and Muse only runs stdio.
+    const accountMcps =
+      input.aside || input.codexReview || model.providerId === 'muse'
+        ? []
+        : await accountConnectors.forRun({ taken: orionMcps.servers.map((server) => server.name) });
     if (orionMcps.needsSignIn.length > 0) {
       emitAgentEvent(event.sender, {
         runId,
@@ -4760,7 +4776,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           ...input,
           // Servers shared from Claude Code already load from its own config.
           orionMcpServers: claudeOrionMcpServers(
-            await withoutClaudeNativeMcps(orionMcps.servers, input.projectPath)
+            await withoutClaudeNativeMcps([...orionMcps.servers, ...accountMcps], input.projectPath)
           ),
         },
         model,
@@ -4829,6 +4845,22 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       typeof input.providerOptions?.extraArgs === 'string' &&
       input.providerOptions.extraArgs.trim().length > 0;
     const codexShellCwd = codexHasProcessArgs ? input.projectPath : os.homedir();
+    // Reuse equivalent native servers and reject unsafe name collisions. A
+    // collision caused by an account connector drops the account connectors
+    // instead of failing the turn.
+    const codexMcpServers = async () => {
+      const options = {
+        cwd: input.projectPath,
+        shellCwd: codexShellCwd,
+        configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
+      };
+      if (accountMcps.length === 0) return withoutCodexNativeMcps(orionMcps.servers, options);
+      try {
+        return await withoutCodexNativeMcps([...orionMcps.servers, ...accountMcps], options);
+      } catch {
+        return withoutCodexNativeMcps(orionMcps.servers, options);
+      }
+    };
     let runtimeInput =
       useCodexAppServer
         ? {
@@ -4839,23 +4871,26 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
                 shellCwd: codexShellCwd,
                 configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
               }),
-              // Reuse equivalent native servers and reject unsafe name collisions.
-              await withoutCodexNativeMcps(orionMcps.servers, {
-                cwd: input.projectPath,
-                shellCwd: codexShellCwd,
-                configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
-              }),
+              await codexMcpServers(),
               input.accessMode || 'full-access'
             ),
           }
         : input;
     // Check before allocating a bridge or passing credentials to OpenCode.
+    let bridgeAccountMcps = accountMcps;
     if (model.providerId === 'opencode') {
-      try {
-        await assertOpenCodeMcpNamesAvailable(orionMcps.servers, {
+      const assertNames = (servers) =>
+        assertOpenCodeMcpNamesAvailable(servers, {
           cwd: input.projectPath,
           providerOptions: input.providerOptions,
           signal: startupController.signal,
+        });
+      try {
+        await assertNames([...orionMcps.servers, ...accountMcps]).catch(async (error) => {
+          // Account connectors whose names OpenCode already uses are left out.
+          if (accountMcps.length === 0 || startupController.signal.aborted) throw error;
+          bridgeAccountMcps = [];
+          await assertNames(orionMcps.servers);
         });
       } catch (error) {
         if (!startupController.signal.aborted) throw error;
@@ -4908,7 +4943,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             providerId: model.providerId,
             accessMode: input.accessMode || 'full-access',
             // Codex receives these through its app-server config instead.
-            userServers: model.providerId === 'codex' ? [] : orionMcps.servers,
+            userServers: model.providerId === 'codex' ? [] : [...orionMcps.servers, ...bridgeAccountMcps],
           });
     const openCodeConfig =
       model.providerId === 'opencode'
@@ -7135,6 +7170,10 @@ ipcMain.handle('mcps:setEnabled', async (_event, input) =>
 
 // MCP servers connected to Orion itself (any provider, @-mentionable).
 ipcMain.handle('orionMcps:list', async () => listOrionMcps());
+ipcMain.handle('accountConnectors:list', async () => ({
+  ...(await accountConnectors.list()),
+  manageUrl: new URL('/?settings=connectors', await durangoClient.baseUrl()).toString(),
+}));
 ipcMain.handle('orionMcps:add', async (_event, input) => addOrionMcp(input));
 ipcMain.handle('orionMcps:update', async (_event, input) => updateOrionMcp(input));
 ipcMain.handle('orionMcps:remove', async (_event, input) => removeOrionMcp(input));

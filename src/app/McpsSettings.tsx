@@ -1,7 +1,7 @@
 import React from 'react';
-import { Globe, LogIn, Plus, RefreshCw, Share2, TerminalSquare, Trash2 } from 'lucide-react';
+import { ExternalLink, Globe, LogIn, Plus, RefreshCw, Share2, TerminalSquare, Trash2 } from 'lucide-react';
 import { useOrionStore } from '../store';
-import type { OrionMcpEntry, ProviderMcpEntry, ProviderMcpSource, ProviderMcpsListResult } from '../types';
+import type { AccountConnectorsListResult, OrionMcpEntry, ProviderMcpEntry, ProviderMcpSource, ProviderMcpsListResult } from '../types';
 import { parseKeyValueLines, splitCommandLine, suggestMcpNickname } from './orionMcps';
 
 // Settings and the composer's @-mention list share the connected-server list;
@@ -818,10 +818,128 @@ const ProviderMcpsSection = React.memo(function ProviderMcpsSection() {
   );
 });
 
+// Connectors added on durango.sh (Settings → Connectors). Read-only here:
+// they're managed on the account, and runs load them next to the servers above.
+const AccountConnectorsSection = React.memo(function AccountConnectorsSection() {
+  const [result, setResult] = React.useState<AccountConnectorsListResult | null>(null);
+  const [loading, setLoading] = React.useState(true);
+
+  const refresh = React.useCallback(async () => {
+    if (!window.orion?.listAccountConnectors) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    try {
+      setResult(await window.orion.listAccountConnectors());
+    } catch (caught) {
+      setResult({ ok: false, signedIn: true, connectors: [], error: caught instanceof Error ? caught.message : String(caught) });
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  if (!window.orion?.listAccountConnectors) return null;
+  const connectors = result?.connectors ?? [];
+
+  return (
+    <>
+      <div className="settings-group-label">From your Durango account</div>
+      <div className="settings-group">
+        <div className="skills-toolbar">
+          <div className="skills-toolbar-main">
+            <div className="skills-toolbar-total">
+              {loading && !result
+                ? 'Reading connectors...'
+                : result?.signedIn === false
+                  ? 'Not signed in to Durango'
+                  : `${connectors.length} connector${connectors.length === 1 ? '' : 's'}`}
+            </div>
+            <div className="skills-toolbar-caption">
+              Apps and MCP servers you connect in Durango (Settings → Connectors) load in every run while Durango Code is
+              signed in to the same account. Their sign-ins stay on Durango; a server above with the same name takes
+              precedence.
+            </div>
+          </div>
+          <div className="skills-toolbar-actions">
+            <button
+              type="button"
+              className="btn secondary small"
+              disabled={loading}
+              onClick={() => void refresh()}
+              title="Re-read connectors from your Durango account"
+            >
+              <RefreshCw size={13} className={loading ? 'spinning' : ''} />
+              Refresh
+            </button>
+            {result?.manageUrl && result.signedIn !== false && (
+              <button
+                type="button"
+                className="btn secondary small"
+                onClick={() => void window.orion?.openExternalUrl(result.manageUrl!)}
+                title="Add or remove connectors on Durango"
+              >
+                <ExternalLink size={13} />
+                Manage
+              </button>
+            )}
+          </div>
+        </div>
+
+        {result?.ok === false && result.error && <div className="skills-message error">{result.error}</div>}
+
+        {result?.signedIn === false && (
+          <div className="setting-row">
+            <div className="setting-label">
+              <div className="setting-label-desc">
+                Sign in to Durango (Settings → Account) to use the connectors on your account. The MCP servers above work
+                without it.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {result?.signedIn && result.ok && connectors.length === 0 && (
+          <div className="setting-row">
+            <div className="setting-label">
+              <div className="setting-label-desc">
+                No connectors on your Durango account yet. Connect Notion or any remote MCP server there and it shows up
+                here.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {connectors.length > 0 && (
+          <div className="skills-list">
+            {connectors.map((connector) => (
+              <div key={connector.id} className="skills-row">
+                <div className="skills-row-main">
+                  <div className="skills-row-head">
+                    <div className="mcp-row-name truncate" title={connector.name}>
+                      {connector.name}
+                    </div>
+                  </div>
+                  <div className="skills-row-desc">Durango connector · mcp__{connector.serverName}__*</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </>
+  );
+});
+
 const McpsSettings = React.memo(function McpsSettings() {
   return (
     <>
       <OrionMcpsSection />
+      <AccountConnectorsSection />
       <ProviderMcpsSection />
     </>
   );

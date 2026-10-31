@@ -341,6 +341,30 @@ export const DISPATCH_CLAIM_WAIT_MS = 25_000;
 const DISPATCH_CLAIM_TIMEOUT_MS = DISPATCH_CLAIM_WAIT_MS + 15_000;
 const ATTACHMENT_TIMEOUT_MS = 60_000;
 
+// An account connector (durango.sh Settings → Connectors) as an MCP server.
+// Only Durango's connector proxy path is accepted, rebuilt on the origin this
+// device's key belongs to: the key rides along as the server's Authorization
+// header and must never go anywhere else (or be lost to a host alias).
+const CONNECTOR_PROXY_PATH = /^\/api\/v1\/connectors\/[A-Za-z0-9_-]{1,64}\/mcp$/;
+const normalizeConnector = (connector, baseUrl) => {
+  const serverName = str(connector?.serverName).trim();
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(serverName)) return null;
+  let pathname;
+  try {
+    pathname = new URL(str(connector?.url)).pathname;
+  } catch {
+    return null;
+  }
+  if (!CONNECTOR_PROXY_PATH.test(pathname)) return null;
+  return {
+    id: str(connector.id),
+    kind: str(connector.kind) || 'custom',
+    name: str(connector.name) || serverName,
+    serverName,
+    url: new URL(pathname, baseUrl).toString(),
+  };
+};
+
 const normalizeDispatch = (dispatch) => {
   if (!dispatch || typeof dispatch !== 'object' || typeof dispatch.id !== 'string' || !dispatch.id) return null;
   const project = dispatch.project && typeof dispatch.project === 'object' ? dispatch.project : {};
@@ -565,6 +589,21 @@ export const createDurangoClient = ({
         total: Number.isFinite(Number(data.total)) ? Number(data.total) : null,
       };
     },
+    /**
+     * The account's connectors as MCP servers, plus the Authorization header
+     * that reaches them (this device's key; durango.sh holds the upstream
+     * credentials).
+     */
+    async listConnectors({ timeout } = {}) {
+      const data = await request('GET', '/connectors', timeout ? { timeout } : {});
+      const credential = await credentials.get();
+      return {
+        connectors: (Array.isArray(data.connectors) ? data.connectors : [])
+          .map((connector) => normalizeConnector(connector, credential.baseUrl))
+          .filter(Boolean),
+        authorization: `Bearer ${credential.key}`,
+      };
+    },
     async recallMemory(query) {
       const data = await request('POST', '/memory/recall', { body: { query: str(query).trim() } });
       return { facts: (Array.isArray(data.facts) ? data.facts : []).map(normalizeFact).filter((fact) => fact.text) };
@@ -778,6 +817,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
         { id: 'm1', role: 'user', content: 'Mock chat message.', createdAt: '2026-10-01T00:00:00.000Z' },
       ]).map(normalizeMessage);
       return { data, nextCursor: null, total: data.length };
+    },
+    async listConnectors() {
+      return { connectors: [], authorization: 'Bearer dgo_mock' };
     },
     async recallMemory() {
       return {
