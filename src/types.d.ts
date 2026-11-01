@@ -743,6 +743,22 @@ type OrionComputerUsePermissions = {
   chromeDebug: OrionChromeDebugStatus;
 };
 
+type OrionSnapShotState = {
+  supported: boolean;
+  settings: import('./store').SnapShotSettings;
+  /** The capture helper: ready, being compiled (development), or missing. */
+  helper: 'unknown' | 'ready' | 'building' | 'missing' | 'unsupported';
+  trigger:
+    | { kind: 'off'; fallback: boolean; error: string | null }
+    | { kind: 'modifier-pair'; modifier: 'shift'; fallback: boolean; error: string | null }
+    | { kind: 'accelerator'; accelerator: string; fallback: boolean; error: string | null };
+  capturing: boolean;
+  lastError: { message: string; at: string } | null;
+  pendingCount: number;
+  screenRecording: OrionComputerUsePermissionStatus;
+  accessibility: OrionComputerUsePermissionStatus;
+};
+
 type OrionChromeDebugStatus = {
   /** enabled: server reachable; stale: configured but Chrome needs restart; disabled: not configured */
   status: 'enabled' | 'stale' | 'disabled' | 'unsupported';
@@ -1570,6 +1586,14 @@ type OrionCodexBrowserIntegrationStatus = {
       workspaceSyncNow?: () => Promise<OrionWorkspaceSyncStatus>;
       workspaceSyncGetState?: () => Promise<OrionWorkspaceSyncStatus>;
       onWorkspaceSyncState?: (cb: (state: OrionWorkspaceSyncStatus) => void) => () => void;
+      // SnapShot (Settings > Computer Use > SnapShot, macOS)
+      snapShotConfigure?: (settings: import('./store').SnapShotSettings) => Promise<OrionSnapShotState>;
+      snapShotGetState?: () => Promise<OrionSnapShotState>;
+      snapShotTakePending?: () => Promise<import('./store').FileAttachment[]>;
+      snapShotCaptureNow?: () => Promise<{ ok: boolean; count?: number; error?: string }>;
+      onSnapShotAvailable?: (cb: () => void) => () => void;
+      onSnapShotState?: (cb: (state: OrionSnapShotState) => void) => () => void;
+      onSnapShotError?: (cb: (error: { message: string; at: string }) => void) => () => void;
       // Remote control (Settings > Remote Control, sidebar Machines section)
       remoteControlGetState?: () => Promise<RemoteControlState>;
       remoteControlConfigure?: (settings: {

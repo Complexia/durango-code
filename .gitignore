@@ -93,3 +93,6 @@ dist/
 
 # Electron-Forge
 out/
+
+# SnapShot helper build output (scripts/build-snapshot-helper.mjs)
+native/snapshot-helper/build/

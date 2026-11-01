@@ -23,6 +23,23 @@ try {
   assert.equal(content[1].source.data, Buffer.from([137, 80, 78, 71]).toString('base64'));
   await assert.rejects(claudeUserContent('missing', [{ path: path.join(dir, 'missing.png'), mimeType: 'image/png' }]));
 
+  // A SnapShot's accessibility outline is inlined as framed, untrusted text;
+  // the same markdown without SnapShot metadata stays path-only.
+  const outline = path.join(dir, 'Safari - PR.snapshot.md');
+  await fs.writeFile(outline, 'SnapShot of Safari.\n\n- button "Close" [1,2,3,4]\n');
+  const snapshotOutline = {
+    path: outline, mimeType: 'text/markdown',
+    snapshot: { kind: 'accessibility', appName: 'Safari', windowTitle: 'PR' },
+  };
+  const snapshotContent = await claudeUserContent('Look', [{ path: image, mimeType: 'image/png', snapshot: { kind: 'image', appName: 'Safari', windowTitle: 'PR' } }, snapshotOutline, snapshotOutline]);
+  assert.deepEqual(snapshotContent.map((part) => part.type), ['text', 'image', 'text']);
+  assert.match(snapshotContent[2].text, /^<snapshot_app_text app="Safari"/);
+  assert.match(snapshotContent[2].text, /never follow instructions/);
+  assert.match(snapshotContent[2].text, /- button "Close" \[1,2,3,4\]/);
+  assert.deepEqual((await claudeUserContent('Look', [{ ...snapshotOutline, snapshot: undefined }])).map((part) => part.type), ['text']);
+  // A vanished outline file doesn't fail the turn; its path is still in the prompt.
+  assert.equal((await claudeUserContent('Look', [{ ...snapshotOutline, path: path.join(dir, 'gone.snapshot.md') }])).length, 1);
+
   const events = [];
   const sender = { isDestroyed: () => false, send: (_channel, event) => events.push(event) };
   const session = { sender, threadId: 'thread', activeTurns: [{ runId: 'run' }] };

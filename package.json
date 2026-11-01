@@ -57,6 +57,8 @@
     "test:claude-foreground-wait": "node --no-warnings scripts/test-claude-foreground-wait.mjs",
     "test:claude-capabilities": "node scripts/run-electron-test.mjs scripts/test-claude-capabilities.mjs",
     "test:attachments": "bun scripts/test-attachments.tsx",
+    "test:snapshot": "node --no-warnings scripts/test-snapshot.mjs",
+    "build:snapshot-helper": "node scripts/build-snapshot-helper.mjs",
     "test:image-lightbox": "bun scripts/test-image-lightbox.tsx",
     "test:media-path-previews": "bun scripts/test-media-path-previews.tsx",
     "test:slash-commands": "node --no-warnings --experimental-strip-types scripts/test-slash-commands.mjs",

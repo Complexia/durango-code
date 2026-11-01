@@ -138,6 +138,7 @@ import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, h
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
 import { bundledCliBinDir, bundledCliEntry, bundledCliVersion, ensureCliSignedIn, installBundledCliShims, readCliCredential } from './main/bundled-cli.js';
 import { installGitCredentialHelper } from './main/git-credential-helper.js';
+import { disposeSnapShot, registerSnapShotIpc, startSnapShot } from './main/snapshot.js';
 import {
   createDurangoWorkspace,
   durangoWorkspaceStatus,
@@ -1077,6 +1078,7 @@ const createWindow = () => {
   }
 
   // DevTools can still be opened manually from the Electron menu when needed.
+  return mainWindow;
 };
 
 // First-party skills install in the background; only the skills list and
@@ -1316,6 +1318,7 @@ app.whenReady().then(async () => {
   });
 
   createWindow();
+  void startSnapShot().catch((error) => console.error('Could not start SnapShot', error));
   await remoteControlReady;
 
   const startupAuthUrl = process.argv.find((arg) => isDesktopAuthCallbackUrl(arg));
@@ -1509,6 +1512,7 @@ const appShutdownError = () =>
     : 'Durango Code is shutting down.';
 
 app.on('will-quit', (event) => {
+  disposeSnapShot();
   shutdownWorkspaceSync();
   shutdownRemoteControl();
   dispatchWorker.stop();
@@ -1536,6 +1540,7 @@ const settleQuitBarrierForUpdate = async () => {
   // Stop remote lifecycle work before taking the persistence-queue snapshot.
   // Otherwise a pairing/revoke could start after this pre-drain and be skipped
   // when will-quit sees the already-satisfied updater barrier.
+  disposeSnapShot();
   shutdownWorkspaceSync();
   shutdownRemoteControl();
   dispatchWorker.stop();
@@ -4108,6 +4113,10 @@ ipcMain.handle('computerUse:openChromeDebugSetup', async () => {
     return { ok: false, error: getProcessErrorMessage(error) };
   }
 });
+
+// SnapShot (Settings → Computer Use → SnapShot): a capture taken while no
+// window is open opens one; never while the app is quitting.
+registerSnapShotIpc({ createWindow: () => (appShutdownRequested ? null : createWindow()) });
 
 ipcMain.handle('app:relaunch', () => {
   app.relaunch();

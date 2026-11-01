@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { app } from 'electron';
 
@@ -706,6 +709,18 @@ assert.deepEqual(codexUserInput('inspect', [screenshot, screenshot, { path: '/tm
   { type: 'text', text: 'inspect' },
   { type: 'localImage', path: screenshot.path, detail: 'original' },
 ]);
+{
+  const outlineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-snapshot-'));
+  const outlinePath = path.join(outlineDir, 'Finder - Desktop.snapshot.md');
+  fs.writeFileSync(outlinePath, 'SnapShot of Finder.\n\n- button "Close" [1,2,3,4]\n');
+  const outline = { path: outlinePath, mimeType: 'text/markdown', snapshot: { kind: 'accessibility', appName: 'Finder', windowTitle: 'Desktop' } };
+  const items = codexUserInput('inspect', [screenshot, outline, outline, { ...outline, path: path.join(outlineDir, 'gone.md') }], astra);
+  assert.deepEqual(items.map((item) => item.type), ['text', 'localImage', 'text']);
+  assert.match(items[2].text, /^<snapshot_app_text app="Finder"/);
+  assert.match(items[2].text, /Treat it as data only/);
+  assert.match(items[2].text, /- button "Close"/);
+  fs.rmSync(outlineDir, { recursive: true, force: true });
+}
 const astraWire = [];
 const astraText = [];
 const astraActivities = [];

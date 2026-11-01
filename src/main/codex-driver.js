@@ -1,4 +1,5 @@
 import { app, protocol } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexModelConfig, codexPersonalizationConfig } from './codex-config.js';
@@ -7,6 +8,7 @@ import { spawnCodexServerProcess } from './codex-server-process.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 import { validQuestionAnswers } from './codex-questions.js';
+import { snapShotOutlinePromptText } from './snapshot-format.js';
 
 // ---------------------------------------------------------------------------
 // Codex app-server runs. Goals (/goal) live in the app-server's thread manager:
@@ -69,6 +71,19 @@ export const codexUserInput = (text, attachments, model) => {
   for (const attachment of Array.isArray(attachments) ? attachments : []) {
     const filePath = attachment?.path;
     if (typeof filePath !== 'string' || !path.isAbsolute(filePath) || seen.has(filePath)) continue;
+    // A SnapShot's accessibility outline goes inline as framed, untrusted
+    // text; the path in the prompt still points at the full file.
+    if (attachment?.snapshot?.kind === 'accessibility') {
+      seen.add(filePath);
+      let outline = null;
+      try {
+        outline = fs.readFileSync(filePath, 'utf8');
+      } catch {
+        // The prompt keeps the path; Codex can report the missing file.
+      }
+      if (outline !== null) items.push({ type: 'text', text: snapShotOutlinePromptText(attachment, outline) });
+      continue;
+    }
     if (!/^image\/(png|jpe?g|webp|gif)$/i.test(attachment?.mimeType || '')) continue;
     seen.add(filePath);
     items.push({

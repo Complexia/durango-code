@@ -162,6 +162,7 @@ import {
   isImageFile,
   isVideoFile,
 } from './app/attachments';
+import { SnapShotAttachmentBadge, openSnapShotOutline } from './app/SnapShotSettings';
 import {
   AgentFamilySwitcher,
   type ChatScrollPosition,
@@ -798,6 +799,7 @@ const App: React.FC = () => {
     setWorkspaceSyncSettings,
     remoteControlSettings,
     setRemoteControlSettings,
+    snapShotSettings,
     deploymentSettings,
     setDeploymentSettings,
     sidebarV2Settings,
@@ -862,6 +864,7 @@ const App: React.FC = () => {
       setWorkspaceSyncSettings: state.setWorkspaceSyncSettings,
       remoteControlSettings: state.remoteControlSettings,
       setRemoteControlSettings: state.setRemoteControlSettings,
+      snapShotSettings: state.snapShotSettings,
       deploymentSettings: state.deploymentSettings,
       setDeploymentSettings: state.setDeploymentSettings,
       sidebarV2Settings: state.sidebarV2Settings,
@@ -5304,25 +5307,51 @@ const App: React.FC = () => {
     return id;
   };
 
+  // The thread new attachments go to: the selected one, or a new thread in
+  // the selected project when none is open. Brings the composer forward.
+  const resolveComposerTarget = useCallback(() => {
+    let targetThreadId = selectedThreadId;
+    if (!targetThreadId) {
+      const projectId = selectedProject?.id ?? projects[0]?.id;
+      if (!projectId) {
+        toast.error('Add a project before attaching files');
+        return null;
+      }
+      targetThreadId = handleCreateThread(projectId);
+    }
+
+    if (activeTab !== 'agents') {
+      setActiveTab('agents');
+    }
+    selectThread(targetThreadId);
+    return targetThreadId;
+  }, [activeTab, handleCreateThread, projects, selectThread, selectedProject?.id, selectedThreadId, setActiveTab]);
+
+  // Appends already-saved files to a thread's draft. The composer only holds
+  // the draft of the thread it shows; a thread it is about to switch to (just
+  // selected or created) gets them in its saved draft, which the swap effect
+  // loads.
+  const appendComposerAttachments = useCallback((threadId: string, attachments: FileAttachment[]) => {
+    if (attachments.length === 0) return;
+    if (composerDraftKeyRef.current === threadId) {
+      setChatAttachments((current) => [...current, ...attachments]);
+      return;
+    }
+    const draft = composerDraftsRef.current.get(threadId) ??
+      useOrionStore.getState().composerDrafts[threadId] ?? { text: '', attachments: [] };
+    const nextDraft = { ...draft, attachments: [...draft.attachments, ...attachments] };
+    composerDraftsRef.current.set(threadId, nextDraft);
+    useOrionStore.getState().setComposerDraft(threadId, nextDraft);
+    setTypedDraftThreadIds((prev) => (prev.has(threadId) ? prev : new Set(prev).add(threadId)));
+  }, []);
+
   const attachFiles = useCallback(
     async (files: FileList | File[]) => {
       const selectedFiles = Array.from(files);
       if (selectedFiles.length === 0) return false;
 
-      let targetThreadId = selectedThreadId;
-      if (!targetThreadId) {
-        const projectId = selectedProject?.id ?? projects[0]?.id;
-        if (!projectId) {
-          toast.error('Add a project before attaching files');
-          return true;
-        }
-        targetThreadId = handleCreateThread(projectId);
-      }
-
-      if (activeTab !== 'agents') {
-        setActiveTab('agents');
-      }
-      selectThread(targetThreadId);
+      const targetThreadId = resolveComposerTarget();
+      if (!targetThreadId) return true;
 
       const saveAttachment = window.orion?.saveAttachment ?? window.orion?.saveImageAttachment;
       if (!saveAttachment) {
@@ -5371,14 +5400,59 @@ const App: React.FC = () => {
         }
       }
 
-      if (savedAttachments.length > 0) {
-        setChatAttachments((current) => [...current, ...savedAttachments]);
-      }
+      appendComposerAttachments(targetThreadId, savedAttachments);
 
       return true;
     },
-    [activeTab, handleCreateThread, projects, selectThread, selectedProject?.id, selectedThreadId, setActiveTab]
+    [appendComposerAttachments, resolveComposerTarget]
   );
+
+  // SnapShot captures (src/main/snapshot.js) wait in main until collected:
+  // on mount, and whenever main announces one. They join the selected
+  // thread's draft even while it runs. The listener mounts once and reaches
+  // the current target through this ref.
+  const takeSnapShotsRef = useRef<() => Promise<void>>(async () => {});
+  takeSnapShotsRef.current = async () => {
+    const attachments = (await window.orion?.snapShotTakePending?.()) ?? [];
+    if (attachments.length === 0) return;
+    const targetThreadId = resolveComposerTarget();
+    if (!targetThreadId) return;
+    setSettingsOpen(false);
+    appendComposerAttachments(targetThreadId, attachments);
+    const capture = attachments.find((attachment) => attachment.snapshot)?.snapshot;
+    if (capture) toast.success(`SnapShot of ${capture.appName} attached`);
+  };
+  useEffect(() => {
+    if (!window.orion?.snapShotTakePending) return undefined;
+    let hydrationUnsubscribe = () => {};
+    const take = () => void takeSnapShotsRef.current().catch(() => {});
+    // Before hydration the selected thread is unknown; collect afterwards.
+    if (useOrionStore.persist.hasHydrated()) take();
+    else hydrationUnsubscribe = useOrionStore.persist.onFinishHydration(take);
+    const unsubscribeAvailable = window.orion.onSnapShotAvailable?.(() => {
+      if (useOrionStore.persist.hasHydrated()) take();
+    });
+    const unsubscribeError = window.orion.onSnapShotError?.((error) => {
+      toast.error(error.message);
+    });
+    return () => {
+      hydrationUnsubscribe();
+      unsubscribeAvailable?.();
+      unsubscribeError?.();
+    };
+  }, []);
+
+  // Main arms the SnapShot trigger from its own copy of these settings at
+  // launch; push the persisted ones after hydration and on every change.
+  useEffect(() => {
+    if (!window.orion?.snapShotConfigure) return undefined;
+    const push = () => void window.orion?.snapShotConfigure?.(useOrionStore.getState().snapShotSettings);
+    if (useOrionStore.persist.hasHydrated()) {
+      push();
+      return undefined;
+    }
+    return useOrionStore.persist.onFinishHydration(push);
+  }, [snapShotSettings]);
 
   const handleRootDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
     if (!Array.from(event.dataTransfer.types).includes('Files')) return;
@@ -9420,9 +9494,26 @@ const App: React.FC = () => {
         {chatAttachments.length > 0 && (
           <div className="composer-attachments">
             {chatAttachments.map((attachment) => (
-              <div key={attachment.id} className="composer-attachment" title={attachment.path}>
+              <div
+                key={attachment.id}
+                className={`composer-attachment${attachment.snapshot?.kind === 'accessibility' ? ' cursor-pointer' : ''}`}
+                title={
+                  attachment.snapshot?.kind === 'accessibility'
+                    ? `Open the app text captured from ${attachment.snapshot.appName}\n${attachment.path}`
+                    : attachment.path
+                }
+                onClick={
+                  attachment.snapshot?.kind === 'accessibility'
+                    ? (event) => {
+                        if ((event.target as HTMLElement).closest('button')) return;
+                        void openSnapShotOutline(attachment.path);
+                      }
+                    : undefined
+                }
+              >
                 <AttachmentThumb attachment={attachment} />
                 <span className="composer-attachment-meta">
+                  {attachment.snapshot && <SnapShotAttachmentBadge snapshot={attachment.snapshot} />}
                   <span className="composer-attachment-name">{attachment.name}</span>
                   <span className="composer-attachment-size">
                     {formatAttachmentSize(attachment.size)}

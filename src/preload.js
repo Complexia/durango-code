@@ -334,6 +334,27 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('durango:focusThread', listener);
   },
 
+  // SnapShot (Settings → Computer Use → SnapShot, macOS)
+  snapShotConfigure: (settings) => ipcRenderer.invoke('snapshot:configure', settings),
+  snapShotGetState: () => ipcRenderer.invoke('snapshot:getState'),
+  snapShotTakePending: () => ipcRenderer.invoke('snapshot:takePending'),
+  snapShotCaptureNow: () => ipcRenderer.invoke('snapshot:captureNow'),
+  onSnapShotAvailable: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('snapshot:available', listener);
+    return () => ipcRenderer.removeListener('snapshot:available', listener);
+  },
+  onSnapShotState: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('snapshot:state', listener);
+    return () => ipcRenderer.removeListener('snapshot:state', listener);
+  },
+  onSnapShotError: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('snapshot:error', listener);
+    return () => ipcRenderer.removeListener('snapshot:error', listener);
+  },
+
   workspaceSyncConfigure: (settings) => ipcRenderer.invoke('sync:configure', settings),
   workspaceSyncNow: () => ipcRenderer.invoke('sync:now'),
   workspaceSyncGetState: () => ipcRenderer.invoke('sync:getState'),

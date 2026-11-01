@@ -260,6 +260,45 @@ export type RemoteControlSettings = {
   connectionMode: 'direct' | 'relay';
 };
 
+/**
+ * SnapShot (macOS): a global trigger captures the window you're working in
+ * and attaches it to the selected thread's draft. Main mirrors these to
+ * userData/snapshot.json (src/main/snapshot.js) so the trigger is armed at
+ * launch; normalizeSnapShotSettings there validates them.
+ */
+export type SnapShotSettings = {
+  enabled: boolean;
+  /** Also attach the window's accessibility outline (needs Accessibility). */
+  includeAppText: boolean;
+  shortcut:
+    | { kind: 'modifier-pair'; modifier: 'shift' }
+    | { kind: 'accelerator'; accelerator: string };
+  /** Play the screenshot sound on capture. */
+  sound: boolean;
+};
+
+export const defaultSnapShotSettings: SnapShotSettings = {
+  enabled: false,
+  includeAppText: true,
+  shortcut: { kind: 'modifier-pair', modifier: 'shift' },
+  sound: true,
+};
+
+/** Persisted (possibly older or hand-edited) SnapShot settings over the defaults. */
+export const mergeSnapShotSettings = (value: unknown): SnapShotSettings => {
+  const input = (value && typeof value === 'object' ? value : {}) as Partial<SnapShotSettings>;
+  const shortcut = input.shortcut as Partial<{ kind: string; accelerator: unknown }> | undefined;
+  return {
+    enabled: input.enabled === true,
+    includeAppText: input.includeAppText !== false,
+    shortcut:
+      shortcut?.kind === 'accelerator' && typeof shortcut.accelerator === 'string' && shortcut.accelerator
+        ? { kind: 'accelerator', accelerator: shortcut.accelerator }
+        : defaultSnapShotSettings.shortcut,
+    sound: input.sound !== false,
+  };
+};
+
 export const defaultRemoteControlSettings: RemoteControlSettings = {
   enabled: false,
   allowIncoming: false,
@@ -331,6 +370,17 @@ export type FileAttachment = {
   path: string;
   mimeType: string;
   size: number;
+  /** Set on the files of a SnapShot (window capture): the image, and the
+   * window's accessibility outline when app text was included. */
+  snapshot?: SnapShotAttachmentInfo;
+};
+
+export type SnapShotAttachmentInfo = {
+  kind: 'image' | 'accessibility';
+  appName: string;
+  windowTitle: string;
+  bundleId?: string;
+  truncated?: boolean;
 };
 
 /** What the user typed into a thread's composer but has not sent yet. */
@@ -824,6 +874,7 @@ interface OrionState {
   workspaceSyncSettings: WorkspaceSyncSettings;
   durangoSettings: DurangoSettings;
   remoteControlSettings: RemoteControlSettings;
+  snapShotSettings: SnapShotSettings;
   deploymentSettings: DeploymentSettings;
   sidebarV2Settings: SidebarV2Settings;
   appearanceSettings: AppearanceSettings;
@@ -862,6 +913,7 @@ interface OrionState {
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   setDurangoSettings: (updates: Partial<DurangoSettings>) => void;
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
+  setSnapShotSettings: (updates: Partial<SnapShotSettings>) => void;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
   setSidebarV2Settings: (updates: Partial<SidebarV2Settings>) => void;
   setAppearanceSettings: (updates: Partial<AppearanceSettings>) => void;
@@ -1576,6 +1628,7 @@ export const useOrionStore = create<OrionState>()(
       workspaceSyncSettings: defaultWorkspaceSyncSettings,
       durangoSettings: defaultDurangoSettings,
       remoteControlSettings: defaultRemoteControlSettings,
+      snapShotSettings: defaultSnapShotSettings,
       deploymentSettings: defaultDeploymentSettings,
       sidebarV2Settings: defaultSidebarV2Settings,
       appearanceSettings: defaultAppearanceSettings,
@@ -1836,6 +1889,11 @@ export const useOrionStore = create<OrionState>()(
             ...state.remoteControlSettings,
             ...updates,
           },
+        })),
+
+      setSnapShotSettings: (updates) =>
+        set((state) => ({
+          snapShotSettings: mergeSnapShotSettings({ ...state.snapShotSettings, ...updates }),
         })),
 
       setDeploymentSettings: (updates) =>
@@ -2536,6 +2594,7 @@ export const useOrionStore = create<OrionState>()(
           ...defaultRemoteControlSettings,
           ...state.remoteControlSettings,
         },
+        snapShotSettings: mergeSnapShotSettings(state.snapShotSettings),
         deploymentSettings: {
           ...defaultDeploymentSettings,
           ...state.deploymentSettings,
@@ -2598,6 +2657,7 @@ export const useOrionStore = create<OrionState>()(
           ...defaultDeploymentSettings,
           ...merged.deploymentSettings,
         };
+        merged.snapShotSettings = mergeSnapShotSettings(merged.snapShotSettings);
         merged.appearanceSettings = { ...defaultAppearanceSettings, ...merged.appearanceSettings };
         // The Pinned group starts off on every launch; turning it on lasts
         // until the app quits. Stores from when sidebar v2 was opt-in turn it

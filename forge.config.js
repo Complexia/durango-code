@@ -21,6 +21,10 @@ const packagerTmpdir = path.join(
 // .desktop entry. macOS and Windows keep the "Durango Code" executable.
 const linuxExecutableName = 'durango-code';
 const isLinuxBuild = process.platform === 'linux';
+const isMacBuild = process.platform === 'darwin';
+// SnapShot's capture helper (native/snapshot-helper), compiled by the
+// prePackage hook below; src/main/snapshot.js runs it from Resources.
+const snapshotHelperBinary = path.join(__dirname, 'native', 'snapshot-helper', 'build', 'durango-snapshot');
 
 module.exports = {
   packagerConfig: {
@@ -38,6 +42,7 @@ module.exports = {
       path.join(__dirname, 'assets', 'bundled-skills'),
       // Tells electron-updater to update Linux installs through the .deb.
       ...(isLinuxBuild ? [path.join(__dirname, 'build', 'linux', 'package-type')] : []),
+      ...(isMacBuild ? [snapshotHelperBinary] : []),
     ],
     // Customer-facing bundle name. The bundle id, the internal app name
     // ("Orion", pinned in src/main/pin-app-identity.js), the userData path and
@@ -63,6 +68,13 @@ module.exports = {
   // Linux has no prebuild and is compiled.
   rebuildConfig: process.platform === 'win32' ? { ignoreModules: ['node-pty'] } : {},
   hooks: {
+    // A universal (arm64 + x86_64) SnapShot helper for every macOS package;
+    // osxSign then signs it with the app's identity and hardened runtime.
+    prePackage: async (_forgeConfig, platform) => {
+      if (platform !== 'darwin' || !isMacBuild) return;
+      const { buildSnapshotHelper } = await import('./scripts/build-snapshot-helper.mjs');
+      buildSnapshotHelper();
+    },
     // The Vite plugin packages only the `.vite` bundle (everything else is
     // ignored), so runtime externals must be copied into the app manually.
     // node-pty stays external (native module) — copy it and restore the

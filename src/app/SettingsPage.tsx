@@ -73,6 +73,7 @@ import type {
   WorkspaceSyncStatus,
 } from './appTypes';
 import { ReleaseNotesList } from './AppUpdateUi';
+import { SnapShotSettingsPanel } from './SnapShotSettings';
 
 const CODEX_BROWSER_EXTENSION_URL =
   'https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg';
@@ -251,7 +252,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     formatCheckedTime,
     formatBytes,
   } = props;
-  const [computerUseSubtab, setComputerUseSubtab] = React.useState<'permissions' | 'browser-use'>('permissions');
+  const [computerUseSubtab, setComputerUseSubtab] = React.useState<'permissions' | 'browser-use' | 'snapshot'>(
+    'permissions'
+  );
   const [skillsAndMcpsSubtab, setSkillsAndMcpsSubtab] = React.useState<'skills' | 'mcps'>('skills');
   // The fx row's Install button opens fx's options and starts the install
   // in its setup card.
@@ -1446,7 +1449,24 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 >
                   Browser use
                 </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={computerUseSubtab === 'snapshot'}
+                  className={`computer-use-subtab ${computerUseSubtab === 'snapshot' ? 'active' : ''}`}
+                  onClick={() => setComputerUseSubtab('snapshot')}
+                >
+                  SnapShot
+                </button>
               </div>
+
+              {computerUseSubtab === 'snapshot' && (
+                <SnapShotSettingsPanel
+                  computerUsePerms={computerUsePerms}
+                  computerUseBusyKind={computerUseBusyKind}
+                  handleRequestComputerUsePermission={handleRequestComputerUsePermission}
+                />
+              )}
 
               {computerUseSubtab === 'permissions' &&
                 (computerUsePerms && !computerUsePerms.supported ? (

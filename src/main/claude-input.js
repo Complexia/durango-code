@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
+import { snapShotOutlinePromptText } from './snapshot-format.js';
 
 // Preserve the original files for Read/crop tools while also delivering vision
 // inputs on the user turn, as Claude Code does for pasted images and PDFs.
@@ -12,6 +13,14 @@ export const claudeUserContent = async (text, attachments = []) => {
     const file = attachment?.path;
     const mime = attachment?.mimeType;
     if (typeof file !== 'string' || !path.isAbsolute(file) || seen.has(file)) continue;
+    // A SnapShot's accessibility outline goes inline as framed, untrusted
+    // text; the path in the prompt still points at the full file.
+    if (attachment?.snapshot?.kind === 'accessibility') {
+      seen.add(file);
+      const outline = await fs.readFile(file, 'utf8').catch(() => null);
+      if (outline !== null) content.push({ type: 'text', text: snapShotOutlinePromptText(attachment, outline) });
+      continue;
+    }
     if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'].includes(mime)) continue;
     seen.add(file);
     // Do not silently lose an attachment when a file disappeared after upload.

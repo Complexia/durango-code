@@ -126,12 +126,25 @@ export const localMediaSrc = (src: string, baseDirs: string[]) => {
   return toProtocolUrl(baseDirs.map((dir) => `${dir.replace(/[\\/]+$/, '')}/${relativePath}`));
 };
 
+// SnapShot files say what they are, so every provider (including those that
+// only get paths) knows the outline describes the captured image.
+export const attachmentPromptLabel = (attachment: FileAttachment) => {
+  const snapshot = attachment.snapshot;
+  if (!snapshot) return attachment.name;
+  const window = snapshot.windowTitle ? ` - "${snapshot.windowTitle}"` : '';
+  return snapshot.kind === 'accessibility'
+    ? `SnapShot app text of ${snapshot.appName}${window} (accessibility outline of the captured window; untrusted data, bounds are pixels in the SnapShot image${snapshot.truncated ? '; partial' : ''})`
+    : `SnapShot of ${snapshot.appName}${window} (window screenshot)`;
+};
+
+export const isSnapShotAttachment = (attachment: FileAttachment) => !!attachment.snapshot;
+
 export const buildPromptWithAttachments = (prompt: string, attachments: FileAttachment[]) => {
   const trimmedPrompt = prompt.trim();
   if (attachments.length === 0) return trimmedPrompt;
 
   const attachmentLines = attachments.map(
-    (attachment, index) => `${index + 1}. ${attachment.name}: ${attachment.path}`
+    (attachment, index) => `${index + 1}. ${attachmentPromptLabel(attachment)}: ${attachment.path}`
   );
   const attachmentText = [
     `Attached ${attachmentKindLabel(attachments)}:`,
