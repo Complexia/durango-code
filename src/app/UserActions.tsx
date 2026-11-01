@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, CircleDashed, Eye, ExternalLink, Hand, MessageSquareReply, SendHorizontal } from 'lucide-react';
+import { Check, CircleDashed, Eye, ExternalLink, Hand, MessageSquareReply, SendHorizontal, X } from 'lucide-react';
 import { MarkdownContent } from './markdown';
 import type { PendingUserAction } from './threadLists';
 
@@ -11,19 +11,22 @@ import type { PendingUserAction } from './threadLists';
  * agent what the user wrote instead (the ask may be wrong, or they want
  * something else done). Neither interrupts the agent. An action with a
  * `check` command can be watched: Durango Code runs it until it succeeds and
- * then marks the action done itself.
+ * then marks the action done itself. The X dismisses a redundant action
+ * (already done, superseded, asked twice) without telling the agent.
  */
 export const UserActionCards = React.memo(function UserActionCards({
   actions,
   currentThreadId,
   onDone,
   onReply,
+  onDismiss,
   onWatch,
 }: {
   actions: PendingUserAction[];
   currentThreadId: string;
   onDone: (threadId: string, actionId: string) => void;
   onReply: (threadId: string, actionId: string, reply: string) => void;
+  onDismiss: (threadId: string, actionId: string) => void;
   onWatch: (threadId: string, actionId: string, watching: boolean) => void;
 }) {
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
@@ -123,6 +126,18 @@ export const UserActionCards = React.memo(function UserActionCards({
                 >
                   <MessageSquareReply size={12} />
                   Reply
+                </button>
+                <button
+                  type="button"
+                  title="Dismiss without telling the agent"
+                  aria-label="Dismiss"
+                  onClick={() => {
+                    if (replyingTo === key) setReplyingTo(null);
+                    onDismiss(action.threadId, action.id);
+                  }}
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
+                >
+                  <X size={14} />
                 </button>
               </div>
             </div>

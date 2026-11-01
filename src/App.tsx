@@ -2237,6 +2237,19 @@ const App: React.FC = () => {
     (threadId: string, actionId: string, reply: string) => answerUserAction(threadId, actionId, { reply }),
     [answerUserAction]
   );
+  // The X on a card: the action is redundant (already done, superseded, or
+  // asked twice), so it goes away without telling the agent anything.
+  const dismissUserAction = useCallback(
+    (threadId: string, actionId: string) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const current = thread?.userActions ?? [];
+      const remaining = current.filter((action) => action.id !== actionId);
+      if (remaining.length === current.length) return;
+      updateThread(threadId, { userActions: remaining.length ? remaining : undefined });
+      if (remaining.length === 0) settleWaitingOnUserCaptions(threadId);
+    },
+    [updateThread]
+  );
   const setUserActionWatching = useCallback(
     (threadId: string, actionId: string, watching: boolean) => {
       const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
@@ -9384,6 +9397,7 @@ const App: React.FC = () => {
         currentThreadId={selectedThread.id}
         onDone={markUserActionDone}
         onReply={replyToUserAction}
+        onDismiss={dismissUserAction}
         onWatch={setUserActionWatching}
       />
       <CodexQuestions
