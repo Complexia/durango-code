@@ -8230,19 +8230,32 @@ body {
 .codex-question-option-text { display: flex; min-width: 0; flex-direction: column; gap: 2px; line-height: 1.45; }
 .codex-question-option-text > span { font-weight: 500; }
 .codex-question-option-text small { font-size: 12px; color: var(--text-secondary); }
-.codex-question input {
+.codex-question input,
+.codex-question textarea {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   color: var(--text-primary);
   background: var(--bg-surface);
+  font: inherit;
   font-size: 13px;
   outline: none;
   transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
-.codex-question input::placeholder { color: var(--text-muted); }
-.codex-question input:focus { border-color: rgb(77 141 255 / 45%); box-shadow: 0 0 0 3px var(--accent-soft); }
+/* Grows with its text (height set from scrollHeight in AnswerField), then scrolls. */
+.codex-question textarea {
+  display: block;
+  min-height: 0;
+  max-height: 240px;
+  line-height: 1.5;
+  resize: none;
+  overflow-y: auto;
+}
+.codex-question input::placeholder,
+.codex-question textarea::placeholder { color: var(--text-muted); }
+.codex-question input:focus,
+.codex-question textarea:focus { border-color: rgb(77 141 255 / 45%); box-shadow: 0 0 0 3px var(--accent-soft); }
 .codex-question-footer {
   display: flex;
   flex-shrink: 0;

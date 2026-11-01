@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Check, MessageCircleQuestion } from 'lucide-react';
 
 export type CodexQuestionRequest = {
@@ -24,6 +24,71 @@ type AsyncAnswerHandler = (request: CodexQuestionRequest, answers: Record<string
 
 export const asyncAnswerText = (request: CodexQuestionRequest, answers: Record<string, string[]>) =>
   request.questions.map((question) => `${question.question}\n${answers[question.id].join(', ')}`).join('\n\n');
+
+/**
+ * The free-text answer. Secrets stay a single-line password input; everything
+ * else is a textarea that grows with its text like the composer (up to the CSS
+ * max-height, then scrolls). Enter sends, Shift+Enter adds a line.
+ */
+const AnswerField = ({
+  id,
+  secret,
+  placeholder,
+  value,
+  disabled,
+  onChange,
+  onSubmit,
+}: {
+  id: string;
+  secret?: boolean;
+  placeholder: string;
+  value: string;
+  disabled: boolean;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+}) => {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    // scrollHeight leaves out the borders; add them back so the last line isn't clipped.
+    el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`;
+  }, [value]);
+  const onKeyDown = (event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+      event.preventDefault();
+      onSubmit();
+    }
+  };
+  if (secret) {
+    return (
+      <input
+        id={id}
+        type="password"
+        autoComplete="off"
+        placeholder={placeholder}
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        onKeyDown={onKeyDown}
+      />
+    );
+  }
+  return (
+    <textarea
+      ref={textareaRef}
+      id={id}
+      rows={1}
+      autoComplete="off"
+      placeholder={placeholder}
+      value={value}
+      disabled={disabled}
+      onChange={(event) => onChange(event.target.value)}
+      onKeyDown={onKeyDown}
+    />
+  );
+};
 
 const QuestionCard = ({
   request,
@@ -105,23 +170,17 @@ const QuestionCard = ({
                 })}
               </div>
             )}
-            {question.allowCustom !== false && <input
+            {question.allowCustom !== false && <AnswerField
               id={`codex-question-${request.requestId}-${question.id}`}
-              type={question.isSecret ? 'password' : 'text'}
-              autoComplete="off"
+              secret={question.isSecret}
               placeholder={question.options?.length && !question.isSecret ? 'Or type your own answer…' : 'Your answer…'}
               value={customAnswers[question.id] ?? ''}
               disabled={sending}
-              onChange={(event) => {
+              onChange={(value) => {
                 if (!question.multiSelect) setAnswers((current) => ({ ...current, [question.id]: [] }));
-                setCustomAnswers((current) => ({ ...current, [question.id]: event.target.value }));
+                setCustomAnswers((current) => ({ ...current, [question.id]: value }));
               }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  void submit();
-                }
-              }}
+              onSubmit={() => void submit()}
             />}
           </div>
         ))}
