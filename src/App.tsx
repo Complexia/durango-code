@@ -136,6 +136,7 @@ import { UserActionCards } from './app/UserActions';
 import { ThreadPane } from './app/ThreadPane';
 import { BrowserPanel } from './app/BrowserPanel';
 import { tabsForThread, useBrowserTabs, useThreadParents, type BrowserTab } from './app/useBrowserTabs';
+import { DeviceCard } from './app/DeviceCard';
 import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
 import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
@@ -1354,6 +1355,18 @@ const App: React.FC = () => {
       return next;
     };
     setTasksCardStates(dropStale);
+  }, [threads]);
+  // A deleted thread's devices: end its agent-device sessions (the simulators
+  // keep running). Main ignores threads that never opened one.
+  const deviceThreadIdsRef = useRef<Set<string> | null>(null);
+  useEffect(() => {
+    const liveThreadIds = new Set(threads.map((thread) => thread.id));
+    const previous = deviceThreadIdsRef.current;
+    deviceThreadIdsRef.current = liveThreadIds;
+    if (!previous) return;
+    for (const threadId of previous) {
+      if (!liveThreadIds.has(threadId)) void window.orion?.closeThreadDevices?.(threadId);
+    }
   }, [threads]);
   const selectedProject =
     findProjectById({ projects, noProject }, selectedProjectId) ?? selectedThreadProject ?? null;
@@ -10854,6 +10867,7 @@ const App: React.FC = () => {
                           onClose={() => closeThreadPane(pane.thread.id)}
                           statusDot={renderThreadStatusDot(pane.thread)}
                         >
+                          <DeviceCard threadId={pane.thread.id} />
                           {pane.isTerminal ? (
                             // Mounting spawns the CLI: hold off while the thread's
                             // workspace is being removed so it never opens in a

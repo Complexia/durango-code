@@ -124,6 +124,7 @@ export type SettingsTab =
   | 'skills'
   | 'split-view'
   | 'computer-use'
+  | 'devices'
   | 'dev-servers'
   | 'workspaces'
   | 'cosmetics'

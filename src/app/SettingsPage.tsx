@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Rocket,
   Server,
+  Smartphone,
   Settings,
   Sparkles,
   Square,
@@ -60,6 +61,7 @@ import SkillsSettings from './SkillsSettings';
 import McpsSettings from './McpsSettings';
 import DeploymentsSettings from './DeploymentsSettings';
 import DevServersSettings from './DevServersSettings';
+import DevicesSettings from './DevicesSettings';
 import WorkspacesSettings from './WorkspacesSettings';
 import RemoteControlSettings from './RemoteControlSettings';
 import { orchestrationRoleMeta } from './promptContext';
@@ -363,6 +365,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               label: 'Computer Use',
               Icon: MousePointerClick,
             },
+            { id: 'devices', label: 'Devices', Icon: Smartphone },
             { id: 'dev-servers', label: 'Dev Servers', Icon: Server },
             { id: 'workspaces', label: 'Workspaces', Icon: FolderGit2 },
             { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
@@ -398,6 +401,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'skills' && 'SKILLS & MCPS'}
           {settingsTab === 'split-view' && 'SPLIT VIEW'}
           {settingsTab === 'computer-use' && 'COMPUTER USE'}
+          {settingsTab === 'devices' && 'DEVICES'}
           {settingsTab === 'dev-servers' && 'DEV SERVERS'}
           {settingsTab === 'workspaces' && 'WORKSPACES'}
           {settingsTab === 'cosmetics' && 'COSMETICS'}
@@ -405,7 +409,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
         </div>
 
         <div
-          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'cosmetics' || settingsTab === 'workspaces' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
+          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'cosmetics' || settingsTab === 'workspaces' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'devices' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
         >
           {settingsTab === 'account' && (
             <>
@@ -1343,6 +1347,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               )}
             </>
           )}
+
+          {settingsTab === 'devices' && <DevicesSettings />}
 
           {settingsTab === 'dev-servers' && <DevServersSettings formatBytes={formatBytes} />}
 

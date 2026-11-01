@@ -31,12 +31,26 @@ export const orionBuiltinToolNamesForAccessMode = (accessMode) =>
 // pre-approved; Read only lists just these two, which read existing tabs.
 // test-builtin-browser.mjs keeps this list equal to the tools marked readOnly.
 export const BROWSER_READ_TOOL_NAMES = Object.freeze(['browser_status', 'browser_snapshot']);
+// Simulator tools (device-tools.js), offered only when the user let agents
+// use devices. Listing and screenshots only read; opening boots a simulator
+// and closing can shut one down, so Read only leaves those two unapproved.
+export const ORION_DEVICE_TOOL_NAMES = Object.freeze([
+  'device_list',
+  'device_open',
+  'device_screenshot',
+  'device_close',
+]);
+export const orionDeviceToolNamesForAccessMode = (accessMode) =>
+  accessMode === 'read-only'
+    ? ORION_DEVICE_TOOL_NAMES.filter((name) => name === 'device_list' || name === 'device_screenshot')
+    : ORION_DEVICE_TOOL_NAMES;
 
 /** `name` is the unqualified orion tool name (e.g. `read_chat`). */
 export const isPreapprovedOrionTool = (name, accessMode) =>
   typeof name === 'string' &&
   (orionBuiltinToolNamesForAccessMode(accessMode).includes(name) ||
-    (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))));
+    (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))) ||
+    orionDeviceToolNamesForAccessMode(accessMode).includes(name));
 
 const runPluginHelpCommand = (providerId) =>
   providerId === 'cursor'

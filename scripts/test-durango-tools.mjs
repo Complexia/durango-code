@@ -48,6 +48,9 @@ import {
   watchUserAction,
 } from '../src/main/user-actions.js';
 import { handleMcpBridgeConnection, mcpBridgeSessions, pendingSubagentSpawns } from '../src/main/mcp-bridge.js';
+import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOL_NAMES } from '../src/main/device-tools.js';
+import { ORION_DEVICE_TOOL_NAMES } from '../src/main/thread-reader-routing.js';
+import { setDeviceDataRootForTests } from '../src/main/devices/device-settings.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-durango-tools-'));
@@ -327,6 +330,43 @@ try {
   assert.equal(claudeAction.isError, true, 'no window: the agent is told to ask in its reply');
   assert.match(claudeAction.content[0].text, /Ask in your reply/);
 
+  // --- Device tools: Claude registers them only with agent access, mirroring device-tools.js ---
+  setDeviceDataRootForTests(path.join(testRoot, 'device-data'));
+  for (const name of DEVICE_TOOL_NAMES) {
+    assert.equal(registered.some((entry) => entry.name === name), false, `Claude omits ${name} by default`);
+  }
+  assert.deepEqual([...DEVICE_TOOL_NAMES], [...ORION_DEVICE_TOOL_NAMES]);
+  for (const name of DEVICE_TOOL_NAMES) assert.equal(isPreapprovedOrionTool(name, 'full-access'), true);
+  assert.equal(isPreapprovedOrionTool('device_list', 'read-only'), true);
+  assert.equal(isPreapprovedOrionTool('device_screenshot', 'read-only'), true);
+  assert.equal(isPreapprovedOrionTool('device_open', 'read-only'), false);
+  assert.equal(isPreapprovedOrionTool('device_close', 'read-only'), false);
+  const deviceRegistered = [];
+  createOrionMcpServer(
+    {
+      createSdkMcpServer: (config) => config,
+      tool: (name, description, schema, handler, extra) => {
+        deviceRegistered.push({ name, description, schema, handler, extra });
+        return { name };
+      },
+    },
+    { z },
+    { threadId: 't', projectPath: testRoot, accessMode: 'full-access', sender: null, devicesEnabled: true }
+  );
+  for (const name of DEVICE_TOOL_NAMES) {
+    const entry = deviceRegistered.find((candidate) => candidate.name === name);
+    assert.ok(entry, `Claude registers ${name} with agent access`);
+    assert.equal(entry.description, DEVICE_TOOL_DESCRIPTIONS[name]);
+    assert.deepEqual(Object.keys(entry.schema).sort(), Object.keys(DEVICE_TOOL_INPUT_SCHEMAS[name].properties).sort());
+    for (const [key, property] of Object.entries(DEVICE_TOOL_INPUT_SCHEMAS[name].properties)) {
+      assert.equal(entry.schema[key].description, property.description, `${name}.${key} description`);
+    }
+  }
+  // Registered, but the settings file says no: the call is refused at call time.
+  const refusedList = await deviceRegistered.find((entry) => entry.name === 'device_list').handler({});
+  assert.equal(refusedList.isError, true);
+  assert.match(refusedList.content[0].text, /turned off/);
+
   // --- User actions reach the renderer -------------------------------------------------------
   const sent = [];
   const fakeSender = { isDestroyed: () => false, send: (channel, payload) => sent.push({ channel, payload }) };
@@ -561,6 +601,85 @@ try {
     child.kill();
     bridgeServer.close();
     mcpBridgeSessions.delete('tok');
+  }
+
+  // --- With --devices the shim also lists the device tools, mirroring device-tools.js ---------
+  {
+    const deviceSocketPath = path.join(testRoot, 'device-bridge.sock');
+    const fakeImage = { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' };
+    // A stand-in desktop app: answers device_screenshot with content blocks,
+    // device_list with text only, everything else through the real handler.
+    const deviceBridge = net.createServer((socket) => {
+      let pending = '';
+      socket.on('data', (chunk) => {
+        pending += chunk;
+        const newline = pending.indexOf('\n');
+        if (newline === -1) return;
+        const request = JSON.parse(pending.slice(0, newline));
+        const reply =
+          request.tool === 'device_screenshot'
+            ? { id: request.id, ok: true, text: 'shot', content: [fakeImage, { type: 'text', text: 'shot' }] }
+            : { id: request.id, ok: false, text: `no ${request.tool}` };
+        socket.write(`${JSON.stringify(reply)}\n`);
+      });
+    });
+    await new Promise((resolve) => deviceBridge.listen(deviceSocketPath, resolve));
+    const deviceChild = spawn(process.execPath, [shimPath, '--socket', deviceSocketPath, '--token', 'tok-d', '--devices'], {
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    const deviceWaiters = new Map();
+    let deviceBuffer = '';
+    deviceChild.stdout.on('data', (chunk) => {
+      deviceBuffer += chunk;
+      let newline;
+      while ((newline = deviceBuffer.indexOf('\n')) !== -1) {
+        const message = JSON.parse(deviceBuffer.slice(0, newline));
+        deviceBuffer = deviceBuffer.slice(newline + 1);
+        deviceWaiters.get(message.id)?.(message);
+      }
+    });
+    let deviceNextId = 1;
+    const deviceCall = (method, params) =>
+      new Promise((resolve) => {
+        const id = deviceNextId++;
+        deviceWaiters.set(id, resolve);
+        deviceChild.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      });
+    try {
+      const list = await deviceCall('tools/list', {});
+      const names = list.result.tools.map((tool) => tool.name);
+      assert.deepEqual(names, [...ORION_BUILTIN_TOOL_NAMES, ...DEVICE_TOOL_NAMES]);
+      for (const name of DEVICE_TOOL_NAMES) {
+        const tool = list.result.tools.find((candidate) => candidate.name === name);
+        assert.equal(tool.description, DEVICE_TOOL_DESCRIPTIONS[name], `${name} description matches device-tools.js`);
+        assert.deepEqual(tool.inputSchema, DEVICE_TOOL_INPUT_SCHEMAS[name], `${name} schema matches device-tools.js`);
+      }
+      const shot = await deviceCall('tools/call', { name: 'device_screenshot', arguments: {} });
+      assert.equal(shot.result.isError, false);
+      assert.deepEqual(shot.result.content, [fakeImage, { type: 'text', text: 'shot' }], 'content blocks pass through');
+      const listed = await deviceCall('tools/call', { name: 'device_list', arguments: {} });
+      assert.deepEqual(listed.result.content, [{ type: 'text', text: 'no device_list' }], 'text-only replies stay text');
+      assert.equal(listed.result.isError, true);
+    } finally {
+      deviceChild.kill();
+      deviceBridge.close();
+    }
+  }
+
+  // The real bridge refuses device tools while the user has not allowed them.
+  {
+    const deviceSocket = new EventEmitter();
+    const deviceWritten = [];
+    deviceSocket.write = (data) => deviceWritten.push(JSON.parse(data));
+    mcpBridgeSessions.set('tok-d2', { getSender: () => null, threadId: 't', projectPath: testRoot, accessMode: 'full-access' });
+    handleMcpBridgeConnection(deviceSocket);
+    deviceSocket.emit('data', Buffer.from(`${JSON.stringify({ id: 4, token: 'tok-d2', tool: 'device_open', args: {} })}\n`));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(deviceWritten[0].ok, false);
+    assert.match(deviceWritten[0].text, /turned off/);
+    assert.equal(deviceWritten[0].content, undefined, 'no content key on text replies');
+    mcpBridgeSessions.delete('tok-d2');
   }
 
   // A bridge connection with no client installed still answers in text.

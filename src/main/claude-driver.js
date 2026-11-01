@@ -17,8 +17,10 @@ import {
   SEARCH_CHATS_MAX_LIMIT,
   runDurangoTool,
 } from './durango-tools.js';
-import { orionBuiltinToolNamesForAccessMode } from './thread-reader-routing.js';
+import { orionBuiltinToolNamesForAccessMode, orionDeviceToolNamesForAccessMode } from './thread-reader-routing.js';
 import { browserModeFor, browserToolsForAccessMode, builtinBrowserTips, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
+import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOLS_PROMPT_HINT, runDeviceTool } from './device-tools.js';
+import { agentDeviceAccessAllowed, getCachedDeviceSettings } from './devices/device-settings.js';
 import {
   USER_ACTION_CHECK_MAX_CHARS,
   USER_ACTION_MAX_CHARS,
@@ -438,8 +440,61 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       // lists the same ones). Every browser mode but 'off' includes them;
       // 'chrome' adds Claude in Chrome for signed-in sites.
       ...(hasBuiltinBrowser(session.browserMode) ? claudeBrowserTools(tool, z, session) : []),
+      ...(claudeDeviceToolsEnabled(session) ? createClaudeDeviceTools(tool, z, session) : []),
     ],
   });
+
+// Simulator tools (device-tools.js), registered only while the user lets
+// agents use devices; each call re-checks. Mirrored in mcp-bridge-shim.cjs;
+// test-durango-tools.mjs keeps them in sync.
+export const claudeDeviceToolsEnabled = (session) =>
+  session?.devicesEnabled ?? agentDeviceAccessAllowed(getCachedDeviceSettings());
+
+const createClaudeDeviceTools = (tool, z, session) => {
+  const props = (name) => DEVICE_TOOL_INPUT_SCHEMAS[name].properties;
+  const run = (name) => async (args) =>
+    durangoToolContentResult(
+      await runDeviceTool(name, args, {
+        threadId: session.threadId,
+        getSender: () => session.sender,
+        accessMode: session.accessMode,
+      })
+    );
+  return [
+    tool(
+      'device_list',
+      DEVICE_TOOL_DESCRIPTIONS.device_list,
+      { platform: z.enum(['ios', 'android']).optional().describe(props('device_list').platform.description) },
+      run('device_list'),
+      { annotations: { readOnlyHint: true } }
+    ),
+    tool(
+      'device_open',
+      DEVICE_TOOL_DESCRIPTIONS.device_open,
+      {
+        deviceId: z.string().optional().describe(props('device_open').deviceId.description),
+        platform: z.enum(['ios', 'android']).optional().describe(props('device_open').platform.description),
+      },
+      run('device_open')
+    ),
+    tool(
+      'device_screenshot',
+      DEVICE_TOOL_DESCRIPTIONS.device_screenshot,
+      { deviceId: z.string().optional().describe(props('device_screenshot').deviceId.description) },
+      run('device_screenshot'),
+      { annotations: { readOnlyHint: true } }
+    ),
+    tool(
+      'device_close',
+      DEVICE_TOOL_DESCRIPTIONS.device_close,
+      {
+        deviceId: z.string().optional().describe(props('device_close').deviceId.description),
+        shutdown: z.boolean().optional().describe(props('device_close').shutdown.description),
+      },
+      run('device_close')
+    ),
+  ];
+};
 
 const durangoToolResult = ({ ok, text }) => ({
   content: [{ type: 'text', text }],
@@ -522,6 +577,13 @@ export const claudeBrowserAgentHooks = () => ({
       ],
     },
   ],
+});
+
+// Sibling of durangoToolResult for tools that may return MCP content blocks
+// (an image from device_screenshot): `content` when present, else the text.
+const durangoToolContentResult = ({ ok, text, content }) => ({
+  content: Array.isArray(content) && content.length ? content : [{ type: 'text', text }],
+  ...(ok ? {} : { isError: true }),
 });
 
 // Legacy extra-flags string ("--foo bar --baz") -> SDK extraArgs map.
@@ -1829,6 +1891,9 @@ export const createClaudeSdkSession = ({
       loadZod(),
       resolveClaudeBinary(),
     ]);
+    // Fixed for the session's lifetime (the tools re-check on every call).
+    const devicesEnabled = claudeDeviceToolsEnabled(session);
+    session.devicesEnabled = devicesEnabled;
     const orionMcpServer = createOrionMcpServer(sdk, zod, session);
     // setMcpServers replaces every SDK-supplied server, so later syncs must
     // resend this same instance alongside the Orion-connected ones.
@@ -1846,6 +1911,7 @@ export const createClaudeSdkSession = ({
               ...sdkOptions.allowedTools,
               ...[
                 ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode),
+                ...(devicesEnabled ? orionDeviceToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 'wait_for_background_tasks',
                 ...(builtinBrowser
                   ? browserToolsForAccessMode(sdkOptions.accessMode).map((definition) => definition.name)
@@ -1885,6 +1951,7 @@ export const createClaudeSdkSession = ({
             CLAUDE_USER_ACTION_TIP,
             ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
             ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
+            ...(devicesEnabled ? [DEVICE_TOOLS_PROMPT_HINT] : []),
           ].join('\n\n'),
         },
         // Match the CLI's behavior: without this the SDK loads no user or

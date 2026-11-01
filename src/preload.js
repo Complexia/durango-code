@@ -270,6 +270,23 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('orchestration:stopRequest', listener);
   },
 
+  // Simulator tools (Settings → Devices, the per-thread device card).
+  getDeviceSettings: () => ipcRenderer.invoke('devices:getSettings'),
+  setDeviceSettings: (patch) => ipcRenderer.invoke('devices:setSettings', patch),
+  getDeviceStatus: () => ipcRenderer.invoke('devices:status'),
+  installAgentDevice: () => ipcRenderer.invoke('devices:installAgentDevice'),
+  listDevices: (input) => ipcRenderer.invoke('devices:list', input),
+  getOpenDevices: (threadId) => ipcRenderer.invoke('devices:openState', threadId),
+  screenshotDevice: (input) => ipcRenderer.invoke('devices:screenshot', input),
+  showDevice: (input) => ipcRenderer.invoke('devices:show', input),
+  closeDevice: (input) => ipcRenderer.invoke('devices:close', input),
+  closeThreadDevices: (threadId) => ipcRenderer.invoke('devices:closeThread', threadId),
+  onDeviceEvent: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('agent:device', listener);
+    return () => ipcRenderer.removeListener('agent:device', listener);
+  },
+
   // Computer use permissions (macOS TCC)
   getComputerUsePermissions: () => ipcRenderer.invoke('computerUse:getPermissions'),
   requestComputerUsePermission: (kind) => ipcRenderer.invoke('computerUse:requestPermission', kind),

@@ -3,7 +3,8 @@
 // CLIs (codex, cursor, grok, kimi) spawn as the `orion` MCP server. It
 // exposes the spawn_subagent/stop_subagent/read_thread tools plus the Durango
 // Chat tools (search_chats, read_chat, recall_memory, remember) and the
-// user-action tools (request_user_action, resolve_user_action), and forwards
+// user-action tools (request_user_action, resolve_user_action), the simulator
+// tools (device_list/open/screenshot/close, only with --devices), and forwards
 // calls to the
 // Orion desktop app over a local socket; the app runs the subagent as a
 // visible subthread and returns its final report. Tools that depend on the
@@ -25,6 +26,8 @@ const argValue = (flag) => {
 };
 const socketPath = argValue('--socket') || process.env.ORION_MCP_SOCKET || '';
 const token = argValue('--token') || process.env.ORION_MCP_TOKEN || '';
+// The user let agents use simulators (Settings → Devices); lists device_*.
+const devicesEnabled = argv.includes('--devices');
 
 const spawnSubagentTool = {
   name: 'spawn_subagent',
@@ -266,6 +269,72 @@ const resolveUserActionTool = {
   },
 };
 
+// Simulator tools, served by the desktop app (src/main/device-tools.js), only
+// listed with --devices. Descriptions and schemas mirror device-tools.js
+// exactly; scripts/test-durango-tools.mjs keeps them in sync.
+const deviceListTool = {
+  name: 'device_list',
+  description:
+    'List the iOS Simulators and Android Emulators on this machine (id, name, platform, OS version, state, and whether this thread has it open), plus whether each platform is available and why not. Use it before device_open when you need a specific device.',
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      platform: { type: 'string', enum: ['ios', 'android'], description: 'Only list devices of this platform' },
+    },
+    additionalProperties: false,
+  },
+};
+
+const deviceOpenTool = {
+  name: 'device_open',
+  description:
+    'Open an iOS Simulator or Android Emulator for this thread, booting it if needed; the user watches it in Durango Code. Returns the path of an agent-device command bound to that device and a quick start for driving it (open an app, snapshot, press, fill, screenshot). Without arguments it picks a booted device, else a default iPhone simulator.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      deviceId: {
+        type: 'string',
+        description: 'Device id from device_list (a simulator UDID, an adb serial, or avd:<name>)',
+      },
+      platform: {
+        type: 'string',
+        enum: ['ios', 'android'],
+        description: 'Pick a device of this platform when no deviceId is given',
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
+const deviceScreenshotTool = {
+  name: 'device_screenshot',
+  description:
+    'Take a screenshot of a device and return it as an image (also saved to a file whose path is returned). Without deviceId it uses the device this thread has open. Durango Code also shows it to the user.',
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      deviceId: { type: 'string', description: "Device id; defaults to this thread's open device" },
+    },
+    additionalProperties: false,
+  },
+};
+
+const deviceCloseTool = {
+  name: 'device_close',
+  description:
+    "Close a device this thread opened: ends its agent-device session (quitting the app that session opened) and removes the launcher. Pass shutdown: true to also shut the simulator or emulator down. Without deviceId it closes this thread's only open device.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      deviceId: { type: 'string', description: "Device id; defaults to this thread's only open device" },
+      shutdown: { type: 'boolean', description: 'Also shut the simulator or emulator down (default false)' },
+    },
+    additionalProperties: false,
+  },
+};
+
 const tools = [
   spawnSubagentTool,
   stopSubagentTool,
@@ -276,6 +345,7 @@ const tools = [
   rememberTool,
   requestUserActionTool,
   resolveUserActionTool,
+  ...(devicesEnabled ? [deviceListTool, deviceOpenTool, deviceScreenshotTool, deviceCloseTool] : []),
 ];
 const toolNames = new Set(tools.map((tool) => tool.name));
 // Run-specific tools from the app, fetched once per shim process.

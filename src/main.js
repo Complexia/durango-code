@@ -88,6 +88,7 @@ import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachme
 import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
+import { initDevices, registerDeviceIpc, shutdownDevices } from './main/devices/device-ipc.js';
 import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents, stringifySummary } from './main/stream-adapters.js';
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { deleteSkill, ensureBundledSkills, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
@@ -1159,6 +1160,7 @@ app.whenReady().then(async () => {
   // only the prerequisite they actually need.
   startShellPathSync();
   startLegacyMcpCleanup();
+  void initDevices().catch((error) => console.error('Device setup failed:', error));
   void installBundledCli();
   void installDurangoGitCredentials();
 
@@ -1538,6 +1540,9 @@ const disposeForQuit = (reason = 'quit') => {
   disposeAllTitleGenerations();
   cancelActiveProviderUpdate();
   stopAllDurangoWorkspaceServers();
+  // Ends agent-device sessions and stops its daemon; simulators keep running.
+  // Idempotent and bounded; waitForPendingQuitWork awaits the same promise.
+  void shutdownDevices();
   reapActiveAgentRuns();
   if (!codexAppServerShutdownPromise) {
     // Goal runs must record their pause through the shared server before it
@@ -1560,6 +1565,8 @@ const waitForPendingQuitWork = () =>
     waitForPendingAgentShutdowns(),
     waitForProviderUpdateShutdown(),
     waitForRemoteControlPersistence(),
+    // agent-device sessions and daemon (bounded; never rejects).
+    shutdownDevices(),
   ])
     .then(() => threadsSaveQueue.catch(() => {}));
 
@@ -4115,6 +4122,9 @@ const getComputerUsePermissions = async () => {
 };
 
 ipcMain.handle('computerUse:getPermissions', async () => getComputerUsePermissions());
+
+// Simulator tools: Settings → Devices and the per-thread device card.
+registerDeviceIpc(ipcMain);
 
 ipcMain.handle('computerUse:requestPermission', async (_event, kind) => {
   if (process.platform !== 'darwin') {

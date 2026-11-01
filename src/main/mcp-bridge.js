@@ -11,6 +11,8 @@ import { readThreadForAgent } from './thread-reader.js';
 import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
 import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
+import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
+import { agentDeviceAccessAllowed, readDeviceSettings } from './devices/device-settings.js';
 import {
   acpOrionMcpServers,
   museOrionMcpServers,
@@ -233,6 +235,18 @@ export const handleMcpBridgeConnection = (socket) => {
         void runUserActionTool(message.tool, args, session).then(({ ok, text }) => reply(ok, text));
         continue;
       }
+      if (DEVICE_TOOL_NAMES.includes(message.tool)) {
+        // Re-checks the user's device settings and the run's access mode
+        // itself; resolves, never rejects.
+        void runDeviceTool(message.tool, args, {
+          threadId: session.threadId,
+          getSender: session.getSender,
+          accessMode: session.accessMode,
+        }).then(({ ok, text, content }) =>
+          reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
+        );
+        continue;
+      }
       reply(false, `Unknown tool: ${message.tool}`);
     }
   });
@@ -360,7 +374,10 @@ export const registerMcpBridgeForRun = async ({
     // ELECTRON_RUN_AS_NODE turns Orion's own binary into a plain Node runtime;
     // forge.config.js deliberately keeps that fuse enabled for this shim.
     const command = process.execPath;
-    const args = [shimPath, '--socket', socketPath, '--token', token];
+    // --devices: the shim lists the device_* tools (the user let agents use
+    // simulators). The tools re-check the setting on every call.
+    const devicesEnabled = agentDeviceAccessAllowed(await readDeviceSettings());
+    const args = [shimPath, '--socket', socketPath, '--token', token, ...(devicesEnabled ? ['--devices'] : [])];
     const { pluginDir, tokenRoot } = await writeMcpBridgePlugin({
       token,
       command,

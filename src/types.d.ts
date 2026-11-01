@@ -721,6 +721,46 @@ type OrionWorkspaceSyncStatus = {
   } | null;
 };
 
+export type DevicePlatform = 'ios' | 'android';
+
+export type DeviceSettings = { useDevices: boolean; agentsCanUseDevices: boolean };
+
+export type DeviceInfo = {
+  id: string;
+  name: string;
+  platform: DevicePlatform;
+  version: string;
+  state: string;
+  kind?: 'phone' | 'tablet' | 'emulator' | 'physical';
+  avd?: string | null;
+};
+
+export type DevicePlatformAvailability = { available: boolean; reason: string | null };
+
+export type DeviceStatus = {
+  settings: DeviceSettings;
+  platforms: { ios: DevicePlatformAvailability; android: DevicePlatformAvailability };
+  agentDevice: {
+    name: string;
+    version?: string;
+    installed: boolean;
+    installing?: boolean;
+    error?: string | null;
+    /** Package manager that would install it ('bun' when present, else 'npm'); null when neither is found. */
+    installer?: 'bun' | 'npm' | null;
+    installerPath?: string | null;
+    /** Set when neither bun nor npm is found: asks the user to install Node.js. */
+    installerMissingHint?: string | null;
+  };
+};
+
+export type OpenDevice = { device: DeviceInfo; session: string; command: string; openedAt: number };
+
+export type DeviceEvent =
+  | ({ type: 'opened'; threadId: string } & OpenDevice)
+  | { type: 'screenshot'; threadId: string; deviceId: string; file: string; dataUrl: string; takenAt: number }
+  | { type: 'closed'; threadId: string; deviceId: string };
+
 declare global {
 type OrionComputerUsePermissionKind = 'accessibility' | 'screen-recording' | 'automation';
 
@@ -1313,6 +1353,30 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => Promise<OrionTaskActionResult>;
       /** Opens Durango Tasks (durango.sh/tasks) in the browser. */
       openBoardTasksWeb?: () => Promise<{ ok: boolean; error?: string }>;
+      getDeviceSettings?: () => Promise<DeviceSettings>;
+      setDeviceSettings?: (patch: Partial<DeviceSettings>) => Promise<DeviceSettings>;
+      getDeviceStatus?: () => Promise<DeviceStatus>;
+      installAgentDevice?: () => Promise<{ ok: boolean; error?: string; status: DeviceStatus }>;
+      listDevices?: (input?: { platform?: DevicePlatform }) => Promise<{
+        ok: boolean;
+        error?: string;
+        devices: DeviceInfo[];
+        availability?: DeviceStatus['platforms'];
+      }>;
+      getOpenDevices?: (threadId: string) => Promise<OpenDevice[]>;
+      screenshotDevice?: (input: { threadId: string; deviceId: string }) => Promise<{
+        ok: boolean;
+        error?: string;
+        dataUrl?: string;
+        takenAt?: number;
+      }>;
+      showDevice?: (input: { threadId: string; deviceId: string }) => Promise<{ ok: boolean; error?: string }>;
+      closeDevice?: (input: { threadId: string; deviceId: string; shutdown?: boolean }) => Promise<{
+        ok: boolean;
+        error?: string;
+      }>;
+      closeThreadDevices?: (threadId: string) => Promise<{ ok: boolean }>;
+      onDeviceEvent?: (callback: (event: DeviceEvent) => void) => () => void;
       getComputerUsePermissions: () => Promise<OrionComputerUsePermissions>;
       requestComputerUsePermission: (kind: OrionComputerUsePermissionKind) => Promise<{
         ok: boolean;
