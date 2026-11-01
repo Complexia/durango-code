@@ -26,9 +26,17 @@ export const orionBuiltinToolNamesForAccessMode = (accessMode) =>
     ? ORION_BUILTIN_TOOL_NAMES.filter((name) => name !== 'remember')
     : ORION_BUILTIN_TOOL_NAMES;
 
+// The built-in browser's tools (browser-tools.js) are only listed for runs
+// that use it. Like Claude in Chrome under Workspace write they are
+// pre-approved; Read only lists just these two, which read existing tabs.
+// test-builtin-browser.mjs keeps this list equal to the tools marked readOnly.
+export const BROWSER_READ_TOOL_NAMES = Object.freeze(['browser_status', 'browser_snapshot']);
+
 /** `name` is the unqualified orion tool name (e.g. `read_chat`). */
 export const isPreapprovedOrionTool = (name, accessMode) =>
-  typeof name === 'string' && orionBuiltinToolNamesForAccessMode(accessMode).includes(name);
+  typeof name === 'string' &&
+  (orionBuiltinToolNamesForAccessMode(accessMode).includes(name) ||
+    (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))));
 
 const runPluginHelpCommand = (providerId) =>
   providerId === 'cursor'

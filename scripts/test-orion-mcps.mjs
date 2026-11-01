@@ -1054,6 +1054,7 @@ await server.connect(new StdioServerTransport());
     const orionMcp = null;
     const openCodeConfig = null;
     const museConfigRoot = null;
+    const fxLaunch = null;
     const loginShell = '/bin/zsh';
     const process = { env: {} };
     const commandForModel = () => ['codex', 'app-server'];
@@ -1143,7 +1144,7 @@ await server.connect(new StdioServerTransport());
   const prepareBridge = new (Object.getPrototypeOf(async function () {}).constructor)(
     'model', 'input', 'orionMcps', 'isMcpBridgeProvider', 'providerSupportsRunPlugin',
     'registerMcpBridgeForRun', 'openCodeMcpConfigContent', 'writeMuseMcpConfigRoot',
-    'isEffectiveThreadReaderBridgeReady', 'isRequiredThreadReaderBridgeMissing',
+    'isEffectiveThreadReaderBridgeReady', 'isRequiredThreadReaderBridgeMissing', 'browserModeFor',
     runTurnSource.slice(bridgeStart, bridgeEnd) + '\nreturn { proceeded: true };',
   );
   for (const providerId of ['cursor', 'grok', 'kimi', 'opencode', 'muse', 'codex']) {
@@ -1161,6 +1162,7 @@ await server.connect(new StdioServerTransport());
           },
           () => failure === 'config' ? null : '{}', async () => failure === 'config' ? null : '/fixture/config',
           routing.isEffectiveThreadReaderBridgeReady, routing.isRequiredThreadReaderBridgeMissing,
+          () => 'builtin',
         );
         const mustFail = hasServers && providerId !== 'codex' &&
           (failure === 'unsupported' || failure === 'registration' ||

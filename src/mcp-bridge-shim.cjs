@@ -6,7 +6,10 @@
 // user-action tools (request_user_action, resolve_user_action), and forwards
 // calls to the
 // Orion desktop app over a local socket; the app runs the subagent as a
-// visible subthread and returns its final report. Claude runs use the
+// visible subthread and returns its final report. Tools that depend on the
+// run (the built-in browser's browser_* tools) are not listed here: tools/list
+// asks the app for them over the socket (`__tools`), so their schemas have one
+// source (src/main/browser-tools.js). Claude runs use the
 // in-process SDK server in main.js instead — this file is copied to userData
 // and never bundled.
 //
@@ -275,6 +278,8 @@ const tools = [
   resolveUserActionTool,
 ];
 const toolNames = new Set(tools.map((tool) => tool.name));
+// Run-specific tools from the app, fetched once per shim process.
+let extraTools = null;
 
 const write = (message) => {
   try {
@@ -312,7 +317,13 @@ const callOrion = (tool, args) =>
       if (newline === -1) return;
       try {
         const reply = JSON.parse(buffer.slice(0, newline));
-        finish({ ok: reply.ok !== false, text: String(reply.text ?? '') });
+        finish({
+          ok: reply.ok !== false,
+          text: String(reply.text ?? ''),
+          // Optional MCP content blocks (e.g. images), passed through as-is.
+          ...(Array.isArray(reply.content) && reply.content.length > 0 ? { content: reply.content } : {}),
+          ...(Array.isArray(reply.tools) ? { tools: reply.tools } : {}),
+        });
       } catch {
         finish({ ok: false, text: 'Received an invalid response from Durango Code.' });
       }
@@ -328,6 +339,21 @@ const callOrion = (tool, args) =>
     });
   });
 
+const loadExtraTools = async () => {
+  if (extraTools) return extraTools;
+  const result = await callOrion('__tools', {});
+  if (!result.ok || !Array.isArray(result.tools)) return [];
+  extraTools = result.tools.filter(
+    (tool) =>
+      tool &&
+      typeof tool.name === 'string' &&
+      !toolNames.has(tool.name) &&
+      tool.inputSchema &&
+      typeof tool.inputSchema === 'object'
+  );
+  return extraTools;
+};
+
 const handleMessage = async (message) => {
   const method = message.method;
   if (method === 'initialize') {
@@ -341,18 +367,21 @@ const handleMessage = async (message) => {
   }
   if (typeof method === 'string' && method.startsWith('notifications/')) return;
   if (method === 'tools/list') {
-    respond(message.id, { tools });
+    respond(message.id, { tools: [...tools, ...(await loadExtraTools())] });
     return;
   }
   if (method === 'tools/call') {
     const name = message.params?.name;
-    if (!toolNames.has(name)) {
+    if (!toolNames.has(name) && !(await loadExtraTools()).some((tool) => tool.name === name)) {
       respondError(message.id, -32602, `Unknown tool: ${name}`);
       return;
     }
     const rawArgs = message.params?.arguments;
     const result = await callOrion(name, rawArgs && typeof rawArgs === 'object' ? rawArgs : {});
-    respond(message.id, { content: [{ type: 'text', text: result.text }], isError: !result.ok });
+    respond(message.id, {
+      content: result.content ?? [{ type: 'text', text: result.text }],
+      isError: !result.ok,
+    });
     return;
   }
   if (method === 'ping') {

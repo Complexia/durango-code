@@ -53,6 +53,7 @@ import {
 } from '../agentCatalog';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
+import { BuiltinBrowserSettings } from './BrowserSettings';
 import { FxConnectionsPanel } from './FxConnectionsPanel';
 import { DurangoDispatchSettings } from './DurangoDispatchSettings';
 import SkillsSettings from './SkillsSettings';
@@ -261,15 +262,18 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
   const [fxInstallOnOpen, setFxInstallOnOpen] = React.useState(false);
   const clearFxInstallOnOpen = React.useCallback(() => setFxInstallOnOpen(false), []);
   const configuredCodexBrowserMode = providerSettings.codex?.options?.browserUseMode;
+  // Mirrors codexBrowserUseMode (main/codex-config.js): no choice means the
+  // built-in browser.
   const codexBrowserMode: BrowserUseMode =
     configuredCodexBrowserMode === 'disabled' ||
+    configuredCodexBrowserMode === 'builtin' ||
     configuredCodexBrowserMode === 'extension' ||
     configuredCodexBrowserMode === 'mcp'
       ? configuredCodexBrowserMode
       : providerSettings.codex?.options?.browserControl === true &&
           providerSettings.codex?.options?.browserAutoConnect === true
         ? 'mcp'
-        : 'disabled';
+        : 'builtin';
   const codexBrowserIntegration = computerUsePerms?.browserUse.codex ?? null;
   const chromeDebugStatus = computerUsePerms?.chromeDebug.status ?? 'disabled';
   const appUpdatePercent = Math.max(0, Math.min(100, Math.round(appUpdateState?.progress?.percent ?? 0)));
@@ -1583,8 +1587,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     <div className="setting-label">
                       <div className="setting-label-title">Browser use by provider</div>
                       <div className="setting-label-desc">
-                        Choose browser access separately for each provider. Browser tools remain unavailable in Read
-                        only mode.
+                        Choose browser access separately for each provider. Every choice but Off includes Durango
+                        Code's built-in browser for local dev servers and previews. Choosing your Chrome adds it for
+                        anything behind a login, so agents use your signed-in sessions instead of asking you to sign
+                        in to the built-in browser. In Read only mode agents can only list and read built-in tabs.
                       </div>
                     </div>
                   </div>
@@ -1593,17 +1599,18 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     <div className="setting-label">
                       <div className="setting-label-title">Codex</div>
                       <div className="setting-label-desc">
-                        Use your signed-in Chrome through the extension, or attach through Chrome’s public debugging
-                        server with chrome-devtools-mcp. If Durango Code cannot verify the extension integration, Codex
-                        automatically falls back to the MCP connection.
+                        Built-in only, or your signed-in Chrome through the ChatGPT extension or Chrome’s debugging
+                        server (chrome-devtools-mcp) plus the built-in browser. With your Chrome, Codex uses it for
+                        anything that needs your logins and the built-in browser for everything else.
                       </div>
                     </div>
                     <div className="browser-use-mode-options" role="group" aria-label="Codex browser use mode">
                       {(
                         [
                           { value: 'disabled', label: 'Off' },
-                          { value: 'extension', label: 'Chrome extension' },
-                          { value: 'mcp', label: 'Your Chrome (MCP)' },
+                          { value: 'builtin', label: 'Built-in only' },
+                          { value: 'extension', label: 'Your Chrome (extension) + built-in' },
+                          { value: 'mcp', label: 'Your Chrome (MCP) + built-in' },
                         ] as Array<{ value: BrowserUseMode; label: string }>
                       ).map((option) => (
                         <button
@@ -1614,7 +1621,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                           onClick={() =>
                             setProviderOptions('codex', {
                               browserUseMode: option.value,
-                              browserControl: option.value !== 'disabled',
+                              browserControl: option.value === 'extension' || option.value === 'mcp',
                               browserAutoConnect: option.value === 'mcp',
                             })
                           }
@@ -1712,29 +1719,10 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     </div>
                   )}
 
-                <div className="setting-row">
-                  <div className="setting-label">
-                    <div className="setting-label-title">Claude · Claude in Chrome</div>
-                    <div className="setting-label-desc">
-                      Browser control through the Claude Chrome extension (--chrome): drives your real signed-in Chrome.
-                      Requires the extension to be installed in Chrome.
-                    </div>
-                  </div>
-                  <div className="setting-row-actions">
-                    <label className="provider-toggle">
-                      <input
-                        type="checkbox"
-                        checked={providerSettings.claude?.options?.chrome === true}
-                        onChange={(event) => {
-                          setProviderOptions('claude', {
-                            chrome: event.target.checked,
-                          });
-                        }}
-                      />
-                      <span />
-                    </label>
-                  </div>
-                </div>
+                <BuiltinBrowserSettings
+                  providerSettings={providerSettings}
+                  setProviderOptions={setProviderOptions}
+                />
                 </>
               )}
             </>

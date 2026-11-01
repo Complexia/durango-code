@@ -778,6 +778,61 @@ type OrionCodexBrowserIntegrationStatus = {
   detail: string;
 };
 
+  type OrionBrowserTab = {
+    id: string;
+    threadId: string | null;
+    agentId: string | null;
+    /** A thread id, `thread:agent` for a Claude Task subagent, or `user`. */
+    ownerKey: string;
+    openedBy: 'agent' | 'user';
+    controller: 'agent' | 'user';
+    url: string;
+    title: string;
+    loading: boolean;
+    canGoBack: boolean;
+    canGoForward: boolean;
+    dialog: { id: number; type: string; message: string; defaultPrompt: string; url: string } | null;
+    crashed: boolean;
+    agentBusy: boolean;
+    lastAgentActionAt: number;
+    createdAt: number;
+    blocked: string | null;
+    /** A download waiting for the user's Save / Cancel (Ask before downloading). */
+    pendingDownload: { id: string; filename: string; url: string; totalBytes: number | null } | null;
+    lastDownload: { path: string; state: string } | null;
+  };
+
+  type OrionBrowserState = {
+    tabs: OrionBrowserTab[];
+    visibleTabId: string | null;
+    event?: { type: 'agent-opened' | 'popup-opened' | 'dialog-opened' | 'dialog-closed' | 'download-requested'; tabId: string; threadId: string | null; ownerKey?: string; openerTabId?: string };
+  };
+
+  type OrionBrowserResult = { ok: boolean; error?: string };
+
+  type OrionBrowserApi = {
+    list: () => Promise<OrionBrowserState>;
+    create: (input: { url?: string; projectPath?: string | null; threadId?: string | null }) => Promise<OrionBrowserResult & { tabId?: string }>;
+    navigate: (input: { tabId: string; url: string }) => Promise<OrionBrowserResult>;
+    back: (tabId: string) => Promise<OrionBrowserResult>;
+    forward: (tabId: string) => Promise<OrionBrowserResult>;
+    reload: (tabId: string) => Promise<OrionBrowserResult>;
+    stop: (tabId: string) => Promise<OrionBrowserResult>;
+    close: (tabId: string) => Promise<OrionBrowserResult>;
+    select: (tabId: string | null) => Promise<OrionBrowserResult>;
+    setBounds: (rect: { x: number; y: number; width: number; height: number } | null) => Promise<OrionBrowserResult>;
+    setVisible: (visible: boolean) => Promise<OrionBrowserResult>;
+    takeControl: (tabId: string) => Promise<OrionBrowserResult>;
+    releaseControl: (tabId: string) => Promise<OrionBrowserResult>;
+    adopt: (input: { tabId: string; threadId: string; projectPath?: string | null }) => Promise<OrionBrowserResult>;
+    answerDialog: (input: { tabId: string; dialogId?: number; accept: boolean; promptText?: string }) => Promise<OrionBrowserResult>;
+    answerDownload: (input: { tabId: string; id: string; accept: boolean }) => Promise<OrionBrowserResult>;
+    setOptions: (input: { askBeforeDownload?: boolean }) => Promise<OrionBrowserResult>;
+    closeThreadTabs: (threadId: string) => Promise<OrionBrowserResult>;
+    setThreadParents: (parents: Record<string, string>) => Promise<OrionBrowserResult>;
+    clearData: () => Promise<OrionBrowserResult>;
+  };
+
   interface Window {
     orion: {
       loadStore: () => Promise<string | null>;
@@ -1328,7 +1383,8 @@ type OrionCodexBrowserIntegrationStatus = {
           chrome?: boolean;
           browserControl?: boolean;
           browserAutoConnect?: boolean;
-          browserUseMode?: 'disabled' | 'extension' | 'mcp';
+          browserUseMode?: 'disabled' | 'builtin' | 'extension' | 'mcp';
+          browser?: 'builtin' | 'chrome' | 'off';
           extraArgs?: string;
         };
         /** Set when the thread runs the Orion pseudo-model: the roles it may delegate to. */
@@ -1523,6 +1579,8 @@ type OrionCodexBrowserIntegrationStatus = {
       onSubagentSpawnRequest(callback: (request: SubagentSpawnRequest) => void): () => void;
       reportSubagentStopResult(payload: { stopId: string; ok: boolean; result: string }): Promise<void>;
       onSubagentStopRequest(callback: (request: SubagentStopRequest) => void): () => void;
+      browser?: OrionBrowserApi;
+      onBrowserState?: (callback: (state: OrionBrowserState) => void) => () => void;
       onUserAction?: (
         callback: (
           request:

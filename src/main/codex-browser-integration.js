@@ -33,7 +33,16 @@ export const parseCodexNodeReplEnabled = (output) => parseMcpEnabled(output, 'no
 export const codexBrowserOptionsForIntegration = (providerOptions, integrationStatus) => {
   const options =
     providerOptions && typeof providerOptions === 'object' ? providerOptions : {};
-  if (codexBrowserUseMode(options) === 'extension' && integrationStatus?.ready !== true) {
+  // The probe is advisory: it reports "not ready" for setups whose extension
+  // connects fine at run time. An unverified extension therefore stays the
+  // user's choice (Codex discovers its own Chrome tools; the built-in browser
+  // covers pages without a login). Only runs without Durango Code's bridge,
+  // and so without the built-in browser, keep the separate-profile fallback.
+  if (
+    codexBrowserUseMode(options) === 'extension' &&
+    integrationStatus?.ready !== true &&
+    integrationStatus?.builtinAvailable === false
+  ) {
     return { ...options, browserUseMode: 'mcp', browserAutoConnect: false };
   }
   return options;
@@ -80,7 +89,7 @@ export const probeCodexBrowserIntegration = async (runCommand, readSkill = readF
       extensionInstalled: null,
       extensionEnabled: null,
       nativeHostReady: null,
-      detail: 'Could not inspect this Codex installation. Use the dedicated MCP browser until Codex browser support is available.',
+      detail: 'Could not inspect this Codex installation. Durango Code’s built-in browser is used until Codex browser support is available.',
     };
   }
 
@@ -129,17 +138,17 @@ export const probeCodexBrowserIntegration = async (runCommand, readSkill = readF
     extensionInstalled === true &&
     extensionEnabled === true &&
     nativeHostReady === true;
-  let detail = 'Chrome extension setup detected. Durango Code checks the connection when a task uses it and keeps a separate browser available if it cannot connect.';
+  let detail = 'Chrome extension setup detected. Durango Code checks the connection when a task uses it and falls back to its built-in browser if it cannot connect.';
   if (!plugin.installed || !plugin.enabled) {
-    detail = 'The Codex Chrome plugin is not installed and enabled. Install or update Codex browser support, or use the dedicated MCP browser.';
+    detail = 'The Codex Chrome plugin is not installed and enabled. Install or update Codex browser support; until then Codex uses the built-in browser.';
   } else if (!browserWorkflowAvailable) {
-    detail = 'This Codex installation has no available Chrome browser workflow. Durango Code will use a separate browser without your Chrome logins or tabs.';
+    detail = 'This Codex installation has no available Chrome browser workflow. Durango Code will use its built-in browser, without your Chrome logins or tabs.';
   } else if (extensionInstalled === false || extensionEnabled === false) {
     detail = 'Install and enable the ChatGPT Chrome extension to let Codex use your signed-in Chrome.';
   } else if (nativeHostReady === false) {
-    detail = 'The Codex browser native host needs repair. Reinstall Codex browser support, or use the dedicated MCP browser.';
+    detail = 'The Codex browser native host needs repair. Reinstall Codex browser support; until then Codex uses the built-in browser.';
   } else if (!ready) {
-    detail = 'Codex could not verify the Chrome extension connection. Use the dedicated MCP browser until setup is complete.';
+    detail = 'Codex could not verify the Chrome extension connection. Codex uses the built-in browser until setup is complete.';
   }
 
   return {

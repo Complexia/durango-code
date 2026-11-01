@@ -3,6 +3,7 @@ import { chromeDevtoolsMcpPackage, claudeEffortForCli, claudeModelArgForContextW
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexConfigArgs, codexModelConfig, codexPersonalizationConfig, splitCodexConfigContextArgs } from './codex-config.js';
 import { grokPermissionModeForAccessMode } from './grok-access-mode.js';
 import { CLAUDE_CHROME_BROWSER_TIPS } from './claude-chrome.js';
+import { browserModeFor } from './browser-tools.js';
 
 export const commandForModel = (model, input) => {
   const prompt =
@@ -42,7 +43,7 @@ export const commandForModel = (model, input) => {
     if (options.networkAccess) configArgs.push('--config', 'sandbox_workspace_write.network_access=true');
     if (options.webSearch) configArgs.push('--config', 'tools.web_search=true');
     configArgs.push(
-      ...codexConfigArgs(codexBrowserMcpConfig(options, accessMode, chromeDevtoolsMcpPackage))
+      ...codexConfigArgs(codexBrowserMcpConfig(options, accessMode, chromeDevtoolsMcpPackage, { builtinAvailable: Boolean(input.orionMcp) }))
     );
     // Orion's spawn_subagent bridge (@-mention delegation / orchestration).
     // A spawned subagent can run for a long time, so lift codex's 60s default
@@ -69,7 +70,7 @@ export const commandForModel = (model, input) => {
     }
     // The selected and runtime-verified browser backend gets an explicit steer
     // so Codex does not try the unavailable alternative first and stop there.
-    const browserNote = codexBrowserEnvironmentNote(options, accessMode);
+    const browserNote = codexBrowserEnvironmentNote(options, accessMode, { builtinAvailable: Boolean(input.orionMcp) });
     const codexPrompt = `${browserNote}${prompt}`;
 
     if (resumeSessionId) {
@@ -129,7 +130,7 @@ export const commandForModel = (model, input) => {
     // Headless runs can't show permission prompts, so tools outside the
     // permission mode's defaults must be pre-approved here. Claude in Chrome
     // tools are MCP tools, so enabling --chrome also pre-approves its server.
-    const chromeEnabled = options.chrome === true && accessMode !== 'read-only';
+    const chromeEnabled = browserModeFor('claude', options, accessMode) === 'chrome';
     // One-shot runs have no SDK hooks, so they get the usage tips but not the
     // cross-thread Chrome lease.
     const chromeArgs = chromeEnabled

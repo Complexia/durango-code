@@ -32,7 +32,7 @@ export const codexAppServerConfig = (model, input) => {
   };
   if (options.networkAccess) config['sandbox_workspace_write.network_access'] = true;
   if (options.webSearch) config['tools.web_search'] = true;
-  Object.assign(config, codexBrowserMcpConfig(options, input.accessMode, chromeDevtoolsMcpPackage));
+  Object.assign(config, codexBrowserMcpConfig(options, input.accessMode, chromeDevtoolsMcpPackage, { builtinAvailable: Boolean(input.orionMcp) }));
   // Full resolved definitions are required for plugin-provided MCPs. They are
   // kept off argv and passed only across this local JSON-RPC connection.
   Object.assign(config, input.mcpRuntimeConfig);
@@ -515,7 +515,7 @@ export const createCodexAppServerDriver = ({
   const userTurnParams = () => ({
     threadId,
     input: codexUserInput(
-      `${codexBrowserEnvironmentNote(input.providerOptions, accessMode)}${input.prompt}`,
+      `${codexBrowserEnvironmentNote(input.providerOptions, accessMode, { builtinAvailable: Boolean(input.orionMcp) })}${input.prompt}`,
       input.attachments,
       model
     ),

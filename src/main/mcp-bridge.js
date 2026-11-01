@@ -10,6 +10,7 @@ import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
 import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
 import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
+import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import {
   acpOrionMcpServers,
   museOrionMcpServers,
@@ -129,9 +130,11 @@ export const handleMcpBridgeConnection = (socket) => {
         message = JSON.parse(line);
       } catch {}
       if (!message || message.id === undefined) continue;
-      const reply = (ok, text) => {
+      // `content` (optional) carries MCP content blocks, e.g. images, that
+      // the shim returns as-is; `text` alone becomes one text block.
+      const reply = (ok, text, extra) => {
         try {
-          socket.write(`${JSON.stringify({ id: message.id, ok, text })}\n`);
+          socket.write(`${JSON.stringify({ id: message.id, ok, text, ...(extra ?? {}) })}\n`);
         } catch {}
       };
       const session =
@@ -143,6 +146,37 @@ export const handleMcpBridgeConnection = (socket) => {
         continue;
       }
       const args = message.args && typeof message.args === 'object' ? message.args : {};
+      // The shim's tools/list asks which tools this run gets beyond its fixed
+      // set, so the browser_* schemas live only in browser-tools.js.
+      if (message.tool === '__tools') {
+        reply(true, '', {
+          tools: hasBuiltinBrowser(session.browserMode) ? browserMcpToolDefinitions(session.accessMode) : [],
+        });
+        continue;
+      }
+      if (BROWSER_TOOL_NAMES.includes(message.tool)) {
+        if (!hasBuiltinBrowser(session.browserMode)) {
+          reply(false, 'The built-in browser is turned off for this provider in Durango Code settings.');
+          continue;
+        }
+        void runBrowserTool(message.tool, args, { ...session, signedInBrowser: signedInBrowserFor(session.browserMode) }).then(
+          ({ ok, text, images }) =>
+            reply(
+              ok,
+              text,
+              images?.length
+                ? {
+                    content: [
+                      { type: 'text', text },
+                      ...images.map((image) => ({ type: 'image', data: image.data, mimeType: image.mimeType })),
+                    ],
+                  }
+                : undefined
+            ),
+          (error) => reply(false, `Browser tool failed: ${error?.message ?? error}`)
+        );
+        continue;
+      }
       if (message.tool === 'spawn_subagent') {
         if (
           typeof args.model !== 'string' ||
@@ -316,6 +350,7 @@ export const registerMcpBridgeForRun = async ({
   projectPath,
   providerId,
   accessMode,
+  browserMode = 'off',
   userServers = [],
 }) => {
   try {
@@ -332,13 +367,15 @@ export const registerMcpBridgeForRun = async ({
       args,
       userServers,
     });
-    mcpBridgeSessions.set(token, {
+    const session = {
       getSender,
       threadId,
       projectPath,
       providerId,
       accessMode,
-    });
+      browserMode,
+    };
+    mcpBridgeSessions.set(token, session);
     return {
       token,
       socketPath,
@@ -350,6 +387,11 @@ export const registerMcpBridgeForRun = async ({
       // Resolved Orion MCP servers (with secrets) for the provider-specific
       // intakes below: ACP session params, OpenCode inline config, Muse root.
       userServers,
+      // Settled browser mode after provider-specific fallbacks (Codex's
+      // extension check runs after registration).
+      setBrowserMode: (mode) => {
+        session.browserMode = mode;
+      },
       release: () => {
         mcpBridgeSessions.delete(token);
         void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});

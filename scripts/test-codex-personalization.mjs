@@ -91,23 +91,39 @@ assert.deepEqual(codexConfigArgs({
   'developer_instructions="Use \\"quoted\\" guidance."',
 ]);
 
-assert.equal(codexBrowserEnvironmentNote({}, 'full-access'), '');
+// No choice (and the legacy separate-profile toggle) means the built-in browser.
+assert.match(codexBrowserEnvironmentNote({}, 'full-access'), /built-in browser: the browser_\* tools of the orion MCP server/);
+assert.match(codexBrowserEnvironmentNote({}, 'full-access'), /untrusted/);
+assert.equal(codexBrowserEnvironmentNote({}, 'full-access', { builtinAvailable: false }), '', 'no orion bridge, no built-in browser note');
+assert.equal(codexBrowserEnvironmentNote({ browserUseMode: 'disabled' }, 'full-access'), '');
 assert.equal(codexBrowserEnvironmentNote({ browserControl: true }, 'read-only'), '');
-assert.equal(codexBrowserUseMode({}), 'disabled');
-assert.equal(codexBrowserUseMode({ browserControl: true }), 'disabled');
+assert.equal(codexBrowserUseMode({}), 'builtin');
+assert.equal(codexBrowserUseMode({ browserControl: true }), 'builtin');
+assert.equal(codexBrowserUseMode({ browserUseMode: 'disabled' }), 'disabled');
+assert.equal(codexBrowserUseMode({ browserUseMode: 'builtin' }), 'builtin');
+assert.deepEqual(codexBrowserMcpConfig({}, 'full-access', 'test'), {}, 'the built-in browser needs no chrome-devtools MCP');
 assert.equal(codexBrowserUseMode({ browserControl: true, browserAutoConnect: true }), 'mcp');
 assert.equal(codexBrowserUseMode({ browserControl: true, browserUseMode: 'extension' }), 'extension');
 const extensionNote = codexBrowserEnvironmentNote({ browserUseMode: 'extension' }, 'full-access');
 assert.match(extensionNote, /ChatGPT Chrome extension/);
 assert.match(extensionNote, /cua_repl/);
 assert.match(extensionNote, /skill actually listed in this session/);
-assert.match(extensionNote, /chrome_devtools MCP tools/);
-assert.match(extensionNote, /dedicated browser profile/);
+// With the built-in browser: signed-in Chrome for logins, built-in for the rest.
+assert.match(extensionNote, /signed-in Chrome for anything that needs their accounts[\s\S]*Cloudflare/);
+assert.match(extensionNote, /browser_\* tools of the orion MCP server[\s\S]*never ask the user to sign in there/);
+assert.match(extensionNote, /request_user_action either to fix the ChatGPT Chrome extension or to sign in to that site in the built-in browser panel/);
+assert.match(codexBrowserEnvironmentNote({}, 'full-access'), /request_user_action to sign in to that site in the built-in browser panel/);
+assert.doesNotMatch(extensionNote, /chrome_devtools|dedicated browser profile/, 'no separate-profile fallback next to the built-in browser');
 assert.doesNotMatch(extensionNote, /control-chrome|verified Codex browser integration/);
+const bridgelessExtensionNote = codexBrowserEnvironmentNote({ browserUseMode: 'extension' }, 'full-access', { builtinAvailable: false });
+assert.match(bridgelessExtensionNote, /chrome_devtools MCP tools/);
+assert.match(bridgelessExtensionNote, /dedicated browser profile/);
+assert.doesNotMatch(bridgelessExtensionNote, /browser_\*/);
 const mcpNote = codexBrowserEnvironmentNote({ browserUseMode: 'mcp' }, 'full-access');
 assert.match(mcpNote, /chrome_devtools MCP tools/);
 assert.match(mcpNote, /real signed-in Chrome/);
 assert.match(mcpNote, /remote debugging toggle/);
+assert.match(mcpNote, /built-in browser: the browser_\* tools[\s\S]*never ask the user to sign in there/);
 const fallbackMcpNote = codexBrowserEnvironmentNote(
   { browserUseMode: 'mcp', browserAutoConnect: false },
   'full-access'
@@ -134,6 +150,11 @@ assert.deepEqual(
   codexBrowserMcpConfig({ browserUseMode: 'extension', browserAutoConnect: true }, 'full-access', 'chrome-devtools-mcp@test'),
   codexBrowserMcpConfig({ browserUseMode: 'extension' }, 'full-access', 'chrome-devtools-mcp@test'),
   'extension fallback must never inherit signed-in remote debugging access'
+);
+assert.deepEqual(
+  codexBrowserMcpConfig({ browserUseMode: 'extension' }, 'full-access', 'chrome-devtools-mcp@test', { builtinAvailable: true }),
+  {},
+  'the built-in browser replaces the extension mode\'s separate-profile fallback'
 );
 for (const browserUseMode of ['disabled', 'extension']) {
   assert.deepEqual(codexBrowserMcpConfig({ browserUseMode }, 'read-only', 'test'), {});
@@ -166,7 +187,13 @@ assert.equal(parseCodexNodeReplEnabled('node_repl  /tmp/node_repl  -  -  -  enab
 assert.equal(parseCodexNodeReplEnabled('node_repl_old  /tmp/node_repl  -  -  -  enabled  Unsupported'), false);
 assert.deepEqual(
   codexBrowserOptionsForIntegration({ browserUseMode: 'extension', webSearch: true }, { ready: false }),
-  { browserUseMode: 'mcp', browserAutoConnect: false, webSearch: true }
+  { browserUseMode: 'extension', webSearch: true },
+  'the probe is advisory: an unverified extension stays the choice'
+);
+assert.deepEqual(
+  codexBrowserOptionsForIntegration({ browserUseMode: 'extension', webSearch: true }, { ready: false, builtinAvailable: false }),
+  { browserUseMode: 'mcp', browserAutoConnect: false, webSearch: true },
+  'runs without the bridge keep the separate-profile fallback'
 );
 assert.deepEqual(
   codexBrowserOptionsForIntegration({ browserUseMode: 'extension' }, { ready: true }),
@@ -206,7 +233,7 @@ const missingSkillProbe = await browserProbe('node_repl  /tmp/node_repl  enabled
 assert.equal(missingSkillProbe.ready, false, 'extension and native host cannot conceal a removed browser skill');
 assert.equal(missingSkillProbe.browserWorkflowAvailable, false);
 assert.match(missingSkillProbe.detail, /no available Chrome browser workflow/);
-assert.equal(codexBrowserOptionsForIntegration({ browserUseMode: 'extension' }, missingSkillProbe).browserUseMode, 'mcp');
+assert.equal(codexBrowserOptionsForIntegration({ browserUseMode: 'extension' }, missingSkillProbe).browserUseMode, 'extension');
 assert.equal((await browserProbe('node_repl  /tmp/node_repl  enabled', '')).ready, false);
 const modernProbe = await browserProbe('cua_repl  /tmp/cua_repl  enabled');
 assert.equal(modernProbe.ready, true, 'self-describing CUA does not require the removed skill or old node_repl');

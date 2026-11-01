@@ -402,7 +402,8 @@ recoveryDriver = createCodexAppServerDriver({
   child: recoveryChild,
   cwd: '/tmp/project',
   model,
-  input: { prompt: 'retry this exact request' },
+  // No browser note, so the retried prompt is compared verbatim.
+  input: { prompt: 'retry this exact request', providerOptions: { browserUseMode: 'disabled' } },
   goal: undefined,
   review: undefined,
   resumeSessionId: 'recovery-thread',

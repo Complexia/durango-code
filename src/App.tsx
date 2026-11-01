@@ -37,6 +37,7 @@ import {
   Eraser,
   Plug,
   MessageCircle,
+  Globe,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -133,6 +134,8 @@ import {
 } from './app/threadLists';
 import { UserActionCards } from './app/UserActions';
 import { ThreadPane } from './app/ThreadPane';
+import { BrowserPanel } from './app/BrowserPanel';
+import { tabsForThread, useBrowserTabs, useThreadParents, type BrowserTab } from './app/useBrowserTabs';
 import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
 import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
@@ -2455,6 +2458,66 @@ const App: React.FC = () => {
     ? null
     : (activeDurangoWorkspace?.workingDir ?? activeThreadProject?.path ?? null);
   const previousActiveWorkingDirRef = useRef(activeWorkingDir);
+
+  // ---- Built-in browser panel (tabs live in main; see app/BrowserPanel) ----
+  const browserAutoOpen = useOrionStore((state) => state.browserSettings?.autoOpenPanel !== false);
+  const browserAskBeforeDownload = useOrionStore((state) => state.browserSettings?.askBeforeDownload !== false);
+  useEffect(() => {
+    void window.orion?.browser?.setOptions?.({ askBeforeDownload: browserAskBeforeDownload });
+  }, [browserAskBeforeDownload]);
+  const [browserPanelOpen, setBrowserPanelOpenState] = useState(() => {
+    try {
+      return window.localStorage.getItem('orion.browserPanel.open') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const setBrowserPanelOpen = useCallback((open: boolean) => {
+    setBrowserPanelOpenState(open);
+    try {
+      window.localStorage.setItem('orion.browserPanel.open', open ? '1' : '0');
+    } catch {}
+  }, []);
+  const [browserSelectedTabId, setBrowserSelectedTabId] = useState<string | null>(null);
+  const browserThreadParents = useThreadParents(threads);
+  const browserEventContextRef = useRef({ selectedThreadId, parents: browserThreadParents, autoOpen: browserAutoOpen, open: browserPanelOpen });
+  browserEventContextRef.current = { selectedThreadId, parents: browserThreadParents, autoOpen: browserAutoOpen, open: browserPanelOpen };
+  const browserState = useBrowserTabs((event) => {
+    if (event.type !== 'agent-opened' && event.type !== 'popup-opened' && event.type !== 'download-requested') return;
+    const context = browserEventContextRef.current;
+    // Only tabs of the thread on screen (or its subagents) pull the panel open.
+    const ownTab = tabsForThread(
+      [{ ownerKey: event.ownerKey ?? event.threadId ?? '', threadId: event.threadId } as BrowserTab],
+      context.selectedThreadId,
+      context.parents
+    ).length > 0;
+    if (!ownTab) return;
+    // A download waits for the user's answer, so it always opens the panel.
+    if (context.open || context.autoOpen || event.type === 'download-requested') {
+      setBrowserSelectedTabId(event.tabId);
+      if (!context.open) setBrowserPanelOpen(true);
+    }
+  });
+  const browserPanelTabs = useMemo(
+    () => tabsForThread(browserState.tabs, selectedThreadId, browserThreadParents),
+    [browserState.tabs, selectedThreadId, browserThreadParents]
+  );
+  const browserActiveTabId = useMemo(() => {
+    if (browserSelectedTabId && browserPanelTabs.some((tab) => tab.id === browserSelectedTabId)) return browserSelectedTabId;
+    const recent = [...browserPanelTabs].sort(
+      (a, b) => Math.max(b.lastAgentActionAt, b.createdAt) - Math.max(a.lastAgentActionAt, a.createdAt)
+    )[0];
+    return recent?.id ?? null;
+  }, [browserSelectedTabId, browserPanelTabs]);
+  const browserOwnerLabel = useCallback(
+    (tab: BrowserTab) => {
+      if (tab.ownerKey === 'user') return 'You';
+      const title = threads.find((thread) => thread.id === tab.threadId)?.title?.trim() || 'Agent';
+      return tab.agentId ? `${title} · subagent` : title;
+    },
+    [threads]
+  );
+  const browserAgentTabCount = browserPanelTabs.filter((tab) => tab.ownerKey !== 'user').length;
   useLayoutEffect(() => {
     const workingDirChanged = previousActiveWorkingDirRef.current !== activeWorkingDir;
     previousActiveWorkingDirRef.current = activeWorkingDir;
@@ -2610,6 +2673,8 @@ const App: React.FC = () => {
 
       await Promise.all(runIds.map((runId) => window.orion?.stopAgentTurn?.(runId, { terminateBackground: true })));
       await Promise.all(removedThreads.map((thread) => disposeThreadRuntime(thread.id)));
+      // Their built-in browser tabs go with them.
+      for (const thread of removedThreads) void window.orion?.browser?.closeThreadTabs(thread.id);
       for (const spawnId of spawnIds) {
         void window.orion?.reportSubagentResult?.({
           spawnId,
@@ -10539,6 +10604,20 @@ const App: React.FC = () => {
           </div>
 
           <div className="shell-right-group">
+            {activeTab === 'agents' && !settingsOpen && (
+              <button
+                type="button"
+                className="shell-openwith-trigger"
+                aria-pressed={browserPanelOpen}
+                aria-expanded={browserPanelOpen}
+                title={browserPanelOpen ? 'Hide browser' : 'Show browser'}
+                aria-label={browserPanelOpen ? 'Hide browser' : 'Show browser'}
+                onClick={() => setBrowserPanelOpen(!browserPanelOpen)}
+              >
+                <Globe size={14} />
+                {browserAgentTabCount > 0 && <span className="text-[11px] tabular-nums">{browserAgentTabCount}</span>}
+              </button>
+            )}
             {openWithApps.length > 0 && activeWorkingDir && (
               <div className="shell-openwith-control" ref={openWithRef}>
                 <button
@@ -10835,6 +10914,18 @@ const App: React.FC = () => {
                   </div>
                 )}
               </div>
+
+              {browserPanelOpen && !activeRemoteMachine && (
+                <BrowserPanel
+                  tabs={browserPanelTabs}
+                  selectedTabId={browserActiveTabId}
+                  onSelectTab={setBrowserSelectedTabId}
+                  focusedThreadId={selectedThreadId}
+                  focusedProjectPath={activeWorkingDir}
+                  ownerLabel={browserOwnerLabel}
+                  onClose={() => setBrowserPanelOpen(false)}
+                />
+              )}
             </>
           )}
 

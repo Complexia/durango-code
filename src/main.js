@@ -97,6 +97,9 @@ import { createAccountConnectors } from './main/account-connectors.js';
 import { assertOpenCodeMcpNamesAvailable, listProviderMcps, shareProviderMcp, withoutClaudeNativeMcps, withoutCodexNativeMcps } from './main/provider-mcps.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
+import { createBrowserManager } from './main/browser/manager.js';
+import { browserScreenshotsDirectory } from './main/browser/security.js';
+import { browserModeFor, setBrowserManager } from './main/browser-tools.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
 import { externalWebUrl, linkedFileCandidates } from './main/linked-navigation.js';
 import {
@@ -1078,8 +1081,61 @@ const createWindow = () => {
   }
 
   // DevTools can still be opened manually from the Electron menu when needed.
+  browserMainWindow = mainWindow;
+  mainWindow.on('closed', () => {
+    if (browserMainWindow === mainWindow) browserMainWindow = null;
+  });
   return mainWindow;
 };
+
+// -------------------- Built-in browser --------------------
+// Tabs are WebContentsViews owned here (main/browser/manager.js); the
+// renderer's browser panel positions the visible one, agents drive them
+// through the browser_* tools (main/browser-tools.js).
+let browserMainWindow = null;
+let browserManager = null;
+const getBrowserManagerInstance = () => {
+  if (!browserManager) {
+    browserManager = createBrowserManager({
+      getWindow: () =>
+        browserMainWindow && !browserMainWindow.isDestroyed()
+          ? browserMainWindow
+          : BrowserWindow.getAllWindows().find((window) => !window.isDestroyed()) ?? null,
+      emit: (channel, payload) => sendToAllWindows(channel, payload),
+    });
+    setBrowserManager(browserManager, { screenshotsDirectory: browserScreenshotsDirectory() });
+  }
+  return browserManager;
+};
+const handleBrowserIpc = (channel, action) => {
+  ipcMain.handle(channel, async (_event, input) => {
+    try {
+      return await getBrowserManagerInstance().userActions[action](input ?? {});
+    } catch (error) {
+      return { ok: false, error: error?.message ?? String(error) };
+    }
+  });
+};
+handleBrowserIpc('browser:list', 'list');
+handleBrowserIpc('browser:create', 'create');
+handleBrowserIpc('browser:navigate', 'navigate');
+handleBrowserIpc('browser:back', 'back');
+handleBrowserIpc('browser:forward', 'forward');
+handleBrowserIpc('browser:reload', 'reload');
+handleBrowserIpc('browser:stop', 'stop');
+handleBrowserIpc('browser:close', 'close');
+handleBrowserIpc('browser:select', 'select');
+handleBrowserIpc('browser:setBounds', 'setBounds');
+handleBrowserIpc('browser:takeControl', 'takeControl');
+handleBrowserIpc('browser:releaseControl', 'releaseControl');
+handleBrowserIpc('browser:adopt', 'adopt');
+handleBrowserIpc('browser:answerDialog', 'answerDialog');
+handleBrowserIpc('browser:answerDownload', 'answerDownload');
+handleBrowserIpc('browser:setOptions', 'setOptions');
+handleBrowserIpc('browser:closeThreadTabs', 'closeThreadTabs');
+handleBrowserIpc('browser:setThreadParents', 'setThreadParents');
+handleBrowserIpc('browser:clearData', 'clearData');
+ipcMain.handle('browser:setVisible', (_event, visible) => getBrowserManagerInstance().userActions.setVisible(visible === true));
 
 // First-party skills install in the background; only the skills list and
 // agent runs (whose CLI reads the skills folder at launch) wait for them.
@@ -1319,6 +1375,7 @@ app.whenReady().then(async () => {
 
   createWindow();
   void startSnapShot().catch((error) => console.error('Could not start SnapShot', error));
+  getBrowserManagerInstance();
   await remoteControlReady;
 
   const startupAuthUrl = process.argv.find((arg) => isDesktopAuthCallbackUrl(arg));
@@ -4961,6 +5018,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             projectPath: input.projectPath,
             providerId: model.providerId,
             accessMode: input.accessMode || 'full-access',
+            browserMode: browserModeFor(model.providerId, input.providerOptions, input.accessMode || 'full-access'),
             // Codex receives these through its app-server config instead.
             userServers: model.providerId === 'codex' ? [] : [...orionMcps.servers, ...bridgeAccountMcps],
           });
@@ -5014,15 +5072,19 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     ) {
       const browserIntegration = await getCodexBrowserIntegrationStatus();
       if (!browserIntegration.ready) {
-        // Never tell Codex to use extension tools that Orion cannot verify.
-        // The dedicated MCP browser is the supported, self-contained fallback.
+        // An unverified extension stays the user's choice when this run has
+        // the built-in browser for pages without a login; without the bridge
+        // it falls back to the separate-profile chrome-devtools browser.
         runtimeInput = {
           ...runtimeInput,
           providerOptions: codexBrowserOptionsForIntegration(
             input.providerOptions,
-            browserIntegration
+            { ...browserIntegration, builtinAvailable: Boolean(orionMcp) }
           ),
         };
+        orionMcp?.setBrowserMode?.(
+          browserModeFor(model.providerId, runtimeInput.providerOptions, input.accessMode || 'full-access')
+        );
       }
     }
     // Per-process Codex flags cannot be isolated on a shared server. Keep

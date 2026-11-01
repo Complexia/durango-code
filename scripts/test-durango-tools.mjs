@@ -303,6 +303,9 @@ try {
     { threadId: 't', projectPath: testRoot, accessMode: 'read-only', sender: null }
   );
   assert.equal(server.name, 'orion');
+  // browser_* tools join only sessions on the built-in browser; their schema
+  // sync with the shim is covered by scripts/test-builtin-browser.mjs.
+  assert.equal(registered.some((entry) => entry.name.startsWith('browser_')), false);
   for (const name of DURANGO_TOOL_NAMES) {
     const entry = registered.find((candidate) => candidate.name === name);
     assert.ok(entry, `Claude registers ${name}`);

@@ -18,6 +18,7 @@ import {
   runDurangoTool,
 } from './durango-tools.js';
 import { orionBuiltinToolNamesForAccessMode } from './thread-reader-routing.js';
+import { browserModeFor, browserToolsForAccessMode, builtinBrowserTips, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import {
   USER_ACTION_CHECK_MAX_CHARS,
   USER_ACTION_MAX_CHARS,
@@ -433,12 +434,94 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
         // Writes a pending memory candidate on Durango; refused in Read only.
         async (args) => durangoToolResult(await runDurangoTool('remember', args, session))
       ),
+      // Built-in browser (browser-tools.js holds the schemas; the bridge shim
+      // lists the same ones). Every browser mode but 'off' includes them;
+      // 'chrome' adds Claude in Chrome for signed-in sites.
+      ...(hasBuiltinBrowser(session.browserMode) ? claudeBrowserTools(tool, z, session) : []),
     ],
   });
 
 const durangoToolResult = ({ ok, text }) => ({
   content: [{ type: 'text', text }],
   ...(ok ? {} : { isError: true }),
+});
+
+// Like durangoToolResult, plus image blocks (browser screenshots).
+const durangoToolResultWithImages = ({ ok, text, images }) => ({
+  content: [
+    { type: 'text', text },
+    ...(images ?? []).map((image) => ({ type: 'image', data: image.data, mimeType: image.mimeType })),
+  ],
+  ...(ok ? {} : { isError: true }),
+});
+
+// JSON schema property (the subset browser-tools.js uses) -> zod.
+const zodForJsonSchema = (z, schema) => {
+  let type;
+  if (schema.type === 'string') type = Array.isArray(schema.enum) ? z.enum(schema.enum) : z.string();
+  else if (schema.type === 'integer' || schema.type === 'number') {
+    type = schema.type === 'integer' ? z.number().int() : z.number();
+    if (typeof schema.minimum === 'number') type = type.min(schema.minimum);
+    if (typeof schema.maximum === 'number') type = type.max(schema.maximum);
+  } else if (schema.type === 'boolean') type = z.boolean();
+  else if (schema.type === 'array') type = z.array(zodForJsonSchema(z, schema.items ?? { type: 'string' }));
+  else type = z.any();
+  return schema.description ? type.describe(schema.description) : type;
+};
+
+// Claude Task subagents share their parent's session; the PreToolUse hook
+// below stamps their agent id into `_agent` so each gets its own tabs.
+export const CLAUDE_BROWSER_AGENT_ARG = '_agent';
+
+export const claudeBrowserTools = (tool, z, session) =>
+  browserToolsForAccessMode(session.accessMode).map((definition) => {
+    const required = new Set(definition.inputSchema.required ?? []);
+    const shape = {};
+    for (const [key, property] of Object.entries(definition.inputSchema.properties ?? {})) {
+      const type = zodForJsonSchema(z, property);
+      shape[key] = required.has(key) ? type : type.optional();
+    }
+    shape[CLAUDE_BROWSER_AGENT_ARG] = z.string().optional().describe('Set by Durango Code; leave it out.');
+    return tool(
+      definition.name,
+      definition.description,
+      shape,
+      async ({ [CLAUDE_BROWSER_AGENT_ARG]: agentId, ...args }) =>
+        durangoToolResultWithImages(
+          await runBrowserTool(definition.name, args, {
+            threadId: session.threadId,
+            agentId: typeof agentId === 'string' && agentId ? agentId : null,
+            projectPath: session.projectPath,
+            accessMode: session.accessMode,
+            signedInBrowser: signedInBrowserFor(session.browserMode),
+          })
+        ),
+      definition.readOnly ? { annotations: { readOnlyHint: true } } : undefined
+    );
+  });
+
+// PreToolUse: inside a Task subagent the hook input carries agent_id.
+export const claudeBrowserAgentHooks = () => ({
+  PreToolUse: [
+    {
+      matcher: '^mcp__orion__browser_',
+      hooks: [
+        async (input) => {
+          if (!input?.agent_id || !input.tool_input || typeof input.tool_input !== 'object') {
+            return { continue: true };
+          }
+          return {
+            // No permissionDecision: the input changes, approval stays with
+            // the session's own rules (verified live with a Task subagent).
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              updatedInput: { ...input.tool_input, [CLAUDE_BROWSER_AGENT_ARG]: input.agent_id },
+            },
+          };
+        },
+      ],
+    },
+  ],
 });
 
 // Legacy extra-flags string ("--foo bar --baz") -> SDK extraArgs map.
@@ -473,8 +556,9 @@ export const claudeSdkOptionsForInput = (model, input) => {
   const contextWindow = input.claudeContextWindow || defaultClaudeContextWindow;
   // Browser MCP tools can mutate signed-in external state, so Read only must
   // not expose or pre-approve them even though the filesystem sandbox would
-  // otherwise remain intact.
-  const chrome = providerOptions.chrome === true && accessMode !== 'read-only';
+  // otherwise remain intact (browserModeFor turns Chrome off there).
+  const browser = browserModeFor('claude', providerOptions, accessMode);
+  const chrome = browser === 'chrome';
   const allowedTools =
     accessMode !== 'full-access'
       ? String(providerOptions.allowedTools || '')
@@ -501,6 +585,7 @@ export const claudeSdkOptionsForInput = (model, input) => {
     ultracode: reasoningEffort === 'ultracode',
     allowedTools,
     extraArgs,
+    browser,
   };
 };
 
@@ -1671,6 +1756,7 @@ export const createClaudeSdkSession = ({
     threadId,
     projectPath,
     accessMode: sdkOptions.accessMode,
+    browserMode: sdkOptions.browser,
     sender,
     optionsKey: JSON.stringify([projectPath, sdkOptions]),
     createParams: { sender, threadId, projectPath, model, input },
@@ -1748,6 +1834,7 @@ export const createClaudeSdkSession = ({
     // resend this same instance alongside the Orion-connected ones.
     session.orionMcpServer = orionMcpServer;
     const chromeEnabled = 'chrome' in sdkOptions.extraArgs;
+    const builtinBrowser = hasBuiltinBrowser(sdkOptions.browser);
     // Headless runs can't show permission prompts, so outside bypass mode the
     // spawn/stop tools must be pre-approved alongside any user-configured
     // allowlist.
@@ -1760,6 +1847,9 @@ export const createClaudeSdkSession = ({
               ...[
                 ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode),
                 'wait_for_background_tasks',
+                ...(builtinBrowser
+                  ? browserToolsForAccessMode(sdkOptions.accessMode).map((definition) => definition.name)
+                  : []),
               ].map((name) => `mcp__orion__${name}`),
             ]),
           ];
@@ -1790,7 +1880,12 @@ export const createClaudeSdkSession = ({
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          append: [CLAUDE_BACKGROUND_WAIT_TIP, CLAUDE_USER_ACTION_TIP, ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : [])].join('\n\n'),
+          append: [
+            CLAUDE_BACKGROUND_WAIT_TIP,
+            CLAUDE_USER_ACTION_TIP,
+            ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
+            ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
+          ].join('\n\n'),
         },
         // Match the CLI's behavior: without this the SDK loads no user or
         // project settings — no CLAUDE.md, no skills, no MCP servers.
@@ -1802,6 +1897,7 @@ export const createClaudeSdkSession = ({
         hooks: mergeClaudeHooks(
           claudeForegroundWaitHooks(),
           claudeUserActionHooks(session),
+          builtinBrowser ? claudeBrowserAgentHooks() : {},
           chromeEnabled
             ? claudeChromeLeaseHooks(session, {
                 emitActivity: (activity) => {

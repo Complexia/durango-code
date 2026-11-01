@@ -212,6 +212,46 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('orchestration:spawnRequest', listener);
     return () => ipcRenderer.removeListener('orchestration:spawnRequest', listener);
   },
+  // Built-in browser (main/browser/manager.js). Tabs live in main; the panel
+  // only positions the visible one and forwards the person's actions.
+  browser: {
+    list: () => ipcRenderer.invoke('browser:list'),
+    create: (input) => ipcRenderer.invoke('browser:create', input),
+    navigate: (input) => ipcRenderer.invoke('browser:navigate', input),
+    back: (tabId) => ipcRenderer.invoke('browser:back', { tabId }),
+    forward: (tabId) => ipcRenderer.invoke('browser:forward', { tabId }),
+    reload: (tabId) => ipcRenderer.invoke('browser:reload', { tabId }),
+    stop: (tabId) => ipcRenderer.invoke('browser:stop', { tabId }),
+    close: (tabId) => ipcRenderer.invoke('browser:close', { tabId }),
+    select: (tabId) => ipcRenderer.invoke('browser:select', { tabId }),
+    // CSS pixels of the placeholder -> window pixels: the views ignore the
+    // renderer's zoom (Settings → Text size).
+    setBounds: (rect) => {
+      if (!rect) return ipcRenderer.invoke('browser:setBounds', null);
+      const zoom = webFrame.getZoomFactor() || 1;
+      return ipcRenderer.invoke('browser:setBounds', {
+        x: rect.x * zoom,
+        y: rect.y * zoom,
+        width: rect.width * zoom,
+        height: rect.height * zoom,
+      });
+    },
+    setVisible: (visible) => ipcRenderer.invoke('browser:setVisible', visible === true),
+    takeControl: (tabId) => ipcRenderer.invoke('browser:takeControl', { tabId }),
+    releaseControl: (tabId) => ipcRenderer.invoke('browser:releaseControl', { tabId }),
+    adopt: (input) => ipcRenderer.invoke('browser:adopt', input),
+    answerDialog: (input) => ipcRenderer.invoke('browser:answerDialog', input),
+    answerDownload: (input) => ipcRenderer.invoke('browser:answerDownload', input),
+    setOptions: (input) => ipcRenderer.invoke('browser:setOptions', input),
+    closeThreadTabs: (threadId) => ipcRenderer.invoke('browser:closeThreadTabs', { threadId }),
+    setThreadParents: (parents) => ipcRenderer.invoke('browser:setThreadParents', parents),
+    clearData: () => ipcRenderer.invoke('browser:clearData'),
+  },
+  onBrowserState: (callback) => {
+    const listener = (_event, state) => callback(state);
+    ipcRenderer.on('browser:state', listener);
+    return () => ipcRenderer.removeListener('browser:state', listener);
+  },
   // request_user_action / resolve_user_action from any agent run.
   onUserAction: (callback) => {
     const listener = (_event, request) => callback(request);

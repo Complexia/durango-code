@@ -701,7 +701,21 @@ export type OpenFile = {
 export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'fx' | 'muse' | 'opencode';
 
 export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
-export type BrowserUseMode = 'disabled' | 'extension' | 'mcp';
+export type BrowserUseMode = 'disabled' | 'builtin' | 'extension' | 'mcp';
+/** claude: built-in browser panel, Claude in Chrome (--chrome), or none. Others: builtin or off. */
+export type ProviderBrowserMode = 'builtin' | 'chrome' | 'off';
+
+export type BrowserSettings = {
+  /** Open the browser panel when an agent of the focused thread opens a tab. */
+  autoOpenPanel: boolean;
+  /** Hold built-in browser downloads until the user clicks Save (like Chrome's "Ask where to save"). */
+  askBeforeDownload: boolean;
+};
+
+export const defaultBrowserSettings: BrowserSettings = {
+  autoOpenPanel: true,
+  askBeforeDownload: true,
+};
 
 // Per-provider harness capabilities, passed through to the CLI invocation.
 export type ProviderRuntimeOptions = {
@@ -725,13 +739,15 @@ export type ProviderRuntimeOptions = {
   codexDeveloperInstructions?: string;
   /** grok: enable cross-session memory (--experimental-memory) */
   experimentalMemory?: boolean;
-  /** claude: browser control via the Claude Chrome extension (--chrome) */
+  /** legacy claude toggle for Claude in Chrome; `browser: 'chrome'` replaces it */
   chrome?: boolean;
+  /** claude: builtin | chrome | off (default builtin); other non-Codex providers: builtin | off */
+  browser?: ProviderBrowserMode;
   /** legacy codex browser toggle, retained for migration */
   browserControl?: boolean;
   /** legacy codex opt-in to attach MCP browser control to signed-in Chrome */
   browserAutoConnect?: boolean;
-  /** codex: disabled, signed-in Chrome extension, or signed-in Chrome through chrome-devtools MCP */
+  /** codex: disabled, Durango Code's built-in browser (default), signed-in Chrome extension, or signed-in Chrome through chrome-devtools MCP */
   browserUseMode?: BrowserUseMode;
   /** fx: bill models without a connected subscription to Durango usage credits (default on) */
   fxDurangoInference?: boolean;
@@ -877,6 +893,7 @@ interface OrionState {
   snapShotSettings: SnapShotSettings;
   deploymentSettings: DeploymentSettings;
   sidebarV2Settings: SidebarV2Settings;
+  browserSettings: BrowserSettings;
   appearanceSettings: AppearanceSettings;
 
   // Code tab workspace
@@ -946,6 +963,7 @@ interface OrionState {
   /** Forget a saved view. Its threads are untouched. */
   deleteSavedView: (id: string) => void;
   setSplitViewSettings: (updates: Partial<SplitViewSettings>) => void;
+  setBrowserSettings: (updates: Partial<BrowserSettings>) => void;
   updateThread: (id: string, updates: Partial<Thread>) => void;
   /** Remember (or, when empty, forget) a thread's unsent composer draft. */
   setComposerDraft: (threadId: string, draft: ComposerDraft) => void;
@@ -1631,6 +1649,7 @@ export const useOrionStore = create<OrionState>()(
       snapShotSettings: defaultSnapShotSettings,
       deploymentSettings: defaultDeploymentSettings,
       sidebarV2Settings: defaultSidebarV2Settings,
+      browserSettings: defaultBrowserSettings,
       appearanceSettings: defaultAppearanceSettings,
       workspacePath: null,
       openFiles: [],
@@ -1830,6 +1849,11 @@ export const useOrionStore = create<OrionState>()(
       renameProject: (id, name) =>
         set((state) => ({
           projects: state.projects.map((p) => (p.id === id ? { ...p, name } : p)),
+        })),
+
+      setBrowserSettings: (updates) =>
+        set((state) => ({
+          browserSettings: { ...defaultBrowserSettings, ...state.browserSettings, ...updates },
         })),
 
       setSplitViewSettings: (updates) =>
@@ -2605,6 +2629,7 @@ export const useOrionStore = create<OrionState>()(
           views: { ...defaultSidebarV2Settings.views, ...state.sidebarV2Settings?.views },
         },
         appearanceSettings: { ...defaultAppearanceSettings, ...state.appearanceSettings },
+        browserSettings: { ...defaultBrowserSettings, ...state.browserSettings },
         workspacePath: state.workspacePath,
         expandedProjects: state.expandedProjects,
         providerSettings: {
@@ -2659,6 +2684,7 @@ export const useOrionStore = create<OrionState>()(
         };
         merged.snapShotSettings = mergeSnapShotSettings(merged.snapShotSettings);
         merged.appearanceSettings = { ...defaultAppearanceSettings, ...merged.appearanceSettings };
+        merged.browserSettings = { ...defaultBrowserSettings, ...merged.browserSettings };
         // The Pinned group starts off on every launch; turning it on lasts
         // until the app quits. Stores from when sidebar v2 was opt-in turn it
         // on once; those that never had it on get the first-switch settle

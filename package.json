@@ -30,6 +30,7 @@
     "test:model-mentions": "bun scripts/test-model-mentions.ts",
     "test:chat-mentions": "node --no-warnings --experimental-strip-types scripts/test-chat-mentions.mjs",
     "test:durango-tools": "node scripts/run-electron-test.mjs scripts/test-durango-tools.mjs",
+    "test:builtin-browser": "node scripts/run-electron-test.mjs scripts/test-builtin-browser.mjs",
     "test:durango-dispatch": "node --no-warnings --experimental-strip-types scripts/test-durango-dispatch.mjs",
     "test:thread-search": "bun scripts/test-thread-search.tsx",
     "test:thread-references": "bun scripts/test-thread-references.tsx",
