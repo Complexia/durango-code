@@ -639,6 +639,17 @@ export const createBrowserManager = ({ getWindow, emit }) => {
       applyLayout();
       return { ok: true };
     },
+    // Small JPEG of a tab for the corner preview (the panel shows the live
+    // view only when expanded). stayHidden: a hidden tab paints for it.
+    thumbnail: async ({ tabId, width }) => {
+      const tab = findTab(tabId);
+      if (!tab || tab.crashed) return { ok: false };
+      let image = await tab.view.webContents.capturePage(undefined, { stayHidden: true });
+      if (image.isEmpty()) return { ok: false };
+      const target = Math.max(120, Math.min(Math.round(Number(width) || 640), 960));
+      if (image.getSize().width > target) image = image.resize({ width: target, quality: 'good' });
+      return { ok: true, dataUrl: `data:image/jpeg;base64,${image.toJPEG(72).toString('base64')}` };
+    },
     setVisible: (visible) => {
       panelVisible = visible === true;
       applyLayout();

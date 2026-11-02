@@ -237,6 +237,7 @@ contextBridge.exposeInMainWorld('orion', {
       });
     },
     setVisible: (visible) => ipcRenderer.invoke('browser:setVisible', visible === true),
+    thumbnail: (input) => ipcRenderer.invoke('browser:thumbnail', input),
     takeControl: (tabId) => ipcRenderer.invoke('browser:takeControl', { tabId }),
     releaseControl: (tabId) => ipcRenderer.invoke('browser:releaseControl', { tabId }),
     adopt: (input) => ipcRenderer.invoke('browser:adopt', input),

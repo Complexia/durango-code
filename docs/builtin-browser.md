@@ -1,7 +1,8 @@
 # Built-in browser
 
-Durango Code has its own browser: a panel beside the chat (globe button in the
-title bar) whose tabs agents drive through the `browser_*` tools of Durango
+Durango Code has its own browser (globe button in the title bar): a small
+preview in the bottom-right corner of the chat that opens into a modal with the
+live page, tabs and address bar when clicked. Its tabs agents drive through the `browser_*` tools of Durango
 Code's `orion` MCP server. Every provider gets the same tools; the user can
 watch, take over and hand back.
 
@@ -9,7 +10,7 @@ watch, take over and hand back.
 
 | File | Role |
 |---|---|
-| `src/main/browser/manager.js` | Tab registry. Each tab is a `WebContentsView` owned by the main process (tabs survive the panel closing and renderer reloads), with an owner, a controller, one action queue and its snapshot refs. Lays the visible tab over the panel's placeholder; every other tab stays attached but hidden at its last size (1280×800 if never shown). Emits `browser:state`. |
+| `src/main/browser/manager.js` | Tab registry. Each tab is a `WebContentsView` owned by the main process (tabs survive the panel closing and renderer reloads), with an owner, a controller, one action queue and its snapshot refs. Lays the visible tab over the expanded panel's placeholder (the corner preview is a `thumbnail` capture, since a native view would swallow its clicks); every other tab stays attached but hidden at its last size (1280×800 if never shown). Emits `browser:state`. |
 | `src/main/browser/cdp.js` | `webContents.debugger` wrapper: attach on demand, per-command timeouts, main-frame navigation tracking (and JavaScript dialog tracking when `guest-dialogs.js` is unavailable). |
 | `src/main/browser/guest-dialogs.js` | The only use of a private Electron hook: keeps a tab's alert/confirm out of native UI (see Rules). |
 | `src/main/browser/snapshot.js` | Pure: accessibility tree (`Accessibility.getFullAXTree`, plus same-process child frames) → the text outline with `[ref=eN]`. |

@@ -1131,6 +1131,7 @@ handleBrowserIpc('browser:stop', 'stop');
 handleBrowserIpc('browser:close', 'close');
 handleBrowserIpc('browser:select', 'select');
 handleBrowserIpc('browser:setBounds', 'setBounds');
+handleBrowserIpc('browser:thumbnail', 'thumbnail');
 handleBrowserIpc('browser:takeControl', 'takeControl');
 handleBrowserIpc('browser:releaseControl', 'releaseControl');
 handleBrowserIpc('browser:adopt', 'adopt');

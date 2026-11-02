@@ -862,6 +862,7 @@ type OrionCodexBrowserIntegrationStatus = {
     select: (tabId: string | null) => Promise<OrionBrowserResult>;
     setBounds: (rect: { x: number; y: number; width: number; height: number } | null) => Promise<OrionBrowserResult>;
     setVisible: (visible: boolean) => Promise<OrionBrowserResult>;
+    thumbnail?: (input: { tabId: string; width?: number }) => Promise<OrionBrowserResult & { dataUrl?: string }>;
     takeControl: (tabId: string) => Promise<OrionBrowserResult>;
     releaseControl: (tabId: string) => Promise<OrionBrowserResult>;
     adopt: (input: { tabId: string; threadId: string; projectPath?: string | null }) => Promise<OrionBrowserResult>;

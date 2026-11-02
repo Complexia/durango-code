@@ -5,6 +5,7 @@ import {
   Bot,
   Globe,
   Hand,
+  Maximize2,
   Plus,
   RotateCw,
   Square,
@@ -13,11 +14,13 @@ import {
 } from 'lucide-react';
 import type { BrowserTab } from './useBrowserTabs';
 
-const WIDTH_KEY = 'orion.browserPanel.width';
-const DEFAULT_WIDTH = 520;
-const MIN_WIDTH = 340;
-// Leave the thread view at least this much room.
-const MIN_REMAINING = 520;
+// The corner preview: a thumbnail of the selected tab (CSS px).
+const MINI_WIDTH = 320;
+const MINI_MARGIN = 16;
+// Thumbnail refresh: faster while the page is moving.
+const THUMB_BUSY_MS = 1000;
+const THUMB_IDLE_MS = 2500;
+const THUMB_HIDDEN_MS = 4000;
 
 // Anything drawn above the panel's area: the native view would cover it, so
 // the view hides while one of these overlaps the placeholder.
@@ -42,18 +45,6 @@ const OVERLAY_SELECTOR = [
 const intersects = (a: DOMRect, b: DOMRect) =>
   a.width > 0 && a.height > 0 && a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
 
-const readWidth = () => {
-  try {
-    const stored = Number(window.localStorage.getItem(WIDTH_KEY));
-    return Number.isFinite(stored) && stored >= MIN_WIDTH ? stored : DEFAULT_WIDTH;
-  } catch {
-    return DEFAULT_WIDTH;
-  }
-};
-
-const clampWidth = (width: number) =>
-  Math.round(Math.max(MIN_WIDTH, Math.min(width, Math.max(MIN_WIDTH, window.innerWidth - MIN_REMAINING))));
-
 const formatBytes = (bytes: number) =>
   bytes >= 1024 * 1024 * 1024
     ? `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
@@ -77,6 +68,10 @@ type BrowserPanelProps = {
   focusedThreadId: string | null;
   focusedProjectPath: string | null;
   ownerLabel: (tab: BrowserTab) => string;
+  /** Expanded: a modal with the live page; otherwise a preview in the corner. */
+  expanded: boolean;
+  onExpand: () => void;
+  onCollapse: () => void;
   onClose: () => void;
 };
 
@@ -87,14 +82,17 @@ export const BrowserPanel = ({
   focusedThreadId,
   focusedProjectPath,
   ownerLabel,
+  expanded,
+  onExpand,
+  onCollapse,
   onClose,
 }: BrowserPanelProps) => {
   const api = window.orion?.browser;
-  const panelRef = useRef<HTMLElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const placeholderRef = useRef<HTMLDivElement | null>(null);
-  const [width, setWidth] = useState(() => clampWidth(readWidth()));
-  const [resizing, setResizing] = useState(false);
   const [covered, setCovered] = useState(false);
+  const [miniBottom, setMiniBottom] = useState(MINI_MARGIN);
+  const [thumb, setThumb] = useState<{ tabId: string; src: string } | null>(null);
   const [urlDraft, setUrlDraft] = useState('');
   const [editingUrl, setEditingUrl] = useState(false);
   const [promptText, setPromptText] = useState('');
@@ -129,13 +127,26 @@ export const BrowserPanel = ({
       observer.disconnect();
       window.removeEventListener('resize', syncBounds);
     };
-  }, [syncBounds, tab?.id]);
+  }, [syncBounds, tab?.id, expanded]);
 
   // Hide the view under menus, popovers and dialogs that overlap it.
   useEffect(() => {
     let frame = 0;
     const check = () => {
       frame = 0;
+      // The corner preview sits above any composer it would cover.
+      const right = window.innerWidth - MINI_MARGIN;
+      const left = right - MINI_WIDTH;
+      let bottom = MINI_MARGIN;
+      for (const composer of document.querySelectorAll('.composer-shell')) {
+        const rect = composer.getBoundingClientRect();
+        if (!rect.width || rect.right <= left || rect.left >= right) continue;
+        const areaElement = composer.closest('.chat-input-area') ?? composer;
+        areaObserver.observe(areaElement);
+        const area = areaElement.getBoundingClientRect();
+        bottom = Math.max(bottom, Math.round(window.innerHeight - area.top + 8));
+      }
+      setMiniBottom(bottom);
       const placeholder = placeholderRef.current;
       if (!placeholder) return;
       const area = placeholder.getBoundingClientRect();
@@ -155,14 +166,19 @@ export const BrowserPanel = ({
     };
     const observer = new MutationObserver(schedule);
     observer.observe(document.body, { childList: true, subtree: true });
+    // Composers grow while typing without adding nodes.
+    const areaObserver = new ResizeObserver(schedule);
+    window.addEventListener('resize', schedule);
     check();
     return () => {
       observer.disconnect();
+      areaObserver.disconnect();
+      window.removeEventListener('resize', schedule);
       if (frame) window.cancelAnimationFrame(frame);
     };
-  }, [syncBounds]);
+  }, [syncBounds, expanded]);
 
-  const visible = Boolean(tab) && !covered && !resizing && !tab?.crashed;
+  const visible = expanded && Boolean(tab) && !covered && !tab?.crashed;
   useEffect(() => {
     void api?.select(tab?.id ?? null);
   }, [api, tab?.id]);
@@ -171,43 +187,48 @@ export const BrowserPanel = ({
   }, [api, visible]);
   useEffect(() => () => void api?.setVisible(false), [api]);
 
-  // ---- Resizing (the view hides meanwhile: it would swallow the pointer) ----
-  const dragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
-  const handlePointerDown = (event: React.PointerEvent<HTMLButtonElement>) => {
-    if (event.button !== 0) return;
-    dragRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: width };
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setResizing(true);
-    event.preventDefault();
-  };
-  const handlePointerMove = (event: React.PointerEvent<HTMLButtonElement>) => {
-    const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    setWidth(clampWidth(drag.startWidth - (event.clientX - drag.startX)));
-  };
-  const finishResize = (event: React.PointerEvent<HTMLButtonElement>) => {
-    if (dragRef.current?.pointerId !== event.pointerId) return;
-    dragRef.current = null;
-    setResizing(false);
-    try {
-      window.localStorage.setItem(WIDTH_KEY, String(width));
-    } catch {}
-  };
-  const handleResizeKey = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    const step = event.shiftKey ? 48 : 16;
-    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
-    event.preventDefault();
-    const next = clampWidth(width + (event.key === 'ArrowLeft' ? step : -step));
-    setWidth(next);
-    try {
-      window.localStorage.setItem(WIDTH_KEY, String(next));
-    } catch {}
-  };
+  // ---- Corner preview thumbnail ----
+  const tabId = tab?.id ?? null;
+  const pageBusy = Boolean(tab?.loading || tab?.agentBusy);
+  const canThumb = !expanded && Boolean(tabId) && !tab?.crashed && Boolean(api?.thumbnail);
   useEffect(() => {
-    const onResize = () => setWidth((current) => clampWidth(current));
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, []);
+    if (!canThumb || !tabId || !api?.thumbnail) return undefined;
+    let cancelled = false;
+    let timer = 0;
+    let captured = false;
+    const run = async () => {
+      if (!document.hidden) {
+        const result = await api.thumbnail!({ tabId, width: Math.round(MINI_WIDTH * (window.devicePixelRatio || 1)) });
+        if (cancelled) return;
+        if (result?.ok && result.dataUrl) {
+          captured = true;
+          setThumb({ tabId, src: result.dataUrl });
+        }
+      }
+      // A page that has not painted yet is retried soon.
+      const delay = document.hidden ? THUMB_HIDDEN_MS : !captured ? 400 : pageBusy ? THUMB_BUSY_MS : THUMB_IDLE_MS;
+      timer = window.setTimeout(run, delay);
+    };
+    timer = window.setTimeout(run, 150);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [api, canThumb, tabId, pageBusy, tab?.url, tab?.lastAgentActionAt]);
+
+  // Escape closes the modal (focus in the page itself keeps Escape there).
+  useEffect(() => {
+    if (!expanded) return undefined;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      // Escape in a field (the address bar resets itself) stays there.
+      const target = event.target;
+      if (target instanceof Element && target.closest('input, textarea, [contenteditable="true"]')) return;
+      onCollapse();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [expanded, onCollapse]);
 
   // ---- Actions ----
   const report = (result: OrionBrowserResult | undefined) => {
@@ -236,24 +257,93 @@ export const BrowserPanel = ({
   const iconButton =
     'flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#a0a0a8] transition-colors hover:bg-white/[0.06] hover:text-[#ececef] disabled:pointer-events-none disabled:opacity-35';
 
+  const tabLabel = tab ? tab.title || hostOf(tab.url) : 'No tab open';
+  const attention = tab?.dialog
+    ? `${hostOf(tab.dialog.url || tab.url)} is asking something`
+    : tab?.pendingDownload
+      ? `Wants to download ${tab.pendingDownload.filename}`
+      : null;
+
+  if (!expanded) {
+    const thumbSrc = thumb && thumb.tabId === tab?.id ? thumb.src : null;
+    return (
+      <div
+        ref={panelRef}
+        className="browser-mini fixed z-[90] overflow-hidden rounded-xl border border-white/[0.09] bg-[#141416] shadow-[0_16px_48px_rgba(0,0,0,0.55)]"
+        style={{ right: MINI_MARGIN, bottom: miniBottom, width: MINI_WIDTH }}
+        aria-label="Browser preview"
+      >
+        <div className="flex h-8 items-center gap-1.5 border-b border-white/[0.055] pl-2.5 pr-1 text-[12px]">
+          {!tab ? (
+            <Globe size={12} className="shrink-0 text-[#6b6b74]" />
+          ) : agentTab ? (
+            <Bot size={12} className={tab.agentBusy ? 'shrink-0 animate-pulse text-[#4d8dff]' : 'shrink-0 text-[#8b7cf6]'} />
+          ) : (
+            <User size={12} className="shrink-0 text-[#6b6b74]" />
+          )}
+          <span className="min-w-0 flex-1 truncate text-[#ececef]" title={tab ? `${tabLabel} · ${ownerLabel(tab)}` : undefined}>
+            {tabLabel}
+          </span>
+          {tabs.length > 1 && <span className="shrink-0 text-[11px] tabular-nums text-[#6b6b74]">{tabs.length} tabs</span>}
+          <button type="button" className={iconButton} title="Expand" aria-label="Expand browser" onClick={onExpand}>
+            <Maximize2 size={13} />
+          </button>
+          <button type="button" className={iconButton} title="Close browser" aria-label="Close browser" onClick={onClose}>
+            <X size={14} />
+          </button>
+        </div>
+        <button
+          type="button"
+          className="group relative block aspect-[16/10] w-full cursor-zoom-in overflow-hidden bg-[#101012] text-left"
+          aria-label="Expand browser"
+          onClick={onExpand}
+        >
+          {thumbSrc ? (
+            <img src={thumbSrc} alt="" draggable={false} className="h-full w-full object-cover object-top" />
+          ) : (
+            <span className="absolute inset-0 flex items-center justify-center px-6 text-center text-[12px] text-[#6b6b74]">
+              {!tab ? 'Open a page' : tab.crashed ? 'This page crashed' : 'Loading…'}
+            </span>
+          )}
+          <span className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-[opacity,background-color] duration-150 group-hover:bg-black/35 group-hover:opacity-100">
+            <span className="flex items-center gap-1.5 rounded-md bg-black/70 px-2.5 py-1 text-[12px] text-white">
+              <Maximize2 size={12} /> Expand
+            </span>
+          </span>
+          {(attention || (tab && agentTab)) && (
+            <span
+              className={`absolute bottom-2 left-2 flex max-w-[calc(100%-16px)] items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] backdrop-blur ${
+                attention
+                  ? 'bg-[#f4a261]/90 text-[#1a1208]'
+                  : tab?.controller === 'user'
+                    ? 'bg-[#0f2a20]/85 text-[#a7f3d0]'
+                    : 'bg-[#1c1830]/85 text-[#c9c1ff]'
+              }`}
+            >
+              {attention ? null : tab?.controller === 'user' ? <Hand size={11} className="shrink-0" /> : <Bot size={11} className={tab?.agentBusy ? 'shrink-0 animate-pulse' : 'shrink-0'} />}
+              <span className="truncate">{attention ?? (tab?.controller === 'user' ? "You're in control" : 'Agent is controlling')}</span>
+            </span>
+          )}
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <aside
+    <div
       ref={panelRef}
-      className="browser-panel relative flex h-full shrink-0 flex-col border-l border-white/[0.055] bg-[#141416]"
-      style={{ width }}
-      aria-label="Browser"
+      className="browser-modal-backdrop fixed inset-0 z-[1050] flex items-center justify-center bg-[rgb(8_8_10/62%)] p-6 sm:p-10"
+      style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onCollapse();
+      }}
     >
-      <button
-        type="button"
-        className="browser-panel-resize-handle"
-        aria-label="Resize browser panel"
-        title="Drag to resize"
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={finishResize}
-        onPointerCancel={finishResize}
-        onKeyDown={handleResizeKey}
-      />
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Browser"
+      className="flex h-full max-h-[1200px] w-full max-w-[1680px] flex-col overflow-hidden rounded-xl border border-white/[0.09] bg-[#141416] shadow-[0_24px_80px_rgba(0,0,0,0.6)]"
+    >
 
       {/* Tab strip */}
       <div className="flex h-9 shrink-0 items-center gap-1 border-b border-white/[0.055] px-1.5">
@@ -301,7 +391,7 @@ export const BrowserPanel = ({
         <button type="button" className={iconButton} title="New tab" aria-label="New tab" onClick={() => void openNewTab()}>
           <Plus size={15} />
         </button>
-        <button type="button" className={iconButton} title="Close browser panel" aria-label="Close browser panel" onClick={onClose}>
+        <button type="button" className={iconButton} title="Close (Esc)" aria-label="Close browser" onClick={onCollapse}>
           <X size={15} />
         </button>
       </div>
@@ -496,7 +586,7 @@ export const BrowserPanel = ({
             </div>
           </div>
         )}
-        {tab && (covered || resizing) && (
+        {tab && covered && (
           <div className="absolute inset-0 flex items-center justify-center bg-[#101012] text-[12px] text-[#6b6b74]">
             {tab.title || hostOf(tab.url)}
           </div>
@@ -510,7 +600,8 @@ export const BrowserPanel = ({
           </div>
         )}
       </div>
-    </aside>
+    </div>
+    </div>
   );
 };
 
