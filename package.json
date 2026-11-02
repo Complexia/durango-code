@@ -45,6 +45,7 @@
     "test:thread-backfill": "bun scripts/test-thread-backfill.ts",
     "test:composer-drafts": "bun scripts/test-composer-drafts.ts && bun scripts/test-composer-drafts.ts --failed-backfill && bun scripts/test-composer-drafts.ts --cleared-backfill",
     "test:work-log": "bun scripts/test-work-log.tsx",
+    "test:html-visuals": "bun scripts/test-html-visuals.tsx",
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",

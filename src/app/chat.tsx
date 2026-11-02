@@ -5,6 +5,7 @@ import { isNoProjectId, type BtwExchange, type LinkedBoardTask, type Message, ty
 import type { AgentModel } from '../agentCatalog';
 import { SessionImportCard } from './SessionImport';
 import { agentProviders } from '../agentCatalog';
+import { HtmlVisual } from './HtmlVisual';
 import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, ThinkingRow, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
 import {
@@ -334,12 +335,19 @@ const AgentRunMessage: React.FC<{
   const lastStepIndex = segments.reduce((last, segment, index) => (segment.kind === 'activities' ? index : last), -1);
   const foldable = !isRunning && lastStepIndex >= 0;
   const folded = foldable && !stepsOpen;
-  const visibleSegments = folded ? segments.slice(lastStepIndex + 1) : segments;
+  // Visuals (show_html) stay visible when the steps around them fold.
+  const visibleSegments = folded
+    ? [
+        ...segments.slice(0, lastStepIndex + 1).filter((segment) => segment.kind === 'visual'),
+        ...segments.slice(lastStepIndex + 1),
+      ]
+    : segments;
   const lastSegment = segments.at(-1);
   // Between steps (or before the first), say the agent is thinking.
   const thinking =
     isRunning &&
     (!lastSegment ||
+      lastSegment.kind === 'visual' ||
       (lastSegment.kind === 'activities' &&
         !lastSegment.activities.some((activity) => activity.status === 'running' || activity.status === 'waiting')));
 
@@ -381,6 +389,12 @@ const AgentRunMessage: React.FC<{
             live={isRunning && index === visibleSegments.length - 1}
             thinking={thinking && index === visibleSegments.length - 1}
           />
+        ) : segment.kind === 'visual' ? (
+          // One stable element: remounting the frame would reload the page.
+          <React.Fragment key={segment.activity.id}>
+            <HtmlVisual visual={segment.activity.visual} />
+            {thinking && index === visibleSegments.length - 1 && <ThinkingRow />}
+          </React.Fragment>
         ) : segment.kind === 'btw' ? (
           <React.Fragment key={`btw-${segment.exchange.id}`}>{renderBtwAside?.(segment.exchange)}</React.Fragment>
         ) : segment.text.trim() ? (

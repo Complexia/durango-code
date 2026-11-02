@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Bell, BookOpen, Bot, Brain, Check, ChevronDown, ChevronRight, FilePen, Globe, ListChecks, Search, Terminal, Wrench, X } from 'lucide-react';
-import { type AgentActivity, type BtwExchange, type Message, type ThreadGoal, type TurnTokenStats } from '../store';
+import { type AgentActivity, type AgentVisual, type BtwExchange, type Message, type ThreadGoal, type TurnTokenStats } from '../store';
 
 export const formatRunDuration = (startedAt?: string, completedAt?: string) => {
   if (!startedAt) return '';
@@ -402,6 +402,8 @@ export const activityLabel = (activity: AgentActivity): { text: string; code?: b
       return { text: detail ? `Agent: ${detail}` : 'Ran an agent' };
     case 'ToolSearch':
       return { text: 'Loaded tools' };
+    case 'mcp__orion__show_html':
+      return { text: 'Showed a visual' };
     case 'Skill':
       return { text: detail ? `Used the ${detail} skill` : 'Used a skill' };
     default: {
@@ -827,6 +829,7 @@ export const ThinkingRow: React.FC = () => (
 export type AgentRunSegment =
   | { kind: 'text'; text: string }
   | { kind: 'activities'; activities: AgentActivity[] }
+  | { kind: 'visual'; activity: AgentActivity & { visual: AgentVisual } }
   | { kind: 'btw'; exchange: BtwExchange };
 
 export const buildAgentRunSegments = (
@@ -862,6 +865,11 @@ export const buildAgentRunSegments = (
     }
     if (marker.kind === 'btw') {
       segments.push({ kind: 'btw', exchange: marker.value });
+      continue;
+    }
+    // A show_html page stands on its own between the steps around it.
+    if (marker.value.visual) {
+      segments.push({ kind: 'visual', activity: marker.value as AgentActivity & { visual: AgentVisual } });
       continue;
     }
     const last = segments[segments.length - 1];

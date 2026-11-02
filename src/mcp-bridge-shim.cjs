@@ -3,7 +3,7 @@
 // CLIs (codex, cursor, grok, kimi) spawn as the `orion` MCP server. It
 // exposes the spawn_subagent/stop_subagent/read_thread tools plus the Durango
 // Chat tools (search_chats, read_chat, recall_memory, remember) and the
-// user-action tools (request_user_action, resolve_user_action), the simulator
+// user-action tools (request_user_action, resolve_user_action), show_html, the simulator
 // tools (device_list/open/screenshot/close, only with --devices), and forwards
 // calls to the
 // Orion desktop app over a local socket; the app runs the subagent as a
@@ -269,6 +269,39 @@ const resolveUserActionTool = {
   },
 };
 
+// Inline visuals, served by the desktop app (src/main/visual-tools.js), which
+// renders the page in the thread. Description and schema mirror
+// visual-tools.js exactly; scripts/test-durango-tools.mjs keeps them in sync.
+const showHtmlTool = {
+  name: 'show_html',
+  description:
+    'Show a small self-contained HTML page inline in this thread, where you call it, so you can illustrate an answer instead of only describing it: a chart of numbers you gathered, an architecture or flow diagram, a before/after or option comparison, a UI mockup, a timeline, an annotated walkthrough, a small interactive explainer. Use it when a picture makes the answer clearer than prose or a code block; plain text for short answers. It is not for files the user asked you to build (write those to disk) and not for previewing their app (use the browser). The page renders in a sandbox at the width of the reply: inline <style> and <script> only, no network (external scripts, fonts, images and fetch are blocked; use inline SVG, canvas or data: URIs), no storage, links do nothing. Leave html and body without a background, border or outer padding so it sits on the thread, and let content set the height (no vh units or height:100% on html/body); give charts a fixed pixel height. Use the theme CSS variables rather than fixed colors: --background, --foreground, --muted-foreground, --card, --border, --primary, --success, --warning, --danger, --viz-1 to --viz-8 (categorical chart colors), --radius, --font-sans, --font-mono (the page is dark). Keep it under about 60 KB. Do not restate what the page shows in your reply; say the takeaway in a sentence and carry on.',
+  // A sandboxed page with no network: only changes how Durango Code presents the thread.
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      html: {
+        type: 'string',
+        description: 'The page: an HTML fragment or a complete document, with inline <style> and <script>.',
+      },
+      title: {
+        type: 'string',
+        description:
+          'Short title for the visual, e.g. "Request flow" (used for accessibility and the fullscreen header)',
+      },
+      height: {
+        type: 'integer',
+        minimum: 80,
+        maximum: 1600,
+        description: 'Fixed frame height in CSS pixels (80-1600). Omit to fit the content.',
+      },
+    },
+    required: ['html', 'title'],
+    additionalProperties: false,
+  },
+};
+
 // Simulator tools, served by the desktop app (src/main/device-tools.js), only
 // listed with --devices. Descriptions and schemas mirror device-tools.js
 // exactly; scripts/test-durango-tools.mjs keeps them in sync.
@@ -345,6 +378,7 @@ const tools = [
   rememberTool,
   requestUserActionTool,
   resolveUserActionTool,
+  showHtmlTool,
   ...(devicesEnabled ? [deviceListTool, deviceOpenTool, deviceScreenshotTool, deviceCloseTool] : []),
 ];
 const toolNames = new Set(tools.map((tool) => tool.name));

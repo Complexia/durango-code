@@ -9,7 +9,7 @@ import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main
 import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
 import { isPreviewFilePath } from './app/codeFiles.ts';
 import { migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent.ts';
-import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, net, Notification, powerMonitor, protocol, safeStorage, shell, systemPreferences } from 'electron';
+import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, net, Notification, powerMonitor, protocol, safeStorage, shell, systemPreferences, webFrameMain } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import {
@@ -63,6 +63,7 @@ import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, get
 import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteerableRunDrivers, steerFxRun } from './main/fx-driver.js';
 import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
+import { guardVisualFrames } from './main/visual-tools.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { DurangoError, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
@@ -1063,6 +1064,9 @@ const createWindow = () => {
     }
     return { action: 'deny' };
   });
+  // show_html visuals (about:srcdoc frames) may never navigate: that would
+  // send a request the frame's CSP cannot stop (visual-tools.js).
+  guardVisualFrames(mainWindow.webContents, webFrameMain);
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (url === mainWindow.webContents.getURL()) return;
     event.preventDefault();
@@ -5025,6 +5029,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         : await registerMcpBridgeForRun({
             getSender: () => event.sender,
             threadId: input.threadId,
+            runId,
             projectPath: input.projectPath,
             providerId: model.providerId,
             accessMode: input.accessMode || 'full-access',

@@ -21,6 +21,7 @@ import { orionBuiltinToolNamesForAccessMode, orionDeviceToolNamesForAccessMode }
 import { browserModeFor, browserToolsForAccessMode, builtinBrowserTips, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOLS_PROMPT_HINT, runDeviceTool } from './device-tools.js';
 import { agentDeviceAccessAllowed, getCachedDeviceSettings } from './devices/device-settings.js';
+import { VISUAL_MAX_HEIGHT, VISUAL_MIN_HEIGHT, VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, runVisualTool } from './visual-tools.js';
 import {
   USER_ACTION_CHECK_MAX_CHARS,
   USER_ACTION_MAX_CHARS,
@@ -133,6 +134,13 @@ const mergeClaudeHooks = (...sets) => {
 export const CLAUDE_USER_ACTION_TIP = [
   '# Actions only the user can take (Durango Code)',
   'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). If a command tells when it is done (`npm whoami`, `gh auth status`), pass it as `check` and Durango Code watches it for you. Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it; when you run out of such work, end your turn instead of waiting or polling. You are told when it is done without being interrupted: at your next tool call, or in a new turn if you have ended yours. That message starts with "Done:"; if the user replied instead, it starts with "Not done:" followed by what they want instead, so follow it rather than asking again. Call mcp__orion__resolve_user_action with the returned action_id if you see it is done before you are told.',
+].join('\n');
+
+// Say when to illustrate with show_html (visual-tools.js); the tool
+// description carries the page rules.
+export const CLAUDE_VISUALS_TIP = [
+  '# Visuals in the thread (Durango Code)',
+  'When a picture explains something better than prose (numbers worth charting, an architecture or data flow, a comparison of options, a UI idea, a sequence of steps), illustrate it with mcp__orion__show_html: it renders a small self-contained HTML page inline where you call it. Reach for it whenever the user asks to see, visualize, diagram or compare something. Not for short answers, code changes or files the user wants on disk. Then give the takeaway in a sentence instead of restating the page.',
 ].join('\n');
 
 // Mirrored in mcp-bridge-shim.cjs's spawn_subagent schema; keep in step.
@@ -376,6 +384,35 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
               threadId: session.threadId,
             })
           ),
+        { annotations: { readOnlyHint: true } }
+      ),
+      // Inline visuals (visual-tools.js). Mirrored in mcp-bridge-shim.cjs;
+      // test-durango-tools.mjs keeps them in sync.
+      tool(
+        'show_html',
+        VISUAL_TOOL_DESCRIPTIONS.show_html,
+        {
+          html: z.string().describe(VISUAL_TOOL_INPUT_SCHEMAS.show_html.properties.html.description),
+          title: z.string().describe(VISUAL_TOOL_INPUT_SCHEMAS.show_html.properties.title.description),
+          height: z
+            .number()
+            .int()
+            .min(VISUAL_MIN_HEIGHT)
+            .max(VISUAL_MAX_HEIGHT)
+            .optional()
+            .describe(VISUAL_TOOL_INPUT_SCHEMAS.show_html.properties.height.description),
+        },
+        async (args) =>
+          durangoToolResult(
+            await runVisualTool('show_html', args, {
+              getSender: () => session.sender,
+              threadId: session.threadId,
+              // The turn this call belongs to (a background turn included).
+              runId: session.activeTurns?.[0]?.runId,
+            })
+          ),
+        // A sandboxed page with no network: only changes how Durango Code
+        // presents this thread.
         { annotations: { readOnlyHint: true } }
       ),
       // Durango Chat tools (durango-tools.js). Mirrored in mcp-bridge-shim.cjs
@@ -1949,6 +1986,7 @@ export const createClaudeSdkSession = ({
           append: [
             CLAUDE_BACKGROUND_WAIT_TIP,
             CLAUDE_USER_ACTION_TIP,
+            CLAUDE_VISUALS_TIP,
             ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
             ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
             ...(devicesEnabled ? [DEVICE_TOOLS_PROMPT_HINT] : []),

@@ -313,6 +313,14 @@ export type AgentPlanEntry = {
   status: 'pending' | 'in_progress' | 'completed';
 };
 
+/** A page an agent showed with show_html (src/main/visual-tools.js). */
+export type AgentVisual = {
+  html: string;
+  title: string;
+  /** Fixed frame height in CSS pixels; absent = fit the content. */
+  height?: number;
+};
+
 export type AgentActivity = {
   id: string;
   key?: string;
@@ -336,6 +344,8 @@ export type AgentActivity = {
   plan?: AgentPlanEntry[];
   /** 'waiting' = blocked on a permission decision. */
   status?: 'running' | 'done' | 'error' | 'waiting';
+  /** An inline HTML page from show_html, rendered as its own block (HtmlVisual). */
+  visual?: AgentVisual;
   ts: string;
   /**
    * Length of the message content when this activity was added — lets the

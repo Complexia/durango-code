@@ -50,6 +50,7 @@ import {
 import { handleMcpBridgeConnection, mcpBridgeSessions, pendingSubagentSpawns } from '../src/main/mcp-bridge.js';
 import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOL_NAMES } from '../src/main/device-tools.js';
 import { ORION_DEVICE_TOOL_NAMES } from '../src/main/thread-reader-routing.js';
+import { VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, VISUAL_TOOL_NAMES } from '../src/main/visual-tools.js';
 import { setDeviceDataRootForTests } from '../src/main/devices/device-settings.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
 
@@ -285,6 +286,12 @@ try {
     assert.ok(ORION_BUILTIN_TOOL_NAMES.includes(name));
     assert.equal(isPreapprovedOrionTool(name, 'read-only'), true, `${name} in read-only`);
   }
+  for (const name of VISUAL_TOOL_NAMES) {
+    assert.ok(ORION_BUILTIN_TOOL_NAMES.includes(name));
+    for (const mode of ['read-only', 'workspace-write', 'full-access']) {
+      assert.equal(isPreapprovedOrionTool(name, mode), true, `${name} in ${mode}`);
+    }
+  }
   assert.equal(isPreapprovedOrionTool('remember', 'read-only'), false);
   assert.equal(isPreapprovedOrionTool('remember', 'workspace-write'), true);
   assert.equal(isPreapprovedOrionTool('bash', 'full-access'), false);
@@ -329,6 +336,32 @@ try {
   const claudeAction = await registered.find((entry) => entry.name === 'request_user_action').handler({ action: 'Log in' });
   assert.equal(claudeAction.isError, true, 'no window: the agent is told to ask in its reply');
   assert.match(claudeAction.content[0].text, /Ask in your reply/);
+
+  for (const name of VISUAL_TOOL_NAMES) {
+    const entry = registered.find((candidate) => candidate.name === name);
+    assert.ok(entry, `Claude registers ${name}`);
+    assert.equal(entry.description, VISUAL_TOOL_DESCRIPTIONS[name]);
+    assert.deepEqual(Object.keys(entry.schema).sort(), Object.keys(VISUAL_TOOL_INPUT_SCHEMAS[name].properties).sort());
+    assert.equal(entry.extra?.annotations?.readOnlyHint, true);
+  }
+  const claudeVisual = await registered.find((entry) => entry.name === 'show_html').handler({ html: '<p>x</p>', title: 'X' });
+  assert.equal(claudeVisual.isError, true, 'no window: the agent is told to describe it instead');
+  assert.match(claudeVisual.content[0].text, /Describe it in your reply/);
+  // With a running turn the page goes out as that run's activity event.
+  const turnEvents = [];
+  const visualSender = { isDestroyed: () => false, send: (channel, payload) => turnEvents.push({ channel, payload }) };
+  const visualTools = [];
+  createOrionMcpServer(
+    { createSdkMcpServer: (config) => config, tool: (name, description, schema, handler) => visualTools.push({ name, handler }) },
+    { z },
+    { threadId: 't-vis', projectPath: testRoot, accessMode: 'read-only', sender: visualSender, activeTurns: [{ runId: 'run-vis' }] }
+  );
+  const shownVisual = await visualTools.find((entry) => entry.name === 'show_html').handler({ html: '<p>x</p>', title: 'X' });
+  assert.equal(shownVisual.isError, undefined);
+  assert.equal(turnEvents.length, 1);
+  assert.equal(turnEvents[0].channel, 'agent:turnEvent');
+  assert.equal(turnEvents[0].payload.runId, 'run-vis');
+  assert.equal(turnEvents[0].payload.activity.visual.html, '<p>x</p>');
 
   // --- Device tools: Claude registers them only with agent access, mirroring device-tools.js ---
   setDeviceDataRootForTests(path.join(testRoot, 'device-data'));
@@ -586,7 +619,16 @@ try {
       assert.equal(tool.description, USER_ACTION_TOOL_DESCRIPTIONS[name], `${name} description matches user-actions.js`);
       assert.deepEqual(tool.inputSchema, USER_ACTION_TOOL_INPUT_SCHEMAS[name], `${name} schema matches user-actions.js`);
     }
+    for (const name of VISUAL_TOOL_NAMES) {
+      const tool = shimTools.find((candidate) => candidate.name === name);
+      assert.ok(tool, `shim lists ${name}`);
+      assert.equal(tool.description, VISUAL_TOOL_DESCRIPTIONS[name], `${name} description matches visual-tools.js`);
+      assert.deepEqual(tool.inputSchema, VISUAL_TOOL_INPUT_SCHEMAS[name], `${name} schema matches visual-tools.js`);
+    }
     assert.deepEqual(shimTools.map((tool) => tool.name), ORION_BUILTIN_TOOL_NAMES);
+    const shimVisual = await call('tools/call', { name: 'show_html', arguments: { html: '<p>x</p>', title: 'X' } });
+    assert.equal(shimVisual.result.isError, true, 'the bridge routes show_html (no window here)');
+    assert.match(shimVisual.result.content[0].text, /Describe it in your reply/);
     const shimAction = await call('tools/call', { name: 'request_user_action', arguments: { action: 'Log in' } });
     assert.equal(shimAction.result.isError, true, 'the bridge routes user actions (no window here)');
     assert.match(shimAction.result.content[0].text, /Ask in your reply/);

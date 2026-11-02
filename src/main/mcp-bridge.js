@@ -10,6 +10,7 @@ import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
 import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
 import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
+import { VISUAL_TOOL_NAMES, runVisualTool } from './visual-tools.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
 import { agentDeviceAccessAllowed, readDeviceSettings } from './devices/device-settings.js';
@@ -98,7 +99,7 @@ export const requestSubagentStop = ({ getSender, threadId }, args) =>
 // to userData. Cursor and Grok receive it through process-only plugins;
 // Codex, Kimi, and OpenCode accept per-run MCP configuration directly. Every
 // path carries an exact token, so concurrent runs never route by cwd.
-export const mcpBridgeSessions = new Map(); // token -> { getSender, threadId, projectPath, accessMode }
+export const mcpBridgeSessions = new Map(); // token -> { getSender, threadId, runId, projectPath, accessMode }
 
 let mcpBridgeInstanceIdCache = null;
 // The single-instance lock already prevents two processes from sharing one
@@ -235,6 +236,10 @@ export const handleMcpBridgeConnection = (socket) => {
         void runUserActionTool(message.tool, args, session).then(({ ok, text }) => reply(ok, text));
         continue;
       }
+      if (VISUAL_TOOL_NAMES.includes(message.tool)) {
+        void runVisualTool(message.tool, args, session).then(({ ok, text }) => reply(ok, text));
+        continue;
+      }
       if (DEVICE_TOOL_NAMES.includes(message.tool)) {
         // Re-checks the user's device settings and the run's access mode
         // itself; resolves, never rejects.
@@ -361,6 +366,7 @@ export const providerSupportsThreadReader = async (providerId) => {
 export const registerMcpBridgeForRun = async ({
   getSender,
   threadId,
+  runId,
   projectPath,
   providerId,
   accessMode,
@@ -387,6 +393,7 @@ export const registerMcpBridgeForRun = async ({
     const session = {
       getSender,
       threadId,
+      runId,
       projectPath,
       providerId,
       accessMode,
