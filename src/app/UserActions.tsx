@@ -1,7 +1,22 @@
-import React, { useState } from 'react';
-import { Check, CircleDashed, Eye, ExternalLink, Hand, MessageSquareReply, SendHorizontal, X } from 'lucide-react';
+import React, { useRef, useState } from 'react';
+import {
+  Check,
+  CircleDashed,
+  Eye,
+  ExternalLink,
+  Hand,
+  LoaderCircle,
+  MessageSquareReply,
+  Paperclip,
+  SendHorizontal,
+  X,
+} from 'lucide-react';
+import type { FileAttachment } from '../store';
+import { AttachmentThumb, formatAttachmentSize, saveFilesAsAttachments } from './attachments';
 import { MarkdownContent } from './markdown';
 import type { PendingUserAction } from './threadLists';
+
+const hasFiles = (event: React.DragEvent) => Array.from(event.dataTransfer.types).includes('Files');
 
 /**
  * What the agent asked the user to do outside the chat (request_user_action),
@@ -9,7 +24,9 @@ import type { PendingUserAction } from './threadLists';
  * messages. It stays until the agent resolves it or the user marks it done;
  * the agent may keep working meanwhile. Reply clears it too and sends the
  * agent what the user wrote instead (the ask may be wrong, or they want
- * something else done). Neither interrupts the agent. An action with a
+ * something else done); it can carry files (picked, pasted or dropped on the
+ * card), such as a screenshot of where the user is stuck, which reach the
+ * agent as paths it can read. Neither interrupts the agent. An action with a
  * `check` command can be watched: Durango Code runs it until it succeeds and
  * then marks the action done itself. The X dismisses a redundant action
  * (already done, superseded, asked twice) without telling the agent.
@@ -25,19 +42,44 @@ export const UserActionCards = React.memo(function UserActionCards({
   actions: PendingUserAction[];
   currentThreadId: string;
   onDone: (threadId: string, actionId: string) => void;
-  onReply: (threadId: string, actionId: string, reply: string) => void;
+  onReply: (threadId: string, actionId: string, reply: string, attachments: FileAttachment[]) => void;
   onDismiss: (threadId: string, actionId: string) => void;
   onWatch: (threadId: string, actionId: string, watching: boolean) => void;
 }) {
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
   const [reply, setReply] = useState('');
+  const [replyFiles, setReplyFiles] = useState<FileAttachment[]>([]);
+  // Saves in flight; Send waits for them so a pasted screenshot isn't lost.
+  const [saving, setSaving] = useState(0);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Which reply a save belongs to: files saved after the reply was sent,
+  // closed or moved to another action are dropped.
+  const replyingToRef = useRef(replyingTo);
+  replyingToRef.current = replyingTo;
   if (actions.length === 0) return null;
-  const sendReply = (action: PendingUserAction) => {
-    const text = reply.trim();
-    if (!text) return;
-    onReply(action.threadId, action.id, text);
-    setReplyingTo(null);
+  const openReply = (key: string | null) => {
+    setReplyingTo(key);
     setReply('');
+    setReplyFiles([]);
+  };
+  const addFiles = async (key: string, files: File[]) => {
+    if (files.length === 0) return;
+    if (replyingToRef.current !== key) openReply(key);
+    replyingToRef.current = key;
+    setSaving((count) => count + 1);
+    try {
+      const saved = await saveFilesAsAttachments(files);
+      if (saved?.length && replyingToRef.current === key) setReplyFiles((current) => [...current, ...saved]);
+    } finally {
+      setSaving((count) => count - 1);
+    }
+  };
+  const canSend = saving === 0 && (reply.trim().length > 0 || replyFiles.length > 0);
+  const sendReply = (action: PendingUserAction) => {
+    if (!canSend) return;
+    onReply(action.threadId, action.id, reply.trim(), replyFiles);
+    openReply(null);
   };
   return (
     <div
@@ -52,7 +94,26 @@ export const UserActionCards = React.memo(function UserActionCards({
       {actions.map((action) => {
         const key = `${action.threadId}:${action.id}`;
         return (
-          <div key={key} className="mt-1.5">
+          <div
+            key={key}
+            className={`mt-1.5 rounded-lg ${dropTarget === key ? 'outline outline-1 outline-offset-4 outline-amber-300/60' : ''}`}
+            onDragOver={(event) => {
+              if (!hasFiles(event)) return;
+              event.preventDefault();
+              event.dataTransfer.dropEffect = 'copy';
+              if (dropTarget !== key) setDropTarget(key);
+            }}
+            onDragLeave={(event) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null);
+            }}
+            onDrop={(event) => {
+              if (!hasFiles(event)) return;
+              // The app's root drop handler skips a drop taken here.
+              event.preventDefault();
+              setDropTarget(null);
+              void addFiles(key, Array.from(event.dataTransfer.files));
+            }}
+          >
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1 [&_.markdown-content]:text-[13.5px] [&_.markdown-content>:first-child]:mt-0 [&_.markdown-content>:last-child]:mb-0">
                 <MarkdownContent content={action.action} />
@@ -118,10 +179,7 @@ export const UserActionCards = React.memo(function UserActionCards({
                   type="button"
                   title="Tell the agent something else instead"
                   aria-expanded={replyingTo === key}
-                  onClick={() => {
-                    setReplyingTo(replyingTo === key ? null : key);
-                    setReply('');
-                  }}
+                  onClick={() => openReply(replyingTo === key ? null : key)}
                   className="inline-flex items-center gap-1 rounded-md border border-white/15 px-2.5 py-1 text-[12px] font-medium text-[var(--text-primary)] hover:bg-white/[0.06]"
                 >
                   <MessageSquareReply size={12} />
@@ -132,7 +190,7 @@ export const UserActionCards = React.memo(function UserActionCards({
                   title="Dismiss without telling the agent"
                   aria-label="Dismiss"
                   onClick={() => {
-                    if (replyingTo === key) setReplyingTo(null);
+                    if (replyingTo === key) openReply(null);
                     onDismiss(action.threadId, action.id);
                   }}
                   className="inline-flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
@@ -143,6 +201,48 @@ export const UserActionCards = React.memo(function UserActionCards({
             </div>
             {replyingTo === key && (
               <div className="relative mt-2">
+                {(replyFiles.length > 0 || saving > 0) && (
+                  <div className="mb-2 flex flex-wrap gap-2">
+                    {replyFiles.map((file) => (
+                      <div key={file.id} className="composer-attachment" title={file.path}>
+                        <AttachmentThumb attachment={file} />
+                        <span className="composer-attachment-meta">
+                          <span className="composer-attachment-name">{file.name}</span>
+                          <span className="composer-attachment-size">{formatAttachmentSize(file.size)}</span>
+                        </span>
+                        <button
+                          type="button"
+                          className="composer-attachment-remove"
+                          title="Remove attachment"
+                          aria-label={`Remove ${file.name}`}
+                          onClick={() => setReplyFiles((current) => current.filter((entry) => entry.id !== file.id))}
+                        >
+                          <X size={13} />
+                        </button>
+                      </div>
+                    ))}
+                    {saving > 0 && (
+                      <div className="flex h-[58px] items-center gap-1.5 px-2 text-[11.5px] text-[var(--text-secondary)]">
+                        <LoaderCircle size={13} className="animate-spin" />
+                        Attaching…
+                      </div>
+                    )}
+                  </div>
+                )}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  hidden
+                  tabIndex={-1}
+                  aria-hidden="true"
+                  onChange={(event) => {
+                    const files = Array.from(event.currentTarget.files ?? []);
+                    // Let the same file be picked again after it is removed.
+                    event.currentTarget.value = '';
+                    void addFiles(key, files);
+                  }}
+                />
                 <textarea
                   autoFocus
                   rows={2}
@@ -150,22 +250,37 @@ export const UserActionCards = React.memo(function UserActionCards({
                   placeholder="Tell the agent what to do instead…"
                   aria-label="Reply to the agent"
                   onChange={(event) => setReply(event.target.value)}
+                  onPaste={(event) => {
+                    const files = Array.from(event.clipboardData.files);
+                    if (files.length === 0) return;
+                    event.preventDefault();
+                    void addFiles(key, files);
+                  }}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                       event.preventDefault();
                       sendReply(action);
                     } else if (event.key === 'Escape') {
                       event.preventDefault();
-                      setReplyingTo(null);
+                      openReply(null);
                     }
                   }}
-                  className="block w-full resize-none rounded-md border border-white/15 bg-black/20 py-1.5 pl-2.5 pr-10 text-[13px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)] focus:border-amber-300/50"
+                  className="block w-full resize-none rounded-md border border-white/15 bg-black/20 py-1.5 pl-2.5 pr-[4.25rem] text-[13px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)] focus:border-amber-300/50"
                 />
+                <button
+                  type="button"
+                  title="Attach files (or paste or drop them here)"
+                  aria-label="Attach files"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="absolute bottom-1.5 right-8 inline-flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
+                >
+                  <Paperclip size={13} />
+                </button>
                 <button
                   type="button"
                   title="Send (Enter)"
                   aria-label="Send reply"
-                  disabled={!reply.trim()}
+                  disabled={!canSend}
                   onClick={() => sendReply(action)}
                   className="absolute bottom-1.5 right-1.5 inline-flex h-6 w-6 items-center justify-center rounded-md bg-amber-300 text-neutral-950 hover:bg-amber-200 disabled:opacity-40 disabled:hover:bg-amber-300"
                 >

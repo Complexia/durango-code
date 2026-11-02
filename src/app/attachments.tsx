@@ -1,5 +1,6 @@
 import React from 'react';
 import { FileText } from 'lucide-react';
+import { toast } from 'sonner';
 import { type FileAttachment } from '../store';
 import { handleLightboxImageClick } from './imageLightbox';
 
@@ -180,4 +181,58 @@ export const getDroppedFilePath = (file: File) => {
 
   const legacyPath = (file as File & { path?: string }).path;
   return typeof legacyPath === 'string' && legacyPath.length > 0 ? legacyPath : '';
+};
+
+// Turns picked, dropped or pasted files into attachments the agent can read:
+// a dropped file with a lasting path is referenced in place, anything else
+// (pasted images, transient drops) is copied into Durango Code's attachment
+// dir. Failures are toasted per file; null when attachments are unavailable.
+export const saveFilesAsAttachments = async (files: File[]): Promise<FileAttachment[] | null> => {
+  const saveAttachment = window.orion?.saveAttachment ?? window.orion?.saveImageAttachment;
+  if (!saveAttachment) {
+    toast.error('Attachments are unavailable');
+    return null;
+  }
+
+  const savedAttachments: FileAttachment[] = [];
+  for (const file of files) {
+    const fallbackMimeType = isVideoFile(file)
+      ? 'video/*'
+      : isImageFile(file)
+        ? 'image/*'
+        : 'application/octet-stream';
+    const droppedPath = getDroppedFilePath(file);
+    if (droppedPath && !isEphemeralDropPath(droppedPath)) {
+      savedAttachments.push({
+        id: crypto.randomUUID(),
+        name: file.name || droppedPath.split(/[\\/]/).pop() || 'file',
+        path: droppedPath,
+        mimeType: file.type || fallbackMimeType,
+        size: file.size,
+      });
+      continue;
+    }
+
+    try {
+      const result = await saveAttachment({
+        name: file.name || 'file',
+        mimeType: file.type || fallbackMimeType,
+        data: await file.arrayBuffer(),
+      });
+
+      if (result.ok && result.attachment) {
+        savedAttachments.push(result.attachment);
+      } else {
+        toast.error(result.error ?? `Could not attach ${file.name || 'file'}`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      toast.error(
+        message.includes('No handler registered')
+          ? 'Restart Durango Code to finish enabling attachments.'
+          : message || `Could not attach ${file.name || 'file'}`
+      );
+    }
+  }
+  return savedAttachments;
 };

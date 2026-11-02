@@ -161,10 +161,7 @@ import {
   attachmentKindLabel,
   buildPromptWithAttachments,
   formatAttachmentSize,
-  getDroppedFilePath,
-  isEphemeralDropPath,
-  isImageFile,
-  isVideoFile,
+  saveFilesAsAttachments,
 } from './app/attachments';
 import { SnapShotAttachmentBadge, openSnapShotOutline } from './app/SnapShotSettings';
 import {
@@ -2190,7 +2187,11 @@ const App: React.FC = () => {
   // when no live run or session takes it does it go as an ordinary message,
   // queued behind the running turn or sent at once.
   const answerUserAction = useCallback(
-    (threadId: string, actionId: string, answer: { reply?: string; detected?: boolean } = {}) => {
+    (
+      threadId: string,
+      actionId: string,
+      answer: { reply?: string; attachments?: FileAttachment[]; detected?: boolean } = {}
+    ) => {
       const threads = useOrionStore.getState().threads;
       const thread = threads.find((candidate) => candidate.id === threadId);
       const done = thread?.userActions?.find((action) => action.id === actionId);
@@ -2209,15 +2210,23 @@ const App: React.FC = () => {
       const providerId = findAgentModel(agentModels, target.modelId ?? defaultAgentModelId)?.providerId;
       settleWaitingOnUserCaptions(threadId);
       const { reply, detected } = answer;
+      const attachments = reply !== undefined ? (answer.attachments ?? []) : [];
+      // A reply may be only files (a screenshot of where the user is stuck).
+      const replyText = reply !== undefined ? [`Not done: ${done.action}`, reply].filter(Boolean).join('\n\n') : '';
+      // Files go to the running agent as paths it can read (every provider's
+      // notify path is text); a queued fallback carries them as attachments.
       const text =
         reply !== undefined
-          ? `Not done: ${done.action}\n\n${reply}`
+          ? buildPromptWithAttachments(replyText, attachments)
           : detected && done.check
             ? `Done: ${done.action}\n\n(Durango Code saw \`${done.check}\` succeed.)`
             : `Done: ${done.action}`;
       const notice =
         reply !== undefined
-          ? { title: 'You replied instead of marking it done', detail: `${done.action}\n\n${reply}` }
+          ? {
+              title: 'You replied instead of marking it done',
+              detail: buildPromptWithAttachments([done.action, reply].filter(Boolean).join('\n\n'), attachments),
+            }
           : detected && done.check
             ? { title: `Done: \`${done.check}\` succeeded`, detail: done.action }
             : { title: 'You marked it done', detail: done.action };
@@ -2239,7 +2248,10 @@ const App: React.FC = () => {
         }
         if (accepted || cancelled()) return;
         pinThreadToBottom(targetId);
-        queueMessageToThread(targetId, { text });
+        queueMessageToThread(
+          targetId,
+          attachments.length > 0 ? { text: replyText, attachments } : { text }
+        );
       });
     },
     [agentModels, pinThreadToBottom, queueMessageToThread, updateThread]
@@ -2253,7 +2265,8 @@ const App: React.FC = () => {
     [answerUserAction]
   );
   const replyToUserAction = useCallback(
-    (threadId: string, actionId: string, reply: string) => answerUserAction(threadId, actionId, { reply }),
+    (threadId: string, actionId: string, reply: string, attachments: FileAttachment[]) =>
+      answerUserAction(threadId, actionId, { reply, attachments }),
     [answerUserAction]
   );
   // The X on a card: the action is redundant (already done, superseded, or
@@ -5456,53 +5469,8 @@ const App: React.FC = () => {
       const targetThreadId = resolveComposerTarget();
       if (!targetThreadId) return true;
 
-      const saveAttachment = window.orion?.saveAttachment ?? window.orion?.saveImageAttachment;
-      if (!saveAttachment) {
-        toast.error('Attachments are unavailable');
-        return true;
-      }
-
-      const savedAttachments: FileAttachment[] = [];
-      for (const file of selectedFiles) {
-        const fallbackMimeType = isVideoFile(file)
-          ? 'video/*'
-          : isImageFile(file)
-            ? 'image/*'
-            : 'application/octet-stream';
-        const droppedPath = getDroppedFilePath(file);
-        if (droppedPath && !isEphemeralDropPath(droppedPath)) {
-          savedAttachments.push({
-            id: crypto.randomUUID(),
-            name: file.name || droppedPath.split(/[\\/]/).pop() || 'file',
-            path: droppedPath,
-            mimeType: file.type || fallbackMimeType,
-            size: file.size,
-          });
-          continue;
-        }
-
-        try {
-          const result = await saveAttachment({
-            name: file.name || 'file',
-            mimeType: file.type || fallbackMimeType,
-            data: await file.arrayBuffer(),
-          });
-
-          if (result.ok && result.attachment) {
-            savedAttachments.push(result.attachment);
-          } else {
-            toast.error(result.error ?? `Could not attach ${file.name || 'file'}`);
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : '';
-          toast.error(
-            message.includes('No handler registered')
-              ? 'Restart Durango Code to finish enabling attachments.'
-              : message || `Could not attach ${file.name || 'file'}`
-          );
-        }
-      }
-
+      const savedAttachments = await saveFilesAsAttachments(selectedFiles);
+      if (!savedAttachments) return true;
       appendComposerAttachments(targetThreadId, savedAttachments);
 
       return true;
@@ -5581,9 +5549,11 @@ const App: React.FC = () => {
   const handleRootDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
       if (!Array.from(event.dataTransfer.types).includes('Files')) return;
-      event.preventDefault();
       dragDepth.current = 0;
       setDraggingFiles(false);
+      // Taken by a drop target of its own (a Needs you reply).
+      if (event.defaultPrevented) return;
+      event.preventDefault();
       void attachFiles(event.dataTransfer.files);
     },
     [attachFiles]
