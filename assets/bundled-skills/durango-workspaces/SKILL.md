@@ -93,6 +93,13 @@ for what they asked.
   machine), so run `deploys --watch` (or the `deploys retry` you are waiting on)
   as a background command and wait for it to exit; never wait in the foreground
   or poll a deploy log in a foreground loop. Report the outcome.
+- In a Durango Build app (cloned with `durango-code build clone`), landing
+  publishes the app: Durango Source merges the change and deploys the app
+  itself, and `land` waits for that deploy and prints the live URL, or the
+  error (exit 1; the merge stands and the previous release keeps serving;
+  `durango-code logs <deployment-id> --stream build` shows the build log).
+  There is nothing to `deploys --watch`; `durango-code build status` shows
+  the app. A direct `git push` to its `main` is refused.
 - `durango-code land --all` lands every open change, oldest first;
   `durango-code land <id> <id>…` lands specific ones; `land --cancel <id>` takes
   one off the train. Never deploy any other way.

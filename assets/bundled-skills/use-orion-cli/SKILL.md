@@ -38,6 +38,12 @@ from there, and land only when the user asks. If your prompt has a
 `[Durango workspace]` block, that workspace is already yours; do not create
 another.
 
+Durango Build apps (`durango-code build clone <project>`) work this way too
+(new ones have a `durango.toml`; older ones without one land the same way).
+Their `main` only moves by landing a change, and landing publishes the app:
+don't `git push` to main (it is refused) or run `durango-code deploy` there.
+`durango-code build status --json` shows the live app and its last deploy.
+
 ## Publish a requested plan
 
 Publish a plan only when the user explicitly asks for a plan of something. Do
