@@ -2028,7 +2028,14 @@ export const createClaudeSdkSession = ({
         stderr: (data) => {
           session.stderrTail = `${session.stderrTail}${data}`.slice(-2000);
         },
-        env: withClaudeEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }),
+        // DURANGO_THREAD_ID: `durango-code change create` records the thread on
+        // the change, so a Durango task linked to this thread follows it.
+        env: withClaudeEnv({
+          ...process.env,
+          FORCE_COLOR: '0',
+          NO_COLOR: '1',
+          ...(session.threadId ? { DURANGO_THREAD_ID: String(session.threadId) } : {}),
+        }),
       },
     });
     void pumpClaudeSession(session);

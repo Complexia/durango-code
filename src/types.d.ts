@@ -1068,7 +1068,7 @@ type OrionCodexBrowserIntegrationStatus = {
         baseRoot?: string;
         error?: string;
       }>;
-      createDurangoWorkspace?: (input: { projectPath: string; name: string }) => Promise<{
+      createDurangoWorkspace?: (input: { projectPath: string; name: string; threadId?: string }) => Promise<{
         ok: boolean;
         workspace?: import('./store').ThreadDurangoWorkspace;
         /** Dependency directories that could not be cloned (run `hints` to install). */

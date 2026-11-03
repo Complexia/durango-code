@@ -67,8 +67,11 @@ const workspaceFromCli = (workspace, relativeDir) => ({
 /**
  * `ws new` from the project's base checkout. A name taken by an earlier
  * workspace gets a numeric suffix rather than failing the thread's turn.
+ * `threadId` (DURANGO_THREAD_ID, which CLIs without thread support ignore)
+ * records the thread on the workspace, so the changes opened from it carry it
+ * and a Durango task linked to the thread follows them.
  */
-export const createDurangoWorkspace = async ({ projectPath, name, env }) => {
+export const createDurangoWorkspace = async ({ projectPath, name, threadId, env }) => {
   const project = await inspectDurangoWorkspaceProject(projectPath);
   if (!project.eligible) {
     return { ok: false, error: 'This project is not in a Durango repository (no durango.toml at its root).' };
@@ -78,7 +81,7 @@ export const createDurangoWorkspace = async ({ projectPath, name, env }) => {
     const candidate = attempt === 0 ? name : `${name.slice(0, 45)}-${attempt + 1}`;
     const result = await runBundledCli(['ws', 'new', candidate, '--repo', project.baseRoot, '--json'], {
       cwd: project.baseRoot,
-      env,
+      env: typeof threadId === 'string' && threadId ? { ...env, DURANGO_THREAD_ID: threadId } : env,
       timeout: WS_NEW_TIMEOUT_MS,
     });
     if (result.json?.ok && result.json.workspace) {

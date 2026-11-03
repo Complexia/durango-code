@@ -5594,7 +5594,7 @@ const App: React.FC = () => {
       markWorkspaceThreads('setup', [threadId], true);
       try {
         const name = durangoWorkspaceName(seed || (isDefaultTitle(thread.title) ? '' : thread.title));
-        const result = await window.orion.createDurangoWorkspace({ projectPath: project.path, name });
+        const result = await window.orion.createDurangoWorkspace({ projectPath: project.path, name, threadId });
         if (!result.ok || !result.workspace) {
           return {
             ok: false,

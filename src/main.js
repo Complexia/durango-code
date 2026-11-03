@@ -2730,7 +2730,11 @@ ipcMain.handle('durangoWorkspace:create', async (_event, input) => {
     // `ws new` starts from main on Durango Source, and the agent will open its
     // change from here, so make sure the CLI is signed in first (best effort).
     const cliSignIn = await signInBundledCli();
-    const result = await createDurangoWorkspace({ projectPath: input.projectPath, name: input.name });
+    const result = await createDurangoWorkspace({
+      projectPath: input.projectPath,
+      name: input.name,
+      threadId: typeof input.threadId === 'string' ? input.threadId : undefined,
+    });
     return { ...result, cliSignedIn: cliSignIn.signedIn === true };
   } catch (error) {
     return { ok: false, error: error?.message || String(error) };
