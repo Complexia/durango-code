@@ -2506,6 +2506,20 @@ const App: React.FC = () => {
   }, []);
   // The browser shows as a preview in the corner; expanded, as a modal.
   const [browserExpanded, setBrowserExpanded] = useState(false);
+  // Minimized: the corner preview retracts to its title bar (remembered).
+  const [browserMinimized, setBrowserMinimizedState] = useState(() => {
+    try {
+      return window.localStorage.getItem('orion.browserPanel.minimized') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const setBrowserMinimized = useCallback((minimized: boolean) => {
+    setBrowserMinimizedState(minimized);
+    try {
+      window.localStorage.setItem('orion.browserPanel.minimized', minimized ? '1' : '0');
+    } catch {}
+  }, []);
   const [browserSelectedTabId, setBrowserSelectedTabId] = useState<string | null>(null);
   const browserThreadParents = useThreadParents(threads);
   const browserEventContextRef = useRef({ selectedThreadId, parents: browserThreadParents, autoOpen: browserAutoOpen, open: browserPanelOpen });
@@ -10935,6 +10949,8 @@ const App: React.FC = () => {
                   expanded={browserExpanded}
                   onExpand={expandBrowser}
                   onCollapse={collapseBrowser}
+                  minimized={browserMinimized}
+                  onMinimizedChange={setBrowserMinimized}
                   onClose={closeBrowser}
                 />
               )}

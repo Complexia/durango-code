@@ -3,9 +3,12 @@ import {
   ArrowLeft,
   ArrowRight,
   Bot,
+  ChevronUp,
   Globe,
   Hand,
   Maximize2,
+  Minimize2,
+  Minus,
   Plus,
   RotateCw,
   Square,
@@ -16,6 +19,8 @@ import type { BrowserTab } from './useBrowserTabs';
 
 // The corner preview: a thumbnail of the selected tab (CSS px).
 const MINI_WIDTH = 320;
+// Minimized: only the title bar, so it covers less of the thread.
+const MINIMIZED_WIDTH = 260;
 const MINI_MARGIN = 16;
 // Thumbnail refresh: faster while the page is moving.
 const THUMB_BUSY_MS = 1000;
@@ -72,6 +77,9 @@ type BrowserPanelProps = {
   expanded: boolean;
   onExpand: () => void;
   onCollapse: () => void;
+  /** Minimized: the corner preview shows only its title bar (tabs keep running). */
+  minimized: boolean;
+  onMinimizedChange: (minimized: boolean) => void;
   onClose: () => void;
 };
 
@@ -85,6 +93,8 @@ export const BrowserPanel = ({
   expanded,
   onExpand,
   onCollapse,
+  minimized,
+  onMinimizedChange,
   onClose,
 }: BrowserPanelProps) => {
   const api = window.orion?.browser;
@@ -190,7 +200,7 @@ export const BrowserPanel = ({
   // ---- Corner preview thumbnail ----
   const tabId = tab?.id ?? null;
   const pageBusy = Boolean(tab?.loading || tab?.agentBusy);
-  const canThumb = !expanded && Boolean(tabId) && !tab?.crashed && Boolean(api?.thumbnail);
+  const canThumb = !expanded && !minimized && Boolean(tabId) && !tab?.crashed && Boolean(api?.thumbnail);
   useEffect(() => {
     if (!canThumb || !tabId || !api?.thumbnail) return undefined;
     let cancelled = false;
@@ -270,10 +280,14 @@ export const BrowserPanel = ({
       <div
         ref={panelRef}
         className="browser-mini fixed z-[90] overflow-hidden rounded-xl border border-white/[0.09] bg-[#141416] shadow-[0_16px_48px_rgba(0,0,0,0.55)]"
-        style={{ right: MINI_MARGIN, bottom: miniBottom, width: MINI_WIDTH }}
+        style={{ right: MINI_MARGIN, bottom: miniBottom, width: minimized ? MINIMIZED_WIDTH : MINI_WIDTH }}
         aria-label="Browser preview"
       >
-        <div className="flex h-8 items-center gap-1.5 border-b border-white/[0.055] pl-2.5 pr-1 text-[12px]">
+        <div
+          className={`flex h-8 items-center gap-1.5 pl-2.5 pr-1 text-[12px] ${minimized ? 'cursor-pointer' : 'border-b border-white/[0.055]'}`}
+          onClick={minimized ? () => onMinimizedChange(false) : undefined}
+          title={minimized ? 'Show preview' : undefined}
+        >
           {!tab ? (
             <Globe size={12} className="shrink-0 text-[#6b6b74]" />
           ) : agentTab ? (
@@ -284,47 +298,86 @@ export const BrowserPanel = ({
           <span className="min-w-0 flex-1 truncate text-[#ececef]" title={tab ? `${tabLabel} · ${ownerLabel(tab)}` : undefined}>
             {tabLabel}
           </span>
+          {minimized && attention && <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#f4a261]" title={attention} />}
           {tabs.length > 1 && <span className="shrink-0 text-[11px] tabular-nums text-[#6b6b74]">{tabs.length} tabs</span>}
-          <button type="button" className={iconButton} title="Expand" aria-label="Expand browser" onClick={onExpand}>
+          {minimized ? (
+            <button
+              type="button"
+              className={iconButton}
+              title="Show preview"
+              aria-label="Show browser preview"
+              onClick={(event) => {
+                event.stopPropagation();
+                onMinimizedChange(false);
+              }}
+            >
+              <ChevronUp size={14} />
+            </button>
+          ) : (
+            <button type="button" className={iconButton} title="Minimize" aria-label="Minimize browser" onClick={() => onMinimizedChange(true)}>
+              <Minus size={14} />
+            </button>
+          )}
+          <button
+            type="button"
+            className={iconButton}
+            title="Expand"
+            aria-label="Expand browser"
+            onClick={(event) => {
+              event.stopPropagation();
+              onExpand();
+            }}
+          >
             <Maximize2 size={13} />
           </button>
-          <button type="button" className={iconButton} title="Close browser" aria-label="Close browser" onClick={onClose}>
+          <button
+            type="button"
+            className={iconButton}
+            title="Close browser"
+            aria-label="Close browser"
+            onClick={(event) => {
+              event.stopPropagation();
+              onClose();
+            }}
+          >
             <X size={14} />
           </button>
         </div>
-        <button
-          type="button"
-          className="group relative block aspect-[16/10] w-full cursor-zoom-in overflow-hidden bg-[#101012] text-left"
-          aria-label="Expand browser"
-          onClick={onExpand}
-        >
-          {thumbSrc ? (
-            <img src={thumbSrc} alt="" draggable={false} className="h-full w-full object-cover object-top" />
-          ) : (
-            <span className="absolute inset-0 flex items-center justify-center px-6 text-center text-[12px] text-[#6b6b74]">
-              {!tab ? 'Open a page' : tab.crashed ? 'This page crashed' : 'Loading…'}
+        {!minimized && (
+          <button
+            type="button"
+            className="group relative block aspect-[16/10] w-full cursor-zoom-in overflow-hidden bg-[#101012] text-left"
+            aria-label="Expand browser"
+            onClick={onExpand}
+          >
+            {thumbSrc ? (
+              <img src={thumbSrc} alt="" draggable={false} className="h-full w-full object-cover object-top" />
+            ) : (
+              <span className="absolute inset-0 flex items-center justify-center px-6 text-center text-[12px] text-[#6b6b74]">
+                {!tab ? 'Open a page' : tab.crashed ? 'This page crashed' : 'Loading…'}
+              </span>
+            )}
+            <span className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-[opacity,background-color] duration-150 group-hover:bg-black/35 group-hover:opacity-100">
+              <span className="flex items-center gap-1.5 rounded-md bg-black/70 px-2.5 py-1 text-[12px] text-white">
+                <Maximize2 size={12} /> Expand
+              </span>
             </span>
-          )}
-          <span className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-[opacity,background-color] duration-150 group-hover:bg-black/35 group-hover:opacity-100">
-            <span className="flex items-center gap-1.5 rounded-md bg-black/70 px-2.5 py-1 text-[12px] text-white">
-              <Maximize2 size={12} /> Expand
-            </span>
-          </span>
-          {(attention || (tab && agentTab)) && (
-            <span
-              className={`absolute bottom-2 left-2 flex max-w-[calc(100%-16px)] items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] backdrop-blur ${
-                attention
-                  ? 'bg-[#f4a261]/90 text-[#1a1208]'
-                  : tab?.controller === 'user'
-                    ? 'bg-[#0f2a20]/85 text-[#a7f3d0]'
-                    : 'bg-[#1c1830]/85 text-[#c9c1ff]'
-              }`}
-            >
-              {attention ? null : tab?.controller === 'user' ? <Hand size={11} className="shrink-0" /> : <Bot size={11} className={tab?.agentBusy ? 'shrink-0 animate-pulse' : 'shrink-0'} />}
-              <span className="truncate">{attention ?? (tab?.controller === 'user' ? "You're in control" : 'Agent is controlling')}</span>
-            </span>
-          )}
-        </button>
+            {(attention || (tab && agentTab)) && (
+              <span
+                className={`absolute bottom-2 left-2 flex max-w-[calc(100%-16px)] items-center gap-1.5 rounded-md px-2 py-0.5 text-[11px] backdrop-blur ${
+                  attention
+                    ? 'bg-[#f4a261]/90 text-[#1a1208]'
+                    : tab?.controller === 'user'
+                      ? 'bg-[#0f2a20]/85 text-[#a7f3d0]'
+                      : 'bg-[#1c1830]/85 text-[#c9c1ff]'
+                }`}
+              >
+                {attention ? null : tab?.controller === 'user' ? <Hand size={11} className="shrink-0" /> : <Bot size={11} className={tab?.agentBusy ? 'shrink-0 animate-pulse' : 'shrink-0'} />}
+                <span className="truncate">{attention ?? (tab?.controller === 'user' ? "You're in control" : 'Agent is controlling')}</span>
+              </span>
+            )}
+          </button>
+        )}
       </div>
     );
   }
@@ -391,7 +444,10 @@ export const BrowserPanel = ({
         <button type="button" className={iconButton} title="New tab" aria-label="New tab" onClick={() => void openNewTab()}>
           <Plus size={15} />
         </button>
-        <button type="button" className={iconButton} title="Close (Esc)" aria-label="Close browser" onClick={onCollapse}>
+        <button type="button" className={iconButton} title="Make small (Esc)" aria-label="Make browser small" onClick={onCollapse}>
+          <Minimize2 size={14} />
+        </button>
+        <button type="button" className={iconButton} title="Close browser" aria-label="Close browser" onClick={onClose}>
           <X size={15} />
         </button>
       </div>
