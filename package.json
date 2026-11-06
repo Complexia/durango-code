@@ -47,6 +47,7 @@
     "test:work-log": "bun scripts/test-work-log.tsx",
     "test:html-visuals": "bun scripts/test-html-visuals.tsx",
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
+    "test:text-context-menu": "node --no-warnings scripts/test-text-context-menu.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",

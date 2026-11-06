@@ -64,6 +64,7 @@ import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteera
 import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { guardVisualFrames } from './main/visual-tools.js';
+import { attachTextContextMenu } from './main/text-context-menu.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { DurangoError, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
@@ -1067,6 +1068,8 @@ const createWindow = () => {
   // show_html visuals (about:srcdoc frames) may never navigate: that would
   // send a request the frame's CSP cannot stop (visual-tools.js).
   guardVisualFrames(mainWindow.webContents, webFrameMain);
+  // Spelling suggestions and edit actions on right-click (built on demand).
+  attachTextContextMenu(mainWindow, { Menu, clipboard, shell, externalUrl: externalWebUrl });
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (url === mainWindow.webContents.getURL()) return;
     event.preventDefault();
