@@ -386,6 +386,14 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('durango:dispatchState', listener);
     return () => ipcRenderer.removeListener('durango:dispatchState', listener);
   },
+  // Deploy watcher (deploys changes landed elsewhere; main: durango-deploy-watcher.js)
+  durangoDeployWatcherState: () => ipcRenderer.invoke('durango:deployWatcherState'),
+  durangoOpenDeployLog: (input) => ipcRenderer.invoke('durango:openDeployLog', input),
+  onDurangoDeployWatcherState: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('durango:deployWatcherState', listener);
+    return () => ipcRenderer.removeListener('durango:deployWatcherState', listener);
+  },
   onDurangoFocusThread: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('durango:focusThread', listener);

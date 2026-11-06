@@ -33,6 +33,7 @@
     "test:builtin-browser": "node scripts/run-electron-test.mjs scripts/test-builtin-browser.mjs",
     "test:devices": "node scripts/run-electron-test.mjs scripts/test-devices.mjs",
     "test:durango-dispatch": "node --no-warnings --experimental-strip-types scripts/test-durango-dispatch.mjs",
+    "test:durango-deploy-watcher": "node --no-warnings scripts/test-durango-deploy-watcher.mjs",
     "test:thread-search": "bun scripts/test-thread-search.tsx",
     "test:thread-references": "bun scripts/test-thread-references.tsx",
     "test:thread-reader": "electron scripts/test-thread-reader.mjs",

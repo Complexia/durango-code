@@ -48,6 +48,7 @@ import {
   defaultNotificationSettings,
   defaultDurangoSettings,
   defaultDurangoDispatchSettings,
+  defaultDurangoDeployWatcherSettings,
   defaultSidebarV2Settings,
   defaultAppearanceSettings,
   findProjectById,
@@ -3131,6 +3132,7 @@ const App: React.FC = () => {
       .durangoConfigure({
         useDurangoTasks: settings.useDurangoTasks !== false,
         dispatch: { ...defaultDurangoDispatchSettings, ...settings.dispatch },
+        deployWatcher: { ...defaultDurangoDeployWatcherSettings, ...settings.deployWatcher },
         projects: dispatchProjectsPayload(state.projects),
       })
       .catch(() => {});

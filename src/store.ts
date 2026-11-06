@@ -203,6 +203,20 @@ export type DurangoSettings = {
   useDurangoTasks: boolean;
   /** "Allow Durango Chat and Tasks to start agents on this Mac" (main: durango-dispatch.js). */
   dispatch: DurangoDispatchSettings;
+  /** "Deploy changes landed elsewhere" (main: durango-deploy-watcher.js). */
+  deployWatcher: DurangoDeployWatcherSettings;
+};
+
+export type DurangoDeployWatcherSettings = {
+  /**
+   * Off by default: deploys run on this Mac with its railway/convex/wrangler
+   * logins, so turning it on is the user's call (and per Mac).
+   */
+  enabled: boolean;
+};
+
+export const defaultDurangoDeployWatcherSettings: DurangoDeployWatcherSettings = {
+  enabled: false,
 };
 
 export type DurangoDispatchSettings = {
@@ -233,6 +247,7 @@ export const defaultDurangoSettings: DurangoSettings = {
   includeProfileMemory: false,
   useDurangoTasks: true,
   dispatch: defaultDurangoDispatchSettings,
+  deployWatcher: defaultDurangoDeployWatcherSettings,
 };
 
 /**
@@ -2718,6 +2733,10 @@ export const useOrionStore = create<OrionState>()(
           dispatch: {
             ...defaultDurangoDispatchSettings,
             ...merged.durangoSettings?.dispatch,
+          },
+          deployWatcher: {
+            ...defaultDurangoDeployWatcherSettings,
+            ...merged.durangoSettings?.deployWatcher,
           },
         };
         // The commit/PR message model used to live on epicsSettings; it now

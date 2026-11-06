@@ -75,6 +75,13 @@ import {
   dispatchSourceUrl,
   normalizeDispatchSettings,
 } from './main/durango-dispatch.js';
+import {
+  createDeployWatcher,
+  createSourceConfigFetcher,
+  createSourceDeploysFetcher,
+  normalizeDeployWatcherSettings,
+  startBundledDeployRunner,
+} from './main/durango-deploy-watcher.js';
 import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } from './main/durango-tools.js';
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsBatch, readThreadsHead, readThreadsIndex, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
@@ -89,7 +96,7 @@ import {
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
-import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellQuote, startShellPathSync } from './main/shell-env.js';
+import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellPathSyncPromise, shellQuote, startShellPathSync } from './main/shell-env.js';
 import { initDevices, registerDeviceIpc, shutdownDevices } from './main/devices/device-ipc.js';
 import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvider, sendsJsonEvents, stringifySummary } from './main/stream-adapters.js';
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
@@ -142,7 +149,7 @@ import {
 } from './main/workspace-sync.js';
 import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
-import { bundledCliBinDir, bundledCliEntry, bundledCliVersion, ensureCliSignedIn, installBundledCliShims, readCliCredential } from './main/bundled-cli.js';
+import { bundledCliBinDir, bundledCliEntry, bundledCliError, bundledCliVersion, ensureCliSignedIn, installBundledCliShims, readCliCredential, runBundledCli } from './main/bundled-cli.js';
 import { installGitCredentialHelper } from './main/git-credential-helper.js';
 import { disposeSnapShot, registerSnapShotIpc, startSnapShot } from './main/snapshot.js';
 import {
@@ -741,6 +748,7 @@ const clearAccountSession = async ({ preserveRepository = false } = {}) => {
   notifyRemoteControlAccountChanged(null, { reconcile: false });
   // Durango Chat dispatch stops polling the moment sign-out begins.
   dispatchWorker.accountChanged(durangoMock);
+  deployWatcher.accountChanged(false);
   await Promise.all([repositoryClear, durangoClear.catch(() => {})]);
   await fs.rm(getAccountSessionFilePath(), { force: true });
 };
@@ -764,8 +772,10 @@ const publishAccountState = async (session) => {
   // Remote control is gated on the live session: sign-out must stop the
   // listener and drop every connection immediately, sign-in re-arms it.
   notifyRemoteControlAccountChanged(effectiveSession);
-  // Same for Durango Chat dispatch (never claims while signed out).
+  // Same for Durango Chat dispatch (never claims while signed out) and the
+  // deploy watcher (never checks or deploys while signed out).
   dispatchWorker.accountChanged(durangoMock || account.authenticated);
+  deployWatcher.accountChanged(account.authenticated);
   return account;
 };
 
@@ -1233,18 +1243,27 @@ app.whenReady().then(async () => {
   // Durango Chat dispatch (off by default). Seed from the persisted store so
   // an enabled worker resumes before the renderer hydrates; the renderer
   // re-pushes settings and projects over durango:configure on every change.
-  powerMonitor.on('suspend', () => dispatchWorker.suspend());
-  powerMonitor.on('resume', () => dispatchWorker.resume());
+  // The deploy watcher (off by default) is seeded and gated the same way.
+  powerMonitor.on('suspend', () => {
+    dispatchWorker.suspend();
+    deployWatcher.suspend();
+  });
+  powerMonitor.on('resume', () => {
+    dispatchWorker.resume();
+    deployWatcher.resume();
+  });
   void Promise.all([readPersistedStoreState(), isDispatchSignedIn()])
     .then(async ([state, signedIn]) => {
       if (dispatchConfigureSeq === 0 && state?.durangoSettings) {
         await configureDurango({
           useDurangoTasks: state.durangoSettings.useDurangoTasks,
           dispatch: state.durangoSettings.dispatch,
+          deployWatcher: state.durangoSettings.deployWatcher,
           projects: state.projects,
         });
       }
       dispatchWorker.accountChanged(signedIn);
+      deployWatcher.accountChanged(signedIn && !durangoMock);
     })
     .catch((error) => console.error('Could not start Durango Chat dispatch', error));
   void remoteControlReady
@@ -1588,6 +1607,7 @@ app.on('will-quit', (event) => {
   shutdownWorkspaceSync();
   shutdownRemoteControl();
   dispatchWorker.stop();
+  deployWatcher.stop();
   disposeForQuit();
   if (quitBarrierSatisfied) return;
 
@@ -1616,6 +1636,7 @@ const settleQuitBarrierForUpdate = async () => {
   shutdownWorkspaceSync();
   shutdownRemoteControl();
   dispatchWorker.stop();
+  deployWatcher.stop();
   disposeForQuit('update');
   // If a quit is already draining this same work, waiting on it here settles at
   // the same time; either way the barrier is open once the work has landed.
@@ -3929,20 +3950,88 @@ const dispatchWorker = createDispatchWorker({
   onStateChange: (state) => sendToAllWindows('durango:dispatchState', state),
 });
 
+// --- Deploy watcher: deploy changes landed elsewhere ----------------------------------
+// src/main/durango-deploy-watcher.js checks Durango Source for pending deploy
+// targets and starts the bundled CLI's detached `deploys run` (the runner
+// `durango-code land` starts) in the repository's base checkout.
+
+const deployWatcherProjects = (projects) =>
+  (Array.isArray(projects) ? projects : [])
+    .filter((project) => typeof project?.path === 'string' && path.isAbsolute(project.path))
+    .map((project) => ({ id: String(project.id ?? ''), name: typeof project.name === 'string' ? project.name : '', path: project.path }));
+
+// Cancellable: turning the setting off, signing out, sleep or quit during the
+// preparation (PATH, CLI install, CLI sign-in) means no runner is spawned.
+const startDeployRunner = (input) =>
+  startBundledDeployRunner(input, {
+    hasCli: () => Boolean(bundledCliEntry()),
+    preparePath: () => shellPathSyncPromise,
+    installCli: () => installBundledCli(),
+    signInCli: () => signInBundledCli(),
+    isSignedIn: async () => !durangoMock && (await isDispatchSignedIn()),
+    runCli: (args, { cwd }) => runBundledCli(args, { cwd, timeout: 60_000 }),
+    cliError: bundledCliError,
+  });
+
+const deployNotifications = new Set();
+const notifyDeployStarted = ({ name, targets, log }) => {
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({
+    title: `Deploying ${name} on this Mac`,
+    body: `${targets.join(', ')}: landed elsewhere, deploying with this Mac's logins.${log ? ' Click for the log.' : ''}`,
+  });
+  deployNotifications.add(notification);
+  const forget = () => deployNotifications.delete(notification);
+  notification.on('click', () => {
+    forget();
+    if (log) void shell.openPath(log);
+  });
+  notification.on('close', forget);
+  notification.show();
+};
+
+const deployWatcher = createDeployWatcher({
+  fetchDeploys: createSourceDeploysFetcher({
+    readSession: () => readAccountSession(),
+    baseUrl: () => getDurangoWebUrl().toString(),
+  }),
+  fetchConfig: createSourceConfigFetcher({
+    readSession: () => readAccountSession(),
+    baseUrl: () => getDurangoWebUrl().toString(),
+  }),
+  startRunner: startDeployRunner,
+  isSignedIn: async () => !durangoMock && (await isDispatchSignedIn()),
+  isOnline: () => net.isOnline(),
+  notify: notifyDeployStarted,
+  onStateChange: (state) => sendToAllWindows('durango:deployWatcherState', state),
+});
+
 let dispatchConfigureSeq = 0;
 const configureDurango = async (input) => {
   const seq = ++dispatchConfigureSeq;
   if (typeof input?.useDurangoTasks === 'boolean') useDurangoTasksSetting = input.useDurangoTasks;
   const settings = normalizeDispatchSettings(input?.dispatch);
+  // The deploy watcher reads each project's link and durango.toml itself,
+  // and only while it is on.
+  const deploySettings = normalizeDeployWatcherSettings(input?.deployWatcher);
+  deployWatcher.configure({ settings: deploySettings, projects: deployWatcherProjects(input?.projects) });
   // Resolve repo ids only when they matter (the worker is on).
   const projects = settings.enabled ? await dispatchProjectsWithRepoIds(input?.projects) : [];
   if (seq !== dispatchConfigureSeq) return { ok: true, superseded: true };
   dispatchWorker.configure({ settings, projects });
-  return { ok: true, state: dispatchWorker.getState() };
+  return { ok: true, state: dispatchWorker.getState(), deployWatcherState: deployWatcher.getState() };
 };
 
 ipcMain.handle('durango:configure', (_event, input) => configureDurango(input));
 ipcMain.handle('durango:dispatchState', () => dispatchWorker.getState());
+ipcMain.handle('durango:deployWatcherState', () => deployWatcher.getState());
+ipcMain.handle('durango:openDeployLog', async (_event, input) => {
+  // Only logs the watcher itself reported (the runner's log under ~/.durango/deploys/logs).
+  const log = typeof input?.log === 'string' ? input.log : '';
+  if (!log || !deployWatcher.getState().repos.some((repo) => repo.log === log)) return { ok: false, error: 'Unknown log.' };
+  const error = await shell.openPath(log);
+  return error ? { ok: false, error } : { ok: true };
+});
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
 ipcMain.handle('durango:dispatchSettled', (_event, input) =>
   dispatchWorker.settle({

@@ -57,6 +57,7 @@ import { SelectMenu } from './SelectMenu';
 import { BuiltinBrowserSettings } from './BrowserSettings';
 import { FxConnectionsPanel } from './FxConnectionsPanel';
 import { DurangoDispatchSettings } from './DurangoDispatchSettings';
+import { DurangoDeployWatcherSetting } from './DurangoDeployWatcherSetting';
 import SkillsSettings from './SkillsSettings';
 import McpsSettings from './McpsSettings';
 import DeploymentsSettings from './DeploymentsSettings';
@@ -595,6 +596,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 authenticated={accountState.authenticated}
                 modelGroups={orchestrationModelGroups}
               />
+              <DurangoDeployWatcherSetting authenticated={accountState.authenticated} />
             </>
           )}
 

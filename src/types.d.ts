@@ -702,6 +702,30 @@ type DurangoDispatchState = {
   running: Array<{ dispatchId: string; threadId: string | null; projectName: string | null }>;
 };
 
+/** Settings → Durango → "Deploy changes landed elsewhere" (main: durango-deploy-watcher.js). */
+type DurangoDeployWatcherSettingsInput = {
+  enabled: boolean;
+};
+
+type DurangoDeployWatcherState = {
+  enabled: boolean;
+  signedIn: boolean;
+  status: 'off' | 'signed_out' | 'paused' | 'offline' | 'watching' | 'error';
+  lastError: string | null;
+  lastCheckAt: string | null;
+  repos: Array<{
+    repoId: string;
+    name: string;
+    checkout: string;
+    state: 'idle' | 'deploying' | 'started' | 'stalled' | 'error' | 'unavailable';
+    pending: string[];
+    error: string | null;
+    startedAt: string | null;
+    pid: number | null;
+    log: string | null;
+  }>;
+};
+
 type DurangoSearchChatsResult =
   | { ok: true; data: DurangoChatSummary[]; nextCursor: string | null }
   | { ok: false; code: DurangoErrorCode; error: string };
@@ -1691,9 +1715,13 @@ type OrionCodexBrowserIntegrationStatus = {
       durangoConfigure?: (input: {
         useDurangoTasks: boolean;
         dispatch: DurangoDispatchSettingsInput;
+        deployWatcher: DurangoDeployWatcherSettingsInput;
         projects: Array<{ id: string; name: string; path: string }>;
-      }) => Promise<{ ok: boolean; state?: DurangoDispatchState }>;
+      }) => Promise<{ ok: boolean; state?: DurangoDispatchState; deployWatcherState?: DurangoDeployWatcherState }>;
       durangoDispatchState?: () => Promise<DurangoDispatchState>;
+      durangoDeployWatcherState?: () => Promise<DurangoDeployWatcherState>;
+      durangoOpenDeployLog?: (input: { log: string }) => Promise<{ ok: boolean; error?: string }>;
+      onDurangoDeployWatcherState?: (cb: (state: DurangoDeployWatcherState) => void) => () => void;
       durangoDispatchSettled?: (input: {
         dispatchId: string;
         threadId: string;
