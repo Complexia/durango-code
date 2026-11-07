@@ -33,7 +33,7 @@ import { formatWorkedDuration, threadSidebarTone, threadWorkedMs, workStartedAt,
 
 // Sidebar v2 (Settings → Experimental), after T3 Code's: one flat list of
 // threads instead of project groups. The header holds search, New agent, Add
-// project and a views menu that toggles Pinned, Recent, Snoozed and Settled.
+// project and a views menu that toggles Pinned, Working, Snoozed and Settled.
 // A row can be snoozed (it leaves the list until its run finishes or it needs
 // you) or settled (archived until you restore it or send it a new message).
 
@@ -43,16 +43,25 @@ const HOVER_CARD_DELAY_MS = 550;
 
 const VIEW_LABELS: Record<SidebarV2View, string> = {
   pinned: 'Pinned',
+  working: 'Working',
   recent: 'Recent',
   snoozed: 'Snoozed',
   settled: 'Settled',
 };
 // Sections in sidebar order. Recent (every thread you haven't snoozed or
 // settled, pinned ones included) is always shown; the menu toggles the others.
-const VIEW_ORDER: SidebarV2View[] = ['pinned', 'recent', 'snoozed', 'settled'];
-const TOGGLEABLE_VIEWS: SidebarV2View[] = ['pinned', 'snoozed', 'settled'];
+const VIEW_ORDER: SidebarV2View[] = ['pinned', 'working', 'recent', 'snoozed', 'settled'];
+const TOGGLEABLE_VIEWS: SidebarV2View[] = ['pinned', 'working', 'snoozed', 'settled'];
+const VIEW_EMPTY_LABELS: Record<SidebarV2View, string> = {
+  pinned: 'Nothing pinned',
+  working: 'Nothing running',
+  recent: 'No threads yet',
+  snoozed: 'Nothing snoozed',
+  settled: 'Nothing settled yet',
+};
 const VIEW_MENU_HINTS: Partial<Record<SidebarV2View, string>> = {
   pinned: 'Also list pinned threads at the top',
+  working: 'Also list every running thread, snoozed ones included',
 };
 
 /** Row actions. App passes one stable object so memoized rows skip re-renders. */
@@ -426,14 +435,14 @@ const ThreadRow = React.memo(function ThreadRow({
 
   // Hover actions replace the time: snooze/settle for live threads, wake /
   // restore inside the Snoozed and Settled views (and for a settled thread
-  // that stays in Pinned).
+  // that stays in Pinned, or a snoozed one listed under Working).
   const quickActions =
     view === 'settled' || thread.settledAt ? (
       <QuickAction label="Restore to sidebar" onClick={() => model.unsettleThread(thread.id)}>
         <ArchiveRestore size={13} />
         <span>Restore</span>
       </QuickAction>
-    ) : view === 'snoozed' ? (
+    ) : view === 'snoozed' || thread.snoozedAt ? (
       <>
         <QuickAction label="Unsnooze thread" onClick={() => model.unsnoozeThread(thread.id)} iconOnly>
           <AlarmClock size={13} />
@@ -755,6 +764,7 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [limits, setLimits] = useState<Record<SidebarV2View, number>>({
     pinned: PAGE_SIZE,
+    working: PAGE_SIZE,
     recent: PAGE_SIZE,
     snoozed: PAGE_SIZE,
     settled: PAGE_SIZE,
@@ -763,14 +773,15 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
 
   const counts = {
     pinned: threadsByView.pinned.length,
+    working: threadsByView.working.length,
     recent: threadsByView.recent.length,
     snoozed: threadsByView.snoozed.length,
     settled: threadsByView.settled.length,
   };
   // Search labels No project threads too.
   const searchProjects = useMemo(() => (noProject ? [...projects, noProject] : projects), [noProject, projects]);
-  // Recent always shows. An empty Pinned group is hidden; Snoozed and Settled were turned on
-  // deliberately, so they say they're empty instead.
+  // Recent always shows. An empty Pinned group is hidden; Working, Snoozed and Settled were
+  // turned on deliberately, so they say they're empty instead.
   const shownViews = VIEW_ORDER.filter((view) =>
     view === 'recent' ? true : view === 'pinned' ? views.pinned && threadsByView.pinned.length > 0 : views[view]
   );
@@ -858,13 +869,7 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
               )}
               {threads.length === 0 ? (
                 <div className="px-4 py-1.5 text-[12.5px] text-neutral-600">
-                  {view === 'pinned'
-                    ? 'Nothing pinned'
-                    : view === 'snoozed'
-                      ? 'Nothing snoozed'
-                      : view === 'settled'
-                        ? 'Nothing settled yet'
-                        : 'No threads yet'}
+                  {VIEW_EMPTY_LABELS[view]}
                 </div>
               ) : (
                 <div className="flex flex-col gap-px">

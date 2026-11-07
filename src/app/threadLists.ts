@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { STEERED_RUN_CAPTION, WAITING_ON_BACKGROUND_CAPTION, type Message, type Thread, type UserAction } from '../store';
 import { getThreadActivityTime } from './time';
 
-export type SidebarV2View = 'pinned' | 'recent' | 'snoozed' | 'settled';
+export type SidebarV2View = 'pinned' | 'working' | 'recent' | 'snoozed' | 'settled';
 export type SidebarV2ViewsSettings = Record<SidebarV2View, boolean>;
 
 /**
@@ -26,7 +26,8 @@ export const threadSidebarTone = (thread: Thread, hasPendingInput: boolean): Thr
  * The sidebar v2 lists. Recent has every thread you haven't snoozed or
  * settled, pinned or not; pinned ones are also in Pinned. Settling a pinned
  * thread keeps it in Pinned (and adds it to Settled); snoozing one moves it to
- * Snoozed but keeps its pin, so it comes back pinned.
+ * Snoozed but keeps its pin, so it comes back pinned. Working has every
+ * thread whose run is going, snoozed or not.
  */
 export type SidebarV2Lists = Record<SidebarV2View, Thread[]>;
 
@@ -35,17 +36,19 @@ export const sidebarV2ThreadLists = (
   isChild: (thread: Thread) => boolean,
   compareRecent: (a: Thread, b: Thread) => number
 ): SidebarV2Lists => {
-  const lists: SidebarV2Lists = { pinned: [], recent: [], snoozed: [], settled: [] };
+  const lists: SidebarV2Lists = { pinned: [], working: [], recent: [], snoozed: [], settled: [] };
   for (const thread of threads) {
     if (isChild(thread)) continue;
     if (thread.settledAt) lists.settled.push(thread);
     else if (thread.snoozedAt) lists.snoozed.push(thread);
     else lists.recent.push(thread);
     if (thread.pinnedAt && (thread.settledAt || !thread.snoozedAt)) lists.pinned.push(thread);
+    if (thread.status === 'running') lists.working.push(thread);
   }
   const newest = (key: 'pinnedAt' | 'snoozedAt' | 'settledAt') => (a: Thread, b: Thread) =>
     new Date(b[key] ?? 0).getTime() - new Date(a[key] ?? 0).getTime();
   lists.pinned.sort(newest('pinnedAt'));
+  lists.working.sort(compareRecent);
   lists.recent.sort(compareRecent);
   lists.snoozed.sort(newest('snoozedAt'));
   lists.settled.sort(newest('settledAt'));

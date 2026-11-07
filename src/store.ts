@@ -99,7 +99,7 @@ export type SidebarV2Settings = {
    * opt-in) are switched on once, and a later "off" sticks.
    */
   version?: number;
-  views: { pinned: boolean; recent: boolean; snoozed: boolean; settled: boolean };
+  views: { pinned: boolean; working: boolean; recent: boolean; snoozed: boolean; settled: boolean };
   /**
    * Set once the threads from before sidebar v2 were settled. The first time
    * it is turned on, every listed thread except pinned ones is settled so the
@@ -123,7 +123,7 @@ export const defaultAppearanceSettings: AppearanceSettings = {
 export const defaultSidebarV2Settings: SidebarV2Settings = {
   enabled: true,
   version: 2,
-  views: { pinned: false, recent: true, snoozed: false, settled: false },
+  views: { pinned: false, working: false, recent: true, snoozed: false, settled: false },
 };
 
 /**
