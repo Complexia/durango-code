@@ -20,7 +20,7 @@ const orionMcps = await import('../src/main/orion-mcps.js');
 const { mcpBridgePluginConfig, openCodeMcpConfigContent, orionAcpMcpServers } = await import(
   '../src/main/mcp-bridge.js'
 );
-const { syncClaudeOrionMcpServers, createClaudeSdkSession, claudeSdkSessions, runClaudeSdkTurn, terminatingClaudeSdkSessions } = await import('../src/main/claude-driver.js');
+const { syncClaudeOrionMcpServers, loadClaudeOrionMcpServers, loadToolsDescription, createClaudeSdkSession, claudeSdkSessions, runClaudeSdkTurn, terminatingClaudeSdkSessions } = await import('../src/main/claude-driver.js');
 const { createKimiAcpDriver } = await import('../src/main/kimi-driver.js');
 const { codexAppServerConfig } = await import('../src/main/codex-driver.js');
 const { buildMcpMentionsContext, mergeMcpAttachments, parseMcpMentions, splitCommandLine, suggestMcpNickname } =
@@ -789,10 +789,11 @@ await server.connect(new StdioServerTransport());
     }
   }
 
-  // --- Claude: live sessions sync through setMcpServers, keeping `orion` -------------------
+  // --- Claude: servers load on demand (orion load_tools), keeping `orion` ----------------
   const calls = [];
   const session = {
     orionMcpServer: { type: 'sdk', name: 'orion' },
+    loadedMcpServers: [],
     query: {
       setMcpServers: async (value) => {
         calls.push(value);
@@ -801,44 +802,45 @@ await server.connect(new StdioServerTransport());
     },
   };
   assert.deepEqual(await syncClaudeOrionMcpServers(session, {}), {}, 'no Orion MCPs: no control request');
-  assert.equal(calls.length, 0);
-  await syncClaudeOrionMcpServers(session, claude);
-  assert.deepEqual(Object.keys(calls[0]).sort(), ['local_tools', 'open', 'orion', 'secure']);
+  assert.deepEqual(await syncClaudeOrionMcpServers(session, claude), {});
+  assert.equal(calls.length, 0, 'a turn never connects servers the agent has not loaded');
+  for (const name of Object.keys(claude)) assert.match(loadToolsDescription(session), new RegExp(name));
+  assert.match(await loadClaudeOrionMcpServers(session, []), new RegExp(`Apps you can load: ${Object.keys(claude).join(', ')}`));
+  assert.equal(calls.length, 0, 'listing apps connects nothing');
+  assert.match(await loadClaudeOrionMcpServers(session, ['@open', 'nope']), /Loaded open[\s\S]*Not connected: nope/);
+  assert.deepEqual(Object.keys(calls[0]).sort(), ['open', 'orion'], 'only the requested server is connected');
   assert.equal(calls[0].orion, session.orionMcpServer);
   await syncClaudeOrionMcpServers(session, claude);
-  assert.equal(calls.length, 1, 'an unchanged set is not re-sent');
+  assert.equal(calls.length, 1, 'an unchanged loaded set is not re-sent on the next turn');
+  await Promise.all([loadClaudeOrionMcpServers(session, ['secure']), loadClaudeOrionMcpServers(session, ['local_tools'])]);
+  assert.deepEqual(Object.keys(calls.at(-1)).sort(), ['local_tools', 'open', 'orion', 'secure'], 'concurrent loads are queued, not lost');
+  await syncClaudeOrionMcpServers(session, { open: claude.open });
+  assert.deepEqual(Object.keys(calls.at(-1)).sort(), ['open', 'orion'], 'switching a loaded server off unloads it');
+  const callsBefore = calls.length;
+  await syncClaudeOrionMcpServers(session, { open: { ...claude.open, headers: { Authorization: 'Bearer refreshed' } } });
+  assert.equal(calls.length, callsBefore + 1, 'a loaded server whose sign-in changed is reconnected');
   await syncClaudeOrionMcpServers(session, {});
-  assert.deepEqual(Object.keys(calls[1]), ['orion'], 'detaching unloads the server but keeps Orion tools');
-  session.query.setMcpServers = async () => ({ errors: { open: 'boom' } });
-  assert.deepEqual(await syncClaudeOrionMcpServers(session, { open: claude.open }), { open: 'boom' });
-  assert.deepEqual(
-    await syncClaudeOrionMcpServers(session, { open: claude.open }),
-    { open: 'boom' },
-    'a failed connection is retried and its error remains visible'
-  );
+  assert.deepEqual(Object.keys(calls.at(-1)), ['orion'], 'detaching unloads the server but keeps Orion tools');
+
+  const failing = { orionMcpServer: {}, loadedMcpServers: [], orionMcpServers: { open: claude.open } };
+  failing.query = { setMcpServers: async () => ({ errors: { open: 'boom' } }) };
+  assert.match(await loadClaudeOrionMcpServers(failing, ['open']), /Could not connect open: boom/);
+  assert.deepEqual(failing.loadedMcpServers, [], 'a failed load is not kept');
   let recoveredCalls = 0;
-  session.query.setMcpServers = async () => {
-    recoveredCalls++;
-    return { errors: {} };
-  };
-  await syncClaudeOrionMcpServers(session, { open: claude.open });
-  await syncClaudeOrionMcpServers(session, { open: claude.open });
-  assert.equal(recoveredCalls, 1, 'only a successful retry is cached');
-  session.query.setMcpServers = async () => ({ errors: { local_tools: 'offline' } });
-  await syncClaudeOrionMcpServers(session, claude);
-  session.query.setMcpServers = async () => {
-    recoveredCalls++;
-    return { errors: {} };
-  };
-  await syncClaudeOrionMcpServers(session, { open: claude.open });
-  assert.equal(recoveredCalls, 2, 'reverting after a partial failure must also resynchronize');
-  session.query.setMcpServers = async () => { throw new Error('control channel failed'); };
-  await assert.rejects(syncClaudeOrionMcpServers(session, {}), /control channel failed/);
-  session.query.setMcpServers = async () => {
-    recoveredCalls++;
-    return { errors: {} };
-  };
-  await syncClaudeOrionMcpServers(session, {});
+  failing.query.setMcpServers = async () => { recoveredCalls++; return { errors: {} }; };
+  assert.match(await loadClaudeOrionMcpServers(failing, ['open']), /Loaded open/);
+  assert.equal(recoveredCalls, 1, 'a failed load is retried');
+  failing.query.setMcpServers = async () => { throw new Error('control channel failed'); };
+  failing.orionMcpServers = { open: claude.open, secure: claude.secure };
+  assert.match(await loadClaudeOrionMcpServers(failing, ['secure']), /Could not load secure: control channel failed/);
+  assert.deepEqual(failing.loadedMcpServers, ['open'], 'a thrown load keeps what was loaded before');
+  failing.query.setMcpServers = async () => { recoveredCalls++; return { errors: {} }; };
+  await syncClaudeOrionMcpServers(failing, failing.orionMcpServers);
+  assert.equal(recoveredCalls, 2, 'after a failed control request the next turn resynchronizes');
+  failing.query.setMcpServers = async () => { throw new Error('control channel failed'); };
+  await assert.rejects(syncClaudeOrionMcpServers(failing, {}), /control channel failed/);
+  failing.query.setMcpServers = async () => { recoveredCalls++; return { errors: {} }; };
+  await syncClaudeOrionMcpServers(failing, {});
   assert.equal(recoveredCalls, 3, 'failed detaches are retried even when the desired set is empty');
 
   // A real turn must dispose the session and never enqueue a prompt if the
@@ -849,6 +851,8 @@ await server.connect(new StdioServerTransport());
     const model = { providerId: 'claude', slug: 'claude-sonnet-4-6' };
     const live = createClaudeSdkSession({ sender, threadId: input.threadId, projectPath: testRoot, model, input });
     live.orionMcpServers = { open: claude.open };
+    live.loadedMcpServers = ['open'];
+    live.liveMcpNames = ['open'];
     live.orionMcpKey = JSON.stringify(live.orionMcpServers);
     live.orionMcpServer = {};
     live.query = { setMcpServers: async () => {
