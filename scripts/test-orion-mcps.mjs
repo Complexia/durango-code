@@ -17,7 +17,7 @@ process.env.ORION_MCP_CREDENTIALS_PATH = path.join(testRoot, 'orion-mcp-credenti
 
 const { app, shell } = await import('electron');
 const orionMcps = await import('../src/main/orion-mcps.js');
-const { mcpBridgePluginConfig, openCodeMcpConfigContent, orionAcpMcpServers } = await import(
+const { mcpBridgePluginConfig, openCodeMcpConfigContent, orionAcpMcpServers, registerMcpBridgeForRun } = await import(
   '../src/main/mcp-bridge.js'
 );
 const { syncClaudeOrionMcpServers, loadClaudeOrionMcpServers, loadToolsDescription, createClaudeSdkSession, claudeSdkSessions, runClaudeSdkTurn, terminatingClaudeSdkSessions } = await import('../src/main/claude-driver.js');
@@ -703,6 +703,74 @@ await server.connect(new StdioServerTransport());
   assert.throws(() => orionMcps.museOrionMcpServers(run.servers), /Muse does not support HTTP MCP servers: @open, @secure/);
   assert.deepEqual(Object.keys(orionMcps.museOrionMcpServers(run.servers.filter((server) => server.transport === 'stdio'))), ['local_tools']);
 
+  // --- Bridge providers: the run's servers load on demand through `orion` ---------------
+  {
+    const net = await import('node:net');
+    const registration = await registerMcpBridgeForRun({
+      getSender: () => null, threadId: 'on-demand', runId: 'on-demand', projectPath: testRoot,
+      providerId: 'kimi', accessMode: 'full-access', userServers: run.servers,
+    });
+    assert.ok(registration, 'bridge registered');
+    try {
+      assert.deepEqual(registration.userServers, [], 'provider intakes get only the bridge');
+      const pluginJson = JSON.parse(await fs.readFile(path.join(registration.pluginDir, '.mcp.json'), 'utf8'));
+      assert.deepEqual(Object.keys(pluginJson.mcpServers), ['orion'], 'the run plugin carries no user servers');
+      const ask = (tool, args = {}) => new Promise((resolve, reject) => {
+        const socket = net.connect(registration.socketPath);
+        let buffer = '';
+        socket.on('connect', () => socket.write(`${JSON.stringify({ id: 1, token: registration.token, tool, args })}\n`));
+        socket.on('data', (chunk) => {
+          buffer += chunk;
+          const newline = buffer.indexOf('\n');
+          if (newline !== -1) { socket.destroy(); resolve(JSON.parse(buffer.slice(0, newline))); }
+        });
+        socket.on('error', reject);
+      });
+      const listed = await ask('__tools');
+      const toolNames = listed.tools.map((tool) => tool.name);
+      assert.ok(toolNames.includes('load_tools') && toolNames.includes('call_app_tool'));
+      assert.match(listed.tools.find((tool) => tool.name === 'load_tools').description, /open/);
+      assert.match((await ask('load_tools', {})).text, /Apps you can load: .*open/);
+      const loadedOpen = await ask('load_tools', { apps: ['@open', 'missing'] });
+      assert.equal(loadedOpen.ok, true, loadedOpen.text);
+      const payload = JSON.parse(loadedOpen.text);
+      assert.deepEqual(payload.apps[0].tools.map((tool) => tool.name), ['echo']);
+      assert.equal(payload.apps[0].tools[0].inputSchema.type, 'object');
+      assert.deepEqual(payload.notConnected, ['missing']);
+      const echoed = await ask('call_app_tool', { app: 'open', tool: 'echo', arguments: { text: 'hi there' } });
+      assert.equal(echoed.ok, true, echoed.text);
+      assert.equal(echoed.text, 'hi there');
+      assert.deepEqual(echoed.content, [{ type: 'text', text: 'hi there' }]);
+      // Calling before loading connects on first use.
+      const securely = await ask('call_app_tool', { app: 'secure', tool: 'echo', arguments: { text: 'auth ok' } });
+      assert.equal(securely.text, 'auth ok', 'the resolved sign-in headers reach the server');
+      assert.match((await ask('call_app_tool', { app: 'open', tool: 'nope' })).text, /no tool named nope/);
+      assert.match((await ask('call_app_tool', { app: 'ghost', tool: 'echo' })).text, /Not connected: ghost/);
+    } finally {
+      registration.release();
+    }
+    const readOnly = await registerMcpBridgeForRun({
+      getSender: () => null, threadId: 'on-demand-ro', runId: 'on-demand-ro', projectPath: testRoot,
+      providerId: 'kimi', accessMode: 'read-only', userServers: run.servers,
+    });
+    try {
+      const session = (await import('../src/main/mcp-bridge.js')).mcpBridgeSessions.get(readOnly.token);
+      assert.match((await session.onDemandMcps.call({ app: 'open', tool: 'echo', arguments: { text: 'x' } }, { accessMode: 'read-only' })).text, /Read only/);
+    } finally {
+      readOnly.release();
+    }
+    const quiet = await registerMcpBridgeForRun({
+      getSender: () => null, threadId: 'on-demand-none', runId: 'on-demand-none', projectPath: testRoot,
+      providerId: 'kimi', accessMode: 'full-access', userServers: [],
+    });
+    try {
+      const session = (await import('../src/main/mcp-bridge.js')).mcpBridgeSessions.get(quiet.token);
+      assert.deepEqual(session.onDemandMcps.names(), [], 'no servers: no load_tools');
+    } finally {
+      quiet.release();
+    }
+  }
+
   // Negotiate a fake ACP agent through the real driver. Unsupported transports
   // must fail before session creation or resume; supported HTTP is passed intact.
   for (const httpSupport of [undefined, false, true]) {
@@ -1087,7 +1155,7 @@ await server.connect(new StdioServerTransport());
   assert.equal(customizedLaunch.options.cwd, launchInput.projectPath, 'customized runs retain their checked project-shell environment');
   assert.equal(captureLaunch(launchInput, false, false, null, launchOs).options.cwd, launchInput.projectPath, 'other launches still start in the project');
   const resolutionStart = runTurnSource.indexOf('    const orionMcps =');
-  const resolutionEnd = runTurnSource.indexOf("    if (model.providerId === 'muse')", resolutionStart);
+  const resolutionEnd = runTurnSource.indexOf('    // Connectors from the Durango account join', resolutionStart);
   assert.ok(resolutionStart >= 0 && resolutionEnd > resolutionStart);
   const resolveStartup = new (Object.getPrototypeOf(async function () {}).constructor)(
     'input', 'startupController', 'startingAgentRuns', 'runId', 'resolveOrionMcpsForRun',
@@ -1115,40 +1183,13 @@ await server.connect(new StdioServerTransport());
   // Exercise the actual startup configuration block with unavailable plugin
   // support and failed registration/configuration, before any prompt is sent.
   const routing = await import('../src/main/thread-reader-routing.js');
-  const openCodeCheckStart = runTurnSource.indexOf('    // Check before allocating a bridge or passing credentials to OpenCode.');
-  const openCodeCheckEnd = runTurnSource.indexOf('    // spawn_subagent for non-Claude drivers:', openCodeCheckStart);
-  assert.ok(openCodeCheckStart >= 0 && openCodeCheckEnd > openCodeCheckStart);
-  const checkOpenCodeStartup = new (Object.getPrototypeOf(async function () {}).constructor)(
-    'model', 'input', 'orionMcps', 'startupController', 'startingAgentRuns', 'runId', 'assertOpenCodeMcpNamesAvailable',
-    runTurnSource.slice(openCodeCheckStart, openCodeCheckEnd) + '\nreturn { proceeded: true };',
-  );
-  const requestedServers = [{ name: 'conflict' }];
-  await assert.rejects(checkOpenCodeStartup(
-    { providerId: 'opencode' }, { projectPath: testRoot }, { servers: requestedServers },
-    new AbortController(), new Map(), 'collision',
-    async (servers, options) => {
-      assert.deepEqual(servers, requestedServers);
-      assert.equal(options.cwd, testRoot);
-      assert.ok(options.signal instanceof AbortSignal);
-      throw new Error('OpenCode nicknames conflict');
-    },
-  ), /OpenCode nicknames conflict/);
-  const stoppedCheck = new AbortController();
-  assert.deepEqual(await checkOpenCodeStartup(
-    { providerId: 'opencode' }, { projectPath: testRoot }, { servers: requestedServers },
-    stoppedCheck, new Map(), 'stopped', async () => {
-      stoppedCheck.abort(new Error('Stopped during discovery'));
-      throw stoppedCheck.signal.reason;
-    },
-  ), { ok: true, runId: 'stopped' });
   const bridgeStart = runTurnSource.indexOf('    const bridgeProvider = isMcpBridgeProvider(model.providerId);');
-  assert.ok(openCodeCheckEnd < bridgeStart, 'collision checks happen before bridge allocation');
   const bridgeEnd = runTurnSource.indexOf("    if (\n      model.providerId === 'codex'", bridgeStart);
   assert.ok(bridgeStart >= 0 && bridgeEnd > bridgeStart);
   const prepareBridge = new (Object.getPrototypeOf(async function () {}).constructor)(
-    'model', 'input', 'orionMcps', 'isMcpBridgeProvider', 'providerSupportsRunPlugin',
+    'model', 'input', 'orionMcps', 'accountMcps', 'codexMcpServers', 'isMcpBridgeProvider', 'providerSupportsRunPlugin',
     'registerMcpBridgeForRun', 'openCodeMcpConfigContent', 'writeMuseMcpConfigRoot',
-    'isEffectiveThreadReaderBridgeReady', 'isRequiredThreadReaderBridgeMissing', 'browserModeFor',
+    'isEffectiveThreadReaderBridgeReady', 'isRequiredThreadReaderBridgeMissing', 'browserModeFor', 'runId',
     runTurnSource.slice(bridgeStart, bridgeEnd) + '\nreturn { proceeded: true };',
   );
   for (const providerId of ['cursor', 'grok', 'kimi', 'opencode', 'muse', 'codex']) {
@@ -1159,16 +1200,18 @@ await server.connect(new StdioServerTransport());
         const servers = hasServers ? [{ name: 'requested', transport: 'stdio', command: 'test', args: [], env: {} }] : [];
         const result = await prepareBridge(
           { providerId }, { projectPath: testRoot, mcpServerIds: hasServers ? ['attached'] : [] }, { servers },
+          [], async () => servers,
           routing.isMcpBridgeProvider, async () => failure !== 'unsupported',
-          async () => {
+          async (options) => {
+            assert.deepEqual(options.userServers, servers, 'the run\'s servers go to the bridge, for every provider');
             registered = true;
             return failure === 'registration' ? null : { release: () => { released = true; } };
           },
           () => failure === 'config' ? null : '{}', async () => failure === 'config' ? null : '/fixture/config',
           routing.isEffectiveThreadReaderBridgeReady, routing.isRequiredThreadReaderBridgeMissing,
-          () => 'builtin',
+          () => 'builtin', 'bridge-run',
         );
-        const mustFail = hasServers && providerId !== 'codex' &&
+        const mustFail = hasServers &&
           (failure === 'unsupported' || failure === 'registration' ||
             (failure === 'config' && ['opencode', 'muse'].includes(providerId)));
         if (mustFail) {
@@ -1190,12 +1233,11 @@ await server.connect(new StdioServerTransport());
   );
   assert.match(
     runTurnSource,
-    /orionMcpServers: claudeOrionMcpServers\(\s*await withoutClaudeNativeMcps\(orionMcps\.servers, input\.projectPath\)/
+    /orionMcpServers: claudeOrionMcpServers\(\s*await withoutClaudeNativeMcps\(\[\.\.\.orionMcps\.servers, \.\.\.accountMcps\], input\.projectPath\)/
   );
-  assert.ok(runTurnSource.indexOf('museOrionMcpServers(orionMcps.servers)') < runTurnSource.indexOf('writeMuseMcpConfigRoot(orionMcp)'));
-  assert.match(runTurnSource, /withCodexOrionMcps\(/);
-  assert.match(runTurnSource, /await withoutCodexNativeMcps\(orionMcps\.servers,/);
-  assert.match(runTurnSource, /userServers: model\.providerId === 'codex' \? \[\] : orionMcps\.servers/);
+  assert.doesNotMatch(runTurnSource, /withCodexOrionMcps\(/, 'Codex config never carries the run\'s servers');
+  assert.match(runTurnSource, /withoutCodexNativeMcps\(\[\.\.\.orionMcps\.servers, \.\.\.accountMcps\], options\)/);
+  assert.match(runTurnSource, /model\.providerId === 'codex'\s*\? await codexMcpServers\(\)\s*: \[\.\.\.orionMcps\.servers, \.\.\.accountMcps\]/);
 
   console.log('Orion MCP regression checks passed.');
 } finally {

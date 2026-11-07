@@ -102,9 +102,9 @@ import { extractSessionIdFromJsonEvent, isTerminalJsonEvent, jsonAdapterForProvi
 import { syncOrchestrationInstructionFiles } from './main/orchestration-files.js';
 import { deleteSkill, ensureBundledSkills, importSkills, listSkills, openSkillsFolder, revealSkill, setSkillEnabled } from './main/skills.js';
 import { listMcps, readMcpRuntimeConfig, setMcpEnabled } from './main/mcps.js';
-import { addOrionMcp, cancelOrionMcpSignIn, claudeOrionMcpServers, listOrionMcps, museOrionMcpServers, reconnectOrionMcp, removeOrionMcp, reservedNicknames, resolveOrionMcpsForRun, updateOrionMcp, withCodexOrionMcps } from './main/orion-mcps.js';
+import { addOrionMcp, cancelOrionMcpSignIn, claudeOrionMcpServers, listOrionMcps, reconnectOrionMcp, removeOrionMcp, reservedNicknames, resolveOrionMcpsForRun, updateOrionMcp } from './main/orion-mcps.js';
 import { createAccountConnectors } from './main/account-connectors.js';
-import { assertOpenCodeMcpNamesAvailable, listProviderMcps, shareProviderMcp, withoutClaudeNativeMcps, withoutCodexNativeMcps } from './main/provider-mcps.js';
+import { listProviderMcps, shareProviderMcp, withoutClaudeNativeMcps, withoutCodexNativeMcps } from './main/provider-mcps.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
 import { createBrowserManager } from './main/browser/manager.js';
@@ -4908,17 +4908,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       const aborted = startingAgentRuns.get(runId);
       return aborted?.abortError ? { ok: false, error: aborted.abortError } : { ok: true, runId };
     }
-    if (model.providerId === 'muse') {
-      try {
-        museOrionMcpServers(orionMcps.servers);
-      } catch (error) {
-        return { ok: false, error: error.message };
-      }
-    }
     // Connectors from the Durango account join Durango Code's own servers.
-    // Best effort: they never make a turn fail, and Muse only runs stdio.
+    // Best effort: they never make a turn fail.
     const accountMcps =
-      input.aside || input.codexReview || model.providerId === 'muse'
+      input.aside || input.codexReview
         ? []
         : await accountConnectors.forRun({ taken: orionMcps.servers.map((server) => server.name) });
     if (orionMcps.needsSignIn.length > 0) {
@@ -5052,41 +5045,14 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       useCodexAppServer
         ? {
             ...input,
-            mcpRuntimeConfig: withCodexOrionMcps(
-              await readMcpRuntimeConfig({
-                cwd: input.projectPath,
-                shellCwd: codexShellCwd,
-                configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
-              }),
-              await codexMcpServers(),
-              input.accessMode || 'full-access'
-            ),
+            // The run's own servers load on demand through the bridge below.
+            mcpRuntimeConfig: await readMcpRuntimeConfig({
+              cwd: input.projectPath,
+              shellCwd: codexShellCwd,
+              configArgs: splitCodexConfigContextArgs(input.providerOptions).configArgs,
+            }),
           }
         : input;
-    // Check before allocating a bridge or passing credentials to OpenCode.
-    let bridgeAccountMcps = accountMcps;
-    if (model.providerId === 'opencode') {
-      const assertNames = (servers) =>
-        assertOpenCodeMcpNamesAvailable(servers, {
-          cwd: input.projectPath,
-          providerOptions: input.providerOptions,
-          signal: startupController.signal,
-        });
-      try {
-        await assertNames([...orionMcps.servers, ...accountMcps]).catch(async (error) => {
-          // Account connectors whose names OpenCode already uses are left out.
-          if (accountMcps.length === 0 || startupController.signal.aborted) throw error;
-          bridgeAccountMcps = [];
-          await assertNames(orionMcps.servers);
-        });
-      } catch (error) {
-        if (!startupController.signal.aborted) throw error;
-      }
-      if (startupController.signal.aborted) {
-        const aborted = startingAgentRuns.get(runId);
-        return aborted?.abortError ? { ok: false, error: aborted.abortError } : { ok: true, runId };
-      }
-    }
     // fx chooses its route (subscription first, then the billed provider) and
     // credentials before the process starts: its ACP initialize already
     // needs a usable startup provider.
@@ -5114,7 +5080,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const bridgeProvider = isMcpBridgeProvider(model.providerId);
     const supportsRunPlugin =
       bridgeProvider && (await providerSupportsRunPlugin(model.providerId));
-    if (orionMcps.servers.length > 0 && model.providerId !== 'codex' && !supportsRunPlugin) {
+    if (orionMcps.servers.length > 0 && !supportsRunPlugin) {
       return {
         ok: false,
         error: `This ${model.providerId} installation cannot load Durango Code MCP servers: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Update the provider CLI or switch providers.`,
@@ -5131,8 +5097,13 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             providerId: model.providerId,
             accessMode: input.accessMode || 'full-access',
             browserMode: browserModeFor(model.providerId, input.providerOptions, input.accessMode || 'full-access'),
-            // Codex receives these through its app-server config instead.
-            userServers: model.providerId === 'codex' ? [] : [...orionMcps.servers, ...bridgeAccountMcps],
+            // Not in the provider's config: the bridge connects them when the
+            // agent loads them (load_tools / call_app_tool, mcp-on-demand.js).
+            // Codex skips servers its own config already runs.
+            userServers:
+              model.providerId === 'codex'
+                ? await codexMcpServers()
+                : [...orionMcps.servers, ...accountMcps],
           });
     const openCodeConfig =
       model.providerId === 'opencode'
@@ -5154,7 +5125,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       Boolean(openCodeConfig),
       Boolean(museConfigRoot)
     );
-    if (orionMcps.servers.length > 0 && model.providerId !== 'codex' && !effectiveThreadReaderBridgeReady) {
+    if (orionMcps.servers.length > 0 && !effectiveThreadReaderBridgeReady) {
       orionMcp?.release();
       return {
         ok: false,

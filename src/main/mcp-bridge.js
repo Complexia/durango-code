@@ -13,6 +13,12 @@ import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
 import { VISUAL_TOOL_NAMES, runVisualTool } from './visual-tools.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
+import {
+  CALL_APP_TOOL_NAME,
+  LOAD_TOOLS_TOOL_NAME,
+  createOnDemandMcps,
+  onDemandMcpToolDefinitions,
+} from './mcp-on-demand.js';
 import { agentDeviceAccessAllowed, readDeviceSettings } from './devices/device-settings.js';
 import {
   acpOrionMcpServers,
@@ -153,8 +159,27 @@ export const handleMcpBridgeConnection = (socket) => {
       // set, so the browser_* schemas live only in browser-tools.js.
       if (message.tool === '__tools') {
         reply(true, '', {
-          tools: hasBuiltinBrowser(session.browserMode) ? browserMcpToolDefinitions(session.accessMode) : [],
+          tools: [
+            ...(hasBuiltinBrowser(session.browserMode) ? browserMcpToolDefinitions(session.accessMode) : []),
+            // The run's MCP servers load on demand (mcp-on-demand.js).
+            ...onDemandMcpToolDefinitions(session.onDemandMcps?.names() ?? []),
+          ],
         });
+        continue;
+      }
+      if (message.tool === LOAD_TOOLS_TOOL_NAME || message.tool === CALL_APP_TOOL_NAME) {
+        if (!session.onDemandMcps || session.onDemandMcps.names().length === 0) {
+          reply(false, 'No connected apps are available in this run.');
+          continue;
+        }
+        const pending =
+          message.tool === LOAD_TOOLS_TOOL_NAME
+            ? session.onDemandMcps.load(args)
+            : session.onDemandMcps.call(args, { accessMode: session.accessMode });
+        void pending.then(
+          ({ ok, text, content }) => reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined),
+          (error) => reply(false, `${message.tool} failed: ${error?.message ?? error}`)
+        );
         continue;
       }
       if (BROWSER_TOOL_NAMES.includes(message.tool)) {
@@ -384,12 +409,15 @@ export const registerMcpBridgeForRun = async ({
     // simulators). The tools re-check the setting on every call.
     const devicesEnabled = agentDeviceAccessAllowed(await readDeviceSettings());
     const args = [shimPath, '--socket', socketPath, '--token', token, ...(devicesEnabled ? ['--devices'] : [])];
+    // The run's MCP servers stay out of the provider's config: the bridge
+    // connects them only when the agent loads them (mcp-on-demand.js).
     const { pluginDir, tokenRoot } = await writeMcpBridgePlugin({
       token,
       command,
       args,
-      userServers,
+      userServers: [],
     });
+    const onDemandMcps = createOnDemandMcps(userServers);
     const session = {
       getSender,
       threadId,
@@ -398,6 +426,7 @@ export const registerMcpBridgeForRun = async ({
       providerId,
       accessMode,
       browserMode,
+      onDemandMcps,
     };
     mcpBridgeSessions.set(token, session);
     return {
@@ -408,9 +437,10 @@ export const registerMcpBridgeForRun = async ({
       args,
       pluginDir,
       tokenRoot,
-      // Resolved Orion MCP servers (with secrets) for the provider-specific
-      // intakes below: ACP session params, OpenCode inline config, Muse root.
-      userServers,
+      // Provider-specific MCP intakes (ACP session params, OpenCode inline
+      // config, Muse root) get only the bridge: the run's own servers load
+      // on demand through it.
+      userServers: [],
       // Settled browser mode after provider-specific fallbacks (Codex's
       // extension check runs after registration).
       setBrowserMode: (mode) => {
@@ -418,6 +448,7 @@ export const registerMcpBridgeForRun = async ({
       },
       release: () => {
         mcpBridgeSessions.delete(token);
+        void onDemandMcps.close();
         void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});
       },
     };
