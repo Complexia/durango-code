@@ -81,6 +81,17 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
   // The engine reports available:false when it could not read or persist
   // pairings at all — pairing forms would only produce failures, so hide them.
   const engineReady = remoteState?.available !== false;
+  // Enabling needs a signed-in account and an engine that can run. Each gets
+  // its own reason: an engine that could not start is not a signed-out user.
+  const engineStarting = remoteState === null || remoteState.starting === true;
+  const engineUnavailable = remoteState?.available === false && !engineStarting;
+  const enableBlockedReason = !accountState.authenticated
+    ? 'Sign in to your Durango account first'
+    : engineStarting
+      ? 'Remote control is starting…'
+      : engineUnavailable
+        ? (remoteState?.error ?? 'Remote control is unavailable on this machine')
+        : null;
   const settings = remoteControlSettings;
   const host = remoteState?.host;
   const machines = remoteState?.machines ?? [];
@@ -257,21 +268,21 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
               paired with — and devices you pair with a code generated here can drive this one.
               Everything is end-to-end encrypted and requires your own Durango account on both ends;
               nothing can connect without a pairing code.
-              {!authenticated && !settings.enabled && ' Sign in on the Account tab to enable.'}
+              {!accountState.authenticated && !settings.enabled && ' Sign in on the Account tab to enable.'}
             </div>
           </div>
           <label
             className="provider-toggle"
             title={
-              authenticated || settings.enabled
+              settings.enabled || !enableBlockedReason
                 ? 'Enable remote control between your machines'
-                : 'Sign in to your Durango account first'
+                : enableBlockedReason
             }
           >
             <input
               type="checkbox"
               checked={settings.enabled}
-              disabled={!authenticated && !settings.enabled}
+              disabled={Boolean(enableBlockedReason) && !settings.enabled}
               onChange={(e) =>
                 // One switch: being controllable is what remote control means
                 // here. Pairing codes still gate every actual connection.

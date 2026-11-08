@@ -2,6 +2,7 @@ import { BrowserWindow, app, autoUpdater as nativeAutoUpdater, net } from 'elect
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { DEFAULT_UPDATE_FEED_BASE_URL } from './web-origin.js';
+import { installLinuxPackage, readLinuxPackageType } from './linux-package-install.js';
 
 export let appUpdateState = {
   status: 'idle',
@@ -152,7 +153,10 @@ export const initializeAppUpdaterOnce = async () => {
   }
 
   autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = true;
+  // .pacman and .deb installs need a password, so they install only when the
+  // user clicks "Restart to update" (installDownloadedLinuxUpdate), never as
+  // a surprise polkit prompt while the app is quitting.
+  autoUpdater.autoInstallOnAppQuit = !(await linuxPackageType());
   // Differential download fetches blockmaps and many byte ranges against the
   // feed's signed URL; any of those requests landing after the signature
   // expires 403s the whole update. One plain GET keeps the window small.
@@ -294,6 +298,24 @@ export const initializeAppUpdaterOnce = async () => {
   });
 
   return autoUpdater;
+};
+
+const linuxPackageType = async () =>
+  process.platform === 'linux' && app.isPackaged ? readLinuxPackageType(process.resourcesPath) : null;
+
+/**
+ * Linux .pacman/.deb builds: install the downloaded update with the system
+ * package manager (one polkit prompt). Resolves to null where
+ * electron-updater's own install applies (macOS, Windows, AppImage), else to
+ * installLinuxPackage's result.
+ */
+export const installDownloadedLinuxUpdate = async () => {
+  const type = await linuxPackageType();
+  if (!type) return null;
+  const autoUpdater = await initializeAppUpdater();
+  // The raw path: LinuxUpdater's installerPath getter shell-escapes it.
+  const file = autoUpdater.downloadedUpdateHelper?.file ?? null;
+  return installLinuxPackage({ type, file });
 };
 
 export const initializeAppUpdater = () => {

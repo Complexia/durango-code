@@ -357,6 +357,8 @@ export type RemoteControlState = {
   available: boolean;
   /** Set when pairings cannot be read or persisted at all on this machine. */
   error?: string | null;
+  /** True until the engine has loaded its pairing file at startup. */
+  starting?: boolean;
   machineId?: string;
   machineName?: string;
   authenticated?: boolean;

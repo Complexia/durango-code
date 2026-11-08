@@ -26,9 +26,6 @@ export const providerUpdaterConfigs = [
     // update` reported as already current, forever. See
     // readClaudeLatestVersion.
     readLatestVersion: (commandPath) => readClaudeLatestVersion(commandPath),
-    // `claude update` only prints "use your package manager" for installs a
-    // package manager owns, so run that package manager's upgrade instead.
-    resolveManagedUpdateCommand: (commandPath) => resolveClaudeManagedUpdateCommand(commandPath),
     updateCommands: [['update']],
     verifyAfterUpdate: true,
     authCommands: [['auth', 'login']],
@@ -333,12 +330,15 @@ export const isNativeClaudeInstall = async (commandPath) => {
   }
 };
 
-// mise (Omarchy's default for developer tools) keeps each version under
-// <data>/mise/installs/claude/<version>; `mise activate` puts that directory
-// on PATH, and mise's shims (symlinks to mise itself) dispatch to it.
+// mise (Omarchy's default for developer tools, every agent CLI included)
+// keeps each version under <data>/mise/installs/<tool>/<version>;
+// `mise activate` puts that directory on PATH, and mise's shims (symlinks to
+// mise itself) dispatch to it. A CLI's own updater cannot update such an
+// install: `claude update` only says to use the package manager, and
+// `codex update` exits 0 while the mise copy on PATH stays on the old version.
 const MISE_PATH_PATTERN = /[/\\]mise[/\\](?:installs|shims)[/\\]/i;
 
-export const isMiseClaudeInstall = async (commandPath) => {
+export const isMiseInstall = async (commandPath) => {
   if (!commandPath) return false;
   if (MISE_PATH_PATTERN.test(commandPath)) return true;
   try {
@@ -348,33 +348,75 @@ export const isMiseClaudeInstall = async (commandPath) => {
   }
 };
 
+// The tool in `mise ls --json` output whose install directory holds binPath.
+// Keys are what `mise upgrade` takes: a registry shorthand (`codex`) or a
+// backend id (`npm:@moonshot-ai/kimi-code`, whose command is `kimi`).
+export const miseToolForPath = (tools, binPath) => {
+  if (!tools || typeof tools !== 'object' || !binPath) return null;
+  for (const [tool, versions] of Object.entries(tools)) {
+    for (const entry of Array.isArray(versions) ? versions : []) {
+      const installPath = typeof entry?.install_path === 'string' ? entry.install_path.replace(/[/\\]+$/, '') : '';
+      if (installPath && (binPath === installPath || binPath.startsWith(`${installPath}/`) || binPath.startsWith(`${installPath}\\`))) {
+        return tool;
+      }
+    }
+  }
+  return null;
+};
+
+// One `mise ls` serves every provider of an update check.
+const MISE_TOOLS_CACHE_MS = 10_000;
+let miseToolsCache = null;
+const readMiseTools = () => {
+  if (miseToolsCache && Date.now() - miseToolsCache.at < MISE_TOOLS_CACHE_MS) return miseToolsCache.promise;
+  const promise = runShellCommand('mise ls --installed --json', 20000)
+    .then(({ stdout }) => JSON.parse(stdout))
+    .catch(() => null);
+  miseToolsCache = { at: Date.now(), promise };
+  return promise;
+};
+
+// The mise tool that provides `command`, or null when mise does not own the
+// command on PATH. Falls back to the command's own name, which is the
+// registry shorthand for the agent CLIs (claude, codex, cursor-agent, grok…).
+export const resolveMiseTool = async (commandPath, command) => {
+  if (!(await isMiseInstall(commandPath))) return null;
+  let binPath = commandPath;
+  try {
+    // A shim resolves to mise itself; `mise which` names the real binary.
+    const { stdout } = await runShellCommand(`mise which ${shellQuote(command)}`, 15000);
+    binPath = stdout.trim().split(/\r?\n/).pop()?.trim() || commandPath;
+  } catch {}
+  let resolvedBinPath = binPath;
+  try {
+    resolvedBinPath = await realpath(binPath);
+  } catch {}
+  const tools = await readMiseTools();
+  return miseToolForPath(tools, binPath) ?? miseToolForPath(tools, resolvedBinPath) ?? command;
+};
+
 // mise holds back releases younger than its cooldown (minimum_release_age).
 // An update the user asked for wants the current release, as Omarchy's own
 // `omarchy update` does, and the check must agree with what the upgrade gets.
 const MISE_UPDATE_ENV = 'MISE_MINIMUM_RELEASE_AGE=0';
 
-// The version `mise upgrade claude` installs, which is the one to compare
-// against: npm can be ahead of mise's backend for a while.
-export const readMiseLatestVersion = async (tool) => {
+export const miseUpgradeCommand = (tool) => `${MISE_UPDATE_ENV} mise upgrade ${shellQuote(tool)}`;
+
+// The version `mise upgrade <tool>` installs, which is the one to compare
+// against: npm or a CLI's own channel can be ahead of mise's backend.
+export const readMiseLatestVersion = async (tool, versionPattern) => {
   try {
     const { stdout } = await runShellCommand(
       `${MISE_UPDATE_ENV} mise latest ${shellQuote(tool)}`,
       20000
     );
-    return parseVersion(stdout);
+    return extractVersion(stdout, versionPattern);
   } catch {
     return null;
   }
 };
 
-export const resolveClaudeManagedUpdateCommand = async (commandPath) =>
-  (await isMiseClaudeInstall(commandPath)) ? `${MISE_UPDATE_ENV} mise upgrade claude` : null;
-
 export const readClaudeLatestVersion = async (commandPath) => {
-  if (await isMiseClaudeInstall(commandPath)) {
-    const version = await readMiseLatestVersion('claude');
-    if (version) return version;
-  }
   const channel = await readClaudeUpdateChannel();
   if (await isNativeClaudeInstall(commandPath)) {
     return readRemoteLatestVersion(`${CLAUDE_RELEASES_URL}/${channel}`);
@@ -632,6 +674,20 @@ export const checkProviderUpdate = async (config, enabledProviderIds = null) => 
   );
   const withCurrentVersion = { ...base, currentVersion };
 
+  // A mise-owned CLI updates through mise, so mise says what is latest.
+  const miseTool = await resolveMiseTool(commandPath, config.command);
+  const miseLatestVersion = miseTool ? await readMiseLatestVersion(miseTool, config.versionPattern) : null;
+  if (miseLatestVersion) {
+    const updateAvailable =
+      enabled && currentVersion ? compareVersionStrings(currentVersion, miseLatestVersion) < 0 : false;
+    return {
+      ...withCurrentVersion,
+      latestVersion: miseLatestVersion,
+      updateAvailable,
+      status: updateAvailable ? 'available' : 'current',
+    };
+  }
+
   if (config.checkCommand) {
     try {
       const command = [config.command, ...config.checkCommand].map(shellQuote).join(' ');
@@ -751,7 +807,14 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
     };
   }
 
-  const managedUpdateCommand = (await config.resolveManagedUpdateCommand?.(commandPath)) ?? null;
+  // A config may name its package manager's command itself; otherwise mise
+  // owns the CLI when it is on PATH through mise.
+  const configuredManagedCommand = (await config.resolveManagedUpdateCommand?.(commandPath)) ?? null;
+  const miseTool = configuredManagedCommand ? null : await resolveMiseTool(commandPath, config.command);
+  const managedUpdateCommand = configuredManagedCommand ?? (miseTool ? miseUpgradeCommand(miseTool) : null);
+  // A package manager's upgrade is checked like a self-updater that is known
+  // to exit 0 without updating: the version on PATH has to move.
+  const verifyAfterUpdate = Boolean(config.verifyAfterUpdate || managedUpdateCommand);
   const args = managedUpdateCommand ? [] : await resolveProviderUpdateCommand(config);
   if (!args) {
     return {
@@ -788,7 +851,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
       if (manualOutput) outputParts.push(manualOutput);
     }
 
-    if (config.verifyAfterUpdate && expectedLatestVersion) {
+    if (verifyAfterUpdate && expectedLatestVersion) {
       onPhase?.('verifying');
       let installedVersion = await readInstalledVersion();
       const isStale = (version) =>
@@ -797,7 +860,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
       // A self-updater can exit 0 without installing anything (e.g. grok
       // routing through a broken npm path). Reinstall from the configured
       // source before declaring failure.
-      if (isStale(installedVersion) && config.fallbackInstallCommand) {
+      if (isStale(installedVersion) && config.fallbackInstallCommand && !managedUpdateCommand) {
         onPhase?.('installing');
         try {
           const fallbackResult = await runUpdateCommand(config.fallbackInstallCommand);

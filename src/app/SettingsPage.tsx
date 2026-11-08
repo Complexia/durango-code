@@ -85,6 +85,14 @@ const CODEX_BROWSER_EXTENSION_URL =
 // Settings remains controlled by App because its asynchronous account and
 // update operations are shared with the shell. Keeping that integration in a
 // single view model avoids creating a second set of store subscriptions here.
+// The session's expiry is in the future; formatCheckedTime only does "… ago"
+// and turned every expiry into "until just now".
+const formatSessionExpiry = (iso: string | null | undefined) => {
+  const time = iso ? new Date(iso) : null;
+  if (!time || Number.isNaN(time.getTime())) return '';
+  return ` until ${time.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`;
+};
+
 export type SettingsPageProps = {
   notificationSettings: NotificationSettings;
   setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
@@ -461,7 +469,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     <div className="setting-label-title">Desktop session</div>
                     <div className="setting-label-desc">
                       Authorized by Durango Code web
-                      {accountState.expiresAt ? ` until ${formatCheckedTime(accountState.expiresAt)}` : ''}.
+                      {formatSessionExpiry(accountState.expiresAt)}.
                     </div>
                   </div>
                   <button

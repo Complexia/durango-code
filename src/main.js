@@ -47,7 +47,7 @@ import {
 } from './cloud-sync.js';
 import { getWhatsNew, markWhatsNewSeen } from './main/whats-new.js';
 import { browseDirectories, resolveProjectDirectory } from './main/project-browse.js';
-import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
+import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, installDownloadedLinuxUpdate, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, notifyClaudeSession, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { unwatchUserActions, watchUserAction } from './main/user-actions.js';
@@ -1813,7 +1813,9 @@ const afterRemoteControlInit =
     await remoteControlReady;
     return handler(...args);
   };
-ipcMain.handle('remote:getState', afterRemoteControlInit(() => getRemoteControlState()));
+// State reads never wait: before the engine has started they report
+// `starting`, and the engine broadcasts 'remote:state' once it has.
+ipcMain.handle('remote:getState', () => getRemoteControlState());
 ipcMain.handle('remote:configure', afterRemoteControlInit((_event, value) => configureRemoteControl(value)));
 ipcMain.handle('remote:startPairing', afterRemoteControlInit(() => startRemotePairing()));
 ipcMain.handle('remote:cancelPairing', afterRemoteControlInit(() => cancelRemotePairing()));
@@ -4906,7 +4908,25 @@ const restartForAppUpdate = async () => {
       return { ok: false, error };
     }
 
+    // Linux packages install before anything shuts down: the password prompt
+    // can be dismissed or fail, and then the app keeps running as it was.
+    const linuxInstall = await installDownloadedLinuxUpdate();
+    if (linuxInstall && !linuxInstall.ok) {
+      appUpdateRestartRequested = false;
+      if (linuxInstall.cancelled) {
+        publishAppUpdateState({ status: 'downloaded', progress: null, error: null });
+        return { ok: false, error: 'The update was not installed.' };
+      }
+      publishAppUpdateState({ status: 'error', progress: null, error: linuxInstall.error });
+      return { ok: false, error: linuxInstall.error };
+    }
+
     await settleQuitBarrierForUpdate();
+    if (linuxInstall) {
+      app.relaunch();
+      app.quit();
+      return { ok: true };
+    }
     const autoUpdater = await initializeAppUpdater();
     autoUpdater.quitAndInstall(false, true);
     return { ok: true };

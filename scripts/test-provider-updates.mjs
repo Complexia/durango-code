@@ -5,12 +5,14 @@ import path from 'node:path';
 
 import {
   checkProviderUpdate,
-  isMiseClaudeInstall,
+  isMiseInstall,
   isNativeClaudeInstall,
+  miseToolForPath,
+  miseUpgradeCommand,
   providerUpdaterConfigs,
   readClaudeUpdateChannel,
   readCliVersion,
-  resolveClaudeManagedUpdateCommand,
+  resolveMiseTool,
   updateProviderTool,
 } from '../src/main/provider-updates.js';
 
@@ -64,31 +66,52 @@ try {
     'other claude commands are package-manager installs'
   );
 
-  // Omarchy runs Claude Code from mise (shims, or `mise activate` putting
-  // installs/claude/<version> on PATH), where `claude update` only says to
-  // use the package manager.
+  // Omarchy runs every agent CLI from mise (shims, or `mise activate` putting
+  // installs/<tool>/<version> on PATH), where the CLI's own updater either
+  // says to use the package manager (claude) or leaves the mise copy alone
+  // (codex).
   const miseInstallDir = path.join(claudeFixtureDir, 'mise', 'installs', 'claude', '2.1.309');
   await mkdir(miseInstallDir, { recursive: true });
   await writeFile(path.join(miseInstallDir, 'claude'), '#!/bin/sh\n', 'utf8');
   await symlink(path.join(miseInstallDir, 'claude'), path.join(binDir, 'mise-linked-claude'));
   for (const commandPath of [
     '/home/user/.local/share/mise/shims/claude',
+    '/home/user/.local/share/mise/shims/codex',
     path.join(miseInstallDir, 'claude'),
     path.join(binDir, 'mise-linked-claude'),
   ]) {
-    assert.equal(await isMiseClaudeInstall(commandPath), true, `${commandPath} is a mise install`);
+    assert.equal(await isMiseInstall(commandPath), true, `${commandPath} is a mise install`);
   }
-  assert.equal(await isMiseClaudeInstall(path.join(binDir, 'claude')), false, 'a native install is not mise');
-  assert.match(
-    await resolveClaudeManagedUpdateCommand(path.join(miseInstallDir, 'claude')),
-    /mise upgrade claude$/,
-    'a mise install updates through mise'
-  );
+  assert.equal(await isMiseInstall(path.join(binDir, 'claude')), false, 'a native install is not mise');
   assert.equal(
-    await resolveClaudeManagedUpdateCommand(path.join(binDir, 'claude')),
+    await resolveMiseTool(path.join(binDir, 'claude'), 'claude'),
     null,
     'a native install keeps `claude update`'
   );
+  assert.match(miseUpgradeCommand('codex'), /mise upgrade 'codex'$/, 'a mise install updates through mise');
+
+  // `mise ls --json` names the tool that owns the binary, including backend
+  // ids whose command differs from the tool name.
+  const miseTools = {
+    codex: [{ version: '0.50.0', install_path: '/home/u/.local/share/mise/installs/codex/0.50.0' }],
+    'npm:@moonshot-ai/kimi-code': [
+      { version: '1.2.0', install_path: '/home/u/.local/share/mise/installs/npm-moonshot-ai-kimi-code/1.2.0/' },
+    ],
+  };
+  assert.equal(
+    miseToolForPath(miseTools, '/home/u/.local/share/mise/installs/codex/0.50.0/codex'),
+    'codex'
+  );
+  assert.equal(
+    miseToolForPath(miseTools, '/home/u/.local/share/mise/installs/npm-moonshot-ai-kimi-code/1.2.0/bin/kimi'),
+    'npm:@moonshot-ai/kimi-code'
+  );
+  assert.equal(
+    miseToolForPath(miseTools, '/home/u/.local/share/mise/installs/codex/0.50.01/codex'),
+    null,
+    'a sibling directory with the same prefix is not the install'
+  );
+  assert.equal(miseToolForPath(null, '/x'), null);
 
   process.env.CLAUDE_CONFIG_DIR = path.join(claudeFixtureDir, 'config');
   assert.equal(await readClaudeUpdateChannel(), 'latest', 'the channel defaults to latest');

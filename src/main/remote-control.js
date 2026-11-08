@@ -436,7 +436,18 @@ const clientStatus = (machineId) => {
 
 export const getRemoteControlState = () => {
   if (!stateLoaded || !identity || pairingPersistenceUnavailable()) {
-    return { available: false, error: stateError ?? pairingPersistenceUnavailable() };
+    // `authenticated` and `starting` let the settings panel tell "sign in
+    // first" apart from "still starting" and "cannot run here"; without them
+    // an engine that failed to start read as a signed-out account.
+    return {
+      available: false,
+      starting: !stateLoaded,
+      authenticated: Boolean(currentUserId),
+      error:
+        stateError ??
+        pairingPersistenceUnavailable() ??
+        (stateLoaded ? 'Remote control could not start on this machine.' : null),
+    };
   }
   const connectedDeviceIds = [...hostSessions]
     .filter((session) => session.ready)
@@ -721,8 +732,22 @@ const reconcile = () => {
 export const initRemoteControl = async (dependencies) => {
   deps = dependencies;
   shuttingDown = false;
-  await loadPersistedState();
-  await applyPendingUserIdMigrations();
+  try {
+    await loadPersistedState();
+    await applyPendingUserIdMigrations();
+    // The renderer may have read a `starting` state already; reconcile only
+    // publishes when the engine is usable, so report the loaded state here.
+    publishState();
+  } catch (error) {
+    // Leave a reason on the state instead of an engine that never finished
+    // loading, which the settings panel cannot explain.
+    console.error('remote-control: start error', error);
+    identity = null;
+    stateError = `Remote control could not start: ${error?.message || String(error)}`;
+    stateLoaded = true;
+    publishState();
+    throw error;
+  }
   await reconcile();
 };
 
