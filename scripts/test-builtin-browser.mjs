@@ -979,6 +979,19 @@ try {
       manager.userActions.closeThreadTabs({ threadId: 'thread-d' });
     }
 
+    // A finished thread's tabs close, except ones the person opened or is driving.
+    {
+      await run('browser_open', { url: `${origin}/two`, new_tab: true });
+      const agentTabs = [...manager.tabs.values()].filter((tab) => tab.threadId === 'thread-a' && tab.openedBy === 'agent');
+      assert.ok(agentTabs.length >= 2, 'thread-a has agent tabs to close');
+      const driven = agentTabs[0];
+      manager.userActions.takeControl({ tabId: driven.id });
+      for (const tab of agentTabs.slice(1)) manager.userActions.releaseControl({ tabId: tab.id });
+      manager.userActions.closeThreadTabs({ threadId: 'thread-a', finished: true });
+      const left = [...manager.tabs.values()].filter((tab) => tab.threadId === 'thread-a').map((tab) => tab.id).sort();
+      assert.deepEqual(left, [driven.id, userTab.tabId].sort(), 'only the adopted tab and the driven tab stay');
+    }
+
     // Closing a thread's tabs.
     manager.userActions.closeThreadTabs({ threadId: 'thread-a' });
     assert.equal([...manager.tabs.values()].filter((tab) => tab.threadId === 'thread-a').length, 0);

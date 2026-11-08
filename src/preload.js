@@ -249,7 +249,7 @@ contextBridge.exposeInMainWorld('orion', {
     answerDialog: (input) => ipcRenderer.invoke('browser:answerDialog', input),
     answerDownload: (input) => ipcRenderer.invoke('browser:answerDownload', input),
     setOptions: (input) => ipcRenderer.invoke('browser:setOptions', input),
-    closeThreadTabs: (threadId) => ipcRenderer.invoke('browser:closeThreadTabs', { threadId }),
+    closeThreadTabs: (threadId, options) => ipcRenderer.invoke('browser:closeThreadTabs', { threadId, finished: options?.finished === true }),
     setThreadParents: (parents) => ipcRenderer.invoke('browser:setThreadParents', parents),
     clearData: () => ipcRenderer.invoke('browser:clearData'),
   },

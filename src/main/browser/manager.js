@@ -716,8 +716,16 @@ export const createBrowserManager = ({ getWindow, emit }) => {
         return { ok: false, error: error?.message ?? String(error) };
       }
     },
-    closeThreadTabs: ({ threadId }) => {
-      for (const tab of [...tabs.values()]) if (tab.threadId === threadId && tab.ownerKey !== USER_OWNER) closeTab(tab);
+    // `finished`: the thread stopped working, so the pages its agents left
+    // open (dev servers, games, animations) stop costing CPU and GPU. Tabs the
+    // person opened ("Let agent use") or is driving stay; deleting the thread
+    // (no `finished`) closes those too.
+    closeThreadTabs: ({ threadId, finished = false }) => {
+      for (const tab of [...tabs.values()]) {
+        if (tab.threadId !== threadId || tab.ownerKey === USER_OWNER) continue;
+        if (finished && (tab.openedBy === 'user' || tab.controller === 'user')) continue;
+        closeTab(tab);
+      }
       return { ok: true };
     },
     setThreadParents: (map) => {

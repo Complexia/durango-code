@@ -893,7 +893,7 @@ type OrionCodexBrowserIntegrationStatus = {
     answerDialog: (input: { tabId: string; dialogId?: number; accept: boolean; promptText?: string }) => Promise<OrionBrowserResult>;
     answerDownload: (input: { tabId: string; id: string; accept: boolean }) => Promise<OrionBrowserResult>;
     setOptions: (input: { askBeforeDownload?: boolean }) => Promise<OrionBrowserResult>;
-    closeThreadTabs: (threadId: string) => Promise<OrionBrowserResult>;
+    closeThreadTabs: (threadId: string, options?: { finished?: boolean }) => Promise<OrionBrowserResult>;
     setThreadParents: (parents: Record<string, string>) => Promise<OrionBrowserResult>;
     clearData: () => Promise<OrionBrowserResult>;
   };

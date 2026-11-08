@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Thread } from '../store';
 
 export type BrowserTab = OrionBrowserTab;
@@ -55,6 +55,58 @@ export const useThreadParents = (threads: Thread[]) => {
     void window.orion?.browser?.setThreadParents(JSON.parse(key) as Record<string, string>);
   }, [key]);
   return parents;
+};
+
+// How long a thread must stay finished before its tabs close, so a queued
+// follow-up or a steer (stop, then run again) keeps the pages it is using.
+export const FINISHED_THREAD_TAB_GRACE_MS = 15_000;
+
+/**
+ * Closes a thread's built-in browser tabs once it stops working. Agents rarely
+ * call browser_close, and a page left open (a dev server, a WebGL game) keeps
+ * rendering in the background for as long as the app runs. Tabs the person
+ * opened or is driving stay (see closeThreadTabs in main).
+ */
+export const useCloseTabsOfFinishedThreads = (threads: Thread[]) => {
+  const statusRef = useRef(new Map<string, Thread['status']>());
+  const runningRef = useRef(new Set<string>());
+  const timersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  useEffect(() => {
+    const previous = statusRef.current;
+    const next = new Map<string, Thread['status']>();
+    const running = new Set<string>();
+    for (const thread of threads) {
+      next.set(thread.id, thread.status);
+      if (thread.status === 'running') running.add(thread.id);
+    }
+    runningRef.current = running;
+    const timers = timersRef.current;
+    for (const [threadId, status] of next) {
+      if (status === 'running') {
+        const timer = timers.get(threadId);
+        if (timer) clearTimeout(timer);
+        timers.delete(threadId);
+        continue;
+      }
+      if (previous.get(threadId) !== 'running' || timers.has(threadId)) continue;
+      timers.set(
+        threadId,
+        setTimeout(() => {
+          timers.delete(threadId);
+          if (runningRef.current.has(threadId)) return;
+          void window.orion?.browser?.closeThreadTabs(threadId, { finished: true });
+        }, FINISHED_THREAD_TAB_GRACE_MS)
+      );
+    }
+    statusRef.current = next;
+  }, [threads]);
+  useEffect(() => {
+    const timers = timersRef.current;
+    return () => {
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
 };
 
 /** Tabs the panel shows for a focused thread: its family's tabs and the person's own. */

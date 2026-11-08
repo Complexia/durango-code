@@ -141,7 +141,7 @@ import {
 import { UserActionCards } from './app/UserActions';
 import { ThreadPane } from './app/ThreadPane';
 import { BrowserPanel } from './app/BrowserPanel';
-import { tabsForThread, useBrowserTabs, useThreadParents, type BrowserTab } from './app/useBrowserTabs';
+import { tabsForThread, useBrowserTabs, useCloseTabsOfFinishedThreads, useThreadParents, type BrowserTab } from './app/useBrowserTabs';
 import { DeviceCard } from './app/DeviceCard';
 import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
@@ -2118,6 +2118,7 @@ const App: React.FC = () => {
   }, []);
   const [browserSelectedTabId, setBrowserSelectedTabId] = useState<string | null>(null);
   const browserThreadParents = useThreadParents(threads);
+  useCloseTabsOfFinishedThreads(threads);
   const browserEventContextRef = useRef({ selectedThreadId, parents: browserThreadParents, autoOpen: browserAutoOpen, open: browserPanelOpen });
   browserEventContextRef.current = { selectedThreadId, parents: browserThreadParents, autoOpen: browserAutoOpen, open: browserPanelOpen };
   const browserState = useBrowserTabs((event) => {

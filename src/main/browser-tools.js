@@ -263,6 +263,7 @@ export const builtinBrowserTips = (signedInBrowser = null) =>
     '- If a call says the user is controlling the tab, wait or ask them; do not try to take it back. A tab the user opened needs their "Let agent use" click before you can use it.',
     '- Pass screenshot: true to browser_snapshot only when you need to see layout or visuals.',
     '- When several agents of this thread browse at once (parallel Task subagents), each opens its own tab with new_tab: true and passes that tab id to every call.',
+    '- Close tabs with browser_close once you are done with them. The tabs you opened close on their own shortly after the thread finishes working, so do not leave a page open for the user to look at later: give them its URL instead.',
   ].join('\n');
 
 export const BUILTIN_BROWSER_TIPS = builtinBrowserTips(null);
