@@ -327,9 +327,13 @@ const AgentRunMessage: React.FC<{
   const startedAt = workSince ?? message.startedAt;
   const [stepsOpen, setStepsOpen] = useState(false);
   const hasContent = message.content.trim().length > 0;
-  const activities = message.activities ?? [];
   const showStatusText = !!message.statusText && !isRunning && message.statusText !== 'Finished.';
-  const segments = buildAgentRunSegments(message.content, activities, btwExchanges);
+  // A long run carries hundreds of activities; sorting them into segments is
+  // only redone when the run itself (or its /btw asides) changed.
+  const segments = useMemo(
+    () => buildAgentRunSegments(message.content, message.activities ?? [], btwExchanges),
+    [message.content, message.activities, btwExchanges]
+  );
   // Folded: only what came after the last step (the answer). With no steps
   // there is nothing to fold.
   const lastStepIndex = segments.reduce((last, segment, index) => (segment.kind === 'activities' ? index : last), -1);
@@ -417,6 +421,8 @@ const AgentRunMessage: React.FC<{
   );
 };
 
+const NO_BTW_EXCHANGES: BtwExchange[] = [];
+
 export type ChatMessageProps = {
   message: Message;
   /** An agent run's work start (ISO): the user's message it answers, see workStartedAt. */
@@ -443,7 +449,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   taskBusy,
   onMarkTaskDone,
   onUnlinkTask,
-  btwExchanges = [],
+  btwExchanges = NO_BTW_EXCHANGES,
   renderBtwAside,
   onAuthenticateProvider,
   authenticatingProviderId,
@@ -611,7 +617,25 @@ export const AgentsWelcome: React.FC<{
 };
 
 /** A thread's last transcript position: raw offset plus whether it sat at the end. */
-export type ChatScrollPosition = { top: number; pinned: boolean };
+export type ChatScrollPosition = {
+  top: number;
+  pinned: boolean;
+  /** First message the transcript rendered (see the transcript window below); null = the latest few. */
+  windowStartId?: string | null;
+};
+
+/**
+ * Long threads only mount their latest messages: rendering every agent run's
+ * markdown is what made opening (and re-rendering) a thread with hundreds of
+ * turns slow. Older messages are added a page at a time as the reader nears
+ * the top, keeping what they were looking at in place.
+ */
+const TRANSCRIPT_WINDOW_INITIAL = 20;
+const TRANSCRIPT_WINDOW_STEP = 20;
+/** How close (px, at least a viewport) to the top of the rendered window an earlier page is added. */
+const TRANSCRIPT_LOAD_MARGIN = 800;
+
+const NO_MESSAGES: Message[] = [];
 
 /**
  * Scroll state for one transcript. The split view mounts a transcript per pane,
@@ -698,15 +722,15 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       removeQueuedThreadMessage: state.removeQueuedThreadMessage,
     }))
   );
+  // The thread's transcript. Everything below reads messages from here only.
+  const messages = thread?.messages ?? NO_MESSAGES;
   const latestAgentRun = useMemo(() => {
-    const messages = thread?.messages;
-    if (!messages) return null;
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
       if (message.role === 'agent' && message.kind === 'agent-run') return message;
     }
     return null;
-  }, [thread?.messages]);
+  }, [messages]);
   const floatingPlan = useMemo(() => {
     if (!latestAgentRun) return null;
     const activity = latestAgentRun.activities?.find((entry) => entry.type === 'plan');
@@ -718,12 +742,16 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     };
   }, [latestAgentRun]);
 
-
+  const btwExchanges = thread?.btwExchanges;
+  // Each anchor's list keeps its identity while its exchanges are unchanged,
+  // so a streamed chunk elsewhere doesn't re-render runs that carry an aside.
+  const previousBtwByAnchorRef = useRef(new Map<string, BtwExchange[]>());
   const { btwAsidesByAnchor, leadingBtwAsides, trailingBtwAsides } = useMemo(() => {
     const byAnchor = new Map<string, BtwExchange[]>();
     const leading: BtwExchange[] = [];
     const trailing: BtwExchange[] = [];
-    if (!thread) {
+    if (!btwExchanges?.length) {
+      previousBtwByAnchorRef.current = byAnchor;
       return {
         btwAsidesByAnchor: byAnchor,
         leadingBtwAsides: leading,
@@ -731,50 +759,138 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       };
     }
 
-    const messageIds = new Set(thread.messages.map((message) => message.id));
-    for (const exchange of thread.btwExchanges ?? []) {
+    const messageIds = new Set(messages.map((message) => message.id));
+    for (const exchange of btwExchanges) {
       let anchorId =
         exchange.afterMessageId && messageIds.has(exchange.afterMessageId)
           ? exchange.afterMessageId
           : undefined;
       const exchangeTime = new Date(exchange.createdAt).getTime();
       if (!anchorId && Number.isFinite(exchangeTime)) {
-        anchorId = [...thread.messages]
-          .reverse()
-          .find((message) => {
-            const messageTime = new Date(message.ts).getTime();
-            return Number.isFinite(messageTime) && messageTime <= exchangeTime;
-          })?.id;
+        for (let index = messages.length - 1; index >= 0; index--) {
+          const messageTime = new Date(messages[index].ts).getTime();
+          if (Number.isFinite(messageTime) && messageTime <= exchangeTime) {
+            anchorId = messages[index].id;
+            break;
+          }
+        }
       }
       if (anchorId) {
         const anchored = byAnchor.get(anchorId);
         if (anchored) anchored.push(exchange);
         else byAnchor.set(anchorId, [exchange]);
-      } else if (Number.isFinite(exchangeTime) && thread.messages.length > 0) {
+      } else if (Number.isFinite(exchangeTime) && messages.length > 0) {
         leading.push(exchange);
       } else {
         trailing.push(exchange);
       }
     }
+    const previous = previousBtwByAnchorRef.current;
+    for (const [anchorId, list] of byAnchor) {
+      const before = previous.get(anchorId);
+      if (before && before.length === list.length && before.every((exchange, index) => exchange === list[index])) {
+        byAnchor.set(anchorId, before);
+      }
+    }
+    previousBtwByAnchorRef.current = byAnchor;
 
     return {
       btwAsidesByAnchor: byAnchor,
       leadingBtwAsides: leading,
       trailingBtwAsides: trailing,
     };
-  }, [thread]);
+  }, [btwExchanges, messages]);
+
+  // The transcript window: only messages from windowStartId on are mounted
+  // (null = the latest TRANSCRIPT_WINDOW_INITIAL, sliding as messages arrive).
+  // It is remembered per thread with the scroll offset, so a restored offset
+  // lands on the same content.
+  const [windowState, setWindowState] = useState<{ threadId: string; startId: string | null }>(() => ({
+    threadId,
+    startId: chatScrollPositionsRef.current.get(threadId)?.windowStartId ?? null,
+  }));
+  const windowStartId =
+    windowState.threadId === threadId
+      ? windowState.startId
+      : (chatScrollPositionsRef.current.get(threadId)?.windowStartId ?? null);
+  const windowStart = useMemo(() => {
+    if (windowStartId) {
+      const index = messages.findIndex((message) => message.id === windowStartId);
+      if (index >= 0) return index;
+    }
+    return Math.max(0, messages.length - TRANSCRIPT_WINDOW_INITIAL);
+  }, [messages, windowStartId]);
+  const visibleMessages = useMemo(
+    () => (windowStart === 0 ? messages : messages.slice(windowStart)),
+    [messages, windowStart]
+  );
+  // Marks the top of the window; the element after it is the scroll anchor
+  // when an earlier page is added above.
+  const windowTopRef = useRef<HTMLDivElement | null>(null);
+  const prependAnchorRef = useRef<{ node: Element; top: number } | null>(null);
+  const windowRef = useRef({ threadId, messages, windowStart, windowStartId });
+  windowRef.current = { threadId, messages, windowStart, windowStartId };
+
+  const setWindowStartId = useCallback(
+    (startId: string | null) => {
+      const current = windowRef.current;
+      if (current.windowStartId === startId) return;
+      const saved = chatScrollPositionsRef.current.get(current.threadId);
+      if (saved) chatScrollPositionsRef.current.set(current.threadId, { ...saved, windowStartId: startId });
+      setWindowState({ threadId: current.threadId, startId });
+    },
+    [chatScrollPositionsRef]
+  );
+
+  // The id an earlier page would start at, recording what is on screen now so
+  // the layout effect below can keep it in place once the page is added.
+  const earlierPageStart = useCallback(() => {
+    const { messages: all, windowStart: start } = windowRef.current;
+    const anchor = windowTopRef.current?.nextElementSibling;
+    prependAnchorRef.current = anchor ? { node: anchor, top: anchor.getBoundingClientRect().top } : null;
+    return all[Math.max(0, start - TRANSCRIPT_WINDOW_STEP)].id;
+  }, []);
+
+  const showEarlierMessages = () => {
+    if (windowRef.current.windowStart > 0) setWindowStartId(earlierPageStart());
+  };
 
   const handleChatScroll = useCallback(() => {
     const element = chatScrollRef.current;
     if (!element) return;
+    const wasPinned = chatPinnedRef.current;
     chatPinnedRef.current =
       element.scrollHeight - element.scrollTop - element.clientHeight < 80;
     chatScrollTopRef.current = element.scrollTop;
+
+    const { messages: all, windowStart: start, windowStartId: startId } = windowRef.current;
+    let nextStartId = startId;
+    if (chatPinnedRef.current) {
+      // Back at the latest message: let the window slide (and shrink) again.
+      if (!wasPinned) nextStartId = null;
+    } else if (startId === null && all[start]) {
+      // Reading back: hold the window still while new messages arrive below.
+      nextStartId = all[start].id;
+    }
+    if (start > 0 && element.scrollTop < Math.max(TRANSCRIPT_LOAD_MARGIN, element.clientHeight)) {
+      nextStartId = earlierPageStart();
+    }
+
     chatScrollPositionsRef.current.set(threadId, {
       top: element.scrollTop,
       pinned: chatPinnedRef.current,
+      windowStartId: nextStartId,
     });
-  }, [chatPinnedRef, chatScrollPositionsRef, chatScrollRef, chatScrollTopRef, threadId]);
+    setWindowStartId(nextStartId);
+  }, [
+    chatPinnedRef,
+    chatScrollPositionsRef,
+    chatScrollRef,
+    chatScrollTopRef,
+    earlierPageStart,
+    setWindowStartId,
+    threadId,
+  ]);
 
   // The subagent switcher swaps transcripts inside the *same* scroll container,
   // so the browser has nothing to restore: main came back pinned to whatever
@@ -788,6 +904,10 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     const saved = chatScrollPositionsRef.current.get(threadId);
     chatPinnedRef.current = saved?.pinned ?? true;
     chatScrollTopRef.current = saved?.top ?? 0;
+    prependAnchorRef.current = null;
+    setWindowState((current) =>
+      current.threadId === threadId ? current : { threadId, startId: saved?.windowStartId ?? null }
+    );
 
     const applyPosition = () => {
       const element = chatScrollRef.current;
@@ -805,16 +925,43 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     return () => cancelAnimationFrame(frame);
   }, [chatPinnedRef, chatScrollPositionsRef, chatScrollRef, chatScrollTopRef, threadId]);
 
+  // An earlier page was added above: move the scroll offset by however far
+  // that pushed the content being read, so it stays put. (A pinned transcript
+  // just stays at the bottom.)
+  useLayoutEffect(() => {
+    const anchor = prependAnchorRef.current;
+    if (!anchor) return;
+    prependAnchorRef.current = null;
+    const element = chatScrollRef.current;
+    if (!element) return;
+    if (chatPinnedRef.current) {
+      element.scrollTo({ top: element.scrollHeight, behavior: 'instant' });
+    } else if (anchor.node.isConnected) {
+      const delta = anchor.node.getBoundingClientRect().top - anchor.top;
+      if (Math.abs(delta) >= 1) element.scrollTo({ top: element.scrollTop + delta, behavior: 'instant' });
+    }
+    chatScrollTopRef.current = element.scrollTop;
+    const saved = chatScrollPositionsRef.current.get(threadId);
+    if (saved) chatScrollPositionsRef.current.set(threadId, { ...saved, top: element.scrollTop });
+  }, [chatPinnedRef, chatScrollPositionsRef, chatScrollRef, chatScrollTopRef, threadId, windowStart]);
+
   useEffect(() => {
     if (!chatPinnedRef.current) return;
     chatEndRef.current?.scrollIntoView({ behavior: 'instant', block: 'end' });
+    // Pinned again by a send after reading back: let a window grown by
+    // scrolling up slide (and shrink) with the conversation again.
+    const { messages: all, windowStart: start, windowStartId: startId } = windowRef.current;
+    if (startId !== null && all.length - start > TRANSCRIPT_WINDOW_INITIAL + TRANSCRIPT_WINDOW_STEP) {
+      setWindowStartId(null);
+    }
   }, [
     chatEndRef,
     chatPinnedRef,
     isSending,
-    thread?.messages,
+    messages,
     thread?.queuedMessages,
-    thread?.btwExchanges,
+    btwExchanges,
+    setWindowStartId,
   ]);
 
   const handleMarkTaskDone = useCallback(
@@ -913,7 +1060,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       >
         <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
           <div className="chat-container">
-            {thread.messages.length === 0 && (
+            {messages.length === 0 && (
               <AgentsWelcome
                 projectName={projectName}
                 selectedProjectId={thread.projectId}
@@ -923,39 +1070,50 @@ export const ChatTranscript = React.memo(function ChatTranscript({
               />
             )}
 
-            {leadingBtwAsides.map(renderBtwAside)}
+            {windowStart > 0 ? (
+              <button type="button" className="chat-window-earlier" onClick={showEarlierMessages}>
+                Show {Math.min(windowStart, TRANSCRIPT_WINDOW_STEP)} earlier{' '}
+                {Math.min(windowStart, TRANSCRIPT_WINDOW_STEP) === 1 ? 'message' : 'messages'}
+              </button>
+            ) : (
+              leadingBtwAsides.map(renderBtwAside)
+            )}
+            <div ref={windowTopRef} className="chat-window-top" aria-hidden="true" />
 
-            {thread.messages.map((message) => (
-              <React.Fragment key={message.id}>
-                <ChatMessage
-                  message={message}
-                  workSince={message.kind === 'agent-run' ? workSinceIso(thread.messages, message) : undefined}
-                  runRunning={
-                    message.status === 'running' ||
-                    (message.id === latestAgentRun?.id && thread.status === 'running')
-                  }
-                  liveTasks={thread.linkedTasks}
-                  taskBusy={isSending}
-                  onMarkTaskDone={handleMarkTaskDone}
-                  onUnlinkTask={handleUnlinkTask}
-                  btwExchanges={
-                    message.kind === 'agent-run'
-                      ? btwAsidesByAnchor.get(message.id)
-                      : undefined
-                  }
-                  renderBtwAside={renderBtwAside}
-                  onAuthenticateProvider={onAuthenticateProvider}
-                  authenticatingProviderId={authenticatingProviderId}
-                  onDiscardClaudeBackgroundTasks={handleDiscardClaudeBackgroundTasks}
-                />
-                {message.kind !== 'agent-run' &&
-                  btwAsidesByAnchor.get(message.id)?.map(renderBtwAside)}
-              </React.Fragment>
-            ))}
+            {visibleMessages.map((message) => {
+              const isAgentRun = message.kind === 'agent-run';
+              const btwAsides = btwAsidesByAnchor.get(message.id);
+              // Props a message doesn't use stay undefined, so a change to
+              // them (sending flips taskBusy, a login flips the provider) only
+              // re-renders the messages that show it.
+              const hasTasks = (message.linkedTasks?.length ?? 0) > 0;
+              return (
+                <React.Fragment key={message.id}>
+                  <ChatMessage
+                    message={message}
+                    workSince={isAgentRun ? workSinceIso(messages, message) : undefined}
+                    runRunning={
+                      message.status === 'running' ||
+                      (message.id === latestAgentRun?.id && thread.status === 'running')
+                    }
+                    liveTasks={hasTasks ? thread.linkedTasks : undefined}
+                    taskBusy={hasTasks ? isSending : undefined}
+                    onMarkTaskDone={handleMarkTaskDone}
+                    onUnlinkTask={handleUnlinkTask}
+                    btwExchanges={isAgentRun ? btwAsides : undefined}
+                    renderBtwAside={isAgentRun && btwAsides ? renderBtwAside : undefined}
+                    onAuthenticateProvider={onAuthenticateProvider}
+                    authenticatingProviderId={message.authProviderId ? authenticatingProviderId : undefined}
+                    onDiscardClaudeBackgroundTasks={handleDiscardClaudeBackgroundTasks}
+                  />
+                  {!isAgentRun && btwAsides?.map(renderBtwAside)}
+                </React.Fragment>
+              );
+            })}
 
             {isSending &&
-              thread.messages.at(-1)?.role !== 'agent' &&
-              thread.messages.at(-1)?.kind !== 'claude-background-intervention' && (
+              messages.at(-1)?.role !== 'agent' &&
+              messages.at(-1)?.kind !== 'claude-background-intervention' && (
               <div className="message agent opacity-70">Starting agent...</div>
             )}
 
