@@ -3,7 +3,7 @@ import ReactMarkdown, { defaultUrlTransform, type ExtraProps } from 'react-markd
 import remarkGfm from 'remark-gfm';
 import { MessageCircle, MessageSquare } from 'lucide-react';
 import { toast } from 'sonner';
-import { useOrionStore } from '../store';
+import { type Thread, useOrionStore } from '../store';
 import { imageFileNamePattern, isLocalFilePath, localMediaSrc, videoFileNamePattern } from './attachments';
 import { handleLightboxImageClick } from './imageLightbox';
 import { resolveThreadReference, threadReferencePattern } from './promptContext';
@@ -75,6 +75,17 @@ export const MarkdownMedia: React.FC<{
 
 const THREAD_REFERENCE_SCHEME = 'orion-thread:';
 
+const threadReferenceCache = new WeakMap<Thread[], Map<string, Thread | undefined>>();
+const resolveThreadReferenceCached = (reference: string, threads: Thread[]) => {
+  let resolved = threadReferenceCache.get(threads);
+  if (!resolved) {
+    resolved = new Map();
+    threadReferenceCache.set(threads, resolved);
+  }
+  if (!resolved.has(reference)) resolved.set(reference, resolveThreadReference(reference, threads));
+  return resolved.get(reference);
+};
+
 // A clickable reference to another Orion thread, labelled with its current
 // title. Cmd/Ctrl-click opens it in a split pane, like dragging it in from the
 // sidebar. References to threads this app doesn't have stay inert text.
@@ -82,10 +93,11 @@ export const ThreadReferenceLink: React.FC<{ reference: string; children: React.
   reference,
   children,
 }) => {
-  const threadId = useOrionStore((state) => resolveThreadReference(reference, state.threads)?.id);
-  const title = useOrionStore((state) =>
-    threadId ? state.threads.find((thread) => thread.id === threadId)?.title : undefined
-  );
+  // Resolved once per `threads` array (it changes only when a shell does), not
+  // on every store update: transcripts stream many updates a second.
+  const thread = useOrionStore((state) => resolveThreadReferenceCached(reference, state.threads));
+  const threadId = thread?.id;
+  const title = thread?.title;
   if (!threadId) {
     return <span title="This thread isn't available in Durango Code">{children}</span>;
   }

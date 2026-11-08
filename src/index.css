@@ -3463,6 +3463,30 @@ body {
 /* A /btw aside: a side Q&A answered by a fork of the thread's session. Styled
    as a detached card — dashed edge, no bubble colors — so it reads as margin
    notes next to the conversation rather than part of it. */
+/* Long threads mount only their latest messages; this loads the page before
+   them (scrolling near the top does the same). */
+.chat-window-earlier {
+  align-self: center;
+  padding: 4px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.chat-window-earlier:hover {
+  color: var(--text-secondary);
+  border-color: var(--border-default);
+}
+
+/* Marks where the mounted messages start; takes no room in the column. */
+.chat-window-top {
+  display: contents;
+}
+
 .btw-aside {
   align-self: stretch;
   max-width: 100%;

@@ -46,7 +46,7 @@ export type AgentsSidebarModel = {
   savedViewsSectionOpen: boolean;
   setSavedViewsSectionOpen: React.Dispatch<React.SetStateAction<boolean>>;
   updateThread: (id: string, updates: Partial<Thread>) => void;
-  branchThread: (sourceThreadId: string) => string | null;
+  branchThread: (sourceThreadId: string) => Promise<string | null>;
   renameProject: (id: string, name: string) => void;
   selectProject: (id: string | null) => void;
   threadSearchOpen: boolean;

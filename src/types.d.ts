@@ -904,23 +904,33 @@ type OrionCodexBrowserIntegrationStatus = {
       saveStore: (value: string) => Promise<boolean>;
       /** Blocking quit-time flush — see preload. */
       saveStoreSync?: (value: string) => boolean;
-      /** Startup transcripts the first frame shows, as JSON text. ok:false suppresses thread persistence. */
-      loadThreadsHead?: (input?: { count?: number; ids?: string[] }) => Promise<{ ok: boolean; value?: string }>;
-      /** The remaining transcripts by id, in bounded batches, as JSON text. */
+      /**
+       * Every thread's shell plus the stored threads named by `ids` (the open
+       * panes), as JSON text. ok:false suppresses thread persistence.
+       */
+      loadThreadShells?: (input?: { ids?: string[] }) => Promise<{ ok: boolean; value?: string }>;
+      /** Blocking quit-time read of one stored thread as JSON text (null: not stored). */
+      loadThreadSync?: (id: string) => { ok: boolean; value?: string | null };
+      /** Stored transcripts by id, in bounded batches, as JSON text. */
       loadThreadsBatch?: (input: { ids: string[]; maxBytes?: number }) => Promise<{ ok: boolean; value?: string }>;
-      saveThreads: (value: {
-        version: 2;
-        upserts: import('./store').Thread[];
-        deletes: string[];
-        order: string[];
-      }) => Promise<boolean>;
+      /** Transcript match scores per query token, by thread id (threads that matched any token). */
+      /**
+       * Scores per thread, aligned with `tokens` (the request's tokens main
+       * scored; it skips some, e.g. over-long ones). `superseded`: a newer
+       * search request replaced this one before it finished.
+       */
+      searchThreads?: (input: {
+        tokens: string[];
+      }) => Promise<{ ok: boolean; tokens?: string[]; scores?: Record<string, number[]>; superseded?: boolean }>;
+      /** Search result excerpts read from the stored transcripts, by thread id. */
+      threadSearchExcerpts?: (input: {
+        items: Array<{ id: string; tokens: string[] }>;
+      }) => Promise<{ ok: boolean; excerpts?: Record<string, string | null> }>;
+      /** Loads the transcript search texts ahead of a search. */
+      warmThreadSearch?: () => Promise<boolean>;
+      saveThreads: (value: import('./store').ThreadsPatch) => Promise<boolean>;
       /** Blocking quit-time flush — see preload. */
-      saveThreadsSync?: (value: {
-        version: 2;
-        upserts: import('./store').Thread[];
-        deletes: string[];
-        order: string[];
-      }) => boolean;
+      saveThreadsSync?: (value: import('./store').ThreadsPatch) => boolean;
       clearStore: () => Promise<boolean>;
       /** Lists Claude Code / Codex sessions the user ran outside Orion. */
       scanImportableSessions?: (input: {
@@ -1782,7 +1792,7 @@ type OrionCodexBrowserIntegrationStatus = {
       remoteFetchThread?: (input: {
         machineId: string;
         threadId: string;
-      }) => Promise<{ ok: boolean; thread?: import('./store').Thread; error?: string }>;
+      }) => Promise<{ ok: boolean; thread?: import('./store').ThreadRecord; error?: string }>;
       remoteRunTurn?: (input: {
         machineId: string;
         threadId?: string;

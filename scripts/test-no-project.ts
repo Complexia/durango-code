@@ -35,7 +35,7 @@ const writes: string[] = [];
 let directoryRequests = 0;
 const bridge = {
   loadStore: async () => savedValue,
-  loadThreadsHead: async () => {
+  loadThreadShells: async () => {
     headRequested.resolve();
     return transcriptHead.promise;
   },
@@ -90,7 +90,7 @@ const hydrated = new Promise<void>((resolve) => {
     resolve();
   });
 });
-transcriptHead.resolve({ ok: true, value: JSON.stringify({ version: 2, present: true, order: [], threads: [] }) });
+transcriptHead.resolve({ ok: true, value: JSON.stringify({ version: 2, present: true, shells: [], threads: [] }) });
 await hydrated;
 await Promise.resolve();
 assert.equal(directoryRequests, 1, 'The disposed effect must not initialize after hydration');

@@ -3,8 +3,11 @@ import assert from 'node:assert/strict';
 // Updating to the release where sidebar v2 is the default: a store from when it
 // was opt-in (off, never settled) turns it on and, once every stored thread has
 // loaded, settles them all except pinned ones, saved like a user's settle.
-// `--failed-backfill` checks that a partial load settles nothing. All storage
-// is in memory.
+// Only the open thread's transcript loads: the settle is a shell change, saved
+// without the others' transcripts. `--failed-backfill` checks that a failed
+// thread load settles nothing. All storage is in memory.
+import { summarizeThreadMessages } from '../src/thread-shell.js';
+
 const failedBackfill = process.argv.includes('--failed-backfill');
 
 const project = { id: 'project', name: 'Project', path: '/tmp/project' };
@@ -24,10 +27,15 @@ const stored = [
   thread('older'),
   thread('oldest'),
 ];
-const headIds = ['head', 'pinned'];
+const headIds = ['head'];
+const shellOf = ({ messages, ...fields }: ReturnType<typeof thread>) => ({
+  ...fields,
+  summary: summarizeThreadMessages(messages as never),
+});
 
 const storeSaves: string[] = [];
-const threadSaves: Array<{ upserts: Array<{ id: string; settledAt?: string }> }> = [];
+type SavedThread = { id: string; settledAt?: string; messages?: unknown[] };
+const threadSaves: Array<{ upserts: SavedThread[]; shells: SavedThread[] }> = [];
 const bridge = {
   loadStore: async () =>
     JSON.stringify({
@@ -42,17 +50,19 @@ const bridge = {
     storeSaves.push(value);
     return true;
   },
-  loadThreadsHead: async () => ({
-    ok: true,
-    value: JSON.stringify({
-      version: 2,
-      present: true,
-      order: stored.map((entry) => entry.id),
-      threads: stored.filter((entry) => headIds.includes(entry.id)),
-    }),
-  }),
+  loadThreadShells: async () =>
+    failedBackfill
+      ? { ok: false }
+      : {
+          ok: true,
+          value: JSON.stringify({
+            version: 2,
+            present: true,
+            shells: stored.map(shellOf),
+            threads: stored.filter((entry) => headIds.includes(entry.id)),
+          }),
+        },
   loadThreadsBatch: async (input: { ids: string[] }) => {
-    if (failedBackfill) return { ok: false };
     return {
       ok: true,
       value: JSON.stringify({
@@ -85,8 +95,8 @@ assert.equal(state.sidebarV2Settings.enabled, true, 'the update turns sidebar v2
 assert.equal(state.sidebarV2Settings.version, 2);
 
 if (failedBackfill) {
-  assert.equal(state.sidebarV2Settings.settledExistingAt, undefined, 'a partial load waits for a full one');
-  assert.equal(settledAt('head'), undefined);
+  assert.equal(state.sidebarV2Settings.settledExistingAt, undefined, 'a failed load waits for a full one');
+  assert.equal(state.threads.length, 0);
   console.log('Sidebar v2 update checks passed (failed backfill).');
   process.exit(0);
 }
@@ -98,9 +108,16 @@ assert.equal(settledAt('pinned'), undefined, 'a pinned thread stays');
 // Both the settle and the switch are saved.
 assert.ok(await flushOrionThreadsSave());
 const savedSettled = new Set(
-  threadSaves.flatMap((patch) => patch.upserts.filter((entry) => entry.settledAt).map((entry) => entry.id))
+  threadSaves.flatMap((patch) =>
+    [...patch.upserts, ...patch.shells].filter((entry) => entry.settledAt).map((entry) => entry.id)
+  )
 );
 assert.deepEqual([...savedSettled].sort(), ['head', 'older', 'oldest']);
+assert.ok(
+  threadSaves.every((patch) => patch.upserts.length === 0),
+  'a settle changes shells only: no transcript is sent, none is loaded for it'
+);
+assert.deepEqual(Object.keys(useOrionStore.getState().transcripts), ['head'], 'only the open thread loaded');
 await flushOrionStoreSave();
 const savedSidebar = JSON.parse(storeSaves.at(-1)!).state.sidebarV2Settings;
 assert.equal(savedSidebar.enabled, true);

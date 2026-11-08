@@ -551,33 +551,80 @@ const syncSnapshot = async (token, storeState, threads, { ownerId, generation, s
   totals.projects = projectPayloads.length;
 };
 
-const syncThreads = async (token, threadIndex, { generation, signal }) => {
-  // The local manifest already carries the content hash written alongside
-  // each transcript. Load and serialize only threads that differ from the
-  // server instead of rebuilding every historical transcript every minute.
-  const changedIds = threadIndex.entries
-    .filter((entry) => {
-      if (typeof entry?.id !== 'string') return false;
-      const known = knownThreadStates.get(entry.id);
-      return !known || known.transcriptHash !== entry.hash || known.usageChecked !== true;
-    })
-    .map((entry) => entry.id);
-  totals.threads = threadIndex.entries.length;
-  if (changedIds.length === 0) return;
-  const threads = await readChangedThreads(threadIndex, changedIds);
-  const entries = [];
-  for (const thread of threads) {
-    ensureCurrentSync(generation, signal);
-    if (typeof thread?.id !== 'string') continue;
-    const serialized = JSON.stringify(thread);
-    const hash = crypto.createHash('sha256').update(serialized).digest('hex');
-    entries.push({ thread, serialized, hash });
-  }
-  if (entries.length === 0) return;
+// The version a thread is synced under (thread-storage.js syncVersionOf):
+// the hash it was uploaded under before the storage upgrade while it is still
+// at its migrated version, its own version hash after.
+const syncVersionOf = (entry) => entry?.syncHash ?? entry?.hash;
 
-  for (let index = 0; index < entries.length; index += THREAD_SYNC_BATCH) {
+// Changed threads are read, serialized and uploaded a batch at a time — up
+// to THREAD_SYNC_BATCH threads or THREAD_SYNC_BATCH_BYTES of transcript — so
+// even a pass where every thread changed holds one batch, never all of them.
+const THREAD_SYNC_BATCH_BYTES = 32 * 1024 * 1024;
+const syncBatches = (entries) => {
+  const batches = [];
+  let batch = [];
+  let bytes = 0;
+  for (const entry of entries) {
+    const size = Number(entry.transcriptBytes) || 0;
+    if (batch.length > 0 && (batch.length >= THREAD_SYNC_BATCH || bytes + size > THREAD_SYNC_BATCH_BYTES)) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(entry);
+    bytes += size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+};
+
+// Each thread read with the sync version of exactly the stored version read
+// (so a save between the index and the read is uploaded under its own
+// version). Threads that can't be read come back with an error.
+const readThreadsToSync = async (threadIndex, ids) => {
+  if (deps.readThreadsForSync) return deps.readThreadsForSync(ids);
+  const versionById = new Map(threadIndex.entries.map((entry) => [entry?.id, syncVersionOf(entry)]));
+  return (await readChangedThreads(threadIndex, ids)).map((thread) => ({
+    thread,
+    version:
+      versionById.get(thread?.id) ?? crypto.createHash('sha256').update(JSON.stringify(thread)).digest('hex'),
+  }));
+};
+
+// One unreadable thread must not stop the others: it is skipped (and
+// reported once per stored version) and the pass syncs the rest.
+const reportedUnreadable = new Set();
+
+const syncThreads = async (token, threadIndex, { generation, signal }) => {
+  // Threads whose version the server already has are never read or
+  // serialized: only changed threads cost anything per pass.
+  const changed = threadIndex.entries.filter((entry) => {
+    if (typeof entry?.id !== 'string') return false;
+    const known = knownThreadStates.get(entry.id);
+    return !known || known.transcriptHash !== syncVersionOf(entry) || known.usageChecked !== true;
+  });
+  totals.threads = threadIndex.entries.length;
+  for (const group of syncBatches(changed)) {
     ensureCurrentSync(generation, signal);
-    const batch = entries.slice(index, index + THREAD_SYNC_BATCH);
+    const read = await readThreadsToSync(
+      threadIndex,
+      group.map((entry) => entry.id)
+    );
+    const batch = [];
+    for (const result of read) {
+      ensureCurrentSync(generation, signal);
+      if (result?.error || typeof result?.thread?.id !== 'string') {
+        const key = `${result?.id ?? result?.thread?.id}:${result?.version}`;
+        if (!reportedUnreadable.has(key)) {
+          reportedUnreadable.add(key);
+          console.warn(`Workspace sync skipped thread ${result?.id ?? '?'}: ${result?.error ?? 'unreadable'}`);
+        }
+        continue;
+      }
+      const serialized = JSON.stringify(result.thread);
+      batch.push({ thread: result.thread, serialized, hash: result.version });
+    }
+    if (batch.length === 0) continue;
     const payloads = [];
     // Historical rollouts can be large. Stream them one at a time so a
     // zero-usage backfill cannot open an entire 50-thread batch concurrently.

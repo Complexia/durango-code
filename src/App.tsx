@@ -1,4 +1,12 @@
-import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+  useMemo,
+  useRef,
+  useSyncExternalStore,
+} from 'react';
 import { createPortal } from 'react-dom';
 import { CodexQuestions, asyncAnswerText, type CodexQuestionRequest } from './app/CodexQuestions';
 import {
@@ -18,31 +26,28 @@ import {
   Pause,
   Target,
   Shield,
-  Square,
   Terminal,
   Bot,
-  Sparkles,
-  ArrowUp,
   Paperclip,
   RefreshCw,
   AppWindow,
   SquareArrowOutUpRight,
-  ListPlus,
-  Zap,
   SquareKanban,
   CircleCheck,
   Menu,
   SlidersHorizontal,
-  SquareSlash,
-  Eraser,
   Plug,
-  MessageCircle,
   Globe,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   useOrionStore,
+  ensureThreadTranscript,
+  ensureThreadTranscripts,
+  findThread,
+  flushIntoStoreBeforeUnload,
   flushOrionThreadsSave,
+  holdThreadTranscript,
   defaultProviderSettings,
   defaultOrchestrationSettings,
   defaultNotificationSettings,
@@ -60,7 +65,6 @@ import {
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
-  type ComposerDraft,
   type FileAttachment,
   type LinkedBoardTask,
   type Message,
@@ -70,6 +74,7 @@ import {
   type SidebarV2Settings,
   type Thread,
   type ThreadGoal,
+  type ThreadTranscript,
   type TurnTokenStats,
 } from './store';
 import type {
@@ -142,7 +147,13 @@ import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
 import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
-import { ComposerPopover } from './app/ComposerPopover';
+import {
+  Composer,
+  compareRecentThreadOrder,
+  useLatestCallback,
+  type ComposerReviewRequest,
+} from './app/Composer';
+import { createComposerDraftController } from './app/composerDraft';
 import { ModelPickerPopover } from './app/ModelPickerPopover';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import {
@@ -157,14 +168,7 @@ import {
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
 import { dispatchProjectsPayload, durangoDispatchOutcome } from './app/durangoDispatch';
-import {
-  AttachmentThumb,
-  attachmentKindLabel,
-  buildPromptWithAttachments,
-  formatAttachmentSize,
-  saveFilesAsAttachments,
-} from './app/attachments';
-import { SnapShotAttachmentBadge, openSnapShotOutline } from './app/SnapShotSettings';
+import { buildPromptWithAttachments, saveFilesAsAttachments } from './app/attachments';
 import {
   AgentFamilySwitcher,
   type ChatScrollPosition,
@@ -190,51 +194,23 @@ import {
   linkedTaskFromBoardTask,
   linkedTaskAttachments,
   linkedTaskStatusLabel,
-  modelMentionToken,
   orchestrationRoleMeta,
   parseModelMentions,
   parseThreadMentions,
-  threadMentionToken,
 } from './app/promptContext';
 import { durangoWorkspaceName } from './app/durangoWorkspace';
-import {
-  getThreadSearchEntry,
-  parseSearchQuery,
-  scoreThreadSearchEntry,
-} from './app/threadSearch';
-import {
-  allowsThreadMentionsInComposer,
-  getChatMentionReplaceEnd,
-  hasThreadReaderSupport,
-  isThreadReferenceCandidate,
-} from './app/chatMentions';
-import {
-  buildChatMentionsContext,
-  chatMentionToken,
-  formatChatUpdatedAt,
-  knownDurangoChats,
-  parseChatMentions,
-  rememberDurangoChats,
-  type DurangoChatRef,
-} from './app/durangoChats';
+import { hasThreadReaderSupport } from './app/chatMentions';
+import { buildChatMentionsContext, knownDurangoChats, parseChatMentions } from './app/durangoChats';
 import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
 import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
 import { RestartToUpdateDialog, WhatsNewNotice } from './app/AppUpdateUi';
 import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
-import {
-  addPromptContext,
-  buildSlashCommandCandidates,
-  completedSlashCommand,
-  filterSlashCommands,
-  getSlashToken,
-  parseCodexReviewCommand,
-  type SlashCommandCandidate,
-} from './app/slashCommands';
+import { addPromptContext, parseCodexReviewCommand } from './app/slashCommands';
 import type { SlashCommandInfo } from './types';
 import { withThreadStartReservation } from './app/turnStart';
 import { buildMcpMentionsContext, mergeMcpAttachments, parseMcpMentions } from './app/orionMcps';
 import { ORION_MCPS_CHANGED_EVENT } from './app/McpsSettings';
-import { formatShortTime, getThreadActivityTime } from './app/time';
+import { getThreadActivityTime } from './app/time';
 import {
   deriveTitle,
   getGoalTitleSeed,
@@ -271,18 +247,45 @@ const normalizeRepositoryPath = (value: string) => value.replace(/\\/g, '/').rep
 // control is off (a fresh [] every render would defeat React.memo).
 const EMPTY_REMOTE_MACHINES: RemoteMachineEntry[] = [];
 
+// A thread's loaded transcript messages (undefined while it isn't loaded;
+// ensureThreadTranscript loads it).
+const loadedMessages = (threadId: string): Message[] | undefined =>
+  useOrionStore.getState().transcripts[threadId]?.messages;
+
+// How long a thread's queue waits after a queued message couldn't start.
+const QUEUE_RETRY_DELAY_MS = 30_000;
+
+const TRANSCRIPT_UNAVAILABLE_ERROR =
+  "This thread's transcript could not be read from disk, so nothing was sent. Try again in a moment.";
+
+// A thread's transcript messages, loading them first when needed. Null when
+// the thread is gone or its stored transcript can't be read: callers must
+// not build context (or start work) from a transcript they don't have.
+const loadThreadMessages = async (threadId: string): Promise<Message[] | null> => {
+  try {
+    return (await ensureThreadTranscript(threadId))?.messages ?? null;
+  } catch (error) {
+    console.warn(`Could not load the transcript of thread ${threadId}`, error);
+    return null;
+  }
+};
+
 const dispatchedModelIdForProvider = (
   thread: Thread,
   providerId: string,
   preferredMessageId?: string
 ) => {
+  const messages = loadedMessages(thread.id) ?? [];
   const matchesProvider = (message: Message) =>
     message.kind === 'agent-run' && message.modelId?.split(':', 1)[0] === providerId;
   const preferred = preferredMessageId
-    ? thread.messages.find((message) => message.id === preferredMessageId)
+    ? messages.find((message) => message.id === preferredMessageId)
     : undefined;
   if (preferred && matchesProvider(preferred)) return preferred.modelId;
-  return [...thread.messages].reverse().find(matchesProvider)?.modelId;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (matchesProvider(messages[index])) return messages[index].modelId;
+  }
+  return undefined;
 };
 
 const qualifyProviderModelId = (providerId: string, modelId?: string) => {
@@ -498,9 +501,9 @@ const releaseMissingDurangoWorkspaces = async (paths?: string[]) => {
  */
 const syncAgentWorkspace = async (threadId: string, messageId: string, turnOver: boolean) => {
   const state = useOrionStore.getState();
-  const thread = state.threads.find((candidate) => candidate.id === threadId);
+  const thread = findThread(state.threads, threadId);
   if (!thread) return;
-  const message = thread.messages.find((candidate) => candidate.id === messageId);
+  const message = state.transcripts[threadId]?.messages.find((candidate) => candidate.id === messageId);
   const last = lastWorkspaceCommand(message?.activities ?? [], turnOver);
   const current = thread.durangoWorkspace;
   if (
@@ -551,7 +554,7 @@ const threadShellSignature = (thread: Thread): string => {
   const cached = threadShellSignatureCache.get(thread);
   if (cached !== undefined) return cached;
 
-  const lastMessage = thread.messages.at(-1);
+  const lastMessage = thread.summary.lastMessage;
   const queuedIds = thread.queuedMessages?.map((message) => message.id).join(',') ?? '';
   const signature = [
     thread.id,
@@ -584,7 +587,9 @@ const threadShellSignature = (thread: Thread): string => {
     thread.branchedFromThreadId,
     thread.spawnId,
     thread.terminalActivityAt,
-    thread.messages.length,
+    thread.summary.messageCount,
+    thread.summary.workingSince,
+    thread.summary.workedMs,
     lastMessage?.id,
     lastMessage?.ts,
     lastMessage?.status,
@@ -607,6 +612,19 @@ const threadShellSignature = (thread: Thread): string => {
   ].join('\u0000');
   threadShellSignatureCache.set(thread, signature);
   return signature;
+};
+
+// The signatures of every shell, recomputed only when `threads` changes:
+// zustand runs this selector on every store update, including each streamed
+// chunk, which no longer touches `threads`.
+let signaturesThreads: Thread[] | null = null;
+let signatures: string[] = [];
+const selectThreadShellSignatures = (state: { threads: Thread[] }) => {
+  if (state.threads !== signaturesThreads) {
+    signaturesThreads = state.threads;
+    signatures = state.threads.map(threadShellSignature);
+  }
+  return signatures;
 };
 
 const formatCheckedTime = (iso: string): string => {
@@ -660,36 +678,6 @@ const renderThreadStatusDot = (thread: Thread) => {
   );
 };
 
-// One row of the composer's @-mention dropdown. The root level offers the
-// mention kinds; picking one (or just typing) narrows to models or threads.
-type ChatMentionMode = 'model' | 'thread' | 'mcp' | 'chat';
-type ChatMentionCandidate =
-  | { kind: 'category'; category: ChatMentionMode; label: string; hint: string }
-  | { kind: 'model'; model: AgentModel }
-  | { kind: 'thread'; thread: Thread; projectName: string }
-  | { kind: 'mcp'; server: OrionMcpEntry }
-  | { kind: 'chat'; chat: DurangoChatRef }
-  // Non-selectable row for the Durango chat list: loading, empty, or why it
-  // is unavailable. `action` makes Enter/click do something useful.
-  | { kind: 'chatStatus'; message: string; action?: 'sign-in' };
-
-const chatMentionCategories: Array<Extract<ChatMentionCandidate, { kind: 'category' }>> = [
-  { kind: 'category', category: 'model', label: 'Model', hint: 'delegate to a model' },
-  { kind: 'category', category: 'thread', label: 'Thread', hint: 'reference another thread' },
-  { kind: 'category', category: 'chat', label: 'Durango chats', hint: 'reference a Durango Chat conversation' },
-  { kind: 'category', category: 'mcp', label: 'MCP', hint: 'use a connected MCP server' },
-];
-
-// Results of the @chat dropdown's Durango search (main → GET /api/v1/chats).
-type DurangoChatSearchState = {
-  query: string;
-  status: 'loading' | 'ready' | 'error';
-  chats: DurangoChatRef[];
-  code?: string;
-  error?: string;
-};
-const DURANGO_CHAT_SEARCH_DEBOUNCE_MS = 250;
-
 // "[Durango memory]" block for a fresh agent session when the user opted in
 // (Settings → Durango). Main caches the recall for 10 minutes; a slow or
 // unreachable Durango never holds a turn back for more than a few seconds.
@@ -707,16 +695,6 @@ const fetchDurangoProfileMemoryBlock = async (): Promise<string> => {
   }
 };
 
-// The thread list inside the @-mention dropdown loads this many rows at a time;
-// scrolling (or arrowing) to the bottom appends the next page.
-const CHAT_MENTION_THREAD_PAGE = 20;
-
-// The sidebar's "Recent agents" ordering: running agents are active "now", so
-// they always rank above finished ones. Among running agents, keep start order
-// so the list doesn't reshuffle as they stream; finished agents sort by their
-// last activity (i.e. when they finished) — or by when they were unpinned, so
-// a just-unpinned thread surfaces at the top instead of sinking back to its
-// old chronological spot.
 // Caption for a turn that ended while the harness still owns live background
 // tasks (subagents, workflows, backgrounded shell commands). Task descriptions
 // come from the driver's done event; naming them lets the user tell a genuine
@@ -751,28 +729,22 @@ const settleWaitingOnUserCaptions = (threadId: string) => {
   while (thread && !seen.has(thread.id)) {
     seen.add(thread.id);
     if (pendingUserActions(state.threads, thread.id).length > 0) return;
-    const lastRun = [...thread.messages].reverse().find((message) => message.role === 'agent');
-    if (lastRun?.status === 'done' && lastRun.statusText?.startsWith(WAITING_ON_USER_PREFIX)) {
-      state.updateThreadMessage(thread.id, lastRun.id, { statusText: 'Finished.' });
+    // Only a thread whose last turn finished can carry the caption.
+    if (thread.summary.lastAgentRun?.status === 'done') {
+      state.updateThreadTranscript(thread.id, (transcript) => {
+        const lastRun = [...transcript.messages].reverse().find((message) => message.role === 'agent');
+        if (lastRun?.status !== 'done' || !lastRun.statusText?.startsWith(WAITING_ON_USER_PREFIX)) return transcript;
+        return {
+          ...transcript,
+          messages: transcript.messages.map((message) =>
+            message.id === lastRun.id ? { ...message, statusText: 'Finished.' } : message
+          ),
+        };
+      });
     }
     const parentId = thread.parentThreadId;
     thread = parentId ? state.threads.find((candidate) => candidate.id === parentId) : undefined;
   }
-};
-
-const compareRecentThreadOrder = (a: Thread, b: Thread) => {
-  const aRunning = a.status === 'running';
-  const bRunning = b.status === 'running';
-  if (aRunning !== bRunning) return aRunning ? -1 : 1;
-  if (aRunning) {
-    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-  }
-  const recentRank = (t: Thread) =>
-    Math.max(
-      getThreadActivityTime(t).getTime(),
-      t.unpinnedAt ? new Date(t.unpinnedAt).getTime() : Number.NEGATIVE_INFINITY
-    );
-  return recentRank(b) - recentRank(a);
 };
 
 const App: React.FC = () => {
@@ -907,14 +879,25 @@ const App: React.FC = () => {
       removeBtwExchange: state.removeBtwExchange,
     }))
   );
-  const threadShellSignatures = useOrionStore(useShallow((state) => state.threads.map(threadShellSignature)));
+  const threadShellSignatures = useOrionStore(useShallow(selectThreadShellSignatures));
+  // Branching loads the transcripts it copies; one that can't be read fails
+  // the branch, and the user is told rather than given a partial copy.
+  const branchThreadWithFeedback = useCallback(
+    async (sourceThreadId: string) => {
+      try {
+        return await branchThread(sourceThreadId);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : 'The thread could not be branched.');
+        return null;
+      }
+    },
+    [branchThread]
+  );
   const threads = useMemo(() => useOrionStore.getState().threads, [threadShellSignatures]);
   // Bumped when a turn completes without the thread leaving 'running' (a
   // Claude turn still waiting on background agents) — invisible to the
   // runningAgentCount-based refresh below, but its files are on disk.
   const [treeTurnRefreshTick, setTreeTurnRefreshTick] = useState(0);
-  const [chatInput, setChatInput] = useState('');
-  const [chatAttachments, setChatAttachments] = useState<FileAttachment[]>([]);
   const [draggingFiles, setDraggingFiles] = useState(false);
   // One agent run may be active per thread; runs in other threads are
   // independent, so starting/stopping one never blocks the rest.
@@ -948,39 +931,15 @@ const App: React.FC = () => {
   const [utilityModelPickerOpen, setUtilityModelPickerOpen] = useState(false);
   const [utilityModelSearch, setUtilityModelSearch] = useState('');
   const [utilityModelTab, setUtilityModelTab] = useState<AgentProviderId>('codex');
-  // Active @-mention token in the composer: index of the '@' and the query
-  // typed after it (null when the caret isn't inside a mention token). `mode`
-  // is set once the user picks a kind from the root dropdown level; while
-  // unset, typing filters models directly (the pre-thread-mentions behavior).
-  const [chatMention, setChatMention] = useState<{
-    start: number;
-    query: string;
-    mode?: ChatMentionMode;
-  } | null>(null);
-  const [chatMentionIndex, setChatMentionIndex] = useState(0);
-  // How many thread rows the @-mention dropdown currently shows; grows as the
-  // user scrolls and resets whenever the thread query changes.
-  const [chatMentionThreadLimit, setChatMentionThreadLimit] = useState(CHAT_MENTION_THREAD_PAGE);
-  const [durangoChatSearch, setDurangoChatSearch] = useState<DurangoChatSearchState | null>(null);
   const [threadReaderSupport, setThreadReaderSupport] = useState<{
     providerId: AgentProviderId;
     supported: boolean;
   } | null>(null);
   // Slash-command menu (Claude Code style): the real command list reported by
-  // each project's Claude session, the highlighted row, and the exact draft
-  // dismissed with Escape (any edit reopens the menu).
+  // each project's Claude session (the menu itself lives in the Composer).
   const [slashCommandsByProject, setSlashCommandsByProject] = useState<
     Record<string, SlashCommandInfo[]>
   >({});
-  const [slashCommandIndex, setSlashCommandIndex] = useState(0);
-  const [slashDismissedDraft, setSlashDismissedDraft] = useState<string | null>(null);
-  // Start offset of a token dismissed with Escape, so it stays closed until
-  // the user begins a new mention.
-  const chatMentionDismissRef = useRef<number | null>(null);
-  const chatMentionRef = useRef<typeof chatMention>(null);
-  useEffect(() => {
-    chatMentionRef.current = chatMention;
-  }, [chatMention]);
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [accessModeOpen, setAccessModeOpen] = useState(false);
@@ -1115,6 +1074,8 @@ const App: React.FC = () => {
   // subagent-activity events): `${parentThreadId}:${providerId}:${subagentId}`
   // → the child thread + agent-run message their transcript streams into.
   const nativeSubagentTargets = useRef(new Map<string, { threadId: string; messageId: string }>());
+  // Subagents whose events arrived with no thread to bind to (keys as above).
+  const unboundNativeSubagents = useRef(new Set<string>());
   const agentModelsRef = useRef<AgentModel[]>(fallbackAgentModels);
   const startTurnForThreadRef = useRef<
     | ((
@@ -1139,7 +1100,6 @@ const App: React.FC = () => {
   const cancelPendingSteers = useCallback((threadIds: Iterable<string>) => {
     steeringCoordinatorRef.current.cancel(threadIds);
   }, []);
-  const recoveredInterruptedRuns = useRef(false);
   const dragDepth = useRef(0);
   // Each pane scrolls its own transcript, so the DOM refs and the pinned/offset
   // bookkeeping are per thread rather than per shell. Entries are plain objects
@@ -1172,7 +1132,6 @@ const App: React.FC = () => {
   const utilityModelPickerRef = useRef<HTMLDivElement>(null);
   const taskPickerRef = useRef<HTMLDivElement>(null);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
-  const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const accessModeRef = useRef<HTMLDivElement>(null);
@@ -1204,31 +1163,6 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => () => composerControlsObserverRef.current?.disconnect(), []);
-
-  // Autosize the composer to its content. The height lives as an inline style
-  // on the textarea, so it is lost with the DOM node on every unmount.
-  const resizeChatInput = useCallback((el: HTMLTextAreaElement | null) => {
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${el.scrollHeight}px`;
-  }, []);
-
-  // The composer unmounts whenever the shell swaps views — Settings, the Code
-  // tab — and remounts with a fresh node that has no height style, collapsing a
-  // long draft back to one line. Measuring from the ref callback re-applies the
-  // height during the same commit that mounts the node, so the draft keeps the
-  // size its text earns no matter what caused the remount.
-  const setChatInputRef = useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      chatInputRef.current = el;
-      resizeChatInput(el);
-    },
-    [resizeChatInput]
-  );
-
-  useLayoutEffect(() => {
-    resizeChatInput(chatInputRef.current);
-  }, [chatInput, resizeChatInput]);
 
   // Selecting a thread no longer forces the transcript to the bottom — the
   // transcript restores that thread's own position (bottom for never-visited
@@ -1391,53 +1325,63 @@ const App: React.FC = () => {
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
   // empty composer. Non-empty ones are also saved with the store
-  // (composerDrafts), so they survive a restart.
+  // (composerDrafts), so they survive a restart. The draft lives in this
+  // controller, not in App state: typing re-renders only the Composer, and
+  // the store gets the draft debounced (flushed on switch, send, blur, hide
+  // and unload) instead of on every keystroke.
   const composerDraftKey = selectedThreadId ?? null;
-  const composerDraftsRef = useRef(new Map<string, ComposerDraft>());
-  // Starts unset so the swap effect below restores the first thread's draft
-  // even when the store hydrated before this first render; otherwise the save
-  // effect would overwrite that saved draft with the empty composer.
-  const composerDraftKeyRef = useRef<string | null>(null);
-  const rememberComposerDraft = (threadId: string, draft: ComposerDraft) => {
-    composerDraftsRef.current.set(threadId, draft);
-    useOrionStore.getState().setComposerDraft(threadId, draft);
-  };
-  const hasComposerDraft = (threadId: string) => {
-    const draft =
-      composerDraftsRef.current.get(threadId) ?? useOrionStore.getState().composerDrafts[threadId];
-    return !!draft && (!!draft.text.trim() || draft.attachments.length > 0);
-  };
   // Empty threads whose composer has been typed into (or given an attachment)
   // this session, or that came back from the last one with a saved draft.
   // Sidebar v2 lists a blank draft only once it is in here, so the fresh
   // composer opened after a snooze or settle stays out of the list.
   const [typedDraftThreadIds, setTypedDraftThreadIds] = useState<ReadonlySet<string>>(() => new Set());
-
+  const [composerDraft] = useState(() =>
+    createComposerDraftController({
+      load: (threadId) => useOrionStore.getState().composerDrafts[threadId],
+      save: (threadId, draft) => {
+        const state = useOrionStore.getState();
+        // A debounced save landing after its thread was deleted must not
+        // bring the draft back as an orphan.
+        if (!(threadId in state.composerDrafts) && !state.threads.some((thread) => thread.id === threadId)) return;
+        state.setComposerDraft(threadId, draft);
+      },
+      // Once per thread per session, not per keystroke.
+      onDraftTyped: (threadId) =>
+        setTypedDraftThreadIds((prev) => (prev.has(threadId) ? prev : new Set(prev).add(threadId))),
+    })
+  );
+  const hasComposerDraft = (threadId: string) => composerDraft.hasThreadDraft(threadId);
+  // Mid-run, a non-empty draft adds the queue/steer buttons, which the
+  // controls row's width estimate counts. A boolean that is only read while a
+  // run is active: typing re-renders App at most when the draft turns
+  // empty/non-empty during a run, and clearing it on send never does.
+  const composerHasDraft = useSyncExternalStore(
+    composerDraft.subscribe,
+    () => isSending && composerDraft.hasActiveContent()
+  );
+  // Swap drafts in the same commit that selects the thread, so the composer
+  // never shows the previous thread's draft for a frame. Starts from no key,
+  // so the first selected thread's saved draft is restored, not overwritten.
+  useLayoutEffect(() => {
+    composerDraft.switchTo(composerDraftKey);
+  }, [composerDraft, composerDraftKey]);
+  // Pending drafts reach the store before the window can go away: on unload
+  // (ahead of the store's synchronous write), on blur and when hidden.
   useEffect(() => {
-    // Skip the render where the key just changed: chatInput still holds the
-    // previous project's draft until the swap effect below runs.
-    if (!composerDraftKey || composerDraftKeyRef.current !== composerDraftKey) return;
-    rememberComposerDraft(composerDraftKey, { text: chatInput, attachments: chatAttachments });
-    if (chatInput.trim() || chatAttachments.length > 0) {
-      setTypedDraftThreadIds((prev) => (prev.has(composerDraftKey) ? prev : new Set(prev).add(composerDraftKey)));
-    }
-  }, [chatInput, chatAttachments, composerDraftKey]);
-
-  useEffect(() => {
-    const prevKey = composerDraftKeyRef.current;
-    if (prevKey === composerDraftKey) return;
-    composerDraftKeyRef.current = composerDraftKey;
-    const draft = composerDraftKey
-      ? (composerDraftsRef.current.get(composerDraftKey) ??
-        useOrionStore.getState().composerDrafts[composerDraftKey])
-      : undefined;
-    setChatInput(draft?.text ?? '');
-    setChatAttachments(draft?.attachments ?? []);
-    // The restored draft has no caret yet, so no mention token can be active.
-    setChatMention(null);
-    chatMentionDismissRef.current = null;
-    setSlashDismissedDraft(null);
-  }, [composerDraftKey]);
+    const flush = () => composerDraft.flush();
+    const flushWhenHidden = () => {
+      if (document.visibilityState === 'hidden') composerDraft.flush();
+    };
+    const stopUnloadFlush = flushIntoStoreBeforeUnload(flush);
+    window.addEventListener('blur', flush);
+    document.addEventListener('visibilitychange', flushWhenHidden);
+    return () => {
+      stopUnloadFlush();
+      window.removeEventListener('blur', flush);
+      document.removeEventListener('visibilitychange', flushWhenHidden);
+      composerDraft.flush();
+    };
+  }, [composerDraft]);
 
   // The spawn-request listener mounts once; it reads the live model catalog
   // through this ref instead of a stale closure.
@@ -1449,7 +1393,7 @@ const App: React.FC = () => {
     !!selectedThread &&
     !selectedThread.durangoWorkspace &&
     !selectedThreadWorkspacePending &&
-    selectedThread.messages.length === 0 &&
+    selectedThread.summary.messageCount === 0 &&
     selectedThread.status === 'idle' &&
     !isSending;
 
@@ -1607,11 +1551,6 @@ const App: React.FC = () => {
     };
   }, [threadReaderProviderId]);
   const canReferenceThreads = hasThreadReaderSupport(threadReaderProviderId, threadReaderSupport);
-  const canReferenceThreadsFromComposer =
-    canReferenceThreads && allowsThreadMentionsInComposer(chatInput);
-  // Asides, reviews, and goals skip the dispatcher that resolves @nickname
-  // mentions; the embedded Claude Code terminal never loads Orion MCPs.
-  const canMentionMcpsFromComposer = !isTerminalThread && allowsThreadMentionsInComposer(chatInput);
   const enabledProviderIds = useMemo(
     () =>
       agentProviders
@@ -1642,289 +1581,6 @@ const App: React.FC = () => {
     () => agentModels.find((model) => model.id === claudeCodeCliModelId),
     [agentModels]
   );
-  // Composer @-mention candidates. Root level (no mode picked yet) offers the
-  // Model / Thread kinds; typing there filters models directly so the
-  // pre-thread-mentions muscle memory keeps working. Model mode: models on
-  // enabled providers, 'orion' excluded (work can't be delegated to the
-  // orchestrator itself); an empty query shows the favorites (or everything).
-  // Thread mode: every thread in "Recent agents" order, searched with the same
-  // scoring as the sidebar's thread search, lazy-loaded a page at a time
-  // (threadMatchTotal reports the full match count so scrolling knows when to
-  // fetch more). Model lists cap at 8 rows.
-  const { candidates: chatMentionCandidates, threadMatchTotal: chatMentionThreadTotal } = useMemo<{
-    candidates: ChatMentionCandidate[];
-    threadMatchTotal: number;
-  }>(() => {
-    if (!chatMention) return { candidates: [], threadMatchTotal: 0 };
-    const query = chatMention.query.toLowerCase();
-    const mcpMatches = (limit: number) =>
-      (canMentionMcpsFromComposer ? orionMcps : [])
-        .filter(
-          (server) =>
-            !query ||
-            server.nickname.includes(query) ||
-            (server.detail ?? '').toLowerCase().includes(query)
-        )
-        .slice(0, limit)
-        .map((server) => ({ kind: 'mcp' as const, server }));
-
-    if (chatMention.mode === 'mcp') {
-      return { candidates: mcpMatches(20), threadMatchTotal: 0 };
-    }
-
-    if (chatMention.mode === 'chat') {
-      // Same capability gate as threads: the agent reads a mentioned chat
-      // with read_chat on the same `orion` MCP server as read_thread.
-      if (!canReferenceThreadsFromComposer) return { candidates: [], threadMatchTotal: 0 };
-      const trimmedQuery = chatMention.query.trim();
-      const search = durangoChatSearch?.query === trimmedQuery ? durangoChatSearch : null;
-      const status = (message: string, action?: 'sign-in') => ({
-        candidates: [{ kind: 'chatStatus' as const, message, ...(action ? { action } : {}) }],
-        threadMatchTotal: 0,
-      });
-      if (search?.status === 'error') {
-        if (search.code === 'not_signed_in') return status('Sign in to your Durango account to mention Durango chats', 'sign-in');
-        if (search.code === 'not_connected') return status(`Durango Chat isn't connected: ${search.error ?? 'try again later'}`);
-        return status(`Couldn't search Durango chats: ${search.error ?? 'try again later'}`);
-      }
-      // While a new query loads, keep showing the previous results.
-      const chats = search?.status === 'ready' ? search.chats : (durangoChatSearch?.chats ?? []);
-      if (chats.length === 0) {
-        if (!search || search.status === 'loading') return status('Searching Durango chats…');
-        return status(trimmedQuery ? `No Durango chats match "${trimmedQuery}"` : 'No Durango chats yet');
-      }
-      return {
-        candidates: chats.map((chat) => ({ kind: 'chat' as const, chat })),
-        threadMatchTotal: 0,
-      };
-    }
-
-    if (chatMention.mode === 'thread') {
-      // Hide unresolvable references for terminal threads and providers whose
-      // installed CLI cannot receive Orion's read_thread tool.
-      if (!canReferenceThreadsFromComposer) return { candidates: [], threadMatchTotal: 0 };
-      const projectById = new Map(projects.map((project) => [project.id, project]));
-      // The composing thread can't usefully reference itself.
-      const base = threads.filter((thread) =>
-        isThreadReferenceCandidate(
-          thread.id,
-          selectedThreadId,
-          isClaudeCodeCliModelId(thread.modelId)
-        )
-      );
-      const trimmedQuery = chatMention.query.trim();
-      if (!trimmedQuery) {
-        return {
-          candidates: base
-            .slice()
-            .sort(compareRecentThreadOrder)
-            .slice(0, chatMentionThreadLimit)
-            .map((thread) => ({
-              kind: 'thread' as const,
-              thread,
-              projectName: projectById.get(thread.projectId)?.name ?? 'Unknown project',
-            })),
-          threadMatchTotal: base.length,
-        };
-      }
-      const parsedQuery = parseSearchQuery(trimmedQuery);
-      const scored = base
-        .map((thread) => {
-          const project = projectById.get(thread.projectId);
-          const projectName = project?.name ?? 'Unknown project';
-          const entry = getThreadSearchEntry(
-            thread,
-            projectName,
-            project?.path ?? ''
-          );
-          return { thread, projectName, score: scoreThreadSearchEntry(entry, parsedQuery) };
-        })
-        .filter((result) => result.score > 0)
-        .sort(
-          (a, b) =>
-            b.score - a.score ||
-            getThreadActivityTime(b.thread).getTime() - getThreadActivityTime(a.thread).getTime()
-        );
-      return {
-        candidates: scored
-          .slice(0, chatMentionThreadLimit)
-          .map(({ thread, projectName }) => ({ kind: 'thread' as const, thread, projectName })),
-        threadMatchTotal: scored.length,
-      };
-    }
-
-    const base = agentModels.filter(
-      (model) =>
-        model.providerId !== 'orion' &&
-        // The Claude Code CLI pseudo-model is an interactive terminal, not a
-        // delegable harness.
-        model.id !== claudeCodeCliModelId &&
-        enabledProviderIdSet.has(model.providerId)
-    );
-    const categoryAvailable = (category: ChatMentionMode) =>
-      category === 'model' ||
-      ((category === 'thread' || category === 'chat') && canReferenceThreadsFromComposer) ||
-      (category === 'mcp' && canMentionMcpsFromComposer && orionMcps.length > 0);
-    if (!query) {
-      if (!chatMention.mode) {
-        return {
-          candidates: chatMentionCategories.filter((candidate) => categoryAvailable(candidate.category)),
-          threadMatchTotal: 0,
-        };
-      }
-      const favorites = base.filter((model) => model.favorite);
-      return {
-        candidates: (favorites.length > 0 ? favorites : base)
-          .slice(0, 8)
-          .map((model) => ({ kind: 'model' as const, model })),
-        threadMatchTotal: 0,
-      };
-    }
-    // Kind rows that prefix-match keep the root level reachable by typing
-    // (e.g. "@th" highlights Thread).
-    const categories = chatMention.mode
-      ? []
-      : chatMentionCategories.filter(
-          (candidate) =>
-            categoryAvailable(candidate.category) &&
-            (candidate.label.toLowerCase().startsWith(query) ||
-              // "@chat" reaches "Durango chats" too.
-              (candidate.category === 'chat' && 'chat'.startsWith(query)))
-        );
-    const models = base
-      .filter(
-        (model) =>
-          model.id.toLowerCase().includes(query) ||
-          model.label.toLowerCase().includes(query) ||
-          model.slug.toLowerCase().includes(query) ||
-          model.providerLabel.toLowerCase().includes(query)
-      )
-      .slice(0, 8)
-      .map((model) => ({ kind: 'model' as const, model }));
-    // Typing straight after '@' also finds connected MCPs by nickname.
-    const mcps = chatMention.mode ? [] : mcpMatches(4);
-    return { candidates: [...categories, ...mcps, ...models], threadMatchTotal: 0 };
-  }, [
-    agentModels,
-    canMentionMcpsFromComposer,
-    canReferenceThreadsFromComposer,
-    orionMcps,
-    chatMention,
-    chatMentionThreadLimit,
-    durangoChatSearch,
-    enabledProviderIdSet,
-    projects,
-    selectedThreadId,
-    threads,
-  ]);
-  const chatMentionHasMoreThreads =
-    chatMention?.mode === 'thread' && chatMentionThreadTotal > chatMentionCandidates.length;
-  // @chat dropdown: search Durango as the query changes (debounced; the
-  // newest query wins). Nothing is fetched until the user picks "Durango
-  // chats", so composing never touches the network otherwise.
-  const durangoChatQuery =
-    chatMention?.mode === 'chat' && canReferenceThreadsFromComposer ? chatMention.query.trim() : null;
-  useEffect(() => {
-    if (durangoChatQuery === null) return;
-    const query = durangoChatQuery;
-    if (!window.orion?.durangoSearchChats) {
-      setDurangoChatSearch({
-        query,
-        status: 'error',
-        chats: [],
-        code: 'not_connected',
-        error: 'this build cannot reach Durango Chat',
-      });
-      return;
-    }
-    let active = true;
-    setDurangoChatSearch((current) => ({
-      query,
-      status: 'loading',
-      chats: current?.status === 'ready' ? current.chats : [],
-    }));
-    const timer = window.setTimeout(() => {
-      void window.orion!.durangoSearchChats!({ query, limit: 20 }).then(
-        (result) => {
-          if (!active) return;
-          if (result.ok) {
-            rememberDurangoChats(result.data);
-            setDurangoChatSearch({ query, status: 'ready', chats: result.data });
-          } else {
-            setDurangoChatSearch({ query, status: 'error', chats: [], code: result.code, error: result.error });
-          }
-        },
-        () => {
-          if (active) {
-            setDurangoChatSearch({ query, status: 'error', chats: [], code: 'network', error: 'Durango is unreachable' });
-          }
-        }
-      );
-    }, query ? DURANGO_CHAT_SEARCH_DEBOUNCE_MS : 0);
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
-  }, [durangoChatQuery]);
-  // A new thread query starts back at the first page.
-  const chatMentionThreadQuery = chatMention?.mode === 'thread' ? chatMention.query.trim() : null;
-  useEffect(() => {
-    setChatMentionThreadLimit(CHAT_MENTION_THREAD_PAGE);
-  }, [chatMentionThreadQuery]);
-  // Nearing the bottom of the dropdown loads the next page of threads.
-  const handleChatMentionScroll = useCallback(
-    (event: React.UIEvent<HTMLDivElement>) => {
-      if (!chatMentionHasMoreThreads) return;
-      const el = event.currentTarget;
-      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 48) {
-        setChatMentionThreadLimit((limit) => limit + CHAT_MENTION_THREAD_PAGE);
-      }
-    },
-    [chatMentionHasMoreThreads]
-  );
-  const chatMentionOpen = Boolean(chatMention) && chatMentionCandidates.length > 0;
-  // Reset the highlight to the top whenever the candidate list changes —
-  // except when lazy loading merely appends thread rows, which should leave
-  // the highlight (and the user's scroll position) where they are.
-  const chatMentionListKey = chatMentionCandidates
-    .map((candidate) =>
-      candidate.kind === 'category'
-        ? `category:${candidate.category}`
-        : candidate.kind === 'model'
-          ? `model:${candidate.model.id}`
-          : candidate.kind === 'mcp'
-            ? `mcp:${candidate.server.id}`
-            : candidate.kind === 'chat'
-              ? `chat:${candidate.chat.id}`
-              : candidate.kind === 'chatStatus'
-                ? `chatStatus:${candidate.message}`
-                : `thread:${candidate.thread.id}`
-    )
-    .join('|');
-  const prevChatMentionListKeyRef = useRef('');
-  const chatMentionListAppendedRef = useRef(false);
-  useEffect(() => {
-    const prev = prevChatMentionListKeyRef.current;
-    prevChatMentionListKeyRef.current = chatMentionListKey;
-    const appended =
-      prev !== '' && chatMentionListKey !== prev && chatMentionListKey.startsWith(`${prev}|`);
-    chatMentionListAppendedRef.current = appended;
-    if (!appended) setChatMentionIndex(0);
-  }, [chatMentionListKey]);
-  // The dropdown's height is clamped to the space around the composer, so
-  // keyboard navigation has to keep the highlighted row scrolled into view.
-  // Skip the scroll when rows were appended without the highlight moving
-  // (wheel-driven lazy load) so the list doesn't jump back to the highlight.
-  const chatMentionSelectedRef = useRef<HTMLButtonElement | null>(null);
-  const prevChatMentionIndexRef = useRef(0);
-  useEffect(() => {
-    const indexChanged = prevChatMentionIndexRef.current !== chatMentionIndex;
-    prevChatMentionIndexRef.current = chatMentionIndex;
-    const appended = chatMentionListAppendedRef.current;
-    chatMentionListAppendedRef.current = false;
-    if (appended && !indexChanged) return;
-    chatMentionSelectedRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [chatMentionIndex, chatMentionListKey]);
   // Whether the selected thread resolves to a Claude SDK session — directly
   // (claude provider) or via an Orion orchestrator whose main driver is
   // Claude. Gates the slash-command menu, /btw hint, and /clear dispatch.
@@ -1933,72 +1589,11 @@ const App: React.FC = () => {
     ((selectedAgentModel?.providerId === 'orion' || isOrionModelId(selectedThread?.modelId ?? '')) &&
       findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)?.providerId ===
         'claude');
-  // Slash-command menu: active while the whole draft is a single "/" token.
-  // The pool is every command available in this composer context (Orion
-  // natives + the project's live Claude list, seeded by a static fallback);
-  // the menu shows the pool filtered by what's typed after the "/".
-  const slashToken = getSlashToken(chatInput.trimStart());
-  const slashCommandPool = useMemo<SlashCommandCandidate[]>(() => {
-    if (!selectedThread || isNativeSubagentThread) return [];
-    if (!chatInput.trimStart().startsWith('/')) return [];
-    const liveCommands = selectedThreadProjectPath
-      ? (slashCommandsByProject[selectedThreadProjectPath] ?? null)
-      : null;
-    return buildSlashCommandCandidates(
-      {
-        providerId: selectedAgentModel?.providerId ?? null,
-        claudeBacked: selectedThreadClaudeBacked,
-        isTerminal: isTerminalThread,
-      },
-      liveCommands
-    );
-  }, [
-    chatInput,
-    isNativeSubagentThread,
-    isTerminalThread,
-    selectedAgentModel?.providerId,
-    selectedThread,
-    selectedThreadClaudeBacked,
-    selectedThreadProjectPath,
-    slashCommandsByProject,
-  ]);
-  const slashCommandCandidates = useMemo<SlashCommandCandidate[]>(
-    () => (slashToken ? filterSlashCommands(slashCommandPool, slashToken.query) : []),
-    [slashCommandPool, slashToken?.query]
-  );
-  // Codex's one-click /review presets outrank the generic slash menu: a bare
-  // "/review" draft goes straight to the preset popover so a single click
-  // dispatches the review instead of first re-completing the command.
-  const codexReviewPresetsActive =
-    selectedAgentModel?.providerId === 'codex' &&
-    !isTerminalThread &&
-    /^\/review\s*$/i.test(chatInput.trimStart());
-  const slashMenuOpen =
-    Boolean(slashToken) &&
-    slashCommandCandidates.length > 0 &&
-    chatInput !== slashDismissedDraft &&
-    !codexReviewPresetsActive;
-  const slashCommandListKey = slashCommandCandidates
-    .map((candidate) => `${candidate.source}:${candidate.command.name}`)
-    .join('|');
-  useEffect(() => {
-    setSlashCommandIndex(0);
-  }, [slashCommandListKey]);
-  const slashCommandSelectedRef = useRef<HTMLButtonElement | null>(null);
-  useEffect(() => {
-    slashCommandSelectedRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [slashCommandIndex, slashCommandListKey]);
-  // Argument-hint strip under the composer once a known command is completed
-  // (menu closed). /review, /goal, and /btw keep their richer bespoke banners.
-  const completedSlash = useMemo(() => {
-    if (slashMenuOpen || slashCommandPool.length === 0) return null;
-    const candidate = completedSlashCommand(chatInput.trimStart(), slashCommandPool);
-    if (!candidate) return null;
-    if (candidate.source === 'orion' && /^(review|goal|btw)$/.test(candidate.command.name)) {
-      return null;
-    }
-    return candidate;
-  }, [chatInput, slashCommandPool, slashMenuOpen]);
+  // The selected project's live Claude command list for the Composer's
+  // slash menu (null until reported; the menu falls back to a static list).
+  const selectedThreadSlashCommands = selectedThreadProjectPath
+    ? (slashCommandsByProject[selectedThreadProjectPath] ?? null)
+    : null;
   // Role-model options for Settings → Orchestration: every real model grouped
   // by provider. The Orion pseudo-model can't delegate to itself.
   const orchestrationModelGroups = useMemo(
@@ -2402,7 +1997,7 @@ const App: React.FC = () => {
                 )
             ).filter(
               (thread) =>
-                thread.messages.length > 0 ||
+                thread.summary.messageCount > 0 ||
                 thread.status === 'running' ||
                 thread.modelId === claudeCodeCliModelId ||
                 !!thread.pinnedAt ||
@@ -4127,7 +3722,7 @@ const App: React.FC = () => {
       if (!window.orion?.linkBoardTask) return;
       const project = findProjectById(state, thread.projectId);
       // A fresh, untitled thread adopts the first task's title.
-      const adoptTitle = linkedTasks.length === 0 && thread.messages.length === 0 && isDefaultTitle(thread.title);
+      const adoptTitle = linkedTasks.length === 0 && thread.summary.messageCount === 0 && isDefaultTitle(thread.title);
 
       const result = await window.orion.linkBoardTask({
         taskId: task.id,
@@ -4257,7 +3852,8 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!window.orion?.onAgentTurnEvent) return undefined;
-    const unsubscribe = window.orion.onAgentTurnEvent((event) => {
+    type AgentTurnEvent = Parameters<Parameters<NonNullable<typeof window.orion.onAgentTurnEvent>>[0]>[0];
+    const handleEvent = (event: AgentTurnEvent) => {
       // `/btw` aside runs stream into their exchange, not the transcript.
       // Their `session` events are deliberately dropped: the fork's id must
       // never replace the thread's real session id.
@@ -4279,8 +3875,7 @@ const App: React.FC = () => {
           const asideAnswerTail =
             useOrionStore
               .getState()
-              .threads.find((thread) => thread.id === btwRun.threadId)
-              ?.btwExchanges?.find((exchange) => exchange.id === btwRun.exchangeId)
+              .transcripts[btwRun.threadId]?.btwExchanges?.find((exchange) => exchange.id === btwRun.exchangeId)
               ?.answer.slice(-1200) ?? '';
           const asideLoggedOut = isProviderAuthErrorText(event.error) || isProviderAuthErrorText(asideAnswerTail);
           updateBtwExchange(btwRun.threadId, btwRun.exchangeId, {
@@ -4321,7 +3916,8 @@ const App: React.FC = () => {
         if (retainedRunId) clearActiveRun(retainedRunId);
         const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
         if (!thread) return;
-        for (const message of thread.messages) {
+        const threadMessages = loadedMessages(thread.id) ?? [];
+        for (const message of threadMessages) {
           const intervention = message.claudeBackgroundIntervention;
           if (
             message.kind !== 'claude-background-intervention' ||
@@ -4339,7 +3935,7 @@ const App: React.FC = () => {
           });
         }
         if (thread.status !== 'running') return;
-        const lastRun = [...thread.messages].reverse().find((m) => m.kind === 'agent-run');
+        const lastRun = [...threadMessages].reverse().find((m) => m.kind === 'agent-run');
         updateThread(event.threadId, { status: 'done' });
         notifyThreadFinished(event.threadId, 'done');
         pushLinkedTaskStatus(event.threadId, 'finished', lastRun?.content.trim() || undefined);
@@ -4364,34 +3960,47 @@ const App: React.FC = () => {
         const subagentId = info?.id ?? event.subagentId;
         if (!subagentId) return;
         const state = useOrionStore.getState();
-        const runThread = state.threads.find((t) => t.id === event.threadId);
+        const runThread = findThread(state.threads, event.threadId);
         if (!runThread) return;
         const providerId = (info?.providerId ?? event.providerId ?? runThread.modelId.split(':')[0]) as ProviderId;
-        const trackedRun = runOutputMessages.current.get(event.runId);
-        const dispatchedModelId = dispatchedModelIdForProvider(
-          runThread,
-          providerId,
-          trackedRun?.threadId === runThread.id ? trackedRun.messageId : undefined
-        );
         const reportedNativeModelId = qualifyProviderModelId(providerId, info?.model);
-        const nativeModelId = reportedNativeModelId ?? dispatchedModelId;
         const key = `${event.threadId}:${providerId}:${subagentId}`;
-        const familyThreadIds = descendantThreadIds(state.threads, runThread.id);
-        const findFamilySubagent = (providerSubagentId: string) =>
-          state.threads.find(
+        let target = nativeSubagentTargets.current.get(key) ?? null;
+        // Streamed output for a subagent that has no thread (and no info to
+        // make one) is dropped as before; don't search for it on every chunk.
+        if (!target && !info && unboundNativeSubagents.current.has(key)) return;
+        // The rest is for a subagent seen for the first time (or rebound after
+        // a reload), not for every streamed chunk: whole-thread scans happen
+        // only on that rare path.
+        let familyThreadIds: Set<string> | null = null;
+        const findFamilySubagent = (providerSubagentId: string) => {
+          familyThreadIds ??= descendantThreadIds(state.threads, runThread.id);
+          const family = familyThreadIds;
+          return state.threads.find(
             (thread) =>
-              familyThreadIds.has(thread.id) &&
+              family.has(thread.id) &&
               thread.subagent?.providerId === providerId &&
               thread.subagent.id === providerSubagentId
           );
-        let target = nativeSubagentTargets.current.get(key) ?? null;
+        };
+        const nativeModelIdFor = () => {
+          if (reportedNativeModelId) return reportedNativeModelId;
+          const trackedRun = runOutputMessages.current.get(event.runId);
+          return dispatchedModelIdForProvider(
+            runThread,
+            providerId,
+            trackedRun?.threadId === runThread.id ? trackedRun.messageId : undefined
+          );
+        };
 
         // Rebind after an app reload: the child thread persists, the ref map
         // doesn't. Search the run's descendants for nested agents, but keep
         // provider-local ids inside this run's thread family.
         if (!target) {
           const existing = findFamilySubagent(subagentId);
-          const lastRun = existing ? [...existing.messages].reverse().find((m) => m.kind === 'agent-run') : undefined;
+          // The shell knows the child's last run without loading it; its
+          // events load it (store actions wait for the transcript).
+          const lastRun = existing?.summary.lastAgentRun;
           if (existing && lastRun) {
             target = { threadId: existing.id, messageId: lastRun.id };
             nativeSubagentTargets.current.set(key, target);
@@ -4404,6 +4013,7 @@ const App: React.FC = () => {
           // reports one, so the switcher shows the real tree instead of
           // flattening every descendant onto the run's thread.
           const parent = (info.parentSubagentId && findFamilySubagent(info.parentSubagentId)) || runThread;
+          const nativeModelId = nativeModelIdFor();
           const childThreadId = state.createThread(parent.projectId, info.title || info.kind || 'Subagent', {
             parentThreadId: parent.id,
             modelId: nativeModelId ?? parent.modelId,
@@ -4438,7 +4048,11 @@ const App: React.FC = () => {
           target = { threadId: childThreadId, messageId };
           nativeSubagentTargets.current.set(key, target);
         }
-        if (!target) return;
+        if (!target) {
+          unboundNativeSubagents.current.add(key);
+          return;
+        }
+        unboundNativeSubagents.current.delete(key);
 
         if (event.type === 'subagent-chunk' && event.chunk) {
           // Same buffered flush as main-run chunks: subagent transcripts tail
@@ -4454,10 +4068,7 @@ const App: React.FC = () => {
               messageId: target.messageId,
               text: event.chunk,
               baseLen:
-                useOrionStore
-                  .getState()
-                  .threads.find((t) => t.id === target.threadId)
-                  ?.messages.find((m) => m.id === target.messageId)?.content.length ?? 0,
+                loadedMessages(target.threadId)?.find((m) => m.id === target.messageId)?.content.length ?? 0,
             };
             chunkBuffers.current.set(bufferKey, buffer);
           }
@@ -4510,18 +4121,24 @@ const App: React.FC = () => {
           }
           // A late-arriving prompt (codex delivers it inside the rollout)
           // fills in the transcript's opening user bubble.
-          if (childThread && info.prompt && !childThread.messages.some((m) => m.role === 'user')) {
-            updateThread(target.threadId, {
-              messages: [
-                {
-                  id: crypto.randomUUID(),
-                  role: 'user',
-                  content: info.prompt,
-                  ts: childThread.messages[0]?.ts ?? new Date().toISOString(),
-                },
-                ...childThread.messages,
-              ],
-            });
+          if (childThread && info.prompt && !childThread.summary.hasUserMessage) {
+            const prompt = info.prompt;
+            useOrionStore.getState().updateThreadTranscript(target.threadId, (transcript) =>
+              transcript.messages.some((m) => m.role === 'user')
+                ? transcript
+                : {
+                    ...transcript,
+                    messages: [
+                      {
+                        id: crypto.randomUUID(),
+                        role: 'user',
+                        content: prompt,
+                        ts: transcript.messages[0]?.ts ?? new Date().toISOString(),
+                      },
+                      ...transcript.messages,
+                    ],
+                  }
+            );
           }
           if (info.status && info.status !== 'running') {
             const failed = info.status === 'error';
@@ -4548,7 +4165,7 @@ const App: React.FC = () => {
         if (event.type === 'started' && event.background) {
           const thread = useOrionStore.getState().threads.find((t) => t.id === event.threadId);
           if (!thread) return;
-          for (const message of thread.messages) {
+          for (const message of loadedMessages(thread.id) ?? []) {
             const intervention = message.claudeBackgroundIntervention;
             if (
               message.kind === 'claude-background-intervention' &&
@@ -4614,10 +4231,8 @@ const App: React.FC = () => {
           // A keyed update may carry only the result; the command is on the row.
           const { key } = event.activity;
           const merged = key
-            ? useOrionStore
-                .getState()
-                .threads.find((thread) => thread.id === tracked.threadId)
-                ?.messages.find((message) => message.id === tracked.messageId)
+            ? loadedMessages(tracked.threadId)
+                ?.find((message) => message.id === tracked.messageId)
                 ?.activities?.find((activity) => activity.key === key)
             : undefined;
           if (activityRanWorkspaceCommand(merged ?? event.activity)) {
@@ -4640,10 +4255,7 @@ const App: React.FC = () => {
             messageId: tracked.messageId,
             text: event.chunk,
             baseLen:
-              useOrionStore
-                .getState()
-                .threads.find((t) => t.id === tracked.threadId)
-                ?.messages.find((m) => m.id === tracked.messageId)?.content.length ?? 0,
+              loadedMessages(tracked.threadId)?.find((m) => m.id === tracked.messageId)?.content.length ?? 0,
           };
           chunkBuffers.current.set(event.runId, buffer);
         }
@@ -4675,9 +4287,7 @@ const App: React.FC = () => {
         void syncAgentWorkspace(tracked.threadId, tracked.messageId, true);
         if (discardableShellTasks.length > 0) {
           const content = `Left running in the background: ${discardableShellTasks.join('; ')}`;
-          const existingMonitor = [...(useOrionStore.getState().threads.find(
-            (thread) => thread.id === tracked.threadId
-          )?.messages ?? [])]
+          const existingMonitor = [...(loadedMessages(tracked.threadId) ?? [])]
             .reverse()
             .find(
               (message) =>
@@ -4725,10 +4335,8 @@ const App: React.FC = () => {
             .completeInProgressPlanEntries(tracked.threadId, tracked.messageId);
           // Turn finished — surface the work on the board (In Review column)
           // with the response the user sees in this completed agent message.
-          const finalResponse = useOrionStore
-            .getState()
-            .threads.find((thread) => thread.id === tracked.threadId)
-            ?.messages.find((message) => message.id === tracked.messageId)
+          const finalResponse = loadedMessages(tracked.threadId)
+            ?.find((message) => message.id === tracked.messageId)
             ?.content.trim();
           pushLinkedTaskStatus(tracked.threadId, 'finished', finalResponse || undefined);
         }
@@ -4750,7 +4358,7 @@ const App: React.FC = () => {
         // an Authenticate button instead of a dead-end error.
         const errorThread = useOrionStore.getState().threads.find((thread) => thread.id === tracked.threadId);
         const contentTail =
-          errorThread?.messages.find((message) => message.id === tracked.messageId)?.content.slice(-1200) ?? '';
+          loadedMessages(tracked.threadId)?.find((message) => message.id === tracked.messageId)?.content.slice(-1200) ?? '';
         const looksLoggedOut = isProviderAuthErrorText(event.error) || isProviderAuthErrorText(contentTail);
         const rawAuthProviderId = looksLoggedOut ? (event.providerId ?? errorThread?.modelId.split(':')[0]) : undefined;
         // The Orion pseudo-provider has no CLI of its own to authenticate.
@@ -4769,6 +4377,33 @@ const App: React.FC = () => {
         runOutputMessages.current.delete(event.runId);
         clearActiveRun(event.runId);
       }
+    };
+
+    // The handler reads the transcript of the event's thread. When that
+    // thread's transcript isn't loaded (a background session's turn on a
+    // thread nobody has open), its events wait, in order, until it is: none
+    // is dropped or handled against a missing transcript.
+    const waitingForTranscript = new Map<string, AgentTurnEvent[]>();
+    const unsubscribe = window.orion.onAgentTurnEvent((event) => {
+      const threadId = event.threadId;
+      const waiting = threadId ? waitingForTranscript.get(threadId) : undefined;
+      if (waiting) {
+        waiting.push(event);
+        return;
+      }
+      const state = useOrionStore.getState();
+      if (threadId && !state.transcripts[threadId] && findThread(state.threads, threadId)) {
+        waitingForTranscript.set(threadId, [event]);
+        void ensureThreadTranscript(threadId)
+          .catch((error) => console.warn('Could not load the transcript of a thread with agent events', error))
+          .finally(() => {
+            const events = waitingForTranscript.get(threadId) ?? [];
+            waitingForTranscript.delete(threadId);
+            for (const queued of events) handleEvent(queued);
+          });
+        return;
+      }
+      handleEvent(event);
     });
 
     return () => {
@@ -4790,35 +4425,8 @@ const App: React.FC = () => {
     updateThreadMessage,
   ]);
 
-  useEffect(() => {
-    if (recoveredInterruptedRuns.current || threads.length === 0) return;
-    recoveredInterruptedRuns.current = true;
-    for (const thread of threads) {
-      for (const exchange of thread.btwExchanges ?? []) {
-        if (exchange.status === 'running') {
-          updateBtwExchange(thread.id, exchange.id, {
-            status: 'error',
-            error: 'Interrupted before Durango Code received the answer.',
-          });
-        }
-      }
-      if (thread.status !== 'running') continue;
-      const lastMessage = thread.messages.at(-1);
-      if (lastMessage?.role === 'agent' && lastMessage.content.trim().length === 0) {
-        appendToThreadMessage(
-          thread.id,
-          lastMessage.id,
-          'The previous agent run was interrupted before Durango Code received output. Send the prompt again to start a fresh run.'
-        );
-      } else {
-        addMessageToThread(thread.id, {
-          role: 'system',
-          content: 'The previous agent run was interrupted before Durango Code received completion.',
-        });
-      }
-      updateThread(thread.id, { status: 'error' });
-    }
-  }, [addMessageToThread, appendToThreadMessage, threads, updateBtwExchange, updateThread]);
+  // Runs and /btw asides the previous session left going are cleaned up
+  // when their transcript loads (store.ts restoreTranscriptFromPreviousRun).
 
   // Resolve (and create) the scratch directory No project agents run in.
   useEffect(() => {
@@ -4993,7 +4601,7 @@ const App: React.FC = () => {
         .threads.find(
           (thread) =>
             thread.projectId === projectId &&
-            thread.messages.length === 0 &&
+            thread.summary.messageCount === 0 &&
             thread.status !== 'running' &&
             thread.modelId !== claudeCodeCliModelId &&
             !thread.parentThreadId &&
@@ -5427,9 +5035,8 @@ const App: React.FC = () => {
       selectedThread &&
       selectedThread.projectId === projectId &&
       selectedThread.modelId !== claudeCodeCliModelId &&
-      selectedThread.messages.length === 0 &&
-      !chatInput.trim() &&
-      chatAttachments.length === 0
+      selectedThread.summary.messageCount === 0 &&
+      !composerDraft.hasThreadDraft(selectedThread.id)
     ) {
       setActiveTab('agents');
       return selectedThread.id;
@@ -5463,19 +5070,16 @@ const App: React.FC = () => {
   // the draft of the thread it shows; a thread it is about to switch to (just
   // selected or created) gets them in its saved draft, which the swap effect
   // loads.
-  const appendComposerAttachments = useCallback((threadId: string, attachments: FileAttachment[]) => {
-    if (attachments.length === 0) return;
-    if (composerDraftKeyRef.current === threadId) {
-      setChatAttachments((current) => [...current, ...attachments]);
-      return;
-    }
-    const draft = composerDraftsRef.current.get(threadId) ??
-      useOrionStore.getState().composerDrafts[threadId] ?? { text: '', attachments: [] };
-    const nextDraft = { ...draft, attachments: [...draft.attachments, ...attachments] };
-    composerDraftsRef.current.set(threadId, nextDraft);
-    useOrionStore.getState().setComposerDraft(threadId, nextDraft);
-    setTypedDraftThreadIds((prev) => (prev.has(threadId) ? prev : new Set(prev).add(threadId)));
-  }, []);
+  const appendComposerAttachments = useCallback(
+    (threadId: string, attachments: FileAttachment[]) => {
+      if (attachments.length === 0) return;
+      composerDraft.updateThreadDraft(threadId, (draft) => ({
+        ...draft,
+        attachments: [...draft.attachments, ...attachments],
+      }));
+    },
+    [composerDraft]
+  );
 
   const attachFiles = useCallback(
     async (files: FileList | File[]) => {
@@ -5575,10 +5179,6 @@ const App: React.FC = () => {
     [attachFiles]
   );
 
-  const removeChatAttachment = (id: string) => {
-    setChatAttachments((current) => current.filter((attachment) => attachment.id !== id));
-  };
-
   // Durango workspaces (docs/workspaces.md). A thread that has never run gets
   // its own workspace when its project is in a Durango repository (a
   // durango.toml at the repository root) and the setting is on. Threads that
@@ -5596,7 +5196,7 @@ const App: React.FC = () => {
         thread.branchedFromThreadId ||
         Object.values(thread.agentSessionIds ?? {}).some(Boolean) ||
         // A thread whose workspace was removed starts over in a new one.
-        (!thread.durangoWorkspaceRemovedAt && thread.messages.some((message) => message.kind === 'agent-run'))
+        (!thread.durangoWorkspaceRemovedAt && Boolean(thread.summary.lastAgentRun))
       ) {
         return { ok: true };
       }
@@ -5864,7 +5464,8 @@ const App: React.FC = () => {
       // independently resumable session), carry the visible child transcript
       // into this first fresh turn. The branched parent still does not absorb
       // every child transcript.
-      addAgentContext(inheritedSubagentResumeContext(thread, model.providerId));
+      // startTurnForThread loaded and holds the transcript.
+      addAgentContext(inheritedSubagentResumeContext(thread, loadedMessages(threadId) ?? [], model.providerId));
       // @-model mentions in the user's original text: tell the agent which
       // models were referenced so it can delegate to them. Works on any
       // thread, not just Orion ones.
@@ -5926,7 +5527,7 @@ const App: React.FC = () => {
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
-      if (thread.messages.length === 0 && isDefaultTitle(thread.title)) {
+      if (thread.summary.messageCount === 0 && isDefaultTitle(thread.title)) {
         const titleSeed = userContent || tasksToInject[0]?.title || '';
         const initialTitle = deriveTitle(titleSeed);
         const expectedTitle = isPlausibleTitle(initialTitle) ? initialTitle : thread.title;
@@ -6093,14 +5694,28 @@ const App: React.FC = () => {
       const turnStart = await withThreadStartReservation(
         pendingTurnStartsRef.current,
         threadId,
-        () =>
-          startTurnForThreadUnlocked(
-            threadId,
-            promptText,
-            attachments,
-            claimStart,
-            applyClaimedSettings
-          )
+        async () => {
+          // The turn reads and grows the transcript: load it first (threads
+          // started from elsewhere may not be open) and keep it loaded.
+          const release = holdThreadTranscript(threadId);
+          try {
+            if (
+              !(await loadThreadMessages(threadId)) &&
+              findThread(useOrionStore.getState().threads, threadId)
+            ) {
+              return { ok: false as const, error: TRANSCRIPT_UNAVAILABLE_ERROR };
+            }
+            return await startTurnForThreadUnlocked(
+              threadId,
+              promptText,
+              attachments,
+              claimStart,
+              applyClaimedSettings
+            );
+          } finally {
+            release();
+          }
+        }
       );
       return turnStart.acquired
         ? turnStart.value
@@ -6257,10 +5872,9 @@ const App: React.FC = () => {
   // background agents…" forever after the runtime is disposed.
   const markUntrackedRunStopped = useCallback(
     (threadId: string, statusText: string) => {
-      const thread = useOrionStore.getState().threads.find((t) => t.id === threadId);
-      const lastRun = thread
-        ? [...thread.messages].reverse().find((message) => message.kind === 'agent-run')
-        : undefined;
+      // The shell knows the last run; the update waits for the transcript if
+      // it isn't loaded.
+      const lastRun = findThread(useOrionStore.getState().threads, threadId)?.summary.lastAgentRun;
       if (!lastRun) return;
       updateThreadMessage(threadId, lastRun.id, {
         statusText,
@@ -6451,17 +6065,31 @@ const App: React.FC = () => {
       if (!spawnId) continue;
       if (thread.status !== 'done' && thread.status !== 'error') continue;
       updateThread(thread.id, { spawnId: undefined });
-      const lastAgentMessage = [...thread.messages]
-        .reverse()
-        .find((message) => message.role === 'agent' && (message.content.trim() || message.error));
-      const output = lastAgentMessage?.content.trim();
-      void window.orion?.reportSubagentResult?.({
-        spawnId,
-        ok: thread.status === 'done',
-        result:
-          thread.status === 'done'
-            ? output || '(no output)'
-            : lastAgentMessage?.error || output || 'The subagent run failed.',
+      const status = thread.status;
+      // A run that just ended has its transcript loaded; load it otherwise.
+      void loadThreadMessages(thread.id).then((messages) => {
+        if (!messages) {
+          // Never report an unreadable transcript as a finished run with no
+          // output: the driver would act on a result that doesn't exist.
+          void window.orion?.reportSubagentResult?.({
+            spawnId,
+            ok: false,
+            result: `The subagent ${status === 'done' ? 'finished' : 'stopped'}, but Durango Code could not read its transcript to report the result. Read the subagent thread instead.`,
+          });
+          return;
+        }
+        const lastAgentMessage = [...messages]
+          .reverse()
+          .find((message) => message.role === 'agent' && (message.content.trim() || message.error));
+        const output = lastAgentMessage?.content.trim();
+        void window.orion?.reportSubagentResult?.({
+          spawnId,
+          ok: status === 'done',
+          result:
+            status === 'done'
+              ? output || '(no output)'
+              : lastAgentMessage?.error || output || 'The subagent run failed.',
+        });
       });
     }
   }, [threads, updateThread]);
@@ -6583,7 +6211,7 @@ const App: React.FC = () => {
   // `/goal` — codex goal runs. The whole pursuit (codex auto-continues turns
   // until the goal completes, blocks, or hits budget) is one agent-run
   // message driven over `codex app-server`.
-  const startGoalRunForThread = useCallback(
+  const startGoalRunForThreadLoaded = useCallback(
     (
       threadId: string,
       rawText: string,
@@ -6619,7 +6247,8 @@ const App: React.FC = () => {
       if (!window.orion?.runAgentTurn) {
         return { ok: false, error: 'Agent runtime is unavailable' };
       }
-      const inheritedResumeContext = inheritedSubagentResumeContext(thread, 'codex');
+      // startGoalRunForThread loaded and holds the transcript.
+      const inheritedResumeContext = inheritedSubagentResumeContext(thread, loadedMessages(threadId) ?? [], 'codex');
 
       // Goal commands bypass the normal send flow, so seed the title here
       // from the objective before the first transcript messages are added.
@@ -6719,9 +6348,26 @@ const App: React.FC = () => {
     ]
   );
 
+  // The run's context comes from the transcript: load it (and keep it
+  // loaded) first, and refuse rather than run without it.
+  const startGoalRunForThread = useCallback(
+    async (threadId: string, rawText: string, goalAction: Parameters<typeof startGoalRunForThreadLoaded>[2]): Promise<{ ok: boolean; error?: string }> => {
+      const release = holdThreadTranscript(threadId);
+      try {
+        if (!(await loadThreadMessages(threadId)) && findThread(useOrionStore.getState().threads, threadId)) {
+          return { ok: false, error: TRANSCRIPT_UNAVAILABLE_ERROR };
+        }
+        return startGoalRunForThreadLoaded(threadId, rawText, goalAction);
+      } finally {
+        release();
+      }
+    },
+    [startGoalRunForThreadLoaded]
+  );
+
   // `/review` — Codex's dedicated reviewer, run inline on the current native
   // Codex session so it can see the conversation that led to the changes.
-  const startReviewForThread = useCallback(
+  const startReviewForThreadLoaded = useCallback(
     (
       threadId: string,
       rawText: string,
@@ -6734,6 +6380,9 @@ const App: React.FC = () => {
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
+      // The transcript before this review's own messages (its review context).
+      // startReviewForThread loaded and holds the transcript.
+      const priorMessages = loadedMessages(threadId) ?? [];
       if (!thread) return { ok: false, error: 'Thread no longer exists' };
       const project = findProjectById(state, thread.projectId);
       if (!project) return { ok: false, error: 'Select a project for this thread first' };
@@ -6810,7 +6459,7 @@ const App: React.FC = () => {
           codexServiceTier: thread.codexServiceTier ?? defaultCodexServiceTier,
           codexReview: {
             ...review,
-            threadContext: buildReviewThreadContext(thread),
+            threadContext: buildReviewThreadContext(thread, priorMessages),
           },
         })
         .then((result) => {
@@ -6852,6 +6501,23 @@ const App: React.FC = () => {
     ]
   );
 
+  // The run's context comes from the transcript: load it (and keep it
+  // loaded) first, and refuse rather than run without it.
+  const startReviewForThread = useCallback(
+    async (threadId: string, rawText: string, review: Parameters<typeof startReviewForThreadLoaded>[2]): Promise<{ ok: boolean; error?: string }> => {
+      const release = holdThreadTranscript(threadId);
+      try {
+        if (!(await loadThreadMessages(threadId)) && findThread(useOrionStore.getState().threads, threadId)) {
+          return { ok: false, error: TRANSCRIPT_UNAVAILABLE_ERROR };
+        }
+        return startReviewForThreadLoaded(threadId, rawText, review);
+      } finally {
+        release();
+      }
+    },
+    [startReviewForThreadLoaded]
+  );
+
   // Dismissing a still-running aside also kills its forked run.
   const dismissBtwExchange = useCallback(
     (threadId: string, exchangeId: string) => {
@@ -6869,6 +6535,11 @@ const App: React.FC = () => {
   // Queued follow-ups dispatch as soon as their thread has no run in flight —
   // after a turn finishes (done or error) and after app-restart recovery. Each
   // dispatch resumes the provider session, so the agent keeps its context.
+  // One that can't start goes back to the front of its queue (never lost) and
+  // the error is shown as a toast: the transcript may be what failed to load.
+  // That thread's queue then waits a while before trying again.
+  const queueRetryAfterRef = useRef(new Map<string, number>());
+  const [queueRetryTick, setQueueRetryTick] = useState(0);
   useEffect(() => {
     for (const thread of threads) {
       const next = thread.queuedMessages?.[0];
@@ -6876,24 +6547,27 @@ const App: React.FC = () => {
       if (thread.status === 'running' || activeRunsByThread[thread.id] || pendingTurnStartsRef.current.has(thread.id)) {
         continue;
       }
+      if ((queueRetryAfterRef.current.get(thread.id) ?? 0) > Date.now()) continue;
+      queueRetryAfterRef.current.delete(thread.id);
       removeQueuedThreadMessage(thread.id, next.id);
+      const putBack = (error: string) => {
+        const current = findThread(useOrionStore.getState().threads, thread.id);
+        if (!current) return;
+        if (!current.queuedMessages?.some((queued) => queued.id === next.id)) {
+          updateThread(thread.id, { queuedMessages: [next, ...(current.queuedMessages ?? [])] });
+        }
+        queueRetryAfterRef.current.set(thread.id, Date.now() + QUEUE_RETRY_DELAY_MS);
+        window.setTimeout(() => setQueueRetryTick((tick) => tick + 1), QUEUE_RETRY_DELAY_MS);
+        toast.error(`Could not send the queued message in "${current.title}": ${error}`);
+      };
       void startTurnForThread(thread.id, next.text, next.attachments ?? []).then(
         (result) => {
-          if (result.ok) return;
-          addMessageToThread(thread.id, {
-            role: 'system',
-            content: `Could not send the queued message: ${result.error}`,
-          });
+          if (!result.ok) putBack(result.error ?? 'the agent turn could not start');
         },
-        (error) => {
-          addMessageToThread(thread.id, {
-            role: 'system',
-            content: `Could not send the queued message: ${error instanceof Error ? error.message : 'unknown error'}`,
-          });
-        }
+        (error) => putBack(error instanceof Error ? error.message : String(error))
       );
     }
-  }, [threads, activeRunsByThread, removeQueuedThreadMessage, startTurnForThread, addMessageToThread]);
+  }, [threads, activeRunsByThread, removeQueuedThreadMessage, startTurnForThread, updateThread, queueRetryTick]);
 
   // Goal pause/clear is an intentional cancellation, so detach the live run
   // before stopping its app-server. Otherwise the SIGTERM tail can race back
@@ -6919,7 +6593,7 @@ const App: React.FC = () => {
   // `/goal <objective> [budget:500k]` sets (or replaces) the codex goal and
   // starts pursuing it; `/goal pause|resume|clear|status` manage it. Stop on
   // a goal run pauses the goal, so pause and Stop are the same gesture.
-  const handleGoalCommand = (promptText: string, rest: string) => {
+  const handleGoalCommand = async (promptText: string, rest: string) => {
     if (!selectedThreadId || !selectedThread) return;
     const state = useOrionStore.getState();
     const model = findAgentModel(agentModels, selectedThread.modelId ?? defaultAgentModelId);
@@ -6932,8 +6606,7 @@ const App: React.FC = () => {
     const project = findProjectById(state, selectedThread.projectId);
     const workingDir = project ? threadWorkingDir(selectedThread, project) : null;
     const finishInput = () => {
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
     };
     const sub = rest.toLowerCase();
 
@@ -7065,14 +6738,9 @@ const App: React.FC = () => {
         toast.error('A run is already in flight on this thread.');
         return;
       }
-      const result = startGoalRunForThread(selectedThreadId, promptText, {
-        action: 'resume',
-      });
-      if (!result.ok) {
-        toast.error(result.error);
-        return;
-      }
-      finishInput();
+      await startFromComposer(selectedThreadId, promptText, () =>
+        startGoalRunForThread(selectedThreadId, promptText, { action: 'resume' })
+      );
       return;
     }
 
@@ -7094,21 +6762,18 @@ const App: React.FC = () => {
       toast.error('Describe the goal, e.g. “/goal get all tests passing budget:500k”.');
       return;
     }
-    const result = startGoalRunForThread(selectedThreadId, promptText, {
-      action: 'set',
-      objective,
-      ...(tokenBudget ? { tokenBudget } : {}),
-    });
-    if (!result.ok) {
-      toast.error(result.error);
-      return;
-    }
-    finishInput();
+    await startFromComposer(selectedThreadId, promptText, () =>
+      startGoalRunForThread(selectedThreadId, promptText, {
+        action: 'set',
+        objective,
+        ...(tokenBudget ? { tokenBudget } : {}),
+      })
+    );
   };
 
   // `/review` → codex reviewer. Bare = uncommitted changes; `base <branch>`,
   // `commit <sha>`, anything else = custom instructions (codex's own modes).
-  const dispatchReview = (
+  const dispatchReview = async (
     rawText: string,
     review: {
       mode: 'uncommitted' | 'base' | 'commit' | 'custom';
@@ -7122,13 +6787,37 @@ const App: React.FC = () => {
       toast.error('Wait for the current run to finish before starting a review.');
       return;
     }
-    const result = startReviewForThread(selectedThreadId, rawText, review);
-    if (!result.ok) {
-      toast.error(result.error);
-      return;
+    await startFromComposer(selectedThreadId, rawText, () => startReviewForThread(selectedThreadId, rawText, review));
+  };
+
+  // A composer command that starts a run (/goal, /review) may wait on the
+  // thread's transcript. Like a send, it takes the command out of the composer
+  // and marks the thread starting first — so a second Enter can't start it
+  // again, and whatever the user types meanwhile (or another thread's draft)
+  // is never what gets cleared — and puts the command back on its own thread
+  // if the run doesn't start.
+  const startFromComposer = async (
+    threadId: string,
+    commandText: string,
+    start: () => Promise<{ ok: boolean; error?: string }>
+  ) => {
+    composerDraft.setText('');
+    composerDraft.setStarting(threadId, true);
+    let result: { ok: boolean; error?: string };
+    try {
+      result = await start();
+    } catch (error) {
+      result = { ok: false, error: error instanceof Error ? error.message : 'The run could not start' };
+    } finally {
+      composerDraft.setStarting(threadId, false);
     }
-    setChatInput('');
-    setChatMention(null);
+    if (!result.ok) {
+      restoreComposerDraft(threadId, commandText, []);
+      toast.error(result.error);
+      return false;
+    }
+    composerDraft.flush();
+    return true;
   };
 
   const handleReviewCommand = (promptText: string) => {
@@ -7144,23 +6833,17 @@ const App: React.FC = () => {
       toast.error(parsed.error);
       return;
     }
-    dispatchReview(promptText, parsed.review);
+    void dispatchReview(promptText, parsed.review);
   };
 
   // Async delivery can outlive the originating thread selection. Restore a
   // failed submission to that thread's draft rather than overwriting whatever
   // the user is currently composing elsewhere.
   const restoreComposerDraft = (threadId: string, promptText: string, attachments: FileAttachment[]) => {
-    if (composerDraftKeyRef.current === threadId) {
-      setChatInput((current) => [promptText, current].filter(Boolean).join('\n\n'));
-      setChatAttachments((current) => [...attachments, ...current]);
-      return;
-    }
-    const draft = composerDraftsRef.current.get(threadId) ?? useOrionStore.getState().composerDrafts[threadId];
-    rememberComposerDraft(threadId, {
-      text: [promptText, draft?.text ?? ''].filter(Boolean).join('\n\n'),
-      attachments: [...attachments, ...(draft?.attachments ?? [])],
-    });
+    composerDraft.updateThreadDraft(threadId, (draft) => ({
+      text: [promptText, draft.text].filter(Boolean).join('\n\n'),
+      attachments: [...attachments, ...draft.attachments],
+    }));
   };
 
   const sendMessage = async (overrideText?: string) => {
@@ -7173,12 +6856,15 @@ const App: React.FC = () => {
     // Guard against being used directly as an event handler (onClick passes
     // the event as the first argument) — only real strings override the draft.
     const forcedText = typeof overrideText === 'string' ? overrideText : null;
-    const draftText = forcedText ?? chatInput;
+    // Read at send time: the draft lives in the composer, not in App state.
+    const draft = composerDraft.getDraft();
+    const draftText = forcedText ?? draft.text;
+    const draftAttachments = draft.attachments;
     const promptText = draftText.trim();
     // Freshly linked board tasks can be sent on their own — the cards are the
     // prompt. Mid-run they can't (queued follow-ups need their own text).
     const canSendLinkedTasksAlone = !isSending && hasPendingLinkedTasks;
-    if (!promptText && chatAttachments.length === 0 && !canSendLinkedTasksAlone) return;
+    if (!promptText && draftAttachments.length === 0 && !canSendLinkedTasksAlone) return;
 
     if (selectedThreadWorkspaceUnavailable) {
       toast.error(
@@ -7200,12 +6886,11 @@ const App: React.FC = () => {
       if (pendingTurnStartsRef.current.has(selectedThreadId)) return;
       const submittedThreadId = selectedThreadId;
       const submittedInput = draftText;
-      const submittedAttachments = chatAttachments;
+      const submittedAttachments = draftAttachments;
       // Clear before the linked-task refresh so edits made during that wait
       // belong to the current composer and are never erased by this submission.
-      setChatInput('');
-      setChatMention(null);
-      setChatAttachments([]);
+      composerDraft.clear();
+      composerDraft.flush();
       pendingTurnStartsRef.current.add(selectedThreadId);
       try {
         await refreshLinkedTasksBeforeDispatch(submittedThreadId);
@@ -7222,6 +6907,13 @@ const App: React.FC = () => {
         toast.error('This thread’s Durango workspace is being removed');
         return;
       }
+      // Inherited subagent context comes from the transcript.
+      const currentMessages = currentThread ? await loadThreadMessages(currentThread.id) : [];
+      if (!currentMessages) {
+        restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
+        toast.error(TRANSCRIPT_UNAVAILABLE_ERROR);
+        return;
+      }
       const tasksToInject = (currentThread?.linkedTasks ?? []).filter((task) => !task.injected);
       let text = buildPromptWithAttachments(promptText, submittedAttachments);
       if (tasksToInject.length > 0) {
@@ -7232,7 +6924,7 @@ const App: React.FC = () => {
         );
       }
       if (currentThread) {
-        const inheritedContext = inheritedSubagentResumeContext(currentThread, 'claude');
+        const inheritedContext = inheritedSubagentResumeContext(currentThread, currentMessages, 'claude');
         if (inheritedContext) text = addPromptContext(text, inheritedContext, true);
       }
       if (!text) {
@@ -7306,7 +6998,7 @@ const App: React.FC = () => {
     // custom Claude command named /goal still reaches the CLI's expander.
     const goalMatch = promptText.match(/^\/goal(?:\s+([\s\S]+))?$/i);
     if (goalMatch && !selectedThreadClaudeBacked) {
-      handleGoalCommand(promptText, goalMatch[1]?.trim() ?? '');
+      void handleGoalCommand(promptText, goalMatch[1]?.trim() ?? '');
       return;
     }
 
@@ -7335,8 +7027,7 @@ const App: React.FC = () => {
         toast.error(result.error);
         return;
       }
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
       return;
     }
 
@@ -7350,8 +7041,7 @@ const App: React.FC = () => {
       }
       const clearedThreadId = selectedThreadId;
       const clearedThread = selectedThread;
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
       void window.orion?.clearClaudeSession?.(clearedThreadId).catch(() => {});
       updateThread(clearedThreadId, {
         agentSessionIds: { ...clearedThread.agentSessionIds, claude: undefined },
@@ -7369,8 +7059,7 @@ const App: React.FC = () => {
         toast.error('Stop the run before switching models.');
         return;
       }
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
       const providerId = selectedAgentModel?.providerId;
       if (providerId) setActiveProviderTab(providerId);
       setModelPickerOpen(true);
@@ -7382,28 +7071,35 @@ const App: React.FC = () => {
       pinThreadToBottom(selectedThreadId);
       queueMessageToThread(selectedThreadId, {
         text: promptText,
-        attachments: chatAttachments,
+        attachments: draftAttachments,
       });
-      setChatInput('');
-      setChatMention(null);
-      setChatAttachments([]);
+      composerDraft.clear();
+      composerDraft.flush();
       return;
     }
 
     const submittedThreadId = selectedThreadId;
     const submittedInput = draftText;
-    const submittedAttachments = chatAttachments;
-    setChatInput('');
-    setChatMention(null);
-    setChatAttachments([]);
+    const submittedAttachments = draftAttachments;
+    // Empty the composer and show "Starting" before any preflight (linked-task
+    // refresh, workspace setup, mention checks) — only the composer re-renders.
+    // A failed start restores the draft below.
+    composerDraft.clear();
+    composerDraft.setStarting(submittedThreadId, true);
     let result: { ok: boolean; error?: string };
     try {
-      result = await startTurnForThread(submittedThreadId, promptText, submittedAttachments);
+      const turnStart = startTurnForThread(submittedThreadId, promptText, submittedAttachments);
+      // The sent draft is gone from disk too (after the turn's synchronous
+      // start, so it never delays it).
+      composerDraft.flush();
+      result = await turnStart;
     } catch (error) {
+      composerDraft.setStarting(submittedThreadId, false);
       restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
       toast.error(error instanceof Error ? error.message : 'The agent turn could not start');
       return;
     }
+    composerDraft.setStarting(submittedThreadId, false);
     if (!result.ok) {
       restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
       toast.error(result.error);
@@ -7467,10 +7163,7 @@ const App: React.FC = () => {
     const trackedRun = runOutputMessages.current.get(runId);
     const splitRun = trackedRun && trackedRun.threadId === threadId ? trackedRun : undefined;
     const splitMessage = splitRun
-      ? useOrionStore
-          .getState()
-          .threads.find((thread) => thread.id === threadId)
-          ?.messages.find((message) => message.id === splitRun.messageId)
+      ? loadedMessages(threadId)?.find((message) => message.id === splitRun.messageId)
       : undefined;
     const moveSplitMessage =
       !!splitMessage &&
@@ -7513,14 +7206,14 @@ const App: React.FC = () => {
       // Same run, same bubble — it just hasn't streamed anything yet, so
       // repositioning it below the steered message keeps reading order
       // without leaving an empty closed bubble behind. No retarget needed.
-      const currentMessages =
-        useOrionStore.getState().threads.find((thread) => thread.id === threadId)?.messages ?? [];
-      const bubble = currentMessages.find((message) => message.id === splitMessage.id);
-      if (bubble) {
-        updateThread(threadId, {
-          messages: [...currentMessages.filter((message) => message.id !== bubble.id), bubble],
-        });
-      }
+      useOrionStore.getState().updateThreadTranscript(threadId, (transcript) => {
+        const bubble = transcript.messages.find((message) => message.id === splitMessage.id);
+        if (!bubble) return transcript;
+        return {
+          ...transcript,
+          messages: [...transcript.messages.filter((message) => message.id !== bubble.id), bubble],
+        };
+      });
     } else if (splitMessage) {
       const continuationMessageId = addMessageToThread(threadId, {
         role: 'agent',
@@ -7616,6 +7309,13 @@ const App: React.FC = () => {
         }
       }
 
+      // Inherited subagent context comes from the transcript.
+      const threadMessages = await loadThreadMessages(thread.id);
+      if (cancelled()) return;
+      if (!threadMessages || activeRunsByThreadRef.current[threadId] !== target.runId) {
+        queueForTurnEnd();
+        return;
+      }
       const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
       const taskAttachments = linkedTaskAttachments(tasksToInject);
       const turnAttachments = [...taskAttachments, ...attachments];
@@ -7629,7 +7329,9 @@ const App: React.FC = () => {
       if (tasksToInject.length > 0) {
         addAgentContext(buildLinkedTaskContext(tasksToInject, Boolean(agentPrompt)));
       }
-      addAgentContext(inheritedSubagentResumeContext(thread, target.agentModel.providerId));
+      addAgentContext(
+        inheritedSubagentResumeContext(thread, threadMessages, target.agentModel.providerId)
+      );
       const mentionedModels = promptText ? parseModelMentions(promptText, agentModels) : [];
       if (mentionedModels.length > 0) {
         addAgentContext(buildModelMentionsContext(mentionedModels));
@@ -7735,12 +7437,12 @@ const App: React.FC = () => {
   // Composer ⚡ / ⌘⏎: steer with the current draft.
   const steerActiveAgent = async () => {
     if (!canSteerNow()) return;
-    const promptText = chatInput.trim();
-    const attachments = chatAttachments;
+    const draft = composerDraft.getDraft();
+    const promptText = draft.text.trim();
+    const attachments = draft.attachments;
     if (!promptText && attachments.length === 0) return;
-    setChatInput('');
-    setChatMention(null);
-    setChatAttachments([]);
+    composerDraft.clear();
+    composerDraft.flush();
     if (!selectedThreadId) return;
     await steerWithContent(selectedThreadId, promptText, attachments);
   };
@@ -7806,8 +7508,8 @@ const App: React.FC = () => {
       updateThread(rootThread.id, { queuedMessages: [] });
     }
     if (restoreRootQueueToComposer && queued.length > 0) {
-      setChatInput((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
-      setChatAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
+      composerDraft.setText((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
+      composerDraft.setAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
     }
     const pendingSpawnIds: string[] = [];
 
@@ -7871,8 +7573,9 @@ const App: React.FC = () => {
 
   const discardClaudeBackgroundTasks = useCallback(
     async (threadId: string, messageId: string, runId: string) => {
+      // Clicked on a card in an open transcript, so it is loaded.
       const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
-      const message = thread?.messages.find((candidate) => candidate.id === messageId);
+      const message = loadedMessages(threadId)?.find((candidate) => candidate.id === messageId);
       const intervention = message?.claudeBackgroundIntervention;
       if (!thread || !message || !intervention || intervention.runId !== runId) return;
 
@@ -7896,8 +7599,9 @@ const App: React.FC = () => {
         };
       }
 
-      const currentThread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
-      const currentMessage = currentThread?.messages.find((candidate) => candidate.id === messageId);
+      const currentMessage = (await ensureThreadTranscript(threadId).catch(() => null))?.messages.find(
+        (candidate) => candidate.id === messageId
+      );
       const currentIntervention = currentMessage?.claudeBackgroundIntervention;
       if (!currentIntervention || currentIntervention.runId !== runId) return;
 
@@ -7927,7 +7631,10 @@ const App: React.FC = () => {
       if (currentRunId === runId) clearActiveRun(runId);
       const freshThread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
       if (freshThread?.status === 'running') {
-        const lastRun = [...freshThread.messages].reverse().find((candidate) => candidate.kind === 'agent-run');
+        // Running: its transcript is loaded.
+        const lastRun = [...(loadedMessages(threadId) ?? [])]
+          .reverse()
+          .find((candidate) => candidate.kind === 'agent-run');
         updateThread(threadId, { status: 'done' });
         notifyThreadFinished(threadId, 'done');
         pushLinkedTaskStatus(threadId, 'finished', lastRun?.content.trim() || undefined);
@@ -8131,7 +7838,7 @@ const App: React.FC = () => {
                 : 'Thread not found on this machine.',
             };
           }
-          const result = startReviewForThread(threadId, promptText, reviewCommand.review);
+          const result = await startReviewForThread(threadId, promptText, reviewCommand.review);
           if (!result.ok && createdThread) useOrionStore.getState().deleteThread(threadId);
           return result.ok
             ? { ok: true, threadId }
@@ -8151,7 +7858,7 @@ const App: React.FC = () => {
         // A follow-up's outcome is its own run, not the thread's first one.
         const dispatchRunOffset =
           dispatch && !createdThread
-            ? thread!.messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length
+            ? thread!.summary.agentRunCount
             : 0;
         let dispatchLinkedTaskId: string | null = null;
         if (dispatch && !createdThread) {
@@ -8346,12 +8053,45 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!window.orion?.durangoDispatchSettled) return undefined;
     const inFlight = new Set<string>();
+    const loading = new Set<string>();
+    // Shells already looked at with no outcome (or an unreadable
+    // transcript). An outcome can only appear when the shell changes (its
+    // status or summary), so each shell version is examined — and its
+    // transcript loaded — at most once.
+    const examined = new WeakSet<Thread>();
     const check = (threads: Thread[]) => {
+      const { transcripts } = useOrionStore.getState();
       for (const thread of threads) {
         const dispatch = thread.durangoDispatch;
         if (!dispatch || dispatch.reportedAt || inFlight.has(dispatch.id)) continue;
-        const outcome = durangoDispatchOutcome(thread);
-        if (!outcome) continue;
+        if (thread.status === 'running' || examined.has(thread)) continue;
+        // No dispatched run yet, and no start failure to report.
+        if (thread.summary.agentRunCount <= (dispatch.runOffset ?? 0) && thread.status !== 'error') {
+          examined.add(thread);
+          continue;
+        }
+        const transcript = transcripts[thread.id];
+        if (!transcript) {
+          // The outcome is in the transcript: load it, then look again.
+          if (loading.has(thread.id)) continue;
+          loading.add(thread.id);
+          void ensureThreadTranscript(thread.id)
+            .catch((error) => {
+              console.warn('Could not load a dispatched thread to report its outcome', error);
+              examined.add(thread);
+              return null;
+            })
+            .finally(() => {
+              loading.delete(thread.id);
+              check(useOrionStore.getState().threads);
+            });
+          continue;
+        }
+        const outcome = durangoDispatchOutcome(thread, transcript.messages);
+        if (!outcome) {
+          examined.add(thread);
+          continue;
+        }
         inFlight.add(dispatch.id);
         updateThread(thread.id, { durangoDispatch: { ...dispatch, reportedAt: new Date().toISOString() } });
         const settled = window.orion?.durangoDispatchSettled?.({
@@ -8381,200 +8121,6 @@ const App: React.FC = () => {
       }),
     []
   );
-
-  // Track the composer's active @-mention token: the last '@' at/before the
-  // caret whose preceding character is start-of-text or whitespace, with no
-  // whitespace between the '@' and the caret. Thread mode is the exception:
-  // its search query may contain spaces (thread titles do), so only a newline
-  // ends the token there. The mode a user picked survives as long as the same
-  // '@' is being edited — once the mention closes, it is gone, which is what
-  // stops a completed "@thread:… " token from reopening the dropdown while
-  // the rest of the message is typed.
-  const updateChatMention = useCallback((value: string, caret: number | null) => {
-    const prev = chatMentionRef.current;
-    let next: { start: number; query: string; mode?: ChatMentionMode } | null = null;
-    if (caret !== null) {
-      const beforeCaret = value.slice(0, caret);
-      const atIndex = beforeCaret.lastIndexOf('@');
-      if (atIndex !== -1) {
-        const charBefore = atIndex > 0 ? beforeCaret[atIndex - 1] : '';
-        const query = beforeCaret.slice(atIndex + 1);
-        const mode = prev && prev.start === atIndex ? prev.mode : undefined;
-        const queryAllowed =
-          mode === 'thread' || mode === 'chat' ? !/[\r\n]/.test(query) : !/\s/.test(query);
-        if ((!charBefore || /\s/.test(charBefore)) && queryAllowed) {
-          next = { start: atIndex, query, ...(mode ? { mode } : {}) };
-        }
-      }
-    }
-    // A token dismissed with Escape stays closed until a new '@' is typed.
-    if (next && chatMentionDismissRef.current === next.start) {
-      next = null;
-    } else {
-      chatMentionDismissRef.current = null;
-    }
-    chatMentionRef.current = next;
-    setChatMention(next);
-  }, []);
-
-  // Selecting a kind at the dropdown's root level clears anything typed after
-  // the '@' and narrows the dropdown to that kind's list.
-  const selectChatMentionCategory = (mode: ChatMentionMode) => {
-    if (!chatMention) return;
-    const replaceEnd = getChatMentionReplaceEnd(chatInput, chatMention, 'model');
-    const nextValue = chatInput.slice(0, chatMention.start + 1) + chatInput.slice(replaceEnd);
-    const caret = chatMention.start + 1;
-    setChatInput(nextValue);
-    setChatMention({ start: chatMention.start, query: '', mode });
-    requestAnimationFrame(() => {
-      const el = chatInputRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(caret, caret);
-    });
-  };
-
-  // Selecting a mention replaces the typed token with the model's or thread's
-  // unambiguous mention token and puts the caret right after the inserted text.
-  const insertChatMention = (candidate: ChatMentionCandidate | undefined) => {
-    if (!chatMention || !candidate) return;
-    if (candidate.kind === 'category') {
-      selectChatMentionCategory(candidate.category);
-      return;
-    }
-    if (candidate.kind === 'chatStatus') {
-      if (candidate.action === 'sign-in') {
-        setChatMention(null);
-        openAccountSettings();
-      }
-      return;
-    }
-    if (candidate.kind === 'chat') rememberDurangoChats([candidate.chat]);
-    const inserted =
-      candidate.kind === 'model'
-        ? `@${modelMentionToken(candidate.model, agentModels)} `
-        : candidate.kind === 'mcp'
-          ? `@${candidate.server.nickname} `
-          : candidate.kind === 'chat'
-            ? `@${chatMentionToken(candidate.chat)} `
-            : `@${threadMentionToken(candidate.thread)} `;
-    // Thread and chat searches can contain spaces, so text after the caret
-    // is ambiguous and must be preserved. Model mentions have a safe
-    // slug-like token boundary and still consume a matching suffix.
-    const replaceEnd = getChatMentionReplaceEnd(
-      chatInput,
-      chatMention,
-      candidate.kind === 'thread' ? 'thread' : candidate.kind === 'chat' ? 'chat' : 'model'
-    );
-    const nextValue = chatInput.slice(0, chatMention.start) + inserted + chatInput.slice(replaceEnd);
-    const caret = chatMention.start + inserted.length;
-    setChatInput(nextValue);
-    setChatMention(null);
-    chatMentionDismissRef.current = null;
-    setSlashDismissedDraft(null);
-    requestAnimationFrame(() => {
-      const el = chatInputRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(caret, caret);
-    });
-  };
-
-  // Selecting a slash command replaces the draft with the command. Commands
-  // that take arguments complete to "/name " so the user can type them;
-  // argument-less ones can submit immediately (Claude Code's Enter-runs-it).
-  const insertSlashCommand = (
-    candidate: SlashCommandCandidate | undefined,
-    options?: { submit?: boolean }
-  ) => {
-    if (!candidate) return;
-    const hasArguments = Boolean(candidate.command.argumentHint);
-    const nextValue = `/${candidate.command.name}${hasArguments ? ' ' : ''}`;
-    setSlashDismissedDraft(null);
-    setChatInput(nextValue);
-    if (options?.submit && !hasArguments) {
-      void sendMessage(nextValue);
-      return;
-    }
-    requestAnimationFrame(() => {
-      const el = chatInputRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(nextValue.length, nextValue.length);
-    });
-  };
-
-  // Handle chat submit: ⏎ sends (or queues mid-run), ⌘⏎ steers mid-run.
-  const handleChatKeyDown = (e: React.KeyboardEvent) => {
-    // The open slash-command menu captures navigation keys first. It never
-    // coexists with the @-mention dropdown: the slash token spans the whole
-    // draft and contains no whitespace, so no "@" token can start inside it.
-    if (slashMenuOpen) {
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        e.preventDefault();
-        const delta = e.key === 'ArrowDown' ? 1 : -1;
-        const count = slashCommandCandidates.length;
-        setSlashCommandIndex((index) => (index + delta + count) % count);
-        return;
-      }
-      // Tab completes; Enter completes and runs argument-less commands
-      // immediately. Shift+Enter keeps its newline meaning.
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        insertSlashCommand(slashCommandCandidates[slashCommandIndex] ?? slashCommandCandidates[0]);
-        return;
-      }
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        insertSlashCommand(slashCommandCandidates[slashCommandIndex] ?? slashCommandCandidates[0], {
-          submit: true,
-        });
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setSlashDismissedDraft(chatInput);
-        return;
-      }
-    }
-    // The open @-mention dropdown captures navigation keys first.
-    if (chatMentionOpen) {
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        e.preventDefault();
-        const delta = e.key === 'ArrowDown' ? 1 : -1;
-        const count = chatMentionCandidates.length;
-        // At the bottom with more threads unloaded, arrowing down fetches the
-        // next page and steps onto its first row instead of wrapping to the top.
-        if (delta === 1 && chatMentionIndex === count - 1 && chatMentionHasMoreThreads) {
-          setChatMentionThreadLimit((limit) => limit + CHAT_MENTION_THREAD_PAGE);
-          setChatMentionIndex(count);
-          return;
-        }
-        setChatMentionIndex((index) => (index + delta + count) % count);
-        return;
-      }
-      // Shift+Enter keeps its newline meaning even with the dropdown open;
-      // plain Enter and Tab select the highlighted mention.
-      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
-        e.preventDefault();
-        insertChatMention(chatMentionCandidates[chatMentionIndex] ?? chatMentionCandidates[0]);
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        chatMentionDismissRef.current = chatMention?.start ?? null;
-        setChatMention(null);
-        return;
-      }
-    }
-    if (e.key !== 'Enter' || e.shiftKey) return;
-    e.preventDefault();
-    if ((e.metaKey || e.ctrlKey) && isSending && steerReady) {
-      void steerActiveAgent();
-      return;
-    }
-    sendMessage();
-  };
 
   const openAccountSettings = useCallback(() => {
     setSettingsTab('account');
@@ -8753,7 +8299,7 @@ const App: React.FC = () => {
     savedViewsSectionOpen,
     setSavedViewsSectionOpen,
     updateThread,
-    branchThread,
+    branchThread: branchThreadWithFeedback,
     renameProject,
     selectProject: selectProjectFromSidebar,
     threadSearchOpen,
@@ -8836,7 +8382,7 @@ const App: React.FC = () => {
       selectThread: selectThreadFromSidebar,
       setActiveTab,
       updateThread,
-      branchThread,
+      branchThread: branchThreadWithFeedback,
       pinThread,
       unpinThread,
       snoozeThread: snoozeThreadFromSidebar,
@@ -8848,7 +8394,7 @@ const App: React.FC = () => {
       renderThreadCliBadge,
     }),
     [
-      branchThread,
+      branchThreadWithFeedback,
       deleteThreadWithRuntime,
       pinThread,
       selectThreadFromSidebar,
@@ -8999,76 +8545,6 @@ const App: React.FC = () => {
     [openThreadInSplit]
   );
 
-  // A sidebar thread dropped on the composer links it as an @thread mention —
-  // the same token the @ dropdown inserts — rather than opening a split pane.
-  // Only drags the composer can turn into a working reference are intercepted;
-  // anything else falls through to the panel's split-view handlers above.
-  const [composerThreadDropActive, setComposerThreadDropActive] = useState(false);
-  const composerAcceptsThreadDrop =
-    canReferenceThreadsFromComposer && !isNativeSubagentThread && !selectedThreadWorkspaceUnavailable;
-
-  const handleComposerThreadDragOver = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      if (!isThreadDrag(event) || !composerAcceptsThreadDrop) return;
-      event.preventDefault();
-      event.stopPropagation();
-      event.dataTransfer.dropEffect = 'copy';
-      setComposerThreadDropActive(true);
-      // The panel's split-drop hint is already up from the travel across the
-      // main view; the composer takes over while the drag is above it.
-      setThreadDropActive(false);
-    },
-    [composerAcceptsThreadDrop]
-  );
-
-  const handleComposerThreadDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!isThreadDrag(event)) return;
-    // Ignore transitions between the composer's own children.
-    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-    setComposerThreadDropActive(false);
-  }, []);
-
-  const handleComposerThreadDrop = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      if (!isThreadDrag(event) || !composerAcceptsThreadDrop) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setComposerThreadDropActive(false);
-      const threadId = event.dataTransfer.getData(THREAD_DRAG_MIME);
-      const thread = threads.find((t) => t.id === threadId);
-      if (
-        !thread ||
-        !isThreadReferenceCandidate(
-          thread.id,
-          selectedThreadId,
-          isClaudeCodeCliModelId(thread.modelId)
-        )
-      ) {
-        return;
-      }
-      // Insert at the caret (the textarea keeps its selection while unfocused),
-      // padding with spaces so the token stays a standalone word.
-      const token = `@${threadMentionToken(thread)}`;
-      const el = chatInputRef.current;
-      const start = el?.selectionStart ?? chatInput.length;
-      const end = el?.selectionEnd ?? start;
-      const before = chatInput.slice(0, start);
-      const after = chatInput.slice(end);
-      const inserted = `${before && !/\s$/.test(before) ? ' ' : ''}${token}${/^\s/.test(after) ? '' : ' '}`;
-      setChatInput(before + inserted + after);
-      setChatMention(null);
-      chatMentionDismissRef.current = null;
-      const caret = start + inserted.length;
-      requestAnimationFrame(() => {
-        const input = chatInputRef.current;
-        if (!input) return;
-        input.focus();
-        input.setSelectionRange(caret, caret);
-      });
-    },
-    [chatInput, composerAcceptsThreadDrop, selectedThreadId, threads]
-  );
-
   // Width every composer chip would take if they all stayed on the row. Depends
   // only on the labels, so it never changes as a result of collapsing them —
   // the compact row can't measure the full one, and a measured switch would
@@ -9098,7 +8574,7 @@ const App: React.FC = () => {
     if (!isTerminalThread) widths.push(34);
     widths.push(34); // File attachment picker.
     widths.push(36); // Send, or stop while a run is in flight.
-    if (isSending && (chatInput.trim() || chatAttachments.length > 0)) {
+    if (isSending && composerHasDraft) {
       widths.push(36); // Queue.
       if (steerSupported) widths.push(36);
     }
@@ -9553,6 +9029,32 @@ const App: React.FC = () => {
   // The composer belongs to the focused pane: one thread takes input at a
   // time and clicking any pane moves it there. Built once, outside the pane
   // loop, so a six-way split never duplicates the picker/mention machinery.
+  // Handlers the Composer calls. Stable identities that always run the latest
+  // App closure, so passing them never re-renders the Composer by itself.
+  const sendFromComposer = useLatestCallback((overrideText?: string) => {
+    void sendMessage(overrideText);
+  });
+  const steerFromComposer = useLatestCallback(() => {
+    void steerActiveAgent();
+  });
+  const stopFromComposer = useLatestCallback(() => {
+    void stopActiveAgent();
+  });
+  const dispatchReviewFromComposer = useLatestCallback((rawText: string, review: ComposerReviewRequest) =>
+    dispatchReview(rawText, review)
+  );
+  const hideThreadDropHint = useCallback(() => setThreadDropActive(false), []);
+  // Base branches the Codex "/review base" picker offers.
+  const reviewBranches = useMemo(
+    () => (gitState?.branches ?? []).filter((branch) => !branch.current).map((branch) => branch.name),
+    [gitState?.branches]
+  );
+  // Whether /btw can run: Claude, directly or as an Orion main driver.
+  const btwAvailable =
+    selectedAgentModel?.providerId === 'claude' ||
+    (isOrionModelId(selectedThread?.modelId ?? '') &&
+      findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)?.providerId === 'claude');
+
   const composerNode = selectedThread ? (
     <div className="chat-input-area">
       <UserActionCards
@@ -9574,426 +9076,111 @@ const App: React.FC = () => {
         split={threadPanes.length > 1}
       />
       {composerGitBar}
-      <div
-        className={`composer-shell${composerThreadDropActive ? ' thread-drop-target' : ''}`}
-        onDragOver={handleComposerThreadDragOver}
-        onDragLeave={handleComposerThreadDragLeave}
-        onDrop={handleComposerThreadDrop}
-      >
-        {chatAttachments.length > 0 && (
-          <div className="composer-attachments">
-            {chatAttachments.map((attachment) => (
-              <div
-                key={attachment.id}
-                className={`composer-attachment${attachment.snapshot?.kind === 'accessibility' ? ' cursor-pointer' : ''}`}
-                title={
-                  attachment.snapshot?.kind === 'accessibility'
-                    ? `Open the app text captured from ${attachment.snapshot.appName}\n${attachment.path}`
-                    : attachment.path
-                }
-                onClick={
-                  attachment.snapshot?.kind === 'accessibility'
-                    ? (event) => {
-                        if ((event.target as HTMLElement).closest('button')) return;
-                        void openSnapShotOutline(attachment.path);
-                      }
-                    : undefined
-                }
-              >
-                <AttachmentThumb attachment={attachment} />
-                <span className="composer-attachment-meta">
-                  {attachment.snapshot && <SnapShotAttachmentBadge snapshot={attachment.snapshot} />}
-                  <span className="composer-attachment-name">{attachment.name}</span>
-                  <span className="composer-attachment-size">
-                    {formatAttachmentSize(attachment.size)}
-                  </span>
-                </span>
-                <button
-                  type="button"
-                  className="composer-attachment-remove"
-                  onClick={() => removeChatAttachment(attachment.id)}
-                  title="Remove attachment"
-                >
-                  <X size={13} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-        {hasPendingLinkedTasks && (
-          <div className="composer-task-row">
-            {pendingLinkedTasks.map((linkedTask) => (
-              <div
-                key={linkedTask.id}
-                className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
-                title={linkedTask.description || linkedTask.title}
-              >
-                <SquareKanban size={13} />
-                <span className="composer-task-title">{linkedTask.title}</span>
-                <span className="composer-task-status">
-                  {linkedTaskStatusLabel(linkedTask.lastStatus)}
-                </span>
-                {linkedTask.lastStatus !== 'done' && !isSending && (
-                  <button
-                    type="button"
-                    className="composer-task-action done"
-                    onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
-                    title="Mark the task as done in Durango Tasks"
+      <Composer
+        controller={composerDraft}
+        threadId={selectedThread.id}
+        agentModels={agentModels}
+        enabledProviderIds={enabledProviderIdSet}
+        orionMcps={orionMcps}
+        threads={threads}
+        projects={projects}
+        canReferenceThreads={canReferenceThreads}
+        liveSlashCommands={selectedThreadSlashCommands}
+        reviewBranches={reviewBranches}
+        providerId={selectedAgentModel?.providerId ?? null}
+        modelAvailable={selectedAgentModel?.available !== false}
+        claudeBacked={selectedThreadClaudeBacked}
+        btwAvailable={btwAvailable}
+        isTerminalThread={isTerminalThread}
+        isNativeSubagentThread={isNativeSubagentThread}
+        workspaceUnavailable={selectedThreadWorkspaceUnavailable}
+        workspaceRemoving={selectedThreadWorkspaceRemoving}
+        isSending={isSending}
+        steerSupported={steerSupported}
+        steerReady={steerReady}
+        pendingLinkedTaskCount={pendingLinkedTasks.length}
+        taskRow={
+          <>
+            {hasPendingLinkedTasks && (
+              <div className="composer-task-row">
+                {pendingLinkedTasks.map((linkedTask) => (
+                  <div
+                    key={linkedTask.id}
+                    className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
+                    title={linkedTask.description || linkedTask.title}
                   >
-                    <CircleCheck size={13} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="composer-task-action"
-                  onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
-                  title="Unlink task"
-                >
-                  <X size={12} />
-                </button>
+                    <SquareKanban size={13} />
+                    <span className="composer-task-title">{linkedTask.title}</span>
+                    <span className="composer-task-status">
+                      {linkedTaskStatusLabel(linkedTask.lastStatus)}
+                    </span>
+                    {linkedTask.lastStatus !== 'done' && !isSending && (
+                      <button
+                        type="button"
+                        className="composer-task-action done"
+                        onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
+                        title="Mark the task as done in Durango Tasks"
+                      >
+                        <CircleCheck size={13} />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="composer-task-action"
+                      onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
+                      title="Unlink task"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        )}
-        {attachedOrionMcps.length > 0 && selectedThread && !isTerminalThread && (
-          <div className="composer-mcp-row">
-            {attachedOrionMcps.map((server) => (
-              <div
-                key={server.id}
-                className={`composer-mcp-chip${server.status === 'needs-sign-in' ? ' needs-sign-in' : ''}`}
-                title={
-                  server.status === 'needs-sign-in'
-                    ? `@${server.nickname} needs a new sign-in in Settings → Skills & MCPs`
-                    : `@${server.nickname} is loaded for every turn in this thread`
-                }
-              >
-                <Plug size={12} />
-                <span>@{server.nickname}</span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    updateThread(selectedThread.id, {
-                      mcpServerIds: (selectedThread.mcpServerIds ?? []).filter((id) => id !== server.id),
-                    })
-                  }
-                  title="Stop loading this MCP in this thread"
-                >
-                  <X size={11} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-        {!slashMenuOpen && completedSlash && (
-          <div className="composer-btw-hint">
-            <SquareSlash size={12} />
-            <span>
-              /{completedSlash.command.name}
-              {completedSlash.command.argumentHint ? ` ${completedSlash.command.argumentHint}` : ''}
-              {completedSlash.command.description ? ` — ${completedSlash.command.description}` : ''}
-            </span>
-          </div>
-        )}
-        {!slashMenuOpen &&
-          !isTerminalThread &&
-          // Claude-backed threads run Claude Code's own /review (expanded
-          // CLI-side); the generic command hint above covers it there. While
-          // the preset popover is up it already explains the choices, so the
-          // long banner would only stack noise above the composer.
-          !selectedThreadClaudeBacked &&
-          !codexReviewPresetsActive &&
-          /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
-            <div className="composer-btw-hint">
-              <SquarePen size={12} />
-              <span>
-                {selectedAgentModel?.providerId === 'codex'
-                  ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
-                  : '/review is only available on Codex agents.'}
-              </span>
-            </div>
-          )}
-        {!slashMenuOpen &&
-          !isTerminalThread &&
-          !selectedThreadClaudeBacked &&
-          /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
-          <div className="composer-btw-hint">
-            <Target size={12} />
-            <span>
-              {selectedAgentModel?.providerId === 'codex'
-                ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
-                : '/goal is only available on Codex agents.'}
-            </span>
-          </div>
-        )}
-        {!slashMenuOpen && !isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
-          <div className="composer-btw-hint">
-            <Sparkles size={12} />
-            <span>
-              {selectedAgentModel?.providerId === 'claude' ||
-              (isOrionModelId(selectedThread.modelId) &&
-                findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)
-                  ?.providerId === 'claude')
-                ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
-                : '/btw is only available on Claude agents for now.'}
-            </span>
-          </div>
-        )}
-        {codexReviewPresetsActive && (
-            <ComposerPopover className="review-popover">
-              <button
-                type="button"
-                role="option"
-                className="mention-row"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() =>
-                  dispatchReview('/review', {
-                    mode: 'uncommitted',
-                  })
-                }
-              >
-                <SquarePen size={14} />
-                <span className="mention-row-label">Review uncommitted changes</span>
-              </button>
-              <button
-                type="button"
-                role="option"
-                className="mention-row"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => setChatInput('/review base ')}
-              >
-                <GitBranch size={14} />
-                <span className="mention-row-label">Review against a base branch</span>
-              </button>
-            </ComposerPopover>
-          )}
-        {!slashMenuOpen &&
-          selectedAgentModel?.providerId === 'codex' &&
-          /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
-            <ComposerPopover className="review-popover">
-              {(gitState?.branches ?? [])
-                .filter((branch) => !branch.current)
-                .slice(0, 12)
-                .map((branch) => (
-                  <button
-                    key={branch.name}
-                    type="button"
-                    role="option"
-                    className="mention-row"
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() =>
-                      dispatchReview(`/review base ${branch.name}`, {
-                        mode: 'base',
-                        base: branch.name,
-                      })
+            )}
+          </>
+        }
+        mcpRow={
+          <>
+            {attachedOrionMcps.length > 0 && selectedThread && !isTerminalThread && (
+              <div className="composer-mcp-row">
+                {attachedOrionMcps.map((server) => (
+                  <div
+                    key={server.id}
+                    className={`composer-mcp-chip${server.status === 'needs-sign-in' ? ' needs-sign-in' : ''}`}
+                    title={
+                      server.status === 'needs-sign-in'
+                        ? `@${server.nickname} needs a new sign-in in Settings → Skills & MCPs`
+                        : `@${server.nickname} is loaded for every turn in this thread`
                     }
                   >
-                    <GitBranch size={14} />
-                    <span className="mention-row-label">{branch.name}</span>
-                  </button>
+                    <Plug size={12} />
+                    <span>@{server.nickname}</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateThread(selectedThread.id, {
+                          mcpServerIds: (selectedThread.mcpServerIds ?? []).filter((id) => id !== server.id),
+                        })
+                      }
+                      title="Stop loading this MCP in this thread"
+                    >
+                      <X size={11} />
+                    </button>
+                  </div>
                 ))}
-              {!(gitState?.branches ?? []).some((branch) => !branch.current) && (
-                <div className="mention-row" aria-disabled="true">
-                  <GitBranch size={14} />
-                  <span className="mention-row-label">No other branches — type a branch name</span>
-                </div>
-              )}
-            </ComposerPopover>
-          )}
-        {slashMenuOpen && (
-          <ComposerPopover className="slash-popover">
-            {slashCommandCandidates.map((candidate, index) => {
-              const { command, source } = candidate;
-              const RowIcon =
-                source === 'orion'
-                  ? command.name === 'goal'
-                    ? Target
-                    : command.name === 'review'
-                      ? SquarePen
-                      : command.name === 'btw'
-                        ? Sparkles
-                        : command.name === 'clear'
-                          ? Eraser
-                          : command.name === 'model'
-                            ? Bot
-                            : SquareSlash
-                  : SquareSlash;
-              return (
-                <button
-                  key={`${source}:${command.name}`}
-                  ref={index === slashCommandIndex ? slashCommandSelectedRef : null}
-                  type="button"
-                  role="option"
-                  aria-selected={index === slashCommandIndex}
-                  className={`mention-row ${index === slashCommandIndex ? 'selected' : ''}`}
-                  onMouseEnter={() => setSlashCommandIndex(index)}
-                  // Keep the textarea focused so selection doesn't blur the composer.
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => insertSlashCommand(candidate, { submit: true })}
-                >
-                  <RowIcon size={16} />
-                  <span className="mention-row-label">
-                    /{command.name}
-                    {command.argumentHint ? (
-                      <span className="slash-row-hint"> {command.argumentHint}</span>
-                    ) : null}
-                  </span>
-                  <span className="mention-row-slug">{command.description}</span>
-                </button>
-              );
-            })}
-          </ComposerPopover>
-        )}
-        {chatMentionOpen && (
-          <ComposerPopover onScroll={handleChatMentionScroll}>
-            {chatMentionCandidates.map((candidate, index) => {
-              const rowProps = {
-                ref: index === chatMentionIndex ? chatMentionSelectedRef : null,
-                type: 'button' as const,
-                role: 'option',
-                'aria-selected': index === chatMentionIndex,
-                className: `mention-row ${index === chatMentionIndex ? 'selected' : ''}`,
-                onMouseEnter: () => setChatMentionIndex(index),
-                // Keep the textarea focused so selection doesn't blur the composer.
-                onMouseDown: (e: React.MouseEvent) => e.preventDefault(),
-                onClick: () => insertChatMention(candidate),
-              };
-              if (candidate.kind === 'category') {
-                const CategoryIcon =
-                  candidate.category === 'model'
-                    ? Bot
-                    : candidate.category === 'mcp'
-                      ? Plug
-                      : candidate.category === 'chat'
-                        ? MessageCircle
-                        : MessageSquare;
-                return (
-                  <button key={`category:${candidate.category}`} {...rowProps} title={candidate.hint}>
-                    <CategoryIcon size={16} />
-                    <span className="mention-row-label">{candidate.label}</span>
-                    <span className="mention-row-slug">{candidate.hint}</span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'thread') {
-                const { thread, projectName } = candidate;
-                return (
-                  <button key={thread.id} {...rowProps} title={threadMentionToken(thread)}>
-                    <MessageSquare size={16} />
-                    <span className="mention-row-label">{thread.title}</span>
-                    <span className="mention-row-slug">
-                      {projectName} · {formatShortTime(getThreadActivityTime(thread))}
-                    </span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'chat') {
-                const { chat } = candidate;
-                const updated = formatChatUpdatedAt(chat.updatedAt);
-                const snippet = chat.snippet?.trim().replace(/\s+/g, ' ') ?? '';
-                return (
-                  <button
-                    key={`chat:${chat.id}`}
-                    {...rowProps}
-                    className={`${rowProps.className} chat-mention-row`}
-                    title={`@${chatMentionToken(chat)}`}
-                  >
-                    <MessageCircle size={16} />
-                    <span className="mention-row-label">{chat.title || 'Untitled chat'}</span>
-                    <span className="mention-row-slug">
-                      {[updated, snippet].filter(Boolean).join(' · ') || 'Durango chat'}
-                    </span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'chatStatus') {
-                return (
-                  <button
-                    key={`chatStatus:${candidate.message}`}
-                    {...rowProps}
-                    aria-disabled={!candidate.action}
-                    title={candidate.action === 'sign-in' ? 'Open account settings' : candidate.message}
-                  >
-                    <MessageCircle size={16} />
-                    <span className="mention-row-slug">{candidate.message}</span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'mcp') {
-                const { server } = candidate;
-                return (
-                  <button key={`mcp:${server.id}`} {...rowProps} title={`@${server.nickname}`}>
-                    <Plug size={16} />
-                    <span className="mention-row-label">@{server.nickname}</span>
-                    <span className="mention-row-slug">
-                      {server.status === 'needs-sign-in'
-                        ? 'sign in needed'
-                        : server.enabled
-                          ? 'always on'
-                          : 'MCP · loads when mentioned'}
-                    </span>
-                  </button>
-                );
-              }
-              const { model } = candidate;
-              const ProviderIcon =
-                agentProviders.find((provider) => provider.id === model.providerId)?.icon ?? Play;
-              return (
-                <button key={model.id} {...rowProps} title={modelMentionToken(model, agentModels)}>
-                  <ProviderIcon size={16} />
-                  <span className="mention-row-label">{model.label}</span>
-                  <span className="mention-row-slug">{modelMentionToken(model, agentModels)}</span>
-                </button>
-              );
-            })}
-          </ComposerPopover>
-        )}
-        <textarea
-          ref={setChatInputRef}
-          className="chat-input min-h-[52px]"
-          disabled={isNativeSubagentThread || selectedThreadWorkspaceUnavailable}
-          placeholder={
-            isNativeSubagentThread
-              ? 'Read-only subagent transcript — steer from the parent thread.'
-              : selectedThreadWorkspaceUnavailable
-                ? selectedThreadWorkspaceRemoving
-                  ? 'Removing this thread’s Durango workspace…'
-                  : 'Creating a Durango workspace for this thread — cloning dependencies, one moment…'
-                : isTerminalThread
-                  ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
-                  : isSending
-                    ? steerSupported
-                      ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
-                      : 'Queue a follow-up — sends when the agent finishes (⏎)…'
-                    : chatAttachments.length > 0
-                      ? `Ask something about the attached ${attachmentKindLabel(chatAttachments)}...`
-                      : hasPendingLinkedTasks
-                        ? `Add details (optional) — send starts on the linked ${
-                            pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
-                          }...`
-                        : 'Describe what you want the agent to do...'
-          }
-          value={chatInput}
-          onChange={(e) => {
-            setSlashDismissedDraft(null);
-            setChatInput(e.target.value);
-            updateChatMention(e.target.value, e.target.selectionStart);
-          }}
-          onKeyDown={handleChatKeyDown}
-          // Caret moves without input still open/close the mention
-          // dropdown. Dropdown-navigation keys are excluded so a
-          // handled keydown can't immediately recompute the token.
-          onKeyUp={(e) => {
-            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
-              updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart);
-            }
-          }}
-          onClick={(e) => updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart)}
-          rows={2}
-        />
-        <div
-          className={`composer-controls${composerControlsCompact ? ' compact' : ''}`}
-          ref={composerControlsRef}
-        >
+              </div>
+            )}
+          </>
+        }
+        controlsClassName={`composer-controls${composerControlsCompact ? ' compact' : ''}`}
+        controlsRef={composerControlsRef}
+        onSend={sendFromComposer}
+        onSteer={steerFromComposer}
+        onStop={stopFromComposer}
+        onDispatchReview={dispatchReviewFromComposer}
+        onOpenAccountSettings={openAccountSettings}
+        onThreadDragOver={hideThreadDropHint}
+      >
+        <>
           <div className="model-picker-anchor" ref={modelPickerRef}>
             <button
               className="model-trigger"
@@ -10344,53 +9531,8 @@ const App: React.FC = () => {
           >
             <Paperclip size={15} />
           </button>
-
-          {isSending ? (
-            <>
-              {(chatInput.trim() || chatAttachments.length > 0) && (
-                <>
-                  <button
-                    className="send-button"
-                    onClick={sendMessage}
-                    title="Queue — sends when the current run finishes (⏎)"
-                  >
-                    <ListPlus size={15} />
-                  </button>
-                  {steerSupported && (
-                    <button
-                      className="send-button steer"
-                      onClick={steerActiveAgent}
-                      disabled={!steerReady}
-                      title={
-                        steerReady
-                          ? 'Steer — the agent picks this up mid-run without losing its work (⌘⏎)'
-                          : 'Steer is unavailable — the message will queue instead'
-                      }
-                    >
-                      <Zap size={14} />
-                    </button>
-                  )}
-                </>
-              )}
-              <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
-                <Square size={14} fill="currentColor" />
-              </button>
-            </>
-          ) : (
-            <button
-              className="send-button"
-              onClick={sendMessage}
-              disabled={
-                (!chatInput.trim() && chatAttachments.length === 0 && !hasPendingLinkedTasks) ||
-                selectedAgentModel?.available === false
-              }
-              title="Send"
-            >
-              <ArrowUp size={16} strokeWidth={2.5} />
-            </button>
-          )}
-        </div>
-      </div>
+        </>
+      </Composer>
     </div>
   ) : null;
 
@@ -10530,7 +9672,7 @@ const App: React.FC = () => {
                       role="menuitem"
                       onClick={() => {
                         setThreadMenuOpen(false);
-                        if (selectedThread) branchThread(selectedThread.id);
+                        if (selectedThread) void branchThreadWithFeedback(selectedThread.id);
                       }}
                     >
                       <GitBranch size={13} /> Branch
@@ -10582,7 +9724,7 @@ const App: React.FC = () => {
                         role="menuitem"
                         onClick={() => {
                           setGoalMenuOpen(false);
-                          handleGoalCommand('/goal pause', 'pause');
+                          void handleGoalCommand('/goal pause', 'pause');
                         }}
                       >
                         <Pause size={13} /> Pause goal
@@ -10594,7 +9736,7 @@ const App: React.FC = () => {
                         role="menuitem"
                         onClick={() => {
                           setGoalMenuOpen(false);
-                          handleGoalCommand('/goal resume', 'resume');
+                          void handleGoalCommand('/goal resume', 'resume');
                         }}
                       >
                         <Play size={13} /> Resume goal
@@ -10606,7 +9748,7 @@ const App: React.FC = () => {
                       role="menuitem"
                       onClick={() => {
                         setGoalMenuOpen(false);
-                        handleGoalCommand('/goal clear', 'clear');
+                        void handleGoalCommand('/goal clear', 'clear');
                       }}
                     >
                       <X size={13} /> Clear goal

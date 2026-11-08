@@ -702,21 +702,24 @@ try {
   // Renderer: when a dispatched thread counts as settled
   // ======================================================================================
 
+  // The store keeps the transcript apart from the thread's shell.
+  const outcomeOf = (thread) => durangoDispatchOutcome(thread, thread.messages);
+
   await test('renderer outcome: finished summary, error, stop, restart, still running', () => {
     const dispatch = { id: 'd1', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' };
     const run = (fields) => ({ id: 'm', role: 'agent', kind: 'agent-run', content: '', ts: 'x', ...fields });
-    assert.equal(durangoDispatchOutcome({ status: 'running', messages: [run({ status: 'running' })], durangoDispatch: dispatch }), null);
-    assert.equal(durangoDispatchOutcome({ status: 'idle', messages: [], durangoDispatch: dispatch }), null, 'not started yet');
-    assert.deepEqual(durangoDispatchOutcome({ status: 'done', messages: [run({ status: 'done', content: 'Fixed it.' })], durangoDispatch: dispatch }), { outcome: 'finished', summary: 'Fixed it.' });
-    assert.deepEqual(durangoDispatchOutcome({ status: 'error', messages: [run({ status: 'error', error: 'claude exited with code 1.' })], durangoDispatch: dispatch }), { outcome: 'failed', error: 'claude exited with code 1.' });
-    assert.match(durangoDispatchOutcome({ status: 'idle', messages: [run({ status: 'stopped' })], durangoDispatch: dispatch }).error, /Stopped in Durango Code/);
-    assert.match(durangoDispatchOutcome({ status: 'idle', messages: [run({ status: 'stopped', statusText: 'Interrupted by app restart.' })], durangoDispatch: dispatch }).error, /quit before/);
-    assert.equal(durangoDispatchOutcome({ status: 'done', messages: [run({ status: 'done' })], durangoDispatch: { ...dispatch, reportedAt: 'x' } }), null, 'reported once');
+    assert.equal(outcomeOf({ status: 'running', messages: [run({ status: 'running' })], durangoDispatch: dispatch }), null);
+    assert.equal(outcomeOf({ status: 'idle', messages: [], durangoDispatch: dispatch }), null, 'not started yet');
+    assert.deepEqual(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'Fixed it.' })], durangoDispatch: dispatch }), { outcome: 'finished', summary: 'Fixed it.' });
+    assert.deepEqual(outcomeOf({ status: 'error', messages: [run({ status: 'error', error: 'claude exited with code 1.' })], durangoDispatch: dispatch }), { outcome: 'failed', error: 'claude exited with code 1.' });
+    assert.match(outcomeOf({ status: 'idle', messages: [run({ status: 'stopped' })], durangoDispatch: dispatch }).error, /Stopped in Durango Code/);
+    assert.match(outcomeOf({ status: 'idle', messages: [run({ status: 'stopped', statusText: 'Interrupted by app restart.' })], durangoDispatch: dispatch }).error, /quit before/);
+    assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done' })], durangoDispatch: { ...dispatch, reportedAt: 'x' } }), null, 'reported once');
     // A follow-up counts its own run, not the thread's earlier ones.
     const followUp = { ...dispatch, runOffset: 1 };
-    assert.equal(durangoDispatchOutcome({ status: 'idle', messages: [run({ status: 'done', content: 'Old.' })], durangoDispatch: followUp }), null, 'its run has not started');
+    assert.equal(outcomeOf({ status: 'idle', messages: [run({ status: 'done', content: 'Old.' })], durangoDispatch: followUp }), null, 'its run has not started');
     assert.deepEqual(
-      durangoDispatchOutcome({ status: 'done', messages: [run({ status: 'done', content: 'Old.' }), run({ status: 'done', content: 'Tests added.' })], durangoDispatch: followUp }),
+      outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'Old.' }), run({ status: 'done', content: 'Tests added.' })], durangoDispatch: followUp }),
       { outcome: 'finished', summary: 'Tests added.' }
     );
     const summary = dispatchSummaryText('a'.repeat(100) + 'THE END', 20);

@@ -29,7 +29,7 @@ import { SidebarSearchPanel, warmSearchIndex } from './threadSearch';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { useSidebarResize } from './useSidebarResize';
 import { THREAD_DRAG_MIME } from './AgentsSidebar';
-import { formatWorkedDuration, threadSidebarTone, threadWorkedMs, workStartedAt, type SidebarV2Lists, type SidebarV2View, type SidebarV2ViewsSettings } from './threadLists';
+import { formatWorkedDuration, threadSidebarTone, threadWorkedMs, type SidebarV2Lists, type SidebarV2View, type SidebarV2ViewsSettings } from './threadLists';
 
 // Sidebar v2 (Settings → Experimental), after T3 Code's: one flat list of
 // threads instead of project groups. The header holds search, New agent, Add
@@ -69,7 +69,7 @@ export type SidebarV2Actions = {
   selectThread: (id: string | null) => void;
   setActiveTab: (tab: 'agents' | 'code') => void;
   updateThread: (id: string, updates: Partial<Thread>) => void;
-  branchThread: (sourceThreadId: string) => string | null;
+  branchThread: (sourceThreadId: string) => Promise<string | null>;
   pinThread: (threadId: string) => void;
   unpinThread: (threadId: string) => void;
   snoozeThread: (threadId: string) => void;
@@ -675,14 +675,7 @@ const ProviderMark: React.FC<{ modelId: string }> = ({ modelId }) => {
 // "Working 12s": time since the user's message, across the turns the agent
 // was re-invoked for while it waited on background tasks.
 const WorkingDuration: React.FC<{ thread: Thread }> = ({ thread }) => {
-  const startedAt = useMemo(() => {
-    for (let i = thread.messages.length - 1; i >= 0; i -= 1) {
-      const message = thread.messages[i];
-      if (message.kind === 'agent-run') return workStartedAt(thread.messages, message);
-      if (message.role === 'agent') return Date.parse(message.ts);
-    }
-    return null;
-  }, [thread.messages]);
+  const startedAt = thread.summary.workingSince;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);

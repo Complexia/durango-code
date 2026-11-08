@@ -8,7 +8,7 @@ import {
   Send,
   Square,
 } from 'lucide-react';
-import type { Thread } from '../store';
+import type { Thread, ThreadRecord } from '../store';
 import type { RemoteEvent, RemoteSnapshot, RemoteThreadMeta } from '../types';
 import { createLatestOperationGate } from './remote-operation-gate';
 import { formatShortTime } from './time';
@@ -46,7 +46,7 @@ const RemoteMachineView = React.memo(function RemoteMachineView({
   const [loading, setLoading] = React.useState(true);
   const [selectedThreadId, setSelectedThreadId] = React.useState<string | null>(null);
   const [selectedProjectId, setSelectedProjectId] = React.useState<string | null>(null);
-  const [thread, setThread] = React.useState<Thread | null>(null);
+  const [thread, setThread] = React.useState<ThreadRecord | null>(null);
   const [threadLoading, setThreadLoading] = React.useState(false);
   const [threadError, setThreadError] = React.useState<string | null>(null);
   const [prompt, setPrompt] = React.useState('');

@@ -4,7 +4,7 @@ import { deriveTitle, getGoalTitleSeed, tryGenerateBetterTitle } from '../src/ap
 
 const freshThread = {
   title: 'Thread 09:22 PM',
-  messages: [],
+  summary: { messageCount: 0 },
 };
 const objective = 'ship the release safely';
 
@@ -24,7 +24,7 @@ assert.equal(
   'a goal must preserve an existing custom title'
 );
 assert.equal(
-  getGoalTitleSeed({ ...freshThread, messages: [{}] }, { action: 'set', objective }),
+  getGoalTitleSeed({ ...freshThread, summary: { messageCount: 1 } }, { action: 'set', objective }),
   null,
   'a goal must not retitle a thread with existing transcript messages'
 );

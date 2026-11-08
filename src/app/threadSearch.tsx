@@ -1,38 +1,24 @@
-import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useDeferredValue, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { MessageSquare, Search } from 'lucide-react';
-import { type Message, type Project, type Thread, useOrionStore } from '../store';
+import { type Message, type Project, type Thread, type ThreadTranscript, useOrionStore } from '../store';
+import {
+  BODY_MATCH_WORD,
+  isWordStart,
+  messageSearchText,
+  normalizeSearchText,
+  scoreBodyToken,
+  transcriptExcerpt,
+} from '../thread-shell.js';
 import { ProjectIcon } from './ProjectIcon';
 import { formatShortTime, getThreadActivityTime } from './time';
+
+export { normalizeSearchText };
 
 export const THREAD_SEARCH_INDEX_REFRESH_MS = 150;
 
 const RECENT_THREAD_LIMIT = 12;
 const RESULT_LIMIT = 50;
 const THREAD_RESULT_LIMIT = 40;
-// Activity details range from a one-line command to a whole file's output.
-// Short ones (commands, paths) are worth finding; long ones only add noise
-// and indexing cost.
-const ACTIVITY_DETAIL_INDEX_LIMIT = 400;
-// Scores at or above this come from a name match, which always beats the best
-// transcript match — so once a token hits a name the transcript is skipped.
-const BODY_MATCH_WORD = 18;
-const BODY_MATCH_SUBSTRING = 8;
-
-const NON_ASCII = /[^\x00-\x7f]/;
-
-export const normalizeSearchText = (value: string) => {
-  let text = value.toLowerCase();
-  // NFKD is the slow step and only matters for accented input.
-  if (NON_ASCII.test(text)) text = text.normalize('NFKD').replace(/[̀-ͯ]/g, '');
-  return text
-    .replace(/[^a-z0-9/_ .:-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-};
-
-const WORD_SEPARATORS = ' /_.:-';
-const isWordStart = (text: string, index: number) =>
-  index === 0 || WORD_SEPARATORS.includes(text[index - 1]);
 
 export type SearchQuery = {
   /** Distinct normalized words; every one must match for a result to count. */
@@ -98,23 +84,6 @@ const scoreNameToken = (name: string, token: string) => {
   return fuzzyNameScore(name, token);
 };
 
-const scoreBodyToken = (chunks: readonly string[], token: string) => {
-  if (token.length < 2) return 0;
-  let found = false;
-  for (const chunk of chunks) {
-    let index = chunk.indexOf(token);
-    // Common fragments recur thousands of times in a long transcript; a
-    // handful of misses is enough to settle for a plain substring hit.
-    for (let checks = 0; index !== -1 && checks < 8; checks += 1) {
-      if (isWordStart(chunk, index)) return BODY_MATCH_WORD;
-      found = true;
-      index = chunk.indexOf(token, index + 1);
-    }
-    if (index !== -1) found = true;
-  }
-  return found ? BODY_MATCH_SUBSTRING : 0;
-};
-
 const recencyBonus = (activityMs: number) => {
   if (!Number.isFinite(activityMs)) return 0;
   const ageHours = Math.max(0, (Date.now() - activityMs) / (1000 * 60 * 60));
@@ -128,17 +97,153 @@ const messageTextCache = new WeakMap<Message, string>();
 const normalizedMessageText = (message: Message) => {
   let text = messageTextCache.get(message);
   if (text === undefined) {
-    const parts = [message.content];
-    for (const activity of message.activities ?? []) {
-      parts.push(activity.title);
-      if (activity.detail && activity.detail.length <= ACTIVITY_DETAIL_INDEX_LIMIT) parts.push(activity.detail);
-    }
-    for (const file of message.changedFiles ?? []) parts.push(file.path);
-    for (const attachment of message.attachments ?? []) parts.push(attachment.name);
-    text = normalizeSearchText(parts.join(' '));
+    text = messageSearchText(message);
     messageTextCache.set(message, text);
   }
   return text;
+};
+
+// ---------------------------------------------------------------------------
+// Transcripts the renderer hasn't loaded are searched in main, against the
+// stored copies (thread-storage.js searchThreadBodies). Scores arrive per
+// query token and are kept briefly; a revision tells searches to re-score.
+
+const REMOTE_SCORES_TTL_MS = 30_000;
+type RemoteTokenScores = { fetchedAt: number; scores: Map<string, number> };
+const remoteBodyScores = new Map<string, RemoteTokenScores>();
+// The tokens each open search still wants, by search, and the request in
+// flight. Main runs one scan at a time and a newer request supersedes the one
+// in flight, so every request carries every token any open search still
+// lacks, not just the new ones: a superseded request's tokens that still
+// matter are always in the request that replaced it, and nothing has to be
+// asked again (or could loop).
+const activeSearchTokens = new Map<string, readonly string[]>();
+let remoteBodyRequest: { tokens: ReadonlySet<string> } | null = null;
+const remoteExcerpts = new Map<string, string | null>();
+const remoteExcerptsPending = new Set<string>();
+let remoteRevision = 0;
+const remoteListeners = new Set<() => void>();
+const bumpRemoteRevision = () => {
+  remoteRevision += 1;
+  for (const listener of [...remoteListeners]) listener();
+};
+const subscribeRemote = (listener: () => void) => {
+  remoteListeners.add(listener);
+  return () => {
+    remoteListeners.delete(listener);
+  };
+};
+
+const fresh = (entry: RemoteTokenScores | undefined) =>
+  Boolean(entry && Date.now() - entry.fetchedAt < REMOTE_SCORES_TTL_MS);
+
+const missingRemoteTokens = () => {
+  const missing = new Set<string>();
+  for (const tokens of activeSearchTokens.values()) {
+    // Main doesn't score tokens over 200 characters (a pasted path or URL).
+    for (const token of tokens) {
+      if (token.length >= 2 && token.length <= 200 && !fresh(remoteBodyScores.get(token))) missing.add(token);
+    }
+  }
+  return [...missing];
+};
+
+const sendRemoteBodyRequest = (retryIfSupersededElsewhere = true) => {
+  const wanted = missingRemoteTokens();
+  if (wanted.length === 0 || typeof window === 'undefined' || !window.orion?.searchThreads) return;
+  // The request in flight already asks for all of them.
+  if (remoteBodyRequest && wanted.every((token) => remoteBodyRequest!.tokens.has(token))) return;
+  const request = { tokens: new Set(wanted) };
+  remoteBodyRequest = request;
+  void window.orion
+    .searchThreads({ tokens: wanted })
+    .then((result) => {
+      if (!result?.ok || !result.scores) {
+        // Superseded by a scan this renderer didn't ask for (only possible
+        // when it is still the newest request): ask once more.
+        if (result && 'superseded' in result && remoteBodyRequest === request && retryIfSupersededElsewhere) {
+          remoteBodyRequest = null;
+          sendRemoteBodyRequest(false);
+        }
+        return;
+      }
+      // Scores are aligned with the tokens main actually scored (it skips
+      // over-long ones and keeps at most 16): record those, and nothing — not
+      // even "no match" — for tokens it didn't score.
+      const scored = Array.isArray(result.tokens) ? result.tokens.filter((token) => request.tokens.has(token)) : [];
+      const fetchedAt = Date.now();
+      const byToken = scored.map(() => new Map<string, number>());
+      const position = new Map((result.tokens ?? []).map((token, index) => [token, index]));
+      for (const [threadId, scores] of Object.entries(result.scores)) {
+        scored.forEach((token, index) => {
+          const score = scores[position.get(token)!];
+          if (score > 0) byToken[index].set(threadId, score);
+        });
+      }
+      scored.forEach((token, index) => remoteBodyScores.set(token, { fetchedAt, scores: byToken[index] }));
+      bumpRemoteRevision();
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (remoteBodyRequest === request) remoteBodyRequest = null;
+    });
+};
+
+/**
+ * The transcript scores search `searchId` needs for `tokens`, asked of main
+ * for any it hasn't answered recently (together with what other open
+ * searches still lack).
+ */
+export const requestRemoteBodyScores = (tokens: readonly string[], searchId = 'default') => {
+  activeSearchTokens.set(searchId, tokens);
+  sendRemoteBodyRequest();
+};
+
+/** A search that closed no longer needs its tokens. */
+export const releaseRemoteBodyScores = (searchId = 'default') => {
+  activeSearchTokens.delete(searchId);
+};
+
+const excerptKey = (threadId: string, tokens: readonly string[]) => `${threadId}\u0000${tokens.join(' ')}`;
+
+/** Ask main for search-result excerpts of threads whose transcript isn't loaded. */
+export const requestRemoteExcerpts = (items: Array<{ threadId: string; tokens: string[] }>) => {
+  const wanted = items.filter((item) => {
+    const key = excerptKey(item.threadId, item.tokens);
+    return !remoteExcerpts.has(key) && !remoteExcerptsPending.has(key);
+  });
+  if (wanted.length === 0 || typeof window === 'undefined' || !window.orion?.threadSearchExcerpts) return;
+  const keys = wanted.map((item) => excerptKey(item.threadId, item.tokens));
+  for (const key of keys) remoteExcerptsPending.add(key);
+  void window.orion
+    .threadSearchExcerpts({ items: wanted.map((item) => ({ id: item.threadId, tokens: item.tokens })) })
+    .then((result) => {
+      if (!result?.ok || !result.excerpts) return;
+      wanted.forEach((item, index) => remoteExcerpts.set(keys[index], result.excerpts![item.threadId] ?? null));
+      // Bounded: excerpts are only for what a result list shows.
+      while (remoteExcerpts.size > 500) remoteExcerpts.delete(remoteExcerpts.keys().next().value!);
+      bumpRemoteRevision();
+    })
+    .catch(() => {})
+    .finally(() => {
+      for (const key of keys) remoteExcerptsPending.delete(key);
+    });
+};
+
+/**
+ * Re-renders when main answers a transcript search, and asks it about
+ * `tokens`. Searches pass the result to their memos so they re-score.
+ */
+export const useRemoteThreadSearch = (tokens: readonly string[]) => {
+  const revision = useSyncExternalStore(subscribeRemote, () => remoteRevision, () => remoteRevision);
+  const searchId = useId();
+  const key = tokens.join(' ');
+  useEffect(() => {
+    requestRemoteBodyScores(tokens, searchId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key, searchId]);
+  useEffect(() => () => releaseRemoteBodyScores(searchId), [searchId]);
+  return revision;
 };
 
 export type ThreadSearchEntry = {
@@ -149,13 +254,19 @@ export type ThreadSearchEntry = {
   project: string;
   /** Path, model and status: matched like transcript text, at half weight. */
   meta: string;
-  /** Normalized text per message, index-aligned with thread.messages. */
-  body: string[];
+  /** The loaded transcript's messages, when it is loaded. */
+  messages: Message[] | null;
+  /**
+   * Normalized text per message, index-aligned with `messages`. Null when the
+   * transcript isn't loaded: main scores it then (requestRemoteBodyScores).
+   */
+  body: string[] | null;
 };
 
 type CachedThreadSearchEntry = {
   projectName: string;
   projectPath: string;
+  transcript: ThreadTranscript | undefined;
   entry: ThreadSearchEntry;
 };
 
@@ -175,7 +286,8 @@ const buildThreadSearchSummary = (
   title: normalizeSearchText(thread.title),
   project: normalizeSearchText(projectName),
   meta: normalizeSearchText(`${projectPath} ${thread.modelId} ${thread.status}`),
-  body: [],
+  messages: useOrionStore.getState().transcripts?.[thread.id]?.messages ?? null,
+  body: null,
 });
 
 export const getThreadSearchEntry = (
@@ -183,16 +295,30 @@ export const getThreadSearchEntry = (
   projectName: string,
   projectPath: string
 ): ThreadSearchEntry => {
+  const transcript = useOrionStore.getState().transcripts?.[thread.id];
   const cached = threadEntryCache.get(thread);
-  if (cached && cached.projectName === projectName && cached.projectPath === projectPath) {
+  if (
+    cached &&
+    cached.projectName === projectName &&
+    cached.projectPath === projectPath &&
+    cached.transcript === transcript
+  ) {
     return cached.entry;
   }
   const entry: ThreadSearchEntry = {
     ...buildThreadSearchSummary(thread, projectName, projectPath),
-    body: thread.messages.map(normalizedMessageText),
+    messages: transcript?.messages ?? null,
+    body: transcript ? transcript.messages.map(normalizedMessageText) : null,
   };
-  threadEntryCache.set(thread, { projectName, projectPath, entry });
+  threadEntryCache.set(thread, { projectName, projectPath, transcript, entry });
   return entry;
+};
+
+// A loaded transcript is scored here (it may hold unsaved output); any other
+// from main's answer, 0 until it arrives.
+const bodyTokenScore = (entry: ThreadSearchEntry, token: string) => {
+  if (entry.body) return scoreBodyToken(entry.body, token);
+  return remoteBodyScores.get(token)?.scores.get(entry.thread.id) ?? 0;
 };
 
 export const scoreThreadSearchEntry = (entry: ThreadSearchEntry, query: string | SearchQuery) => {
@@ -206,7 +332,7 @@ export const scoreThreadSearchEntry = (entry: ThreadSearchEntry, query: string |
       scoreNameToken(entry.project, token) * 0.4
     );
     if (best < BODY_MATCH_WORD) {
-      best = Math.max(best, scoreBodyToken(entry.body, token), scoreBodyToken([entry.meta], token) * 0.5);
+      best = Math.max(best, bodyTokenScore(entry, token), scoreBodyToken([entry.meta], token) * 0.5);
     }
     // Every word has to land somewhere, or the thread isn't a match.
     if (best === 0) return 0;
@@ -253,34 +379,30 @@ const scoreProjectSearchEntry = (entry: ProjectSearchEntry, query: SearchQuery, 
   return score + recencyBonus(activityMs);
 };
 
-const excerptAround = (source: string, index: number) => {
-  const start = index > 24 ? index - 24 : 0;
-  const excerpt = source.slice(start, start + 140).trim();
-  return `${start > 0 ? '…' : ''}${excerpt}${source.length > start + 140 ? '…' : ''}`;
-};
+// The words a result's excerpt looks for: those its title doesn't explain.
+const excerptTokens = (entry: ThreadSearchEntry, query: SearchQuery) =>
+  query.tokens.filter((token) => token.length > 1 && !entry.title.includes(token));
 
-const flattenText = (text: string) => text.replace(/\s+/g, ' ').trim();
-
+/**
+ * The line under a result: where the transcript matched a word the title
+ * didn't explain (the most recent mention), else the newest message. From
+ * main for transcripts that aren't loaded (requestRemoteExcerpts), the
+ * project path until it answers.
+ */
 export const getThreadSearchExcerpt = (entry: ThreadSearchEntry, query: SearchQuery) => {
-  const { messages } = entry.thread;
-  // Show where the transcript matched a word the title didn't explain,
-  // preferring the most recent mention.
-  const bodyTokens = query.tokens.filter((token) => token.length > 1 && !entry.title.includes(token));
-  for (const token of bodyTokens) {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      if (!entry.body[index]?.includes(token)) continue;
-      const source = flattenText(messages[index].content);
-      const hit = source.toLowerCase().indexOf(token);
-      if (hit !== -1) return excerptAround(source, hit);
-    }
+  const tokens = excerptTokens(entry, query);
+  if (entry.messages) {
+    return transcriptExcerpt(entry.messages, tokens, entry.body ?? undefined) ?? entry.projectPath;
   }
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const source = flattenText(messages[index].content);
-    if (source) return excerptAround(source, 0);
-  }
-  return entry.projectPath;
+  return remoteExcerpts.get(excerptKey(entry.thread.id, tokens)) ?? entry.projectPath;
 };
+
+const requestExcerptsFor = (entries: ThreadSearchEntry[], query: SearchQuery) =>
+  requestRemoteExcerpts(
+    entries
+      .filter((entry) => !entry.messages)
+      .map((entry) => ({ threadId: entry.thread.id, tokens: excerptTokens(entry, query) }))
+  );
 
 /** Wraps each occurrence of a query word in <mark>. */
 const highlightMatches = (text: string, tokens: readonly string[]): React.ReactNode => {
@@ -319,23 +441,24 @@ const projectNameFor = (project: Project | undefined) => project?.name ?? 'Unkno
 
 /**
  * Keeps the index a step behind the store while it is streaming: a running
- * agent replaces `threads` on every chunk, and re-scoring that often would
- * compete with the typing it is meant to serve.
+ * agent replaces its transcript on every chunk, and re-scoring that often
+ * would compete with the typing it is meant to serve.
  */
 const useThrottledThreads = () => {
   const threads = useOrionStore((state) => state.threads);
-  const latestRef = useRef(threads);
-  const [indexed, setIndexed] = useState(threads);
+  const transcripts = useOrionStore((state) => state.transcripts);
+  const latestRef = useRef({ threads, transcripts });
+  const [indexed, setIndexed] = useState(latestRef.current);
   const timerRef = useRef<number | null>(null);
 
-  latestRef.current = threads;
+  latestRef.current = { threads, transcripts };
   useEffect(() => {
-    if (threads === indexed || timerRef.current !== null) return;
+    if ((threads === indexed.threads && transcripts === indexed.transcripts) || timerRef.current !== null) return;
     timerRef.current = window.setTimeout(() => {
       timerRef.current = null;
       setIndexed(latestRef.current);
     }, THREAD_SEARCH_INDEX_REFRESH_MS);
-  }, [indexed, threads]);
+  }, [indexed, threads, transcripts]);
 
   useEffect(
     () => () => {
@@ -347,47 +470,21 @@ const useThrottledThreads = () => {
   return indexed;
 };
 
-let searchIndexWarmup: Generator<void> | null = null;
+let lastWarmup = 0;
 
-/** Warm the shared cache in bounded slices, yielding between messages. */
+/**
+ * Get transcript search ready before the first keystroke (hover, focus):
+ * main loads its search texts, building any that are missing.
+ */
 export const warmSearchIndex = () => {
-  // Hover and focus can arrive together; share one pending pass.
-  if (searchIndexWarmup) return;
-  searchIndexWarmup = (function* () {
-    const { threads, projects } = useOrionStore.getState();
-    const projectById = new Map(projects.map((project) => [project.id, project]));
-    for (const thread of threads) {
-      const project = projectById.get(thread.projectId);
-      const projectName = projectNameFor(project);
-      const projectPath = project?.path ?? '';
-      const cached = threadEntryCache.get(thread);
-      if (!cached || cached.projectName !== projectName || cached.projectPath !== projectPath) {
-        for (const message of thread.messages) {
-          normalizedMessageText(message);
-          yield;
-        }
-        getThreadSearchEntry(thread, projectName, projectPath);
-      }
-      yield;
-    }
-  })();
-
-  const schedule = () => {
-    if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(run, { timeout: 1000 });
-    else window.setTimeout(() => run(), 0);
-  };
-  const run = (deadline?: IdleDeadline) => {
-    const started = performance.now();
-    for (let steps = 0; steps < 64; steps += 1) {
-      if (steps > 0 && (performance.now() - started >= 4 || (deadline && deadline.timeRemaining() <= 0))) break;
-      if (searchIndexWarmup?.next().done) {
-        searchIndexWarmup = null;
-        return;
-      }
-    }
-    schedule();
-  };
-  schedule();
+  const now = Date.now();
+  // Hover and focus can arrive together; main keeps the texts a while anyway.
+  if (now - lastWarmup < REMOTE_SCORES_TTL_MS) return;
+  lastWarmup = now;
+  // Transcript text may have changed since the last search.
+  remoteBodyScores.clear();
+  remoteExcerpts.clear();
+  void window.orion?.warmThreadSearch?.().catch(() => {});
 };
 
 export type SidebarSearchPanelProps = {
@@ -410,12 +507,14 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
   const [query, setQuery] = useState('');
   // Scoring runs against the deferred copy, so the input never waits on it.
   const deferredQuery = useDeferredValue(query);
-  const threads = useThrottledThreads();
+  const { threads, transcripts } = useThrottledThreads();
   const [activeIndex, setActiveIndex] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
 
   const parsedQuery = useMemo(() => parseSearchQuery(deferredQuery), [deferredQuery]);
   const hasQuery = parsedQuery.tokens.length > 0;
+  // Bumped when main answers for the transcripts that aren't loaded.
+  const remoteRevision = useRemoteThreadSearch(parsedQuery.tokens);
 
   const projectById = useMemo(() => new Map(projects.map((project) => [project.id, project])), [projects]);
 
@@ -452,7 +551,8 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
       const project = projectById.get(thread.projectId);
       return buildEntry(thread, projectNameFor(project), project?.path ?? '');
     });
-  }, [hasQuery, projectById, threads]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- transcripts: entries read them
+  }, [hasQuery, projectById, threads, transcripts]);
 
   const results = useMemo<SearchResult[]>(() => {
     if (!hasQuery) {
@@ -482,7 +582,16 @@ export const SidebarSearchPanel = React.memo(function SidebarSearchPanel({
     threadMatches.sort(compareThreadSearchResults);
     matches.push(...threadMatches.slice(0, THREAD_RESULT_LIMIT));
     return matches.sort((a, b) => b.score - a.score).slice(0, RESULT_LIMIT);
-  }, [hasQuery, parsedQuery, projectEntries, threadEntries, threadStats]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- remoteRevision: scores read main's answers
+  }, [hasQuery, parsedQuery, projectEntries, remoteRevision, threadEntries, threadStats]);
+
+  // Excerpts of listed threads whose transcript isn't loaded come from main.
+  useEffect(() => {
+    requestExcerptsFor(
+      results.flatMap((result) => (result.kind === 'thread' ? [result.entry] : [])),
+      parsedQuery
+    );
+  }, [parsedQuery, results]);
 
   useEffect(() => setActiveIndex(0), [parsedQuery]);
 

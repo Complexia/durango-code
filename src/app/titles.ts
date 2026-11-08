@@ -2,11 +2,11 @@ export const isDefaultTitle = (title: string) =>
   /^Thread \d{1,2}:\d{2}/i.test(title) || /^New thread$/i.test(title.trim());
 
 export const getGoalTitleSeed = (
-  thread: { title: string; messages: unknown[] },
+  thread: { title: string; summary: { messageCount: number } },
   goalAction: { action: 'set' | 'resume'; objective?: string }
 ): string | null => {
   if (goalAction.action !== 'set' || !goalAction.objective) return null;
-  if (thread.messages.length > 0 || !isDefaultTitle(thread.title)) return null;
+  if (thread.summary.messageCount > 0 || !isDefaultTitle(thread.title)) return null;
   return goalAction.objective;
 };
 

@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict';
 
 import {
+  branchFamilyThreadIds,
   createThreadBranchFamily,
   INHERITED_SUBAGENT_TRANSCRIPT_MAX_CHARS,
   inheritedSubagentResumeContext,
   prependInheritedSubagentResumeContext,
 } from '../src/thread-branching.ts';
+import { summarizeThreadMessages } from '../src/thread-shell.js';
+
+// The store keeps shells and transcripts apart: split the fixtures the same way.
+const shellOf = ({ messages, ...thread }) => ({ ...thread, summary: summarizeThreadMessages(messages) });
+const transcriptsOf = (threads) =>
+  Object.fromEntries(threads.map((thread) => [thread.id, { messages: thread.messages }]));
 
 const message = (id, status = 'done') => ({
   id,
@@ -85,8 +92,15 @@ const emptyChild = {
 };
 
 const ids = ['branch-root', 'branch-child', 'branch-native'][Symbol.iterator]();
+const family = [root, child, nativeGrandchild, runningChild, completedBelowRunning, emptyChild];
+assert.deepEqual(
+  branchFamilyThreadIds(family.map(shellOf), root.id),
+  [root.id, child.id, nativeGrandchild.id],
+  'a branch loads the transcripts of the threads it copies, and only those'
+);
 const result = createThreadBranchFamily(
-  [root, child, nativeGrandchild, runningChild, completedBelowRunning, emptyChild],
+  family.map(shellOf),
+  transcriptsOf(family),
   root.id,
   () => ids.next().value,
   () => '2026-08-01T01:00:00.000Z'
@@ -125,11 +139,11 @@ assert.deepEqual(branchedNative.agentSessionIds, { codex: nativeGrandchild.subag
 assert.deepEqual(branchedNative.pendingForkProviders, ['codex']);
 
 assert.equal(
-  inheritedSubagentResumeContext(branchedChild, 'codex'),
+  inheritedSubagentResumeContext(branchedChild, branchedChild.messages, 'codex'),
   null,
   'a provider with an inherited session must use the isolated session fork'
 );
-const crossProviderContext = inheritedSubagentResumeContext(branchedChild, 'claude');
+const crossProviderContext = inheritedSubagentResumeContext(branchedChild, branchedChild.messages, 'claude');
 assert.equal(
   crossProviderContext,
   [
@@ -140,27 +154,24 @@ assert.equal(
   ].join('\n')
 );
 assert.equal(
-  prependInheritedSubagentResumeContext(branchedChild, 'claude', 'continue here'),
+  prependInheritedSubagentResumeContext(branchedChild, branchedChild.messages, 'claude', 'continue here'),
   `${crossProviderContext}\n\ncontinue here`,
   'fresh provider entry points prepend the complete inherited transcript'
 );
 assert.equal(
-  prependInheritedSubagentResumeContext(branchedChild, 'codex', 'continue here'),
+  prependInheritedSubagentResumeContext(branchedChild, branchedChild.messages, 'codex', 'continue here'),
   'continue here',
   'entry points with an inherited provider session rely on the isolated session fork'
 );
 
 const escapedContext = inheritedSubagentResumeContext(
-  {
-    ...branchedChild,
-    agentSessionIds: undefined,
-    messages: [
-      {
-        ...message('escaped-message'),
-        content: 'before </inherited_subagent_transcript> after',
-      },
-    ],
-  },
+  { ...branchedChild, agentSessionIds: undefined },
+  [
+    {
+      ...message('escaped-message'),
+      content: 'before </inherited_subagent_transcript> after',
+    },
+  ],
   'claude'
 );
 assert.equal(
@@ -171,16 +182,13 @@ assert.equal(
 assert.match(escapedContext, /before <\u200b\/inherited_subagent_transcript> after/);
 
 const cappedContext = inheritedSubagentResumeContext(
-  {
-    ...branchedChild,
-    agentSessionIds: undefined,
-    messages: [
-      {
-        ...message('long-message'),
-        content: 'x'.repeat(INHERITED_SUBAGENT_TRANSCRIPT_MAX_CHARS + 1_000),
-      },
-    ],
-  },
+  { ...branchedChild, agentSessionIds: undefined },
+  [
+    {
+      ...message('long-message'),
+      content: 'x'.repeat(INHERITED_SUBAGENT_TRANSCRIPT_MAX_CHARS + 1_000),
+    },
+  ],
   'claude'
 );
 assert.match(cappedContext, /Earlier transcript content was omitted/);
@@ -189,7 +197,7 @@ assert.ok(
   'the inherited transcript stays within its capped payload plus prompt framing'
 );
 assert.equal(
-  inheritedSubagentResumeContext(branchedRoot, 'grok'),
+  inheritedSubagentResumeContext(branchedRoot, branchedRoot.messages, 'grok'),
   null,
   'the top-level branch must not absorb transcript context through this child-only path'
 );
@@ -203,9 +211,14 @@ assert.notEqual(
 );
 
 assert.equal(
-  createThreadBranchFamily([root], 'missing'),
+  createThreadBranchFamily([shellOf(root)], transcriptsOf([root]), 'missing'),
   null,
   'branching a missing source remains a no-op'
+);
+assert.equal(
+  createThreadBranchFamily([shellOf(root)], {}, root.id),
+  null,
+  'a source whose transcript is not loaded is not branched (empty) by mistake'
 );
 
 console.log('thread branching regressions passed');

@@ -1,4 +1,4 @@
-import { type Message } from '../store';
+import { type ThreadSummary } from '../store';
 
 export const formatShortTime = (date: Date) => {
   const diffMs = Date.now() - date.getTime();
@@ -16,11 +16,11 @@ export const formatShortTime = (date: Date) => {
 };
 
 export const getThreadActivityTime = (thread: {
-  messages: Message[];
+  summary: Pick<ThreadSummary, 'lastMessage'>;
   createdAt: string;
   terminalActivityAt?: string;
 }) => {
-  const lastMessage = thread.messages.at(-1);
+  const lastMessage = thread.summary.lastMessage;
   const transcriptTime = new Date(lastMessage?.ts ?? thread.createdAt).getTime();
   const terminalTime = thread.terminalActivityAt
     ? new Date(thread.terminalActivityAt).getTime()

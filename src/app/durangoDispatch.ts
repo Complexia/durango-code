@@ -1,4 +1,4 @@
-import type { Thread } from '../store';
+import type { Message, Thread } from '../store';
 
 // Renderer side of Durango Chat dispatch (main: src/main/durango-dispatch.js).
 
@@ -18,12 +18,13 @@ export const dispatchSummaryText = (content: string, max = DISPATCH_SUMMARY_MAX_
  * Later turns are the user's own.
  */
 export const durangoDispatchOutcome = (
-  thread: Pick<Thread, 'status' | 'messages' | 'durangoDispatch'>
+  thread: Pick<Thread, 'status' | 'durangoDispatch'>,
+  messages: Message[]
 ): { outcome: 'finished'; summary: string } | { outcome: 'failed'; error: string } | null => {
   const dispatch = thread.durangoDispatch;
   if (!dispatch || dispatch.reportedAt) return null;
   if (thread.status === 'running') return null;
-  const runs = thread.messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run');
+  const runs = messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run');
   // The run message exists before `durangoDispatch` is stamped, so take the
   // run by position rather than filtering by time.
   const run = runs[dispatch.runOffset ?? 0] ?? null;

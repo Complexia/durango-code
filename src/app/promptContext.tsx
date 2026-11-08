@@ -1,4 +1,4 @@
-import { type FileAttachment, type LinkedBoardTask, type OrchestrationRoleId, type Thread, type ThreadDurangoWorkspace } from '../store';
+import { type FileAttachment, type LinkedBoardTask, type Message, type OrchestrationRoleId, type Thread, type ThreadDurangoWorkspace } from '../store';
 import { type AgentModel } from '../agentCatalog';
 import { getThreadActivityTime } from './time';
 
@@ -96,8 +96,8 @@ export const buildLinkedTaskContext = (tasks: LinkedBoardTask[], hasUserMessage:
 // transcript explicitly so references such as "the issues you found" resolve
 // the same way they do in the surrounding chat.
 export const REVIEW_THREAD_CONTEXT_MAX_CHARS = 80_000;
-export const buildReviewThreadContext = (thread: Thread) => {
-  const entries = thread.messages
+export const buildReviewThreadContext = (thread: Pick<Thread, 'linkedTasks'>, messages: Message[]) => {
+  const entries = messages
     .filter(
       (message) =>
         (message.role === 'user' || message.role === 'agent') && message.content.trim().length > 0
@@ -478,7 +478,7 @@ export const buildThreadMentionsContext = (
       const projectName = projectNameById?.get(thread.projectId);
       const details = [
         `thread_id: ${thread.id}`,
-        `${thread.messages.length} messages`,
+        `${thread.summary.messageCount} messages`,
         `status: ${thread.status}`,
         ...(projectName ? [`project: ${projectName}`] : []),
         `last active: ${getThreadActivityTime(thread).toISOString()}`,

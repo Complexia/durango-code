@@ -3,7 +3,7 @@ import { Check, Loader2, MoreHorizontal } from 'lucide-react';
 import { toast } from 'sonner';
 import type { AgentModel } from '../agentCatalog';
 import { ClaudeBrandIcon, CodexBrandIcon, OrionBrandIcon } from '../providerIcons';
-import { type Project, type Thread, useOrionStore } from '../store';
+import { type Project, type Thread, type ThreadRecord, useOrionStore } from '../store';
 import type { ImportableSessionSummary, ImportedSessionTranscript } from '../types';
 
 type ImportProviderId = ImportableSessionSummary['providerId'];
@@ -80,7 +80,7 @@ const toThread = (
   transcript: ImportedSessionTranscript,
   projectId: string,
   models: AgentModel[]
-): Thread => ({
+): ThreadRecord => ({
   id: crypto.randomUUID(),
   projectId,
   title: transcript.title || `${PROVIDER_LABELS[transcript.providerId]} conversation`,
@@ -145,7 +145,7 @@ export const SessionImportCard: React.FC<{ agentModels: AgentModel[] }> = ({ age
         const known = knownSessionIds(state.threads);
         const projectsByPath = new Map(state.projects.map((project) => [normalizePath(project.path), project]));
         const newProjects: Project[] = [];
-        const threads: Thread[] = [];
+        const threads: ThreadRecord[] = [];
         for (const transcript of result.sessions) {
           if (!transcript) {
             failed += 1;

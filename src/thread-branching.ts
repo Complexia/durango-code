@@ -1,4 +1,4 @@
-import type { Message, NativeSubagentInfo, ProviderId, Thread } from './store';
+import type { Message, NativeSubagentInfo, ProviderId, Thread, ThreadRecord, ThreadTranscript } from './store';
 
 const INHERITED_SUBAGENT_CLOSE_TAG = '</inherited_subagent_transcript>';
 const NEUTRALIZED_INHERITED_SUBAGENT_CLOSE_TAG = '<\u200b/inherited_subagent_transcript>';
@@ -39,11 +39,12 @@ const inheritedSessions = (thread: Thread): Partial<Record<ProviderId, string>> 
 
 const branchCopy = (
   source: Thread,
+  messages: Message[],
   id: string,
   createdAt: string,
   parentThreadId?: string,
   inheritedChild = false
-): Thread => {
+): ThreadRecord => {
   const agentSessionIds = inheritedSessions(source);
   const pendingForkProviders = Object.keys(agentSessionIds) as ProviderId[];
   return {
@@ -65,7 +66,7 @@ const branchCopy = (
     // A new branch is a top-level Recent entry even when its source was a
     // hidden child (or had previously been removed from Recent).
     hiddenFromRecent: parentThreadId ? true : undefined,
-    messages: cloneMessages(source.messages),
+    messages: cloneMessages(messages),
     // Goals live in a provider session, and /btw answers are detached asides,
     // so both intentionally reset just as they did for a single-thread branch.
     agentSessionIds: pendingForkProviders.length ? agentSessionIds : undefined,
@@ -84,7 +85,7 @@ const branchCopy = (
 
 export type ThreadBranchFamily = {
   rootId: string;
-  threads: Thread[];
+  threads: ThreadRecord[];
 };
 
 /**
@@ -94,6 +95,7 @@ export type ThreadBranchFamily = {
  */
 export const inheritedSubagentResumeContext = (
   thread: Thread,
+  messages: Message[],
   providerId: ProviderId
 ): string | null => {
   const isInheritedChild = Boolean(
@@ -101,7 +103,7 @@ export const inheritedSubagentResumeContext = (
   );
   if (!isInheritedChild || thread.agentSessionIds?.[providerId]) return null;
 
-  let transcript = thread.messages
+  let transcript = messages
     .map((message) => {
       const content = message.content
         .trim()
@@ -131,30 +133,24 @@ export const inheritedSubagentResumeContext = (
 
 export const prependInheritedSubagentResumeContext = (
   thread: Thread,
+  messages: Message[],
   providerId: ProviderId,
   prompt: string
 ): string => {
-  const inheritedContext = inheritedSubagentResumeContext(thread, providerId);
+  const inheritedContext = inheritedSubagentResumeContext(thread, messages, providerId);
   if (!inheritedContext) return prompt;
   return prompt ? `${inheritedContext}\n\n${prompt}` : inheritedContext;
 };
 
-/**
- * Clone a thread plus its settled subagent hierarchy. Live descendants are
- * deliberately excluded: their transcripts and sessions are still changing,
- * so there is no stable completed instance to inherit.
- */
-export const createThreadBranchFamily = (
-  threads: Thread[],
-  sourceThreadId: string,
-  createId: () => string = () => crypto.randomUUID(),
-  now: () => string = () => new Date().toISOString()
-): ThreadBranchFamily | null => {
-  const source = threads.find((thread) => thread.id === sourceThreadId);
-  if (!source) return null;
+// A copied child must have settled: its last run finished and the thread
+// isn't running. Live descendants are still changing, so there is no stable
+// completed instance to inherit.
+const isSettledChild = (child: Thread) => {
+  const lastRun = child.summary.lastAgentRun;
+  return child.status !== 'running' && Boolean(lastRun) && lastRun!.status !== 'running';
+};
 
-  const rootId = createId();
-  const root = branchCopy(source, rootId, now());
+const childrenByParentOf = (threads: Thread[]) => {
   const childrenByParent = new Map<string, Thread[]>();
   for (const thread of threads) {
     if (!thread.parentThreadId) continue;
@@ -162,26 +158,60 @@ export const createThreadBranchFamily = (
     if (children) children.push(thread);
     else childrenByParent.set(thread.parentThreadId, [thread]);
   }
+  return childrenByParent;
+};
 
-  const copies: Thread[] = [root];
+/** The threads a branch of `sourceThreadId` copies: it and its settled subagents. */
+export const branchFamilyThreadIds = (threads: Thread[], sourceThreadId: string): string[] => {
+  if (!threads.some((thread) => thread.id === sourceThreadId)) return [];
+  const childrenByParent = childrenByParentOf(threads);
+  const ids = [sourceThreadId];
+  const seen = new Set(ids);
+  const visit = (parentId: string) => {
+    for (const child of childrenByParent.get(parentId) ?? []) {
+      if (seen.has(child.id) || !isSettledChild(child)) continue;
+      seen.add(child.id);
+      ids.push(child.id);
+      visit(child.id);
+    }
+  };
+  visit(sourceThreadId);
+  return ids;
+};
+
+/**
+ * Clone a thread plus its settled subagent hierarchy. Live descendants are
+ * deliberately excluded: their transcripts and sessions are still changing,
+ * so there is no stable completed instance to inherit. Needs the transcripts
+ * of branchFamilyThreadIds; null when the source's isn't loaded, and a child
+ * whose transcript isn't loaded is left out.
+ */
+export const createThreadBranchFamily = (
+  threads: Thread[],
+  transcripts: Record<string, ThreadTranscript | undefined>,
+  sourceThreadId: string,
+  createId: () => string = () => crypto.randomUUID(),
+  now: () => string = () => new Date().toISOString()
+): ThreadBranchFamily | null => {
+  const source = threads.find((thread) => thread.id === sourceThreadId);
+  const sourceTranscript = transcripts[sourceThreadId];
+  if (!source || !sourceTranscript) return null;
+
+  const rootId = createId();
+  const root = branchCopy(source, sourceTranscript.messages, rootId, now());
+  const childrenByParent = childrenByParentOf(threads);
+
+  const copies: ThreadRecord[] = [root];
   const seen = new Set<string>([source.id]);
-  const copyChildren = (sourceParentId: string, copiedParent: Thread) => {
+  const copyChildren = (sourceParentId: string, copiedParent: ThreadRecord) => {
     for (const child of childrenByParent.get(sourceParentId) ?? []) {
-      const lastRun = [...child.messages]
-        .reverse()
-        .find((message) => message.kind === 'agent-run');
-      if (
-        seen.has(child.id) ||
-        child.status === 'running' ||
-        !lastRun ||
-        lastRun.status === 'running'
-      ) {
-        continue;
-      }
+      const childTranscript = transcripts[child.id];
+      if (seen.has(child.id) || !isSettledChild(child) || !childTranscript) continue;
       seen.add(child.id);
       const childId = createId();
       const copiedChild = branchCopy(
         child,
+        childTranscript.messages,
         childId,
         child.createdAt,
         copiedParent.id,

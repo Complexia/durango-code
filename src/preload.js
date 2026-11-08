@@ -15,7 +15,12 @@ contextBridge.exposeInMainWorld('orion', {
   saveStore: (value) => ipcRenderer.invoke('storage:save', value),
   // Blocking quit-time flush, like saveThreadsSync below.
   saveStoreSync: (value) => ipcRenderer.sendSync('storage:saveSync', value),
-  loadThreadsHead: (input) => ipcRenderer.invoke('storage:loadThreadsHead', input),
+  loadThreadShells: (input) => ipcRenderer.invoke('storage:loadThreadShells', input),
+  // Blocking quit-time read of one stored thread, like saveThreadsSync below.
+  loadThreadSync: (id) => ipcRenderer.sendSync('storage:loadThreadSync', id),
+  searchThreads: (input) => ipcRenderer.invoke('storage:searchThreads', input),
+  threadSearchExcerpts: (input) => ipcRenderer.invoke('storage:threadSearchExcerpts', input),
+  warmThreadSearch: () => ipcRenderer.invoke('storage:warmThreadSearch'),
   loadThreadsBatch: (input) => ipcRenderer.invoke('storage:loadThreadsBatch', input),
   saveThreads: (value) => ipcRenderer.invoke('storage:saveThreads', value),
   // Synchronous on purpose: the quit-time flush must block unload until the

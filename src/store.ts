@@ -1,7 +1,16 @@
 import { create } from 'zustand';
 import { persist, type PersistStorage, type StorageValue } from 'zustand/middleware';
 import { agentModelSuccessors } from './agentCatalog';
-import { createThreadBranchFamily } from './thread-branching';
+import { branchFamilyThreadIds, createThreadBranchFamily } from './thread-branching';
+import {
+  sameThreadSummary,
+  STEERED_RUN_CAPTION,
+  summarizeThreadMessages,
+  threadShellOf,
+  WAITING_ON_BACKGROUND_CAPTION,
+  withSubagentDetails,
+  type ThreadSummary,
+} from './thread-shell.js';
 import { defaultWorkspaceSyncConsentSettings, migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent';
 
 export type Project = {
@@ -456,15 +465,9 @@ export type Message = {
   steer?: boolean;
 };
 
-/**
- * The caption of a Claude turn that finished while the agent still waits on
- * background tasks (waitingOnBackgroundStatusText in App.tsx; keep the two in
- * sync). The thread stays Working until the follow-up turn.
- */
-export const WAITING_ON_BACKGROUND_CAPTION = /^Waiting on (\d+ background (?:agents?|tasks?)|background task)\b.*…$/;
-
-/** The caption of a run bubble closed where a steer split it (App.tsx); the run goes on below. */
-export const STEERED_RUN_CAPTION = 'Steered — the agent continues below.';
+// The run captions live with the shell summary that reads them (thread-shell.js).
+export { STEERED_RUN_CAPTION, WAITING_ON_BACKGROUND_CAPTION };
+export type { ThreadSummary };
 
 export type QueuedMessage = {
   id: string;
@@ -622,7 +625,11 @@ export type Thread = {
   importedFrom?: { providerId: 'claude' | 'codex'; sessionId: string; importedAt: string };
   /** Imported but not opened yet: the sidebar shows the source provider's icon until then. */
   importedUnseen?: boolean;
-  messages: Message[];
+  /**
+   * What the shell knows about the transcript (thread-shell.js). Kept current
+   * by the store's transcript actions; never stored in the thread file.
+   */
+  summary: ThreadSummary;
   // Per-provider harness session ids so follow-up turns resume the same
   // conversation (claude --resume, codex exec resume, etc.).
   agentSessionIds?: Partial<Record<ProviderId, string>>;
@@ -651,8 +658,6 @@ export type Thread = {
   spawnId?: string;
   /** Follow-ups submitted while a run was in flight; dispatched in order when the run ends. */
   queuedMessages?: QueuedMessage[];
-  /** `/btw` asides answered by session forks; rendered alongside the transcript, never part of it. */
-  btwExchanges?: BtwExchange[];
   /** Kanban cards on the Orion web board driving/driven by this thread, in link order. */
   linkedTasks?: LinkedBoardTask[];
   /**
@@ -691,6 +696,32 @@ export type Thread = {
    * on every turn here (even when switched off in Settings) until detached.
    */
   mcpServerIds?: string[];
+};
+
+/**
+ * A thread's transcript. The store keeps every thread's shell (`Thread`) but
+ * only some transcripts (`transcripts`): the open panes', running threads',
+ * recently opened ones' and any with unsaved changes. The rest load from disk
+ * on demand (ensureThreadTranscript).
+ */
+export type ThreadTranscript = {
+  messages: Message[];
+  /** `/btw` asides answered by session forks; rendered alongside the transcript, never part of it. */
+  btwExchanges?: BtwExchange[];
+};
+
+/** A thread as stored on disk and exchanged whole: the shell's fields plus the transcript. */
+export type ThreadRecord = Omit<Thread, 'summary'> & ThreadTranscript;
+
+/** What the store sends main to persist (thread-storage.js writeThreadsPatch). */
+export type ThreadsPatch = {
+  version: 2;
+  /** Whole threads: shell and transcript. */
+  upserts: ThreadRecord[];
+  /** Shell-only saves of threads whose transcript isn't loaded; main keeps the stored transcript. */
+  shells: Array<Omit<Thread, 'summary'>>;
+  deletes: string[];
+  order?: string[];
 };
 
 export type ThreadDurangoWorkspace = {
@@ -883,7 +914,13 @@ interface OrionState {
   projects: Project[];
   /** The No project pseudo-project, once its scratch directory is known. */
   noProject: Project | null;
+  /** Every thread's shell, in stored order. Streaming output never replaces these. */
   threads: Thread[];
+  /**
+   * Loaded transcripts by thread id (see ThreadTranscript). Read one with
+   * `state.transcripts[id]`; load one with ensureThreadTranscript.
+   */
+  transcripts: Record<string, ThreadTranscript>;
   selectedProjectId: string | null;
   selectedThreadId: string | null;
   /**
@@ -947,7 +984,7 @@ interface OrionState {
   addProject: (project: Omit<Project, 'id'>) => string; // returns new project id
   setNoProjectPath: (path: string) => void;
   /** Adds imported threads (and the projects created for them) without changing selection. */
-  importThreads: (input: { projects: Project[]; threads: Thread[] }) => void;
+  importThreads: (input: { projects: Project[]; threads: ThreadRecord[] }) => void;
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
@@ -976,7 +1013,11 @@ interface OrionState {
       select?: boolean;
     }
   ) => string; // returns new thread id
-  branchThread: (sourceThreadId: string) => string | null; // returns new thread id
+  /**
+   * Copies a thread (and its settled subagents) into a new one. Loads the
+   * transcripts it copies first; resolves to the new thread id.
+   */
+  branchThread: (sourceThreadId: string) => Promise<string | null>;
   selectProject: (id: string | null) => void;
   selectThread: (id: string | null) => void;
   /** Add a thread as an extra pane beside the ones already open, and focus it. */
@@ -989,7 +1030,12 @@ interface OrionState {
   deleteSavedView: (id: string) => void;
   setSplitViewSettings: (updates: Partial<SplitViewSettings>) => void;
   setBrowserSettings: (updates: Partial<BrowserSettings>) => void;
-  updateThread: (id: string, updates: Partial<Thread>) => void;
+  updateThread: (id: string, updates: Partial<Omit<Thread, 'id' | 'summary'>>) => void;
+  /**
+   * Replace a thread's transcript with `recipe(transcript)`. When it isn't
+   * loaded the change waits for it (loading it now), so it is never lost.
+   */
+  updateThreadTranscript: (threadId: string, recipe: (transcript: ThreadTranscript) => ThreadTranscript) => void;
   /** Remember (or, when empty, forget) a thread's unsent composer draft. */
   setComposerDraft: (threadId: string, draft: ComposerDraft) => void;
   deleteThread: (id: string) => void;
@@ -1087,8 +1133,27 @@ export const flushOrionStoreSave = async (): Promise<boolean> => {
   }
 };
 
+// State kept outside the store that must reach it before the unload-time
+// synchronous write below (the composer's debounced draft). Window listeners
+// for the same event run in registration order, and this module registers
+// first, so a later beforeunload listener would be too late.
+const beforeUnloadStoreFlushes = new Set<() => void>();
+export const flushIntoStoreBeforeUnload = (flush: () => void) => {
+  beforeUnloadStoreFlushes.add(flush);
+  return () => {
+    beforeUnloadStoreFlushes.delete(flush);
+  };
+};
+
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
+    for (const flush of beforeUnloadStoreFlushes) {
+      try {
+        flush();
+      } catch (error) {
+        console.warn('Failed to flush into orion-storage on unload', error);
+      }
+    }
     // Like the threads flush below: an async save started here races app
     // teardown, and the store carries unsent composer drafts typed (or
     // cleared by a send) moments before quitting. Block on a synchronous
@@ -1113,25 +1178,41 @@ if (typeof window !== 'undefined') {
   });
 }
 
-// Threads (full transcripts) are excluded from the persisted store above and
-// live in sharded storage on a slower save cadence — see the saver below the
-// store definition. State shared with it:
+// Threads are excluded from the persisted store above and live in sharded
+// storage (main/thread-storage.js) on a slower save cadence — see the saver
+// below the store definition.
+//
+// Memory model: the store holds every thread's shell (`threads`) and only some
+// transcripts (`transcripts`). Startup reads the shells from the storage
+// manifest plus the open panes' transcripts; any other transcript loads when
+// something needs it (ensureThreadTranscript): opening it, an agent event or
+// store action for it, or code that reads it (branching, review context…).
+// Transcripts nothing needs any more are dropped again (evictTranscripts),
+// never while they have unsaved changes.
+//
+// Saving is patch-based: whole threads whose transcript changed, shell-only
+// saves for the rest (main keeps the stored transcript, so a thread whose
+// transcript isn't loaded is never written without its messages), explicit
+// deletes, and the order when it changed.
 let threadsSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let threadsSaveFlush: Promise<boolean> | null = null;
-type ThreadsPatch = { version: 2; upserts: Thread[]; deletes: string[]; order: string[] };
-const pendingThreadUpserts = new Map<string, Thread>();
+// Thread ids whose transcript changed since it was last handed to main.
+const dirtyTranscripts = new Set<string>();
+// Thread ids whose shell changed since then (whole-thread saves cover both).
+const dirtyShells = new Set<string>();
 const pendingThreadDeletes = new Set<string>();
 let pendingThreadOrder = false;
-let threadsInFlightPatch: ThreadsPatch | null = null;
+type InFlightThreadsSave = { transcriptIds: Set<string>; shellIds: Set<string>; deletes: Set<string> };
+let threadsInFlight: InFlightThreadsSave | null = null;
 let loadedThreadsFromStorage = false;
 // The threads reference at clearStorage time: zustand clears storage without
 // clearing in-memory state, so the savers must not write this exact snapshot
 // back to disk. A later thread change (fresh reference) resumes persistence.
 let clearedThreadsSnapshot: Thread[] | null = null;
-// Set when the threads file exists but could not be read or parsed: the
-// hydrated state then lacks the real transcripts, and any flush would
-// overwrite the (possibly recoverable) file with that lesser snapshot. All
-// thread persistence stays suppressed until an explicit clearStorage.
+// Set when the threads storage exists but could not be read: the hydrated
+// state then lacks the real threads, and any flush would overwrite the
+// (possibly recoverable) files with that lesser snapshot. All thread
+// persistence stays suppressed until an explicit clearStorage.
 let threadsPersistenceBlocked = false;
 
 const cancelQueuedThreadsSave = () => {
@@ -1141,38 +1222,22 @@ const cancelQueuedThreadsSave = () => {
   }
 };
 
-// Startup hydration is split so the window is usable at once: the store
-// hydrates with the head (the threads the first frame shows — see
-// readThreadsHead in main/thread-storage.js) and the remaining transcripts
-// load in the background afterwards (backfillThreads below). Thread
-// persistence is patch-based — upserts of changed threads, explicit deletes,
-// and an order in which unknown ids keep their place — so saving while the
-// older transcripts are still loading never touches them on disk.
-type PersistedThreadsHead = { version: 2; present: boolean; order: string[]; threads: Thread[] };
-type PersistedThreadsBatch = { version: 2; consumed: number; threads: Thread[] };
+type PersistedThreadShells = { version: 2; present: boolean; shells: Thread[]; threads: ThreadRecord[] };
+type PersistedThreadsBatch = { version: 2; consumed: number; threads: ThreadRecord[] };
 
-const THREADS_HEAD_COUNT = 60;
 const THREADS_BATCH_BYTES = 8 * 1024 * 1024;
-const THREADS_BATCH_IDS = 500;
 
-// Set by hydration when the head left transcripts on disk; cleared once
-// they are in the store (or storage is cleared).
-let threadsBackfill: { order: string[]; pendingIds: string[] } | null = null;
-let threadsBackfillGeneration = 0;
-// Threads deleted while the backfill runs must not come back with it.
-const threadsDeletedDuringBackfill = new Set<string>();
-let threadsSavedDuringBackfill = false;
-// Set when the backfill gave up on some stored transcripts: they are still on
-// disk, so the store holds less than every thread that exists.
-let threadsBackfillIncomplete = false;
-let applyingThreadsBackfill = false;
 const threadsCompleteListeners = new Set<() => void>();
 
-/** True once every stored transcript is in the store (always, for a fresh or legacy store). */
-export const allThreadsLoaded = () => threadsBackfill === null;
-/** Runs `listener` once every stored transcript is in the store; returns an unsubscribe. */
+/**
+ * True once every stored thread's shell is in the store. Shells all load with
+ * hydration, so this is hydration itself (kept for the startup tasks that
+ * must see every thread).
+ */
+export const allThreadsLoaded = () => useOrionStore.persist.hasHydrated();
+/** Runs `listener` once every stored thread's shell is in the store; returns an unsubscribe. */
 export const onAllThreadsLoaded = (listener: () => void) => {
-  if (allThreadsLoaded() && useOrionStore.persist.hasHydrated()) {
+  if (allThreadsLoaded()) {
     listener();
     return () => {};
   }
@@ -1188,18 +1253,12 @@ const notifyAllThreadsLoaded = () => {
   }
 };
 
-// The ids hydration itself checks threads against (merge below): they must
-// be in the head or the selection, panes and saved views would be dropped.
-const threadIdsNamedByStore = (state: Record<string, unknown>) => {
+// The panes the first frame shows: their transcripts come with the shells.
+const paneThreadIdsNamedByStore = (state: Record<string, unknown>) => {
   const ids = new Set<string>();
-  const addAll = (value: unknown) => {
-    if (!Array.isArray(value)) return;
-    for (const id of value) if (typeof id === 'string') ids.add(id);
-  };
   if (typeof state.selectedThreadId === 'string') ids.add(state.selectedThreadId);
-  addAll(state.paneThreadIds);
-  if (Array.isArray(state.savedViews)) {
-    for (const view of state.savedViews) addAll((view as { threadIds?: unknown } | null)?.threadIds);
+  if (Array.isArray(state.paneThreadIds)) {
+    for (const id of state.paneThreadIds) if (typeof id === 'string') ids.add(id);
   }
   return [...ids];
 };
@@ -1207,13 +1266,14 @@ const threadIdsNamedByStore = (state: Record<string, unknown>) => {
 const parseStorageValue = (value: string | null) =>
   value === null ? null : (JSON.parse(value) as StorageValue<unknown>);
 
-// Graft the head of the separately-persisted threads into the persisted
-// state so the persist middleware — including its crash-recovery merge —
-// sees one combined snapshot. With no threads directory yet (pre-split
-// builds), the store value's own embedded threads are used as-is and the
-// first threads save migrates them out.
+// Graft the separately persisted threads into the persisted state so the
+// persist middleware — including its crash-recovery merge — sees one combined
+// snapshot: every shell, and the transcripts of the panes that will be on
+// screen. With no threads directory yet (pre-split builds), the store value's
+// own embedded threads are used as-is and the first threads save migrates
+// them out.
 const withThreadsGrafted = async (value: string | null): Promise<StorageValue<unknown> | null> => {
-  if (!window.orion.loadThreadsHead) return parseStorageValue(value);
+  if (!window.orion.loadThreadShells) return parseStorageValue(value);
   // A lost/corrupt store file must not take the transcripts with it.
   let parsed: { state: Record<string, unknown>; version?: number };
   try {
@@ -1234,35 +1294,46 @@ const withThreadsGrafted = async (value: string | null): Promise<StorageValue<un
     parsed = { state: {}, version: 1 };
   }
   try {
-    const result = await window.orion.loadThreadsHead({
-      count: THREADS_HEAD_COUNT,
-      ids: threadIdsNamedByStore(parsed.state),
-    });
-    if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread head read failed.');
-    const head = JSON.parse(result.value) as PersistedThreadsHead;
+    const result = await window.orion.loadThreadShells({ ids: paneThreadIdsNamedByStore(parsed.state) });
+    if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread shells read failed.');
+    const stored = JSON.parse(result.value) as PersistedThreadShells;
     if (
-      head?.version !== 2 ||
-      typeof head.present !== 'boolean' ||
-      !Array.isArray(head.order) ||
-      !Array.isArray(head.threads)
+      stored?.version !== 2 ||
+      typeof stored.present !== 'boolean' ||
+      !Array.isArray(stored.shells) ||
+      !Array.isArray(stored.threads)
     ) {
-      throw new Error('Invalid thread head response.');
+      throw new Error('Invalid thread shells response.');
     }
-    if (!head.present) return parseStorageValue(value);
+    if (!stored.present) return parseStorageValue(value);
     loadedThreadsFromStorage = true;
-    const loadedIds = new Set(head.threads.map((thread) => thread.id));
-    const pendingIds = head.order.filter((id) => !loadedIds.has(id));
-    threadsBackfill = pendingIds.length > 0 ? { order: head.order, pendingIds } : null;
-    parsed.state = { ...parsed.state, threads: head.threads };
+    const transcripts: Record<string, ThreadTranscript> = {};
+    const records = new Map<string, ThreadRecord>();
+    for (const record of stored.threads) {
+      transcripts[record.id] = transcriptOfRecord(record);
+      records.set(record.id, record);
+    }
+    // The manifest's shells leave out subagent prompts and reports; the
+    // threads that arrive whole put them back, so a whole-thread save (or a
+    // branch) of an open pane keeps them.
+    const shells = records.size === 0 ? stored.shells : stored.shells.map((shell) => {
+      const record = records.get(shell.id);
+      return record ? withStoredSubagentDetails(shell, record) : shell;
+    });
+    parsed.state = { ...parsed.state, threads: shells, transcripts };
     return parsed;
   } catch (error) {
     console.error('Failed to hydrate Orion threads', error);
-    // Hydrating without the real transcript snapshot is survivable, but
-    // persisting over it is not.
+    // Hydrating without the real threads is survivable, but persisting over
+    // them is not.
     threadsPersistenceBlocked = true;
     return parseStorageValue(value);
   }
 };
+
+// Persisting the settings envelope costs a partialize and a stringify; skip
+// both when no persisted field changed (streaming output changes none).
+let lastPersistedState: unknown = null;
 
 // Objects in, objects out: zustand's createJSONStorage would make the
 // grafted transcripts take a stringify and a second parse on every launch.
@@ -1287,6 +1358,9 @@ const orionStorage: PersistStorage<unknown> = {
     return null;
   },
   setItem: async (name, storageValue) => {
+    // partialize returns the same object while nothing it reads changed.
+    if (storageValue.state === lastPersistedState) return;
+    lastPersistedState = storageValue.state;
     const value = JSON.stringify(storageValue);
     memoryStorage.set(name, value);
     pendingStoreValue = value;
@@ -1304,6 +1378,8 @@ const orionStorage: PersistStorage<unknown> = {
   },
   removeItem: async (name) => {
     memoryStorage.delete(name);
+    // lastPersistedState stays: the in-memory state survives the clear, and
+    // only a change to it may write the store file again.
     pendingStoreValue = null;
     if (storeSaveTimer !== null) {
       clearTimeout(storeSaveTimer);
@@ -1315,22 +1391,13 @@ const orionStorage: PersistStorage<unknown> = {
     // throttled saver and the unload flush both honor.
     cancelQueuedThreadsSave();
     clearedThreadsSnapshot = useOrionStore.getState().threads;
-    pendingThreadUpserts.clear();
+    dirtyTranscripts.clear();
+    dirtyShells.clear();
     pendingThreadDeletes.clear();
     pendingThreadOrder = false;
-    // An explicit clear discards whatever unreadable file blocked
+    // An explicit clear discards whatever unreadable storage blocked
     // persistence — new activity may persist fresh snapshots again.
     threadsPersistenceBlocked = false;
-    // Transcripts still loading belong to the storage being cleared.
-    if (threadsBackfill) {
-      threadsBackfill = null;
-      threadsBackfillGeneration += 1;
-      threadsDeletedDuringBackfill.clear();
-      // Cancelled, not loaded: draft pruning must not run (and write the
-      // store back) on the strength of it.
-      threadsBackfillIncomplete = true;
-      notifyAllThreadsLoaded();
-    }
 
     if (typeof window === 'undefined' || !window.orion?.clearStore) {
       return;
@@ -1343,101 +1410,210 @@ const orionStorage: PersistStorage<unknown> = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Shells and transcripts.
+
+/** The transcript part of a stored thread. */
+export const transcriptOfRecord = (record: Pick<ThreadRecord, 'messages' | 'btwExchanges'>): ThreadTranscript => {
+  const messages = Array.isArray(record.messages) ? record.messages : [];
+  return Array.isArray(record.btwExchanges) ? { messages, btwExchanges: record.btwExchanges } : { messages };
+};
+
+/** The shell of a stored thread, with its summary computed from the transcript. */
+export const shellOfRecord = (record: ThreadRecord): Thread =>
+  ({ ...threadShellOf(record), summary: summarizeThreadMessages(record.messages) }) as Thread;
+
+/** `shell` with the subagent details its light manifest copy left out, from the stored thread. */
+const withStoredSubagentDetails = (shell: Thread, record: ThreadRecord): Thread => {
+  let next = shell;
+  if (next.subagent) {
+    const subagent = withSubagentDetails(next.subagent, record.subagent);
+    if (subagent !== next.subagent) next = { ...next, subagent };
+  }
+  if (next.inheritedSubagent) {
+    const inheritedSubagent = withSubagentDetails(next.inheritedSubagent, record.inheritedSubagent);
+    if (inheritedSubagent !== next.inheritedSubagent) next = { ...next, inheritedSubagent };
+  }
+  return next;
+};
+
+/** A whole thread from its shell and transcript (what main stores). */
+export const threadRecordOf = (shell: Thread, transcript: ThreadTranscript): ThreadRecord => {
+  const { summary: _summary, ...fields } = shell;
+  return {
+    ...fields,
+    messages: transcript.messages,
+    ...(transcript.btwExchanges ? { btwExchanges: transcript.btwExchanges } : {}),
+  };
+};
+
+// Thread lookups by id, built once per `threads` array (which only changes
+// when a shell does), so per-update selectors don't scan every thread.
+const threadIndexCache = new WeakMap<Thread[], Map<string, number>>();
+const threadIndexById = (threads: Thread[]) => {
+  let index = threadIndexCache.get(threads);
+  if (!index) {
+    index = new Map();
+    for (let i = 0; i < threads.length; i += 1) index.set(threads[i].id, i);
+    threadIndexCache.set(threads, index);
+  }
+  return index;
+};
+
+/** The thread with this id, in O(1) for a `threads` array already looked up once. */
+export const findThread = (threads: Thread[], id: string | null | undefined): Thread | undefined => {
+  if (!id) return undefined;
+  const index = threadIndexById(threads).get(id);
+  return index === undefined ? undefined : threads[index];
+};
+
+const replaceThreadAt = (threads: Thread[], index: number, thread: Thread) => {
+  const next = threads.slice();
+  next[index] = thread;
+  // The ids and positions are unchanged: reuse the index.
+  const index_ = threadIndexCache.get(threads);
+  if (index_) threadIndexCache.set(next, index_);
+  return next;
+};
+
+/** The thread with this id plus its transcript, when the transcript is loaded. */
+export const getThreadRecord = (threadId: string): ThreadRecord | undefined => {
+  const state = useOrionStore.getState();
+  const shell = findThread(state.threads, threadId);
+  const transcript = state.transcripts[threadId];
+  return shell && transcript ? threadRecordOf(shell, transcript) : undefined;
+};
+
+// Store actions that change a transcript which isn't loaded wait here, in
+// order, and run on it as soon as it has loaded (ensureThreadTranscript).
+type TranscriptRecipe = (transcript: ThreadTranscript) => ThreadTranscript;
+const pendingTranscriptOps = new Map<string, TranscriptRecipe[]>();
+
+// Threads that were running when the previous session ended: their stored
+// transcripts still say so and are corrected when they load.
+const interruptedAtStartup = new Set<string>();
+// Transcripts written by this session reflect it; only older ones need the
+// previous-session cleanup when they load.
+const transcriptsWrittenThisSession = new Set<string>();
+let sessionStartedAt = new Date().toISOString();
+
 // Threads and their user messages used to hold at most one board task in a
 // `linkedTask` field; both now hold a `linkedTasks` list. Rewrite the legacy
-// shape on hydration so old transcripts keep their chips and their board link.
+// shape so old transcripts keep their chips and their board link.
 type LegacyLinkedTaskMessage = Message & {
   linkedTask?: Pick<LinkedBoardTask, 'id' | 'title' | 'description'>;
 };
-type LegacyLinkedTaskThread = Omit<Thread, 'messages'> & {
-  linkedTask?: LinkedBoardTask;
-  messages: LegacyLinkedTaskMessage[];
+
+const migrateLegacyLinkedTaskShell = (thread: Thread): Thread => {
+  const legacy = thread as Thread & { linkedTask?: LinkedBoardTask };
+  if (!legacy.linkedTask || legacy.linkedTasks) return thread;
+  const { linkedTask, ...rest } = legacy;
+  return { ...rest, linkedTasks: [linkedTask] };
 };
 
-const migrateLegacyLinkedTask = (thread: Thread): Thread => {
-  const legacy = thread as LegacyLinkedTaskThread;
-  const migratesThread = Boolean(legacy.linkedTask) && !legacy.linkedTasks;
-  const migratesMessages = legacy.messages.some(
-    (message) => message.linkedTask && !message.linkedTasks
-  );
-  if (!migratesThread && !migratesMessages) return thread;
-  const migrated: LegacyLinkedTaskThread = {
-    ...legacy,
-    ...(migratesThread ? { linkedTasks: [legacy.linkedTask!] } : {}),
-    ...(migratesMessages
-      ? {
-          messages: legacy.messages.map((message) => {
-            if (!message.linkedTask || message.linkedTasks) return message;
-            const { linkedTask, ...rest } = message;
-            return { ...rest, linkedTasks: [linkedTask] };
-          }),
-        }
-      : {}),
-  };
-  delete migrated.linkedTask;
-  return migrated;
+const migrateLegacyLinkedTaskMessages = (messages: Message[]): Message[] => {
+  const legacy = messages as LegacyLinkedTaskMessage[];
+  if (!legacy.some((message) => message.linkedTask && !message.linkedTasks)) return messages;
+  return legacy.map((message) => {
+    if (!message.linkedTask || message.linkedTasks) return message;
+    const { linkedTask, ...rest } = message;
+    return { ...rest, linkedTasks: [linkedTask] };
+  });
 };
 
-// Agent runs can't survive an app restart — the CLI processes die with
-// the app — so any thread or message rehydrated as 'running' is a
-// leftover from the previous session. Left alone it pins the run
-// status bar forever, because the run-event handler only flips
-// messages tracked by runs started in this session.
-//
-// A Claude turn can finish while its background tasks keep working:
-// the message persists as 'done' captioned "Waiting on … background
-// task(s) …" (waitingOnBackgroundStatusText in App.tsx — keep this
-// pattern in sync) with the thread 'running'. Those tasks died with
-// the app, so the wait can never settle — rewrite the caption
-// alongside the status flip. Only while the thread is still
-// 'running', though: every resolution path (a background-settled
-// event or the synthetic follow-up turn finishing) flips the thread
-// off 'running' but leaves the old caption behind as history, and
-// history must not be rebranded as a restart casualty. The first
-// alternation of the pattern matches captions persisted by older
-// builds ("Waiting on N background agents…").
-const restoreThreadFromPreviousRun = (thread: Thread, restartedAt: string): Thread => {
-  const waitingOnBackground = WAITING_ON_BACKGROUND_CAPTION;
+// Agent runs can't survive an app restart — the CLI processes die with the
+// app — so any thread rehydrated as 'running' is a leftover from the
+// previous session. Left alone it pins the run status bar forever, because
+// the run-event handler only flips messages tracked by runs started in this
+// session. Its transcript is corrected when it loads
+// (restoreTranscriptFromPreviousRun).
+const restoreShellFromPreviousRun = (input: Thread): Thread => {
   // Threads used to carry a single board task; they now carry a list.
-  thread = migrateLegacyLinkedTask(thread);
+  let thread = migrateLegacyLinkedTaskShell(input);
   // Epics were removed; drop the grouping older builds persisted.
   if ('epicId' in thread) {
     const { epicId: _epicId, ...rest } = thread as Thread & { epicId?: unknown };
     thread = rest;
   }
-  const waitUnresolved = thread.status === 'running';
-  const stale =
-    waitUnresolved || thread.messages.some((message) => message.status === 'running');
-  if (!stale) return thread;
-  // Only a currently live wait may be rebranded. Every resolution
-  // path (a background-settled event or a synthetic follow-up turn)
-  // appends a newer agent-run message after the waiting one, while a
-  // resolved wait can keep its historical "Waiting on …" caption. So
-  // the wait is live only when the thread's newest agent-run message
-  // is the one carrying the caption; a captioned message behind a
-  // newer turn — including the running foreground or synthetic turn
-  // that made this thread 'running' — is history from a wait that
-  // already resolved and must not be relabeled as a restart casualty.
-  const lastAgentRun = waitUnresolved
-    ? [...thread.messages].reverse().find((message) => message.kind === 'agent-run')
-    : undefined;
-  const liveWaitId =
-    lastAgentRun &&
-    lastAgentRun.status !== 'running' &&
-    lastAgentRun.statusText != null &&
-    waitingOnBackground.test(lastAgentRun.statusText)
-      ? lastAgentRun.id
+  if (!thread.summary) thread = { ...thread, summary: summarizeThreadMessages([]) };
+  // A summary stored while a run was going still counts it as running (the
+  // sidebar's "Worked" time would keep growing); its transcript says
+  // 'stopped' once loaded.
+  const { summary } = thread;
+  if (
+    summary.runningRunStarts.length > 0 ||
+    summary.lastMessage?.status === 'running' ||
+    summary.lastAgentRun?.status === 'running'
+  ) {
+    thread = {
+      ...thread,
+      summary: {
+        ...summary,
+        runningRunStarts: [],
+        lastMessage:
+          summary.lastMessage?.status === 'running' ? { ...summary.lastMessage, status: 'stopped' } : summary.lastMessage,
+        lastAgentRun:
+          summary.lastAgentRun?.status === 'running' ? { ...summary.lastAgentRun, status: 'stopped' } : summary.lastAgentRun,
+      },
+    };
+  }
+  if (thread.status !== 'running') return thread;
+  interruptedAtStartup.add(thread.id);
+  return { ...thread, status: 'idle' };
+};
+
+// The transcript side of the cleanup above, run once per stored transcript
+// this session loads (and never on one it has written).
+//
+// A Claude turn can finish while its background tasks keep working: the
+// message persists as 'done' captioned "Waiting on … background task(s) …"
+// (waitingOnBackgroundStatusText in App.tsx — keep this pattern in sync) with
+// the thread 'running'. Those tasks died with the app, so the wait can never
+// settle — rewrite the caption alongside the status flip. Only while the
+// thread was still 'running', though: every resolution path (a
+// background-settled event or the synthetic follow-up turn finishing) flips
+// the thread off 'running' but leaves the old caption behind as history, and
+// history must not be rebranded as a restart casualty. The first alternation
+// of the pattern matches captions persisted by older builds ("Waiting on N
+// background agents…").
+const restoreTranscriptFromPreviousRun = (
+  transcript: ThreadTranscript,
+  wasRunning: boolean,
+  restartedAt: string
+): ThreadTranscript => {
+  let result = transcript;
+  const migrated = migrateLegacyLinkedTaskMessages(transcript.messages);
+  if (migrated !== transcript.messages) result = { ...result, messages: migrated };
+  const stale = wasRunning || result.messages.some((message) => message.status === 'running');
+  if (stale) {
+    // Only a currently live wait may be rebranded. Every resolution path (a
+    // background-settled event or a synthetic follow-up turn) appends a newer
+    // agent-run message after the waiting one, while a resolved wait can
+    // keep its historical "Waiting on …" caption. So the wait is live only
+    // when the thread's newest agent-run message is the one carrying the
+    // caption; a captioned message behind a newer turn — including the
+    // running foreground or synthetic turn that made this thread 'running' —
+    // is history from a wait that already resolved and must not be relabeled
+    // as a restart casualty.
+    const lastAgentRun = wasRunning
+      ? [...result.messages].reverse().find((message) => message.kind === 'agent-run')
       : undefined;
-  return {
-    ...thread,
-    status: waitUnresolved ? 'idle' : thread.status,
-    messages: thread.messages.map((message) => {
+    const liveWaitId =
+      lastAgentRun &&
+      lastAgentRun.status !== 'running' &&
+      lastAgentRun.statusText != null &&
+      WAITING_ON_BACKGROUND_CAPTION.test(lastAgentRun.statusText)
+        ? lastAgentRun.id
+        : undefined;
+    let changed = false;
+    const messages = result.messages.map((message) => {
       if (
         message.kind === 'claude-background-intervention' &&
         message.claudeBackgroundIntervention &&
         (message.claudeBackgroundIntervention.status === 'pending' ||
           message.claudeBackgroundIntervention.status === 'stopping')
       ) {
+        changed = true;
         return {
           ...message,
           claudeBackgroundIntervention: {
@@ -1448,6 +1624,7 @@ const restoreThreadFromPreviousRun = (thread: Thread, restartedAt: string): Thre
         };
       }
       if (message.status === 'running') {
+        changed = true;
         return {
           ...message,
           status: 'stopped' as const,
@@ -1456,15 +1633,94 @@ const restoreThreadFromPreviousRun = (thread: Thread, restartedAt: string): Thre
         };
       }
       if (message.id === liveWaitId) {
+        changed = true;
         return {
           ...message,
           statusText: 'Background tasks interrupted by app restart.',
         };
       }
       return message;
-    }),
-  };
+    });
+    if (changed) result = { ...result, messages };
+  }
+  // A /btw aside can't outlive the app either.
+  if (result.btwExchanges?.some((exchange) => exchange.status === 'running')) {
+    result = {
+      ...result,
+      btwExchanges: result.btwExchanges.map((exchange) =>
+        exchange.status === 'running'
+          ? { ...exchange, status: 'error' as const, error: 'Interrupted before Durango Code received the answer.' }
+          : exchange
+      ),
+    };
+  }
+  return result;
 };
+
+/**
+ * The state change for `recipe` applied to one thread's transcript, with the
+ * shell's summary (and `shellPatch`) updated only when they actually change,
+ * so streaming output leaves `threads` — and everything that lists threads —
+ * untouched. A transcript that isn't loaded gets the recipe once it is.
+ */
+const transcriptChange = (
+  state: Pick<OrionState, 'threads' | 'transcripts'>,
+  threadId: string,
+  recipe: TranscriptRecipe,
+  options: { summary?: boolean; shellPatch?: (shell: Thread) => Partial<Thread> } = {}
+): Partial<OrionState> => {
+  const index = threadIndexById(state.threads).get(threadId);
+  if (index === undefined) return {};
+  const shell = state.threads[index];
+  let nextShell = shell;
+  if (options.shellPatch) {
+    const patch = options.shellPatch(shell);
+    if (Object.entries(patch).some(([key, value]) => shell[key as keyof Thread] !== value)) {
+      nextShell = { ...shell, ...patch };
+    }
+  }
+  const transcript = state.transcripts[threadId];
+  let nextTranscript = transcript;
+  if (!transcript) {
+    const queue = pendingTranscriptOps.get(threadId);
+    if (queue) queue.push(recipe);
+    else pendingTranscriptOps.set(threadId, [recipe]);
+    // Outside the update that queued it.
+    queueMicrotask(() => {
+      void ensureThreadTranscript(threadId).catch((error) =>
+        console.warn('Could not load an Orion thread transcript', error)
+      );
+    });
+  } else {
+    nextTranscript = recipe(transcript);
+    if (nextTranscript !== transcript && options.summary !== false) {
+      const summary = summarizeThreadMessages(nextTranscript.messages);
+      if (!sameThreadSummary(summary, shell.summary)) nextShell = { ...nextShell, summary };
+    }
+  }
+  const result: Partial<OrionState> = {};
+  if (nextTranscript !== transcript) result.transcripts = { ...state.transcripts, [threadId]: nextTranscript };
+  if (nextShell !== shell) result.threads = replaceThreadAt(state.threads, index, nextShell);
+  return result;
+};
+
+const mapMessage = (
+  transcript: ThreadTranscript,
+  messageId: string,
+  update: (message: Message) => Message
+): ThreadTranscript => {
+  const index = transcript.messages.findIndex((message) => message.id === messageId);
+  if (index === -1) return transcript;
+  const current = transcript.messages[index];
+  const next = update(current);
+  if (next === current) return transcript;
+  const messages = transcript.messages.slice();
+  messages[index] = next;
+  return { ...transcript, messages };
+};
+
+// Message fields the shell summary reads; other updates skip recomputing it.
+const SUMMARY_MESSAGE_FIELDS = new Set(['status', 'completedAt', 'startedAt', 'ts', 'kind', 'role', 'stats', 'statusText', 'steer']);
 
 // Opening a thread already on screen just moves focus to its pane. Opening any
 // other thread leaves the split behind and shows that thread alone: clicking a
@@ -1652,6 +1908,111 @@ const threadsWithOpenedSeen = (state: OrionState, ids: string | string[]) => {
   );
 };
 
+// What the store file persists (everything but threads and transcripts),
+// memoized on the fields it reads: see `partialize` below.
+const PERSISTED_SOURCE_KEYS = [
+  'activeSavedViewId',
+  'activeTab',
+  'appearanceSettings',
+  'browserSettings',
+  'composerDrafts',
+  'deploymentSettings',
+  'durangoSettings',
+  'durangoWorkspaceSettings',
+  'expandedProjects',
+  'noProject',
+  'notificationSettings',
+  'orchestrationSettings',
+  'paneThreadIds',
+  'projects',
+  'providerSettings',
+  'remoteControlSettings',
+  'savedViews',
+  'selectedProjectId',
+  'selectedThreadId',
+  'sidebarV2Settings',
+  'snapShotSettings',
+  'splitViewSettings',
+  'textGenerationSettings',
+  'workspacePath',
+  'workspaceSyncSettings',
+] as const;
+let persistedSource: OrionState | null = null;
+let persistedSettings: unknown = null;
+const persistedSettingsOf = (state: OrionState) => {
+  if (persistedSource && PERSISTED_SOURCE_KEYS.every((key) => persistedSource![key] === state[key])) {
+    return persistedSettings;
+  }
+  persistedSource = state;
+  persistedSettings = buildPersistedSettings(state);
+  return persistedSettings;
+};
+const buildPersistedSettings = (state: OrionState) => ({
+        activeTab: state.activeTab,
+        projects: state.projects,
+        noProject: state.noProject,
+        selectedProjectId: state.selectedProjectId,
+        selectedThreadId: state.selectedThreadId,
+        paneThreadIds: state.paneThreadIds,
+        composerDrafts: state.composerDrafts,
+        savedViews: state.savedViews,
+        activeSavedViewId: state.activeSavedViewId,
+        splitViewSettings: {
+          ...defaultSplitViewSettings,
+          ...state.splitViewSettings,
+        },
+        durangoWorkspaceSettings: {
+          ...defaultDurangoWorkspaceSettings,
+          ...state.durangoWorkspaceSettings,
+        },
+        workspaceSyncSettings: {
+          ...defaultWorkspaceSyncSettings,
+          ...state.workspaceSyncSettings,
+        },
+        durangoSettings: {
+          ...defaultDurangoSettings,
+          ...state.durangoSettings,
+        },
+        remoteControlSettings: {
+          ...defaultRemoteControlSettings,
+          ...state.remoteControlSettings,
+        },
+        snapShotSettings: mergeSnapShotSettings(state.snapShotSettings),
+        deploymentSettings: {
+          ...defaultDeploymentSettings,
+          ...state.deploymentSettings,
+        },
+        sidebarV2Settings: {
+          ...defaultSidebarV2Settings,
+          ...state.sidebarV2Settings,
+          views: { ...defaultSidebarV2Settings.views, ...state.sidebarV2Settings?.views },
+        },
+        appearanceSettings: { ...defaultAppearanceSettings, ...state.appearanceSettings },
+        browserSettings: { ...defaultBrowserSettings, ...state.browserSettings },
+        workspacePath: state.workspacePath,
+        expandedProjects: state.expandedProjects,
+        providerSettings: {
+          ...defaultProviderSettings,
+          ...state.providerSettings,
+        },
+        orchestrationSettings: {
+          ...defaultOrchestrationSettings,
+          ...state.orchestrationSettings,
+          models: {
+            ...defaultOrchestrationSettings.models,
+            ...state.orchestrationSettings?.models,
+          },
+        },
+        notificationSettings: {
+          ...defaultNotificationSettings,
+          ...state.notificationSettings,
+        },
+        textGenerationSettings: {
+          ...defaultTextGenerationSettings,
+          ...state.textGenerationSettings,
+        },
+      });
+
 export const useOrionStore = create<OrionState>()(
   persist(
     (set, get) => ({
@@ -1660,6 +2021,7 @@ export const useOrionStore = create<OrionState>()(
       projects: [],
       noProject: null,
       threads: [],
+      transcripts: {},
       selectedProjectId: null,
       selectedThreadId: null,
       paneThreadIds: [],
@@ -1817,13 +2179,17 @@ export const useOrionStore = create<OrionState>()(
         set((state) => {
           const knownProjectIds = new Set(state.projects.map((project) => project.id));
           const newProjects = projects.filter((project) => !knownProjectIds.has(project.id));
-          const knownThreadIds = new Set(state.threads.map((thread) => thread.id));
-          const newThreads = threads.filter((thread) => !knownThreadIds.has(thread.id));
+          const known = threadIndexById(state.threads);
+          const newThreads = threads.filter((thread) => !known.has(thread.id));
+          // Imported transcripts arrive whole; they stay loaded until saved.
+          const transcripts = newThreads.length > 0 ? { ...state.transcripts } : state.transcripts;
+          for (const thread of newThreads) transcripts[thread.id] = transcriptOfRecord(thread);
           return {
             // The sidebar orders projects and threads by activity, so imported
             // history lands in its chronological place wherever it's appended.
             projects: [...state.projects, ...newProjects],
-            threads: [...state.threads, ...newThreads],
+            threads: [...state.threads, ...newThreads.map(shellOfRecord)],
+            transcripts,
           };
         });
       },
@@ -1839,6 +2205,14 @@ export const useOrionStore = create<OrionState>()(
           const removedThreadIds = state.threads
             .filter((thread) => thread.projectId === id && thread.id in state.composerDrafts)
             .map((thread) => thread.id);
+          let transcripts = state.transcripts;
+          for (const thread of state.threads) {
+            if (thread.projectId !== id) continue;
+            pendingTranscriptOps.delete(thread.id);
+            if (!(thread.id in transcripts)) continue;
+            if (transcripts === state.transcripts) transcripts = { ...state.transcripts };
+            delete transcripts[thread.id];
+          }
           const composerDrafts = removedThreadIds.length > 0 ? { ...state.composerDrafts } : state.composerDrafts;
           for (const threadId of removedThreadIds) delete composerDrafts[threadId];
           const panes = panesAfterRemoval(
@@ -1852,6 +2226,7 @@ export const useOrionStore = create<OrionState>()(
           return {
             projects: remainingProjects,
             threads,
+            transcripts,
             selectedProjectId:
               focusedPaneThread?.projectId ??
               (state.selectedProjectId === id ? fallbackProject?.id ?? null : state.selectedProjectId),
@@ -1985,7 +2360,7 @@ export const useOrionStore = create<OrionState>()(
         // picked. Hidden/background subagents must not become that default;
         // child threads inherit from their explicit parent instead.
         const threadActivityTime = (t: Thread) =>
-          new Date(t.messages.at(-1)?.ts ?? t.createdAt).getTime();
+          new Date(t.summary.lastMessage?.ts ?? t.createdAt).getTime();
         const projectThreads = get().threads.filter((t) => t.projectId === projectId);
         const parentThread = options?.parentThreadId
           ? projectThreads.find((t) => t.id === options.parentThreadId)
@@ -2032,10 +2407,11 @@ export const useOrionStore = create<OrionState>()(
               : parentThread?.durangoWorkspace
                 ? { ...parentThread.durangoWorkspace, adopted: undefined }
                 : parentThread?.durangoWorkspace,
-          messages: [],
+          summary: summarizeThreadMessages([]),
         };
         set((state) => ({
           threads: [newThread, ...state.threads],
+          transcripts: { ...state.transcripts, [newThread.id]: { messages: [] } },
           ...(options?.select === false
             ? {}
             : {
@@ -2048,16 +2424,40 @@ export const useOrionStore = create<OrionState>()(
         return newThread.id;
       },
 
-      branchThread: (sourceThreadId) => {
-        const state = get();
-        const family = createThreadBranchFamily(state.threads, sourceThreadId);
+      branchThread: async (sourceThreadId) => {
+        // The copy needs the transcripts of the thread and of the subagents
+        // it carries along: load them, and keep them loaded until copied.
+        const familyIds = branchFamilyThreadIds(get().threads, sourceThreadId);
+        const releases = familyIds.map((id) => holdThreadTranscript(id));
+        let family: ReturnType<typeof createThreadBranchFamily>;
+        try {
+          const loads = await Promise.allSettled(familyIds.map((id) => ensureThreadTranscript(id)));
+          // A thread deleted meanwhile resolves to null and is simply not
+          // copied; one that couldn't be read fails the whole branch rather
+          // than leaving it out of the copy.
+          const unreadable = familyIds.filter((_, index) => loads[index].status === 'rejected');
+          if (unreadable.length > 0) {
+            throw new Error(
+              unreadable.includes(sourceThreadId)
+                ? "This thread's transcript could not be read, so it was not branched."
+                : `The transcript of ${unreadable.length === 1 ? 'a subagent' : `${unreadable.length} subagents`} could not be read, so the thread was not branched.`
+            );
+          }
+          const state = get();
+          family = createThreadBranchFamily(state.threads, state.transcripts, sourceThreadId);
+        } finally {
+          for (const release of releases) release();
+        }
         if (!family) return null;
-        const newThread = family.threads.find((thread) => thread.id === family.rootId);
+        const newThread = family.threads.find((thread) => thread.id === family!.rootId);
         if (!newThread) return null;
         set((state) => {
-          const threads = [...family.threads, ...state.threads];
+          const threads = [...family!.threads.map(shellOfRecord), ...state.threads];
+          const transcripts = { ...state.transcripts };
+          for (const thread of family!.threads) transcripts[thread.id] = transcriptOfRecord(thread);
           return {
             threads,
+            transcripts,
             selectedProjectId: newThread.projectId,
             ...syncSavedView(state, panesForSelection(state, newThread.id), { threads }),
           };
@@ -2067,7 +2467,7 @@ export const useOrionStore = create<OrionState>()(
 
       selectProject: (id) =>
         set((state) => {
-          const selectedThread = state.threads.find((t) => t.id === state.selectedThreadId);
+          const selectedThread = findThread(state.threads, state.selectedThreadId);
 
           // Moving the shell to another project drops the thread view, split
           // and all — the same rule as before panes existed, keyed off the
@@ -2086,7 +2486,7 @@ export const useOrionStore = create<OrionState>()(
 
       selectThread: (id) =>
         set((state) => {
-          const thread = state.threads.find((t) => t.id === id);
+          const thread = findThread(state.threads, id);
 
           return {
             ...syncSavedView(state, panesForSelection(state, id)),
@@ -2097,7 +2497,7 @@ export const useOrionStore = create<OrionState>()(
 
       openThreadInSplit: (id) =>
         set((state) => {
-          const thread = state.threads.find((t) => t.id === id);
+          const thread = findThread(state.threads, id);
           if (!thread) return {};
           // Already on screen: focus it rather than opening a second copy —
           // two panes on one thread would fight over the same transcript.
@@ -2180,8 +2580,9 @@ export const useOrionStore = create<OrionState>()(
 
       updateThread: (id, updates) =>
         set((state) => {
-          const threads = state.threads.map((t) => {
-            if (t.id !== id) return t;
+          const index = threadIndexById(state.threads).get(id);
+          if (index === undefined) return {};
+          const update = (t: Thread) => {
             const next = { ...t, ...updates };
             // A run that ends while the user is elsewhere leaves a dot in the
             // sidebar until the thread is opened; starting a new run (or
@@ -2217,7 +2618,8 @@ export const useOrionStore = create<OrionState>()(
               }
             }
             return next;
-          });
+          };
+          const threads = replaceThreadAt(state.threads, index, update(state.threads[index]));
           return {
             threads,
             // Saved-view labels are derived from their current thread titles,
@@ -2252,6 +2654,8 @@ export const useOrionStore = create<OrionState>()(
           // left with one thread goes with it.
           const threads = state.threads.filter((thread) => thread.id !== id);
           const { [id]: _removedDraft, ...composerDrafts } = state.composerDrafts;
+          pendingTranscriptOps.delete(id);
+          const { [id]: _removedTranscript, ...transcripts } = state.transcripts;
           const savedViews = pruneSavedViews(state.savedViews, threads);
           const panes = panesAfterRemoval(state, (paneId) => paneId === id);
           const focusedPaneThread = panes.selectedThreadId
@@ -2259,6 +2663,7 @@ export const useOrionStore = create<OrionState>()(
             : undefined;
           return {
             threads,
+            transcripts: id in state.transcripts ? transcripts : state.transcripts,
             ...panes,
             selectedProjectId: focusedPaneThread?.projectId ?? state.selectedProjectId,
             composerDrafts: id in state.composerDrafts ? composerDrafts : state.composerDrafts,
@@ -2275,54 +2680,47 @@ export const useOrionStore = create<OrionState>()(
           id: crypto.randomUUID(),
           ts: new Date().toISOString(),
         };
-        set((state) => ({
-          threads: state.threads.map((t) =>
-            // New activity puts a thread back in Recent agents even if it was
-            // removed — except subagent children, which render nested under
-            // their parent and never as top-level Recent rows.
-            t.id === threadId
-              ? {
-                  ...t,
-                  messages: [...t.messages, msg],
-                  hiddenFromRecent: t.parentThreadId ? t.hiddenFromRecent : false,
-                }
-              : t
-          ),
-        }));
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) => ({ ...transcript, messages: [...transcript.messages, msg] }),
+            {
+              // New activity puts a thread back in Recent agents even if it was
+              // removed — except subagent children, which render nested under
+              // their parent and never as top-level Recent rows.
+              shellPatch: (thread) => ({ hiddenFromRecent: thread.parentThreadId ? thread.hiddenFromRecent : false }),
+            }
+          )
+        );
         return msg.id;
       },
 
       appendToThreadMessage: (threadId, messageId, chunk) => {
         if (!chunk) return;
-        set((state) => ({
-          threads: state.threads.map((thread) =>
-            thread.id === threadId
-              ? {
-                  ...thread,
-                  messages: thread.messages.map((message) =>
-                    message.id === messageId
-                      ? { ...message, content: `${message.content}${chunk}` }
-                      : message
-                  ),
-                }
-              : thread
-          ),
-        }));
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) =>
+              mapMessage(transcript, messageId, (message) => ({ ...message, content: `${message.content}${chunk}` })),
+            // Streamed text changes nothing the shell shows.
+            { summary: false }
+          )
+        );
       },
 
       updateThreadMessage: (threadId, messageId, updates) =>
-        set((state) => ({
-          threads: state.threads.map((thread) =>
-            thread.id === threadId
-              ? {
-                  ...thread,
-                  messages: thread.messages.map((message) =>
-                    message.id === messageId ? { ...message, ...updates } : message
-                  ),
-                }
-              : thread
-          ),
-        })),
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) => mapMessage(transcript, messageId, (message) => ({ ...message, ...updates })),
+            { summary: Object.keys(updates).some((key) => SUMMARY_MESSAGE_FIELDS.has(key)) }
+          )
+        ),
+
+      updateThreadTranscript: (threadId, recipe) => set((state) => transcriptChange(state, threadId, recipe)),
 
       addActivityToThreadMessage: (threadId, messageId, activity) =>
         set((state) => {
@@ -2341,89 +2739,84 @@ export const useOrionStore = create<OrionState>()(
             Object.entries(activityFields).filter(([, value]) => value !== undefined)
           ) as Partial<AgentActivity>;
 
-          return {
-            threads: state.threads.map((thread) =>
-              thread.id === threadId
-                ? {
-                    ...thread,
-                    messages: thread.messages.map((message) => {
-                      if (message.id !== messageId) return message;
+          return transcriptChange(
+            state,
+            threadId,
+            (transcript) =>
+              mapMessage(transcript, messageId, (message) => {
+                const existingActivities = message.activities ?? [];
+                const existingIndex = activity.key
+                  ? existingActivities.findIndex((existing) => existing.key === activity.key)
+                  : -1;
 
-                      const existingActivities = message.activities ?? [];
-                      const existingIndex = activity.key
-                        ? existingActivities.findIndex((existing) => existing.key === activity.key)
-                        : -1;
+                if (existingIndex >= 0) {
+                  return {
+                    ...message,
+                    activities: existingActivities.map((existing, index) =>
+                      index === existingIndex
+                        ? {
+                            ...existing,
+                            ...patch,
+                            ...(detailDelta
+                              ? { detail: `${existing.detail ?? ''}${detailDelta}` }
+                              : {}),
+                            ts: nextActivity.ts,
+                            contentOffset: existing.contentOffset,
+                          }
+                        : existing
+                    ),
+                  };
+                }
 
-                      if (existingIndex >= 0) {
-                        return {
-                          ...message,
-                          activities: existingActivities.map((existing, index) =>
-                            index === existingIndex
-                              ? {
-                                  ...existing,
-                                  ...patch,
-                                  ...(detailDelta
-                                    ? { detail: `${existing.detail ?? ''}${detailDelta}` }
-                                    : {}),
-                                  ts: nextActivity.ts,
-                                  contentOffset: existing.contentOffset,
-                                }
-                              : existing
-                          ),
-                        };
-                      }
-
-                      return {
-                        ...message,
-                        activities: [
-                          ...existingActivities,
-                          { ...nextActivity, contentOffset: message.content.length },
-                        ],
-                      };
-                    }),
-                  }
-                : thread
-            ),
-          };
+                return {
+                  ...message,
+                  activities: [
+                    ...existingActivities,
+                    { ...nextActivity, contentOffset: message.content.length },
+                  ],
+                };
+              }),
+            // Tool activity changes nothing the shell shows.
+            { summary: false }
+          );
         }),
 
       completeInProgressPlanEntries: (threadId, messageId) =>
-        set((state) => ({
-          threads: state.threads.map((thread) =>
-            thread.id === threadId
-              ? {
-                  ...thread,
-                  messages: thread.messages.map((message) => {
-                    if (message.id !== messageId || !message.activities?.length) return message;
-                    let changed = false;
-                    const activities = message.activities.map((activity) => {
-                      if (
-                        activity.type !== 'plan' ||
-                        !activity.plan?.some((entry) => entry.status === 'in_progress')
-                      ) {
-                        return activity;
-                      }
-                      changed = true;
-                      const plan = activity.plan.map((entry) =>
-                        entry.status === 'in_progress'
-                          ? { ...entry, status: 'completed' as const }
-                          : entry
-                      );
-                      const completed = plan.filter((entry) => entry.status === 'completed').length;
-                      const allDone = completed === plan.length;
-                      return {
-                        ...activity,
-                        plan,
-                        ...(allDone ? { status: 'done' as const } : {}),
-                        title: `Tasks (${completed}/${plan.length})`,
-                      };
-                    });
-                    return changed ? { ...message, activities } : message;
-                  }),
-                }
-              : thread
-          ),
-        })),
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) =>
+              mapMessage(transcript, messageId, (message) => {
+                if (!message.activities?.length) return message;
+                let changed = false;
+                const activities = message.activities.map((activity) => {
+                  if (
+                    activity.type !== 'plan' ||
+                    !activity.plan?.some((entry) => entry.status === 'in_progress')
+                  ) {
+                    return activity;
+                  }
+                  changed = true;
+                  const plan = activity.plan.map((entry) =>
+                    entry.status === 'in_progress'
+                      ? { ...entry, status: 'completed' as const }
+                      : entry
+                  );
+                  const completed = plan.filter((entry) => entry.status === 'completed').length;
+                  const allDone = completed === plan.length;
+                  return {
+                    ...activity,
+                    plan,
+                    ...(allDone ? { status: 'done' as const } : {}),
+                    title: `Tasks (${completed}/${plan.length})`,
+                  };
+                });
+                return changed ? { ...message, activities } : message;
+              }),
+            { summary: false }
+          )
+        ),
 
       queueMessageToThread: (threadId, message) => {
         const id = crypto.randomUUID();
@@ -2450,73 +2843,80 @@ export const useOrionStore = create<OrionState>()(
         })),
 
       addBtwExchange: (threadId, question) => {
-        const thread = get().threads.find((t) => t.id === threadId);
-        const anchorMessage = thread?.messages.at(-1);
-        const afterMessageId = anchorMessage?.id;
-        const exchange: BtwExchange = {
-          id: crypto.randomUUID(),
-          question,
-          answer: '',
-          status: 'running',
-          createdAt: new Date().toISOString(),
-          ...(afterMessageId ? { afterMessageId } : {}),
-          ...(anchorMessage?.kind === 'agent-run'
-            ? { contentOffset: anchorMessage.content.length }
-            : {}),
-        };
-        set((state) => ({
-          threads: state.threads.map((t) =>
-            t.id === threadId
-              ? { ...t, btwExchanges: [...(t.btwExchanges ?? []), exchange] }
-              : t
-          ),
-        }));
-        return exchange.id;
+        const id = crypto.randomUUID();
+        const createdAt = new Date().toISOString();
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) => {
+              const anchorMessage = transcript.messages.at(-1);
+              const afterMessageId = anchorMessage?.id;
+              const exchange: BtwExchange = {
+                id,
+                question,
+                answer: '',
+                status: 'running',
+                createdAt,
+                ...(afterMessageId ? { afterMessageId } : {}),
+                ...(anchorMessage?.kind === 'agent-run'
+                  ? { contentOffset: anchorMessage.content.length }
+                  : {}),
+              };
+              return { ...transcript, btwExchanges: [...(transcript.btwExchanges ?? []), exchange] };
+            },
+            { summary: false }
+          )
+        );
+        return id;
       },
 
       appendToBtwExchange: (threadId, exchangeId, chunk) => {
         if (!chunk) return;
-        set((state) => ({
-          threads: state.threads.map((t) =>
-            t.id === threadId
-              ? {
-                  ...t,
-                  btwExchanges: (t.btwExchanges ?? []).map((exchange) =>
-                    exchange.id === exchangeId
-                      ? { ...exchange, answer: `${exchange.answer}${chunk}` }
-                      : exchange
-                  ),
-                }
-              : t
-          ),
-        }));
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) => ({
+              ...transcript,
+              btwExchanges: (transcript.btwExchanges ?? []).map((exchange) =>
+                exchange.id === exchangeId
+                  ? { ...exchange, answer: `${exchange.answer}${chunk}` }
+                  : exchange
+              ),
+            }),
+            { summary: false }
+          )
+        );
       },
 
       updateBtwExchange: (threadId, exchangeId, updates) =>
-        set((state) => ({
-          threads: state.threads.map((t) =>
-            t.id === threadId
-              ? {
-                  ...t,
-                  btwExchanges: (t.btwExchanges ?? []).map((exchange) =>
-                    exchange.id === exchangeId ? { ...exchange, ...updates } : exchange
-                  ),
-                }
-              : t
-          ),
-        })),
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) => ({
+              ...transcript,
+              btwExchanges: (transcript.btwExchanges ?? []).map((exchange) =>
+                exchange.id === exchangeId ? { ...exchange, ...updates } : exchange
+              ),
+            }),
+            { summary: false }
+          )
+        ),
 
       removeBtwExchange: (threadId, exchangeId) =>
-        set((state) => ({
-          threads: state.threads.map((t) =>
-            t.id === threadId
-              ? {
-                  ...t,
-                  btwExchanges: (t.btwExchanges ?? []).filter((e) => e.id !== exchangeId),
-                }
-              : t
-          ),
-        })),
+        set((state) =>
+          transcriptChange(
+            state,
+            threadId,
+            (transcript) => ({
+              ...transcript,
+              btwExchanges: (transcript.btwExchanges ?? []).filter((e) => e.id !== exchangeId),
+            }),
+            { summary: false }
+          )
+        ),
 
       toggleProjectExpanded: (id) =>
         set((state) => ({
@@ -2608,76 +3008,12 @@ export const useOrionStore = create<OrionState>()(
       name: ORION_STORE_NAME,
       storage: orionStorage,
       version: 1,
-      // `threads` is deliberately absent: the persist middleware stringifies
-      // this partialized state on EVERY store update, and threads hold every
-      // transcript (multi-MB after a while) — including them made each
-      // streaming chunk an O(entire-history) serialize. They are persisted by
-      // the throttled saver below instead, and grafted back in on hydration.
-      partialize: (state) => ({
-        activeTab: state.activeTab,
-        projects: state.projects,
-        noProject: state.noProject,
-        selectedProjectId: state.selectedProjectId,
-        selectedThreadId: state.selectedThreadId,
-        paneThreadIds: state.paneThreadIds,
-        composerDrafts: state.composerDrafts,
-        savedViews: state.savedViews,
-        activeSavedViewId: state.activeSavedViewId,
-        splitViewSettings: {
-          ...defaultSplitViewSettings,
-          ...state.splitViewSettings,
-        },
-        durangoWorkspaceSettings: {
-          ...defaultDurangoWorkspaceSettings,
-          ...state.durangoWorkspaceSettings,
-        },
-        workspaceSyncSettings: {
-          ...defaultWorkspaceSyncSettings,
-          ...state.workspaceSyncSettings,
-        },
-        durangoSettings: {
-          ...defaultDurangoSettings,
-          ...state.durangoSettings,
-        },
-        remoteControlSettings: {
-          ...defaultRemoteControlSettings,
-          ...state.remoteControlSettings,
-        },
-        snapShotSettings: mergeSnapShotSettings(state.snapShotSettings),
-        deploymentSettings: {
-          ...defaultDeploymentSettings,
-          ...state.deploymentSettings,
-        },
-        sidebarV2Settings: {
-          ...defaultSidebarV2Settings,
-          ...state.sidebarV2Settings,
-          views: { ...defaultSidebarV2Settings.views, ...state.sidebarV2Settings?.views },
-        },
-        appearanceSettings: { ...defaultAppearanceSettings, ...state.appearanceSettings },
-        browserSettings: { ...defaultBrowserSettings, ...state.browserSettings },
-        workspacePath: state.workspacePath,
-        expandedProjects: state.expandedProjects,
-        providerSettings: {
-          ...defaultProviderSettings,
-          ...state.providerSettings,
-        },
-        orchestrationSettings: {
-          ...defaultOrchestrationSettings,
-          ...state.orchestrationSettings,
-          models: {
-            ...defaultOrchestrationSettings.models,
-            ...state.orchestrationSettings?.models,
-          },
-        },
-        notificationSettings: {
-          ...defaultNotificationSettings,
-          ...state.notificationSettings,
-        },
-        textGenerationSettings: {
-          ...defaultTextGenerationSettings,
-          ...state.textGenerationSettings,
-        },
-      }),
+      // `threads` and `transcripts` are deliberately absent: they are
+      // persisted by the throttled saver below instead, and grafted back in on
+      // hydration. The middleware calls this on EVERY store update, so it
+      // returns the previous object while none of its inputs changed, and
+      // orionStorage.setItem then skips the stringify.
+      partialize: (state) => persistedSettingsOf(state),
       merge: (persisted, current) => {
         const merged = { ...current, ...(persisted as Partial<OrionState>) };
         // Retired features whose persisted state may linger in older stores:
@@ -2770,9 +3106,40 @@ export const useOrionStore = create<OrionState>()(
         if (merged.textGenerationSettings.modelId) {
           merged.textGenerationSettings.modelId = upgradeModelId(merged.textGenerationSettings.modelId);
         }
-        // Leftovers of the previous session's runs (restoreThreadFromPreviousRun).
-        const restartedAt = new Date().toISOString();
-        merged.threads = merged.threads.map((thread) => restoreThreadFromPreviousRun(thread, restartedAt));
+        // Threads arrive as shells with the panes' transcripts (thread
+        // storage), or whole from a store written before threads moved out of
+        // it; split those. Then clean up the previous session's runs
+        // (restoreShellFromPreviousRun, restoreTranscriptFromPreviousRun).
+        sessionStartedAt = new Date().toISOString();
+        const transcripts: Record<string, ThreadTranscript> = {
+          ...(merged.transcripts && typeof merged.transcripts === 'object' ? merged.transcripts : {}),
+        };
+        merged.threads = (Array.isArray(merged.threads) ? merged.threads : []).map((thread) => {
+          const record = thread as Thread & Partial<ThreadTranscript>;
+          if (!Array.isArray(record.messages)) return restoreShellFromPreviousRun(thread);
+          transcripts[record.id] = transcriptOfRecord(record as ThreadRecord);
+          return restoreShellFromPreviousRun(shellOfRecord(record as ThreadRecord));
+        });
+        const liveIds = new Set(merged.threads.map((thread) => thread.id));
+        for (const id of Object.keys(transcripts)) {
+          if (!liveIds.has(id)) {
+            delete transcripts[id];
+            continue;
+          }
+          transcripts[id] = restoreTranscriptFromPreviousRun(
+            transcripts[id],
+            interruptedAtStartup.has(id),
+            sessionStartedAt
+          );
+        }
+        // Summaries of the transcripts at hand reflect the cleanup.
+        merged.threads = merged.threads.map((thread) => {
+          const transcript = transcripts[thread.id];
+          if (!transcript) return thread;
+          const summary = summarizeThreadMessages(transcript.messages);
+          return sameThreadSummary(summary, thread.summary) ? thread : { ...thread, summary };
+        });
+        merged.transcripts = transcripts;
         // Panes must reference threads that survived to this launch, and stores
         // written before the split view shipped carry no pane list at all —
         // rebuild it from the selected thread so those users reopen on the
@@ -2833,10 +3200,10 @@ export const useOrionStore = create<OrionState>()(
   )
 );
 
-// The threads saver sends only changed transcripts at most once per
-// THREADS_SAVE_MS (a streaming run mutates a thread many times a second),
-// with a synchronous patch flush on unload. Zustand actions replace the
-// changed thread object, so reference identity identifies dirty transcripts.
+// The threads saver sends what changed at most once per THREADS_SAVE_MS (a
+// streaming run mutates a transcript many times a second), with a synchronous
+// patch flush on unload. Zustand actions replace the shell or transcript they
+// change, so reference identity identifies what is dirty.
 const THREADS_SAVE_MS = 5000;
 
 const scheduleThreadsSave = () => {
@@ -2845,6 +3212,51 @@ const scheduleThreadsSave = () => {
     threadsSaveTimer = null;
     flushThreadsSave();
   }, THREADS_SAVE_MS);
+};
+
+const shellForSave = (shell: Thread): Omit<Thread, 'summary'> => {
+  const { summary: _summary, ...fields } = shell;
+  return fields;
+};
+
+// The patch for these ids against the current state: whole threads for
+// changed transcripts (always loaded: transcripts with unsaved changes are
+// never evicted), shells for the rest, deletes for threads that are gone.
+const threadsPatchFor = (
+  transcriptIds: Iterable<string>,
+  shellIds: Iterable<string>,
+  deleteIds: Iterable<string>,
+  withOrder: boolean
+) => {
+  const state = useOrionStore.getState();
+  const upserts: ThreadRecord[] = [];
+  const shells: Array<Omit<Thread, 'summary'>> = [];
+  const sent: InFlightThreadsSave = { transcriptIds: new Set(), shellIds: new Set(), deletes: new Set() };
+  for (const id of transcriptIds) {
+    const shell = findThread(state.threads, id);
+    const transcript = state.transcripts[id];
+    if (!shell || !transcript || sent.transcriptIds.has(id)) continue;
+    upserts.push(threadRecordOf(shell, transcript));
+    sent.transcriptIds.add(id);
+  }
+  for (const id of shellIds) {
+    if (sent.transcriptIds.has(id) || sent.shellIds.has(id)) continue;
+    const shell = findThread(state.threads, id);
+    if (!shell) continue;
+    shells.push(shellForSave(shell));
+    sent.shellIds.add(id);
+  }
+  for (const id of deleteIds) {
+    if (!findThread(state.threads, id)) sent.deletes.add(id);
+  }
+  const patch: ThreadsPatch = {
+    version: 2,
+    upserts,
+    shells,
+    deletes: [...sent.deletes],
+    ...(withOrder ? { order: state.threads.map((thread) => thread.id) } : {}),
+  };
+  return { patch, sent };
 };
 
 export const flushOrionThreadsSave = async (): Promise<boolean> => {
@@ -2861,35 +3273,31 @@ export const flushOrionThreadsSave = async (): Promise<boolean> => {
     if (!(await threadsSaveFlush)) return false;
     return flushOrionThreadsSave();
   }
-  const threads = useOrionStore.getState().threads;
-  if (pendingThreadUpserts.size === 0 && pendingThreadDeletes.size === 0 && !pendingThreadOrder) return true;
-  const patch: ThreadsPatch = {
-    version: 2,
-    upserts: [...pendingThreadUpserts.values()],
-    deletes: [...pendingThreadDeletes],
-    order: threads.map((thread) => thread.id),
-  };
-  for (const thread of patch.upserts) pendingThreadUpserts.delete(thread.id);
-  for (const id of patch.deletes) pendingThreadDeletes.delete(id);
+  if (dirtyTranscripts.size === 0 && dirtyShells.size === 0 && pendingThreadDeletes.size === 0 && !pendingThreadOrder) {
+    return true;
+  }
+  const { patch, sent } = threadsPatchFor(dirtyTranscripts, dirtyShells, pendingThreadDeletes, pendingThreadOrder);
+  dirtyTranscripts.clear();
+  dirtyShells.clear();
+  pendingThreadDeletes.clear();
   pendingThreadOrder = false;
-  threadsInFlightPatch = patch;
-  if (threadsBackfill) threadsSavedDuringBackfill = true;
+  threadsInFlight = sent;
   const save = (async () => {
     try {
       const saved = await window.orion.saveThreads(patch);
       if (!saved) throw new Error('Thread patch was not acknowledged.');
+      for (const id of sent.transcriptIds) transcriptsWrittenThisSession.add(id);
+      // Threads storage exists now (it may not have at launch), so saved
+      // transcripts can be dropped from memory and read back.
+      loadedThreadsFromStorage = true;
       return saved;
     } catch (error) {
       console.warn('Failed to persist Orion threads; retrying', error);
-      const currentById = new Map(useOrionStore.getState().threads.map((thread) => [thread.id, thread]));
-      for (const thread of patch.upserts) {
-        if (!pendingThreadUpserts.has(thread.id) && currentById.has(thread.id)) {
-          pendingThreadUpserts.set(thread.id, currentById.get(thread.id)!);
-        }
-      }
-      for (const id of patch.deletes) {
-        if (!pendingThreadUpserts.has(id) && !currentById.has(id)) pendingThreadDeletes.add(id);
-      }
+      // Everything in the failed patch is dirty again; the retry reads the
+      // current state.
+      for (const id of sent.transcriptIds) dirtyTranscripts.add(id);
+      for (const id of sent.shellIds) dirtyShells.add(id);
+      for (const id of sent.deletes) pendingThreadDeletes.add(id);
       pendingThreadOrder = true;
       scheduleThreadsSave();
       return false;
@@ -2899,8 +3307,9 @@ export const flushOrionThreadsSave = async (): Promise<boolean> => {
   try {
     return await save;
   } finally {
-    if (threadsInFlightPatch === patch) threadsInFlightPatch = null;
+    if (threadsInFlight === sent) threadsInFlight = null;
     if (threadsSaveFlush === save) threadsSaveFlush = null;
+    scheduleTranscriptEviction();
   }
 };
 
@@ -2908,156 +3317,333 @@ const flushThreadsSave = () => {
   void flushOrionThreadsSave();
 };
 
+// Set while a loaded transcript (and the shell fields it fills in) goes into
+// the store: that is what is stored already, not a change to save.
+let applyingTranscriptLoad = false;
+
 useOrionStore.subscribe((state, previous) => {
-  if (state.threads === previous.threads || !useOrionStore.persist.hasHydrated()) return;
-  // Backfilled transcripts are exactly what is on disk already.
-  if (applyingThreadsBackfill) return;
-  if (state.threads.length === previous.threads.length) {
-    let sameOrder = true;
-    let changed = false;
-    for (let index = 0; index < state.threads.length; index += 1) {
-      const thread = state.threads[index];
-      const prior = previous.threads[index];
-      if (thread.id !== prior.id) {
-        sameOrder = false;
-        break;
-      }
-      if (thread !== prior) {
-        pendingThreadUpserts.set(thread.id, thread);
-        pendingThreadDeletes.delete(thread.id);
+  if (!useOrionStore.persist.hasHydrated() || applyingTranscriptLoad) return;
+  let changed = false;
+  if (state.transcripts !== previous.transcripts) {
+    // Only loaded transcripts are visited: a handful, not every thread.
+    for (const id in state.transcripts) {
+      if (state.transcripts[id] !== previous.transcripts[id]) {
+        dirtyTranscripts.add(id);
         changed = true;
       }
     }
-    // Streaming updates keep array order stable and replace only the active
-    // thread. Avoid allocating two 888-entry maps for every output chunk.
+  }
+  if (state.threads !== previous.threads) {
+    const sameOrder =
+      state.threads.length === previous.threads.length &&
+      state.threads.every((thread, index) => thread.id === previous.threads[index].id);
     if (sameOrder) {
-      if (changed) scheduleThreadsSave();
-      return;
+      for (let index = 0; index < state.threads.length; index += 1) {
+        if (state.threads[index] !== previous.threads[index]) {
+          dirtyShells.add(state.threads[index].id);
+          changed = true;
+        }
+      }
+    } else {
+      const previousIndex = threadIndexById(previous.threads);
+      const currentIndex = threadIndexById(state.threads);
+      for (const thread of state.threads) {
+        const index = previousIndex.get(thread.id);
+        if (index === undefined || previous.threads[index] !== thread) {
+          dirtyShells.add(thread.id);
+          pendingThreadDeletes.delete(thread.id);
+        }
+      }
+      for (const thread of previous.threads) {
+        if (!currentIndex.has(thread.id)) {
+          dirtyShells.delete(thread.id);
+          dirtyTranscripts.delete(thread.id);
+          pendingThreadDeletes.add(thread.id);
+        }
+      }
+      pendingThreadOrder = true;
+      changed = true;
     }
   }
-  const previousById = new Map(previous.threads.map((thread) => [thread.id, thread]));
-  const currentIds = new Set<string>();
-  for (const thread of state.threads) {
-    currentIds.add(thread.id);
-    if (previousById.get(thread.id) !== thread) {
-      pendingThreadUpserts.set(thread.id, thread);
-      pendingThreadDeletes.delete(thread.id);
-    }
-  }
-  for (const thread of previous.threads) {
-    if (!currentIds.has(thread.id)) {
-      pendingThreadUpserts.delete(thread.id);
-      pendingThreadDeletes.add(thread.id);
-      if (threadsBackfill) threadsDeletedDuringBackfill.add(thread.id);
-    }
-  }
-  pendingThreadOrder = true;
-  scheduleThreadsSave();
+  if (changed) scheduleThreadsSave();
 });
 
-// Slot the backfilled transcripts back where they are stored, around the
-// threads already in memory (which keep their own order, including threads
-// created since launch).
-const mergeBackfilledThreads = (current: Thread[], loaded: Thread[], order: string[]) => {
-  const position = new Map(order.map((id, index) => [id, index]));
-  const currentIds = new Set(current.map((thread) => thread.id));
-  const additions = loaded
-    .filter((thread) => !currentIds.has(thread.id) && !threadsDeletedDuringBackfill.has(thread.id))
-    .sort((a, b) => (position.get(a.id) ?? 0) - (position.get(b.id) ?? 0));
-  if (additions.length === 0) return current;
-  const threads: Thread[] = [];
-  let next = 0;
-  for (const thread of current) {
-    const at = position.get(thread.id);
-    if (at !== undefined) {
-      while (next < additions.length && position.get(additions[next].id)! < at) threads.push(additions[next++]);
+// ---------------------------------------------------------------------------
+// Loading and evicting transcripts.
+
+const transcriptLoads = new Map<string, Promise<ThreadTranscript | null>>();
+const TRANSCRIPT_LOAD_ATTEMPTS = 3;
+
+const readStoredThread = async (threadId: string): Promise<ThreadRecord | null> => {
+  if (typeof window === 'undefined' || !window.orion?.loadThreadsBatch) return null;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= TRANSCRIPT_LOAD_ATTEMPTS; attempt += 1) {
+    try {
+      const result = await window.orion.loadThreadsBatch({ ids: [threadId], maxBytes: THREADS_BATCH_BYTES });
+      if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread transcript read failed.');
+      const batch = JSON.parse(result.value) as PersistedThreadsBatch;
+      if (batch?.version !== 2 || !Array.isArray(batch.threads)) throw new Error('Invalid thread batch response.');
+      return batch.threads.find((thread) => thread?.id === threadId) ?? null;
+    } catch (error) {
+      lastError = error;
+      if (attempt < TRANSCRIPT_LOAD_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
     }
-    threads.push(thread);
   }
-  while (next < additions.length) threads.push(additions[next++]);
-  return threads;
+  throw lastError;
 };
 
-// App's interrupted-run recovery only sees the threads hydration loaded.
-const restoreBackfilledThread = (thread: Thread, restartedAt: string): Thread => {
-  const restored = restoreThreadFromPreviousRun(thread, restartedAt);
-  if (!restored.btwExchanges?.some((exchange) => exchange.status === 'running')) return restored;
-  return {
-    ...restored,
-    btwExchanges: restored.btwExchanges.map((exchange) =>
-      exchange.status === 'running'
-        ? { ...exchange, status: 'error' as const, error: 'Interrupted before Durango Code received the answer.' }
-        : exchange
-    ),
+// A stored thread as it goes into the store: the previous session's
+// leftovers cleaned up (once per session), the changes queued for it while it
+// wasn't loaded applied in order, and its shell's summary and subagent
+// details brought up to date. The shell keeps every field the store has.
+const resolveLoadedThread = (
+  threadId: string,
+  shell: Thread,
+  record: ThreadRecord | null,
+  ops: TranscriptRecipe[]
+) => {
+  // A thread that was never stored has nothing on disk to lose.
+  let transcript: ThreadTranscript = record ? transcriptOfRecord(record) : { messages: [] };
+  let changed = false;
+  if (record && !transcriptsWrittenThisSession.has(threadId)) {
+    const restored = restoreTranscriptFromPreviousRun(transcript, interruptedAtStartup.has(threadId), sessionStartedAt);
+    if (restored !== transcript) {
+      transcript = restored;
+      changed = true;
+    }
+  }
+  for (const op of ops) {
+    const next = op(transcript);
+    if (next !== transcript) {
+      transcript = next;
+      changed = true;
+    }
+  }
+  let nextShell = shell;
+  const summary = summarizeThreadMessages(transcript.messages);
+  if (!sameThreadSummary(summary, shell.summary)) nextShell = { ...nextShell, summary };
+  // The manifest's shell leaves out subagent prompts and reports; take them
+  // from the stored thread so a whole-thread save keeps them.
+  if (record) nextShell = withStoredSubagentDetails(nextShell, record);
+  return { shell: nextShell, transcript, changed };
+};
+
+const applyLoadedTranscript = (threadId: string, record: ThreadRecord | null) => {
+  applyingTranscriptLoad = true;
+  let changedByLoad = false;
+  try {
+    useOrionStore.setState((state) => {
+      const index = threadIndexById(state.threads).get(threadId);
+      // Deleted while it loaded: so are the changes waiting for it.
+      if (index === undefined) {
+        pendingTranscriptOps.delete(threadId);
+        return {};
+      }
+      // Loaded some other way meanwhile.
+      if (state.transcripts[threadId]) return {};
+      const shell = state.threads[index];
+      const ops = pendingTranscriptOps.get(threadId) ?? [];
+      pendingTranscriptOps.delete(threadId);
+      const loaded = resolveLoadedThread(threadId, shell, record, ops);
+      changedByLoad = loaded.changed;
+      return {
+        transcripts: { ...state.transcripts, [threadId]: loaded.transcript },
+        ...(loaded.shell !== shell ? { threads: replaceThreadAt(state.threads, index, loaded.shell) } : {}),
+      };
+    });
+  } finally {
+    applyingTranscriptLoad = false;
+  }
+  if (changedByLoad) {
+    dirtyTranscripts.add(threadId);
+    scheduleThreadsSave();
+  }
+  scheduleTranscriptEviction();
+};
+
+// Changes queued for a transcript whose load failed must not wait for some
+// later trigger: retry the load a few times, backing off.
+const PENDING_LOAD_RETRIES = 5;
+const pendingLoadRetries = new Map<string, number>();
+const retryLoadForPendingOps = (threadId: string) => {
+  if (!pendingTranscriptOps.has(threadId)) {
+    pendingLoadRetries.delete(threadId);
+    return;
+  }
+  const attempt = (pendingLoadRetries.get(threadId) ?? 0) + 1;
+  if (attempt > PENDING_LOAD_RETRIES) {
+    console.error(`Gave up loading Orion thread ${threadId}; its queued changes are kept until it loads or the app quits.`);
+    return;
+  }
+  pendingLoadRetries.set(threadId, attempt);
+  setTimeout(() => {
+    void ensureThreadTranscript(threadId).catch(() => {});
+  }, 2000 * attempt);
+};
+
+/**
+ * Loads a thread's transcript into the store (if it isn't already) and
+ * resolves to it; null for a thread that doesn't exist. Rejects when the
+ * stored transcript can't be read; changes waiting for it stay queued.
+ */
+export const ensureThreadTranscript = (threadId: string): Promise<ThreadTranscript | null> => {
+  const state = useOrionStore.getState();
+  const loaded = state.transcripts[threadId];
+  if (loaded) return Promise.resolve(loaded);
+  if (!findThread(state.threads, threadId)) return Promise.resolve(null);
+  const inFlight = transcriptLoads.get(threadId);
+  if (inFlight) return inFlight;
+  const load = (async () => {
+    let record: ThreadRecord | null;
+    try {
+      record = await readStoredThread(threadId);
+    } catch (error) {
+      retryLoadForPendingOps(threadId);
+      throw error;
+    }
+    pendingLoadRetries.delete(threadId);
+    applyLoadedTranscript(threadId, record);
+    return useOrionStore.getState().transcripts[threadId] ?? null;
+  })().finally(() => {
+    transcriptLoads.delete(threadId);
+  });
+  transcriptLoads.set(threadId, load);
+  return load;
+};
+
+/** ensureThreadTranscript for several threads; resolves once all are settled. */
+export const ensureThreadTranscripts = async (threadIds: Iterable<string>) => {
+  await Promise.all(
+    [...new Set(threadIds)].map((id) =>
+      ensureThreadTranscript(id).catch((error) => {
+        console.warn('Could not load an Orion thread transcript', error);
+        return null;
+      })
+    )
+  );
+};
+
+/** Whether a thread's transcript is in the store. */
+export const isThreadTranscriptLoaded = (threadId: string) => threadId in useOrionStore.getState().transcripts;
+
+// How many recently opened threads keep their transcript after they leave
+// the screen, so switching back and forth doesn't reload them.
+const RECENT_TRANSCRIPTS = 20;
+const recentThreadIds: string[] = [];
+const touchRecentThread = (threadId: string) => {
+  const at = recentThreadIds.indexOf(threadId);
+  if (at !== -1) recentThreadIds.splice(at, 1);
+  recentThreadIds.unshift(threadId);
+  if (recentThreadIds.length > RECENT_TRANSCRIPTS) recentThreadIds.length = RECENT_TRANSCRIPTS;
+};
+
+// Code that reads a transcript across awaits can hold it loaded.
+const transcriptHolds = new Map<string, number>();
+/** Keeps a thread's transcript from being evicted until the returned release is called. */
+export const holdThreadTranscript = (threadId: string) => {
+  transcriptHolds.set(threadId, (transcriptHolds.get(threadId) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const count = (transcriptHolds.get(threadId) ?? 1) - 1;
+    if (count > 0) transcriptHolds.set(threadId, count);
+    else transcriptHolds.delete(threadId);
+    scheduleTranscriptEviction();
   };
 };
 
-const BACKFILL_ATTEMPTS = 3;
-
-// Load the transcripts hydration left on disk, then add them in one update.
-// Runs after the first frame; nothing waits on it.
-const backfillThreads = async () => {
-  const backfill = threadsBackfill;
-  if (!backfill || !window.orion?.loadThreadsBatch) return;
-  const generation = threadsBackfillGeneration;
-  const loaded: Thread[] = [];
-  let index = 0;
-  let failures = 0;
-  while (index < backfill.pendingIds.length) {
-    if (generation !== threadsBackfillGeneration) return;
-    try {
-      const ids = backfill.pendingIds.slice(index, index + THREADS_BATCH_IDS);
-      const result = await window.orion.loadThreadsBatch({ ids, maxBytes: THREADS_BATCH_BYTES });
-      if (!result?.ok || typeof result.value !== 'string') throw new Error('Thread batch read failed.');
-      const batch = JSON.parse(result.value) as PersistedThreadsBatch;
-      if (
-        batch?.version !== 2 ||
-        !Array.isArray(batch.threads) ||
-        !Number.isInteger(batch.consumed) ||
-        batch.consumed < 1 ||
-        batch.consumed > ids.length
-      ) {
-        throw new Error('Invalid thread batch response.');
-      }
-      loaded.push(...batch.threads);
-      index += batch.consumed;
-      failures = 0;
-    } catch (error) {
-      failures += 1;
-      if (failures >= BACKFILL_ATTEMPTS) {
-        // Saving stays safe without them (patches never touch threads that
-        // aren't in memory); they come back on the next launch.
-        console.error('Could not load older Orion threads', error);
-        threadsBackfillIncomplete = true;
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500 * failures));
-    }
+/**
+ * Drops the transcripts nothing needs: not on screen, not running, not among
+ * the recently opened, not held, and fully saved. Their shells stay.
+ */
+export const evictTranscripts = () => {
+  // Without working persistence the store's copy may be the only one.
+  if (threadsPersistenceBlocked || !loadedThreadsFromStorage) return;
+  const state = useOrionStore.getState();
+  const keep = new Set([...state.paneThreadIds, ...recentThreadIds]);
+  if (state.selectedThreadId) keep.add(state.selectedThreadId);
+  const evicted: string[] = [];
+  for (const id in state.transcripts) {
+    if (keep.has(id) || transcriptHolds.has(id) || pendingTranscriptOps.has(id)) continue;
+    if (dirtyTranscripts.has(id) || threadsInFlight?.transcriptIds.has(id)) continue;
+    const shell = findThread(state.threads, id);
+    if (!shell || shell.status === 'running') continue;
+    evicted.push(id);
   }
-  if (generation !== threadsBackfillGeneration) return;
-  const restartedAt = new Date().toISOString();
-  const restored = loaded.map((thread) => restoreBackfilledThread(thread, restartedAt));
-  applyingThreadsBackfill = true;
+  if (evicted.length === 0) return;
+  applyingTranscriptLoad = true;
   try {
-    useOrionStore.setState((state) => ({
-      threads: mergeBackfilledThreads(state.threads, restored, backfill.order),
-    }));
+    useOrionStore.setState((current) => {
+      const transcripts = { ...current.transcripts };
+      for (const id of evicted) {
+        // Re-checked against the state being replaced.
+        if (dirtyTranscripts.has(id) || transcripts[id] !== state.transcripts[id]) continue;
+        delete transcripts[id];
+      }
+      return { transcripts };
+    });
   } finally {
-    applyingThreadsBackfill = false;
+    applyingTranscriptLoad = false;
   }
-  threadsBackfill = null;
-  threadsDeletedDuringBackfill.clear();
-  // A save made meanwhile stored the partial order; the old threads kept
-  // their place behind it, but write the real one back.
-  if (threadsSavedDuringBackfill) {
-    threadsSavedDuringBackfill = false;
-    pendingThreadOrder = true;
-    scheduleThreadsSave();
-  }
-  notifyAllThreadsLoaded();
 };
 
-// Materialize the threads file as soon as hydration lands rather than a
+const TRANSCRIPT_EVICTION_DELAY_MS = 2000;
+let transcriptEvictionTimer: ReturnType<typeof setTimeout> | null = null;
+const scheduleTranscriptEviction = () => {
+  if (transcriptEvictionTimer !== null) return;
+  transcriptEvictionTimer = setTimeout(() => {
+    transcriptEvictionTimer = null;
+    evictTranscripts();
+  }, TRANSCRIPT_EVICTION_DELAY_MS);
+};
+
+// What is on screen loads (and counts as recently opened); threads that start
+// running load too, since their events will write to them.
+useOrionStore.subscribe((state, previous) => {
+  if (!useOrionStore.persist.hasHydrated()) return;
+  if (state.paneThreadIds !== previous.paneThreadIds || state.selectedThreadId !== previous.selectedThreadId) {
+    for (const id of [...state.paneThreadIds].reverse()) touchRecentThread(id);
+    if (state.selectedThreadId) touchRecentThread(state.selectedThreadId);
+    void ensureThreadTranscripts(state.paneThreadIds);
+    scheduleTranscriptEviction();
+  }
+  if (state.threads !== previous.threads) {
+    const running: string[] = [];
+    for (const thread of state.threads) {
+      if (thread.status === 'running' && !(thread.id in state.transcripts)) running.push(thread.id);
+    }
+    if (running.length > 0) void ensureThreadTranscripts(running);
+  }
+});
+
+// The whole threads that changes queued for unloaded transcripts produce,
+// read synchronously (the quit-time flush can't wait for a load). A thread
+// whose stored copy can't be read is left alone rather than saved without
+// its messages.
+const threadsWithPendingOpsSync = (): ThreadRecord[] => {
+  if (pendingTranscriptOps.size === 0 || typeof window === 'undefined' || !window.orion?.loadThreadSync) return [];
+  const state = useOrionStore.getState();
+  const records: ThreadRecord[] = [];
+  for (const [threadId, ops] of pendingTranscriptOps) {
+    const shell = findThread(state.threads, threadId);
+    if (!shell || state.transcripts[threadId]) continue;
+    let stored: ThreadRecord | null;
+    try {
+      const result = window.orion.loadThreadSync(threadId);
+      if (!result?.ok) throw new Error('Thread transcript read failed.');
+      stored = typeof result.value === 'string' ? (JSON.parse(result.value) as ThreadRecord) : null;
+    } catch (error) {
+      console.error(`Could not save the queued changes of Orion thread ${threadId}`, error);
+      continue;
+    }
+    const loaded = resolveLoadedThread(threadId, shell, stored, ops);
+    records.push(threadRecordOf(loaded.shell, loaded.transcript));
+  }
+  return records;
+};
+
+// Materialize the threads storage as soon as hydration lands rather than a
 // throttle-window later: the store file stops embedding threads on its first
 // post-hydration save, so until this flush runs the transcripts exist only in
 // memory and a crash would lose them.
@@ -3066,22 +3652,20 @@ const backfillThreads = async () => {
 // from when it was opt-in, or one that turned it on before the first-switch
 // settle existed) get it once here rather than in `merge`: thread edits made
 // during hydration are never saved, while this one goes through the saver
-// like a user's. It settles every thread, so it waits for the backfill; until
-// then App shows the lists as they will be after it.
+// like a user's.
 const settleThreadsFromBeforeSidebarV2 = () => {
   const { sidebarV2Settings, setSidebarV2Settings } = useOrionStore.getState();
-  // Only over every stored thread: after a failed or cancelled backfill it
-  // waits for a launch that loads them all.
-  if (threadsPersistenceBlocked || threadsBackfillIncomplete) return;
+  // Only over every stored thread.
+  if (threadsPersistenceBlocked) return;
   if (!sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return;
   setSidebarV2Settings({});
 };
 const pruneOrphanComposerDrafts = () => {
   // A thread that failed to load is not a deleted one; its draft waits for a
   // launch that reads it.
-  if (threadsPersistenceBlocked || threadsBackfillIncomplete) return;
+  if (threadsPersistenceBlocked) return;
   const { threads, composerDrafts } = useOrionStore.getState();
-  const liveThreadIds = new Set(threads.map((thread) => thread.id));
+  const liveThreadIds = threadIndexById(threads);
   const orphanIds = Object.keys(composerDrafts).filter((id) => !liveThreadIds.has(id));
   if (orphanIds.length === 0) return;
   const kept = { ...composerDrafts };
@@ -3089,15 +3673,21 @@ const pruneOrphanComposerDrafts = () => {
   useOrionStore.setState({ composerDrafts: kept });
 };
 const finishThreadsHydration = () => {
+  const state = useOrionStore.getState();
   if (!loadedThreadsFromStorage && !threadsPersistenceBlocked) {
-    for (const thread of useOrionStore.getState().threads) pendingThreadUpserts.set(thread.id, thread);
+    // Threads embedded in an older store file: write them all out.
+    for (const thread of state.threads) {
+      if (thread.id in state.transcripts) dirtyTranscripts.add(thread.id);
+      else dirtyShells.add(thread.id);
+    }
     pendingThreadOrder = true;
   }
-  onAllThreadsLoaded(settleThreadsFromBeforeSidebarV2);
-  onAllThreadsLoaded(pruneOrphanComposerDrafts);
+  for (const id of [...state.paneThreadIds].reverse()) touchRecentThread(id);
+  void ensureThreadTranscripts(state.paneThreadIds);
+  notifyAllThreadsLoaded();
+  settleThreadsFromBeforeSidebarV2();
+  pruneOrphanComposerDrafts();
   flushThreadsSave();
-  if (threadsBackfill) void backfillThreads();
-  else notifyAllThreadsLoaded();
 };
 useOrionStore.persist.onFinishHydration(finishThreadsHydration);
 if (useOrionStore.persist.hasHydrated()) finishThreadsHydration();
@@ -3107,7 +3697,7 @@ if (typeof window !== 'undefined') {
     cancelQueuedThreadsSave();
     // Closing the window mid-hydration must preserve the on-disk snapshot —
     // the store still holds the initial threads: [] and flushing it would
-    // erase the transcript history. Same when the threads file existed but
+    // erase the transcript history. Same when the threads storage existed but
     // failed to load: never overwrite it with the lesser hydrated state.
     if (threadsPersistenceBlocked || !useOrionStore.persist.hasHydrated()) return;
     // An async IPC save started here races app teardown — Electron can exit
@@ -3120,23 +3710,18 @@ if (typeof window !== 'undefined') {
       // Cleared storage must stay cleared — don't write the lingering
       // in-memory snapshot back.
       if (threads === clearedThreadsSnapshot) return;
-      const currentById = new Map(threads.map((thread) => [thread.id, thread]));
-      const affectedIds = new Set<string>([
-        ...pendingThreadUpserts.keys(),
-        ...pendingThreadDeletes,
-        ...(threadsInFlightPatch?.upserts.map((thread) => thread.id) ?? []),
-        ...(threadsInFlightPatch?.deletes ?? []),
-      ]);
-      const patch: ThreadsPatch = {
-        version: 2,
-        upserts: [...affectedIds].flatMap((id) => {
-          const thread = currentById.get(id);
-          return thread ? [thread] : [];
-        }),
-        deletes: [...affectedIds].filter((id) => !currentById.has(id)),
-        order: threads.map((thread) => thread.id),
-      };
-      if (patch.upserts.length > 0 || patch.deletes.length > 0 || pendingThreadOrder) {
+      const inFlight = threadsInFlight;
+      const { patch } = threadsPatchFor(
+        [...dirtyTranscripts, ...(inFlight?.transcriptIds ?? [])],
+        [...dirtyShells, ...(inFlight?.shellIds ?? [])],
+        [...pendingThreadDeletes, ...(inFlight?.deletes ?? [])],
+        true
+      );
+      // Changes still waiting for a transcript to load (quitting mid-load,
+      // or a load that keeps failing) would die with the renderer: read
+      // those transcripts synchronously and save them with the changes.
+      patch.upserts.push(...threadsWithPendingOpsSync());
+      if (patch.upserts.length > 0 || patch.shells.length > 0 || patch.deletes.length > 0 || pendingThreadOrder) {
         window.orion.saveThreadsSync(patch);
       }
     } else {

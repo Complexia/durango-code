@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 
 // Unsent composer drafts are saved with the store so a restart brings them
 // back. Empty drafts are never kept, deleting a thread drops its draft, and
-// drafts of threads that no longer exist are pruned only once every stored
-// transcript has loaded (the head alone may be partial), never after a failed
-// load. All storage is in memory. `--failed-backfill` and `--cleared-backfill`
-// run the cases where the backfill doesn't finish.
+// drafts of threads that no longer exist are pruned once every stored
+// thread's shell has loaded (hydration), never after a failed load. All
+// storage is in memory. `--failed-backfill` runs a failed thread load;
+// `--cleared-backfill` clears storage while a transcript is still loading.
+import { summarizeThreadMessages } from '../src/thread-shell.js';
+
 const failedBackfill = process.argv.includes('--failed-backfill');
 const clearedBackfill = process.argv.includes('--cleared-backfill');
 const deferred = <T>() => {
@@ -29,11 +31,12 @@ const stored = [thread('fresh'), thread('later')];
 const attachment = { id: 'a1', name: 'shot.png', path: '/tmp/shot.png', mimeType: 'image/png', size: 1 };
 const savedDrafts = {
   fresh: { text: 'typed before the restart', attachments: [attachment] },
-  later: { text: 'in a thread the backfill loads', attachments: [] },
+  later: { text: 'in a thread whose transcript is not loaded', attachments: [] },
   gone: { text: 'its thread was deleted', attachments: [] },
 };
 
 const batchGate = deferred<void>();
+const threadSaves: unknown[] = [];
 const storeSaves: string[] = [];
 const syncStoreSaves: string[] = [];
 const unloadListeners: Array<() => void> = [];
@@ -58,18 +61,20 @@ const bridge = {
     return true;
   },
   clearStore: async () => true,
-  loadThreadsHead: async () => ({
-    ok: true,
-    value: JSON.stringify({
-      version: 2,
-      present: true,
-      order: stored.map((entry) => entry.id),
-      threads: stored.filter((entry) => entry.id === 'fresh'),
-    }),
-  }),
+  loadThreadShells: async () =>
+    failedBackfill
+      ? { ok: false }
+      : {
+          ok: true,
+          value: JSON.stringify({
+            version: 2,
+            present: true,
+            shells: stored.map(({ messages, ...fields }) => ({ ...fields, summary: summarizeThreadMessages(messages) })),
+            threads: stored.filter((entry) => entry.id === 'fresh'),
+          }),
+        },
   loadThreadsBatch: async (input: { ids: string[] }) => {
     await batchGate.promise;
-    if (failedBackfill) return { ok: false };
     return {
       ok: true,
       value: JSON.stringify({
@@ -79,7 +84,10 @@ const bridge = {
       }),
     };
   },
-  saveThreads: async () => true,
+  saveThreads: async (patch: unknown) => {
+    threadSaves.push(patch);
+    return true;
+  },
   getNoProjectDir: async () => '/tmp/no-project',
 };
 Object.assign(globalThis, {
@@ -99,26 +107,9 @@ await new Promise<void>((resolve) => {
 });
 const drafts = () => useOrionStore.getState().composerDrafts;
 
-assert.equal(useOrionStore.getState().selectedThreadId, 'fresh');
-assert.deepEqual(drafts().fresh, savedDrafts.fresh, 'the open thread gets its draft back');
-assert.ok(drafts().gone, 'drafts wait for the backfill before anything is pruned');
-
-const complete = new Promise<void>((resolve) => onAllThreadsLoaded(resolve));
-if (clearedBackfill) {
-  await flushOrionStoreSave();
-  const savesBefore = storeSaves.length;
-  await useOrionStore.persist.clearStorage();
-  await complete;
-  batchGate.resolve();
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  assert.equal(storeSaves.length, savesBefore, 'a clear during the backfill writes nothing back');
-  assert.ok(drafts().gone, 'a cancelled backfill prunes nothing');
-  console.log('Composer draft persistence checks passed (cleared backfill).');
-  process.exit(0);
-}
-batchGate.resolve();
-await complete;
+await new Promise<void>((resolve) => onAllThreadsLoaded(resolve));
 if (failedBackfill) {
+  assert.equal(useOrionStore.getState().threads.length, 0);
   assert.deepEqual(
     Object.keys(drafts()).sort(),
     ['fresh', 'gone', 'later'],
@@ -127,7 +118,31 @@ if (failedBackfill) {
   console.log('Composer draft persistence checks passed (failed backfill).');
   process.exit(0);
 }
-assert.deepEqual(Object.keys(drafts()).sort(), ['fresh', 'later'], "a deleted thread's draft is pruned");
+assert.equal(useOrionStore.getState().selectedThreadId, 'fresh');
+assert.deepEqual(drafts().fresh, savedDrafts.fresh, 'the open thread gets its draft back');
+assert.deepEqual(
+  Object.keys(drafts()).sort(),
+  ['fresh', 'later'],
+  "a deleted thread's draft is pruned; one whose transcript isn't loaded is kept"
+);
+assert.deepEqual(Object.keys(useOrionStore.getState().transcripts), ['fresh'], 'only the open thread loaded');
+
+if (clearedBackfill) {
+  // Opening the other thread starts its transcript load; clearing storage
+  // meanwhile must not write anything back when it lands.
+  useOrionStore.getState().selectThread('later');
+  await flushOrionStoreSave();
+  const savesBefore = storeSaves.length;
+  const threadSavesBefore = threadSaves.length;
+  await useOrionStore.persist.clearStorage();
+  batchGate.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(storeSaves.length, savesBefore, 'a clear during a transcript load writes no store back');
+  assert.equal(threadSaves.length, threadSavesBefore, 'nor any thread');
+  console.log('Composer draft persistence checks passed (cleared backfill).');
+  process.exit(0);
+}
+batchGate.resolve();
 
 const { setComposerDraft, createThread, deleteThread } = useOrionStore.getState();
 const blank = createThread(project.id, 'Blank', { select: false });

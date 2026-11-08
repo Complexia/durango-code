@@ -84,7 +84,7 @@ import {
 } from './main/durango-deploy-watcher.js';
 import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } from './main/durango-tools.js';
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
-import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsBatch, readThreadsHead, readThreadsIndex, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
+import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsForSync, readThreadsBatch, readThreadRawSync, readThreadShells, readThreadsIndex, searchThreadBodies, searchThreadExcerpts, warmThreadSearch, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
 import {
   configureAgentModelsCache,
@@ -1200,6 +1200,7 @@ app.whenReady().then(async () => {
     readStoreState: () => readPersistedStoreState(),
     readThreadsIndex,
     readThreadsByIds,
+    readThreadsForSync,
     pushOrionSourceControl: async ({ gitRoot, token, signal }) => {
       const branch = await getCurrentGitBranch(gitRoot);
       if (!branch) throw new Error('Cannot push from a detached HEAD.');
@@ -1705,14 +1706,58 @@ ipcMain.handle('storage:save', async (_event, value) => {
   }
 });
 
-// Startup transcript hydration (thread-storage.js): the head the first frame
-// shows, then the rest in bounded background batches. Both arrive as JSON text.
-ipcMain.handle('storage:loadThreadsHead', async (_event, input) => {
+// Thread hydration (thread-storage.js): every thread's shell plus the
+// transcripts of the open panes at startup; other transcripts load when the
+// renderer needs them (loadThreadsBatch). Both arrive as JSON text.
+ipcMain.handle('storage:loadThreadShells', async (_event, input) => {
   try {
-    return { ok: true, value: await readThreadsHead(input) };
+    return { ok: true, value: await readThreadShells(input) };
   } catch (error) {
-    console.error('storage:loadThreadsHead error', error);
+    console.error('storage:loadThreadShells error', error);
     return { ok: false };
+  }
+});
+
+// Quit-time read of one stored thread (see storage:saveThreadsSync): changes
+// the renderer queued for a transcript it hadn't loaded yet are saved with it.
+ipcMain.on('storage:loadThreadSync', (event, id) => {
+  try {
+    event.returnValue = { ok: true, value: typeof id === 'string' ? readThreadRawSync(id) : null };
+  } catch (error) {
+    console.error('storage:loadThreadSync error', error);
+    event.returnValue = { ok: false };
+  }
+});
+
+// Full-text thread search runs here against the stored transcripts, so the
+// renderer never holds them all (thread-storage.js).
+ipcMain.handle('storage:searchThreads', async (_event, input) => {
+  try {
+    const result = await searchThreadBodies(input);
+    // Null: a newer request superseded this one. The renderer's newer request
+    // already carries every token its open searches still lack.
+    return result ? { ok: true, tokens: result.tokens, scores: result.scores } : { ok: false, superseded: true };
+  } catch (error) {
+    console.error('storage:searchThreads error', error);
+    return { ok: false };
+  }
+});
+
+ipcMain.handle('storage:threadSearchExcerpts', async (_event, input) => {
+  try {
+    return { ok: true, excerpts: await searchThreadExcerpts(input) };
+  } catch (error) {
+    console.error('storage:threadSearchExcerpts error', error);
+    return { ok: false };
+  }
+});
+
+ipcMain.handle('storage:warmThreadSearch', async () => {
+  try {
+    return await warmThreadSearch();
+  } catch (error) {
+    console.error('storage:warmThreadSearch error', error);
+    return false;
   }
 });
 
