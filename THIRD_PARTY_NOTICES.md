@@ -34,6 +34,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## libheif (libheif-js)
+
+Durango Code ships [libheif-js](https://github.com/catdad-experiments/libheif-js),
+a WebAssembly build of [libheif](https://github.com/strukturag/libheif), to
+convert HEIC/HEIF image attachments to JPEG on Windows and Linux. libheif is
+licensed under the GNU Lesser General Public License v3.0 (LGPL-3.0); libheif-js
+is LGPL-3.0 as well. It ships unmodified as a separate module
+(`node_modules/libheif-js` inside the app), which can be replaced with another
+build of the same version; its license texts are included there.
+
 ## T3 Code
 
 The design of Durango Code's simulator tools (four `device_*` tools, driving

@@ -87,6 +87,7 @@ import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } fro
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsForSync, readThreadsBatch, readThreadRawSync, readThreadShells, readThreadsIndex, searchThreadBodies, searchThreadExcerpts, warmThreadSearch, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
+import { convertHeicToJpeg, isHeicInput, jpegNameForHeic } from './main/heic.js';
 import {
   configureAgentModelsCache,
   getAgentModels,
@@ -4408,12 +4409,42 @@ const saveAttachment = async (_event, input) => {
     }
 
     const id = crypto.randomUUID();
-    const safeFileName = `${id}-${ensureMediaExtension(originalName, mimeType)}`;
     const attachmentDir = getAttachmentDirectoryPath();
-    const filePath = path.join(attachmentDir, safeFileName);
     const buffer = Buffer.from(data);
-
     await fs.mkdir(attachmentDir, { recursive: true });
+
+    if (isHeicInput(originalName, mimeType)) {
+      // Chromium can't render HEIC and the model APIs don't accept it: keep
+      // a JPEG copy. If conversion fails, attach the original as a plain file.
+      const heicPath = path.join(attachmentDir, `${id}-${originalName}`);
+      const jpegPath = path.join(attachmentDir, `${id}-${jpegNameForHeic(originalName)}`);
+      await fs.writeFile(heicPath, buffer);
+      try {
+        await convertHeicToJpeg(heicPath, jpegPath);
+        await fs.rm(heicPath, { force: true });
+        const { size } = await fs.stat(jpegPath);
+        return {
+          ok: true,
+          attachment: { id, name: originalName, path: jpegPath, mimeType: 'image/jpeg', size },
+        };
+      } catch (error) {
+        console.error('HEIC conversion failed', error);
+        await fs.rm(jpegPath, { force: true });
+        return {
+          ok: true,
+          attachment: {
+            id,
+            name: originalName,
+            path: heicPath,
+            mimeType: 'application/octet-stream',
+            size: buffer.byteLength,
+          },
+        };
+      }
+    }
+
+    const safeFileName = `${id}-${ensureMediaExtension(originalName, mimeType)}`;
+    const filePath = path.join(attachmentDir, safeFileName);
     await fs.writeFile(filePath, buffer);
 
     return {

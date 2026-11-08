@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import {
   attachmentKindLabel,
   buildPromptWithAttachments,
+  isHeicFile,
   isImageFile,
   isVideoFile,
 } from '../src/app/attachments';
@@ -35,6 +36,9 @@ assert.match(
 );
 
 assert.equal(isImageFile(new File(['image'], 'diagram.png', { type: '' })), true);
+assert.equal(isHeicFile(new File(['image'], 'IMG_8336.HEIC', { type: '' })), true);
+assert.equal(isHeicFile(new File(['image'], 'photo', { type: 'image/heif' })), true);
+assert.equal(isHeicFile(new File(['image'], 'diagram.png', { type: 'image/png' })), false);
 assert.equal(isVideoFile(new File(['video'], 'walkthrough.mov', { type: '' })), true);
 assert.equal(ensureMediaExtension('pasted-image', 'image/png'), 'pasted-image.png');
 assert.equal(ensureMediaExtension('screen-recording', 'video/quicktime'), 'screen-recording.mov');

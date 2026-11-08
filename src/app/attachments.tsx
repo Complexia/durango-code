@@ -10,6 +10,18 @@ export const videoFileNamePattern = /\.(mp4|webm|mov|m4v|ogv|mkv|avi)(?:[?#]|$)/
 export const isImageFile = (file: File) =>
   file.type.startsWith('image/') || imageFileNamePattern.test(file.name);
 
+// HEIC/HEIF (iPhone photos): Chromium can't display them, so they are always
+// sent to the main process, which attaches a JPEG copy.
+const heicMimeTypePattern = /^image\/hei[cf](-sequence)?$/i;
+const heicFileNamePattern = /\.(heic|heif|hif)$/i;
+
+export const isHeicFile = (file: File) =>
+  heicMimeTypePattern.test(file.type) || heicFileNamePattern.test(file.name);
+
+const isHeicAttachment = (attachment: FileAttachment) =>
+  heicMimeTypePattern.test(attachment.mimeType) ||
+  heicFileNamePattern.test(attachment.path);
+
 export const isVideoFile = (file: File) =>
   file.type.startsWith('video/') || videoFileNamePattern.test(file.name);
 
@@ -59,9 +71,10 @@ export const AttachmentThumb: React.FC<{ attachment: FileAttachment }> = ({ atta
     return <video src={imageAttachmentSrc(attachment)} muted preload="metadata" />;
   }
   if (
-    attachment.mimeType.startsWith('image/') ||
-    imageFileNamePattern.test(attachment.name) ||
-    imageFileNamePattern.test(attachment.path)
+    !isHeicAttachment(attachment) &&
+    (attachment.mimeType.startsWith('image/') ||
+      imageFileNamePattern.test(attachment.name) ||
+      imageFileNamePattern.test(attachment.path))
   ) {
     return (
       <img
@@ -202,7 +215,7 @@ export const saveFilesAsAttachments = async (files: File[]): Promise<FileAttachm
         ? 'image/*'
         : 'application/octet-stream';
     const droppedPath = getDroppedFilePath(file);
-    if (droppedPath && !isEphemeralDropPath(droppedPath)) {
+    if (droppedPath && !isEphemeralDropPath(droppedPath) && !isHeicFile(file)) {
       savedAttachments.push({
         id: crypto.randomUUID(),
         name: file.name || droppedPath.split(/[\\/]/).pop() || 'file',

@@ -105,6 +105,23 @@ module.exports = {
         }
       }
 
+      // libheif (WebAssembly HEIC decoder for attachments on Windows/Linux,
+      // see src/main/heic.js) is LGPL, so it ships as its own replaceable
+      // module rather than inside the main bundle. Only the self-contained
+      // wasm bundle and the licenses are needed.
+      const libheifSource = path.join(__dirname, 'node_modules', 'libheif-js');
+      const libheifTarget = path.join(buildPath, 'node_modules', 'libheif-js');
+      for (const file of [
+        'package.json',
+        'LICENSE',
+        'wasm-bundle.js',
+        'libheif-wasm/libheif-bundle.js',
+        'libheif-wasm/LICENSE',
+      ]) {
+        fs.mkdirSync(path.dirname(path.join(libheifTarget, file)), { recursive: true });
+        fs.copyFileSync(path.join(libheifSource, file), path.join(libheifTarget, file));
+      }
+
       // The durango-code CLI (dependency-free JavaScript) ships with the app:
       // agents and the app's workspace features run it through the shim in
       // src/main/bundled-cli.js, so installs don't need a global CLI.
