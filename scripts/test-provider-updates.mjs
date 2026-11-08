@@ -5,10 +5,12 @@ import path from 'node:path';
 
 import {
   checkProviderUpdate,
+  isMiseClaudeInstall,
   isNativeClaudeInstall,
   providerUpdaterConfigs,
   readClaudeUpdateChannel,
   readCliVersion,
+  resolveClaudeManagedUpdateCommand,
   updateProviderTool,
 } from '../src/main/provider-updates.js';
 
@@ -60,6 +62,32 @@ try {
     await isNativeClaudeInstall(path.join(claudeFixtureDir, 'npm-claude')),
     false,
     'other claude commands are package-manager installs'
+  );
+
+  // Omarchy runs Claude Code from mise (shims, or `mise activate` putting
+  // installs/claude/<version> on PATH), where `claude update` only says to
+  // use the package manager.
+  const miseInstallDir = path.join(claudeFixtureDir, 'mise', 'installs', 'claude', '2.1.309');
+  await mkdir(miseInstallDir, { recursive: true });
+  await writeFile(path.join(miseInstallDir, 'claude'), '#!/bin/sh\n', 'utf8');
+  await symlink(path.join(miseInstallDir, 'claude'), path.join(binDir, 'mise-linked-claude'));
+  for (const commandPath of [
+    '/home/user/.local/share/mise/shims/claude',
+    path.join(miseInstallDir, 'claude'),
+    path.join(binDir, 'mise-linked-claude'),
+  ]) {
+    assert.equal(await isMiseClaudeInstall(commandPath), true, `${commandPath} is a mise install`);
+  }
+  assert.equal(await isMiseClaudeInstall(path.join(binDir, 'claude')), false, 'a native install is not mise');
+  assert.match(
+    await resolveClaudeManagedUpdateCommand(path.join(miseInstallDir, 'claude')),
+    /mise upgrade claude$/,
+    'a mise install updates through mise'
+  );
+  assert.equal(
+    await resolveClaudeManagedUpdateCommand(path.join(binDir, 'claude')),
+    null,
+    'a native install keeps `claude update`'
   );
 
   process.env.CLAUDE_CONFIG_DIR = path.join(claudeFixtureDir, 'config');
@@ -228,6 +256,30 @@ sleep 2
     }
   );
   assert.equal(completed.ok, true, 'a streaming update should complete without a deadline');
+
+  const managedLog = path.join(fixtureDir, 'managed.log');
+  const managed = await updateProviderTool(
+    {
+      id: 'fixture',
+      label: 'Fixture Provider',
+      command: fixtureCommand,
+      packageName: 'fixture-package-that-must-not-be-installed',
+      updateCommands: [['quick']],
+      resolveManagedUpdateCommand: async () => `printf managed > '${managedLog}'; exit 3`,
+    },
+    null
+  );
+  assert.equal(
+    await readFile(managedLog, 'utf8'),
+    'managed',
+    "a package manager's update command replaces the CLI's own"
+  );
+  assert.equal(managed.ok, false, 'a failed package-manager update is reported');
+  assert.doesNotMatch(
+    managed.output ?? '',
+    /npm/,
+    'a package-manager install is not reinstalled from npm when its update fails'
+  );
   assert.match(completedChunks.join(''), /100%/, 'live progress should be emitted before completion');
 } finally {
   await rm(fixtureDir, { recursive: true });

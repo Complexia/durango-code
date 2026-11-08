@@ -26,6 +26,9 @@ export const providerUpdaterConfigs = [
     // update` reported as already current, forever. See
     // readClaudeLatestVersion.
     readLatestVersion: (commandPath) => readClaudeLatestVersion(commandPath),
+    // `claude update` only prints "use your package manager" for installs a
+    // package manager owns, so run that package manager's upgrade instead.
+    resolveManagedUpdateCommand: (commandPath) => resolveClaudeManagedUpdateCommand(commandPath),
     updateCommands: [['update']],
     verifyAfterUpdate: true,
     authCommands: [['auth', 'login']],
@@ -330,7 +333,48 @@ export const isNativeClaudeInstall = async (commandPath) => {
   }
 };
 
+// mise (Omarchy's default for developer tools) keeps each version under
+// <data>/mise/installs/claude/<version>; `mise activate` puts that directory
+// on PATH, and mise's shims (symlinks to mise itself) dispatch to it.
+const MISE_PATH_PATTERN = /[/\\]mise[/\\](?:installs|shims)[/\\]/i;
+
+export const isMiseClaudeInstall = async (commandPath) => {
+  if (!commandPath) return false;
+  if (MISE_PATH_PATTERN.test(commandPath)) return true;
+  try {
+    return MISE_PATH_PATTERN.test(await realpath(commandPath));
+  } catch {
+    return false;
+  }
+};
+
+// mise holds back releases younger than its cooldown (minimum_release_age).
+// An update the user asked for wants the current release, as Omarchy's own
+// `omarchy update` does, and the check must agree with what the upgrade gets.
+const MISE_UPDATE_ENV = 'MISE_MINIMUM_RELEASE_AGE=0';
+
+// The version `mise upgrade claude` installs, which is the one to compare
+// against: npm can be ahead of mise's backend for a while.
+export const readMiseLatestVersion = async (tool) => {
+  try {
+    const { stdout } = await runShellCommand(
+      `${MISE_UPDATE_ENV} mise latest ${shellQuote(tool)}`,
+      20000
+    );
+    return parseVersion(stdout);
+  } catch {
+    return null;
+  }
+};
+
+export const resolveClaudeManagedUpdateCommand = async (commandPath) =>
+  (await isMiseClaudeInstall(commandPath)) ? `${MISE_UPDATE_ENV} mise upgrade claude` : null;
+
 export const readClaudeLatestVersion = async (commandPath) => {
+  if (await isMiseClaudeInstall(commandPath)) {
+    const version = await readMiseLatestVersion('claude');
+    if (version) return version;
+  }
   const channel = await readClaudeUpdateChannel();
   if (await isNativeClaudeInstall(commandPath)) {
     return readRemoteLatestVersion(`${CLAUDE_RELEASES_URL}/${channel}`);
@@ -707,7 +751,8 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
     };
   }
 
-  const args = await resolveProviderUpdateCommand(config);
+  const managedUpdateCommand = (await config.resolveManagedUpdateCommand?.(commandPath)) ?? null;
+  const args = managedUpdateCommand ? [] : await resolveProviderUpdateCommand(config);
   if (!args) {
     return {
       id: config.id,
@@ -718,9 +763,12 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
     };
   }
 
-  const updateCommand = [config.command, ...args].map(shellQuote).join(' ');
+  const updateCommand =
+    managedUpdateCommand ?? [config.command, ...args].map(shellQuote).join(' ');
   const runUpdateCommand = (command) =>
     runStreamingShellCommand(command, { signal, onOutput, env: config.updateEnv });
+  const readInstalledVersion = () =>
+    readCliVersion(config.command, config.versionPattern, config.versionEnv);
 
   try {
     onPhase?.('updating');
@@ -742,11 +790,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
 
     if (config.verifyAfterUpdate && expectedLatestVersion) {
       onPhase?.('verifying');
-      let installedVersion = await readCliVersion(
-        config.command,
-        config.versionPattern,
-        config.versionEnv
-      );
+      let installedVersion = await readInstalledVersion();
       const isStale = (version) =>
         !version || compareVersionStrings(version, expectedLatestVersion) < 0;
 
@@ -777,11 +821,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
           };
         }
         onPhase?.('verifying');
-        installedVersion = await readCliVersion(
-          config.command,
-          config.versionPattern,
-          config.versionEnv
-        );
+        installedVersion = await readInstalledVersion();
       }
 
       if (isStale(installedVersion)) {
@@ -818,9 +858,11 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
       };
     }
 
-    const fallbackCommand =
-      config.fallbackInstallCommand ??
-      (config.packageName ? `npm install -g ${shellQuote(`${config.packageName}@latest`)}` : null);
+    // A package-manager install must not get a second copy from npm.
+    const fallbackCommand = managedUpdateCommand
+      ? null
+      : config.fallbackInstallCommand ??
+        (config.packageName ? `npm install -g ${shellQuote(`${config.packageName}@latest`)}` : null);
     if (fallbackCommand) {
       try {
         onPhase?.('installing');
@@ -829,11 +871,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
 
         if (config.verifyAfterUpdate && expectedLatestVersion) {
           onPhase?.('verifying');
-          const installedVersion = await readCliVersion(
-            config.command,
-            config.versionPattern,
-            config.versionEnv
-          );
+          const installedVersion = await readInstalledVersion();
           if (
             !installedVersion ||
             compareVersionStrings(installedVersion, expectedLatestVersion) < 0
