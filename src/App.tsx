@@ -1,4 +1,12 @@
-import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+  useMemo,
+  useRef,
+  useSyncExternalStore,
+} from 'react';
 import { createPortal } from 'react-dom';
 import { CodexQuestions, asyncAnswerText, type CodexQuestionRequest } from './app/CodexQuestions';
 import {
@@ -18,30 +26,23 @@ import {
   Pause,
   Target,
   Shield,
-  Square,
   Terminal,
   Bot,
-  Sparkles,
-  ArrowUp,
   Paperclip,
   RefreshCw,
   AppWindow,
   SquareArrowOutUpRight,
-  ListPlus,
-  Zap,
   SquareKanban,
   CircleCheck,
   Menu,
   SlidersHorizontal,
-  SquareSlash,
-  Eraser,
   Plug,
-  MessageCircle,
   Globe,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
   useOrionStore,
+  flushIntoStoreBeforeUnload,
   flushOrionThreadsSave,
   defaultProviderSettings,
   defaultOrchestrationSettings,
@@ -60,7 +61,6 @@ import {
   type AgentActivity,
   type BtwExchange,
   type ChangedFileSummary,
-  type ComposerDraft,
   type FileAttachment,
   type LinkedBoardTask,
   type Message,
@@ -142,7 +142,13 @@ import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
 import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
-import { ComposerPopover } from './app/ComposerPopover';
+import {
+  Composer,
+  compareRecentThreadOrder,
+  useLatestCallback,
+  type ComposerReviewRequest,
+} from './app/Composer';
+import { createComposerDraftController } from './app/composerDraft';
 import { ModelPickerPopover } from './app/ModelPickerPopover';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import {
@@ -157,14 +163,7 @@ import {
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
 import { dispatchProjectsPayload, durangoDispatchOutcome } from './app/durangoDispatch';
-import {
-  AttachmentThumb,
-  attachmentKindLabel,
-  buildPromptWithAttachments,
-  formatAttachmentSize,
-  saveFilesAsAttachments,
-} from './app/attachments';
-import { SnapShotAttachmentBadge, openSnapShotOutline } from './app/SnapShotSettings';
+import { buildPromptWithAttachments, saveFilesAsAttachments } from './app/attachments';
 import {
   AgentFamilySwitcher,
   type ChatScrollPosition,
@@ -190,51 +189,23 @@ import {
   linkedTaskFromBoardTask,
   linkedTaskAttachments,
   linkedTaskStatusLabel,
-  modelMentionToken,
   orchestrationRoleMeta,
   parseModelMentions,
   parseThreadMentions,
-  threadMentionToken,
 } from './app/promptContext';
 import { durangoWorkspaceName } from './app/durangoWorkspace';
-import {
-  getThreadSearchEntry,
-  parseSearchQuery,
-  scoreThreadSearchEntry,
-} from './app/threadSearch';
-import {
-  allowsThreadMentionsInComposer,
-  getChatMentionReplaceEnd,
-  hasThreadReaderSupport,
-  isThreadReferenceCandidate,
-} from './app/chatMentions';
-import {
-  buildChatMentionsContext,
-  chatMentionToken,
-  formatChatUpdatedAt,
-  knownDurangoChats,
-  parseChatMentions,
-  rememberDurangoChats,
-  type DurangoChatRef,
-} from './app/durangoChats';
+import { hasThreadReaderSupport } from './app/chatMentions';
+import { buildChatMentionsContext, knownDurangoChats, parseChatMentions } from './app/durangoChats';
 import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
 import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
 import { RestartToUpdateDialog, WhatsNewNotice } from './app/AppUpdateUi';
 import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
-import {
-  addPromptContext,
-  buildSlashCommandCandidates,
-  completedSlashCommand,
-  filterSlashCommands,
-  getSlashToken,
-  parseCodexReviewCommand,
-  type SlashCommandCandidate,
-} from './app/slashCommands';
+import { addPromptContext, parseCodexReviewCommand } from './app/slashCommands';
 import type { SlashCommandInfo } from './types';
 import { withThreadStartReservation } from './app/turnStart';
 import { buildMcpMentionsContext, mergeMcpAttachments, parseMcpMentions } from './app/orionMcps';
 import { ORION_MCPS_CHANGED_EVENT } from './app/McpsSettings';
-import { formatShortTime, getThreadActivityTime } from './app/time';
+import { getThreadActivityTime } from './app/time';
 import {
   deriveTitle,
   getGoalTitleSeed,
@@ -660,36 +631,6 @@ const renderThreadStatusDot = (thread: Thread) => {
   );
 };
 
-// One row of the composer's @-mention dropdown. The root level offers the
-// mention kinds; picking one (or just typing) narrows to models or threads.
-type ChatMentionMode = 'model' | 'thread' | 'mcp' | 'chat';
-type ChatMentionCandidate =
-  | { kind: 'category'; category: ChatMentionMode; label: string; hint: string }
-  | { kind: 'model'; model: AgentModel }
-  | { kind: 'thread'; thread: Thread; projectName: string }
-  | { kind: 'mcp'; server: OrionMcpEntry }
-  | { kind: 'chat'; chat: DurangoChatRef }
-  // Non-selectable row for the Durango chat list: loading, empty, or why it
-  // is unavailable. `action` makes Enter/click do something useful.
-  | { kind: 'chatStatus'; message: string; action?: 'sign-in' };
-
-const chatMentionCategories: Array<Extract<ChatMentionCandidate, { kind: 'category' }>> = [
-  { kind: 'category', category: 'model', label: 'Model', hint: 'delegate to a model' },
-  { kind: 'category', category: 'thread', label: 'Thread', hint: 'reference another thread' },
-  { kind: 'category', category: 'chat', label: 'Durango chats', hint: 'reference a Durango Chat conversation' },
-  { kind: 'category', category: 'mcp', label: 'MCP', hint: 'use a connected MCP server' },
-];
-
-// Results of the @chat dropdown's Durango search (main → GET /api/v1/chats).
-type DurangoChatSearchState = {
-  query: string;
-  status: 'loading' | 'ready' | 'error';
-  chats: DurangoChatRef[];
-  code?: string;
-  error?: string;
-};
-const DURANGO_CHAT_SEARCH_DEBOUNCE_MS = 250;
-
 // "[Durango memory]" block for a fresh agent session when the user opted in
 // (Settings → Durango). Main caches the recall for 10 minutes; a slow or
 // unreachable Durango never holds a turn back for more than a few seconds.
@@ -707,16 +648,6 @@ const fetchDurangoProfileMemoryBlock = async (): Promise<string> => {
   }
 };
 
-// The thread list inside the @-mention dropdown loads this many rows at a time;
-// scrolling (or arrowing) to the bottom appends the next page.
-const CHAT_MENTION_THREAD_PAGE = 20;
-
-// The sidebar's "Recent agents" ordering: running agents are active "now", so
-// they always rank above finished ones. Among running agents, keep start order
-// so the list doesn't reshuffle as they stream; finished agents sort by their
-// last activity (i.e. when they finished) — or by when they were unpinned, so
-// a just-unpinned thread surfaces at the top instead of sinking back to its
-// old chronological spot.
 // Caption for a turn that ended while the harness still owns live background
 // tasks (subagents, workflows, backgrounded shell commands). Task descriptions
 // come from the driver's done event; naming them lets the user tell a genuine
@@ -758,21 +689,6 @@ const settleWaitingOnUserCaptions = (threadId: string) => {
     const parentId = thread.parentThreadId;
     thread = parentId ? state.threads.find((candidate) => candidate.id === parentId) : undefined;
   }
-};
-
-const compareRecentThreadOrder = (a: Thread, b: Thread) => {
-  const aRunning = a.status === 'running';
-  const bRunning = b.status === 'running';
-  if (aRunning !== bRunning) return aRunning ? -1 : 1;
-  if (aRunning) {
-    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-  }
-  const recentRank = (t: Thread) =>
-    Math.max(
-      getThreadActivityTime(t).getTime(),
-      t.unpinnedAt ? new Date(t.unpinnedAt).getTime() : Number.NEGATIVE_INFINITY
-    );
-  return recentRank(b) - recentRank(a);
 };
 
 const App: React.FC = () => {
@@ -913,8 +829,6 @@ const App: React.FC = () => {
   // Claude turn still waiting on background agents) — invisible to the
   // runningAgentCount-based refresh below, but its files are on disk.
   const [treeTurnRefreshTick, setTreeTurnRefreshTick] = useState(0);
-  const [chatInput, setChatInput] = useState('');
-  const [chatAttachments, setChatAttachments] = useState<FileAttachment[]>([]);
   const [draggingFiles, setDraggingFiles] = useState(false);
   // One agent run may be active per thread; runs in other threads are
   // independent, so starting/stopping one never blocks the rest.
@@ -948,39 +862,15 @@ const App: React.FC = () => {
   const [utilityModelPickerOpen, setUtilityModelPickerOpen] = useState(false);
   const [utilityModelSearch, setUtilityModelSearch] = useState('');
   const [utilityModelTab, setUtilityModelTab] = useState<AgentProviderId>('codex');
-  // Active @-mention token in the composer: index of the '@' and the query
-  // typed after it (null when the caret isn't inside a mention token). `mode`
-  // is set once the user picks a kind from the root dropdown level; while
-  // unset, typing filters models directly (the pre-thread-mentions behavior).
-  const [chatMention, setChatMention] = useState<{
-    start: number;
-    query: string;
-    mode?: ChatMentionMode;
-  } | null>(null);
-  const [chatMentionIndex, setChatMentionIndex] = useState(0);
-  // How many thread rows the @-mention dropdown currently shows; grows as the
-  // user scrolls and resets whenever the thread query changes.
-  const [chatMentionThreadLimit, setChatMentionThreadLimit] = useState(CHAT_MENTION_THREAD_PAGE);
-  const [durangoChatSearch, setDurangoChatSearch] = useState<DurangoChatSearchState | null>(null);
   const [threadReaderSupport, setThreadReaderSupport] = useState<{
     providerId: AgentProviderId;
     supported: boolean;
   } | null>(null);
   // Slash-command menu (Claude Code style): the real command list reported by
-  // each project's Claude session, the highlighted row, and the exact draft
-  // dismissed with Escape (any edit reopens the menu).
+  // each project's Claude session (the menu itself lives in the Composer).
   const [slashCommandsByProject, setSlashCommandsByProject] = useState<
     Record<string, SlashCommandInfo[]>
   >({});
-  const [slashCommandIndex, setSlashCommandIndex] = useState(0);
-  const [slashDismissedDraft, setSlashDismissedDraft] = useState<string | null>(null);
-  // Start offset of a token dismissed with Escape, so it stays closed until
-  // the user begins a new mention.
-  const chatMentionDismissRef = useRef<number | null>(null);
-  const chatMentionRef = useRef<typeof chatMention>(null);
-  useEffect(() => {
-    chatMentionRef.current = chatMention;
-  }, [chatMention]);
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [accessModeOpen, setAccessModeOpen] = useState(false);
@@ -1172,7 +1062,6 @@ const App: React.FC = () => {
   const utilityModelPickerRef = useRef<HTMLDivElement>(null);
   const taskPickerRef = useRef<HTMLDivElement>(null);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
-  const chatInputRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
   const codexSettingsRef = useRef<HTMLDivElement>(null);
   const accessModeRef = useRef<HTMLDivElement>(null);
@@ -1204,31 +1093,6 @@ const App: React.FC = () => {
   }, []);
 
   useEffect(() => () => composerControlsObserverRef.current?.disconnect(), []);
-
-  // Autosize the composer to its content. The height lives as an inline style
-  // on the textarea, so it is lost with the DOM node on every unmount.
-  const resizeChatInput = useCallback((el: HTMLTextAreaElement | null) => {
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${el.scrollHeight}px`;
-  }, []);
-
-  // The composer unmounts whenever the shell swaps views — Settings, the Code
-  // tab — and remounts with a fresh node that has no height style, collapsing a
-  // long draft back to one line. Measuring from the ref callback re-applies the
-  // height during the same commit that mounts the node, so the draft keeps the
-  // size its text earns no matter what caused the remount.
-  const setChatInputRef = useCallback(
-    (el: HTMLTextAreaElement | null) => {
-      chatInputRef.current = el;
-      resizeChatInput(el);
-    },
-    [resizeChatInput]
-  );
-
-  useLayoutEffect(() => {
-    resizeChatInput(chatInputRef.current);
-  }, [chatInput, resizeChatInput]);
 
   // Selecting a thread no longer forces the transcript to the bottom — the
   // transcript restores that thread's own position (bottom for never-visited
@@ -1391,53 +1255,63 @@ const App: React.FC = () => {
   // Unsent composer drafts are kept per thread so switching threads swaps the
   // draft instead of carrying it along, and a fresh thread starts with an
   // empty composer. Non-empty ones are also saved with the store
-  // (composerDrafts), so they survive a restart.
+  // (composerDrafts), so they survive a restart. The draft lives in this
+  // controller, not in App state: typing re-renders only the Composer, and
+  // the store gets the draft debounced (flushed on switch, send, blur, hide
+  // and unload) instead of on every keystroke.
   const composerDraftKey = selectedThreadId ?? null;
-  const composerDraftsRef = useRef(new Map<string, ComposerDraft>());
-  // Starts unset so the swap effect below restores the first thread's draft
-  // even when the store hydrated before this first render; otherwise the save
-  // effect would overwrite that saved draft with the empty composer.
-  const composerDraftKeyRef = useRef<string | null>(null);
-  const rememberComposerDraft = (threadId: string, draft: ComposerDraft) => {
-    composerDraftsRef.current.set(threadId, draft);
-    useOrionStore.getState().setComposerDraft(threadId, draft);
-  };
-  const hasComposerDraft = (threadId: string) => {
-    const draft =
-      composerDraftsRef.current.get(threadId) ?? useOrionStore.getState().composerDrafts[threadId];
-    return !!draft && (!!draft.text.trim() || draft.attachments.length > 0);
-  };
   // Empty threads whose composer has been typed into (or given an attachment)
   // this session, or that came back from the last one with a saved draft.
   // Sidebar v2 lists a blank draft only once it is in here, so the fresh
   // composer opened after a snooze or settle stays out of the list.
   const [typedDraftThreadIds, setTypedDraftThreadIds] = useState<ReadonlySet<string>>(() => new Set());
-
+  const [composerDraft] = useState(() =>
+    createComposerDraftController({
+      load: (threadId) => useOrionStore.getState().composerDrafts[threadId],
+      save: (threadId, draft) => {
+        const state = useOrionStore.getState();
+        // A debounced save landing after its thread was deleted must not
+        // bring the draft back as an orphan.
+        if (!(threadId in state.composerDrafts) && !state.threads.some((thread) => thread.id === threadId)) return;
+        state.setComposerDraft(threadId, draft);
+      },
+      // Once per thread per session, not per keystroke.
+      onDraftTyped: (threadId) =>
+        setTypedDraftThreadIds((prev) => (prev.has(threadId) ? prev : new Set(prev).add(threadId))),
+    })
+  );
+  const hasComposerDraft = (threadId: string) => composerDraft.hasThreadDraft(threadId);
+  // Mid-run, a non-empty draft adds the queue/steer buttons, which the
+  // controls row's width estimate counts. A boolean that is only read while a
+  // run is active: typing re-renders App at most when the draft turns
+  // empty/non-empty during a run, and clearing it on send never does.
+  const composerHasDraft = useSyncExternalStore(
+    composerDraft.subscribe,
+    () => isSending && composerDraft.hasActiveContent()
+  );
+  // Swap drafts in the same commit that selects the thread, so the composer
+  // never shows the previous thread's draft for a frame. Starts from no key,
+  // so the first selected thread's saved draft is restored, not overwritten.
+  useLayoutEffect(() => {
+    composerDraft.switchTo(composerDraftKey);
+  }, [composerDraft, composerDraftKey]);
+  // Pending drafts reach the store before the window can go away: on unload
+  // (ahead of the store's synchronous write), on blur and when hidden.
   useEffect(() => {
-    // Skip the render where the key just changed: chatInput still holds the
-    // previous project's draft until the swap effect below runs.
-    if (!composerDraftKey || composerDraftKeyRef.current !== composerDraftKey) return;
-    rememberComposerDraft(composerDraftKey, { text: chatInput, attachments: chatAttachments });
-    if (chatInput.trim() || chatAttachments.length > 0) {
-      setTypedDraftThreadIds((prev) => (prev.has(composerDraftKey) ? prev : new Set(prev).add(composerDraftKey)));
-    }
-  }, [chatInput, chatAttachments, composerDraftKey]);
-
-  useEffect(() => {
-    const prevKey = composerDraftKeyRef.current;
-    if (prevKey === composerDraftKey) return;
-    composerDraftKeyRef.current = composerDraftKey;
-    const draft = composerDraftKey
-      ? (composerDraftsRef.current.get(composerDraftKey) ??
-        useOrionStore.getState().composerDrafts[composerDraftKey])
-      : undefined;
-    setChatInput(draft?.text ?? '');
-    setChatAttachments(draft?.attachments ?? []);
-    // The restored draft has no caret yet, so no mention token can be active.
-    setChatMention(null);
-    chatMentionDismissRef.current = null;
-    setSlashDismissedDraft(null);
-  }, [composerDraftKey]);
+    const flush = () => composerDraft.flush();
+    const flushWhenHidden = () => {
+      if (document.visibilityState === 'hidden') composerDraft.flush();
+    };
+    const stopUnloadFlush = flushIntoStoreBeforeUnload(flush);
+    window.addEventListener('blur', flush);
+    document.addEventListener('visibilitychange', flushWhenHidden);
+    return () => {
+      stopUnloadFlush();
+      window.removeEventListener('blur', flush);
+      document.removeEventListener('visibilitychange', flushWhenHidden);
+      composerDraft.flush();
+    };
+  }, [composerDraft]);
 
   // The spawn-request listener mounts once; it reads the live model catalog
   // through this ref instead of a stale closure.
@@ -1607,11 +1481,6 @@ const App: React.FC = () => {
     };
   }, [threadReaderProviderId]);
   const canReferenceThreads = hasThreadReaderSupport(threadReaderProviderId, threadReaderSupport);
-  const canReferenceThreadsFromComposer =
-    canReferenceThreads && allowsThreadMentionsInComposer(chatInput);
-  // Asides, reviews, and goals skip the dispatcher that resolves @nickname
-  // mentions; the embedded Claude Code terminal never loads Orion MCPs.
-  const canMentionMcpsFromComposer = !isTerminalThread && allowsThreadMentionsInComposer(chatInput);
   const enabledProviderIds = useMemo(
     () =>
       agentProviders
@@ -1642,289 +1511,6 @@ const App: React.FC = () => {
     () => agentModels.find((model) => model.id === claudeCodeCliModelId),
     [agentModels]
   );
-  // Composer @-mention candidates. Root level (no mode picked yet) offers the
-  // Model / Thread kinds; typing there filters models directly so the
-  // pre-thread-mentions muscle memory keeps working. Model mode: models on
-  // enabled providers, 'orion' excluded (work can't be delegated to the
-  // orchestrator itself); an empty query shows the favorites (or everything).
-  // Thread mode: every thread in "Recent agents" order, searched with the same
-  // scoring as the sidebar's thread search, lazy-loaded a page at a time
-  // (threadMatchTotal reports the full match count so scrolling knows when to
-  // fetch more). Model lists cap at 8 rows.
-  const { candidates: chatMentionCandidates, threadMatchTotal: chatMentionThreadTotal } = useMemo<{
-    candidates: ChatMentionCandidate[];
-    threadMatchTotal: number;
-  }>(() => {
-    if (!chatMention) return { candidates: [], threadMatchTotal: 0 };
-    const query = chatMention.query.toLowerCase();
-    const mcpMatches = (limit: number) =>
-      (canMentionMcpsFromComposer ? orionMcps : [])
-        .filter(
-          (server) =>
-            !query ||
-            server.nickname.includes(query) ||
-            (server.detail ?? '').toLowerCase().includes(query)
-        )
-        .slice(0, limit)
-        .map((server) => ({ kind: 'mcp' as const, server }));
-
-    if (chatMention.mode === 'mcp') {
-      return { candidates: mcpMatches(20), threadMatchTotal: 0 };
-    }
-
-    if (chatMention.mode === 'chat') {
-      // Same capability gate as threads: the agent reads a mentioned chat
-      // with read_chat on the same `orion` MCP server as read_thread.
-      if (!canReferenceThreadsFromComposer) return { candidates: [], threadMatchTotal: 0 };
-      const trimmedQuery = chatMention.query.trim();
-      const search = durangoChatSearch?.query === trimmedQuery ? durangoChatSearch : null;
-      const status = (message: string, action?: 'sign-in') => ({
-        candidates: [{ kind: 'chatStatus' as const, message, ...(action ? { action } : {}) }],
-        threadMatchTotal: 0,
-      });
-      if (search?.status === 'error') {
-        if (search.code === 'not_signed_in') return status('Sign in to your Durango account to mention Durango chats', 'sign-in');
-        if (search.code === 'not_connected') return status(`Durango Chat isn't connected: ${search.error ?? 'try again later'}`);
-        return status(`Couldn't search Durango chats: ${search.error ?? 'try again later'}`);
-      }
-      // While a new query loads, keep showing the previous results.
-      const chats = search?.status === 'ready' ? search.chats : (durangoChatSearch?.chats ?? []);
-      if (chats.length === 0) {
-        if (!search || search.status === 'loading') return status('Searching Durango chats…');
-        return status(trimmedQuery ? `No Durango chats match "${trimmedQuery}"` : 'No Durango chats yet');
-      }
-      return {
-        candidates: chats.map((chat) => ({ kind: 'chat' as const, chat })),
-        threadMatchTotal: 0,
-      };
-    }
-
-    if (chatMention.mode === 'thread') {
-      // Hide unresolvable references for terminal threads and providers whose
-      // installed CLI cannot receive Orion's read_thread tool.
-      if (!canReferenceThreadsFromComposer) return { candidates: [], threadMatchTotal: 0 };
-      const projectById = new Map(projects.map((project) => [project.id, project]));
-      // The composing thread can't usefully reference itself.
-      const base = threads.filter((thread) =>
-        isThreadReferenceCandidate(
-          thread.id,
-          selectedThreadId,
-          isClaudeCodeCliModelId(thread.modelId)
-        )
-      );
-      const trimmedQuery = chatMention.query.trim();
-      if (!trimmedQuery) {
-        return {
-          candidates: base
-            .slice()
-            .sort(compareRecentThreadOrder)
-            .slice(0, chatMentionThreadLimit)
-            .map((thread) => ({
-              kind: 'thread' as const,
-              thread,
-              projectName: projectById.get(thread.projectId)?.name ?? 'Unknown project',
-            })),
-          threadMatchTotal: base.length,
-        };
-      }
-      const parsedQuery = parseSearchQuery(trimmedQuery);
-      const scored = base
-        .map((thread) => {
-          const project = projectById.get(thread.projectId);
-          const projectName = project?.name ?? 'Unknown project';
-          const entry = getThreadSearchEntry(
-            thread,
-            projectName,
-            project?.path ?? ''
-          );
-          return { thread, projectName, score: scoreThreadSearchEntry(entry, parsedQuery) };
-        })
-        .filter((result) => result.score > 0)
-        .sort(
-          (a, b) =>
-            b.score - a.score ||
-            getThreadActivityTime(b.thread).getTime() - getThreadActivityTime(a.thread).getTime()
-        );
-      return {
-        candidates: scored
-          .slice(0, chatMentionThreadLimit)
-          .map(({ thread, projectName }) => ({ kind: 'thread' as const, thread, projectName })),
-        threadMatchTotal: scored.length,
-      };
-    }
-
-    const base = agentModels.filter(
-      (model) =>
-        model.providerId !== 'orion' &&
-        // The Claude Code CLI pseudo-model is an interactive terminal, not a
-        // delegable harness.
-        model.id !== claudeCodeCliModelId &&
-        enabledProviderIdSet.has(model.providerId)
-    );
-    const categoryAvailable = (category: ChatMentionMode) =>
-      category === 'model' ||
-      ((category === 'thread' || category === 'chat') && canReferenceThreadsFromComposer) ||
-      (category === 'mcp' && canMentionMcpsFromComposer && orionMcps.length > 0);
-    if (!query) {
-      if (!chatMention.mode) {
-        return {
-          candidates: chatMentionCategories.filter((candidate) => categoryAvailable(candidate.category)),
-          threadMatchTotal: 0,
-        };
-      }
-      const favorites = base.filter((model) => model.favorite);
-      return {
-        candidates: (favorites.length > 0 ? favorites : base)
-          .slice(0, 8)
-          .map((model) => ({ kind: 'model' as const, model })),
-        threadMatchTotal: 0,
-      };
-    }
-    // Kind rows that prefix-match keep the root level reachable by typing
-    // (e.g. "@th" highlights Thread).
-    const categories = chatMention.mode
-      ? []
-      : chatMentionCategories.filter(
-          (candidate) =>
-            categoryAvailable(candidate.category) &&
-            (candidate.label.toLowerCase().startsWith(query) ||
-              // "@chat" reaches "Durango chats" too.
-              (candidate.category === 'chat' && 'chat'.startsWith(query)))
-        );
-    const models = base
-      .filter(
-        (model) =>
-          model.id.toLowerCase().includes(query) ||
-          model.label.toLowerCase().includes(query) ||
-          model.slug.toLowerCase().includes(query) ||
-          model.providerLabel.toLowerCase().includes(query)
-      )
-      .slice(0, 8)
-      .map((model) => ({ kind: 'model' as const, model }));
-    // Typing straight after '@' also finds connected MCPs by nickname.
-    const mcps = chatMention.mode ? [] : mcpMatches(4);
-    return { candidates: [...categories, ...mcps, ...models], threadMatchTotal: 0 };
-  }, [
-    agentModels,
-    canMentionMcpsFromComposer,
-    canReferenceThreadsFromComposer,
-    orionMcps,
-    chatMention,
-    chatMentionThreadLimit,
-    durangoChatSearch,
-    enabledProviderIdSet,
-    projects,
-    selectedThreadId,
-    threads,
-  ]);
-  const chatMentionHasMoreThreads =
-    chatMention?.mode === 'thread' && chatMentionThreadTotal > chatMentionCandidates.length;
-  // @chat dropdown: search Durango as the query changes (debounced; the
-  // newest query wins). Nothing is fetched until the user picks "Durango
-  // chats", so composing never touches the network otherwise.
-  const durangoChatQuery =
-    chatMention?.mode === 'chat' && canReferenceThreadsFromComposer ? chatMention.query.trim() : null;
-  useEffect(() => {
-    if (durangoChatQuery === null) return;
-    const query = durangoChatQuery;
-    if (!window.orion?.durangoSearchChats) {
-      setDurangoChatSearch({
-        query,
-        status: 'error',
-        chats: [],
-        code: 'not_connected',
-        error: 'this build cannot reach Durango Chat',
-      });
-      return;
-    }
-    let active = true;
-    setDurangoChatSearch((current) => ({
-      query,
-      status: 'loading',
-      chats: current?.status === 'ready' ? current.chats : [],
-    }));
-    const timer = window.setTimeout(() => {
-      void window.orion!.durangoSearchChats!({ query, limit: 20 }).then(
-        (result) => {
-          if (!active) return;
-          if (result.ok) {
-            rememberDurangoChats(result.data);
-            setDurangoChatSearch({ query, status: 'ready', chats: result.data });
-          } else {
-            setDurangoChatSearch({ query, status: 'error', chats: [], code: result.code, error: result.error });
-          }
-        },
-        () => {
-          if (active) {
-            setDurangoChatSearch({ query, status: 'error', chats: [], code: 'network', error: 'Durango is unreachable' });
-          }
-        }
-      );
-    }, query ? DURANGO_CHAT_SEARCH_DEBOUNCE_MS : 0);
-    return () => {
-      active = false;
-      window.clearTimeout(timer);
-    };
-  }, [durangoChatQuery]);
-  // A new thread query starts back at the first page.
-  const chatMentionThreadQuery = chatMention?.mode === 'thread' ? chatMention.query.trim() : null;
-  useEffect(() => {
-    setChatMentionThreadLimit(CHAT_MENTION_THREAD_PAGE);
-  }, [chatMentionThreadQuery]);
-  // Nearing the bottom of the dropdown loads the next page of threads.
-  const handleChatMentionScroll = useCallback(
-    (event: React.UIEvent<HTMLDivElement>) => {
-      if (!chatMentionHasMoreThreads) return;
-      const el = event.currentTarget;
-      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 48) {
-        setChatMentionThreadLimit((limit) => limit + CHAT_MENTION_THREAD_PAGE);
-      }
-    },
-    [chatMentionHasMoreThreads]
-  );
-  const chatMentionOpen = Boolean(chatMention) && chatMentionCandidates.length > 0;
-  // Reset the highlight to the top whenever the candidate list changes —
-  // except when lazy loading merely appends thread rows, which should leave
-  // the highlight (and the user's scroll position) where they are.
-  const chatMentionListKey = chatMentionCandidates
-    .map((candidate) =>
-      candidate.kind === 'category'
-        ? `category:${candidate.category}`
-        : candidate.kind === 'model'
-          ? `model:${candidate.model.id}`
-          : candidate.kind === 'mcp'
-            ? `mcp:${candidate.server.id}`
-            : candidate.kind === 'chat'
-              ? `chat:${candidate.chat.id}`
-              : candidate.kind === 'chatStatus'
-                ? `chatStatus:${candidate.message}`
-                : `thread:${candidate.thread.id}`
-    )
-    .join('|');
-  const prevChatMentionListKeyRef = useRef('');
-  const chatMentionListAppendedRef = useRef(false);
-  useEffect(() => {
-    const prev = prevChatMentionListKeyRef.current;
-    prevChatMentionListKeyRef.current = chatMentionListKey;
-    const appended =
-      prev !== '' && chatMentionListKey !== prev && chatMentionListKey.startsWith(`${prev}|`);
-    chatMentionListAppendedRef.current = appended;
-    if (!appended) setChatMentionIndex(0);
-  }, [chatMentionListKey]);
-  // The dropdown's height is clamped to the space around the composer, so
-  // keyboard navigation has to keep the highlighted row scrolled into view.
-  // Skip the scroll when rows were appended without the highlight moving
-  // (wheel-driven lazy load) so the list doesn't jump back to the highlight.
-  const chatMentionSelectedRef = useRef<HTMLButtonElement | null>(null);
-  const prevChatMentionIndexRef = useRef(0);
-  useEffect(() => {
-    const indexChanged = prevChatMentionIndexRef.current !== chatMentionIndex;
-    prevChatMentionIndexRef.current = chatMentionIndex;
-    const appended = chatMentionListAppendedRef.current;
-    chatMentionListAppendedRef.current = false;
-    if (appended && !indexChanged) return;
-    chatMentionSelectedRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [chatMentionIndex, chatMentionListKey]);
   // Whether the selected thread resolves to a Claude SDK session — directly
   // (claude provider) or via an Orion orchestrator whose main driver is
   // Claude. Gates the slash-command menu, /btw hint, and /clear dispatch.
@@ -1933,72 +1519,11 @@ const App: React.FC = () => {
     ((selectedAgentModel?.providerId === 'orion' || isOrionModelId(selectedThread?.modelId ?? '')) &&
       findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)?.providerId ===
         'claude');
-  // Slash-command menu: active while the whole draft is a single "/" token.
-  // The pool is every command available in this composer context (Orion
-  // natives + the project's live Claude list, seeded by a static fallback);
-  // the menu shows the pool filtered by what's typed after the "/".
-  const slashToken = getSlashToken(chatInput.trimStart());
-  const slashCommandPool = useMemo<SlashCommandCandidate[]>(() => {
-    if (!selectedThread || isNativeSubagentThread) return [];
-    if (!chatInput.trimStart().startsWith('/')) return [];
-    const liveCommands = selectedThreadProjectPath
-      ? (slashCommandsByProject[selectedThreadProjectPath] ?? null)
-      : null;
-    return buildSlashCommandCandidates(
-      {
-        providerId: selectedAgentModel?.providerId ?? null,
-        claudeBacked: selectedThreadClaudeBacked,
-        isTerminal: isTerminalThread,
-      },
-      liveCommands
-    );
-  }, [
-    chatInput,
-    isNativeSubagentThread,
-    isTerminalThread,
-    selectedAgentModel?.providerId,
-    selectedThread,
-    selectedThreadClaudeBacked,
-    selectedThreadProjectPath,
-    slashCommandsByProject,
-  ]);
-  const slashCommandCandidates = useMemo<SlashCommandCandidate[]>(
-    () => (slashToken ? filterSlashCommands(slashCommandPool, slashToken.query) : []),
-    [slashCommandPool, slashToken?.query]
-  );
-  // Codex's one-click /review presets outrank the generic slash menu: a bare
-  // "/review" draft goes straight to the preset popover so a single click
-  // dispatches the review instead of first re-completing the command.
-  const codexReviewPresetsActive =
-    selectedAgentModel?.providerId === 'codex' &&
-    !isTerminalThread &&
-    /^\/review\s*$/i.test(chatInput.trimStart());
-  const slashMenuOpen =
-    Boolean(slashToken) &&
-    slashCommandCandidates.length > 0 &&
-    chatInput !== slashDismissedDraft &&
-    !codexReviewPresetsActive;
-  const slashCommandListKey = slashCommandCandidates
-    .map((candidate) => `${candidate.source}:${candidate.command.name}`)
-    .join('|');
-  useEffect(() => {
-    setSlashCommandIndex(0);
-  }, [slashCommandListKey]);
-  const slashCommandSelectedRef = useRef<HTMLButtonElement | null>(null);
-  useEffect(() => {
-    slashCommandSelectedRef.current?.scrollIntoView({ block: 'nearest' });
-  }, [slashCommandIndex, slashCommandListKey]);
-  // Argument-hint strip under the composer once a known command is completed
-  // (menu closed). /review, /goal, and /btw keep their richer bespoke banners.
-  const completedSlash = useMemo(() => {
-    if (slashMenuOpen || slashCommandPool.length === 0) return null;
-    const candidate = completedSlashCommand(chatInput.trimStart(), slashCommandPool);
-    if (!candidate) return null;
-    if (candidate.source === 'orion' && /^(review|goal|btw)$/.test(candidate.command.name)) {
-      return null;
-    }
-    return candidate;
-  }, [chatInput, slashCommandPool, slashMenuOpen]);
+  // The selected project's live Claude command list for the Composer's
+  // slash menu (null until reported; the menu falls back to a static list).
+  const selectedThreadSlashCommands = selectedThreadProjectPath
+    ? (slashCommandsByProject[selectedThreadProjectPath] ?? null)
+    : null;
   // Role-model options for Settings → Orchestration: every real model grouped
   // by provider. The Orion pseudo-model can't delegate to itself.
   const orchestrationModelGroups = useMemo(
@@ -5428,8 +4953,7 @@ const App: React.FC = () => {
       selectedThread.projectId === projectId &&
       selectedThread.modelId !== claudeCodeCliModelId &&
       selectedThread.messages.length === 0 &&
-      !chatInput.trim() &&
-      chatAttachments.length === 0
+      !composerDraft.hasThreadDraft(selectedThread.id)
     ) {
       setActiveTab('agents');
       return selectedThread.id;
@@ -5463,19 +4987,16 @@ const App: React.FC = () => {
   // the draft of the thread it shows; a thread it is about to switch to (just
   // selected or created) gets them in its saved draft, which the swap effect
   // loads.
-  const appendComposerAttachments = useCallback((threadId: string, attachments: FileAttachment[]) => {
-    if (attachments.length === 0) return;
-    if (composerDraftKeyRef.current === threadId) {
-      setChatAttachments((current) => [...current, ...attachments]);
-      return;
-    }
-    const draft = composerDraftsRef.current.get(threadId) ??
-      useOrionStore.getState().composerDrafts[threadId] ?? { text: '', attachments: [] };
-    const nextDraft = { ...draft, attachments: [...draft.attachments, ...attachments] };
-    composerDraftsRef.current.set(threadId, nextDraft);
-    useOrionStore.getState().setComposerDraft(threadId, nextDraft);
-    setTypedDraftThreadIds((prev) => (prev.has(threadId) ? prev : new Set(prev).add(threadId)));
-  }, []);
+  const appendComposerAttachments = useCallback(
+    (threadId: string, attachments: FileAttachment[]) => {
+      if (attachments.length === 0) return;
+      composerDraft.updateThreadDraft(threadId, (draft) => ({
+        ...draft,
+        attachments: [...draft.attachments, ...attachments],
+      }));
+    },
+    [composerDraft]
+  );
 
   const attachFiles = useCallback(
     async (files: FileList | File[]) => {
@@ -5574,10 +5095,6 @@ const App: React.FC = () => {
     },
     [attachFiles]
   );
-
-  const removeChatAttachment = (id: string) => {
-    setChatAttachments((current) => current.filter((attachment) => attachment.id !== id));
-  };
 
   // Durango workspaces (docs/workspaces.md). A thread that has never run gets
   // its own workspace when its project is in a Durango repository (a
@@ -6932,8 +6449,7 @@ const App: React.FC = () => {
     const project = findProjectById(state, selectedThread.projectId);
     const workingDir = project ? threadWorkingDir(selectedThread, project) : null;
     const finishInput = () => {
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
     };
     const sub = rest.toLowerCase();
 
@@ -7127,8 +6643,7 @@ const App: React.FC = () => {
       toast.error(result.error);
       return;
     }
-    setChatInput('');
-    setChatMention(null);
+    composerDraft.setText('');
   };
 
   const handleReviewCommand = (promptText: string) => {
@@ -7151,16 +6666,10 @@ const App: React.FC = () => {
   // failed submission to that thread's draft rather than overwriting whatever
   // the user is currently composing elsewhere.
   const restoreComposerDraft = (threadId: string, promptText: string, attachments: FileAttachment[]) => {
-    if (composerDraftKeyRef.current === threadId) {
-      setChatInput((current) => [promptText, current].filter(Boolean).join('\n\n'));
-      setChatAttachments((current) => [...attachments, ...current]);
-      return;
-    }
-    const draft = composerDraftsRef.current.get(threadId) ?? useOrionStore.getState().composerDrafts[threadId];
-    rememberComposerDraft(threadId, {
-      text: [promptText, draft?.text ?? ''].filter(Boolean).join('\n\n'),
-      attachments: [...attachments, ...(draft?.attachments ?? [])],
-    });
+    composerDraft.updateThreadDraft(threadId, (draft) => ({
+      text: [promptText, draft.text].filter(Boolean).join('\n\n'),
+      attachments: [...attachments, ...draft.attachments],
+    }));
   };
 
   const sendMessage = async (overrideText?: string) => {
@@ -7173,12 +6682,15 @@ const App: React.FC = () => {
     // Guard against being used directly as an event handler (onClick passes
     // the event as the first argument) — only real strings override the draft.
     const forcedText = typeof overrideText === 'string' ? overrideText : null;
-    const draftText = forcedText ?? chatInput;
+    // Read at send time: the draft lives in the composer, not in App state.
+    const draft = composerDraft.getDraft();
+    const draftText = forcedText ?? draft.text;
+    const draftAttachments = draft.attachments;
     const promptText = draftText.trim();
     // Freshly linked board tasks can be sent on their own — the cards are the
     // prompt. Mid-run they can't (queued follow-ups need their own text).
     const canSendLinkedTasksAlone = !isSending && hasPendingLinkedTasks;
-    if (!promptText && chatAttachments.length === 0 && !canSendLinkedTasksAlone) return;
+    if (!promptText && draftAttachments.length === 0 && !canSendLinkedTasksAlone) return;
 
     if (selectedThreadWorkspaceUnavailable) {
       toast.error(
@@ -7200,12 +6712,11 @@ const App: React.FC = () => {
       if (pendingTurnStartsRef.current.has(selectedThreadId)) return;
       const submittedThreadId = selectedThreadId;
       const submittedInput = draftText;
-      const submittedAttachments = chatAttachments;
+      const submittedAttachments = draftAttachments;
       // Clear before the linked-task refresh so edits made during that wait
       // belong to the current composer and are never erased by this submission.
-      setChatInput('');
-      setChatMention(null);
-      setChatAttachments([]);
+      composerDraft.clear();
+      composerDraft.flush();
       pendingTurnStartsRef.current.add(selectedThreadId);
       try {
         await refreshLinkedTasksBeforeDispatch(submittedThreadId);
@@ -7335,8 +6846,7 @@ const App: React.FC = () => {
         toast.error(result.error);
         return;
       }
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
       return;
     }
 
@@ -7350,8 +6860,7 @@ const App: React.FC = () => {
       }
       const clearedThreadId = selectedThreadId;
       const clearedThread = selectedThread;
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
       void window.orion?.clearClaudeSession?.(clearedThreadId).catch(() => {});
       updateThread(clearedThreadId, {
         agentSessionIds: { ...clearedThread.agentSessionIds, claude: undefined },
@@ -7369,8 +6878,7 @@ const App: React.FC = () => {
         toast.error('Stop the run before switching models.');
         return;
       }
-      setChatInput('');
-      setChatMention(null);
+      composerDraft.setText('');
       const providerId = selectedAgentModel?.providerId;
       if (providerId) setActiveProviderTab(providerId);
       setModelPickerOpen(true);
@@ -7382,28 +6890,35 @@ const App: React.FC = () => {
       pinThreadToBottom(selectedThreadId);
       queueMessageToThread(selectedThreadId, {
         text: promptText,
-        attachments: chatAttachments,
+        attachments: draftAttachments,
       });
-      setChatInput('');
-      setChatMention(null);
-      setChatAttachments([]);
+      composerDraft.clear();
+      composerDraft.flush();
       return;
     }
 
     const submittedThreadId = selectedThreadId;
     const submittedInput = draftText;
-    const submittedAttachments = chatAttachments;
-    setChatInput('');
-    setChatMention(null);
-    setChatAttachments([]);
+    const submittedAttachments = draftAttachments;
+    // Empty the composer and show "Starting" before any preflight (linked-task
+    // refresh, workspace setup, mention checks) — only the composer re-renders.
+    // A failed start restores the draft below.
+    composerDraft.clear();
+    composerDraft.setStarting(submittedThreadId, true);
     let result: { ok: boolean; error?: string };
     try {
-      result = await startTurnForThread(submittedThreadId, promptText, submittedAttachments);
+      const turnStart = startTurnForThread(submittedThreadId, promptText, submittedAttachments);
+      // The sent draft is gone from disk too (after the turn's synchronous
+      // start, so it never delays it).
+      composerDraft.flush();
+      result = await turnStart;
     } catch (error) {
+      composerDraft.setStarting(submittedThreadId, false);
       restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
       toast.error(error instanceof Error ? error.message : 'The agent turn could not start');
       return;
     }
+    composerDraft.setStarting(submittedThreadId, false);
     if (!result.ok) {
       restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
       toast.error(result.error);
@@ -7735,12 +7250,12 @@ const App: React.FC = () => {
   // Composer ⚡ / ⌘⏎: steer with the current draft.
   const steerActiveAgent = async () => {
     if (!canSteerNow()) return;
-    const promptText = chatInput.trim();
-    const attachments = chatAttachments;
+    const draft = composerDraft.getDraft();
+    const promptText = draft.text.trim();
+    const attachments = draft.attachments;
     if (!promptText && attachments.length === 0) return;
-    setChatInput('');
-    setChatMention(null);
-    setChatAttachments([]);
+    composerDraft.clear();
+    composerDraft.flush();
     if (!selectedThreadId) return;
     await steerWithContent(selectedThreadId, promptText, attachments);
   };
@@ -7806,8 +7321,8 @@ const App: React.FC = () => {
       updateThread(rootThread.id, { queuedMessages: [] });
     }
     if (restoreRootQueueToComposer && queued.length > 0) {
-      setChatInput((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
-      setChatAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
+      composerDraft.setText((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
+      composerDraft.setAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
     }
     const pendingSpawnIds: string[] = [];
 
@@ -8382,200 +7897,6 @@ const App: React.FC = () => {
     []
   );
 
-  // Track the composer's active @-mention token: the last '@' at/before the
-  // caret whose preceding character is start-of-text or whitespace, with no
-  // whitespace between the '@' and the caret. Thread mode is the exception:
-  // its search query may contain spaces (thread titles do), so only a newline
-  // ends the token there. The mode a user picked survives as long as the same
-  // '@' is being edited — once the mention closes, it is gone, which is what
-  // stops a completed "@thread:… " token from reopening the dropdown while
-  // the rest of the message is typed.
-  const updateChatMention = useCallback((value: string, caret: number | null) => {
-    const prev = chatMentionRef.current;
-    let next: { start: number; query: string; mode?: ChatMentionMode } | null = null;
-    if (caret !== null) {
-      const beforeCaret = value.slice(0, caret);
-      const atIndex = beforeCaret.lastIndexOf('@');
-      if (atIndex !== -1) {
-        const charBefore = atIndex > 0 ? beforeCaret[atIndex - 1] : '';
-        const query = beforeCaret.slice(atIndex + 1);
-        const mode = prev && prev.start === atIndex ? prev.mode : undefined;
-        const queryAllowed =
-          mode === 'thread' || mode === 'chat' ? !/[\r\n]/.test(query) : !/\s/.test(query);
-        if ((!charBefore || /\s/.test(charBefore)) && queryAllowed) {
-          next = { start: atIndex, query, ...(mode ? { mode } : {}) };
-        }
-      }
-    }
-    // A token dismissed with Escape stays closed until a new '@' is typed.
-    if (next && chatMentionDismissRef.current === next.start) {
-      next = null;
-    } else {
-      chatMentionDismissRef.current = null;
-    }
-    chatMentionRef.current = next;
-    setChatMention(next);
-  }, []);
-
-  // Selecting a kind at the dropdown's root level clears anything typed after
-  // the '@' and narrows the dropdown to that kind's list.
-  const selectChatMentionCategory = (mode: ChatMentionMode) => {
-    if (!chatMention) return;
-    const replaceEnd = getChatMentionReplaceEnd(chatInput, chatMention, 'model');
-    const nextValue = chatInput.slice(0, chatMention.start + 1) + chatInput.slice(replaceEnd);
-    const caret = chatMention.start + 1;
-    setChatInput(nextValue);
-    setChatMention({ start: chatMention.start, query: '', mode });
-    requestAnimationFrame(() => {
-      const el = chatInputRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(caret, caret);
-    });
-  };
-
-  // Selecting a mention replaces the typed token with the model's or thread's
-  // unambiguous mention token and puts the caret right after the inserted text.
-  const insertChatMention = (candidate: ChatMentionCandidate | undefined) => {
-    if (!chatMention || !candidate) return;
-    if (candidate.kind === 'category') {
-      selectChatMentionCategory(candidate.category);
-      return;
-    }
-    if (candidate.kind === 'chatStatus') {
-      if (candidate.action === 'sign-in') {
-        setChatMention(null);
-        openAccountSettings();
-      }
-      return;
-    }
-    if (candidate.kind === 'chat') rememberDurangoChats([candidate.chat]);
-    const inserted =
-      candidate.kind === 'model'
-        ? `@${modelMentionToken(candidate.model, agentModels)} `
-        : candidate.kind === 'mcp'
-          ? `@${candidate.server.nickname} `
-          : candidate.kind === 'chat'
-            ? `@${chatMentionToken(candidate.chat)} `
-            : `@${threadMentionToken(candidate.thread)} `;
-    // Thread and chat searches can contain spaces, so text after the caret
-    // is ambiguous and must be preserved. Model mentions have a safe
-    // slug-like token boundary and still consume a matching suffix.
-    const replaceEnd = getChatMentionReplaceEnd(
-      chatInput,
-      chatMention,
-      candidate.kind === 'thread' ? 'thread' : candidate.kind === 'chat' ? 'chat' : 'model'
-    );
-    const nextValue = chatInput.slice(0, chatMention.start) + inserted + chatInput.slice(replaceEnd);
-    const caret = chatMention.start + inserted.length;
-    setChatInput(nextValue);
-    setChatMention(null);
-    chatMentionDismissRef.current = null;
-    setSlashDismissedDraft(null);
-    requestAnimationFrame(() => {
-      const el = chatInputRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(caret, caret);
-    });
-  };
-
-  // Selecting a slash command replaces the draft with the command. Commands
-  // that take arguments complete to "/name " so the user can type them;
-  // argument-less ones can submit immediately (Claude Code's Enter-runs-it).
-  const insertSlashCommand = (
-    candidate: SlashCommandCandidate | undefined,
-    options?: { submit?: boolean }
-  ) => {
-    if (!candidate) return;
-    const hasArguments = Boolean(candidate.command.argumentHint);
-    const nextValue = `/${candidate.command.name}${hasArguments ? ' ' : ''}`;
-    setSlashDismissedDraft(null);
-    setChatInput(nextValue);
-    if (options?.submit && !hasArguments) {
-      void sendMessage(nextValue);
-      return;
-    }
-    requestAnimationFrame(() => {
-      const el = chatInputRef.current;
-      if (!el) return;
-      el.focus();
-      el.setSelectionRange(nextValue.length, nextValue.length);
-    });
-  };
-
-  // Handle chat submit: ⏎ sends (or queues mid-run), ⌘⏎ steers mid-run.
-  const handleChatKeyDown = (e: React.KeyboardEvent) => {
-    // The open slash-command menu captures navigation keys first. It never
-    // coexists with the @-mention dropdown: the slash token spans the whole
-    // draft and contains no whitespace, so no "@" token can start inside it.
-    if (slashMenuOpen) {
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        e.preventDefault();
-        const delta = e.key === 'ArrowDown' ? 1 : -1;
-        const count = slashCommandCandidates.length;
-        setSlashCommandIndex((index) => (index + delta + count) % count);
-        return;
-      }
-      // Tab completes; Enter completes and runs argument-less commands
-      // immediately. Shift+Enter keeps its newline meaning.
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        insertSlashCommand(slashCommandCandidates[slashCommandIndex] ?? slashCommandCandidates[0]);
-        return;
-      }
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        insertSlashCommand(slashCommandCandidates[slashCommandIndex] ?? slashCommandCandidates[0], {
-          submit: true,
-        });
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setSlashDismissedDraft(chatInput);
-        return;
-      }
-    }
-    // The open @-mention dropdown captures navigation keys first.
-    if (chatMentionOpen) {
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        e.preventDefault();
-        const delta = e.key === 'ArrowDown' ? 1 : -1;
-        const count = chatMentionCandidates.length;
-        // At the bottom with more threads unloaded, arrowing down fetches the
-        // next page and steps onto its first row instead of wrapping to the top.
-        if (delta === 1 && chatMentionIndex === count - 1 && chatMentionHasMoreThreads) {
-          setChatMentionThreadLimit((limit) => limit + CHAT_MENTION_THREAD_PAGE);
-          setChatMentionIndex(count);
-          return;
-        }
-        setChatMentionIndex((index) => (index + delta + count) % count);
-        return;
-      }
-      // Shift+Enter keeps its newline meaning even with the dropdown open;
-      // plain Enter and Tab select the highlighted mention.
-      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
-        e.preventDefault();
-        insertChatMention(chatMentionCandidates[chatMentionIndex] ?? chatMentionCandidates[0]);
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        chatMentionDismissRef.current = chatMention?.start ?? null;
-        setChatMention(null);
-        return;
-      }
-    }
-    if (e.key !== 'Enter' || e.shiftKey) return;
-    e.preventDefault();
-    if ((e.metaKey || e.ctrlKey) && isSending && steerReady) {
-      void steerActiveAgent();
-      return;
-    }
-    sendMessage();
-  };
-
   const openAccountSettings = useCallback(() => {
     setSettingsTab('account');
     setSettingsOpen(true);
@@ -8999,76 +8320,6 @@ const App: React.FC = () => {
     [openThreadInSplit]
   );
 
-  // A sidebar thread dropped on the composer links it as an @thread mention —
-  // the same token the @ dropdown inserts — rather than opening a split pane.
-  // Only drags the composer can turn into a working reference are intercepted;
-  // anything else falls through to the panel's split-view handlers above.
-  const [composerThreadDropActive, setComposerThreadDropActive] = useState(false);
-  const composerAcceptsThreadDrop =
-    canReferenceThreadsFromComposer && !isNativeSubagentThread && !selectedThreadWorkspaceUnavailable;
-
-  const handleComposerThreadDragOver = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      if (!isThreadDrag(event) || !composerAcceptsThreadDrop) return;
-      event.preventDefault();
-      event.stopPropagation();
-      event.dataTransfer.dropEffect = 'copy';
-      setComposerThreadDropActive(true);
-      // The panel's split-drop hint is already up from the travel across the
-      // main view; the composer takes over while the drag is above it.
-      setThreadDropActive(false);
-    },
-    [composerAcceptsThreadDrop]
-  );
-
-  const handleComposerThreadDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!isThreadDrag(event)) return;
-    // Ignore transitions between the composer's own children.
-    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-    setComposerThreadDropActive(false);
-  }, []);
-
-  const handleComposerThreadDrop = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      if (!isThreadDrag(event) || !composerAcceptsThreadDrop) return;
-      event.preventDefault();
-      event.stopPropagation();
-      setComposerThreadDropActive(false);
-      const threadId = event.dataTransfer.getData(THREAD_DRAG_MIME);
-      const thread = threads.find((t) => t.id === threadId);
-      if (
-        !thread ||
-        !isThreadReferenceCandidate(
-          thread.id,
-          selectedThreadId,
-          isClaudeCodeCliModelId(thread.modelId)
-        )
-      ) {
-        return;
-      }
-      // Insert at the caret (the textarea keeps its selection while unfocused),
-      // padding with spaces so the token stays a standalone word.
-      const token = `@${threadMentionToken(thread)}`;
-      const el = chatInputRef.current;
-      const start = el?.selectionStart ?? chatInput.length;
-      const end = el?.selectionEnd ?? start;
-      const before = chatInput.slice(0, start);
-      const after = chatInput.slice(end);
-      const inserted = `${before && !/\s$/.test(before) ? ' ' : ''}${token}${/^\s/.test(after) ? '' : ' '}`;
-      setChatInput(before + inserted + after);
-      setChatMention(null);
-      chatMentionDismissRef.current = null;
-      const caret = start + inserted.length;
-      requestAnimationFrame(() => {
-        const input = chatInputRef.current;
-        if (!input) return;
-        input.focus();
-        input.setSelectionRange(caret, caret);
-      });
-    },
-    [chatInput, composerAcceptsThreadDrop, selectedThreadId, threads]
-  );
-
   // Width every composer chip would take if they all stayed on the row. Depends
   // only on the labels, so it never changes as a result of collapsing them —
   // the compact row can't measure the full one, and a measured switch would
@@ -9098,7 +8349,7 @@ const App: React.FC = () => {
     if (!isTerminalThread) widths.push(34);
     widths.push(34); // File attachment picker.
     widths.push(36); // Send, or stop while a run is in flight.
-    if (isSending && (chatInput.trim() || chatAttachments.length > 0)) {
+    if (isSending && composerHasDraft) {
       widths.push(36); // Queue.
       if (steerSupported) widths.push(36);
     }
@@ -9553,6 +8804,32 @@ const App: React.FC = () => {
   // The composer belongs to the focused pane: one thread takes input at a
   // time and clicking any pane moves it there. Built once, outside the pane
   // loop, so a six-way split never duplicates the picker/mention machinery.
+  // Handlers the Composer calls. Stable identities that always run the latest
+  // App closure, so passing them never re-renders the Composer by itself.
+  const sendFromComposer = useLatestCallback((overrideText?: string) => {
+    void sendMessage(overrideText);
+  });
+  const steerFromComposer = useLatestCallback(() => {
+    void steerActiveAgent();
+  });
+  const stopFromComposer = useLatestCallback(() => {
+    void stopActiveAgent();
+  });
+  const dispatchReviewFromComposer = useLatestCallback((rawText: string, review: ComposerReviewRequest) =>
+    dispatchReview(rawText, review)
+  );
+  const hideThreadDropHint = useCallback(() => setThreadDropActive(false), []);
+  // Base branches the Codex "/review base" picker offers.
+  const reviewBranches = useMemo(
+    () => (gitState?.branches ?? []).filter((branch) => !branch.current).map((branch) => branch.name),
+    [gitState?.branches]
+  );
+  // Whether /btw can run: Claude, directly or as an Orion main driver.
+  const btwAvailable =
+    selectedAgentModel?.providerId === 'claude' ||
+    (isOrionModelId(selectedThread?.modelId ?? '') &&
+      findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)?.providerId === 'claude');
+
   const composerNode = selectedThread ? (
     <div className="chat-input-area">
       <UserActionCards
@@ -9574,426 +8851,111 @@ const App: React.FC = () => {
         split={threadPanes.length > 1}
       />
       {composerGitBar}
-      <div
-        className={`composer-shell${composerThreadDropActive ? ' thread-drop-target' : ''}`}
-        onDragOver={handleComposerThreadDragOver}
-        onDragLeave={handleComposerThreadDragLeave}
-        onDrop={handleComposerThreadDrop}
-      >
-        {chatAttachments.length > 0 && (
-          <div className="composer-attachments">
-            {chatAttachments.map((attachment) => (
-              <div
-                key={attachment.id}
-                className={`composer-attachment${attachment.snapshot?.kind === 'accessibility' ? ' cursor-pointer' : ''}`}
-                title={
-                  attachment.snapshot?.kind === 'accessibility'
-                    ? `Open the app text captured from ${attachment.snapshot.appName}\n${attachment.path}`
-                    : attachment.path
-                }
-                onClick={
-                  attachment.snapshot?.kind === 'accessibility'
-                    ? (event) => {
-                        if ((event.target as HTMLElement).closest('button')) return;
-                        void openSnapShotOutline(attachment.path);
-                      }
-                    : undefined
-                }
-              >
-                <AttachmentThumb attachment={attachment} />
-                <span className="composer-attachment-meta">
-                  {attachment.snapshot && <SnapShotAttachmentBadge snapshot={attachment.snapshot} />}
-                  <span className="composer-attachment-name">{attachment.name}</span>
-                  <span className="composer-attachment-size">
-                    {formatAttachmentSize(attachment.size)}
-                  </span>
-                </span>
-                <button
-                  type="button"
-                  className="composer-attachment-remove"
-                  onClick={() => removeChatAttachment(attachment.id)}
-                  title="Remove attachment"
-                >
-                  <X size={13} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-        {hasPendingLinkedTasks && (
-          <div className="composer-task-row">
-            {pendingLinkedTasks.map((linkedTask) => (
-              <div
-                key={linkedTask.id}
-                className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
-                title={linkedTask.description || linkedTask.title}
-              >
-                <SquareKanban size={13} />
-                <span className="composer-task-title">{linkedTask.title}</span>
-                <span className="composer-task-status">
-                  {linkedTaskStatusLabel(linkedTask.lastStatus)}
-                </span>
-                {linkedTask.lastStatus !== 'done' && !isSending && (
-                  <button
-                    type="button"
-                    className="composer-task-action done"
-                    onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
-                    title="Mark the task as done in Durango Tasks"
+      <Composer
+        controller={composerDraft}
+        threadId={selectedThread.id}
+        agentModels={agentModels}
+        enabledProviderIds={enabledProviderIdSet}
+        orionMcps={orionMcps}
+        threads={threads}
+        projects={projects}
+        canReferenceThreads={canReferenceThreads}
+        liveSlashCommands={selectedThreadSlashCommands}
+        reviewBranches={reviewBranches}
+        providerId={selectedAgentModel?.providerId ?? null}
+        modelAvailable={selectedAgentModel?.available !== false}
+        claudeBacked={selectedThreadClaudeBacked}
+        btwAvailable={btwAvailable}
+        isTerminalThread={isTerminalThread}
+        isNativeSubagentThread={isNativeSubagentThread}
+        workspaceUnavailable={selectedThreadWorkspaceUnavailable}
+        workspaceRemoving={selectedThreadWorkspaceRemoving}
+        isSending={isSending}
+        steerSupported={steerSupported}
+        steerReady={steerReady}
+        pendingLinkedTaskCount={pendingLinkedTasks.length}
+        taskRow={
+          <>
+            {hasPendingLinkedTasks && (
+              <div className="composer-task-row">
+                {pendingLinkedTasks.map((linkedTask) => (
+                  <div
+                    key={linkedTask.id}
+                    className={`composer-task-chip status-${linkedTask.lastStatus ?? 'linked'}`}
+                    title={linkedTask.description || linkedTask.title}
                   >
-                    <CircleCheck size={13} />
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="composer-task-action"
-                  onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
-                  title="Unlink task"
-                >
-                  <X size={12} />
-                </button>
+                    <SquareKanban size={13} />
+                    <span className="composer-task-title">{linkedTask.title}</span>
+                    <span className="composer-task-status">
+                      {linkedTaskStatusLabel(linkedTask.lastStatus)}
+                    </span>
+                    {linkedTask.lastStatus !== 'done' && !isSending && (
+                      <button
+                        type="button"
+                        className="composer-task-action done"
+                        onClick={() => markLinkedTaskDone(selectedThread.id, linkedTask.id)}
+                        title="Mark the task as done in Durango Tasks"
+                      >
+                        <CircleCheck size={13} />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="composer-task-action"
+                      onClick={() => unlinkTaskFromThread(selectedThread.id, linkedTask.id)}
+                      title="Unlink task"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        )}
-        {attachedOrionMcps.length > 0 && selectedThread && !isTerminalThread && (
-          <div className="composer-mcp-row">
-            {attachedOrionMcps.map((server) => (
-              <div
-                key={server.id}
-                className={`composer-mcp-chip${server.status === 'needs-sign-in' ? ' needs-sign-in' : ''}`}
-                title={
-                  server.status === 'needs-sign-in'
-                    ? `@${server.nickname} needs a new sign-in in Settings → Skills & MCPs`
-                    : `@${server.nickname} is loaded for every turn in this thread`
-                }
-              >
-                <Plug size={12} />
-                <span>@{server.nickname}</span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    updateThread(selectedThread.id, {
-                      mcpServerIds: (selectedThread.mcpServerIds ?? []).filter((id) => id !== server.id),
-                    })
-                  }
-                  title="Stop loading this MCP in this thread"
-                >
-                  <X size={11} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-        {!slashMenuOpen && completedSlash && (
-          <div className="composer-btw-hint">
-            <SquareSlash size={12} />
-            <span>
-              /{completedSlash.command.name}
-              {completedSlash.command.argumentHint ? ` ${completedSlash.command.argumentHint}` : ''}
-              {completedSlash.command.description ? ` — ${completedSlash.command.description}` : ''}
-            </span>
-          </div>
-        )}
-        {!slashMenuOpen &&
-          !isTerminalThread &&
-          // Claude-backed threads run Claude Code's own /review (expanded
-          // CLI-side); the generic command hint above covers it there. While
-          // the preset popover is up it already explains the choices, so the
-          // long banner would only stack noise above the composer.
-          !selectedThreadClaudeBacked &&
-          !codexReviewPresetsActive &&
-          /^\/review(\s|$)/i.test(chatInput.trimStart()) && (
-            <div className="composer-btw-hint">
-              <SquarePen size={12} />
-              <span>
-                {selectedAgentModel?.providerId === 'codex'
-                  ? 'Code review — Codex reviews uncommitted changes by default. “/review base <branch>”, “/review commit <sha>”, or “/review <custom instructions>”.'
-                  : '/review is only available on Codex agents.'}
-              </span>
-            </div>
-          )}
-        {!slashMenuOpen &&
-          !isTerminalThread &&
-          !selectedThreadClaudeBacked &&
-          /^\/goal(\s|$)/i.test(chatInput.trimStart()) && (
-          <div className="composer-btw-hint">
-            <Target size={12} />
-            <span>
-              {selectedAgentModel?.providerId === 'codex'
-                ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
-                : '/goal is only available on Codex agents.'}
-            </span>
-          </div>
-        )}
-        {!slashMenuOpen && !isTerminalThread && /^\/btw(\s|$)/i.test(chatInput.trimStart()) && (
-          <div className="composer-btw-hint">
-            <Sparkles size={12} />
-            <span>
-              {selectedAgentModel?.providerId === 'claude' ||
-              (isOrionModelId(selectedThread.modelId) &&
-                findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)
-                  ?.providerId === 'claude')
-                ? 'Aside question — answered by a read-only fork of this thread’s Claude session. It won’t interrupt the agent or join the thread.'
-                : '/btw is only available on Claude agents for now.'}
-            </span>
-          </div>
-        )}
-        {codexReviewPresetsActive && (
-            <ComposerPopover className="review-popover">
-              <button
-                type="button"
-                role="option"
-                className="mention-row"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() =>
-                  dispatchReview('/review', {
-                    mode: 'uncommitted',
-                  })
-                }
-              >
-                <SquarePen size={14} />
-                <span className="mention-row-label">Review uncommitted changes</span>
-              </button>
-              <button
-                type="button"
-                role="option"
-                className="mention-row"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => setChatInput('/review base ')}
-              >
-                <GitBranch size={14} />
-                <span className="mention-row-label">Review against a base branch</span>
-              </button>
-            </ComposerPopover>
-          )}
-        {!slashMenuOpen &&
-          selectedAgentModel?.providerId === 'codex' &&
-          /^\/review\s+base\s*$/i.test(chatInput.trimStart()) && (
-            <ComposerPopover className="review-popover">
-              {(gitState?.branches ?? [])
-                .filter((branch) => !branch.current)
-                .slice(0, 12)
-                .map((branch) => (
-                  <button
-                    key={branch.name}
-                    type="button"
-                    role="option"
-                    className="mention-row"
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() =>
-                      dispatchReview(`/review base ${branch.name}`, {
-                        mode: 'base',
-                        base: branch.name,
-                      })
+            )}
+          </>
+        }
+        mcpRow={
+          <>
+            {attachedOrionMcps.length > 0 && selectedThread && !isTerminalThread && (
+              <div className="composer-mcp-row">
+                {attachedOrionMcps.map((server) => (
+                  <div
+                    key={server.id}
+                    className={`composer-mcp-chip${server.status === 'needs-sign-in' ? ' needs-sign-in' : ''}`}
+                    title={
+                      server.status === 'needs-sign-in'
+                        ? `@${server.nickname} needs a new sign-in in Settings → Skills & MCPs`
+                        : `@${server.nickname} is loaded for every turn in this thread`
                     }
                   >
-                    <GitBranch size={14} />
-                    <span className="mention-row-label">{branch.name}</span>
-                  </button>
+                    <Plug size={12} />
+                    <span>@{server.nickname}</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updateThread(selectedThread.id, {
+                          mcpServerIds: (selectedThread.mcpServerIds ?? []).filter((id) => id !== server.id),
+                        })
+                      }
+                      title="Stop loading this MCP in this thread"
+                    >
+                      <X size={11} />
+                    </button>
+                  </div>
                 ))}
-              {!(gitState?.branches ?? []).some((branch) => !branch.current) && (
-                <div className="mention-row" aria-disabled="true">
-                  <GitBranch size={14} />
-                  <span className="mention-row-label">No other branches — type a branch name</span>
-                </div>
-              )}
-            </ComposerPopover>
-          )}
-        {slashMenuOpen && (
-          <ComposerPopover className="slash-popover">
-            {slashCommandCandidates.map((candidate, index) => {
-              const { command, source } = candidate;
-              const RowIcon =
-                source === 'orion'
-                  ? command.name === 'goal'
-                    ? Target
-                    : command.name === 'review'
-                      ? SquarePen
-                      : command.name === 'btw'
-                        ? Sparkles
-                        : command.name === 'clear'
-                          ? Eraser
-                          : command.name === 'model'
-                            ? Bot
-                            : SquareSlash
-                  : SquareSlash;
-              return (
-                <button
-                  key={`${source}:${command.name}`}
-                  ref={index === slashCommandIndex ? slashCommandSelectedRef : null}
-                  type="button"
-                  role="option"
-                  aria-selected={index === slashCommandIndex}
-                  className={`mention-row ${index === slashCommandIndex ? 'selected' : ''}`}
-                  onMouseEnter={() => setSlashCommandIndex(index)}
-                  // Keep the textarea focused so selection doesn't blur the composer.
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => insertSlashCommand(candidate, { submit: true })}
-                >
-                  <RowIcon size={16} />
-                  <span className="mention-row-label">
-                    /{command.name}
-                    {command.argumentHint ? (
-                      <span className="slash-row-hint"> {command.argumentHint}</span>
-                    ) : null}
-                  </span>
-                  <span className="mention-row-slug">{command.description}</span>
-                </button>
-              );
-            })}
-          </ComposerPopover>
-        )}
-        {chatMentionOpen && (
-          <ComposerPopover onScroll={handleChatMentionScroll}>
-            {chatMentionCandidates.map((candidate, index) => {
-              const rowProps = {
-                ref: index === chatMentionIndex ? chatMentionSelectedRef : null,
-                type: 'button' as const,
-                role: 'option',
-                'aria-selected': index === chatMentionIndex,
-                className: `mention-row ${index === chatMentionIndex ? 'selected' : ''}`,
-                onMouseEnter: () => setChatMentionIndex(index),
-                // Keep the textarea focused so selection doesn't blur the composer.
-                onMouseDown: (e: React.MouseEvent) => e.preventDefault(),
-                onClick: () => insertChatMention(candidate),
-              };
-              if (candidate.kind === 'category') {
-                const CategoryIcon =
-                  candidate.category === 'model'
-                    ? Bot
-                    : candidate.category === 'mcp'
-                      ? Plug
-                      : candidate.category === 'chat'
-                        ? MessageCircle
-                        : MessageSquare;
-                return (
-                  <button key={`category:${candidate.category}`} {...rowProps} title={candidate.hint}>
-                    <CategoryIcon size={16} />
-                    <span className="mention-row-label">{candidate.label}</span>
-                    <span className="mention-row-slug">{candidate.hint}</span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'thread') {
-                const { thread, projectName } = candidate;
-                return (
-                  <button key={thread.id} {...rowProps} title={threadMentionToken(thread)}>
-                    <MessageSquare size={16} />
-                    <span className="mention-row-label">{thread.title}</span>
-                    <span className="mention-row-slug">
-                      {projectName} · {formatShortTime(getThreadActivityTime(thread))}
-                    </span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'chat') {
-                const { chat } = candidate;
-                const updated = formatChatUpdatedAt(chat.updatedAt);
-                const snippet = chat.snippet?.trim().replace(/\s+/g, ' ') ?? '';
-                return (
-                  <button
-                    key={`chat:${chat.id}`}
-                    {...rowProps}
-                    className={`${rowProps.className} chat-mention-row`}
-                    title={`@${chatMentionToken(chat)}`}
-                  >
-                    <MessageCircle size={16} />
-                    <span className="mention-row-label">{chat.title || 'Untitled chat'}</span>
-                    <span className="mention-row-slug">
-                      {[updated, snippet].filter(Boolean).join(' · ') || 'Durango chat'}
-                    </span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'chatStatus') {
-                return (
-                  <button
-                    key={`chatStatus:${candidate.message}`}
-                    {...rowProps}
-                    aria-disabled={!candidate.action}
-                    title={candidate.action === 'sign-in' ? 'Open account settings' : candidate.message}
-                  >
-                    <MessageCircle size={16} />
-                    <span className="mention-row-slug">{candidate.message}</span>
-                  </button>
-                );
-              }
-              if (candidate.kind === 'mcp') {
-                const { server } = candidate;
-                return (
-                  <button key={`mcp:${server.id}`} {...rowProps} title={`@${server.nickname}`}>
-                    <Plug size={16} />
-                    <span className="mention-row-label">@{server.nickname}</span>
-                    <span className="mention-row-slug">
-                      {server.status === 'needs-sign-in'
-                        ? 'sign in needed'
-                        : server.enabled
-                          ? 'always on'
-                          : 'MCP · loads when mentioned'}
-                    </span>
-                  </button>
-                );
-              }
-              const { model } = candidate;
-              const ProviderIcon =
-                agentProviders.find((provider) => provider.id === model.providerId)?.icon ?? Play;
-              return (
-                <button key={model.id} {...rowProps} title={modelMentionToken(model, agentModels)}>
-                  <ProviderIcon size={16} />
-                  <span className="mention-row-label">{model.label}</span>
-                  <span className="mention-row-slug">{modelMentionToken(model, agentModels)}</span>
-                </button>
-              );
-            })}
-          </ComposerPopover>
-        )}
-        <textarea
-          ref={setChatInputRef}
-          className="chat-input min-h-[52px]"
-          disabled={isNativeSubagentThread || selectedThreadWorkspaceUnavailable}
-          placeholder={
-            isNativeSubagentThread
-              ? 'Read-only subagent transcript — steer from the parent thread.'
-              : selectedThreadWorkspaceUnavailable
-                ? selectedThreadWorkspaceRemoving
-                  ? 'Removing this thread’s Durango workspace…'
-                  : 'Creating a Durango workspace for this thread — cloning dependencies, one moment…'
-                : isTerminalThread
-                  ? 'Type a prompt — ⏎ sends it to the Claude Code terminal…'
-                  : isSending
-                    ? steerSupported
-                      ? 'Queue a follow-up (⏎) or steer the agent now (⌘⏎)…'
-                      : 'Queue a follow-up — sends when the agent finishes (⏎)…'
-                    : chatAttachments.length > 0
-                      ? `Ask something about the attached ${attachmentKindLabel(chatAttachments)}...`
-                      : hasPendingLinkedTasks
-                        ? `Add details (optional) — send starts on the linked ${
-                            pendingLinkedTasks.length > 1 ? 'tasks' : 'task'
-                          }...`
-                        : 'Describe what you want the agent to do...'
-          }
-          value={chatInput}
-          onChange={(e) => {
-            setSlashDismissedDraft(null);
-            setChatInput(e.target.value);
-            updateChatMention(e.target.value, e.target.selectionStart);
-          }}
-          onKeyDown={handleChatKeyDown}
-          // Caret moves without input still open/close the mention
-          // dropdown. Dropdown-navigation keys are excluded so a
-          // handled keydown can't immediately recompute the token.
-          onKeyUp={(e) => {
-            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) {
-              updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart);
-            }
-          }}
-          onClick={(e) => updateChatMention(e.currentTarget.value, e.currentTarget.selectionStart)}
-          rows={2}
-        />
-        <div
-          className={`composer-controls${composerControlsCompact ? ' compact' : ''}`}
-          ref={composerControlsRef}
-        >
+              </div>
+            )}
+          </>
+        }
+        controlsClassName={`composer-controls${composerControlsCompact ? ' compact' : ''}`}
+        controlsRef={composerControlsRef}
+        onSend={sendFromComposer}
+        onSteer={steerFromComposer}
+        onStop={stopFromComposer}
+        onDispatchReview={dispatchReviewFromComposer}
+        onOpenAccountSettings={openAccountSettings}
+        onThreadDragOver={hideThreadDropHint}
+      >
+        <>
           <div className="model-picker-anchor" ref={modelPickerRef}>
             <button
               className="model-trigger"
@@ -10344,53 +9306,8 @@ const App: React.FC = () => {
           >
             <Paperclip size={15} />
           </button>
-
-          {isSending ? (
-            <>
-              {(chatInput.trim() || chatAttachments.length > 0) && (
-                <>
-                  <button
-                    className="send-button"
-                    onClick={sendMessage}
-                    title="Queue — sends when the current run finishes (⏎)"
-                  >
-                    <ListPlus size={15} />
-                  </button>
-                  {steerSupported && (
-                    <button
-                      className="send-button steer"
-                      onClick={steerActiveAgent}
-                      disabled={!steerReady}
-                      title={
-                        steerReady
-                          ? 'Steer — the agent picks this up mid-run without losing its work (⌘⏎)'
-                          : 'Steer is unavailable — the message will queue instead'
-                      }
-                    >
-                      <Zap size={14} />
-                    </button>
-                  )}
-                </>
-              )}
-              <button className="send-button stop" onClick={stopActiveAgent} title="Stop agent">
-                <Square size={14} fill="currentColor" />
-              </button>
-            </>
-          ) : (
-            <button
-              className="send-button"
-              onClick={sendMessage}
-              disabled={
-                (!chatInput.trim() && chatAttachments.length === 0 && !hasPendingLinkedTasks) ||
-                selectedAgentModel?.available === false
-              }
-              title="Send"
-            >
-              <ArrowUp size={16} strokeWidth={2.5} />
-            </button>
-          )}
-        </div>
-      </div>
+        </>
+      </Composer>
     </div>
   ) : null;
 

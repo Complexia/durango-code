@@ -1087,8 +1087,27 @@ export const flushOrionStoreSave = async (): Promise<boolean> => {
   }
 };
 
+// State kept outside the store that must reach it before the unload-time
+// synchronous write below (the composer's debounced draft). Window listeners
+// for the same event run in registration order, and this module registers
+// first, so a later beforeunload listener would be too late.
+const beforeUnloadStoreFlushes = new Set<() => void>();
+export const flushIntoStoreBeforeUnload = (flush: () => void) => {
+  beforeUnloadStoreFlushes.add(flush);
+  return () => {
+    beforeUnloadStoreFlushes.delete(flush);
+  };
+};
+
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
+    for (const flush of beforeUnloadStoreFlushes) {
+      try {
+        flush();
+      } catch (error) {
+        console.warn('Failed to flush into orion-storage on unload', error);
+      }
+    }
     // Like the threads flush below: an async save started here races app
     // teardown, and the store carries unsent composer drafts typed (or
     // cleared by a send) moments before quitting. Block on a synchronous

@@ -8,8 +8,9 @@ import {
   parseCodexReviewCommand,
 } from '../src/app/slashCommands.ts';
 
-const [appSource, mainSource, claudeDriverSource] = await Promise.all([
+const [appSource, composerSource, mainSource, claudeDriverSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
+  readFile(new URL('../src/app/Composer.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/main.js', import.meta.url), 'utf8'),
   readFile(new URL('../src/main/claude-driver.js', import.meta.url), 'utf8'),
 ]);
@@ -112,7 +113,7 @@ assert.match(
 const remoteCommands = section(
   appSource,
   '  // Remote runTurn/stopTurn commands from paired controllers',
-  '  // Track the composer\'s active @-mention token:'
+  '  const openAccountSettings = useCallback('
 );
 assert.match(
   remoteCommands,
@@ -126,16 +127,16 @@ assert.match(
 );
 
 const draftSwap = section(
-  appSource,
-  '  useEffect(() => {\n    const prevKey = composerDraftKeyRef.current;',
-  '  // The spawn-request listener'
+  composerSource,
+  '  // A different thread\'s draft: its dismissed slash menu isn\'t this one\'s.',
+  '  // Autosize the composer to its content.'
 );
 assert.match(
   draftSwap,
   /setSlashDismissedDraft\(null\)/,
   'switching composer threads must clear slash-menu dismissal'
 );
-const composerInput = section(appSource, '          value={chatInput}', '          onKeyDown={handleChatKeyDown}');
+const composerInput = section(composerSource, '        value={chatInput}', '        onKeyDown={handleChatKeyDown}');
 assert.match(
   composerInput,
   /onChange=\{\(e\) => \{\s*setSlashDismissedDraft\(null\);/,
