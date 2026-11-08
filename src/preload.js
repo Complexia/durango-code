@@ -358,6 +358,7 @@ contextBridge.exposeInMainWorld('orion', {
   remoteFetchSnapshot: (input) => ipcRenderer.invoke('remote:fetchSnapshot', input),
   remoteFetchThread: (input) => ipcRenderer.invoke('remote:fetchThread', input),
   remoteRunTurn: (input) => ipcRenderer.invoke('remote:runTurn', input),
+  remoteCheckoutSource: (input) => ipcRenderer.invoke('remote:checkoutSource', input),
   remoteStopTurn: (input) => ipcRenderer.invoke('remote:stopTurn', input),
   remoteRendererReady: () => ipcRenderer.invoke('remote:rendererReady'),
   remoteClaimCommand: (input) => ipcRenderer.invoke('remote:claimCommand', input),

@@ -23,7 +23,11 @@ import {
   normalizeDispatchSettings,
   resolveDispatchProject,
   resolveFollowUpProject,
+  SOURCE_CHECKOUT_CAPABILITY,
+  canCheckoutDispatch,
 } from '../src/main/durango-dispatch.js';
+import { checkoutFolderName, chooseCheckoutDir, cliSupportsClone, createSourceCheckout, sourceCheckoutRoot } from '../src/main/source-checkout.js';
+import { linuxPasswordStore } from '../src/main/linux-password-store-policy.js';
 import { durangoDispatchOutcome, dispatchSummaryText } from '../src/app/durangoDispatch.ts';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-durango-dispatch-'));
@@ -541,6 +545,205 @@ try {
     assert.deepEqual(registration.body.projects.map((project) => project.id), ['p1', 'p2'], 'only allowlisted projects are advertised');
     worker.stop();
     await worker.idle();
+  });
+
+  await test('source checkout: a repo this machine lacks is cloned, added, then run; capability needs no allowlist', async () => {
+    assert.ok(canCheckoutDispatch({ project: { repoId: 'repo_new' } }, null, true));
+    assert.ok(!canCheckoutDispatch({ project: { repoId: 'repo_new' } }, ['p1'], true), 'an allowlist never grows by itself');
+    assert.ok(!canCheckoutDispatch({ project: { name: 'x' } }, null, true), 'nothing to clone without a repo id');
+    assert.ok(!canCheckoutDispatch({ project: { repoId: 'r' }, threadId: 't' }, null, true), 'follow-ups need their thread');
+    assert.ok(!canCheckoutDispatch({ project: { repoId: 'r' } }, null, false));
+    assert.ok(!canCheckoutDispatch({ origin: 'api', project: { repoId: 'repo_new' } }, null, true), 'API keys never trigger a clone');
+    assert.ok(canCheckoutDispatch({ origin: 'tasks', project: { repoId: 'repo_new' } }, null, true));
+    assert.deepEqual(
+      buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], sourceCheckout: true }).capabilities,
+      ['thread-follow-up', SOURCE_CHECKOUT_CAPABILITY]
+    );
+    assert.deepEqual(
+      buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], allowedProjectIds: ['p1'], sourceCheckout: true }).capabilities,
+      ['thread-follow-up']
+    );
+
+    let claims = 0;
+    server.always('POST', '/api/v1/code/machines', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/claim', async () => {
+      claims += 1;
+      if (claims === 1) return { json: { dispatch: dispatchWire({ id: 'disp_clone', project: { id: null, name: 'durango', repoId: 'repo_durango' } }) } };
+      if (claims === 2) return { json: { dispatch: dispatchWire({ id: 'disp_clone_fail', project: { id: null, name: 'broken', repoId: 'repo_broken' } }) } };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { json: { dispatch: null } };
+    });
+    server.always('POST', '/api/v1/code/dispatches/disp_clone', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/disp_clone_fail', () => ({ json: { ok: true } }));
+    const checkouts = [];
+    const { worker, calls } = makeWorker({
+      heartbeatMs: 5,
+      deps: {
+        checkoutProject: async ({ repoId, name }) => {
+          checkouts.push({ repoId, name });
+          await new Promise((resolve) => setTimeout(resolve, 30)); // a slow clone: heartbeats meanwhile
+          if (repoId === 'repo_broken') throw new Error('git clone failed: not found');
+          return { id: 'p-new', name, path: '/home/me/Durango/durango', repoId };
+        },
+      },
+    });
+    worker.configure({ settings: { enabled: true }, projects });
+    worker.accountChanged(true);
+    await waitUntil(() => calls.starts.length === 1 && reports('disp_clone_fail').some((body) => body.status === 'failed'), 'clone, run, and a failed clone');
+    const registration = server.requests.find((request) => request.path === '/api/v1/code/machines');
+    assert.ok(registration.body.capabilities.includes(SOURCE_CHECKOUT_CAPABILITY));
+    assert.deepEqual(checkouts.map((item) => item.repoId), ['repo_durango', 'repo_broken']);
+    assert.equal(calls.starts[0].project.id, 'p-new', 'runs in the new checkout');
+    const before = reports('disp_clone').filter((body) => body.status === 'running' && !body.codeThreadId);
+    assert.ok(before.length >= 2, 'running heartbeats keep the lease while cloning');
+    assert.equal(reports('disp_clone').at(-1).codeThreadId, 'thread-1');
+    assert.match(reports('disp_clone_fail').at(-1).error, /Could not check out broken from Durango Source: git clone failed/);
+    await waitUntil(
+      () => server.requests.filter((request) => request.path === '/api/v1/code/machines').some((request) => request.body.projects.some((project) => project.id === 'p-new')),
+      'the checkout is advertised'
+    );
+    worker.stop();
+    await worker.idle();
+  });
+
+  await test('source checkout: an allowlist set while cloning means nothing runs', async () => {
+    let claims = 0;
+    server.always('POST', '/api/v1/code/machines', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/claim', async () => {
+      claims += 1;
+      if (claims === 1) return { json: { dispatch: dispatchWire({ id: 'disp_revoked', project: { id: null, name: 'durango', repoId: 'repo_durango' } }) } };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { json: { dispatch: null } };
+    });
+    server.always('POST', '/api/v1/code/dispatches/disp_revoked', () => ({ json: { ok: true } }));
+    let release;
+    let worker;
+    const made = makeWorker({
+      deps: {
+        checkoutProject: async ({ name, repoId }) => {
+          // Restricted to one project while the clone runs.
+          worker.configure({ settings: { enabled: true, allowedProjectIds: ['p1'] }, projects });
+          await new Promise((resolve) => (release = resolve));
+          return { id: 'p-new', name, path: '/x', repoId };
+        },
+      },
+    });
+    worker = made.worker;
+    worker.configure({ settings: { enabled: true }, projects });
+    worker.accountChanged(true);
+    await waitUntil(() => typeof release === 'function', 'clone started');
+    release();
+    await waitUntil(() => reports('disp_revoked').some((body) => body.status === 'failed'), 'failed report');
+    assert.equal(made.calls.starts.length, 0, 'nothing started');
+    assert.match(reports('disp_revoked').at(-1).error, /turned off or restricted/);
+    worker.stop();
+    await worker.idle();
+  });
+
+  await test('source checkout module: folder choice, reuse, one clone per repo, CLI version gate', async () => {
+    assert.equal(checkoutFolderName('durango', 'r1'), 'durango');
+    assert.equal(checkoutFolderName(' my app/../x ', 'r1'), 'my-app-x');
+    assert.equal(checkoutFolderName('', 'repo_9'), 'repo_9');
+    assert.equal(sourceCheckoutRoot({}, '/home/me'), '/home/me/Durango');
+    assert.equal(sourceCheckoutRoot({ DURANGO_CHECKOUT_ROOT: '/srv/code' }, '/home/me'), '/srv/code');
+    assert.ok(cliSupportsClone('0.10.0') && cliSupportsClone('1.0.0') && cliSupportsClone('0.10.3'));
+    assert.ok(!cliSupportsClone('0.9.9') && !cliSupportsClone('0.8.12') && !cliSupportsClone(null));
+
+    const root = await fs.mkdtemp(path.join(testRoot, 'checkouts-'));
+    await fs.mkdir(path.join(root, 'durango'));
+    await fs.writeFile(path.join(root, 'durango', 'other.txt'), 'x');
+    const links = { [path.join(root, 'durango')]: 'repo_other' };
+    assert.equal(
+      await chooseCheckoutDir(root, { repoId: 'repo_d', name: 'durango' }, async (dir) => links[dir] ?? null),
+      path.join(root, 'durango-repo_d'),
+      'a folder holding something else gets the repo id appended'
+    );
+    links[path.join(root, 'durango')] = 'repo_d';
+    assert.equal(await chooseCheckoutDir(root, { repoId: 'repo_d', name: 'durango' }, async (dir) => links[dir] ?? null), path.join(root, 'durango'), 'its own clone is reused');
+
+    const runs = [];
+    const added = [];
+    const checkout = createSourceCheckout({
+      root: () => root,
+      prepareCli: async () => {},
+      runCli: async (args) => {
+        runs.push(args);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { code: 0, json: { ok: true, path: args[2], name: 'site', env: { written: ['.env.local'] } } };
+      },
+      addProject: async (project) => {
+        added.push(project);
+        return { id: 'p-site' };
+      },
+    });
+    const [first, second] = await Promise.all([checkout({ repoId: 'repo_site', name: 'site' }), checkout({ repoId: 'repo_site', name: 'site' })]);
+    assert.equal(runs.length, 1, 'concurrent requests share one clone');
+    assert.deepEqual(runs[0], ['clone', 'repo_site', path.join(root, 'site'), '--json']);
+    assert.equal(first, second);
+    assert.deepEqual(first, { id: 'p-site', name: 'site', path: path.join(root, 'site'), repoId: 'repo_site', env: { written: ['.env.local'] }, envError: null });
+    assert.deepEqual(added, [{ name: 'site', path: path.join(root, 'site') }]);
+    await assert.rejects(checkout({ repoId: '../x' }), /repository id is required/);
+    await assert.rejects(checkout({ repoId: '--upload-pack=x' }), /repository id is required/, 'never a CLI flag');
+
+    // Cancelling one caller of a shared clone leaves it running for the other.
+    let cloneSignal = null;
+    let finishClone;
+    const shared = createSourceCheckout({
+      root: () => root,
+      prepareCli: async () => {},
+      runCli: async (args, options) => {
+        cloneSignal = options.signal;
+        await new Promise((resolve) => (finishClone = resolve));
+        return { code: 0, json: { ok: true, path: args[2], name: 'mono' } };
+      },
+      addProject: async () => ({ id: 'p-mono' }),
+    });
+    const firstCaller = new AbortController();
+    const firstRun = shared({ repoId: 'repo_mono', name: 'mono', signal: firstCaller.signal });
+    const secondRun = shared({ repoId: 'repo_mono', name: 'mono', signal: new AbortController().signal });
+    await waitUntil(() => cloneSignal !== null, 'the shared clone started');
+    firstCaller.abort();
+    await assert.rejects(firstRun, /cancelled/);
+    assert.equal(cloneSignal.aborted, false, 'still wanted by the second caller');
+    finishClone();
+    assert.equal((await secondRun).id, 'p-mono');
+    // The last caller cancelling stops it.
+    cloneSignal = null;
+    const only = new AbortController();
+    const onlyRun = shared({ repoId: 'repo_solo', name: 'solo', signal: only.signal });
+    await waitUntil(() => cloneSignal !== null, 'the solo clone started');
+    only.abort();
+    await assert.rejects(onlyRun, /cancelled/);
+    assert.equal(cloneSignal.aborted, true);
+    finishClone();
+
+    const failing = createSourceCheckout({
+      root: () => root,
+      prepareCli: async () => {},
+      runCli: async () => ({ code: 1, json: { ok: false, error: 'No Durango Cloud repo nope is visible to this account.' } }),
+      cliError: (result, fallback) => result?.json?.error || fallback,
+      addProject: async () => ({ id: 'never' }),
+    });
+    await assert.rejects(failing({ repoId: 'nope' }), /No Durango Cloud repo nope/);
+
+    const reuse = createSourceCheckout({
+      root: () => root,
+      prepareCli: async () => assert.fail('an existing checkout needs no CLI'),
+      runCli: async () => assert.fail('no clone'),
+      addProject: async () => assert.fail('no add'),
+      existingProject: async (repoId) => (repoId === 'repo_here' ? { id: 'p-here', name: 'here', path: '/x', repoId } : null),
+    });
+    assert.equal((await reuse({ repoId: 'repo_here' })).id, 'p-here');
+  });
+
+  await test('linux password store: tiling compositors ask for the Secret Service', () => {
+    assert.equal(linuxPasswordStore({ platform: 'linux', env: { XDG_CURRENT_DESKTOP: 'Hyprland' } }), 'gnome-libsecret');
+    assert.equal(linuxPasswordStore({ platform: 'linux', env: {} }), 'gnome-libsecret');
+    assert.equal(linuxPasswordStore({ platform: 'linux', env: { XDG_CURRENT_DESKTOP: 'ubuntu:GNOME' } }), null);
+    assert.equal(linuxPasswordStore({ platform: 'linux', env: { XDG_CURRENT_DESKTOP: 'KDE' } }), null);
+    assert.equal(linuxPasswordStore({ platform: 'linux', argv: ['--password-store=basic'], env: {} }), null);
+    assert.equal(linuxPasswordStore({ platform: 'linux', env: { DURANGO_PASSWORD_STORE: 'kwallet6', XDG_CURRENT_DESKTOP: 'sway' } }), 'kwallet6');
+    assert.equal(linuxPasswordStore({ platform: 'darwin', env: {} }), null);
   });
 
   await test('API runs: labelled with the key, follow-ups say "Sent from"', () => {

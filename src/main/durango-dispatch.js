@@ -30,6 +30,30 @@ export const DISPATCH_ACCESS_MODES = ['read-only', 'workspace-write', 'full-acce
 
 /** What this build can do beyond new threads (agentDispatchPolicy.MACHINE_CAPABILITIES on Durango). */
 export const DISPATCH_CAPABILITIES = ['thread-follow-up'];
+/**
+ * Advertised as well when this machine can clone a Durango Source repository
+ * it doesn't have (main/source-checkout.js) and every project may run agents
+ * (no allowlist): Durango then sends it runs for any of the user's Source
+ * repositories, and prefers a machine that already has the project.
+ */
+export const SOURCE_CHECKOUT_CAPABILITY = 'source-checkout';
+
+/**
+ * Whether a dispatch that matched no local project may be checked out of
+ * Durango Source here. Never for API runs (an API key or the Durango MCP):
+ * cloning decrypts the repository's env files on this machine, and a key with
+ * the `code` scope must not reach every repository's vault. Chat and Tasks
+ * runs are confirmed by the user in Durango.
+ */
+export const canCheckoutDispatch = (dispatch, allowedProjectIds, checkoutAvailable) =>
+  Boolean(
+    checkoutAvailable &&
+      dispatch?.origin !== 'api' &&
+      (allowedProjectIds === null || allowedProjectIds === undefined) &&
+      !dispatch?.threadId &&
+      typeof dispatch?.project?.repoId === 'string' &&
+      dispatch.project.repoId
+  );
 
 export const DISPATCH_SUMMARY_MAX_CHARS = 2_000;
 export const DISPATCH_ERROR_MAX_CHARS = 1_000;
@@ -111,7 +135,7 @@ export const resolveDispatchProject = (dispatch, projects, allowedProjectIds = n
   if (!match) {
     return {
       ok: false,
-      error: `This Mac has no project matching "${label}". Add it to Durango Code, or start the agent on another machine.`,
+      error: `This machine has no project matching "${label}". Add it to Durango Code, or start the agent on another machine.`,
     };
   }
   if (!isProjectAllowed(match.id, allowedProjectIds)) {
@@ -144,7 +168,7 @@ export const resolveFollowUpProject = (dispatch, threadProjectId, projects, allo
 };
 
 /** `POST /api/v1/code/machines` body. Only allowlisted projects are advertised. */
-export const buildMachinePayload = ({ machineId, name, platform, projects, allowedProjectIds = null }) => ({
+export const buildMachinePayload = ({ machineId, name, platform, projects, allowedProjectIds = null, sourceCheckout = false }) => ({
   machineId,
   name: String(name ?? '').trim().slice(0, 120) || 'Mac',
   platform: String(platform ?? '').slice(0, 40) || 'unknown',
@@ -156,7 +180,10 @@ export const buildMachinePayload = ({ machineId, name, platform, projects, allow
       name: String(project.name).slice(0, 200),
       repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null,
     })),
-  capabilities: DISPATCH_CAPABILITIES,
+  capabilities:
+    sourceCheckout && (allowedProjectIds === null || allowedProjectIds === undefined)
+      ? [...DISPATCH_CAPABILITIES, SOURCE_CHECKOUT_CAPABILITY]
+      : DISPATCH_CAPABILITIES,
 });
 
 /**
@@ -231,6 +258,12 @@ export const createDispatchWorker = ({
   platform = process.platform,
   isSignedIn,
   startRun,
+  /**
+   * ({ repoId, name, signal }) → { id, name, path, repoId }: clones a Durango
+   * Source repository this machine doesn't have and adds it as a project.
+   * Null: this build can't (runs need the project here).
+   */
+  checkoutProject = null,
   getThread = async () => undefined,
   stopRun = async () => {},
   notify = () => {},
@@ -294,6 +327,7 @@ export const createDispatchWorker = ({
       platform,
       projects,
       allowedProjectIds: settings.allowedProjectIds,
+      sourceCheckout: Boolean(checkoutProject),
     });
     return { payload, signature: JSON.stringify(payload) };
   };
@@ -380,6 +414,59 @@ export const createDispatchWorker = ({
     );
   };
 
+  /**
+   * Clones the dispatch's Source repository and adds it as a project. The
+   * clone can outlast the claim lease (a monorepo), so `running` (without a
+   * thread yet) is reported as the heartbeat meanwhile. → a resolution like
+   * resolveDispatchProject's, or null when the run was cancelled from Durango.
+   */
+  const checkoutForDispatch = async (entry) => {
+    const { dispatch } = entry;
+    const wanted = dispatch.project ?? {};
+    const abort = new AbortController();
+    let cancelledFromChat = false;
+    const beat = async () => {
+      if (abort.signal.aborted) return;
+      // Turned off, paused or signed out meanwhile: stop cloning.
+      if (!shouldRun()) {
+        abort.abort();
+        return;
+      }
+      const outcome = await queueReport(entry, { status: 'running' });
+      if (outcome === 'conflict' && !abort.signal.aborted) {
+        cancelledFromChat = true;
+        abort.abort();
+      }
+    };
+    void beat();
+    const timer = setInterval(() => void beat(), heartbeatMs);
+    timer.unref?.();
+    try {
+      const project = await checkoutProject({ repoId: wanted.repoId, name: wanted.name || null, signal: abort.signal });
+      if (cancelledFromChat) {
+        entry.settled = true;
+        release(entry);
+        return null;
+      }
+      if (!project?.id) return { ok: false, error: `Durango Code could not add the ${wanted.name || 'Source'} checkout as a project.` };
+      // The project is on this machine from now on: advertise it like any other.
+      if (!projects.some((candidate) => candidate.id === project.id)) projects = [...projects, project];
+      void register().catch(() => {});
+      return { ok: true, project };
+    } catch (error) {
+      if (cancelledFromChat) {
+        entry.settled = true;
+        release(entry);
+        return null;
+      }
+      const reason = truncateText(error?.message ?? String(error), DISPATCH_ERROR_MAX_CHARS - 120);
+      return { ok: false, error: `Could not check out ${wanted.name || wanted.repoId} from Durango Source: ${reason}` };
+    } finally {
+      clearInterval(timer);
+      abort.abort();
+    }
+  };
+
   const handleDispatch = async (dispatch) => {
     const entry = {
       dispatch,
@@ -406,7 +493,7 @@ export const createDispatchWorker = ({
       }
       const followUpThreadId = dispatch.threadId || null;
       const followUpThread = followUpThreadId ? await getThread(followUpThreadId).catch(() => undefined) : null;
-      const resolved = followUpThreadId
+      let resolved = followUpThreadId
         ? resolveFollowUpProject(
             dispatch,
             followUpThread ? (followUpThread.projectId ?? null) : undefined,
@@ -414,6 +501,19 @@ export const createDispatchWorker = ({
             settings.allowedProjectIds
           )
         : resolveDispatchProject(dispatch, projects, settings.allowedProjectIds);
+      if (!resolved.ok && canCheckoutDispatch(dispatch, settings.allowedProjectIds, Boolean(checkoutProject))) {
+        resolved = await checkoutForDispatch(entry);
+        if (resolved === null) return;
+        // The clone can take minutes: dispatch may have been turned off, an
+        // allowlist set, or the account signed out meanwhile. Start nothing then.
+        if (
+          resolved.ok &&
+          (!shouldRun() || !(await isSignedIn()) || !canCheckoutDispatch(dispatch, settings.allowedProjectIds, true))
+        ) {
+          await fail(entry, 'Durango dispatch was turned off or restricted on this machine while the repository was being cloned. Nothing ran.');
+          return;
+        }
+      }
       if (!resolved.ok) {
         await fail(entry, resolved.error);
         return;

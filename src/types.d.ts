@@ -410,7 +410,14 @@ export type RemoteCommandRequest = {
   /** Main-process startup deadline, checked around renderer-side preparation. */
   expiresAt: number;
   command: {
-    kind: 'runTurn' | 'stopTurn';
+    /**
+     * addProject: add `projectPath` (a Durango Source checkout main just
+     * cloned, main/source-checkout.js) as a project named `projectName`, or
+     * find the project that already has that path; reports `projectId`.
+     */
+    kind: 'runTurn' | 'stopTurn' | 'addProject';
+    projectPath?: string;
+    projectName?: string;
     prompt?: string;
     threadId?: string;
     projectId?: string;
@@ -1793,6 +1800,15 @@ type OrionCodexBrowserIntegrationStatus = {
         machineId: string;
         threadId: string;
       }) => Promise<{ ok: boolean; thread?: import('./store').ThreadRecord; error?: string }>;
+      /**
+       * Ask a paired host to clone a Durango Source repository it doesn't have
+       * (and add it as a project) before a remoteRunTurn in it.
+       */
+      remoteCheckoutSource?: (input: {
+        machineId: string;
+        repoId: string;
+        name?: string;
+      }) => Promise<{ ok: boolean; projectId?: string; error?: string }>;
       remoteRunTurn?: (input: {
         machineId: string;
         threadId?: string;

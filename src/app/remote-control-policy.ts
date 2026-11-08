@@ -228,6 +228,8 @@ export type RemoteCommandOutcome = {
   threadId?: string;
   /** Durango Chat dispatch: the new thread's title, reported with `running`. */
   threadTitle?: string;
+  /** addProject: the project that holds the path. */
+  projectId?: string;
   error?: string;
 };
 

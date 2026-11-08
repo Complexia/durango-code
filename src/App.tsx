@@ -7668,7 +7668,7 @@ const App: React.FC = () => {
       command: RemoteCommandRequest['command'],
       canPrepare: () => boolean,
       claimStart: () => Promise<boolean>
-    ) => Promise<{ ok: boolean; threadId?: string; threadTitle?: string; error?: string }>
+    ) => Promise<{ ok: boolean; threadId?: string; threadTitle?: string; projectId?: string; error?: string }>
   >(async () => ({ ok: false, error: 'Remote commands are unavailable.' }));
   useLayoutEffect(() => {
     remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
@@ -7979,6 +7979,28 @@ const App: React.FC = () => {
             }
           : { ok: false, ...(createdThread ? {} : { threadId }), error: result.error };
       }
+      if (command.kind === 'addProject') {
+        // A Durango Source checkout main cloned for a run from Durango or a
+        // paired machine. Added like a folder the user picked, except that it
+        // doesn't take over the sidebar selection or open a thread.
+        const projectPath = command.projectPath ?? '';
+        if (!projectPath) return { ok: false, error: 'Missing project path.' };
+        const existing = state.projects.find(
+          (project) => normalizeRepositoryPath(project.path) === normalizeRepositoryPath(projectPath)
+        );
+        if (existing) return { ok: true, projectId: existing.id };
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'Adding the project expired or was cancelled.' };
+        }
+        const before = useOrionStore.getState();
+        const name = command.projectName?.trim() || (await window.orion?.basename(projectPath)) || projectPath;
+        const projectId = before.addProject({ name, path: projectPath });
+        useOrionStore.setState({
+          selectedProjectId: before.selectedProjectId,
+          ...(before.workspacePath ? { workspacePath: before.workspacePath } : {}),
+        });
+        return { ok: true, projectId };
+      }
       if (command.kind === 'stopTurn') {
         const threadId = command.threadId ?? '';
         if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
@@ -8017,7 +8039,7 @@ const App: React.FC = () => {
     if (!window.orion?.onRemoteCommandRequest) return undefined;
     const unsubscribe = window.orion.onRemoteCommandRequest((request) => {
       void (async () => {
-        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; error?: string };
+        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; projectId?: string; error?: string };
         const canPrepare = () => Date.now() < request.expiresAt;
         let claimPromise: Promise<boolean> | null = null;
         const claimStart = () => {

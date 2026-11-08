@@ -48,6 +48,8 @@ const PAIRING_MAX_ATTEMPTS = 5;
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const RUN_TURN_TIMEOUT_MS = 120_000;
+/** A Durango Source clone on the host (checkoutSource). */
+const SOURCE_CHECKOUT_TIMEOUT_MS = 65 * 60_000;
 const CLIENT_RESPONSE_GRACE_MS = 10_000;
 const WORKSPACE_EVENT_DEBOUNCE_MS = 1500;
 // Failed-handshake rate limit per remote IP (brute-force backstop; the real
@@ -1533,6 +1535,7 @@ export const resolveRemoteCommand = (payload) => {
   settlePendingRendererCommand(payload.commandId, pending, {
     ok: payload?.ok === true,
     threadId: typeof payload?.threadId === 'string' ? payload.threadId : undefined,
+    projectId: typeof payload?.projectId === 'string' ? payload.projectId : undefined,
     error: typeof payload?.error === 'string' ? payload.error : undefined,
   });
   return { ok: true };
@@ -1797,6 +1800,24 @@ const handleHostRequest = async (session, message) => {
           acknowledgeClaim
         );
         respond(result);
+        return;
+      }
+      case 'checkoutSource': {
+        // The controller wants to run in a Durango Source repository this
+        // machine may not have: clone it (main/source-checkout.js), add it as
+        // a project, and answer its project id for a following runTurn.
+        if (typeof deps?.checkoutSourceProject !== 'function') {
+          respond({ ok: false, error: 'This machine cannot check out Durango Source repositories. Update Durango Code on it.' });
+          return;
+        }
+        const repoId = typeof message?.repoId === 'string' ? message.repoId : '';
+        const name = typeof message?.name === 'string' ? message.name.slice(0, 200) : null;
+        try {
+          const project = await deps.checkoutSourceProject({ repoId, name });
+          respond({ ok: true, projectId: project.id, projectName: project.name, path: project.path });
+        } catch (error) {
+          respond({ ok: false, error: error?.message ?? String(error) });
+        }
         return;
       }
       case 'stopTurn': {
@@ -2660,6 +2681,26 @@ export const runRemoteTurn = async ({
       threadId: typeof response.threadId === 'string' ? response.threadId : undefined,
       error: response.ok ? undefined : (response.error ?? 'The remote turn could not start.'),
     };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/**
+ * Asks a paired host to clone a Durango Source repository it doesn't have and
+ * add it as a project (an existing checkout is reused) → { ok, projectId }.
+ * The clone can take a while (a monorepo), hence the long timeout.
+ */
+export const checkoutRemoteSource = async ({ machineId, repoId, name } = {}) => {
+  try {
+    const response = await clientRequest(
+      String(machineId ?? ''),
+      { t: 'checkoutSource', repoId: String(repoId ?? ''), ...(name ? { name: String(name).slice(0, 200) } : {}) },
+      SOURCE_CHECKOUT_TIMEOUT_MS
+    );
+    return response.ok
+      ? { ok: true, projectId: typeof response.projectId === 'string' ? response.projectId : undefined }
+      : { ok: false, error: response.error ?? 'The host could not check out the repository.' };
   } catch (error) {
     return clientErrorResult(error);
   }

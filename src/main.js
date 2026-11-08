@@ -1,6 +1,7 @@
 // Must stay the first import: pins the internal app name and legacy userData
 // path before any other module evaluates (see docs/durango-rebrand.md).
 import './main/pin-app-identity.js';
+import './main/linux-password-store.js';
 // Then: a legacy /Applications/Orion.app renames itself to Durango Code.app
 // and relaunches (Dock/Finder show the bundle file name).
 import './main/rename-legacy-bundle-on-start.js';
@@ -133,6 +134,7 @@ import {
   resolveRemoteCommand,
   revokeRemoteDevice,
   runRemoteTurn,
+  checkoutRemoteSource,
   shutdownRemoteControl,
   startRemotePairing,
   stopRemoteTurn,
@@ -150,6 +152,7 @@ import {
 import { codexSubagentTitle, createSubagentTracker, cursorAgentTranscriptFile, handleCodexRolloutLine, handleCursorSubagentLine, watchCodexSubagentSpawns } from './main/subagent-trackers.js';
 import { createGrokAcpDriver, grokStatsFromPromptMeta, grokSubagentUpdatesFile, handleGrokSubagentLine } from './main/grok-driver.js';
 import { bundledCliBinDir, bundledCliEntry, bundledCliError, bundledCliVersion, ensureCliSignedIn, installBundledCliShims, readCliCredential, runBundledCli } from './main/bundled-cli.js';
+import { cliSupportsClone, createSourceCheckout } from './main/source-checkout.js';
 import { installGitCredentialHelper } from './main/git-credential-helper.js';
 import { disposeSnapShot, registerSnapShotIpc, startSnapShot } from './main/snapshot.js';
 import {
@@ -1233,6 +1236,8 @@ app.whenReady().then(async () => {
     listAgentModels: () => listAgentModelsWithAvailability(),
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
     dispatchRendererCommand: (payload) => dispatchRemoteCommand(payload),
+    // Paired machines may ask this one to clone a Source repository it lacks.
+    ...(sourceCheckoutAvailable() ? { checkoutSourceProject: (input) => checkoutSourceProject(input) } : {}),
     createRemotePairingProof,
     verifyRemotePairingProof,
     registerRelayDevice,
@@ -1820,6 +1825,7 @@ ipcMain.handle('remote:disconnectMachine', afterRemoteControlInit((_event, input
 ipcMain.handle('remote:fetchSnapshot', afterRemoteControlInit((_event, input) => fetchRemoteSnapshot(input)));
 ipcMain.handle('remote:fetchThread', afterRemoteControlInit((_event, input) => fetchRemoteThread(input)));
 ipcMain.handle('remote:runTurn', afterRemoteControlInit((_event, input) => runRemoteTurn(input)));
+ipcMain.handle('remote:checkoutSource', afterRemoteControlInit((_event, input) => checkoutRemoteSource(input)));
 ipcMain.handle('remote:stopTurn', afterRemoteControlInit((_event, input) => stopRemoteTurn(input)));
 // Registered only after the renderer has installed onRemoteCommandRequest.
 // did-start-loading/destroyed clear this authority until the next mount.
@@ -3886,6 +3892,7 @@ const resolveDispatchRendererCommand = (payload) => ({
     ok: payload?.ok === true,
     threadId: typeof payload?.threadId === 'string' ? payload.threadId : undefined,
     threadTitle: typeof payload?.threadTitle === 'string' ? payload.threadTitle : undefined,
+    projectId: typeof payload?.projectId === 'string' ? payload.projectId : undefined,
     error: typeof payload?.error === 'string' ? payload.error : undefined,
   }),
 });
@@ -3952,6 +3959,44 @@ const isDispatchSignedIn = async () => {
   return Boolean(session?.token) && !(session.expiresAt && Date.parse(session.expiresAt) <= Date.now());
 };
 
+// Projects as the renderer last reported them (durango:configure), for
+// finding an existing checkout of a Source repository before cloning it.
+let configuredProjects = [];
+
+const existingSourceProject = async (repoId) =>
+  (await dispatchProjectsWithRepoIds(configuredProjects)).find(
+    (project) => project.repoId === repoId && project.path && existsSync(project.path)
+  ) ?? null;
+
+// Clones a Durango Source repository this machine doesn't have and adds it as
+// a project (main/source-checkout.js), for runs started from Durango or a
+// paired machine. Only with a bundled CLI that has `clone`.
+const checkoutSourceProject = createSourceCheckout({
+  runCli: runBundledCli,
+  cliError: bundledCliError,
+  prepareCli: async () => {
+    await installBundledCli();
+    const signIn = await signInBundledCli();
+    if (!signIn.signedIn && !(await readCliCredential().catch(() => null))) {
+      throw new Error(signIn.error || 'Sign in to Durango Code to clone from Durango Source.');
+    }
+  },
+  existingProject: existingSourceProject,
+  addProject: async ({ name, path: projectPath }) => {
+    const result = await requestDispatchRendererCommand(
+      {
+        kind: 'addProject',
+        projectName: name,
+        projectPath,
+        source: { machineId: 'durango-source', machineName: 'Durango Source' },
+      },
+      60_000
+    );
+    return result?.ok && result.projectId ? { id: result.projectId } : { error: result?.error };
+  },
+});
+const sourceCheckoutAvailable = () => Boolean(bundledCliEntry()) && cliSupportsClone(bundledCliVersion());
+
 const dispatchWorker = createDispatchWorker({
   client: durangoClient,
   getMachineId: () => getDurangoDeviceId(),
@@ -3960,6 +4005,7 @@ const dispatchWorker = createDispatchWorker({
   isSignedIn: isDispatchSignedIn,
   isOnline: () => net.isOnline(),
   canStart: () => Boolean(remoteCommandRenderer && !remoteCommandRenderer.isDestroyed()),
+  checkoutProject: sourceCheckoutAvailable() ? checkoutSourceProject : null,
   getThread: async (threadId) => {
     const thread = await readThreadById(threadId);
     if (!thread) return undefined;
@@ -4056,6 +4102,7 @@ const configureDurango = async (input) => {
   const seq = ++dispatchConfigureSeq;
   if (typeof input?.useDurangoTasks === 'boolean') useDurangoTasksSetting = input.useDurangoTasks;
   const settings = normalizeDispatchSettings(input?.dispatch);
+  configuredProjects = Array.isArray(input?.projects) ? input.projects : [];
   // The deploy watcher reads each project's link and durango.toml itself,
   // and only while it is on.
   const deploySettings = normalizeDeployWatcherSettings(input?.deployWatcher);

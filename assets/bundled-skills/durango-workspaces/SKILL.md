@@ -39,6 +39,9 @@ cd "$(durango-code ws path fix-sidebar-dots)"
   `land` there update that same change.
 - Durango Code puts `durango-code` (alias `ds`) on your `PATH`; don't install
   it.
+- No checkout of the repository on this machine yet: `durango-code clone <repo>`
+  clones it from Durango Source with its development env files, then start the
+  workspace from that clone.
 
 ## Run things
 
@@ -50,7 +53,9 @@ cd "$(durango-code ws path fix-sidebar-dots)"
 - Commands that finish (tests, typecheck, lint, builds) don't need a slot:
   `durango-code ws run <name> -- <cmd>`, or run them in the workspace directory.
 - Secrets come from the vault, never from committed files:
-  `durango-code run -- <cmd>` injects development values.
+  `durango-code run -- <cmd>` injects development values, and
+  `durango-code env files pull` restores the repository's local env files
+  (`.env.local`, `.dev.vars`) from the vault if they are missing.
 
 ## Finish: open a change, don't land it
 
