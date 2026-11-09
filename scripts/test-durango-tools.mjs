@@ -36,7 +36,7 @@ import {
   isPreapprovedOrionTool,
   isRequiredThreadReaderBridgeMissing,
 } from '../src/main/thread-reader-routing.js';
-import { createOrionMcpServer } from '../src/main/claude-driver.js';
+import { claudeSecretRefHooks, createOrionMcpServer } from '../src/main/claude-driver.js';
 import {
   USER_ACTION_TOOL_DESCRIPTIONS,
   USER_ACTION_TOOL_INPUT_SCHEMAS,
@@ -47,6 +47,20 @@ import {
   unwatchUserActions,
   watchUserAction,
 } from '../src/main/user-actions.js';
+import {
+  SECRET_REDACTED,
+  SECRET_TOOL_DESCRIPTIONS,
+  SECRET_TOOL_INPUT_SCHEMAS,
+  SECRET_TOOL_NAMES,
+  answerSecretRequest,
+  cancelSecretRequests,
+  listPendingSecretRequests,
+  redactSecrets,
+  resolveSecretRefs,
+  runSecretTool,
+  setSecretsDirForTests,
+  sweepExpiredSecretFiles,
+} from '../src/main/secret-requests.js';
 import { handleMcpBridgeConnection, mcpBridgeSessions, pendingSubagentSpawns } from '../src/main/mcp-bridge.js';
 import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOL_NAMES } from '../src/main/device-tools.js';
 import { ORION_DEVICE_TOOL_NAMES } from '../src/main/thread-reader-routing.js';
@@ -286,6 +300,10 @@ try {
     assert.ok(ORION_BUILTIN_TOOL_NAMES.includes(name));
     assert.equal(isPreapprovedOrionTool(name, 'read-only'), true, `${name} in read-only`);
   }
+  for (const name of SECRET_TOOL_NAMES) {
+    assert.ok(ORION_BUILTIN_TOOL_NAMES.includes(name));
+    assert.equal(isPreapprovedOrionTool(name, 'read-only'), true, `${name} in read-only`);
+  }
   for (const name of VISUAL_TOOL_NAMES) {
     assert.ok(ORION_BUILTIN_TOOL_NAMES.includes(name));
     for (const mode of ['read-only', 'workspace-write', 'full-access']) {
@@ -333,6 +351,19 @@ try {
     assert.equal(entry.description, USER_ACTION_TOOL_DESCRIPTIONS[name]);
     assert.deepEqual(Object.keys(entry.schema).sort(), Object.keys(USER_ACTION_TOOL_INPUT_SCHEMAS[name].properties).sort());
   }
+  for (const name of SECRET_TOOL_NAMES) {
+    const entry = registered.find((candidate) => candidate.name === name);
+    assert.ok(entry, `Claude registers ${name}`);
+    assert.equal(entry.description, SECRET_TOOL_DESCRIPTIONS[name]);
+    assert.deepEqual(Object.keys(entry.schema).sort(), Object.keys(SECRET_TOOL_INPUT_SCHEMAS[name].properties).sort());
+    for (const [key, property] of Object.entries(SECRET_TOOL_INPUT_SCHEMAS[name].properties)) {
+      assert.equal(entry.schema[key].description, property.description, `${name}.${key} description`);
+    }
+    assert.equal(entry.extra?.alwaysLoad, true, `${name} is never deferred behind tool search`);
+  }
+  const claudeSecret = await registered.find((entry) => entry.name === 'request_secret').handler({ label: 'Token', reason: 'For the deploy.' });
+  assert.equal(claudeSecret.isError, true, 'no window: the agent is told what to do without the card');
+  assert.match(claudeSecret.content[0].text, /do not ask for it in chat/);
   const claudeAction = await registered.find((entry) => entry.name === 'request_user_action').handler({ action: 'Log in' });
   assert.equal(claudeAction.isError, true, 'no window: the agent is told to ask in its reply');
   assert.match(claudeAction.content[0].text, /Ask in your reply/);
@@ -573,6 +604,209 @@ try {
   unwatchUserActions({ threadId: 'thread-2', id: 'ua_other' });
   assert.equal(isWatchingUserAction('ua_other'), false);
 
+  // --- Secret requests: private card, owner-only file, scrubbed events -----------------------
+  const secretsDir = path.join(testRoot, 'secrets');
+  setSecretsDirForTests(secretsDir);
+  sent.length = 0;
+  const owner = {};
+  const ask = (args, extra = {}) =>
+    runSecretTool('request_secret', { label: 'Cloudflare API token', reason: 'To deploy the test stack.', ...args }, {
+      getSender: () => fakeSender,
+      threadId: 'thread-1',
+      owner,
+      ...extra,
+    });
+  const lastSecretPayload = () => sent.filter((entry) => entry.payload.type === 'request').at(-1).payload;
+
+  const saving = ask({ url: 'https://dash.cloudflare.com/profile/api-tokens', placeholder: 'cf_…' });
+  await waitFor(() => sent.length > 0, 'the card is shown');
+  const card = lastSecretPayload();
+  assert.equal(sent[0].channel, 'agent:userAction');
+  assert.match(card.id, /^sr_/);
+  assert.equal(card.action, 'Cloudflare API token');
+  assert.equal(card.url, 'https://dash.cloudflare.com/profile/api-tokens');
+  assert.equal(card.secret.reason, 'To deploy the test stack.');
+  assert.equal(card.secret.placeholder, 'cf_…');
+  assert.ok(Date.parse(card.secret.expiresAt) > Date.now());
+  assert.deepEqual(listPendingSecretRequests(), [{ id: card.id, threadId: 'thread-1' }]);
+  assert.deepEqual(
+    await answerSecretRequest({ threadId: 'thread-2', id: card.id, answer: { type: 'save', value: 'x' } }),
+    { ok: false, ended: true, error: 'This request has ended: the agent that asked stopped or stopped waiting.' },
+    "another thread can't answer it"
+  );
+  assert.deepEqual(await answerSecretRequest({ threadId: 'thread-1', id: card.id, answer: { type: 'save', value: '  ' } }), {
+    ok: false,
+    error: 'Enter a value, or decline.',
+  });
+  const value = 'cf-FAKE-token-0123456789';
+  assert.deepEqual(await answerSecretRequest({ threadId: 'thread-1', id: card.id, answer: { type: 'save', value: `${value}\n` } }), { ok: true });
+  const saved = await saving;
+  assert.equal(saved.ok, true);
+  assert.equal(saved.text.includes(value), false, 'the agent never sees the value');
+  const file = /to (\S+) \(owner-only/.exec(saved.text)?.[1];
+  assert.ok(file?.startsWith(secretsDir), saved.text);
+  assert.equal(await fs.readFile(file, 'utf8'), value, 'the trailing newline of a paste is dropped');
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    assert.equal((await fs.stat(secretsDir)).mode & 0o777, 0o700);
+  }
+  assert.deepEqual(sent.at(-1).payload, { type: 'resolve', threadId: 'thread-1', id: card.id, source: 'secret' }, 'the card clears');
+  assert.deepEqual(listPendingSecretRequests(), []);
+  const late = await answerSecretRequest({ threadId: 'thread-1', id: card.id, answer: { type: 'decline' } });
+  assert.equal(late.ended, true, 'an answered request takes no second answer');
+
+  // Agent events reaching the renderer are scrubbed of the value.
+  const event = { type: 'activity', activity: { title: 'Command', output: `token=${value}\nok`, n: 3 }, list: [value, 'x'] };
+  const scrubbed = redactSecrets(event);
+  assert.equal(scrubbed.activity.output, `token=${SECRET_REDACTED}\nok`);
+  assert.deepEqual(scrubbed.list, [SECRET_REDACTED, 'x']);
+  assert.equal(scrubbed.activity.n, 3);
+  assert.equal(event.activity.output.includes(value), true, 'the original event is not mutated');
+  assert.equal(
+    redactSecrets({ out: JSON.stringify({ v: `a"${value}\\` }) }).out.includes(value),
+    false,
+    'a JSON-escaped occurrence is scrubbed too'
+  );
+  const clean = { type: 'delta', text: 'nothing secret' };
+  assert.equal(redactSecrets(clean), clean, 'an event without a secret is passed through as is');
+
+  // Decline, cancel (run ended), abort (Stop) and the no-card `value`.
+  const declining = ask({});
+  await waitFor(() => listPendingSecretRequests().length === 1, 'second card');
+  await answerSecretRequest({ threadId: 'thread-1', id: lastSecretPayload().id, answer: { type: 'decline' } });
+  const declined = await declining;
+  assert.equal(declined.ok, true);
+  assert.match(declined.text, /^Not saved \(declined\)\. .*Do not ask for it again/);
+
+  const cancelling = ask({});
+  await waitFor(() => listPendingSecretRequests().length === 1, 'third card');
+  assert.equal(cancelSecretRequests({ owner: {} }), 0, "another run's release leaves it alone");
+  assert.equal(cancelSecretRequests({ owner }), 1);
+  assert.match((await cancelling).text, /^Not saved \(cancelled\)/);
+
+  const aborter = new AbortController();
+  const aborting = ask({}, { signal: aborter.signal });
+  await waitFor(() => listPendingSecretRequests().length === 1, 'fourth card');
+  aborter.abort();
+  assert.match((await aborting).text, /^Not saved \(cancelled\)/);
+  assert.deepEqual(listPendingSecretRequests(), []);
+
+  for (const bad of [{ label: ' ' }, { url: 'file:///etc/passwd' }, { timeout_seconds: 5 }, { value: ' ' }]) {
+    const sentBefore = sent.length;
+    const rejected = await ask(bad);
+    assert.equal(rejected.ok, false, JSON.stringify(bad));
+    assert.equal(sent.length, sentBefore, 'a rejected request shows no card');
+  }
+  const sentBeforePaste = sent.length;
+  const pasted = await ask({ value: '482916' });
+  assert.equal(pasted.ok, true);
+  assert.equal(sent.length, sentBeforePaste, 'a pasted value is saved without a card');
+  const pastedFile = /to (\S+) \(owner-only/.exec(pasted.text)?.[1];
+  assert.equal(await fs.readFile(pastedFile, 'utf8'), '482916');
+
+  // Ref delivery: the value stays in memory; tools that take secrets swap the ref.
+  const filesBeforeRef = (await fs.readdir(secretsDir)).length;
+  const refRequest = ask({ delivery: 'ref' });
+  await waitFor(() => listPendingSecretRequests().length === 1, 'ref card');
+  const refCard = lastSecretPayload();
+  assert.equal(refCard.secret.delivery, 'ref', 'the card says where the value goes');
+  const refValue = 'pw-FAKE-"quoted"\\-42';
+  await answerSecretRequest({ threadId: 'thread-1', id: refCard.id, answer: { type: 'save', value: refValue } });
+  const refSaved = await refRequest;
+  const ref = /secret ref (dsr_[0-9a-f]{32})/.exec(refSaved.text)?.[1];
+  assert.ok(ref, refSaved.text);
+  assert.equal(refSaved.text.includes(refValue), false);
+  assert.equal((await fs.readdir(secretsDir)).length, filesBeforeRef, 'a ref writes no file');
+  assert.deepEqual(resolveSecretRefs({ a: 1, b: ['plain'] }, { threadId: 'thread-1' }), { ok: true, value: { a: 1, b: ['plain'] }, used: 0, values: [] });
+  const swapped = resolveSecretRefs({ headers: { Authorization: `Bearer ${ref}` }, n: 2 }, { threadId: 'thread-1' });
+  assert.deepEqual(swapped, { ok: true, value: { headers: { Authorization: `Bearer ${refValue}` }, n: 2 }, used: 1, values: [refValue] });
+  const asLiteral = resolveSecretRefs({ expression: `el.value = ${ref}` }, { threadId: 'thread-1', encode: JSON.stringify });
+  assert.equal(asLiteral.value.expression, `el.value = ${JSON.stringify(refValue)}`, 'browser_evaluate gets a string literal');
+  assert.equal(resolveSecretRefs({ a: ref }, { threadId: 'thread-2' }).ok, false, "another thread can't use it");
+  const unknownRef = resolveSecretRefs({ a: `dsr_${'0'.repeat(32)}` }, { threadId: 'thread-1' });
+  assert.equal(unknownRef.ok, false);
+  assert.match(unknownRef.text, /unknown, expired or from another thread/);
+  assert.equal(redactSecrets({ out: `got ${refValue}` }).out, `got ${SECRET_REDACTED}`, 'ref values are scrubbed too');
+  assert.equal(
+    redactSecrets({ out: JSON.stringify({ value: refValue }) }).out,
+    JSON.stringify({ value: SECRET_REDACTED }),
+    'escaped quotes and backslashes do not hide a value'
+  );
+  const shortSaved = await ask({ value: '42', delivery: 'ref' });
+  const shortRef = /secret ref (dsr_[0-9a-f]{32})/.exec(shortSaved.text)[1];
+  assert.equal(redactSecrets({ out: 'answer 42' }).out, 'answer 42', 'short values are not scrubbed everywhere');
+  const shortResolved = resolveSecretRefs({ pin: shortRef }, { threadId: 'thread-1' });
+  assert.deepEqual(shortResolved.values, ['42']);
+  assert.equal(redactSecrets({ out: 'answer 42' }, { alsoValues: shortResolved.values }).out, `answer ${SECRET_REDACTED}`, 'but are in the call that used them');
+  assert.equal((await ask({ delivery: 'env' })).ok, false, 'unknown delivery');
+  const pastedRef = await ask({ value: 'tok_pasted_123', delivery: 'ref' });
+  assert.match(pastedRef.text, /secret ref dsr_[0-9a-f]{32}/);
+
+  // A connected app's tool on the bridge gets the value; its reply is scrubbed.
+  const appCalls = [];
+  const appSocket = new EventEmitter();
+  const appWritten = [];
+  appSocket.write = (data) => appWritten.push(JSON.parse(data));
+  mcpBridgeSessions.set('tok-app', {
+    getSender: () => null,
+    threadId: 'thread-1',
+    accessMode: 'full-access',
+    onDemandMcps: {
+      names: () => ['vault'],
+      call: async (callArgs) => (appCalls.push(callArgs), { ok: true, text: `stored ${callArgs.arguments.token}` }),
+    },
+  });
+  handleMcpBridgeConnection(appSocket);
+  appSocket.emit(
+    'data',
+    Buffer.from(
+      `${JSON.stringify({ id: 1, token: 'tok-app', tool: 'call_app_tool', args: { app: 'vault', tool: 'put', arguments: { token: ref } } })}\n` +
+        `${JSON.stringify({ id: 2, token: 'tok-app', tool: 'call_app_tool', args: { app: 'vault', tool: 'put', arguments: { token: `dsr_${'1'.repeat(32)}` } } })}\n` +
+        `${JSON.stringify({ id: 3, token: 'tok-app', tool: 'call_app_tool', args: { app: 'vault', tool: 'put', arguments: { token: shortRef } } })}\n`
+    )
+  );
+  await waitFor(() => appWritten.length === 3, 'every app call replies');
+  assert.equal(appCalls.length, 2, 'an unknown ref never reaches the app');
+  assert.equal(appWritten.find((entry) => entry.id === 3).text, `stored ${SECRET_REDACTED}`, 'a short secret is scrubbed from the call that used it');
+  assert.equal(appCalls[0].arguments.token, refValue);
+  const appReply = appWritten.find((entry) => entry.id === 1);
+  assert.equal(appReply.text, `stored ${SECRET_REDACTED}`);
+  assert.equal(appWritten.find((entry) => entry.id === 2).ok, false);
+  mcpBridgeSessions.delete('tok-app');
+
+  // Claude: other MCP servers' tools get the value through hooks.
+  const hooks = claudeSecretRefHooks({ threadId: 'thread-1' });
+  const pre = hooks.PreToolUse[0].hooks[0];
+  const post = hooks.PostToolUse[0].hooks[0];
+  const preApp = await pre({ tool_name: 'mcp__vault__put', tool_input: { token: ref } });
+  assert.deepEqual(preApp.hookSpecificOutput, { hookEventName: 'PreToolUse', updatedInput: { token: refValue } });
+  assert.deepEqual(await pre({ tool_name: 'mcp__vault__put', tool_input: { token: 'x' } }), { continue: true });
+  assert.deepEqual(await pre({ tool_name: 'mcp__orion__remember', tool_input: { fact: ref } }), { continue: true }, 'orion tools resolve refs themselves, or not at all');
+  const preDenied = await pre({ tool_name: 'mcp__vault__put', tool_input: { token: `dsr_${'2'.repeat(32)}` } });
+  assert.equal(preDenied.hookSpecificOutput.permissionDecision, 'deny');
+  assert.equal(hooks.PostToolUse[0].matcher, undefined, 'every tool output is checked');
+  const postApp = await post({ tool_name: 'mcp__vault__put', tool_response: [{ type: 'text', text: `ok ${refValue}` }] });
+  assert.deepEqual(postApp.hookSpecificOutput.updatedMCPToolOutput, [{ type: 'text', text: `ok ${SECRET_REDACTED}` }]);
+  assert.deepEqual(await post({ tool_name: 'mcp__vault__put', tool_response: [{ type: 'text', text: 'ok' }] }), { continue: true });
+  const postBash = await post({ tool_name: 'Bash', tool_response: { stdout: `Authorization: Bearer ${value}`, stderr: '', interrupted: false } });
+  assert.deepEqual(postBash.hookSpecificOutput, {
+    hookEventName: 'PostToolUse',
+    updatedToolOutput: { stdout: `Authorization: Bearer ${SECRET_REDACTED}`, stderr: '', interrupted: false },
+  }, 'a command printing a secret from its file is scrubbed before the model reads it');
+  assert.deepEqual(await post({ tool_name: 'mcp__orion__read_thread', tool_response: [{ type: 'text', text: value }] }), { continue: true }, 'orion tools scrub their own results');
+  await pre({ tool_name: 'mcp__vault__put', tool_use_id: 'call-short', tool_input: { pin: shortRef } });
+  const postShort = await post({ tool_name: 'mcp__vault__put', tool_use_id: 'call-short', tool_response: [{ type: 'text', text: 'pin 42 ok' }] });
+  assert.deepEqual(postShort.hookSpecificOutput.updatedMCPToolOutput, [{ type: 'text', text: `pin ${SECRET_REDACTED} ok` }], 'the short secret a call was handed is scrubbed from its output');
+  assert.deepEqual(await post({ tool_name: 'mcp__vault__put', tool_use_id: 'call-short', tool_response: [{ type: 'text', text: 'pin 42 ok' }] }), { continue: true }, 'only for that call');
+
+  // Files expire after 24 hours, swept hourly while the app runs.
+  assert.match(String(await import('../src/main/secret-requests.js').then((m) => m.startSecretFileSweeps)), /setInterval/);
+  const old = new Date(Date.now() - 25 * 60 * 60_000);
+  await fs.utimes(file, old, old);
+  assert.equal(await sweepExpiredSecretFiles(), 1);
+  await assert.rejects(fs.stat(file));
+  await fs.stat(pastedFile);
+
   // --- Bridge shim advertises identical tools and forwards calls ------------------------------
   const shimPath = path.join(testRoot, 'shim.cjs');
   await fs.writeFile(shimPath, shimSource);
@@ -619,6 +853,12 @@ try {
       assert.equal(tool.description, USER_ACTION_TOOL_DESCRIPTIONS[name], `${name} description matches user-actions.js`);
       assert.deepEqual(tool.inputSchema, USER_ACTION_TOOL_INPUT_SCHEMAS[name], `${name} schema matches user-actions.js`);
     }
+    for (const name of SECRET_TOOL_NAMES) {
+      const tool = shimTools.find((candidate) => candidate.name === name);
+      assert.ok(tool, `shim lists ${name}`);
+      assert.equal(tool.description, SECRET_TOOL_DESCRIPTIONS[name], `${name} description matches secret-requests.js`);
+      assert.deepEqual(tool.inputSchema, SECRET_TOOL_INPUT_SCHEMAS[name], `${name} schema matches secret-requests.js`);
+    }
     for (const name of VISUAL_TOOL_NAMES) {
       const tool = shimTools.find((candidate) => candidate.name === name);
       assert.ok(tool, `shim lists ${name}`);
@@ -632,6 +872,9 @@ try {
     const shimAction = await call('tools/call', { name: 'request_user_action', arguments: { action: 'Log in' } });
     assert.equal(shimAction.result.isError, true, 'the bridge routes user actions (no window here)');
     assert.match(shimAction.result.content[0].text, /Ask in your reply/);
+    const shimSecret = await call('tools/call', { name: 'request_secret', arguments: { label: 'Token', reason: 'Deploy.' } });
+    assert.equal(shimSecret.result.isError, true, 'the bridge routes request_secret (no window here)');
+    assert.match(shimSecret.result.content[0].text, /do not ask for it in chat/);
     const search = await call('tools/call', { name: 'search_chats', arguments: { query: 'onboarding' } });
     assert.equal(search.result.isError, false);
     assert.match(search.result.content[0].text, /Onboarding copy ideas/);

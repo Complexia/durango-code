@@ -1701,8 +1701,9 @@ type OrionCodexBrowserIntegrationStatus = {
                 check?: string;
                 cwd?: string;
                 autoWatch?: boolean;
+                secret?: import('./store').UserActionSecret;
               }
-            | { type: 'resolve'; threadId: string; id?: string }
+            | { type: 'resolve'; threadId: string; id?: string; source?: 'secret' }
             | { type: 'detected' | 'watch-stopped'; threadId: string; id: string }
             | { type: 'undelivered'; threadId: string; texts: string[] }
         ) => void
@@ -1716,6 +1717,12 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => Promise<boolean>;
       watchUserAction?: (input: { threadId: string; id: string; check: string; cwd?: string }) => Promise<boolean>;
       unwatchUserAction?: (input: { threadId: string; id: string }) => Promise<boolean>;
+      answerSecretRequest?: (input: {
+        threadId: string;
+        id: string;
+        answer: { type: 'save'; value: string } | { type: 'decline' };
+      }) => Promise<{ ok: boolean; ended?: boolean; error?: string }>;
+      listSecretRequests?: () => Promise<{ id: string; threadId: string }[]>;
       onFileChange?: (cb: (data: { path: string; exists: boolean; mtimeMs: number | null }) => void) => () => void;
       onAppUpdateState?: (cb: (state: AppUpdateState) => void) => () => void;
       onAccountChanged?: (cb: (state: OrionAccountState) => void) => () => void;

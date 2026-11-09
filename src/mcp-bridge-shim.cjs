@@ -226,7 +226,7 @@ const rememberTool = {
 const requestUserActionTool = {
   name: 'request_user_action',
   description:
-    'Ask the user to do something only they can do outside this chat, such as signing in or authorizing in a browser window you opened (npm login, OAuth, a CLI device code), approving a prompt on their machine, or pasting a value you cannot get yourself. Durango Code marks the thread as needing the user, brings it back from Snoozed, and pins the action above the composer until it is resolved, so it does not get lost in your replies. It returns at once: keep working on anything that does not depend on it, and do not wait or poll for it. Write the action as one clear instruction (what to do, where, and any code to enter). If a command can tell when it is done (`npm whoami`, `gh auth status`), pass it as `check`: Durango Code runs it every few seconds and marks the action done as soon as it succeeds. You are told when the action is done without being interrupted: at your next tool call while you work, or in a new turn if you have ended yours (the thread shows as waiting on the user meanwhile). The message starts with "Done:" and repeats the action, so you need not ask the user to tell you. If the user replies instead, it starts with "Not done:", repeats the action and gives what they said: the ask may be wrong or they may want something else, so follow their reply rather than asking again. Call resolve_user_action with the returned action_id if you see it is done before you are told.',
+    'Ask the user to do something only they can do outside this chat, such as signing in or authorizing in a browser window you opened (npm login, OAuth, a CLI device code), approving a prompt on their machine, or giving you a value you cannot get yourself that is not a secret. For a secret (an API key, token, password, PIN or code), call request_secret instead: never ask for one here. Durango Code marks the thread as needing the user, brings it back from Snoozed, and pins the action above the composer until it is resolved, so it does not get lost in your replies. It returns at once: keep working on anything that does not depend on it, and do not wait or poll for it. Write the action as one clear instruction (what to do, where, and any code to enter). If a command can tell when it is done (`npm whoami`, `gh auth status`), pass it as `check`: Durango Code runs it every few seconds and marks the action done as soon as it succeeds. You are told when the action is done without being interrupted: at your next tool call while you work, or in a new turn if you have ended yours (the thread shows as waiting on the user meanwhile). The message starts with "Done:" and repeats the action, so you need not ask the user to tell you. If the user replies instead, it starts with "Not done:", repeats the action and gives what they said: the ask may be wrong or they may want something else, so follow their reply rather than asking again. Call resolve_user_action with the returned action_id if you see it is done before you are told.',
   // Only changes how Durango Code presents the thread.
   annotations: { readOnlyHint: true },
   inputSchema: {
@@ -265,6 +265,56 @@ const resolveUserActionTool = {
         description: 'The action_id request_user_action returned; omit to clear every pending action on this thread',
       },
     },
+    additionalProperties: false,
+  },
+};
+
+// Secret requests, served by the desktop app (src/main/secret-requests.js),
+// which shows a private input card and saves the value to an owner-only file.
+// Description and schema mirror secret-requests.js exactly;
+// scripts/test-durango-tools.mjs keeps them in sync.
+const requestSecretTool = {
+  name: 'request_secret',
+  description:
+    "Ask the user for one secret only they have, such as an API key, access token, password, sudo password, PIN, 2FA or pairing code, through a private input card in Durango Code. Use it instead of asking in chat or telling the user to run the command themselves, and call it as soon as the next step needs the value (do not just offer to). Not for access you already have (env, vault, a logged-in CLI). The value never enters this conversation. With `delivery: \"file\"` (the default, for shell commands) Durango Code saves it to an owner-only file and returns the path: read the file only inside the command that needs it, e.g. `adb pair 192.168.1.42:37099 \"$(cat <file>)\"`, `CLOUDFLARE_API_TOKEN=\"$(cat <file>)\" wrangler deploy` or `sudo -S -p '' <cmd> < <file>`. With `delivery: \"ref\"` (for tools) it returns a secret ref (`dsr_…`) that you pass in place of the value to a tool that takes secrets: browser_type or browser_evaluate in the built-in browser (sign-in forms), or a tool of an app connected through Durango Code (its arguments, e.g. \"Bearer dsr_…\"). The tool gets the value; you see only the ref, and its output comes back with the value replaced by [secret]. Never print, echo or log the value, and never copy it into code, commits, prompts, subagent briefs, memory or replies; write it into a file only where the task needs it (a gitignored .env the user asked for). One value per call; ask again for a second one. The call waits until the user answers (10 minutes by default). If they decline, do not ask again in chat or another way: say what is blocked and go on without it. After a timeout or cancellation, ask again only if it is still needed. If the user already pasted the secret in this thread, pass it as `value` to save it without a card, and pass the file or ref instead of the value from then on. Files and refs expire after 24 hours; a ref works only in this thread.",
+  // Saves only what the user enters; the value never reaches the model.
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      label: {
+        type: 'string',
+        description: 'What the value is, as the card title, e.g. "Cloudflare API token" or "Pixel pairing code"',
+      },
+      reason: {
+        type: 'string',
+        description: 'One or two sentences for the card: what you will use it for and where the user finds or creates it (scopes or permissions to pick, a code on a screen).',
+      },
+      url: {
+        type: 'string',
+        description: 'Page where the user gets or creates the value, if any (shown as an Open button)',
+      },
+      placeholder: {
+        type: 'string',
+        description: 'Hint shown in the empty input, e.g. "sk_test_…" or "6-digit code"',
+      },
+      delivery: {
+        type: 'string',
+        enum: ['file', 'ref'],
+        description: 'file (default): an owner-only file for shell commands. ref: a secret ref for browser_type, browser_evaluate or a connected app tool.',
+      },
+      value: {
+        type: 'string',
+        description: 'Only for a secret the user already pasted in this thread: saves it without showing a card, so you can pass the file or ref on instead of the value.',
+      },
+      timeout_seconds: {
+        type: 'integer',
+        minimum: 30,
+        maximum: 3600,
+        description: 'How long to wait for the user, in seconds (default 600)',
+      },
+    },
+    required: ['label', 'reason'],
     additionalProperties: false,
   },
 };
@@ -378,6 +428,7 @@ const tools = [
   rememberTool,
   requestUserActionTool,
   resolveUserActionTool,
+  requestSecretTool,
   showHtmlTool,
   ...(devicesEnabled ? [deviceListTool, deviceOpenTool, deviceScreenshotTool, deviceCloseTool] : []),
 ];

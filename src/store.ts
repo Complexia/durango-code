@@ -476,12 +476,28 @@ export type QueuedMessage = {
 };
 
 /**
+ * A request_secret card: the agent waits for a value typed into a private
+ * input. Only the request is kept here, never the value (the main process
+ * writes it to an owner-only file and hands the agent the path).
+ */
+export type UserActionSecret = {
+  label: string;
+  /** What the agent will use it for and where to get it. */
+  reason: string;
+  placeholder?: string;
+  /** file: saved to an owner-only file; ref: kept in memory for the agent's tools. */
+  delivery?: 'file' | 'ref';
+  /** When the agent stops waiting. */
+  expiresAt: string;
+};
+
+/**
  * A `/btw` aside: a quick question answered by a read-only fork of the
  * thread's agent session. It has the thread's full context but never joins
  * the thread — the main session and transcript are untouched.
  */
 export type UserAction = {
-  /** Id the agent resolves it by (`ua_…`). */
+  /** Id the agent resolves it by (`ua_…`; `sr_…` for a secret request). */
   id: string;
   /** One instruction, as the agent wrote it (Markdown). */
   action: string;
@@ -497,6 +513,8 @@ export type UserAction = {
    * watch gives up.
    */
   watching?: boolean;
+  /** Set for request_secret: the card asks for the value instead of Done/Reply. */
+  secret?: UserActionSecret;
 };
 
 export type BtwExchange = {

@@ -404,6 +404,8 @@ export const activityLabel = (activity: AgentActivity): { text: string; code?: b
       return { text: 'Loaded tools' };
     case 'mcp__orion__show_html':
       return { text: 'Showed a visual' };
+    case 'mcp__orion__request_secret':
+      return { text: 'Asked for a secret' };
     case 'Skill':
       return { text: detail ? `Used the ${detail} skill` : 'Used a skill' };
     default: {

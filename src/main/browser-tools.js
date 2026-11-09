@@ -3,6 +3,7 @@
 // builds zod schemas from these, and the bridge shim lists them by asking the
 // app over its socket), plus the dispatcher both routes call.
 import { codexBrowserUseMode } from './codex-config.js';
+import { SECRET_TYPED, redactSecrets, resolveSecretRefs } from './secret-requests.js';
 import {
   captureScreenshot,
   clickAction,
@@ -119,7 +120,11 @@ export const BROWSER_TOOLS = [
       properties: {
         tab: tabProperty,
         ref: { type: 'string', description: 'Ref of a textbox, searchbox, textarea or editable element.' },
-        text: { type: 'string', description: 'Text to type.' },
+        text: {
+          type: 'string',
+          description:
+            'Text to type. A secret ref from request_secret (delivery "ref", `dsr_…`) types the secret itself, without it passing through you.',
+        },
         clear: { type: 'boolean', description: 'Replace the current contents instead of appending.' },
         submit: { type: 'boolean', description: 'Press Enter after typing.' },
       },
@@ -161,7 +166,11 @@ export const BROWSER_TOOLS = [
       type: 'object',
       properties: {
         tab: tabProperty,
-        expression: { type: 'string', description: 'JavaScript expression, e.g. "document.querySelectorAll(\'li\').length".' },
+        expression: {
+          type: 'string',
+          description:
+            'JavaScript expression, e.g. "document.querySelectorAll(\'li\').length". A secret ref from request_secret (`dsr_…`), written bare where a string goes (`el.value = dsr_…`, not quoted), becomes the secret as a string literal.',
+        },
         timeout_ms: { type: 'integer', minimum: 100, maximum: 30000, description: 'Timeout (default 10000).' },
       },
       required: ['expression'],
@@ -398,7 +407,26 @@ const withSignInHint = (result, tab, signedInBrowser, snapshotText = '') =>
     ? { ...result, text: `${result.text}${signInHint(signedInBrowser)}` }
     : result;
 
-export const runBrowserTool = async (
+// Secret refs (request_secret, delivery "ref") stand for the secret in these
+// tools' arguments; every browser tool's result is scrubbed of saved secrets
+// before the model reads it (a typed token shows up in a snapshot).
+const SECRET_REF_ENCODERS = { browser_type: (value) => value, browser_evaluate: (value) => JSON.stringify(value) };
+
+export const runBrowserTool = async (name, rawArgs, context = {}) => {
+  let args = rawArgs;
+  let usedValues = [];
+  if (SECRET_REF_ENCODERS[name] && rawArgs && typeof rawArgs === 'object') {
+    const resolved = resolveSecretRefs(rawArgs, { threadId: context.threadId, encode: SECRET_REF_ENCODERS[name] });
+    if (!resolved.ok) return fail(resolved.text);
+    usedValues = resolved.values;
+    // browser_type's reply names what it typed: not a secret, even a short one.
+    if (resolved.used > 0) args = { ...resolved.value, [SECRET_TYPED]: true };
+  }
+  // The secrets this call used are scrubbed whatever their length.
+  return redactSecrets(await runBrowserToolUnscrubbed(name, args, context), { alsoValues: usedValues });
+};
+
+const runBrowserToolUnscrubbed = async (
   name,
   rawArgs,
   { threadId, agentId = null, projectPath = null, accessMode = 'full-access', signedInBrowser = null } = {}

@@ -10,6 +10,7 @@ import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
 import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
 import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
+import { SECRET_TOOL_NAMES, cancelSecretRequests, redactSecrets, resolveSecretRefs, runSecretTool } from './secret-requests.js';
 import { VISUAL_TOOL_NAMES, runVisualTool } from './visual-tools.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
@@ -141,9 +142,14 @@ export const handleMcpBridgeConnection = (socket) => {
       if (!message || message.id === undefined) continue;
       // `content` (optional) carries MCP content blocks, e.g. images, that
       // the shim returns as-is; `text` alone becomes one text block.
+      // Scrubbed of saved secrets (request_secret): a tool that was handed one
+      // through a ref may echo it.
+      // `alsoValues`: secrets this call was handed through refs, scrubbed
+      // whatever their length.
+      let alsoValues = [];
       const reply = (ok, text, extra) => {
         try {
-          socket.write(`${JSON.stringify({ id: message.id, ok, text, ...(extra ?? {}) })}\n`);
+          socket.write(`${JSON.stringify(redactSecrets({ id: message.id, ok, text, ...(extra ?? {}) }, { alsoValues }))}\n`);
         } catch {}
       };
       const session =
@@ -172,10 +178,22 @@ export const handleMcpBridgeConnection = (socket) => {
           reply(false, 'No connected apps are available in this run.');
           continue;
         }
+        // A connected app's tool takes secrets: refs in its arguments become
+        // the values (secret-requests.js).
+        let appArgs = args;
+        if (message.tool === CALL_APP_TOOL_NAME) {
+          const resolved = resolveSecretRefs(args, { threadId: session.threadId });
+          if (!resolved.ok) {
+            reply(false, resolved.text);
+            continue;
+          }
+          appArgs = resolved.value;
+          alsoValues = resolved.values;
+        }
         const pending =
           message.tool === LOAD_TOOLS_TOOL_NAME
             ? session.onDemandMcps.load(args)
-            : session.onDemandMcps.call(args, { accessMode: session.accessMode });
+            : session.onDemandMcps.call(appArgs, { accessMode: session.accessMode });
         void pending.then(
           ({ ok, text, content }) => reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined),
           (error) => reply(false, `${message.tool} failed: ${error?.message ?? error}`)
@@ -259,6 +277,11 @@ export const handleMcpBridgeConnection = (socket) => {
       }
       if (USER_ACTION_TOOL_NAMES.includes(message.tool)) {
         void runUserActionTool(message.tool, args, session).then(({ ok, text }) => reply(ok, text));
+        continue;
+      }
+      if (SECRET_TOOL_NAMES.includes(message.tool)) {
+        // Blocks until the user answers; the run's release cancels it.
+        void runSecretTool(message.tool, args, { ...session, owner: session }).then(({ ok, text }) => reply(ok, text));
         continue;
       }
       if (VISUAL_TOOL_NAMES.includes(message.tool)) {
@@ -448,6 +471,7 @@ export const registerMcpBridgeForRun = async ({
       },
       release: () => {
         mcpBridgeSessions.delete(token);
+        cancelSecretRequests({ owner: session });
         void onDemandMcps.close();
         void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});
       },

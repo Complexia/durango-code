@@ -1,4 +1,5 @@
 import { BrowserWindow } from 'electron';
+import { redactSecrets } from './secret-requests.js';
 
 // Taps on agent turn events, so main-process consumers (remote control) can
 // follow runs without a renderer in the loop. Listener errors never break the
@@ -20,14 +21,19 @@ const notifyAgentEventListeners = (event) => {
   }
 };
 
-export const emitAgentEvent = (webContents, event) => {
+// Secret values the user saved through request_secret (secret-requests.js)
+// are scrubbed here, before any event reaches the renderer (which saves the
+// thread) or remote control.
+export const emitAgentEvent = (webContents, rawEvent) => {
+  const event = redactSecrets(rawEvent);
   if (!webContents.isDestroyed()) {
     webContents.send('agent:turnEvent', event);
   }
   notifyAgentEventListeners(event);
 };
 
-export const sendToAllWindows = (channel, payload) => {
+export const sendToAllWindows = (channel, rawPayload) => {
+  const payload = channel === 'agent:turnEvent' ? redactSecrets(rawPayload) : rawPayload;
   let delivered = 0;
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) {

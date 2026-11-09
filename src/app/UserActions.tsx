@@ -3,9 +3,12 @@ import {
   Check,
   CircleDashed,
   Eye,
+  EyeOff,
   ExternalLink,
   Hand,
+  KeyRound,
   LoaderCircle,
+  Lock,
   MessageSquareReply,
   Paperclip,
   SendHorizontal,
@@ -17,6 +20,145 @@ import { MarkdownContent } from './markdown';
 import type { PendingUserAction } from './threadLists';
 
 const hasFiles = (event: React.DragEvent) => Array.from(event.dataTransfer.types).includes('Files');
+
+type SecretAnswer = { type: 'save'; value: string } | { type: 'decline' };
+
+/**
+ * A request_secret card: the agent is waiting for a value only the user has.
+ * The value lives only in this input until Save hands it to the main process,
+ * which writes it to an owner-only file; the agent gets the path, never the
+ * value, and nothing about it is saved with the thread. Decline tells the
+ * agent to go on without it.
+ */
+const SecretRequestCard = ({
+  action,
+  currentThreadId,
+  onAnswer,
+}: {
+  action: PendingUserAction;
+  currentThreadId: string;
+  onAnswer: (threadId: string, actionId: string, answer: SecretAnswer) => Promise<string | undefined>;
+}) => {
+  const secret = action.secret!;
+  const [value, setValue] = useState('');
+  const [revealed, setRevealed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const answer = async (next: SecretAnswer) => {
+    if (busy || (next.type === 'save' && !value.trim())) return;
+    setBusy(true);
+    setError(null);
+    const failure = await onAnswer(action.threadId, action.id, next);
+    setBusy(false);
+    if (failure) setError(failure);
+    else setValue('');
+  };
+  return (
+    <form
+      className="mt-1.5"
+      autoComplete="off"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void answer({ type: 'save', value });
+      }}
+    >
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-1.5 text-[13.5px] font-medium text-[var(--text-primary)]">
+            <KeyRound size={13} className="shrink-0 text-amber-300" />
+            <span className="min-w-0 truncate">{secret.label}</span>
+          </div>
+          <div className="mt-0.5 text-[12.5px] leading-snug text-[var(--text-secondary)] [&_.markdown-content]:text-[12.5px] [&_.markdown-content>:first-child]:mt-0 [&_.markdown-content>:last-child]:mb-0">
+            <MarkdownContent content={secret.reason} />
+          </div>
+          {action.threadId !== currentThreadId && (
+            <div className="mt-0.5 truncate text-[11.5px] text-[var(--text-secondary)]">
+              From subagent {action.threadTitle}
+            </div>
+          )}
+        </div>
+        {action.url && (
+          <button
+            type="button"
+            title={action.url}
+            onClick={() => void window.orion?.openExternalUrl?.(action.url!)}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border border-white/15 px-2.5 py-1 text-[12px] font-medium text-[var(--text-primary)] hover:bg-white/[0.06]"
+          >
+            <ExternalLink size={12} />
+            Open
+          </button>
+        )}
+      </div>
+      <div className="mt-2 flex items-center gap-1.5">
+        <div className="relative min-w-0 flex-1">
+          <input
+            autoFocus
+            type={revealed ? 'text' : 'password'}
+            value={value}
+            disabled={busy}
+            placeholder={secret.placeholder ?? 'Paste or type the value'}
+            aria-label={secret.label}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            data-1p-ignore
+            data-lpignore="true"
+            onChange={(event) => {
+              setValue(event.target.value);
+              if (error) setError(null);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                setValue('');
+              }
+            }}
+            className="block w-full rounded-md border border-white/15 bg-black/20 py-1.5 pl-2.5 pr-8 font-mono text-[13px] text-[var(--text-primary)] outline-none placeholder:font-sans placeholder:text-[var(--text-secondary)] focus:border-amber-300/50 disabled:opacity-60"
+          />
+          <button
+            type="button"
+            title={revealed ? 'Hide' : 'Show'}
+            aria-label={revealed ? 'Hide value' : 'Show value'}
+            onClick={() => setRevealed((current) => !current)}
+            className="absolute right-1 top-1/2 inline-flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
+          >
+            {revealed ? <EyeOff size={13} /> : <Eye size={13} />}
+          </button>
+        </div>
+        <button
+          type="submit"
+          disabled={busy || !value.trim()}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md bg-amber-300 px-2.5 py-1.5 text-[12px] font-medium text-neutral-950 hover:bg-amber-200 disabled:opacity-40 disabled:hover:bg-amber-300"
+        >
+          {busy ? <LoaderCircle size={12} className="animate-spin" /> : <Lock size={12} />}
+          Save
+        </button>
+        <button
+          type="button"
+          title="Tell the agent to go on without it"
+          disabled={busy}
+          onClick={() => void answer({ type: 'decline' })}
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-white/15 px-2.5 py-1.5 text-[12px] font-medium text-[var(--text-primary)] hover:bg-white/[0.06] disabled:opacity-40"
+        >
+          <X size={12} />
+          Decline
+        </button>
+      </div>
+      {error ? (
+        <div role="alert" className="mt-1 text-[11.5px] text-red-300">
+          {error}
+        </div>
+      ) : (
+        <div className="mt-1 text-[11.5px] text-[var(--text-secondary)]">
+          {secret.delivery === 'ref'
+            ? 'Kept by Durango Code for this thread for 24 hours. The agent can hand it to tools but never sees it.'
+            : 'Saved to a private file on this computer. The agent gets only its path, never the value.'}
+        </div>
+      )}
+    </form>
+  );
+};
 
 /**
  * What the agent asked the user to do outside the chat (request_user_action),
@@ -30,6 +172,7 @@ const hasFiles = (event: React.DragEvent) => Array.from(event.dataTransfer.types
  * `check` command can be watched: Durango Code runs it until it succeeds and
  * then marks the action done itself. The X dismisses a redundant action
  * (already done, superseded, asked twice) without telling the agent.
+ * A secret request (request_secret) shows a private input instead.
  */
 export const UserActionCards = React.memo(function UserActionCards({
   actions,
@@ -38,6 +181,7 @@ export const UserActionCards = React.memo(function UserActionCards({
   onReply,
   onDismiss,
   onWatch,
+  onSecretAnswer,
 }: {
   actions: PendingUserAction[];
   currentThreadId: string;
@@ -45,6 +189,7 @@ export const UserActionCards = React.memo(function UserActionCards({
   onReply: (threadId: string, actionId: string, reply: string, attachments: FileAttachment[]) => void;
   onDismiss: (threadId: string, actionId: string) => void;
   onWatch: (threadId: string, actionId: string, watching: boolean) => void;
+  onSecretAnswer: (threadId: string, actionId: string, answer: SecretAnswer) => Promise<string | undefined>;
 }) {
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
   const [reply, setReply] = useState('');
@@ -93,6 +238,11 @@ export const UserActionCards = React.memo(function UserActionCards({
       </div>
       {actions.map((action) => {
         const key = `${action.threadId}:${action.id}`;
+        if (action.secret) {
+          return (
+            <SecretRequestCard key={key} action={action} currentThreadId={currentThreadId} onAnswer={onSecretAnswer} />
+          );
+        }
         return (
           <div
             key={key}

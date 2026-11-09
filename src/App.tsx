@@ -1914,7 +1914,12 @@ const App: React.FC = () => {
         return;
       }
       if (request.type === 'resolve') {
-        const remaining = request.id ? current.filter((action) => action.id !== request.id) : [];
+        // resolve_user_action never clears a secret card: its request is still
+        // waiting in the main process, which sends its own resolve (with its
+        // id) when it ends.
+        const remaining = current.filter((action) =>
+          request.id ? action.id !== request.id || (action.secret && request.source !== 'secret') : Boolean(action.secret)
+        );
         if (remaining.length !== current.length) {
           updateThread(thread.id, { userActions: remaining.length ? remaining : undefined });
           if (remaining.length === 0) settleWaitingOnUserCaptions(thread.id);
@@ -1933,6 +1938,7 @@ const App: React.FC = () => {
             ...(request.check
               ? { check: request.check, checkCwd: request.cwd, watching: request.autoWatch === true }
               : {}),
+            ...(request.secret ? { secret: request.secret } : {}),
           },
         ],
       });
@@ -1946,6 +1952,51 @@ const App: React.FC = () => {
       });
     });
   }, [queueMessageToThread, setUserActionWatching, updateThread]);
+  // A secret card's answer (request_secret) goes straight to the main
+  // process, which saves the value to a file and ends the agent's wait; its
+  // `resolve` then clears the card. A request that already ended (the run
+  // stopped) loses its card here.
+  const answerSecretRequest = useCallback(
+    async (
+      threadId: string,
+      actionId: string,
+      answer: { type: 'save'; value: string } | { type: 'decline' }
+    ): Promise<string | undefined> => {
+      const result = await window.orion?.answerSecretRequest?.({ threadId, id: actionId, answer });
+      if (result?.ok) return undefined;
+      if (!result || result.ended) dismissUserAction(threadId, actionId);
+      return result?.error ?? 'Durango Code could not take the answer.';
+    },
+    [dismissUserAction]
+  );
+  // Secret cards saved with the thread outlive the request after a restart
+  // (or a window reload during which it ended): once the saved threads have
+  // loaded, drop the cards the main process no longer waits on. Cards asked
+  // for after the check started stay.
+  useEffect(() => {
+    let cancelled = false;
+    const reconcile = () => {
+      const startedAt = Date.now();
+      void window.orion?.listSecretRequests?.().then((pending) => {
+        if (cancelled) return;
+        const live = new Set(pending.map((entry) => entry.id));
+        for (const thread of useOrionStore.getState().threads) {
+          for (const action of thread.userActions ?? []) {
+            if (!action.secret || live.has(action.id)) continue;
+            if ((Date.parse(action.requestedAt) || 0) >= startedAt) continue;
+            dismissUserAction(thread.id, action.id);
+          }
+        }
+      });
+    };
+    const unsubscribe = useOrionStore.persist.hasHydrated()
+      ? (reconcile(), () => {})
+      : useOrionStore.persist.onFinishHydration(reconcile);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [dismissUserAction]);
   // Keep the main process watching exactly the actions whose `check` is on
   // (it holds only timers, so this also re-arms them after a restart), and
   // stop the watch once an action is answered, resolved or deleted.
@@ -9087,6 +9138,7 @@ const App: React.FC = () => {
         onReply={replyToUserAction}
         onDismiss={dismissUserAction}
         onWatch={setUserActionWatching}
+        onSecretAnswer={answerSecretRequest}
       />
       <CodexQuestions
         threadId={selectedThread.id}

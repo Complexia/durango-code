@@ -268,6 +268,10 @@ contextBridge.exposeInMainWorld('orion', {
   notifyAgentTurn: (input) => ipcRenderer.invoke('agent:notifyTurn', input),
   watchUserAction: (input) => ipcRenderer.invoke('agent:watchUserAction', input),
   unwatchUserAction: (input) => ipcRenderer.invoke('agent:unwatchUserAction', input),
+  // request_secret: the user's answer from the private card, and which
+  // requests are still waiting (cards left from before a restart are stale).
+  answerSecretRequest: (input) => ipcRenderer.invoke('agent:answerSecretRequest', input),
+  listSecretRequests: () => ipcRenderer.invoke('agent:listSecretRequests'),
   reportSubagentStopResult: (payload) =>
     ipcRenderer.invoke('orchestration:subagentStopResult', payload),
   onSubagentStopRequest: (callback) => {

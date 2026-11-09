@@ -12,15 +12,16 @@ export const ORION_BUILTIN_TOOL_NAMES = Object.freeze([
   'remember',
   'request_user_action',
   'resolve_user_action',
+  'request_secret',
   'show_html',
 ]);
 
 // Headless runs cannot show permission prompts, so drivers pre-approve the
 // orion tools by qualified name. They are safe in every access mode: spawned
 // subthreads inherit the driver's mode, read_thread and the Durango Chat
-// readers only read the user's own data, and the user-action tools and
+// readers only read the user's own data, the user-action tools and
 // show_html (a sandboxed page with no network) only change how Durango Code
-// presents the thread. `remember` writes to the user's
+// presents the thread, and request_secret saves only what the user enters. `remember` writes to the user's
 // Durango memory, an external mutation, so Read only leaves it unapproved
 // (and the tool itself refuses in that mode).
 export const orionBuiltinToolNamesForAccessMode = (accessMode) =>

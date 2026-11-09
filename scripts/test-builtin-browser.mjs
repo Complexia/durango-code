@@ -45,6 +45,7 @@ import {
   setBrowserManager,
 } from '../src/main/browser-tools.js';
 import { createBrowserManager } from '../src/main/browser/manager.js';
+import { saveSecretRef } from '../src/main/secret-requests.js';
 import { canRouteGuestDialogs } from '../src/main/browser/guest-dialogs.js';
 import { moveHeldDownload, reserveDownloadPath } from '../src/main/browser/security.js';
 import { claudeSdkOptionsForInput, createOrionMcpServer, CLAUDE_BROWSER_AGENT_ARG, claudeBrowserAgentHooks } from '../src/main/claude-driver.js';
@@ -522,6 +523,26 @@ try {
     assert.equal(retyped.ok, true, retyped.text);
     assert.equal((await run('browser_evaluate', { expression: "document.getElementById('email').value" })).text, 'new@x.dev');
     assert.match((await run('browser_type', { ref: refOf(snap.text, /button "Press me"/), text: 'x' })).text, /does not take text/);
+
+    // A secret ref (request_secret, delivery "ref") types the secret itself;
+    // neither the reply nor a later snapshot shows it to the model.
+    const secretRef = saveSecretRef('sekrit@x.dev', 'thread-a');
+    const typedSecret = await run('browser_type', { ref: refOf(snap.text, /textbox "Email"/), text: secretRef, clear: true });
+    assert.equal(typedSecret.ok, true, typedSecret.text);
+    assert.match(typedSecret.text, /^Typed the secret into e\d+/);
+    const fieldValue = await run('browser_evaluate', { expression: "document.getElementById('email').value === 'sekrit@x.dev'" });
+    assert.equal(fieldValue.text, 'true', 'the page got the value');
+    assert.equal((await run('browser_evaluate', { expression: `${secretRef} === 'sekrit@x.dev'` })).text, 'true', 'browser_evaluate gets a string literal');
+    assert.equal((await run('browser_evaluate', { expression: "document.getElementById('email').value" })).text, '[secret]', 'results are scrubbed');
+    snap = await run('browser_snapshot');
+    assert.doesNotMatch(snap.text, /sekrit/);
+    const pinRef = saveSecretRef('77', 'thread-a');
+    assert.equal((await run('browser_evaluate', { expression: `'pin is ' + ${pinRef}` })).text, 'pin is [secret]', 'a short secret is scrubbed from the call that used it');
+    const quotedRef = saveSecretRef('q"uo\\te', 'thread-a');
+    assert.equal((await run('browser_evaluate', { expression: `({ v: ${quotedRef} })` })).text.includes('uo'), false, 'a JSON-escaped secret is scrubbed');
+    const otherThread = await run('browser_type', { ref: refOf(snap.text, /textbox "Email"/), text: secretRef }, { ...caller, threadId: 'thread-b' });
+    assert.equal(otherThread.ok, false);
+    assert.match(otherThread.text, /another thread/);
 
     // Select by label.
     const selected = await run('browser_select', { ref: refOf(snap.text, /combobox "Plan"/), values: ['Pro plan'] });

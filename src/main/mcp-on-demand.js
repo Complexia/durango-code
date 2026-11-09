@@ -64,7 +64,7 @@ export const onDemandMcpToolDefinitions = (names = []) =>
         },
         {
           name: CALL_APP_TOOL_NAME,
-          description: `Call a tool of an app loaded with ${LOAD_TOOLS_TOOL_NAME}. Pass the app, the tool's name and its arguments as described by its input schema.`,
+          description: `Call a tool of an app loaded with ${LOAD_TOOLS_TOOL_NAME}. Pass the app, the tool's name and its arguments as described by its input schema. A secret ref from request_secret (\`dsr_…\`) anywhere in the arguments is replaced by the secret, and the result comes back with it replaced by [secret].`,
           inputSchema: {
             type: 'object',
             properties: {

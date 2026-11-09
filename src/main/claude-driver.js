@@ -29,6 +29,18 @@ import {
   USER_ACTION_TOOL_INPUT_SCHEMAS,
   runUserActionTool,
 } from './user-actions.js';
+import {
+  SECRET_LABEL_MAX_CHARS,
+  SECRET_REASON_MAX_CHARS,
+  SECRET_TIMEOUT_MAX_S,
+  SECRET_TIMEOUT_MIN_S,
+  SECRET_TOOL_DESCRIPTIONS,
+  SECRET_TOOL_INPUT_SCHEMAS,
+  cancelSecretRequests,
+  redactSecrets,
+  resolveSecretRefs,
+  runSecretTool,
+} from './secret-requests.js';
 import { claudeEffortForCli, claudeModelArgForContextWindow, defaultClaudeContextWindow, defaultClaudeReasoningEffort, parseExtraArgs } from './models.js';
 import { finalizingAgentRuns, startingAgentRuns } from './run-registry.js';
 import { execFileAsync, resolveCommandPath } from './shell-env.js';
@@ -133,7 +145,14 @@ const mergeClaudeHooks = (...sets) => {
 // Same reason: say when to reach for request_user_action (user-actions.js).
 export const CLAUDE_USER_ACTION_TIP = [
   '# Actions only the user can take (Durango Code)',
-  'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). If a command tells when it is done (`npm whoami`, `gh auth status`), pass it as `check` and Durango Code watches it for you. Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it; when you run out of such work, end your turn instead of waiting or polling. You are told when it is done without being interrupted: at your next tool call, or in a new turn if you have ended yours. That message starts with "Done:"; if the user replied instead, it starts with "Not done:" followed by what they want instead, so follow it rather than asking again. Call mcp__orion__resolve_user_action with the returned action_id if you see it is done before you are told.',
+  'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself that is not a secret, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). If a command tells when it is done (`npm whoami`, `gh auth status`), pass it as `check` and Durango Code watches it for you. Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it; when you run out of such work, end your turn instead of waiting or polling. You are told when it is done without being interrupted: at your next tool call, or in a new turn if you have ended yours. That message starts with "Done:"; if the user replied instead, it starts with "Not done:" followed by what they want instead, so follow it rather than asking again. Call mcp__orion__resolve_user_action with the returned action_id if you see it is done before you are told.',
+].join('\n');
+
+// Same reason, and the tool is always loaded too (`alwaysLoad`): an agent
+// that never sees request_secret asks for the value in chat.
+export const CLAUDE_SECRET_TIP = [
+  '# Secrets only the user has (Durango Code)',
+  'When the next step needs a secret only the user has (an API key or token for a CLI or API you run, a password or sudo password, a PIN, a 2FA or pairing code), call mcp__orion__request_secret with a label and a short reason (and a url where they get it): never ask for it in chat, and never hand the step to the user\'s own terminal instead. The user enters it in a private card; you get back the path of an owner-only file holding it. Read the file only inside the command that needs it (`TOKEN="$(cat <file>)" cli …`, `sudo -S -p \'\' <cmd> < <file>`), and never print the value or copy it into code, commits, prompts, subagent briefs, memory or replies. To hand a secret to a tool instead of a command (typing a password into a sign-in form with browser_type, an API key in the arguments of a connected app\'s tool, Claude in Chrome), ask with `delivery: "ref"` and pass the returned `dsr_…` ref where the value goes; the tool gets the value and you never see it. If the user pasted a secret in chat, save it with request_secret `value` and pass the file or ref on from then on. If they decline, do not ask again; say what is blocked.',
 ].join('\n');
 
 // Say when to illustrate with show_html (visual-tools.js); the tool
@@ -400,6 +419,50 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
           ),
         { annotations: { readOnlyHint: true } }
       ),
+      // Secret requests (secret-requests.js). Mirrored in mcp-bridge-shim.cjs;
+      // test-durango-tools.mjs keeps them in sync. Blocks until the user
+      // answers; Stop (the SDK's abort) or disposing the session cancels it.
+      tool(
+        'request_secret',
+        SECRET_TOOL_DESCRIPTIONS.request_secret,
+        {
+          label: z
+            .string()
+            .max(SECRET_LABEL_MAX_CHARS)
+            .describe(SECRET_TOOL_INPUT_SCHEMAS.request_secret.properties.label.description),
+          reason: z
+            .string()
+            .max(SECRET_REASON_MAX_CHARS)
+            .describe(SECRET_TOOL_INPUT_SCHEMAS.request_secret.properties.reason.description),
+          url: z.string().optional().describe(SECRET_TOOL_INPUT_SCHEMAS.request_secret.properties.url.description),
+          placeholder: z
+            .string()
+            .optional()
+            .describe(SECRET_TOOL_INPUT_SCHEMAS.request_secret.properties.placeholder.description),
+          delivery: z
+            .enum(['file', 'ref'])
+            .optional()
+            .describe(SECRET_TOOL_INPUT_SCHEMAS.request_secret.properties.delivery.description),
+          value: z.string().optional().describe(SECRET_TOOL_INPUT_SCHEMAS.request_secret.properties.value.description),
+          timeout_seconds: z
+            .number()
+            .int()
+            .min(SECRET_TIMEOUT_MIN_S)
+            .max(SECRET_TIMEOUT_MAX_S)
+            .optional()
+            .describe(SECRET_TOOL_INPUT_SCHEMAS.request_secret.properties.timeout_seconds.description),
+        },
+        async (args, extra) =>
+          durangoToolResult(
+            await runSecretTool('request_secret', args, {
+              getSender: () => session.sender,
+              threadId: session.threadId,
+              owner: session,
+              signal: extra?.signal instanceof AbortSignal ? extra.signal : undefined,
+            })
+          ),
+        { annotations: { readOnlyHint: true }, alwaysLoad: true }
+      ),
       // Inline visuals (visual-tools.js). Mirrored in mcp-bridge-shim.cjs;
       // test-durango-tools.mjs keeps them in sync.
       tool(
@@ -629,6 +692,79 @@ export const claudeBrowserAgentHooks = () => ({
     },
   ],
 });
+
+// Secrets saved through request_secret, kept from the model in Claude runs.
+// Tools of other MCP servers in this session (apps connected through Durango
+// Code, Claude in Chrome) take secret refs (delivery "ref"): the SDK runs
+// those servers itself, so the ref becomes the value in the call's input here
+// (PreToolUse); an unknown, expired or other thread's ref denies the call, so
+// the ref itself is never sent. Orion's own tools resolve refs where they take
+// them (browser-tools.js). Every tool's output (Bash printing a token read
+// from a secret file, an app echoing its input) is scrubbed of saved secrets
+// before the model reads it (PostToolUse; free while none is saved), and of
+// the exact secrets a call was handed whatever their length. A failed call's
+// error can't be rewritten by a hook (PostToolUseFailure only adds context).
+export const claudeSecretRefHooks = (session) => {
+  const appTool = (name) => typeof name === 'string' && name.startsWith('mcp__') && !name.startsWith('mcp__orion__');
+  const handed = new Map(); // tool_use_id -> secrets that call was handed
+  return {
+    PreToolUse: [
+      {
+        matcher: '^mcp__',
+        hooks: [
+          async (input) => {
+            if (!appTool(input?.tool_name) || !input.tool_input || typeof input.tool_input !== 'object') return { continue: true };
+            const resolved = resolveSecretRefs(input.tool_input, { threadId: session.threadId });
+            if (!resolved.ok) {
+              return {
+                hookSpecificOutput: {
+                  hookEventName: 'PreToolUse',
+                  permissionDecision: 'deny',
+                  permissionDecisionReason: resolved.text,
+                },
+              };
+            }
+            if (resolved.used === 0) return { continue: true };
+            if (input.tool_use_id) handed.set(input.tool_use_id, resolved.values);
+            // No permissionDecision: approval stays with the session's rules.
+            return { hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: resolved.value } };
+          },
+        ],
+      },
+    ],
+    PostToolUse: [
+      {
+        hooks: [
+          async (input) => {
+            const name = input?.tool_name;
+            const alsoValues = handed.get(input?.tool_use_id) ?? [];
+            handed.delete(input?.tool_use_id);
+            // Orion's own tools scrub their results themselves.
+            if (typeof name !== 'string' || name.startsWith('mcp__orion__')) return { continue: true };
+            const scrubbed = redactSecrets(input.tool_response, { alsoValues });
+            if (scrubbed === input.tool_response) return { continue: true };
+            return {
+              hookSpecificOutput: {
+                hookEventName: 'PostToolUse',
+                ...(appTool(name) ? { updatedMCPToolOutput: scrubbed } : { updatedToolOutput: scrubbed }),
+              },
+            };
+          },
+        ],
+      },
+    ],
+    PostToolUseFailure: [
+      {
+        hooks: [
+          async (input) => {
+            handed.delete(input?.tool_use_id);
+            return { continue: true };
+          },
+        ],
+      },
+    ],
+  };
+};
 
 // Sibling of durangoToolResult for tools that may return MCP content blocks
 // (an image from device_screenshot): `content` when present, else the text.
@@ -2092,6 +2228,7 @@ export const createClaudeSdkSession = ({
           append: [
             CLAUDE_BACKGROUND_WAIT_TIP,
             CLAUDE_USER_ACTION_TIP,
+            CLAUDE_SECRET_TIP,
             CLAUDE_VISUALS_TIP,
             ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
             ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
@@ -2108,6 +2245,7 @@ export const createClaudeSdkSession = ({
         hooks: mergeClaudeHooks(
           claudeForegroundWaitHooks(),
           claudeUserActionHooks(session),
+          claudeSecretRefHooks(session),
           builtinBrowser ? claudeBrowserAgentHooks() : {},
           chromeEnabled
             ? claudeChromeLeaseHooks(session, {
@@ -2667,6 +2805,7 @@ export const disposeClaudeSdkSession = (threadId) => {
     terminatingClaudeSdkSessions.set(threadId, terminating);
   }
   terminating.add(session);
+  cancelSecretRequests({ owner: session });
   session.dispose();
   return true;
 };

@@ -472,7 +472,12 @@ export const typeAction = async (tab, args) => {
     await pressKey(tab, 'Enter');
     await settleAfterAction(tab);
   }
-  const typed = args.text.length > 60 ? `${args.text.length} characters` : JSON.stringify(args.text);
+  // A secret from a ref (request_secret) is never echoed, however short.
+  const typed = args[Symbol.for('durango.secretTyped')]
+    ? 'the secret'
+    : args.text.length > 60
+      ? `${args.text.length} characters`
+      : JSON.stringify(args.text);
   return `Typed ${typed} into ${args.ref}${args.clear ? ' (replacing its contents)' : ''}${args.submit ? ' and pressed Enter' : ''} in tab ${tab.id}. Now at ${pageLine(tab)}.`;
 };
 

@@ -51,6 +51,7 @@ import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIc
 import { withClaudeEnv } from './main/claude-env.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, notifyClaudeSession, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { unwatchUserActions, watchUserAction } from './main/user-actions.js';
+import { answerSecretRequest, listPendingSecretRequests, startSecretFileSweeps } from './main/secret-requests.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
@@ -1173,6 +1174,9 @@ app.whenReady().then(async () => {
   bundledSkillsReady = ensureBundledSkills()
     .then(() => {})
     .catch((error) => console.error('Could not install bundled agent skills', error));
+  // Secret files (request_secret) expire after 24 hours: swept now (left
+  // over from earlier runs) and hourly while the app runs.
+  startSecretFileSweeps();
   // Reinforce the internal app name (helps in some dev launch scenarios). It
   // must stay "Orion": see ./main/app-identity.js.
   app.setName(INTERNAL_APP_NAME);
@@ -6228,6 +6232,12 @@ ipcMain.handle('agent:unwatchUserAction', (_event, { threadId, id } = {}) => {
   unwatchUserActions({ threadId, id });
   return true;
 });
+
+// request_secret (secret-requests.js): the user's answer from the private
+// card. The value goes straight to an owner-only file; only its path reaches
+// the agent.
+ipcMain.handle('agent:answerSecretRequest', (_event, input) => answerSecretRequest(input ?? {}));
+ipcMain.handle('agent:listSecretRequests', () => listPendingSecretRequests());
 
 ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => {
   const drivers = new Map([...codexSteerableRunDrivers, ...codexGoalRunDrivers]);
