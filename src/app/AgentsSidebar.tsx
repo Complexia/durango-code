@@ -7,8 +7,6 @@ import {
   FolderOpen,
   FolderPlus,
   GitBranch,
-  Monitor,
-  MonitorSmartphone,
   Pin,
   PinOff,
   Plus,
@@ -18,7 +16,6 @@ import {
   X,
 } from 'lucide-react';
 import { isNoProjectId, type Project, type SavedView, type Thread } from '../store';
-import type { RemoteMachineEntry } from '../types';
 import { ProjectIcon } from './ProjectIcon';
 import { InlineRenameInput } from './fileTree';
 import { SidebarSearchPanel, warmSearchIndex } from './threadSearch';
@@ -94,14 +91,6 @@ export type AgentsSidebarModel = {
   renderThreadCliBadge: (thread: Thread) => React.JSX.Element | null;
   renderThreadStatusDot: (thread: Thread) => React.JSX.Element | null;
   sidebarFooterProps: SidebarFooterProps;
-  /** Machines section (remote control). Hidden entirely while the feature is off. */
-  remoteMachinesVisible: boolean;
-  machinesSectionOpen: boolean;
-  setMachinesSectionOpen: React.Dispatch<React.SetStateAction<boolean>>;
-  remoteMachines: RemoteMachineEntry[];
-  activeRemoteMachineId: string | null;
-  selectRemoteMachine: (machineId: string | null) => void;
-  localMachineName: string;
 };
 
 // Dragging a sidebar thread onto the main view opens it as an extra pane. The
@@ -141,7 +130,7 @@ const ThreadItemSelect = ({
   );
 };
 
-export type MachinesAndSavedViewsProps = Pick<
+export type SavedViewsSectionProps = Pick<
   AgentsSidebarModel,
   | 'setActiveTab'
   | 'savedViews'
@@ -151,17 +140,10 @@ export type MachinesAndSavedViewsProps = Pick<
   | 'deleteSavedView'
   | 'savedViewsSectionOpen'
   | 'setSavedViewsSectionOpen'
-  | 'remoteMachinesVisible'
-  | 'machinesSectionOpen'
-  | 'setMachinesSectionOpen'
-  | 'remoteMachines'
-  | 'activeRemoteMachineId'
-  | 'selectRemoteMachine'
-  | 'localMachineName'
 >;
 
-/** The Machines and Saved views sections, shared by both sidebar versions. */
-export const MachinesAndSavedViews = ({
+/** The Saved views section, shared by both sidebar versions. */
+export const SavedViewsSection = ({
   setActiveTab,
   savedViews,
   activeSavedViewId,
@@ -170,74 +152,8 @@ export const MachinesAndSavedViews = ({
   deleteSavedView,
   savedViewsSectionOpen,
   setSavedViewsSectionOpen,
-  remoteMachinesVisible,
-  machinesSectionOpen,
-  setMachinesSectionOpen,
-  remoteMachines,
-  activeRemoteMachineId,
-  selectRemoteMachine,
-  localMachineName,
-}: MachinesAndSavedViewsProps) => (
+}: SavedViewsSectionProps) => (
   <>
-    {/*
-      Machines (remote control): every paired host this instance can drive,
-      plus a "this machine" row to switch back. Absent entirely while remote
-      control is off or no remote machines are paired.
-    */}
-    {remoteMachinesVisible && (
-      <div className="recent-agents-section machines-section">
-        <button
-          type="button"
-          className="sidebar-section-toggle"
-          onClick={() => setMachinesSectionOpen((open) => !open)}
-          aria-expanded={machinesSectionOpen}
-        >
-          <ChevronRight
-            size={12}
-            className={`sidebar-section-chevron ${machinesSectionOpen ? 'open' : ''}`}
-          />
-          <span>Machines</span>
-        </button>
-        {machinesSectionOpen && (
-          <div className="threads-list machines-list">
-            <div className={`thread-item machine-item${activeRemoteMachineId === null ? ' selected' : ''}`}>
-              <button
-                type="button"
-                className="thread-item-select"
-                onClick={() => selectRemoteMachine(null)}
-                title="Work on this machine"
-              >
-                <Monitor size={13} className="machine-item-icon" />
-                <span className="thread-title">
-                  <span className="thread-title-text">{localMachineName || 'This machine'}</span>
-                </span>
-                <span className="machine-status-dot local" />
-              </button>
-            </div>
-            {remoteMachines.map((machine) => (
-              <div
-                key={machine.id}
-                className={`thread-item machine-item${activeRemoteMachineId === machine.id ? ' selected' : ''}`}
-              >
-                <button
-                  type="button"
-                  className="thread-item-select"
-                  onClick={() => selectRemoteMachine(machine.id)}
-                  title={`${machine.name} (${machine.host ? `${machine.host}:${machine.port}` : 'over the internet'}) — ${machine.status}${machine.error ? ` — ${machine.error}` : ''}`}
-                >
-                  <MonitorSmartphone size={13} className="machine-item-icon" />
-                  <span className="thread-title">
-                    <span className="thread-title-text">{machine.name}</span>
-                  </span>
-                  <span className={`machine-status-dot ${machine.status}`} />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    )}
-
     {/*
       Saved views only exist while there are splits to return to — an empty
       section would be a permanent reminder of a feature the user isn't
@@ -443,7 +359,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
           </div>
         </div>
 
-        <MachinesAndSavedViews {...props} />
+        <SavedViewsSection {...props} />
 
         {pinnedThreads.length > 0 && (
           <div className="recent-agents-section">
@@ -490,12 +406,15 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                           ) : (
                             <span className="thread-title">
                               {renderThreadCliBadge(thread)}
-                              <span className="thread-title-text" title={thread.title}>{thread.title}</span>
+                              <span className="thread-title-text" title={thread.remote ? `${thread.title}\nRuns on ${thread.remote.machineName}` : thread.title}>{thread.title}</span>
                             </span>
                           )}
                           <span className="thread-project-tag thread-meta">
                             {projects.find((p) => p.id === thread.projectId)?.name}
                           </span>
+                          {thread.remote && (
+                            <span className="thread-project-tag thread-machine-tag thread-meta">{thread.remote.machineName}</span>
+                          )}
                           <span className="thread-time thread-meta">
                             {formatShortTime(getThreadActivityTime(thread))}
                           </span>
@@ -655,12 +574,15 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                             ) : (
                               <span className="thread-title">
                                 {renderThreadCliBadge(thread)}
-                                <span className="thread-title-text" title={thread.title}>{thread.title}</span>
+                                <span className="thread-title-text" title={thread.remote ? `${thread.title}\nRuns on ${thread.remote.machineName}` : thread.title}>{thread.title}</span>
                               </span>
                             )}
                             <span className="thread-project-tag thread-meta">
                               {projects.find((p) => p.id === thread.projectId)?.name}
                             </span>
+                            {thread.remote && (
+                              <span className="thread-project-tag thread-machine-tag thread-meta">{thread.remote.machineName}</span>
+                            )}
                             <span className="thread-time thread-meta">
                               {formatShortTime(getThreadActivityTime(thread))}
                             </span>
@@ -952,8 +874,11 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
                             ) : (
                               <span className="thread-title">
                                 {renderThreadCliBadge(thread)}
-                                <span className="thread-title-text" title={thread.title}>{thread.title}</span>
+                                <span className="thread-title-text" title={thread.remote ? `${thread.title}\nRuns on ${thread.remote.machineName}` : thread.title}>{thread.title}</span>
                               </span>
+                            )}
+                            {thread.remote && (
+                              <span className="thread-project-tag thread-machine-tag thread-meta">{thread.remote.machineName}</span>
                             )}
                             <span className="thread-time thread-meta">
                               {formatShortTime(getThreadActivityTime(thread))}

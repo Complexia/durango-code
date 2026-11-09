@@ -61,7 +61,7 @@ import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriv
 import { createCompletedCodexQuestions } from './main/codex-questions.js';
 import { commandForModel } from './main/command-for-model.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
-import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
+import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getDetachedGitHead, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteerableRunDrivers, steerFxRun } from './main/fx-driver.js';
 import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
@@ -137,6 +137,12 @@ import {
   revokeRemoteDevice,
   runRemoteTurn,
   checkoutRemoteSource,
+  fetchRemoteAttachment,
+  fetchRemoteThreadGit,
+  listRemoteQuestions,
+  answerRemoteQuestion,
+  remoteUserAction,
+  followRemoteThreads,
   shutdownRemoteControl,
   startRemotePairing,
   stopRemoteTurn,
@@ -494,6 +500,13 @@ const deregisterRelayDevice = ({ machineId, signal }) =>
     allowNotFound: true,
     signal,
   });
+
+// This account's machines at the relay, with online status: where a pairing
+// code typed on its own is offered (pairWithRemoteHost).
+const listRelayDevices = async ({ signal } = {}) => {
+  const data = await relayApiRequest('/api/relay/devices', undefined, { method: 'GET', signal });
+  return Array.isArray(data?.devices) ? data.devices : [];
+};
 
 const mintRelayTicket = async ({ role, machineId, signal }) => {
   const data = await relayApiRequest('/api/relay/ticket', { role, machineId }, { signal });
@@ -1247,7 +1260,14 @@ app.whenReady().then(async () => {
     verifyRemotePairingProof,
     registerRelayDevice,
     deregisterRelayDevice,
+    listRelayDevices,
     mintRelayTicket,
+    projectRepoIds,
+    getAttachmentDirectoryPath,
+    getRemoteAttachmentCacheDir: () => path.join(getAttachmentDirectoryPath(), 'remote'),
+    threadGitState: (threadId) => remoteThreadGitState(threadId),
+    listAgentQuestions: (threadId) => listAgentQuestions(threadId),
+    hasPendingQuestions: (threadId) => listAgentQuestions(threadId).length > 0,
     getAppVersion: () => app.getVersion(),
   }).catch((error) => console.error('Could not start remote control', error));
   addAgentEventListener((event) => forwardAgentEventToRemote(event));
@@ -1811,6 +1831,149 @@ ipcMain.handle('sync:getState', () => getWorkspaceSyncStatus());
 // every mutating handler re-checks the live account session inside the
 // engine, so a stale renderer can never act on a signed-out machine. Calls
 // wait for the engine's startup, which no longer holds up the window.
+// Durango Source repository ids of projects (git config), cached: a remote
+// snapshot or thread list asks for them every few seconds.
+const REPO_ID_CACHE_MS = 5 * 60_000;
+const repoIdCache = new Map(); // path → { repoId, at }
+const repoIdForPath = async (projectPath) => {
+  if (!projectPath) return null;
+  const cached = repoIdCache.get(projectPath);
+  if (cached && Date.now() - cached.at < REPO_ID_CACHE_MS) return cached.repoId;
+  const repoId = (await getCloudRepoLink(projectPath).catch(() => null))?.repoId ?? null;
+  repoIdCache.set(projectPath, { repoId, at: Date.now() });
+  return repoId;
+};
+const projectRepoIds = async (projects) => {
+  const ids = new Map();
+  for (const project of Array.isArray(projects) ? projects : []) {
+    if (typeof project?.path !== 'string') continue;
+    ids.set(project.path, await repoIdForPath(project.path));
+  }
+  return ids;
+};
+
+// Host side: the branch a thread here works on, for a controller's prompt
+// box. Its Durango workspace when it has one, else its project directory.
+const remoteThreadGitState = async (threadId) => {
+  // The shell is enough (project, workspace): read it from the index rather
+  // than loading the whole transcript.
+  const entry = threadId
+    ? ((await readThreadsIndex().catch(() => null))?.entries ?? []).find((candidate) => candidate?.id === threadId)
+    : null;
+  const thread = entry?.shell ?? null;
+  if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+  const state = (await readPersistedStoreState().catch(() => null)) ?? {};
+  const project = [...(state.noProject ? [state.noProject] : []), ...(Array.isArray(state.projects) ? state.projects : [])].find(
+    (candidate) => candidate?.id === thread.projectId
+  );
+  const workingDir = thread.durangoWorkspace?.workingDir ?? thread.durangoWorkspace?.path ?? project?.path;
+  if (!workingDir) return { ok: true, branch: null, detachedHead: null, workspaceName: null, dirty: false };
+  try {
+    const gitRoot = await getGitRoot(workingDir);
+    const [branch, entries] = await Promise.all([getCurrentGitBranch(gitRoot), readGitStatusEntries(gitRoot)]);
+    return {
+      ok: true,
+      branch,
+      detachedHead: branch === null ? await getDetachedGitHead(gitRoot) : null,
+      workspaceName: typeof thread.durangoWorkspace?.name === 'string' ? thread.durangoWorkspace.name : null,
+      dirty: entries.length > 0,
+    };
+  } catch {
+    // Not a git repository (No project, a plain folder).
+    return { ok: true, branch: null, detachedHead: null, workspaceName: null, dirty: false };
+  }
+};
+
+/**
+ * A paired machine's threads for this machine's sidebar, each with the local
+ * project it belongs to here: the same Durango Source repository, else a
+ * project of the same name or folder (null = none; the renderer files it
+ * under No project, labeled with that machine's project name).
+ */
+const listRemoteThreads = async ({ machineId } = {}) => {
+  const snapshot = await fetchRemoteSnapshot({ machineId: String(machineId ?? '') });
+  if (!snapshot.ok || !snapshot.snapshot) return { ok: false, error: snapshot.error ?? 'Could not reach that machine.' };
+  const local = configuredProjects.filter((project) => typeof project?.id === 'string');
+  const localRepoIds = await projectRepoIds(local);
+  const localFor = (hostProject) => {
+    if (!hostProject) return null;
+    if (hostProject.id === REMOTE_NO_PROJECT_ID) return REMOTE_NO_PROJECT_ID;
+    if (hostProject.repoId) {
+      const byRepo = local.find((project) => localRepoIds.get(project.path) === hostProject.repoId);
+      if (byRepo) return byRepo.id;
+    }
+    // Same name or folder, unless both are Source repositories and differ.
+    const name = String(hostProject.name ?? '').toLowerCase();
+    const folder = typeof hostProject.path === 'string' ? path.basename(hostProject.path) : '';
+    return (
+      local.find((project) => {
+        const localRepoId = localRepoIds.get(project.path);
+        if (hostProject.repoId && localRepoId && localRepoId !== hostProject.repoId) return false;
+        return (
+          String(project.name ?? '').toLowerCase() === name ||
+          (folder && typeof project.path === 'string' && path.basename(project.path) === folder)
+        );
+      })?.id ?? null
+    );
+  };
+  const hostProjects = new Map((snapshot.snapshot.projects ?? []).map((project) => [project.id, project]));
+  return {
+    ok: true,
+    machine: snapshot.snapshot.machine,
+    threads: (snapshot.snapshot.threads ?? [])
+      .filter((thread) => !thread.parentThreadId && !thread.subagent)
+      .map((thread) => {
+        const hostProject = hostProjects.get(thread.projectId);
+        return {
+          ...thread,
+          localProjectId: localFor(hostProject),
+          projectName: hostProject?.name ?? null,
+        };
+      }),
+  };
+};
+
+// Where a thread started here runs on a paired machine: its project's Durango
+// Source repository there (cloned if that machine lacks it), else a project
+// of the same name or folder, else nothing (the user adds it there first).
+// "No project" threads use that machine's No project scratch.
+const REMOTE_NO_PROJECT_ID = 'orion:no-project';
+const resolveRemoteProject = async ({ machineId, project } = {}) => {
+  const targetMachineId = String(machineId ?? '');
+  if (!project || project.id === REMOTE_NO_PROJECT_ID) {
+    return { ok: true, projectId: REMOTE_NO_PROJECT_ID, projectName: 'No project' };
+  }
+  const name = String(project.name ?? '').slice(0, 200);
+  const localPath = typeof project.path === 'string' ? project.path : '';
+  const snapshot = await fetchRemoteSnapshot({ machineId: targetMachineId });
+  if (!snapshot.ok) return { ok: false, error: snapshot.error ?? 'Could not reach that machine.' };
+  const hostProjects = (snapshot.snapshot?.projects ?? []).filter((candidate) => candidate.id !== REMOTE_NO_PROJECT_ID);
+  const repoId = localPath ? await repoIdForPath(localPath) : null;
+  // The same Durango Source repository, already there.
+  const sameRepo = repoId ? hostProjects.find((candidate) => candidate.repoId === repoId) : null;
+  if (sameRepo) return { ok: true, projectId: sameRepo.id, projectName: sameRepo.name };
+  // Same name or folder, but never a different repository that happens to
+  // share it (an "api" or "app").
+  const folder = localPath ? path.basename(localPath) : '';
+  const sameName = hostProjects.find(
+    (candidate) =>
+      !(repoId && candidate.repoId && candidate.repoId !== repoId) &&
+      (candidate.name?.toLowerCase() === name.toLowerCase() ||
+        (folder && typeof candidate.path === 'string' && path.basename(candidate.path) === folder))
+  );
+  if (repoId) {
+    // Clone it there (an existing checkout the snapshot didn't link is reused).
+    const checkout = await checkoutRemoteSource({ machineId: targetMachineId, repoId, name });
+    if (checkout.ok && checkout.projectId) return { ok: true, projectId: checkout.projectId, projectName: name };
+    if (!sameName) return { ok: false, error: checkout.error ?? `Could not set up ${name} on that machine.` };
+  }
+  if (sameName) return { ok: true, projectId: sameName.id, projectName: sameName.name };
+  return {
+    ok: false,
+    error: `${name || 'This project'} is not on that machine. Add it there, or publish it to Durango Source so it can be cloned there.`,
+  };
+};
+
 const afterRemoteControlInit =
   (handler) =>
   async (...args) => {
@@ -1834,6 +1997,14 @@ ipcMain.handle('remote:fetchThread', afterRemoteControlInit((_event, input) => f
 ipcMain.handle('remote:runTurn', afterRemoteControlInit((_event, input) => runRemoteTurn(input)));
 ipcMain.handle('remote:checkoutSource', afterRemoteControlInit((_event, input) => checkoutRemoteSource(input)));
 ipcMain.handle('remote:stopTurn', afterRemoteControlInit((_event, input) => stopRemoteTurn(input)));
+ipcMain.handle('remote:resolveProject', afterRemoteControlInit((_event, input) => resolveRemoteProject(input)));
+ipcMain.handle('remote:listThreads', afterRemoteControlInit((_event, input) => listRemoteThreads(input)));
+ipcMain.handle('remote:fetchAttachment', afterRemoteControlInit((_event, input) => fetchRemoteAttachment(input)));
+ipcMain.handle('remote:threadGit', afterRemoteControlInit((_event, input) => fetchRemoteThreadGit(input)));
+ipcMain.handle('remote:listQuestions', afterRemoteControlInit((_event, input) => listRemoteQuestions(input)));
+ipcMain.handle('remote:answerQuestion', afterRemoteControlInit((_event, input) => answerRemoteQuestion(input)));
+ipcMain.handle('remote:userAction', afterRemoteControlInit((_event, input) => remoteUserAction(input)));
+ipcMain.handle('remote:followThreads', afterRemoteControlInit((_event, input) => followRemoteThreads(input)));
 // Registered only after the renderer has installed onRemoteCommandRequest.
 // did-start-loading/destroyed clear this authority until the next mount.
 ipcMain.handle('remote:rendererReady', (event) => markRemoteCommandRendererReady(event.sender));
@@ -6239,14 +6410,20 @@ ipcMain.handle('agent:unwatchUserAction', (_event, { threadId, id } = {}) => {
 ipcMain.handle('agent:answerSecretRequest', (_event, input) => answerSecretRequest(input ?? {}));
 ipcMain.handle('agent:listSecretRequests', () => listPendingSecretRequests());
 
-ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => {
+const listCodexQuestions = (threadId) => {
   const drivers = new Map([...codexSteerableRunDrivers, ...codexGoalRunDrivers]);
   return [...completedCodexQuestions.list(threadId), ...[...drivers].flatMap(([runId, driver]) =>
     (driver.getUserInputs?.() ?? [])
       .filter((request) => request.threadId === threadId)
       .map((request) => ({ ...request, runId }))
   )];
-});
+};
+const listClaudeQuestions = (threadId) => claudeSdkSessions.get(threadId)?.userInputs?.list() ?? [];
+// Every question or approval a thread's agent waits on (paired controllers
+// show and answer them too: remote-control.js).
+const listAgentQuestions = (threadId) => [...listCodexQuestions(threadId), ...listClaudeQuestions(threadId)];
+
+ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => listCodexQuestions(threadId));
 
 ipcMain.handle('agent:answerCodexQuestions', async (event, runId, requestId, answers, text) => {
   const driver = codexSteerableRunDrivers.get(runId) ?? codexGoalRunDrivers.get(runId);
@@ -6265,9 +6442,7 @@ ipcMain.handle('agent:answerCodexQuestions', async (event, runId, requestId, ans
   return driver?.answerUserInput?.(requestId, answers) ?? false;
 });
 
-ipcMain.handle('agent:getClaudeQuestions', (_event, threadId) =>
-  claudeSdkSessions.get(threadId)?.userInputs?.list() ?? []
-);
+ipcMain.handle('agent:getClaudeQuestions', (_event, threadId) => listClaudeQuestions(threadId));
 ipcMain.handle('agent:answerClaudeQuestions', (_event, runId, requestId, answers) => {
   for (const session of claudeSdkSessions.values()) {
     if (session.userInputs?.answer(runId, requestId, answers)) return true;

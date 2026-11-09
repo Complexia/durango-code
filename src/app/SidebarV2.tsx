@@ -10,6 +10,7 @@ import {
   CircleDashed,
   Clock,
   MessageCircleQuestion,
+  MonitorSmartphone,
   Ellipsis,
   FolderPlus,
   GitBranch,
@@ -300,7 +301,9 @@ const ThreadHoverCard: React.FC<{
           ) : (
             <span className="h-3.5 w-3.5 shrink-0 rounded-[4px] border border-dashed border-neutral-500" />
           )}
-          <span className="truncate">{project && !isNoProjectId(project.id) ? project.name : NO_PROJECT_NAME}</span>
+          <span className="truncate">
+            {project && !isNoProjectId(project.id) ? project.name : (thread.remote?.projectName ?? NO_PROJECT_NAME)}
+          </span>
         </div>
         {modelLabel && (
           <div className="flex items-center gap-2">
@@ -317,6 +320,12 @@ const ThreadHoverCard: React.FC<{
             {lastActiveLabel(thread)}
           </span>
         </div>
+        {thread.remote && (
+          <div className="flex items-center gap-2">
+            <MonitorSmartphone size={13} className="shrink-0" />
+            <span className="truncate">Runs on {thread.remote.machineName}</span>
+          </div>
+        )}
         {thread.durangoWorkspace && (
           <div className="flex items-center gap-2">
             <GitBranch size={13} className="shrink-0" />
@@ -390,7 +399,8 @@ const ThreadRow = React.memo(function ThreadRow({
   // Settled threads recede until hovered, as in T3 (also in Pinned).
   const recede = !!thread.settledAt && !selected;
   const isNoProject = !project || isNoProjectId(project.id);
-  const projectName = isNoProject ? NO_PROJECT_NAME : project.name;
+  // Another machine's thread whose project isn't here: its name there.
+  const projectName = isNoProject ? (thread.remote?.projectName ?? NO_PROJECT_NAME) : project.name;
 
   const menuActions: (RowMenuAction | null)[] = [
     { key: 'rename', label: 'Rename', icon: <SquarePen size={13} />, run: () => onStartRename(thread.id) },
@@ -577,10 +587,15 @@ const ThreadRow = React.memo(function ThreadRow({
           </>
         )}
       </div>
-      {/* Line 3, as in T3: where it works (its Durango workspace) and which
-          agent runs it. */}
+      {/* Line 3, as in T3: where it works (the other machine it runs on, or
+          its Durango workspace) and which agent runs it. */}
       <div className="mt-[3px] flex h-4 min-w-0 items-center gap-1.5 text-[11.5px] text-neutral-500">
-        {thread.durangoWorkspace ? (
+        {thread.remote ? (
+          <span className="flex min-w-0 flex-1 items-center gap-1" title={`Runs on ${thread.remote.machineName}`}>
+            <MonitorSmartphone size={11} className="shrink-0" />
+            <span className="truncate">{thread.remote.machineName}</span>
+          </span>
+        ) : thread.durangoWorkspace ? (
           <span className="flex min-w-0 flex-1 items-center gap-1" title={thread.durangoWorkspace.path}>
             <GitBranch size={11} className="shrink-0" />
             <span className="truncate">{thread.durangoWorkspace.name}</span>

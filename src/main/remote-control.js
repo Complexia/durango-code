@@ -15,8 +15,10 @@ import {
   handshakeTranscript,
   macsEqual,
   normalizePairingCode,
+  PAIRING_CODE_LENGTH,
   pairingCodeToPsk,
 } from './remote-crypto.js';
+import { sanitizeAttachmentName } from './media.js';
 import {
   createRelayListener,
   createRelayTransport,
@@ -75,6 +77,13 @@ const MAX_THREAD_TRANSFER_BYTES = 64 * 1024 * 1024;
 // release it if a controller abandons the pull transfer.
 const THREAD_TRANSFER_TTL_MS = 2 * 60 * 1000;
 const ENCRYPTED_FRAME_OVERHEAD_BYTES = 8 + 16;
+// Attachments travel as chunks too (controller → host for a turn's files, host
+// → controller to show the host's attachments in the controller's mirror).
+// 3 MiB of raw bytes is 4 MiB of base64, well under MAX_FRAME_BYTES.
+const ATTACHMENT_CHUNK_BYTES = 3 * 1024 * 1024;
+export const MAX_REMOTE_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+// Uploads one session may hold open (unfinished) at once.
+const MAX_OPEN_UPLOADS = 16;
 // Relay streams have no meaningful source address — the relay is the only peer
 // the socket layer can see. They therefore share one bucket for the per-source
 // connection cap and the failed-handshake rate limit. That is the conservative
@@ -1154,7 +1163,10 @@ const handleInboundConnection = (transport, { ip = null } = {}) => {
     transcript: null,
     authRealPsk: false,
     challengedPairingPsk: null,
-    threadTransfer: null,
+    // Chunked thread pulls in progress, one per thread (threadId → transfer).
+    threadTransfers: new Map(),
+    // Attachments the controller uploaded in this session: uploadId → file.
+    uploads: new Map(),
   };
   // A peer that opens a slot and then says nothing is as much of an abuse as a
   // bad MAC — it just costs the attacker less. Count it, so repeat offenders
@@ -1168,6 +1180,7 @@ const handleInboundConnection = (transport, { ip = null } = {}) => {
   channel.onClose(() => {
     clearTimeout(handshakeTimer);
     clearThreadTransfer(session);
+    discardUnfinishedUploads(session);
     session.abortController.abort(new Error('The remote session closed.'));
     inboundConnections.delete(session);
     cancelPendingRendererCommands('The controlling device disconnected.', {
@@ -1242,7 +1255,14 @@ const handleInboundConnection = (transport, { ip = null } = {}) => {
         received = Buffer.from(String(message?.mac ?? ''), 'base64');
       } catch {}
       if (!session.authRealPsk || !received || !macsEqual(expected, received)) {
-        registerHandshakeFailure(ip);
+        // A pairing attempt while this machine shows no code can never
+        // succeed and is what a controller pairing by code alone sends to
+        // each of the account's machines in turn (pairByCode): don't let it
+        // count toward the rate limit that relay connections share, or a few
+        // mistyped codes would lock this machine out of the relay. Pairing
+        // attempts against a live code, and session handshakes, still count.
+        const pairWithoutCode = session.mode === 'pair' && !session.challengedPairingPsk;
+        if (!pairWithoutCode) registerHandshakeFailure(ip);
         // Charge the attempt cap only for a genuine guess at a live code:
         // authRealPsk means a pairing was active when this connection said
         // hello, so the host answered with the real code's PSK and the peer
@@ -1566,40 +1586,317 @@ export const resolveRemoteCommand = (payload) => {
   return { ok: true };
 };
 
+const optionalString = (value) => (typeof value === 'string' && value ? value : null);
+
 const buildSnapshot = async () => {
   const state = (await deps.readStoreState()) ?? {};
   const threadIndex = deps.readThreadsIndex
     ? await deps.readThreadsIndex()
     : { entries: (await deps.readThreadsFile())?.threads ?? [] };
-  const threads = Array.isArray(threadIndex?.entries) ? threadIndex.entries : [];
+  const entries = Array.isArray(threadIndex?.entries) ? threadIndex.entries : [];
+  // A thread whose subagent waits on the user waits on the user: roll
+  // questions and actions up to the top-level thread a controller lists.
+  const rootOf = (() => {
+    const byId = new Map(entries.map((entry) => [entry.id, entry]));
+    return (id) => {
+      let current = id;
+      const seen = new Set();
+      for (;;) {
+        const parentId = parentIdOf(byId.get(current));
+        if (!parentId || seen.has(parentId) || !byId.has(parentId)) return current;
+        seen.add(current);
+        current = parentId;
+      }
+    };
+  })();
+  const waitingRoots = new Set();
+  const actionsByRoot = new Map();
+  for (const entry of entries) {
+    const shell = entry?.shell ?? entry;
+    if (!shell?.id || shell.remote) continue;
+    const root = rootOf(shell.id);
+    if (deps.hasPendingQuestions?.(shell.id) === true) waitingRoots.add(root);
+    if (Array.isArray(shell.userActions) && shell.userActions.length > 0) {
+      if (!actionsByRoot.has(root)) actionsByRoot.set(root, []);
+      actionsByRoot.get(root).push(...shell.userActions.map((action) => ({ ...action, ownerThreadId: shell.id })));
+    }
+  }
+  const projects = [
+    ...(state.noProject ? [state.noProject] : []),
+    ...(Array.isArray(state.projects) ? state.projects : []),
+  ];
+  // Durango Source repository ids let a controller match these projects to
+  // its own checkouts of the same repositories.
+  const repoIds = deps.projectRepoIds ? await deps.projectRepoIds(projects).catch(() => null) : null;
   return {
     machine: { id: identity.machineId, name: identity.machineName },
     capturedAt: new Date().toISOString(),
     // Remote clients group threads by these entries. Include the scratch
     // workspace on the wire without adding it to the host's saved projects.
-    projects: [
-      ...(state.noProject ? [state.noProject] : []),
-      ...(Array.isArray(state.projects) ? state.projects : []),
-    ].map((project) => ({
+    projects: projects.map((project) => ({
       id: project.id,
       name: project.name,
       path: project.path,
+      repoId: repoIds?.get?.(project.path) ?? null,
     })),
-    threads: threads.map((thread) => ({
-      id: thread.id,
-      projectId: thread.projectId,
-      parentThreadId: thread.parentThreadId ?? null,
-      subagent: Boolean(thread.subagent),
-      title: thread.title,
-      status: thread.status,
-      modelId: thread.modelId,
-      createdAt: thread.createdAt,
-      updatedAt: thread.updatedAt ?? thread.messages?.at?.(-1)?.ts ?? thread.createdAt,
-      messageCount: Number.isSafeInteger(thread.messageCount)
-        ? thread.messageCount
-        : Array.isArray(thread.messages) ? thread.messages.length : 0,
-    })),
+    threads: entries
+      .map((entry) => ({ shell: entry?.shell ?? entry, summary: entry?.summary ?? null, entry }))
+      // A thread that itself runs on another machine is that machine's to
+      // list: mirroring a mirror would loop between two paired machines.
+      .filter(({ shell }) => shell && typeof shell.id === 'string' && !shell.remote)
+      .map(({ shell, summary, entry }) => {
+        const base = {
+          id: shell.id,
+          projectId: shell.projectId,
+          parentThreadId: shell.parentThreadId ?? null,
+          subagent: Boolean(shell.subagent),
+          title: shell.title,
+          status: shell.status,
+          modelId: shell.modelId,
+          createdAt: shell.createdAt,
+          updatedAt: entry.updatedAt ?? summary?.lastMessage?.ts ?? shell.messages?.at?.(-1)?.ts ?? shell.createdAt,
+          messageCount: Number.isSafeInteger(entry.messageCount)
+            ? entry.messageCount
+            : Number.isSafeInteger(summary?.messageCount)
+              ? summary.messageCount
+              : Array.isArray(shell.messages) ? shell.messages.length : 0,
+        };
+        // Subagent threads ride along for clients that show them under their
+        // parent (app.durango.sh); the details below are for listing threads
+        // in a controller's sidebar, which never lists them.
+        if (base.parentThreadId || base.subagent) return base;
+        const userActions = actionsByRoot.get(shell.id) ?? [];
+        return {
+          ...base,
+          ...(summary && typeof summary === 'object' ? { summary } : {}),
+          // What the thread (or a subagent of it) waits on the user for, so a
+          // controller's sidebar can say "Needs you" without opening it.
+          ...(userActions.length > 0 ? { userActions } : {}),
+          ...(waitingRoots.has(shell.id) ? { waitingOnQuestion: true } : {}),
+          settledAt: optionalString(shell.settledAt),
+          hiddenFromRecent: shell.hiddenFromRecent === true,
+          workspaceName: optionalString(shell.durangoWorkspace?.name),
+          // What the controller's prompt box shows for the thread.
+          settings: Object.fromEntries(
+            [
+              'accessMode',
+              'codexReasoningEffort',
+              'codexServiceTier',
+              'claudeReasoningEffort',
+              'claudeContextWindow',
+              'grokReasoningEffort',
+              'museReasoningEffort',
+              'openCodeReasoningEffort',
+            ]
+              .filter((key) => typeof shell[key] === 'string')
+              .map((key) => [key, shell[key]])
+          ),
+        };
+      }),
   };
+};
+
+// A frame larger than MAX_FRAME_BYTES ends the connection, so a host with
+// very many threads sends its snapshot without the listing details (counts
+// and times stay) rather than not at all.
+const SNAPSHOT_SOFT_LIMIT_BYTES = 6 * 1024 * 1024;
+const fitSnapshot = (snapshot) => {
+  if (Buffer.byteLength(JSON.stringify(snapshot), 'utf8') <= SNAPSHOT_SOFT_LIMIT_BYTES) return snapshot;
+  return {
+    ...snapshot,
+    threads: snapshot.threads.map(({ summary: _summary, settings: _settings, ...thread }) => thread),
+  };
+};
+
+// --- Attachments (host side) ---------------------------------------------
+
+// The name a person sees (in the transcript); files on disk are named with
+// sanitizeAttachmentName (media.js), a whitelist safe on every platform.
+const safeAttachmentName = (value) => {
+  const name = String(value ?? '')
+    .replace(/[\\/\u0000-\u001f]/g, '_')
+    .replace(/^\.+/, '')
+    .trim()
+    .slice(0, 120);
+  return name || 'file';
+};
+
+const sanitizeSnapshotInfo = (value) => {
+  if (!value || typeof value !== 'object') return undefined;
+  if (value.kind !== 'image' && value.kind !== 'accessibility') return undefined;
+  return {
+    kind: value.kind,
+    appName: String(value.appName ?? '').slice(0, 200),
+    windowTitle: String(value.windowTitle ?? '').slice(0, 300),
+    ...(value.truncated === true ? { truncated: true } : {}),
+  };
+};
+
+// When the session ends, files no turn used are deleted (unfinished ones, and
+// finished ones whose turn never came or failed).
+// (A command still running with some of them settles those itself.)
+const discardUnfinishedUploads = (session) => {
+  for (const upload of [...(session.uploads?.values?.() ?? [])]) {
+    if (upload.claimed) continue;
+    session.uploads.delete(upload.id);
+    if (!upload.used) void fs.rm(upload.path, { force: true }).catch(() => {});
+  }
+};
+
+const discardUpload = (session, upload) => {
+  session.uploads.delete(upload.id);
+  void fs.rm(upload.path, { force: true }).catch(() => {});
+};
+
+const settleUploadedAttachments = (session, attachments, succeeded) => {
+  for (const attachment of attachments) {
+    const upload = session.uploads.get(attachment.id);
+    if (!upload) continue;
+    if (succeeded) {
+      upload.used = true;
+      session.uploads.delete(upload.id);
+    } else {
+      discardUpload(session, upload);
+    }
+  }
+};
+
+/**
+ * One chunk of a file the controller attaches to a turn. The first chunk
+ * (offset 0, no uploadId) opens the upload; chunks must arrive in order; the
+ * one that reaches `size` completes it. The file lands in this machine's
+ * attachment folder, like a file attached here, and stays there with the
+ * transcript that references it.
+ */
+const handleAttachmentUpload = async (session, message) => {
+  if (typeof deps?.getAttachmentDirectoryPath !== 'function') {
+    return { ok: false, error: 'This machine cannot receive attachments. Update Durango Code on it.' };
+  }
+  const offset = Number(message?.offset);
+  const chunk = typeof message?.data === 'string' ? Buffer.from(message.data, 'base64') : null;
+  if (!chunk || !Number.isSafeInteger(offset) || offset < 0 || chunk.length > ATTACHMENT_CHUNK_BYTES) {
+    return { ok: false, error: 'Invalid attachment chunk.' };
+  }
+  let upload;
+  if (offset === 0 && !message?.uploadId) {
+    const size = Number(message?.size);
+    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_REMOTE_ATTACHMENT_BYTES) {
+      return { ok: false, error: 'This attachment is too large to send to another machine.' };
+    }
+    // Counted (and the slot taken) before any await, so concurrent first
+    // chunks cannot get past the cap together.
+    const unused = [...session.uploads.values()].filter((candidate) => !candidate.used).length;
+    if (unused >= MAX_OPEN_UPLOADS) return { ok: false, error: 'Too many attachments at once.' };
+    const id = crypto.randomUUID();
+    const directory = deps.getAttachmentDirectoryPath();
+    upload = {
+      id,
+      name: safeAttachmentName(message?.name),
+      mimeType: String(message?.mimeType ?? '').slice(0, 200) || 'application/octet-stream',
+      size,
+      written: 0,
+      done: false,
+      used: false,
+      path: path.join(directory, `${id}-${sanitizeAttachmentName(message?.name)}`),
+    };
+    session.uploads.set(id, upload);
+    try {
+      await fs.mkdir(directory, { recursive: true });
+      await fs.writeFile(upload.path, Buffer.alloc(0));
+    } catch (error) {
+      discardUpload(session, upload);
+      throw error;
+    }
+  } else {
+    upload = session.uploads.get(String(message?.uploadId ?? ''));
+    if (!upload || upload.done) return { ok: false, error: 'Unknown attachment upload.' };
+  }
+  if (offset !== upload.written || upload.written + chunk.length > upload.size) {
+    discardUpload(session, upload);
+    return { ok: false, error: 'Attachment chunks arrived out of order.' };
+  }
+  if (chunk.length > 0) {
+    try {
+      await fs.appendFile(upload.path, chunk);
+    } catch (error) {
+      discardUpload(session, upload);
+      throw error;
+    }
+  }
+  upload.written += chunk.length;
+  if (upload.written === upload.size) upload.done = true;
+  return {
+    ok: true,
+    uploadId: upload.id,
+    done: upload.done,
+    received: upload.written,
+    ...(upload.done ? { path: upload.path } : {}),
+  };
+};
+
+/**
+ * The controller's attachments for a turn (or a reply), as files on this
+ * machine. They stay the session's until the command that names them settles
+ * (settleUploadedAttachments): kept with the transcript that references them
+ * when it succeeded, deleted when it didn't.
+ */
+const resolveUploadedAttachments = (session, list) => {
+  if (!Array.isArray(list) || list.length === 0) return [];
+  const uploads = list.slice(0, 32).map((item) => {
+    const upload = session.uploads.get(String(item?.uploadId ?? ''));
+    if (!upload?.done || upload.claimed) throw new Error('An attachment did not finish uploading.');
+    return { item, upload };
+  });
+  return uploads.map(({ item, upload }) => {
+    // One command per upload: a second naming it is refused.
+    upload.claimed = true;
+    return {
+      id: upload.id,
+      name: safeAttachmentName(item?.name ?? upload.name),
+      path: upload.path,
+      mimeType: upload.mimeType,
+      size: upload.size,
+      ...(sanitizeSnapshotInfo(item?.snapshot) ? { snapshot: sanitizeSnapshotInfo(item.snapshot) } : {}),
+    };
+  });
+};
+
+/**
+ * One chunk of an attachment of this machine's threads, so the controller can
+ * show it. Only files in this machine's attachment folder are served.
+ */
+const handleAttachmentRead = async (message) => {
+  if (typeof deps?.getAttachmentDirectoryPath !== 'function') {
+    return { ok: false, error: 'This machine cannot share attachments. Update Durango Code on it.' };
+  }
+  const directory = path.resolve(deps.getAttachmentDirectoryPath());
+  const requested = path.resolve(String(message?.path ?? ''));
+  if (!requested.startsWith(directory + path.sep)) return { ok: false, error: 'Not an attachment.' };
+  const offset = Number(message?.offset ?? 0);
+  if (!Number.isSafeInteger(offset) || offset < 0) return { ok: false, error: 'Invalid offset.' };
+  let handle;
+  try {
+    const real = await fs.realpath(requested);
+    if (!real.startsWith((await fs.realpath(directory)) + path.sep)) return { ok: false, error: 'Not an attachment.' };
+    handle = await fs.open(real, 'r');
+    const { size } = await handle.stat();
+    if (size > MAX_REMOTE_ATTACHMENT_BYTES) return { ok: false, error: 'This attachment is too large to fetch.' };
+    if (offset > size) return { ok: false, error: 'Invalid offset.' };
+    const length = Math.min(ATTACHMENT_CHUNK_BYTES, size - offset);
+    const buffer = Buffer.alloc(length);
+    if (length > 0) await handle.read(buffer, 0, length, offset);
+    return {
+      ok: true,
+      size,
+      offset,
+      data: buffer.toString('base64'),
+      nextOffset: offset + length < size ? offset + length : null,
+    };
+  } catch {
+    return { ok: false, error: 'Attachment not found on the host.' };
+  } finally {
+    await handle?.close().catch(() => {});
+  }
 };
 
 // Kept in sync with src/app/remote-control-policy.ts (remoteThreadRuntime):
@@ -1662,15 +1959,26 @@ const buildModelCatalog = (models) =>
         : {}),
     }));
 
-const clearThreadTransfer = (session) => {
-  const transfer = session.threadTransfer;
+// A controller may pull a few large threads at once (one per open pane), so
+// transfers are kept per thread, a few at most: the oldest goes first.
+const MAX_THREAD_TRANSFERS = 2;
+
+const dropThreadTransfer = (session, threadId) => {
+  const transfer = session.threadTransfers?.get(threadId);
   if (!transfer) return;
   clearTimeout(transfer.expiryTimer);
-  if (session.threadTransfer === transfer) session.threadTransfer = null;
+  session.threadTransfers.delete(threadId);
+};
+
+const clearThreadTransfer = (session) => {
+  for (const threadId of [...(session.threadTransfers?.keys() ?? [])]) dropThreadTransfer(session, threadId);
 };
 
 const retainThreadTransfer = (session, threadId, serialized) => {
-  clearThreadTransfer(session);
+  dropThreadTransfer(session, threadId);
+  while (session.threadTransfers.size >= MAX_THREAD_TRANSFERS) {
+    dropThreadTransfer(session, session.threadTransfers.keys().next().value);
+  }
   const transfer = {
     threadId,
     serialized,
@@ -1678,11 +1986,75 @@ const retainThreadTransfer = (session, threadId, serialized) => {
     expiryTimer: null,
   };
   transfer.expiryTimer = setTimeout(() => {
-    if (session.threadTransfer === transfer) session.threadTransfer = null;
+    if (session.threadTransfers.get(threadId) === transfer) session.threadTransfers.delete(threadId);
   }, THREAD_TRANSFER_TTL_MS);
   transfer.expiryTimer.unref?.();
-  session.threadTransfer = transfer;
+  session.threadTransfers.set(threadId, transfer);
   return transfer;
+};
+
+const indexEntries = async () => {
+  if (!deps?.readThreadsIndex) return [];
+  try {
+    const index = await deps.readThreadsIndex();
+    return Array.isArray(index?.entries) ? index.entries : [];
+  } catch {
+    return [];
+  }
+};
+
+const parentIdOf = (entry) => entry?.parentThreadId ?? entry?.shell?.parentThreadId ?? null;
+
+/** A thread's subagent threads here, at any depth. */
+const descendantThreadIds = async (threadId, entries = null) => {
+  const all = entries ?? (await indexEntries());
+  const children = new Map();
+  for (const entry of all) {
+    const parentId = parentIdOf(entry);
+    if (!parentId) continue;
+    if (!children.has(parentId)) children.set(parentId, []);
+    children.get(parentId).push(entry.id);
+  }
+  const found = [];
+  const queue = [threadId];
+  const seen = new Set(queue);
+  while (queue.length > 0 && found.length < 500) {
+    for (const child of children.get(queue.shift()) ?? []) {
+      if (seen.has(child)) continue;
+      seen.add(child);
+      found.push(child);
+      queue.push(child);
+    }
+  }
+  return found;
+};
+
+/**
+ * The actions a thread or any of its subagents waits on the user for here,
+ * each with the thread that asked (`ownerThreadId`): a controller shows them
+ * on the thread it lists (it doesn't list subagents).
+ */
+const pendingUserActionsOf = async (threadId, entries = null) => {
+  const all = entries ?? (await indexEntries());
+  const byId = new Map(all.map((entry) => [entry.id, entry]));
+  const ids = [threadId, ...(await descendantThreadIds(threadId, all))];
+  return ids.flatMap((id) => {
+    const actions = byId.get(id)?.shell?.userActions;
+    return Array.isArray(actions) ? actions.map((action) => ({ ...action, ownerThreadId: id })) : [];
+  });
+};
+
+// The stored version of a thread (its threads-index hash), so a controller
+// that already has it can skip the transfer.
+const storedThreadVersion = async (threadId) => {
+  if (!deps?.readThreadsIndex) return null;
+  try {
+    const index = await deps.readThreadsIndex();
+    const entry = (index?.entries ?? []).find((candidate) => candidate?.id === threadId);
+    return typeof entry?.hash === 'string' ? entry.hash : null;
+  } catch {
+    return null;
+  }
 };
 
 const threadResponseFitsFrame = (reqId, serialized) =>
@@ -1713,11 +2085,130 @@ const handleHostRequest = async (session, message) => {
         respond({ ok: true });
         return;
       case 'snapshot':
-        respond({ ok: true, snapshot: await buildSnapshot() });
+        respond({ ok: true, snapshot: fitSnapshot(await buildSnapshot()) });
         return;
       case 'models':
         respond({ ok: true, models: buildModelCatalog(await deps.listAgentModels()) });
         return;
+      case 'attachmentUpload':
+        respond(await handleAttachmentUpload(session, message));
+        return;
+      case 'attachmentRead':
+        respond(await handleAttachmentRead(message));
+        return;
+      case 'follow': {
+        // The threads this controller shows: their streams come through.
+        session.followedThreads = new Set(
+          (Array.isArray(message?.threadIds) ? message.threadIds : [])
+            .slice(0, 64)
+            .map((id) => String(id).slice(0, 128))
+        );
+        respond({ ok: true });
+        return;
+      }
+      case 'questions': {
+        // The questions and approvals a thread's agent (or one of its
+        // subagents) is waiting on here.
+        const threadId = String(message?.threadId ?? '');
+        const ids = [threadId, ...(await descendantThreadIds(threadId))];
+        const questions = deps.listAgentQuestions
+          ? (await Promise.all(ids.map((id) => deps.listAgentQuestions(id)))).flat()
+          : null;
+        if (!Array.isArray(questions)) {
+          respond({ ok: false, error: 'This machine cannot share agent questions. Update Durango Code on it.' });
+          return;
+        }
+        respond({ ok: true, questions });
+        return;
+      }
+      case 'answerQuestion': {
+        // Answered here exactly as this machine's own question card would.
+        const answers = message?.answers;
+        if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+          respond({ ok: false, error: 'Invalid answers.' });
+          return;
+        }
+        const result = await requestRendererCommand(
+          {
+            kind: 'answerQuestion',
+            threadId: String(message?.threadId ?? ''),
+            runId: String(message?.runId ?? ''),
+            requestId:
+              typeof message?.requestId === 'number' ? message.requestId : String(message?.requestId ?? ''),
+            answers: Object.fromEntries(
+              Object.entries(answers)
+                .slice(0, 50)
+                .map(([key, values]) => [
+                  String(key).slice(0, 200),
+                  (Array.isArray(values) ? values : []).slice(0, 50).map((value) => String(value).slice(0, 20_000)),
+                ])
+            ),
+            source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
+          },
+          Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
+          session,
+          acknowledgeClaim
+        );
+        respond(result);
+        return;
+      }
+      case 'userAction': {
+        // Done, Reply, Dismiss or Watch on an action a thread here asked for.
+        const op = message?.op;
+        if (op !== 'done' && op !== 'reply' && op !== 'dismiss' && op !== 'watch' && op !== 'secret') {
+          respond({ ok: false, error: 'Invalid user action operation.' });
+          return;
+        }
+        // A request_secret card's answer: the value (or a decline), for this
+        // machine's agent, never stored on the controller.
+        const secretAnswer =
+          op !== 'secret'
+            ? null
+            : message?.secretAnswer?.type === 'save' && typeof message.secretAnswer.value === 'string'
+              ? { type: 'save', value: message.secretAnswer.value.slice(0, 100_000) }
+              : message?.secretAnswer?.type === 'decline'
+                ? { type: 'decline' }
+                : undefined;
+        if (secretAnswer === undefined) {
+          respond({ ok: false, error: 'Invalid secret answer.' });
+          return;
+        }
+        let attachments;
+        try {
+          attachments = resolveUploadedAttachments(session, message?.attachments);
+        } catch (error) {
+          respond({ ok: false, error: error?.message ?? String(error) });
+          return;
+        }
+        const result = await requestRendererCommand(
+          {
+            kind: 'userAction',
+            threadId: String(message?.threadId ?? ''),
+            actionId: String(message?.actionId ?? ''),
+            op,
+            ...(op === 'reply' ? { reply: String(message?.reply ?? '').slice(0, 200_000), attachments } : {}),
+            ...(op === 'watch' ? { watching: message?.watching === true } : {}),
+            ...(secretAnswer ? { secretAnswer } : {}),
+            source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
+          },
+          Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
+          session,
+          acknowledgeClaim
+        );
+        settleUploadedAttachments(session, attachments, result?.ok === true);
+        respond(result);
+        return;
+      }
+      case 'threadGit': {
+        // Where a thread works on this machine: its branch (and workspace),
+        // for the controller's prompt box.
+        if (typeof deps?.threadGitState !== 'function') {
+          respond({ ok: false, error: 'This machine cannot report branches. Update Durango Code on it.' });
+          return;
+        }
+        respond(await deps.threadGitState(String(message?.threadId ?? '')));
+        return;
+      }
       case 'thread': {
         const threadId = String(message?.threadId ?? '');
         const isContinuation = message?.threadOffset !== undefined;
@@ -1729,7 +2220,7 @@ const handleHostRequest = async (session, message) => {
             });
             return;
           }
-          const transfer = session.threadTransfer;
+          const transfer = session.threadTransfers.get(threadId);
           if (
             !transfer ||
             transfer.threadId !== threadId ||
@@ -1755,6 +2246,12 @@ const handleHostRequest = async (session, message) => {
           });
           return;
         }
+        // The controller's copy is current: nothing to send.
+        const storedVersion = await storedThreadVersion(threadId);
+        if (storedVersion && typeof message?.knownVersion === 'string' && message.knownVersion === storedVersion) {
+          respond({ ok: true, unchanged: true, storedVersion });
+          return;
+        }
         let thread = null;
         try {
           if (deps.readThreadById) {
@@ -1773,7 +2270,13 @@ const handleHostRequest = async (session, message) => {
           respond({ ok: false, error: 'This thread is too large to transfer safely.' });
           return;
         }
-        const directPayload = { ok: true, thread };
+        const pendingUserActions = await pendingUserActionsOf(threadId);
+        const directPayload = {
+          ok: true,
+          thread,
+          pendingUserActions,
+          ...(storedVersion ? { storedVersion } : {}),
+        };
         // Keep the original response shape for ordinary transcripts and older
         // controllers. Oversized transcripts use a pull-based byte transfer:
         // the controller requests the next chunk only after receiving this
@@ -1798,19 +2301,30 @@ const handleHostRequest = async (session, message) => {
           nextThreadOffset: end < serialized.length ? end : null,
           threadVersion: transfer.version,
           threadBytes: serialized.length,
+          pendingUserActions,
+          ...(storedVersion ? { storedVersion } : {}),
         });
         return;
       }
       case 'runTurn': {
         const prompt = typeof message?.prompt === 'string' ? message.prompt.trim() : '';
-        if (!prompt) {
+        const hasAttachments = Array.isArray(message?.attachments) && message.attachments.length > 0;
+        if (!prompt && !hasAttachments) {
           respond({ ok: false, error: 'Empty prompt.' });
+          return;
+        }
+        let attachments;
+        try {
+          attachments = resolveUploadedAttachments(session, message?.attachments);
+        } catch (error) {
+          respond({ ok: false, error: error?.message ?? String(error) });
           return;
         }
         const result = await requestRendererCommand(
           {
             kind: 'runTurn',
             prompt: prompt.slice(0, 200_000),
+            ...(attachments.length > 0 ? { attachments } : {}),
             threadId: typeof message?.threadId === 'string' ? message.threadId : undefined,
             projectId: typeof message?.projectId === 'string' ? message.projectId : undefined,
             modelId: typeof message?.modelId === 'string' ? message.modelId : undefined,
@@ -1824,6 +2338,7 @@ const handleHostRequest = async (session, message) => {
           session,
           acknowledgeClaim
         );
+        settleUploadedAttachments(session, attachments, result?.ok === true);
         respond(result);
         return;
       }
@@ -1874,10 +2389,26 @@ const pushToControllers = (payload) => {
   }
 };
 
-/** Tap of agent turn events; forwarded so controllers can follow live runs. */
+// Turn events every controller gets whatever it follows: a run started or
+// ended, or a question asked or answered. The rest (streamed text, tool
+// activity) go only to controllers following that thread.
+const LIFECYCLE_EVENT_TYPES = new Set(['started', 'done', 'error', 'user-input']);
+
+/**
+ * Tap of agent turn events; forwarded so controllers can follow live runs.
+ * A controller that named the threads it follows (`follow`) gets the stream
+ * of those only; one that never did (app.durango.sh, older desktops) gets all.
+ */
 export const forwardAgentEventToRemote = (event) => {
   if (hostSessions.size === 0) return;
-  pushToControllers({ t: 'event', kind: 'turnEvent', payload: event });
+  const payload = { t: 'event', kind: 'turnEvent', payload: event };
+  const lifecycle = LIFECYCLE_EVENT_TYPES.has(event?.type);
+  for (const session of hostSessions) {
+    if (!session.ready || session.channel.closed) continue;
+    const followed = session.followedThreads;
+    if (followed && !lifecycle && !followed.has(event?.threadId) && !followed.has(event?.parentThreadId)) continue;
+    session.channel.send(payload);
+  }
 };
 
 /** Store or threads file changed on disk — tell controllers to refresh. */
@@ -2068,18 +2599,127 @@ const outboundPairingCanContinue = (attempt) =>
 
 const cancelledOutboundPairingResult = (attempt) => ({
   ok: false,
+  cancelled: true,
   error:
     attempt?.cancelledReason ??
     (settings.enabled ? 'The pairing attempt was cancelled.' : 'Remote control is disabled in Settings.'),
 });
 
 /**
- * Pair with a host. Addressing is the only thing that differs between the two
- * modes: pass `host` + `port` to reach it directly, or `machineId` to reach it
- * through the relay. Same pairing code, same handshake, same account proof,
- * same single-use semantics either way.
+ * Pair with a host. Over the internet the pairing code is all the user types:
+ * pass just `code` and the machine is found among this account's machines
+ * (pairByCode). `host` + `port` reach a machine directly on the local network,
+ * and `machineId` names a relay machine explicitly. Same pairing code, same
+ * handshake, same account proof, same single-use semantics either way.
  */
-export const pairWithRemoteHost = async ({ host, port, code, machineId } = {}) => {
+export const pairWithRemoteHost = async ({ host, port, code, machineId } = {}) =>
+  String(machineId ?? '').trim() || String(host ?? '').trim()
+    ? pairWithTarget({ host, port, code, machineId })
+    : pairByCode(code);
+
+/**
+ * Pair by code alone: ask Durango Cloud for this account's machines that are
+ * online at the relay and offer the code to each until one accepts. Only a
+ * machine showing a code can accept; one without an active code fails the
+ * handshake at no cost to it (such attempts don't count toward its relay
+ * rate limit, see the confirm stage). Machines this one has not paired with go first,
+ * since re-pairing an already paired machine is the rare case. The account
+ * proof still binds the pairing to this account, so the lookup only decides
+ * where to knock.
+ */
+// The first release whose hosts don't count a pairing attempt without a live
+// code toward their relay rate limit. Older hosts would be locked out of the
+// relay by a few knocks, so they are not tried (pair with them by address).
+export const PAIR_BY_CODE_MIN_VERSION = '1.0.190';
+
+const versionParts = (value) =>
+  String(value ?? '')
+    .split(/[.+-]/)
+    .slice(0, 3)
+    .map((part) => Number.parseInt(part, 10));
+const compareVersions = (left, right) => {
+  const a = versionParts(left);
+  const b = versionParts(right);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (Number.isFinite(a[index]) ? a[index] : -1) - (Number.isFinite(b[index]) ? b[index] : -1);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+};
+
+/**
+ * Whether a machine (by the version it registered with) can be offered a
+ * code. A development build of this machine also tries machines on its own
+ * version, so two builds of the same tree can pair.
+ */
+export const canOfferCodeTo = (machineVersion, ownVersion) => {
+  const own = ownVersion && compareVersions(ownVersion, PAIR_BY_CODE_MIN_VERSION) < 0 ? ownVersion : PAIR_BY_CODE_MIN_VERSION;
+  return Boolean(machineVersion) && compareVersions(machineVersion, own) >= 0;
+};
+
+const pairByCode = async (code) => {
+  if (!identity) {
+    return { ok: false, error: stateError ?? 'Remote control is unavailable on this machine.' };
+  }
+  if (!settings.enabled) {
+    return { ok: false, error: 'Remote control is disabled in Settings.' };
+  }
+  if (!relayEnabled()) {
+    return {
+      ok: false,
+      error:
+        'Turn on “Connect over the internet” to pair with a code alone, or enter the other machine’s address.',
+    };
+  }
+  if (normalizePairingCode(code).length < PAIRING_CODE_LENGTH) {
+    return { ok: false, error: 'Enter the full pairing code shown on the other machine.' };
+  }
+  if (typeof deps?.listRelayDevices !== 'function') {
+    return { ok: false, error: 'This build cannot look up your machines at Durango Cloud.' };
+  }
+  let devices;
+  try {
+    devices = await deps.listRelayDevices();
+  } catch (error) {
+    return { ok: false, error: `Could not list your machines at Durango Cloud: ${error?.message ?? error}` };
+  }
+  const paired = new Set(remoteMachines.map((machine) => machine.id));
+  const online = (Array.isArray(devices) ? devices : []).filter(
+    (device) =>
+      typeof device?.machineId === 'string' &&
+      device.machineId &&
+      device.online === true &&
+      device.machineId !== identity.machineId
+  );
+  const ownVersion = deps.getAppVersion?.() ?? null;
+  const candidates = online
+    .filter((device) => canOfferCodeTo(device.appVersion, ownVersion))
+    .sort((left, right) => Number(paired.has(left.machineId)) - Number(paired.has(right.machineId)));
+  if (candidates.length === 0) {
+    const outdated = online.map((device) => device.name).filter(Boolean);
+    return {
+      ok: false,
+      error:
+        outdated.length > 0
+          ? `Update Durango Code on ${outdated.join(', ')} to pair with a code alone (or pair by its address on your own network).`
+          : 'None of your other machines is online over the internet. On the machine you want to control, turn on remote control and “Connect over the internet”, then generate a code.',
+    };
+  }
+  // A machine that took the handshake (the code matched) and then failed says
+  // why; that beats the handshake failures of the machines the code wasn't for.
+  let specificError = null;
+  for (const device of candidates) {
+    const result = await pairWithTarget({ machineId: device.machineId, code });
+    if (result.ok || result.cancelled || result.needsAuth) return result;
+    if (result.error && !/^Could not pair:/.test(result.error)) specificError = result.error;
+  }
+  return {
+    ok: false,
+    error: specificError ?? 'None of your machines accepted that code. Check it and that it has not expired.',
+  };
+};
+
+const pairWithTarget = async ({ host, port, code, machineId } = {}) => {
   if (!identity) {
     return { ok: false, error: stateError ?? 'Remote control is unavailable on this machine.' };
   }
@@ -2120,7 +2760,7 @@ export const pairWithRemoteHost = async ({ host, port, code, machineId } = {}) =
       return { ok: false, error: 'Enter a valid port.' };
     }
   }
-  if (normalizedCode.length < 12) return { ok: false, error: 'Enter the full pairing code.' };
+  if (normalizedCode.length < PAIRING_CODE_LENGTH) return { ok: false, error: 'Enter the full pairing code.' };
 
   // A retry supersedes any older controller-side attempt. Abort its transport
   // and Cloud proof request before registering the replacement owner.
@@ -2156,7 +2796,7 @@ export const pairWithRemoteHost = async ({ host, port, code, machineId } = {}) =
     return {
       ok: false,
       error: overRelay
-        ? `Could not pair: ${error?.message ?? error}. Check the machine ID and code, and that the other machine is online over the internet.`
+        ? `Could not pair: ${error?.message ?? error}. Check the code, and that the other machine is online over the internet.`
         : `Could not pair: ${error?.message ?? error}. Check the address, port, and code.`,
       };
   }
@@ -2598,7 +3238,12 @@ export const fetchRemoteSnapshot = async ({ machineId } = {}) => {
   }
 };
 
-export const fetchRemoteThread = async ({ machineId, threadId } = {}) => {
+/**
+ * A paired host's thread. With `knownVersion` (the storedVersion of the copy
+ * this machine has), a host that still has that version answers
+ * `{ unchanged: true }` instead of sending it again.
+ */
+export const fetchRemoteThread = async ({ machineId, threadId, knownVersion } = {}) => {
   try {
     const targetMachineId = String(machineId ?? '');
     const targetThreadId = String(threadId ?? '');
@@ -2606,18 +3251,32 @@ export const fetchRemoteThread = async ({ machineId, threadId } = {}) => {
     let expectedOffset;
     let expectedVersion;
     let expectedBytes;
+    let storedVersion;
+    let pendingUserActions;
     for (;;) {
       const response = await clientRequest(targetMachineId, {
         t: 'thread',
         threadId: targetThreadId,
         threadChunking: true,
+        ...(expectedOffset === undefined && typeof knownVersion === 'string' && knownVersion
+          ? { knownVersion: knownVersion.slice(0, 200) }
+          : {}),
         ...(expectedOffset === undefined ? {} : { threadOffset: expectedOffset }),
         ...(expectedVersion === undefined ? {} : { threadVersion: expectedVersion }),
       });
       if (!response.ok) return { ok: false, error: response.error ?? 'Thread fetch failed.' };
+      if (expectedOffset === undefined && typeof response.storedVersion === 'string') {
+        storedVersion = response.storedVersion.slice(0, 200);
+      }
+      if (response.unchanged === true && expectedOffset === undefined) {
+        return { ok: true, unchanged: true, storedVersion };
+      }
       // Ordinary and older hosts return the complete thread in one response.
+      if (expectedOffset === undefined && Array.isArray(response.pendingUserActions)) {
+        pendingUserActions = response.pendingUserActions;
+      }
       if (response.thread !== undefined && expectedOffset === undefined) {
-        return { ok: true, thread: response.thread };
+        return { ok: true, thread: response.thread, ...(storedVersion ? { storedVersion } : {}), ...(pendingUserActions ? { pendingUserActions } : {}) };
       }
       if (
         typeof response.threadChunk !== 'string' ||
@@ -2648,7 +3307,7 @@ export const fetchRemoteThread = async ({ machineId, threadId } = {}) => {
         } catch {
           throw new Error('The host sent a malformed thread.');
         }
-        return { ok: true, thread };
+        return { ok: true, thread, ...(storedVersion ? { storedVersion } : {}), ...(pendingUserActions ? { pendingUserActions } : {}) };
       }
       if (
         !Number.isSafeInteger(response.nextThreadOffset) ||
@@ -2664,11 +3323,56 @@ export const fetchRemoteThread = async ({ machineId, threadId } = {}) => {
   }
 };
 
+/**
+ * Send one local file to a paired host for a turn (handleAttachmentUpload on
+ * the host) → { uploadId, hostPath }.
+ */
+const uploadAttachmentToHost = async (machineId, attachment) => {
+  const localPath = String(attachment?.path ?? '');
+  const handle = await fs.open(localPath, 'r');
+  try {
+    const { size } = await handle.stat();
+    if (size > MAX_REMOTE_ATTACHMENT_BYTES) {
+      throw new Error(`${attachment?.name ?? 'An attachment'} is too large to send to another machine (100 MB at most).`);
+    }
+    let uploadId;
+    let offset = 0;
+    for (;;) {
+      const length = Math.min(ATTACHMENT_CHUNK_BYTES, size - offset);
+      const buffer = Buffer.alloc(length);
+      if (length > 0) {
+        const { bytesRead } = await handle.read(buffer, 0, length, offset);
+        if (bytesRead !== length) throw new Error(`${attachment?.name ?? 'An attachment'} changed while it was being sent.`);
+      }
+      const response = await clientRequest(machineId, {
+        t: 'attachmentUpload',
+        ...(uploadId ? { uploadId } : { name: String(attachment?.name ?? path.basename(localPath)), mimeType: attachment?.mimeType, size }),
+        offset,
+        data: buffer.toString('base64'),
+      });
+      if (!response.ok) {
+        throw new Error(
+          response.error === 'Unsupported request.'
+            ? 'That machine cannot receive attachments yet. Update Durango Code on it.'
+            : (response.error ?? 'The attachment could not be sent.')
+        );
+      }
+      uploadId = response.uploadId;
+      offset += length;
+      if (response.done) return { uploadId, hostPath: typeof response.path === 'string' ? response.path : null };
+      if (length === 0 || response.received !== offset) throw new Error('The host did not accept the attachment.');
+    }
+  } finally {
+    await handle.close().catch(() => {});
+  }
+};
+
 export const runRemoteTurn = async ({
   machineId,
   threadId,
   projectId,
   prompt,
+  attachments,
   modelId,
   accessMode,
   reasoningEffort,
@@ -2676,12 +3380,25 @@ export const runRemoteTurn = async ({
   claudeContextWindow,
 } = {}) => {
   try {
+    const targetMachineId = String(machineId ?? '');
     const requestedAccessMode = sanitizeAccessMode(accessMode);
     const requestedReasoningEffort = sanitizeReasoningEffort(reasoningEffort);
     const requestedCodexServiceTier = sanitizeCodexServiceTier(codexServiceTier);
     const requestedClaudeContextWindow = sanitizeClaudeContextWindow(claudeContextWindow);
+    // The turn's files go first; the turn names them by upload id.
+    const uploaded = [];
+    for (const attachment of Array.isArray(attachments) ? attachments.slice(0, 32) : []) {
+      const { uploadId, hostPath } = await uploadAttachmentToHost(targetMachineId, attachment);
+      uploaded.push({
+        uploadId,
+        hostPath,
+        localPath: String(attachment.path),
+        name: String(attachment?.name ?? ''),
+        ...(attachment?.snapshot ? { snapshot: attachment.snapshot } : {}),
+      });
+    }
     const response = await clientRequest(
-      String(machineId ?? ''),
+      targetMachineId,
       {
         t: 'runTurn',
         ...(threadId ? { threadId: String(threadId) } : {}),
@@ -2692,6 +3409,15 @@ export const runRemoteTurn = async ({
         ...(requestedCodexServiceTier ? { codexServiceTier: requestedCodexServiceTier } : {}),
         ...(requestedClaudeContextWindow
           ? { claudeContextWindow: requestedClaudeContextWindow }
+          : {}),
+        ...(uploaded.length > 0
+          ? {
+              attachments: uploaded.map(({ uploadId, name, snapshot }) => ({
+                uploadId,
+                name,
+                ...(snapshot ? { snapshot } : {}),
+              })),
+            }
           : {}),
         prompt: String(prompt ?? ''),
       },
@@ -2704,7 +3430,187 @@ export const runRemoteTurn = async ({
     return {
       ok: response.ok === true,
       threadId: typeof response.threadId === 'string' ? response.threadId : undefined,
+      // Where each attachment landed on the host, so the controller's mirror
+      // can show its own copy.
+      ...(uploaded.length > 0
+        ? {
+            attachments: uploaded
+              .filter((item) => item.hostPath)
+              .map(({ hostPath, localPath }) => ({ hostPath, localPath })),
+          }
+        : {}),
       error: response.ok ? undefined : (response.error ?? 'The remote turn could not start.'),
+    };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/**
+ * A copy of one of a paired host's attachments (shown in this machine's
+ * mirror of its thread), kept in this machine's attachment cache. Reused when
+ * already fetched.
+ */
+export const fetchRemoteAttachment = async ({ machineId, path: hostPath } = {}) => {
+  try {
+    const targetMachineId = String(machineId ?? '');
+    const requestedPath = String(hostPath ?? '');
+    if (typeof deps?.getRemoteAttachmentCacheDir !== 'function') {
+      return { ok: false, error: 'Attachments from other machines are unavailable.' };
+    }
+    const directory = path.join(
+      deps.getRemoteAttachmentCacheDir(),
+      crypto.createHash('sha256').update(targetMachineId).digest('hex').slice(0, 16)
+    );
+    const localPath = path.join(
+      directory,
+      `${crypto.createHash('sha256').update(requestedPath).digest('hex').slice(0, 16)}-${sanitizeAttachmentName(path.basename(requestedPath))}`
+    );
+    try {
+      await fs.access(localPath);
+      return { ok: true, path: localPath };
+    } catch {}
+    const chunks = [];
+    let offset = 0;
+    let size = null;
+    for (;;) {
+      const response = await clientRequest(targetMachineId, { t: 'attachmentRead', path: requestedPath, offset });
+      if (!response.ok) return { ok: false, error: response.error ?? 'Could not fetch the attachment.' };
+      if (!Number.isSafeInteger(response.size) || response.size > MAX_REMOTE_ATTACHMENT_BYTES) {
+        throw new Error('The host sent an invalid attachment.');
+      }
+      if (size === null) size = response.size;
+      if (response.size !== size || response.offset !== offset) throw new Error('The host sent an invalid attachment.');
+      const chunk = Buffer.from(String(response.data ?? ''), 'base64');
+      if (chunk.length > ATTACHMENT_CHUNK_BYTES || offset + chunk.length > size) {
+        throw new Error('The host sent an invalid attachment.');
+      }
+      chunks.push(chunk);
+      offset += chunk.length;
+      if (response.nextOffset === null) break;
+      // Bounded by the size the host announced: a host cannot keep a fetch
+      // going (and this machine buffering) past it.
+      if (response.nextOffset !== offset || chunk.length === 0 || offset >= size) {
+        throw new Error('The host sent an invalid attachment.');
+      }
+    }
+    if (offset !== size) throw new Error('The host sent an incomplete attachment.');
+    await fs.mkdir(directory, { recursive: true });
+    const temporary = `${localPath}.${crypto.randomUUID()}.part`;
+    await fs.writeFile(temporary, Buffer.concat(chunks, size));
+    await fs.rename(temporary, localPath);
+    return { ok: true, path: localPath };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/** Name the host threads this machine shows, so their streams come through. */
+export const followRemoteThreads = async ({ machineId, threadIds } = {}) => {
+  try {
+    const response = await clientRequest(String(machineId ?? ''), {
+      t: 'follow',
+      threadIds: (Array.isArray(threadIds) ? threadIds : []).slice(0, 64).map(String),
+    });
+    return { ok: response.ok === true };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+const unsupportedMessage = (response, what) =>
+  response.error === 'Unsupported request.' ? `That machine cannot ${what} yet. Update Durango Code on it.` : null;
+
+/** The questions and approvals a host thread's agent is waiting on. */
+export const listRemoteQuestions = async ({ machineId, threadId } = {}) => {
+  try {
+    const response = await clientRequest(String(machineId ?? ''), { t: 'questions', threadId: String(threadId ?? '') });
+    if (!response.ok) {
+      return { ok: false, error: unsupportedMessage(response, 'share agent questions') ?? response.error ?? 'Could not read the questions.' };
+    }
+    return { ok: true, questions: Array.isArray(response.questions) ? response.questions : [] };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/** Answer one of them there. */
+export const answerRemoteQuestion = async ({ machineId, threadId, runId, requestId, answers } = {}) => {
+  try {
+    const response = await clientRequest(
+      String(machineId ?? ''),
+      { t: 'answerQuestion', threadId: String(threadId ?? ''), runId: String(runId ?? ''), requestId, answers },
+      (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
+        (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),
+      { extendOnClaim: true }
+    );
+    if (!response.ok) {
+      return { ok: false, error: unsupportedMessage(response, 'take answers') ?? response.error ?? 'The answer was not accepted.' };
+    }
+    return { ok: true };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/**
+ * Done, Reply (with files), Dismiss or Watch on an action a host thread asked
+ * the user for (request_user_action).
+ */
+export const remoteUserAction = async ({ machineId, threadId, actionId, op, reply, attachments, watching, secretAnswer } = {}) => {
+  try {
+    const targetMachineId = String(machineId ?? '');
+    const uploaded = [];
+    if (op === 'reply') {
+      for (const attachment of Array.isArray(attachments) ? attachments.slice(0, 32) : []) {
+        const { uploadId } = await uploadAttachmentToHost(targetMachineId, attachment);
+        uploaded.push({ uploadId, name: String(attachment?.name ?? '') });
+      }
+    }
+    const response = await clientRequest(
+      targetMachineId,
+      {
+        t: 'userAction',
+        threadId: String(threadId ?? ''),
+        actionId: String(actionId ?? ''),
+        op,
+        ...(op === 'reply' ? { reply: String(reply ?? ''), attachments: uploaded } : {}),
+        ...(op === 'watch' ? { watching: watching === true } : {}),
+        ...(op === 'secret' ? { secretAnswer } : {}),
+      },
+      (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
+        (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),
+      { extendOnClaim: true }
+    );
+    if (!response.ok) {
+      return { ok: false, error: unsupportedMessage(response, 'take user action answers') ?? response.error ?? 'That machine did not take it.' };
+    }
+    return { ok: true };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/** The branch (and Durango workspace) a host's thread works in. */
+export const fetchRemoteThreadGit = async ({ machineId, threadId } = {}) => {
+  try {
+    const response = await clientRequest(String(machineId ?? ''), { t: 'threadGit', threadId: String(threadId ?? '') });
+    if (!response.ok) {
+      return {
+        ok: false,
+        error:
+          response.error === 'Unsupported request.'
+            ? 'That machine cannot report branches yet. Update Durango Code on it.'
+            : (response.error ?? 'Could not read the branch.'),
+      };
+    }
+    return {
+      ok: true,
+      branch: typeof response.branch === 'string' ? response.branch.slice(0, 300) : null,
+      detachedHead: typeof response.detachedHead === 'string' ? response.detachedHead.slice(0, 64) : null,
+      workspaceName: typeof response.workspaceName === 'string' ? response.workspaceName.slice(0, 200) : null,
+      changeId: typeof response.changeId === 'string' ? response.changeId.slice(0, 100) : null,
+      dirty: response.dirty === true,
     };
   } catch (error) {
     return clientErrorResult(error);

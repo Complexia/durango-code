@@ -39,9 +39,16 @@ if (role) {
 
   // Stand-ins for the orion-next endpoints main.js calls. They count calls so
   // the direct-mode test can assert the engine never reaches for the relay.
-  const relayCalls = { register: 0, ticket: 0, registeredUsers: [] };
+  const relayCalls = { register: 0, ticket: 0, list: 0, registeredUsers: [] };
   let markRelayTicketStarted = null;
+  // What GET /api/relay/devices answers: the account's machines, for pairing
+  // by code alone. Set by the controller role.
+  let relayDeviceList = [];
   const relayDeps = {
+    listRelayDevices: async () => {
+      relayCalls.list += 1;
+      return relayDeviceList;
+    },
     registerRelayDevice: async () => {
       relayCalls.register += 1;
       relayCalls.registeredUsers.push(activeSessionUserId);
@@ -88,6 +95,7 @@ if (role) {
       projectId: 'p1',
       title: 'Fix the flaky test',
       status: 'idle',
+      userActions: [{ id: 'ua1', action: 'Approve the Stripe login in your browser', askedAt: '2026-08-01T10:00:02.000Z' }],
       modelId: 'claude:sonnet',
       createdAt: '2026-08-01T10:00:00.000Z',
       messages: [
@@ -127,12 +135,18 @@ if (role) {
       projects: [{ id: 'p1', name: 'orion', path: '/tmp/orion' }],
     }),
     readThreadsFile: async () => ({ threads: fixtureThreads }),
+    // The stored version of each thread (index hash), for unchanged answers.
+    readThreadsIndex: async () => ({
+      entries: fixtureThreads.map((thread) => ({ id: thread.id, hash: `v-${thread.id}`, shell: thread, summary: null })),
+    }),
     broadcast: () => 1,
     dispatchRendererCommand: (payload) => {
       const { commandId, command } = payload;
       if (command.kind === 'runTurn') {
         engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId ?? 't-new' });
-      } else if (command.kind === 'stopTurn') {
+      } else if (command.kind === 'userAction' && command.actionId === 'gone') {
+        engine.resolveRemoteCommand({ commandId, ok: false, error: 'That action is no longer waiting.' });
+      } else if (command.kind === 'stopTurn' || command.kind === 'answerQuestion' || command.kind === 'userAction') {
         engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId });
       }
       send({ kind: 'commandSeen', command });
@@ -140,6 +154,21 @@ if (role) {
     },
     ...remoteAccountProofDeps,
     ...relayDeps,
+    getAttachmentDirectoryPath: () => path.join(process.env.ORION_TEST_USERDATA, 'attachments'),
+    getRemoteAttachmentCacheDir: () => path.join(process.env.ORION_TEST_USERDATA, 'attachments', 'remote'),
+    // t1's agent waits on a question here.
+    listAgentQuestions: async (threadId) =>
+      threadId === 't1'
+        ? [{ providerId: 'claude', runId: 'run-1', requestId: 7, threadId: 't1', questions: [{ id: 'q1', header: 'Deploy', question: 'Deploy now?', options: [{ label: 'Yes', description: '' }] }] }]
+        : [],
+    hasPendingQuestions: (threadId) => threadId === 't1',
+    threadGitState: async (threadId) => ({
+      ok: true,
+      branch: 'main',
+      detachedHead: null,
+      workspaceName: threadId === 't1' ? 'fix-flaky-test' : null,
+      dirty: false,
+    }),
     getAppVersion: () => '0.0.0-test',
   });
 
@@ -284,13 +313,88 @@ if (role) {
       machineId: crypto.randomUUID(),
       code,
     });
-    results.pair = await engine.pairWithRemoteHost({ machineId: hostMachineId, code });
+    // Pairing by code alone: the lookup offers an online machine the relay
+    // has no host for (it must be skipped), an offline one (never tried), and
+    // the real host.
+    relayDeviceList = [
+      { machineId: crypto.randomUUID(), online: true, appVersion: '0.0.0-test' },
+      { machineId: 'offline-machine', online: false, appVersion: '0.0.0-test' },
+      // Too old to be offered a code (no version: never registered one).
+      { machineId: 'old-machine', name: 'Old Mac', online: true },
+      { machineId: hostMachineId, online: true, appVersion: '0.0.0-test' },
+    ];
+    results.wrongCodeByLookup = await engine.pairWithRemoteHost({ code: 'AAAAA-BBBBB' });
+    results.pair = await engine.pairWithRemoteHost({ code: ` ${code.toLowerCase()} ` });
     results.snapshot = await engine.fetchRemoteSnapshot({ machineId: results.pair.machine?.id });
     results.thread = await engine.fetchRemoteThread({ machineId: results.pair.machine?.id, threadId: 't1' });
+    results.threadAgain = await engine.fetchRemoteThread({
+      machineId: results.pair.machine?.id,
+      threadId: 't1',
+      knownVersion: results.thread.storedVersion,
+    });
+    // A turn with a file big enough to travel in several chunks.
+    const attachmentBytes = crypto.randomBytes(7 * 1024 * 1024 + 123);
+    const attachmentPath = path.join(process.env.ORION_TEST_USERDATA, 'design.bin');
+    fs.writeFileSync(attachmentPath, attachmentBytes);
+    results.attachmentHash = crypto.createHash('sha256').update(attachmentBytes).digest('hex');
     results.runTurn = await engine.runRemoteTurn({
       machineId: results.pair.machine?.id,
       projectId: 'p1',
       prompt: 'build the thing over the internet',
+      attachments: [
+        { id: 'a1', name: 'design.bin', path: attachmentPath, mimeType: 'application/octet-stream', size: attachmentBytes.length },
+      ],
+    });
+    const hostPath = results.runTurn.attachments?.[0]?.hostPath;
+    results.hostCopyHash = hostPath
+      ? crypto.createHash('sha256').update(fs.readFileSync(hostPath)).digest('hex')
+      : null;
+    // …and back: the host's attachment, copied into this machine's cache.
+    results.fetchedAttachment = hostPath
+      ? await engine.fetchRemoteAttachment({ machineId: results.pair.machine?.id, path: hostPath })
+      : null;
+    results.fetchedHash = results.fetchedAttachment?.path
+      ? crypto.createHash('sha256').update(fs.readFileSync(results.fetchedAttachment.path)).digest('hex')
+      : null;
+    results.forbiddenAttachment = await engine.fetchRemoteAttachment({
+      machineId: results.pair.machine?.id,
+      path: attachmentPath,
+    });
+    results.threadGit = await engine.fetchRemoteThreadGit({ machineId: results.pair.machine?.id, threadId: 't1' });
+    results.questions = await engine.listRemoteQuestions({ machineId: results.pair.machine?.id, threadId: 't1' });
+    results.answer = await engine.answerRemoteQuestion({
+      machineId: results.pair.machine?.id,
+      threadId: 't1',
+      runId: 'run-1',
+      requestId: 7,
+      answers: { q1: ['Yes'] },
+    });
+    const replyFile0 = path.join(process.env.ORION_TEST_USERDATA, 'refused.txt');
+    fs.writeFileSync(replyFile0, 'refused');
+    const replyFile = path.join(process.env.ORION_TEST_USERDATA, 'where-i-am-stuck.txt');
+    fs.writeFileSync(replyFile, 'the login page says "expired"');
+    // A reply the host refuses: its file must not stay behind there.
+    results.refusedAction = await engine.remoteUserAction({
+      machineId: results.pair.machine?.id,
+      threadId: 't1',
+      actionId: 'gone',
+      op: 'reply',
+      reply: 'too late',
+      attachments: [{ id: 'r0', name: 'refused.txt', path: replyFile0, mimeType: 'text/plain', size: 7 }],
+    });
+    results.offerChecks = [
+      engine.canOfferCodeTo('1.0.190', '1.0.191'),
+      engine.canOfferCodeTo('1.0.189', '1.0.191'),
+      engine.canOfferCodeTo('1.0.189', '1.0.189'),
+      engine.canOfferCodeTo(null, '1.0.191'),
+    ];
+    results.userAction = await engine.remoteUserAction({
+      machineId: results.pair.machine?.id,
+      threadId: 't1',
+      actionId: 'ua1',
+      op: 'reply',
+      reply: 'It says expired',
+      attachments: [{ id: 'r1', name: 'where-i-am-stuck.txt', path: replyFile, mimeType: 'text/plain', size: 29 }],
     });
     results.continueTurn = await engine.runRemoteTurn({
       machineId: results.pair.machine?.id,
@@ -878,11 +982,11 @@ if (role) {
         for (const listener of [...listeners]) listener(message);
       }
     });
-    const waitFor = (kind, timeoutMs = 20_000) =>
+    const waitFor = (kind, timeoutMs = 20_000, matches = () => true) =>
       new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error(`timed out waiting for ${kind}`)), timeoutMs);
         const listener = (message) => {
-          if (message.kind !== kind) return;
+          if (message.kind !== kind || !matches(message)) return;
           clearTimeout(timer);
           listeners.delete(listener);
           resolve(message);
@@ -937,7 +1041,7 @@ if (role) {
   const hostSocketsBeforeHost = relay.stats.hostSockets;
   const host = spawnRole('host');
   const ready = await host.waitFor('ready');
-  assert.match(ready.code, /^[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$/);
+  assert.match(ready.code, /^[A-Z2-9]{5}-[A-Z2-9]{5}$/);
   assert.equal(relay.stats.hostSockets, hostSocketsBeforeHost + 1, 'the host opens one control socket');
   console.log('ok  host registers and holds the relay control socket');
 
@@ -949,17 +1053,26 @@ if (role) {
       ORION_RELAY_TEST_CODE: ready.code,
     });
     const commandSeen = host.waitFor('commandSeen');
+    const answerSeen = host.waitFor('commandSeen', 60_000, (message) => message.command.kind === 'answerQuestion');
+    const actionSeen = host.waitFor('commandSeen', 60_000, (message) => message.command.kind === 'userAction' && message.command.actionId === 'ua1');
     const { results } = await controller.waitFor('results', 45_000);
 
     assert.equal(results.wrongCode.ok, false, 'a wrong code must fail over the relay too');
     assert.equal(results.unknownMachine.ok, false, 'an unregistered machine id must fail');
-    assert.equal(results.pair.ok, true, `relay pairing failed: ${results.pair.error}`);
+    assert.equal(results.wrongCodeByLookup.ok, false, 'a wrong code must fail when pairing by code alone');
+    assert.equal(results.pair.ok, true, `relay pairing by code failed: ${results.pair.error}`);
     assert.equal(results.pair.machine.id, ready.machineId);
     assert.equal(results.snapshot.ok, true, `snapshot failed: ${results.snapshot.error}`);
     assert.equal(results.snapshot.snapshot.projects.length, 1);
     assert.equal(results.snapshot.snapshot.threads.length, 1);
     assert.equal(results.thread.ok, true);
     assert.equal(results.thread.thread.messages.length, 2);
+    assert.equal(results.thread.storedVersion, 'v-t1');
+    assert.deepEqual(
+      { ok: results.threadAgain.ok, unchanged: results.threadAgain.unchanged, thread: results.threadAgain.thread },
+      { ok: true, unchanged: true, thread: undefined },
+      'a thread this machine already has is not sent again'
+    );
     assert.equal(results.runTurn.ok, true, `runTurn failed: ${results.runTurn.error}`);
     assert.equal(results.runTurn.threadId, 't-new');
     assert.equal(results.continueTurn.threadId, 't1');
@@ -974,6 +1087,47 @@ if (role) {
     const seen = await commandSeen;
     assert.equal(seen.command.kind, 'runTurn');
     assert.equal(seen.command.prompt, 'build the thing over the internet');
+    assert.equal(seen.command.attachments?.length, 1, 'the turn carries its uploaded file');
+    assert.equal(seen.command.attachments[0].name, 'design.bin');
+    assert.equal(seen.command.attachments[0].path, results.runTurn.attachments[0].hostPath);
+    assert.equal(results.hostCopyHash, results.attachmentHash, 'the host has an exact copy of the file');
+    assert.equal(results.fetchedAttachment?.ok, true, `attachment fetch failed: ${results.fetchedAttachment?.error}`);
+    assert.equal(results.fetchedHash, results.attachmentHash, 'the controller fetched an exact copy back');
+    assert.equal(results.forbiddenAttachment.ok, false, 'only files in the host attachment folder are served');
+    assert.deepEqual(
+      { ok: results.threadGit.ok, branch: results.threadGit.branch, workspaceName: results.threadGit.workspaceName },
+      { ok: true, branch: 'main', workspaceName: 'fix-flaky-test' }
+    );
+    console.log('ok  attachments travel to the host and back in chunks; the host reports a thread\'s branch');
+
+    // Questions and user actions of the host's thread, answered from here.
+    const listed = results.snapshot.snapshot.threads.find((thread) => thread.id === 't1');
+    assert.equal(listed.waitingOnQuestion, true, 'the listing says the thread waits on a question');
+    assert.equal(listed.userActions?.[0]?.id, 'ua1', 'the listing carries the actions it waits on');
+    assert.equal(results.questions.ok, true, `questions failed: ${results.questions.error}`);
+    assert.equal(results.questions.questions[0].requestId, 7);
+    assert.equal(results.answer.ok, true, `answer failed: ${results.answer.error}`);
+    assert.equal(results.userAction.ok, true, `user action failed: ${results.userAction.error}`);
+    const answered = await answerSeen;
+    assert.deepEqual(
+      { kind: answered.command.kind, runId: answered.command.runId, requestId: answered.command.requestId, answers: answered.command.answers },
+      { kind: 'answerQuestion', runId: 'run-1', requestId: 7, answers: { q1: ['Yes'] } }
+    );
+    const acted = await actionSeen;
+    assert.equal(acted.command.kind, 'userAction');
+    assert.equal(acted.command.op, 'reply');
+    assert.equal(acted.command.reply, 'It says expired');
+    assert.equal(acted.command.attachments?.[0]?.name, 'where-i-am-stuck.txt');
+    assert.equal(fs.readFileSync(acted.command.attachments[0].path, 'utf8'), 'the login page says "expired"');
+    assert.equal(results.refusedAction.ok, false);
+    const hostAttachments = fs.readdirSync(path.join(tmpRoot, 'host', 'attachments'));
+    assert.equal(
+      hostAttachments.some((name) => name.endsWith('refused.txt')),
+      false,
+      'a refused reply\'s file is deleted on the host'
+    );
+    assert.deepEqual(results.offerChecks, [true, false, true, false], 'codes go only to hosts new enough for them');
+    console.log('ok  the host thread\'s questions and user actions are answered from the controller');
     console.log('ok  pair + snapshot + thread + runTurn/stopTurn round trip over the relay');
   }
 

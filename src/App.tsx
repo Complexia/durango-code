@@ -125,7 +125,7 @@ import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
 import orionIconUrl from '../assets/icon.png';
 import { removeBootSkeleton } from './app/bootSkeleton';
 import { CodeWorkspace } from './app/CodeWorkspace';
-import { AgentsSidebar, type AgentsSidebarModel, MachinesAndSavedViews, THREAD_DRAG_MIME } from './app/AgentsSidebar';
+import { AgentsSidebar, type AgentsSidebarModel, SavedViewsSection, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
 import { ProjectPickerModal, type ProjectPickerView } from './app/ProjectPickerModal';
 import {
@@ -168,6 +168,10 @@ import {
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
 import { dispatchProjectsPayload, durangoDispatchOutcome } from './app/durangoDispatch';
+import MachinePicker from './app/MachinePicker';
+import RemoteBranchPill from './app/RemoteBranchPill';
+import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
+import { useRemoteThreadSync, type RemoteThreadSync } from './app/useRemoteThreadSync';
 import { buildPromptWithAttachments, saveFilesAsAttachments } from './app/attachments';
 import {
   AgentFamilySwitcher,
@@ -239,13 +243,24 @@ const TerminalView = React.lazy(() => import('./TerminalView'));
 const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
 // Remote control is opt-in and rarely on screen; keep its view out of the
 // startup chunk like the settings page.
-const RemoteMachineView = React.lazy(() => import('./app/RemoteMachineView'));
 
 const normalizeRepositoryPath = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
 
 // Stable empty list so the memoized sidebar doesn't re-render while remote
 // control is off (a fresh [] every render would defeat React.memo).
 const EMPTY_REMOTE_MACHINES: RemoteMachineEntry[] = [];
+const EMPTY_THREAD_IDS: string[] = [];
+
+/** A thread and its subagent threads at any depth. */
+const threadFamilyIds = (threads: Thread[], rootId: string) => {
+  const ids = [rootId];
+  for (let index = 0; index < ids.length && ids.length < 500; index += 1) {
+    for (const thread of threads) {
+      if (thread.parentThreadId === ids[index] && !ids.includes(thread.id)) ids.push(thread.id);
+    }
+  }
+  return ids;
+};
 
 // A thread's loaded transcript messages (undefined while it isn't loaded;
 // ensureThreadTranscript loads it).
@@ -601,6 +616,8 @@ const threadShellSignature = (thread: Thread): string => {
     JSON.stringify(thread.inheritedSubagent ?? null),
     JSON.stringify(thread.goal ?? null),
     JSON.stringify(thread.linkedTasks ?? null),
+    // The machine it runs on (prompt box picker, sidebar label).
+    JSON.stringify(thread.remote ?? null),
     // Pinned user actions (request_user_action) and their row tint.
     JSON.stringify(thread.userActions ?? null),
     // Composer chips for @-attached MCP servers.
@@ -1077,6 +1094,11 @@ const App: React.FC = () => {
   // Subagents whose events arrived with no thread to bind to (keys as above).
   const unboundNativeSubagents = useRef(new Set<string>());
   const agentModelsRef = useRef<AgentModel[]>(fallbackAgentModels);
+  const startRemoteTurnRef = useRef<
+    (threadId: string, promptText: string, attachments?: FileAttachment[]) => Promise<{ ok: boolean; error?: string }>
+  >(
+    async () => ({ ok: false, error: 'Remote control is not ready.' })
+  );
   const startTurnForThreadRef = useRef<
     | ((
         threadId: string,
@@ -1772,10 +1794,17 @@ const App: React.FC = () => {
   // so streaming output doesn't hand the sidebar a new map every token.
   const awaitingUserAction = threadsAwaitingUserAction(threads);
   const awaitingUserActionKey = [...awaitingUserAction].map(([id, since]) => `${id}:${since}`).join(',');
+  // Threads on another machine whose agent waits there on a question.
+  const remoteNeedingInput = new Map<string, number>();
+  for (const thread of threads) {
+    const since = thread.remote?.needsInputSince;
+    if (since) remoteNeedingInput.set(thread.id, Date.parse(since) || 0);
+  }
+  const remoteNeedingInputKey = [...remoteNeedingInput].map(([id, since]) => `${id}:${since}`).join(',');
   const attentionThreadIds = useMemo(
-    () => mergeAttentionSince(threadsNeedingInput, awaitingUserAction),
+    () => mergeAttentionSince(threadsNeedingInput, awaitingUserAction, remoteNeedingInput),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [threadsNeedingInput, awaitingUserActionKey]
+    [threadsNeedingInput, awaitingUserActionKey, remoteNeedingInputKey]
   );
   // Done, Reply, or a `check` seeing it done: clears the action and tells the
   // agent that asked without interrupting it (agent:notifyTurn): at its next
@@ -1888,6 +1917,76 @@ const App: React.FC = () => {
     },
     [updateThread]
   );
+
+  const remoteThreadSyncRef = useRef<RemoteThreadSync | null>(null);
+  // The action cards of a thread on another machine act there: the agent that
+  // asked runs there, and so does its `check`. The card updates here at once;
+  // the mirror brings that machine's state back after.
+  const sendRemoteUserAction = useCallback(
+    (
+      threadId: string,
+      actionId: string,
+      op: 'done' | 'reply' | 'dismiss' | 'watch',
+      extra: { reply?: string; attachments?: FileAttachment[]; watching?: boolean } = {}
+    ) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const remote = thread?.remote;
+      if (!thread || !remote?.threadId) return;
+      const before = thread.userActions;
+      if (op === 'watch') {
+        updateThread(threadId, {
+          userActions: (thread.userActions ?? []).map((action) =>
+            action.id === actionId ? { ...action, watching: extra.watching === true } : action
+          ),
+        });
+      } else {
+        const remaining = (thread.userActions ?? []).filter((action) => action.id !== actionId);
+        updateThread(threadId, { userActions: remaining.length ? remaining : undefined });
+      }
+      void window.orion
+        ?.remoteUserAction?.({ machineId: remote.machineId, threadId: remote.threadId, actionId, op, ...extra })
+        .then((result) => result?.ok === true ? null : (result?.error ?? `Could not reach ${remote.machineName}.`))
+        .catch(() => `Could not reach ${remote.machineName}.`)
+        .then((error) => {
+          if (!error) {
+            remoteThreadSyncRef.current?.refreshSoon(threadId);
+            return;
+          }
+          // It didn't go through: the card comes back as it was, and the
+          // thread is read whole from that machine when it can be.
+          updateThread(threadId, { userActions: before });
+          toast.error(op === 'reply' ? `Your reply wasn't sent: ${error}` : error);
+          remoteThreadSyncRef.current?.refreshSoon(threadId, { force: true });
+        });
+    },
+    [updateThread]
+  );
+  const isRemoteThread = (threadId: string) =>
+    Boolean(useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.remote?.threadId);
+  const onUserActionDone = useCallback(
+    (threadId: string, actionId: string) =>
+      isRemoteThread(threadId) ? sendRemoteUserAction(threadId, actionId, 'done') : markUserActionDone(threadId, actionId),
+    [markUserActionDone, sendRemoteUserAction]
+  );
+  const onUserActionReply = useCallback(
+    (threadId: string, actionId: string, reply: string, attachments: FileAttachment[]) =>
+      isRemoteThread(threadId)
+        ? sendRemoteUserAction(threadId, actionId, 'reply', { reply, attachments })
+        : replyToUserAction(threadId, actionId, reply, attachments),
+    [replyToUserAction, sendRemoteUserAction]
+  );
+  const onUserActionDismiss = useCallback(
+    (threadId: string, actionId: string) =>
+      isRemoteThread(threadId) ? sendRemoteUserAction(threadId, actionId, 'dismiss') : dismissUserAction(threadId, actionId),
+    [dismissUserAction, sendRemoteUserAction]
+  );
+  const onUserActionWatch = useCallback(
+    (threadId: string, actionId: string, watching: boolean) =>
+      isRemoteThread(threadId)
+        ? sendRemoteUserAction(threadId, actionId, 'watch', { watching })
+        : setUserActionWatching(threadId, actionId, watching),
+    [sendRemoteUserAction, setUserActionWatching]
+  );
   // request_user_action / resolve_user_action from any run. Asking pins the
   // action on the thread and, like a question, brings the thread the sidebar
   // lists (a subagent's driver) back from Snoozed or Settled.
@@ -1969,6 +2068,25 @@ const App: React.FC = () => {
     },
     [dismissUserAction]
   );
+  // A secret card of a thread on another machine is answered there: the value
+  // goes to that machine (end-to-end encrypted), whose agent asked for it, and
+  // is never written here.
+  const onSecretAnswer = useCallback(
+    async (
+      threadId: string,
+      actionId: string,
+      answer: { type: 'save'; value: string } | { type: 'decline' }
+    ): Promise<string | undefined> => {
+      const remote = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.remote;
+      if (!remote?.threadId) return answerSecretRequest(threadId, actionId, answer);
+      const result = await window.orion
+        ?.remoteUserAction?.({ machineId: remote.machineId, threadId: remote.threadId, actionId, op: 'secret', secretAnswer: answer })
+        .catch(() => null);
+      remoteThreadSyncRef.current?.refreshSoon(threadId, { force: !result?.ok });
+      return result?.ok ? undefined : (result?.error ?? `Could not reach ${remote.machineName}.`);
+    },
+    [answerSecretRequest]
+  );
   // Secret cards saved with the thread outlive the request after a restart
   // (or a window reload during which it ended): once the saved threads have
   // loaded, drop the cards the main process no longer waits on. Cards asked
@@ -1981,6 +2099,8 @@ const App: React.FC = () => {
         if (cancelled) return;
         const live = new Set(pending.map((entry) => entry.id));
         for (const thread of useOrionStore.getState().threads) {
+          // Another machine's secret cards are pending there, not here.
+          if (thread.remote) continue;
           for (const action of thread.userActions ?? []) {
             if (!action.secret || live.has(action.id)) continue;
             if ((Date.parse(action.requestedAt) || 0) >= startedAt) continue;
@@ -2000,7 +2120,9 @@ const App: React.FC = () => {
   // Keep the main process watching exactly the actions whose `check` is on
   // (it holds only timers, so this also re-arms them after a restart), and
   // stop the watch once an action is answered, resolved or deleted.
+  // Not for threads on another machine: their checks run there.
   const watchedUserActionsKey = threads
+    .filter((thread) => !thread.remote)
     .flatMap((thread) =>
       (thread.userActions ?? [])
         .filter((action) => action.check && action.watching)
@@ -2012,6 +2134,7 @@ const App: React.FC = () => {
     const watched = watchedUserActionsRef.current;
     const wanted = new Map<string, { threadId: string; id: string; check: string; cwd?: string }>();
     for (const thread of useOrionStore.getState().threads) {
+      if (thread.remote) continue;
       for (const action of thread.userActions ?? []) {
         if (!action.check || !action.watching) continue;
         wanted.set(`${thread.id}:${action.id}`, { threadId: thread.id, id: action.id, check: action.check, cwd: action.checkCwd });
@@ -2356,6 +2479,10 @@ const App: React.FC = () => {
   const deleteThreadWithRuntime = useCallback(
     async (threadId: string) => {
       const state = useOrionStore.getState();
+      // Deleting another machine's thread here removes it from this
+      // machine's list only (that machine keeps it): don't list it again.
+      const remote = state.threads.find((thread) => thread.id === threadId)?.remote;
+      if (remote?.threadId) dismissRemoteThread(remote.machineId, remote.threadId);
       const threadIds = new Set([threadId]);
       // A spawned child has an independent runtime. Deleting its parent must
       // therefore walk the whole subtree instead of merely orphaning work
@@ -2836,11 +2963,9 @@ const App: React.FC = () => {
   }, []);
 
   // Remote control engine lives in main; push the persisted opt-in settings on
-  // hydration and every change, and mirror its state for the sidebar Machines
-  // section (the settings tab keeps its own subscription while mounted).
+  // hydration and every change, and mirror its state for the prompt box's
+  // machine picker (the settings tab keeps its own subscription while mounted).
   const [remoteControlState, setRemoteControlState] = useState<RemoteControlState | null>(null);
-  const [machinesSectionOpen, setMachinesSectionOpen] = useState(true);
-  const [activeRemoteMachineId, setActiveRemoteMachineId] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     let unsubscribeHydration = () => {};
@@ -2878,55 +3003,29 @@ const App: React.FC = () => {
     const unsubscribe = window.orion?.onRemoteState?.((state) => setRemoteControlState(state));
     return () => unsubscribe?.();
   }, []);
-  const selectRemoteMachine = useCallback((machineId: string | null) => {
-    setActiveRemoteMachineId(machineId);
-  }, []);
-  // Sidebar navigation always returns to this machine — including re-clicking
-  // the already-selected thread/project, which the deselection effect
-  // below (it only sees value changes) would otherwise miss.
-  const selectThreadFromSidebar = useCallback(
-    (id: string | null) => {
-      setActiveRemoteMachineId(null);
-      selectThread(id);
-    },
-    [selectThread]
-  );
-  const selectProjectFromSidebar = useCallback(
-    (id: string | null) => {
-      setActiveRemoteMachineId(null);
-      selectProject(id);
-    },
-    [selectProject]
-  );
-  const openSavedViewFromSidebar = useCallback(
-    (id: string) => {
-      setActiveRemoteMachineId(null);
-      openSavedView(id);
-    },
-    [openSavedView]
-  );
   const remoteMachines = remoteControlState?.machines ?? EMPTY_REMOTE_MACHINES;
-  // The section only earns its place once there is a *remote* machine to switch
-  // to — a list containing just the machine you're already on says nothing.
-  const remoteMachinesVisible = Boolean(
+  // The prompt box offers other machines once remote control is on, signed
+  // in, and at least one machine is paired.
+  const remoteMachinesAvailable = Boolean(
     remoteControlSettings.enabled &&
       remoteControlIsAuthenticated(accountState.authenticated, remoteControlState?.authenticated) &&
       remoteMachines.length > 0
   );
-  const activeRemoteMachine =
-    remoteMachinesVisible && activeRemoteMachineId
-      ? (remoteMachines.find((machine) => machine.id === activeRemoteMachineId) ?? null)
-      : null;
-  // Turning remote control off (or signing out) hides the Machines section;
-  // the remote view must not stay open behind it.
+  const localMachineName = remoteControlState?.machineName ?? 'This machine';
+  // A thread left running on a machine that is no longer paired (or with
+  // remote control off) can't be followed or stopped from here: it shows as
+  // stopped rather than running forever. Turning remote control back on and
+  // reaching the machine brings its real status back.
+  const remoteEngineReady = Boolean(remoteControlState && !remoteControlState.starting);
   useEffect(() => {
-    if (!remoteMachinesVisible) setActiveRemoteMachineId(null);
-  }, [remoteMachinesVisible]);
-  // Local navigation leaves the remote view: picking a thread, project,
-  // or saved view on this machine means the user is done with the remote one.
-  useEffect(() => {
-    setActiveRemoteMachineId(null);
-  }, [selectedThreadId, selectedProjectId, activeSavedViewId]);
+    if (!storeHydrated || (remoteControlSettings.enabled && !remoteEngineReady)) return;
+    const paired = new Set(remoteControlSettings.enabled ? remoteMachines.map((machine) => machine.id) : []);
+    for (const thread of useOrionStore.getState().threads) {
+      if (thread.remote && thread.status === 'running' && !paired.has(thread.remote.machineId)) {
+        useOrionStore.getState().updateThread(thread.id, { status: 'idle' });
+      }
+    }
+  }, [remoteControlSettings.enabled, remoteEngineReady, remoteMachines, storeHydrated, threads]);
 
   useEffect(() => {
     if (!modelPickerOpen) return undefined;
@@ -4655,6 +4754,8 @@ const App: React.FC = () => {
             thread.projectId === projectId &&
             thread.summary.messageCount === 0 &&
             thread.status !== 'running' &&
+            // Another machine's thread is never a draft here.
+            !thread.remote?.threadId &&
             thread.modelId !== claudeCodeCliModelId &&
             !thread.parentThreadId &&
             !thread.subagent &&
@@ -5743,6 +5844,12 @@ const App: React.FC = () => {
       claimStart?: () => Promise<boolean>,
       applyClaimedSettings?: () => void
     ): Promise<ThreadTurnStartResult> => {
+      // A thread on another machine starts its turns there, whichever path
+      // (retry, follow-up, composer) asked for one.
+      if (findThread(useOrionStore.getState().threads, threadId)?.remote) {
+        const remoteStart = await startRemoteTurnRef.current(threadId, promptText, attachments);
+        return remoteStart.ok ? { ok: true, startup: Promise.resolve({ ok: true }) } : { ok: false, error: remoteStart.error };
+      }
       const turnStart = await withThreadStartReservation(
         pendingTurnStartsRef.current,
         threadId,
@@ -6835,6 +6942,11 @@ const App: React.FC = () => {
     }
   ) => {
     if (!selectedThreadId) return;
+    // On another machine, that machine parses /review itself.
+    if (selectedThread?.remote) {
+      await sendMessage(rawText);
+      return;
+    }
     if (isSending) {
       toast.error('Wait for the current run to finish before starting a review.');
       return;
@@ -6898,6 +7010,134 @@ const App: React.FC = () => {
     }));
   };
 
+  // Threads that run on another machine (remote control, Thread.remote): the
+  // mirror of their transcript is kept current here, and their turns start
+  // there instead of in a local agent run.
+  const remoteThreadSync = useRemoteThreadSync({
+    enabled: remoteControlSettings.enabled,
+    threads,
+    openThreadIds: paneThreadIds.length > 0 ? paneThreadIds : selectedThreadId ? [selectedThreadId] : EMPTY_THREAD_IDS,
+    machines: remoteMachines,
+  });
+  remoteThreadSyncRef.current = remoteThreadSync;
+
+  /**
+   * Start a turn of a thread on its machine: the first one finds (or clones)
+   * the project there and creates the thread there; later ones continue it.
+   * The prompt shows in the mirror at once; the other machine's copy replaces
+   * the mirror as soon as it has the turn.
+   */
+  const startRemoteTurn = async (
+    threadId: string,
+    promptText: string,
+    attachments: FileAttachment[] = []
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const state = useOrionStore.getState();
+    const thread = state.threads.find((candidate) => candidate.id === threadId);
+    const remote = thread?.remote;
+    if (!thread || !remote) return { ok: false, error: 'This thread does not run on another machine.' };
+    if (!window.orion?.remoteRunTurn || !window.orion.remoteResolveProject) {
+      return { ok: false, error: 'Remote control is unavailable in this build.' };
+    }
+    const unsupported = remoteThreadRunError(thread.modelId);
+    if (unsupported) return { ok: false, error: unsupported };
+    // One start at a time: the queued-message effect must not send the next
+    // follow-up before this turn shows as running.
+    if (pendingTurnStartsRef.current.has(threadId)) return { ok: false, error: 'This thread is already starting a turn.' };
+    pendingTurnStartsRef.current.add(threadId);
+    const agentModel = findAgentModel(agentModelsRef.current, thread.modelId);
+    const userMessageId = addMessageToThread(threadId, {
+      role: 'user',
+      content: promptText,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    });
+    const derivedTitle = isDefaultTitle(thread.title) && promptText ? deriveTitle(promptText) : null;
+    if (derivedTitle && isPlausibleTitle(derivedTitle)) updateThread(threadId, { title: derivedTitle });
+    // A start that fails leaves the thread as it was: no prompt, its old title.
+    const dropUserMessage = () => {
+      const store = useOrionStore.getState();
+      store.updateThreadTranscript(threadId, (transcript) => ({
+        ...transcript,
+        messages: transcript.messages.filter((message) => message.id !== userMessageId),
+      }));
+      if (derivedTitle && store.threads.find((candidate) => candidate.id === threadId)?.title === derivedTitle) {
+        updateThread(threadId, { title: thread.title });
+      }
+    };
+    try {
+      let hostProjectId = remote.projectId;
+      if (!remote.threadId && !hostProjectId) {
+        const project = findProjectById(state, thread.projectId);
+        const resolved = await window.orion.remoteResolveProject({
+          machineId: remote.machineId,
+          project: project ? { id: project.id, name: project.name, path: project.path } : null,
+        });
+        if (!resolved?.ok || !resolved.projectId) {
+          dropUserMessage();
+          return { ok: false, error: resolved?.error ?? `Could not reach ${remote.machineName}.` };
+        }
+        hostProjectId = resolved.projectId;
+        // Say where it runs: the project there was matched, not chosen.
+        if (resolved.projectName) toast.message(`Running in ${resolved.projectName} on ${remote.machineName}`);
+      }
+      const result = await window.orion.remoteRunTurn({
+        machineId: remote.machineId,
+        ...(remote.threadId ? { threadId: remote.threadId } : { projectId: hostProjectId }),
+        prompt: promptText,
+        // Uploaded to that machine first (main).
+        ...(attachments.length > 0 ? { attachments } : {}),
+        // Only what changed here (all of it for a new thread there), so a
+        // stale value here never overrides a change made there.
+        ...(remoteTurnSettingsToSend(thread, agentModel?.providerId) as Partial<
+          Parameters<NonNullable<NonNullable<Window['orion']>['remoteRunTurn']>>[0]
+        >),
+      });
+      if (!result?.ok) {
+        dropUserMessage();
+        return { ok: false, error: result?.error ?? `${remote.machineName} could not start the agent.` };
+      }
+      const fresh = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      if (fresh?.remote?.machineId === remote.machineId) {
+        const hostThreadId = result.threadId ?? fresh.remote.threadId;
+        // This machine's copies of the files it sent, for showing the mirror.
+        const sentPaths = Object.fromEntries((result.attachments ?? []).map((item) => [item.hostPath, item.localPath]));
+        updateThread(threadId, {
+          status: 'running',
+          remote: {
+            ...fresh.remote,
+            threadId: hostThreadId,
+            projectId: hostProjectId ?? fresh.remote.projectId,
+            // What the turn set there.
+            hostSettings: { ...fresh.remote.hostSettings, ...remoteSettingsOf(thread) },
+            ...(Object.keys(sentPaths).length > 0
+              ? { attachmentPaths: { ...fresh.remote.attachmentPaths, ...sentPaths } }
+              : {}),
+          },
+        });
+        // A listing of that machine may have picked the new thread up first.
+        for (const duplicate of useOrionStore.getState().threads) {
+          if (
+            duplicate.id !== threadId &&
+            duplicate.remote?.imported &&
+            duplicate.remote.machineId === remote.machineId &&
+            duplicate.remote.threadId === hostThreadId
+          ) {
+            useOrionStore.getState().deleteThread(duplicate.id);
+          }
+        }
+        remoteThreadSync.markStarted(threadId);
+      }
+      return { ok: true };
+    } catch (error) {
+      dropUserMessage();
+      return { ok: false, error: error instanceof Error ? error.message : `Could not reach ${remote.machineName}.` };
+    } finally {
+      pendingTurnStartsRef.current.delete(threadId);
+    }
+  };
+
+  startRemoteTurnRef.current = startRemoteTurn;
+
   const sendMessage = async (overrideText?: string) => {
     if (!selectedThreadId || !selectedThread) return;
     // Native subagent transcripts are read-only mirrors — nothing to talk to.
@@ -6930,6 +7170,31 @@ const App: React.FC = () => {
     // Sending to a snoozed thread wakes it at once, rather than when the run
     // it starts ends (or right away for a follow-up queued mid-run).
     if (selectedThread.snoozedAt) unsnoozeThread(selectedThreadId);
+
+    // The thread runs on another machine: the turn starts there.
+    if (selectedThread.remote) {
+      const machineName = selectedThread.remote.machineName;
+      if (!promptText && draftAttachments.length === 0) return;
+      if (selectedThread.status === 'running' || pendingTurnStartsRef.current.has(selectedThreadId)) {
+        pinThreadToBottom(selectedThreadId);
+        queueMessageToThread(selectedThreadId, { text: promptText, attachments: draftAttachments });
+        composerDraft.clear();
+        composerDraft.flush();
+        return;
+      }
+      const submittedThreadId = selectedThreadId;
+      composerDraft.clear();
+      composerDraft.setStarting(submittedThreadId, true);
+      pinThreadToBottom(submittedThreadId);
+      const result = await startRemoteTurn(submittedThreadId, promptText, draftAttachments);
+      composerDraft.setStarting(submittedThreadId, false);
+      composerDraft.flush();
+      if (!result.ok) {
+        restoreComposerDraft(submittedThreadId, draftText, draftAttachments);
+        toast.error(result.error ?? `${machineName} could not start the agent.`);
+      }
+      return;
+    }
 
     // Claude Code CLI thread: the composer feeds the embedded terminal —
     // the draft is delivered to the TUI exactly as if typed there (so claude
@@ -7614,6 +7879,36 @@ const App: React.FC = () => {
   };
 
   const stopActiveAgent = async () => {
+    const remote = selectedThread?.remote;
+    if (remote && selectedThreadId) {
+      const stoppedThreadId = selectedThreadId;
+      // Like a local Stop: the follow-ups waiting on this run go back to the
+      // composer rather than out to that machine once it stops.
+      const queued = selectedThread?.queuedMessages ?? [];
+      if (queued.length > 0) {
+        updateThread(stoppedThreadId, { queuedMessages: [] });
+        composerDraft.setText((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
+        composerDraft.setAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
+      }
+      if (!remote.threadId || !window.orion?.remoteStopTurn) {
+        updateThread(stoppedThreadId, { status: 'idle' });
+        return;
+      }
+      const result = await window.orion
+        .remoteStopTurn({ machineId: remote.machineId, threadId: remote.threadId })
+        .catch((error: unknown) => ({ ok: false, error: error instanceof Error ? error.message : undefined }));
+      if (!result?.ok) {
+        // Unreachable (offline, unpaired, remote control off): don't leave the
+        // thread stuck as running here. The next refresh from that machine
+        // shows it running again if it still is.
+        updateThread(stoppedThreadId, { status: 'idle' });
+        toast.error(
+          `Could not reach ${remote.machineName} to stop the agent${result?.error ? ` (${result.error})` : ''}. Marked stopped here; it may still be running there.`
+        );
+      }
+      remoteThreadSync.refreshSoon(stoppedThreadId, { force: !result?.ok });
+      return;
+    }
     if (!activeRunId || !selectedThreadId) return;
     await stopThreadTree({
       rootThreadId: selectedThreadId,
@@ -7724,9 +8019,14 @@ const App: React.FC = () => {
   useLayoutEffect(() => {
     remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
       const state = useOrionStore.getState();
+      // A thread that itself runs on another machine is that machine's to
+      // drive (and isn't listed to controllers): no relaying through here.
+      if (command.threadId && state.threads.find((candidate) => candidate.id === command.threadId)?.remote) {
+        return { ok: false, error: 'That thread runs on another machine.' };
+      }
       if (command.kind === 'runTurn') {
         const promptText = (command.prompt ?? '').trim();
-        if (!promptText) return { ok: false, error: 'Empty prompt.' };
+        if (!promptText && !(command.attachments?.length ?? 0)) return { ok: false, error: 'Empty prompt.' };
         // Main already dropped unknown access modes / effort values; re-validate
         // here so the thread never stores a value the local picker could not set.
         const requestedAccessMode =
@@ -7980,7 +8280,8 @@ const App: React.FC = () => {
           ? startTurnForThreadRef.current?.(
               threadId,
               promptText,
-              [],
+              // Files the controller sent, already saved here (main).
+              Array.isArray(command.attachments) ? command.attachments : [],
               claimStart,
               applyClaimedSettings
             )
@@ -8081,6 +8382,66 @@ const App: React.FC = () => {
           spawnStoppedText: 'Subagent run was stopped by a paired remote machine before completing.',
         });
         if (!stopped) return { ok: false, error: 'No running turn on that thread.' };
+        return { ok: true, threadId };
+      }
+      if (command.kind === 'answerQuestion') {
+        // A paired controller answering a question this machine's agent asked:
+        // exactly what this machine's own question card does.
+        const threadId = command.threadId ?? '';
+        // Its subagents' questions too (controllers show them on the thread).
+        const pending = (
+          await Promise.all(
+            threadFamilyIds(state.threads, threadId).map(async (id) => [
+              ...((await window.orion?.getCodexQuestions?.(id)) ?? []),
+              ...((await window.orion?.getClaudeQuestions?.(id)) ?? []),
+            ])
+          )
+        ).flat();
+        const request = pending.find(
+          (candidate) =>
+            candidate.runId === command.runId && String(candidate.requestId) === String(command.requestId)
+        ) as CodexQuestionRequest | undefined;
+        if (!request) return { ok: false, error: 'This question is no longer waiting for an answer.' };
+        const answers = command.answers ?? {};
+        if (!request.questions.every((question) => (answers[question.id] ?? []).some((value) => value.trim()))) {
+          return { ok: false, error: 'Every question needs an answer.' };
+        }
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The answer expired or was cancelled.' };
+        }
+        const accepted = request.async
+          ? await answerAsyncQuestion(request, answers)
+          : request.providerId === 'claude'
+            ? await window.orion?.answerClaudeQuestions?.(request.runId, request.requestId, answers)
+            : await window.orion?.answerCodexQuestions?.(request.runId, request.requestId, answers);
+        return accepted
+          ? { ok: true, threadId }
+          : { ok: false, error: 'This question is no longer waiting for an answer.' };
+      }
+      if (command.kind === 'userAction') {
+        // Done / Reply / Dismiss / Watch from a paired controller, through the
+        // same handlers as this machine's own action cards.
+        const actionId = command.actionId ?? '';
+        // The action may be a subagent's (controllers show them on the thread
+        // they list): find the thread that asked.
+        const family = threadFamilyIds(state.threads, command.threadId ?? '');
+        const threadId =
+          family.find((id) =>
+            state.threads.find((candidate) => candidate.id === id)?.userActions?.some((action) => action.id === actionId)
+          ) ?? '';
+        if (!threadId) return { ok: false, error: 'That action is no longer waiting.' };
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The action expired or was cancelled.' };
+        }
+        if (command.op === 'done') markUserActionDone(threadId, actionId);
+        else if (command.op === 'reply') {
+          replyToUserAction(threadId, actionId, command.reply ?? '', Array.isArray(command.attachments) ? command.attachments : []);
+        } else if (command.op === 'dismiss') dismissUserAction(threadId, actionId);
+        else if (command.op === 'watch') setUserActionWatching(threadId, actionId, command.watching === true);
+        else if (command.op === 'secret' && command.secretAnswer) {
+          const error = await answerSecretRequest(threadId, actionId, command.secretAnswer);
+          if (error) return { ok: false, error };
+        } else return { ok: false, error: 'Invalid user action operation.' };
         return { ok: true, threadId };
       }
       return { ok: false, error: 'Unsupported remote command.' };
@@ -8202,6 +8563,10 @@ const App: React.FC = () => {
   }, []);
   const openProviderSettings = useCallback(() => {
     setSettingsTab('providers');
+    setSettingsOpen(true);
+  }, []);
+  const openRemoteControlSettings = useCallback(() => {
+    setSettingsTab('remote-control');
     setSettingsOpen(true);
   }, []);
   const openSettings = useCallback(() => setSettingsOpen(true), []);
@@ -8361,21 +8726,21 @@ const App: React.FC = () => {
 
   const agentsSidebarModel: AgentsSidebarModel = {
     projects,
-    selectThread: selectThreadFromSidebar,
+    selectThread,
     setActiveTab,
     selectedThreadId,
     paneThreadIds,
     savedViews,
     activeSavedViewId,
     threadTitlesById,
-    openSavedView: openSavedViewFromSidebar,
+    openSavedView,
     deleteSavedView,
     savedViewsSectionOpen,
     setSavedViewsSectionOpen,
     updateThread,
     branchThread: branchThreadWithFeedback,
     renameProject,
-    selectProject: selectProjectFromSidebar,
+    selectProject,
     threadSearchOpen,
     setThreadSearchOpen,
     projectMenuOpenId,
@@ -8417,13 +8782,6 @@ const App: React.FC = () => {
     renderThreadCliBadge,
     renderThreadStatusDot,
     sidebarFooterProps,
-    remoteMachinesVisible,
-    machinesSectionOpen,
-    setMachinesSectionOpen,
-    remoteMachines,
-    activeRemoteMachineId,
-    selectRemoteMachine,
-    localMachineName: remoteControlState?.machineName ?? 'This machine',
   };
 
   const sidebarV2ModelLabel = useCallback(
@@ -8453,7 +8811,7 @@ const App: React.FC = () => {
   );
   const sidebarV2Actions = useMemo<SidebarV2Actions>(
     () => ({
-      selectThread: selectThreadFromSidebar,
+      selectThread,
       setActiveTab,
       updateThread,
       branchThread: branchThreadWithFeedback,
@@ -8471,7 +8829,7 @@ const App: React.FC = () => {
       branchThreadWithFeedback,
       deleteThreadWithRuntime,
       pinThread,
-      selectThreadFromSidebar,
+      selectThread,
       setActiveTab,
       settleThreadFromSidebar,
       sidebarV2ModelLabel,
@@ -8482,40 +8840,26 @@ const App: React.FC = () => {
       updateThread,
     ]
   );
-  const localMachineName = remoteControlState?.machineName ?? 'This machine';
   const sidebarV2ExtraSections = useMemo(
     () =>
-      sidebarV2Enabled && (remoteMachinesVisible || savedViews.length > 0) ? (
-        <MachinesAndSavedViews
+      sidebarV2Enabled && savedViews.length > 0 ? (
+        <SavedViewsSection
           setActiveTab={setActiveTab}
           savedViews={savedViews}
           activeSavedViewId={activeSavedViewId}
           threadTitlesById={threadTitlesById}
-          openSavedView={openSavedViewFromSidebar}
+          openSavedView={openSavedView}
           deleteSavedView={deleteSavedView}
           savedViewsSectionOpen={savedViewsSectionOpen}
           setSavedViewsSectionOpen={setSavedViewsSectionOpen}
-          remoteMachinesVisible={remoteMachinesVisible}
-          machinesSectionOpen={machinesSectionOpen}
-          setMachinesSectionOpen={setMachinesSectionOpen}
-          remoteMachines={remoteMachines}
-          activeRemoteMachineId={activeRemoteMachineId}
-          selectRemoteMachine={selectRemoteMachine}
-          localMachineName={localMachineName}
         />
       ) : null,
     [
-      activeRemoteMachineId,
       activeSavedViewId,
       deleteSavedView,
-      localMachineName,
-      machinesSectionOpen,
-      openSavedViewFromSidebar,
-      remoteMachines,
-      remoteMachinesVisible,
+      openSavedView,
       savedViews,
       savedViewsSectionOpen,
-      selectRemoteMachine,
       setActiveTab,
       sidebarV2Enabled,
       threadTitlesById,
@@ -8536,7 +8880,8 @@ const App: React.FC = () => {
       if (!thread) return [];
       const context = threadViewContext(thread);
       const agentModel = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
-      const paneSending = Boolean(activeRunsByThread[threadId]);
+      const paneSending =
+        Boolean(activeRunsByThread[threadId]) || (Boolean(thread.remote) && thread.status === 'running');
       const paneSteerSupported =
         paneSending && !!agentModel && providerFollowUpSupport[agentModel.providerId]?.steer === true;
       const focused = threadId === selectedThreadId;
@@ -8577,7 +8922,6 @@ const App: React.FC = () => {
     storeHydrated &&
     activeTab === 'agents' &&
     !settingsOpen &&
-    !activeRemoteMachine &&
     threadPanes.length === 0 &&
     !!defaultNewThreadProject;
   useEffect(() => {
@@ -8993,10 +9337,41 @@ const App: React.FC = () => {
   // Above the composer's top-right corner: the branch picker with Commit and
   // Push, or the thread's Durango workspace when it has one. Its menus open
   // upward so they never fall off the bottom of the window.
+  // Left of it, once another machine is paired: which machine the thread's
+  // agents run on. A thread on another machine shows its branch there instead
+  // of this machine's.
+  const showMachinePicker = Boolean(selectedThread && (remoteMachinesAvailable || selectedThread.remote));
+  const showLocalGitControls = Boolean(activeThreadProject && !activeIsNoProject && !selectedThread?.remote);
   const composerGitBar =
-    activeTab === 'agents' && selectedThread && activeThreadProject && !activeIsNoProject ? (
+    activeTab === 'agents' && selectedThread && (showMachinePicker || showLocalGitControls) ? (
       <div className="composer-git-bar">
-        {activeDurangoWorkspace && (
+        {showMachinePicker && (
+          <MachinePicker
+            localName={localMachineName}
+            machines={remoteMachines}
+            value={selectedThread.remote ?? null}
+            locked={
+              selectedThread.summary.messageCount > 0 ||
+              Boolean(selectedThread.remote?.threadId) ||
+              isSending ||
+              selectedThread.status === 'running'
+            }
+            onChange={(machine) =>
+              updateThread(selectedThread.id, {
+                remote: machine ? { machineId: machine.id, machineName: machine.name } : undefined,
+              })
+            }
+            onManage={openRemoteControlSettings}
+          />
+        )}
+        {selectedThread.remote?.threadId && (
+          <RemoteBranchPill
+            machineId={selectedThread.remote.machineId}
+            machineName={selectedThread.remote.machineName}
+            threadId={selectedThread.remote.threadId}
+          />
+        )}
+        {showLocalGitControls && activeDurangoWorkspace && (
           <DurangoWorkspaceControl
             workspace={activeDurangoWorkspace}
             disabled={repositoryOperationBusy || activeWorkspaceUnavailable}
@@ -9004,7 +9379,7 @@ const App: React.FC = () => {
             onMissing={() => void releaseMissingDurangoWorkspaces([activeDurangoWorkspace.path])}
           />
         )}
-        {!activeDurangoWorkspace && (
+        {showLocalGitControls && !activeDurangoWorkspace && (
           <div className="shell-branch-control" ref={branchPickerRef}>
             <button
               type="button"
@@ -9129,20 +9504,32 @@ const App: React.FC = () => {
     (isOrionModelId(selectedThread?.modelId ?? '') &&
       findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)?.providerId === 'claude');
 
+  // A thread on another machine is busy while its run goes on there: the
+  // composer queues follow-ups and its Stop button stops that run.
+  const composerIsSending = isSending || (Boolean(selectedThread?.remote) && selectedThread?.status === 'running');
   const composerNode = selectedThread ? (
     <div className="chat-input-area">
       <UserActionCards
         actions={selectedThreadUserActions}
         currentThreadId={selectedThread.id}
-        onDone={markUserActionDone}
-        onReply={replyToUserAction}
-        onDismiss={dismissUserAction}
-        onWatch={setUserActionWatching}
-        onSecretAnswer={answerSecretRequest}
+        onDone={onUserActionDone}
+        onReply={onUserActionReply}
+        onDismiss={onUserActionDismiss}
+        onWatch={onUserActionWatch}
+        onSecretAnswer={onSecretAnswer}
       />
       <CodexQuestions
         threadId={selectedThread.id}
         onAsyncAnswer={answerAsyncQuestion}
+        remote={
+          selectedThread.remote?.threadId
+            ? {
+                machineId: selectedThread.remote.machineId,
+                machineName: selectedThread.remote.machineName,
+                threadId: selectedThread.remote.threadId,
+              }
+            : undefined
+        }
       />
       <AgentFamilySwitcher
         currentThread={selectedThread}
@@ -9170,7 +9557,7 @@ const App: React.FC = () => {
         isNativeSubagentThread={isNativeSubagentThread}
         workspaceUnavailable={selectedThreadWorkspaceUnavailable}
         workspaceRemoving={selectedThreadWorkspaceRemoving}
-        isSending={isSending}
+        isSending={composerIsSending}
         steerSupported={steerSupported}
         steerReady={steerReady}
         pendingLinkedTaskCount={pendingLinkedTasks.length}
@@ -9266,7 +9653,7 @@ const App: React.FC = () => {
                 }
                 setModelPickerOpen(!modelPickerOpen);
               }}
-              disabled={isSending}
+              disabled={composerIsSending}
             >
               {selectedAgentModel &&
                 (() => {
@@ -9691,7 +10078,12 @@ const App: React.FC = () => {
                     ) : (
                       <ProjectBadge project={activeThreadProject} size={16} />
                     )}
-                    <span className="truncate">{activeThreadProject.name}</span>
+                    <span className="truncate">
+                      {/* Another machine's thread whose project isn't here: its name there. */}
+                      {activeIsNoProject && selectedThread?.remote?.projectName
+                        ? selectedThread.remote.projectName
+                        : activeThreadProject.name}
+                    </span>
                     {(!selectedThread || canChangeSelectedThreadProject) && (
                       <ChevronDown size={13} className={`project-pill-chevron ${projectPickerOpen ? 'open' : ''}`} />
                     )}
@@ -10030,23 +10422,9 @@ const App: React.FC = () => {
                 <AgentsSidebar {...agentsSidebarModel} />
               )}
 
-              {/* Remote machine view (remote control): replaces the local
-                  thread panel while a paired machine is selected. The local
-                  panel stays mounted (hidden) so its state survives. */}
-              {activeRemoteMachine && (
-                <React.Suspense fallback={<div className="panel agents-panel" />}>
-                  <RemoteMachineView
-                    machineId={activeRemoteMachine.id}
-                    machineName={activeRemoteMachine.name}
-                    status={activeRemoteMachine.status}
-                    onBack={() => setActiveRemoteMachineId(null)}
-                  />
-                </React.Suspense>
-              )}
-
               {/* Main Panel: Thread view */}
               <div
-                className={`panel agents-panel${threadDropActive ? ' thread-drop-active' : ''}${activeRemoteMachine ? ' hidden-for-remote' : ''}`}
+                className={`panel agents-panel${threadDropActive ? ' thread-drop-active' : ''}`}
                 onDragOver={handleThreadDragOver}
                 onDragLeave={handleThreadDragLeave}
                 onDrop={handleThreadDrop}
@@ -10157,7 +10535,7 @@ const App: React.FC = () => {
                 )}
               </div>
 
-              {browserVisible && !activeRemoteMachine && (
+              {browserVisible && (
                 <BrowserPanel
                   tabs={browserPanelTabs}
                   selectedTabId={browserActiveTabId}

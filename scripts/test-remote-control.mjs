@@ -1839,7 +1839,7 @@ if (
     ORION_REMOTE_TEST_MUTATE_LARGE_THREAD_DURING_FETCH: '1',
   });
   const ready = await host.waitFor('ready');
-  assert.match(ready.code, /^[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$/);
+  assert.match(ready.code, /^[A-Z2-9]{5}-[A-Z2-9]{5}$/);
 
   // Pairing is not a reusable client session, but the master switch still
   // owns it. Disable while the Orion account proof is pending and ensure the
@@ -1902,7 +1902,7 @@ if (
     assert.equal(results.snapshot.ok, true, `snapshot failed: ${results.snapshot.error}`);
     assert.equal(results.snapshot.snapshot.projects.length, 2);
     const noProject = results.snapshot.snapshot.projects.find((project) => project.id === 'orion:no-project');
-    assert.deepEqual(noProject, { id: 'orion:no-project', name: 'No project', path: '/tmp/orion-chats' });
+    assert.deepEqual(noProject, { id: 'orion:no-project', name: 'No project', path: '/tmp/orion-chats', repoId: null });
     assert.equal(
       results.snapshot.snapshot.threads.filter((thread) => thread.projectId === noProject.id).length,
       1,

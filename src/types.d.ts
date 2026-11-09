@@ -388,12 +388,31 @@ export type RemoteThreadMeta = {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  /** Newer hosts: the thread's summary, settled/hidden flags and workspace. */
+  summary?: import('./thread-shell').ThreadSummary;
+  settledAt?: string | null;
+  hiddenFromRecent?: boolean;
+  workspaceName?: string | null;
+  /** Its access mode and effort settings (Thread fields of the same names). */
+  settings?: Record<string, string>;
+  /** Actions it waits on the user for (request_user_action). */
+  userActions?: import('./store').UserAction[];
+  /** A question or approval waits on the user there. */
+  waitingOnQuestion?: boolean;
+};
+
+/** A paired machine's thread for this machine's sidebar (remote:listThreads). */
+export type RemoteListedThread = RemoteThreadMeta & {
+  /** The local project it belongs to here; null when none matches. */
+  localProjectId: string | null;
+  /** Its project's name on that machine. */
+  projectName: string | null;
 };
 
 export type RemoteSnapshot = {
   machine: { id: string; name: string };
   capturedAt: string;
-  projects: Array<{ id: string; name: string; path: string }>;
+  projects: Array<{ id: string; name: string; path: string; repoId?: string | null }>;
   threads: RemoteThreadMeta[];
 };
 
@@ -417,10 +436,22 @@ export type RemoteCommandRequest = {
      * cloned, main/source-checkout.js) as a project named `projectName`, or
      * find the project that already has that path; reports `projectId`.
      */
-    kind: 'runTurn' | 'stopTurn' | 'addProject';
+    kind: 'runTurn' | 'stopTurn' | 'addProject' | 'answerQuestion' | 'userAction';
+    /** answerQuestion: which question, and the answers per question id. */
+    runId?: string;
+    requestId?: string | number;
+    answers?: Record<string, string[]>;
+    /** userAction: which action, and what the user did. */
+    actionId?: string;
+    op?: 'done' | 'reply' | 'dismiss' | 'watch' | 'secret';
+    reply?: string;
+    watching?: boolean;
+    secretAnswer?: { type: 'save'; value: string } | { type: 'decline' };
     projectPath?: string;
     projectName?: string;
     prompt?: string;
+    /** Files a controller sent with the turn, already saved on this machine. */
+    attachments?: import('./store').FileAttachment[];
     threadId?: string;
     projectId?: string;
     modelId?: string;
@@ -1795,7 +1826,7 @@ type OrionCodexBrowserIntegrationStatus = {
         /** Direct mode: the host's address and port. */
         host?: string;
         port?: number;
-        /** Internet mode: the host's machine ID, used instead of host/port. */
+        /** Internet mode: a specific machine. Omit it (and host) to find the machine by its code. */
         machineId?: string;
         code: string;
       }) => Promise<{ ok: boolean; machine?: { id: string; name: string }; error?: string; needsAuth?: boolean }>;
@@ -1808,7 +1839,17 @@ type OrionCodexBrowserIntegrationStatus = {
       remoteFetchThread?: (input: {
         machineId: string;
         threadId: string;
-      }) => Promise<{ ok: boolean; thread?: import('./store').ThreadRecord; error?: string }>;
+        /** The storedVersion of the copy this machine has: an unchanged thread isn't sent again. */
+        knownVersion?: string;
+      }) => Promise<{
+        ok: boolean;
+        thread?: import('./store').ThreadRecord;
+        unchanged?: boolean;
+        storedVersion?: string;
+        /** Its and its subagents' pending user actions there. */
+        pendingUserActions?: import('./store').UserAction[];
+        error?: string;
+      }>;
       /**
        * Ask a paired host to clone a Durango Source repository it doesn't have
        * (and add it as a project) before a remoteRunTurn in it.
@@ -1818,10 +1859,60 @@ type OrionCodexBrowserIntegrationStatus = {
         repoId: string;
         name?: string;
       }) => Promise<{ ok: boolean; projectId?: string; error?: string }>;
+      /**
+       * The project on a paired machine a thread from `project` runs in: its
+       * Source repository there (cloned if missing), else one of the same name.
+       */
+      remoteResolveProject?: (input: {
+        machineId: string;
+        project: { id: string; name: string; path: string } | null;
+      }) => Promise<{ ok: boolean; projectId?: string; projectName?: string; error?: string }>;
+      remoteListThreads?: (input: {
+        machineId: string;
+      }) => Promise<{ ok: boolean; threads?: RemoteListedThread[]; error?: string }>;
+      /** A local copy of one of a paired machine's attachments. */
+      remoteFetchAttachment?: (input: { machineId: string; path: string }) => Promise<{ ok: boolean; path?: string; error?: string }>;
+      /** The branch (and workspace) a paired machine's thread works in. */
+      remoteThreadGit?: (input: { machineId: string; threadId: string }) => Promise<{
+        ok: boolean;
+        branch?: string | null;
+        detachedHead?: string | null;
+        workspaceName?: string | null;
+        dirty?: boolean;
+        error?: string;
+      }>;
+      /** The threads of that machine shown here: their live streams come through. */
+      remoteFollowThreads?: (input: { machineId: string; threadIds: string[] }) => Promise<{ ok: boolean; error?: string }>;
+      /** The questions and approvals a paired machine's thread waits on there. */
+      remoteListQuestions?: (input: {
+        machineId: string;
+        threadId: string;
+      }) => Promise<{ ok: boolean; questions?: import('./app/CodexQuestions').CodexQuestionRequest[]; error?: string }>;
+      remoteAnswerQuestion?: (input: {
+        machineId: string;
+        threadId: string;
+        runId: string;
+        requestId: string | number;
+        answers: Record<string, string[]>;
+      }) => Promise<{ ok: boolean; error?: string }>;
+      /** Done / Reply / Dismiss / Watch on an action a paired machine's thread asked for. */
+      remoteUserAction?: (input: {
+        machineId: string;
+        threadId: string;
+        actionId: string;
+        op: 'done' | 'reply' | 'dismiss' | 'watch' | 'secret';
+        reply?: string;
+        attachments?: import('./store').FileAttachment[];
+        watching?: boolean;
+        /** op 'secret': the answer to a request_secret card (sent to that machine only). */
+        secretAnswer?: { type: 'save'; value: string } | { type: 'decline' };
+      }) => Promise<{ ok: boolean; error?: string }>;
       remoteRunTurn?: (input: {
         machineId: string;
         threadId?: string;
         projectId?: string;
+        /** Local files to send along; they are uploaded to that machine first. */
+        attachments?: import('./store').FileAttachment[];
         modelId?: string;
         accessMode?: 'read-only' | 'workspace-write' | 'full-access';
         reasoningEffort?:
@@ -1839,7 +1930,13 @@ type OrionCodexBrowserIntegrationStatus = {
         codexServiceTier?: 'default' | 'priority';
         claudeContextWindow?: '200k' | '1m';
         prompt: string;
-      }) => Promise<{ ok: boolean; threadId?: string; error?: string }>;
+      }) => Promise<{
+        ok: boolean;
+        threadId?: string;
+        /** Where each attachment landed on that machine. */
+        attachments?: Array<{ hostPath: string; localPath: string }>;
+        error?: string;
+      }>;
       remoteStopTurn?: (input: {
         machineId: string;
         threadId: string;

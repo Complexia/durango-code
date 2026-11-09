@@ -224,8 +224,8 @@ const handshake = async ({ clientPsk, serverPsk }) => {
 // 6. Pairing code utilities.
 {
   const code = generatePairingCode();
-  assert.match(code, /^[A-Z2-9]{4}(-[A-Z2-9]{4}){3}$/);
-  assert.equal(normalizePairingCode(code.toLowerCase().replaceAll('-', ' ')), code.replaceAll('-', ''));
+  assert.match(code, /^[A-HJKMNP-TV-Z2-9]{5}-[A-HJKMNP-TV-Z2-9]{5}$/);
+  assert.equal(normalizePairingCode(` ${code.toLowerCase().replace('-', ' ')} `), code.replace('-', ''));
   assert.ok(macsEqual(pairingCodeToPsk(code), pairingCodeToPsk(code.toLowerCase())));
   assert.ok(!macsEqual(pairingCodeToPsk(code), pairingCodeToPsk(generatePairingCode())));
   console.log('ok  pairing code normalization');

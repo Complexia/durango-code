@@ -11,24 +11,83 @@ Off by default. While it is off, nothing listens and nothing connects.
 ## Using it
 
 **On the machine to be controlled (the host):** Settings → Remote Control →
-enable *Remote control*. Press **Generate code** and note the code, plus
-either the address and port (LAN/VPN) or the machine ID (internet) shown next
-to it. Enabling remote control implies the machine may be controlled — there
+enable *Remote control*. Press **Generate code** and note the 10-character code
+(on your own network only, also the address and port shown next to it).
+Enabling remote control implies the machine may be controlled — there
 is no separate "allow incoming" switch in the UI; pairing codes are what gate
 every actual connection. (The engine still honors
 `remoteControlSettings.allowIncoming`, which the UI keeps in lockstep with
 `enabled`.)
 
 **On the controlling machine:** Settings → Remote Control → enable *Remote
-control*, then under "Machines you can control" enter the host's address and
-port (or its machine ID, in internet mode) together with the pairing code, and
-press **Pair**.
+control*, then under "Machines you can control" enter the pairing code and
+press **Pair**. Over the internet the code is all it takes: the controller asks
+Durango Cloud for this account's machines that are online at the relay
+(`GET /api/relay/devices`) and offers the code to each until one accepts
+(`pairByCode` in `remote-control.js`; machines it hasn't paired with first).
+A machine without an active code fails the handshake at no cost to it. On
+your own network only, enter the host's address and port as well.
 
-The host now appears in the sidebar under **Machines**, alongside "This
-machine". Selecting it replaces the main panel with that machine's workspace:
-its projects and threads, a read-only transcript, and a composer that starts or
-continues turns *on the host*. Selecting "This machine" — or any local thread
-or project — returns to local work.
+**Running agents there.** Once a machine is paired, a machine picker appears
+above the prompt box, left of the branch picker. Pick the machine before a
+thread's first message; the thread then runs there for good (the picker only
+shows where). The thread stays in this machine's sidebar like any other, with
+the machine's name on its third line and in its hover card. Its first turn
+finds the project on the host: its Durango Source repository there (cloned if
+the host lacks it, `checkoutSource`), else a project of the same name or
+folder (`remote:resolveProject` in `main.js`). Turns start with
+`runTurn` (model, access, effort as set in the prompt box); Stop sends
+`stopTurn`; follow-ups typed while it runs queue here and go out when it ends.
+The transcript is a mirror of the host's copy (`Thread.remote` in `store.ts`,
+`src/app/useRemoteThreadSync.ts`): it refreshes on the host's push events, with
+a slow poll while running, for threads open here only (the machine listing
+keeps the rest current). Desktop controllers tell each host which threads they
+show (`follow`): streamed text and tool activity are forwarded only for those,
+run/question/done events to every controller; a client that never sends
+`follow` (app.durango.sh) gets everything. Each fetch names the version it has
+(`knownVersion`, the host's threads-index hash) and an unchanged thread is not
+sent again. The thread's model, access and effort follow the host's
+(`remote.hostSettings`) unless changed here; a turn sends only the settings
+changed here, so a stale value here never overrides a change made there. Stop
+puts queued follow-ups back in the composer; if the host can't be reached the
+thread is marked stopped here. Branching such a thread isn't supported yet.
+Mirrors are not synced to Durango (workspace sync skips them; the host syncs
+its own threads).
+
+**The host's own threads.** While remote control is on, every paired machine
+is kept connected, and each connected machine's threads are listed in this
+machine's sidebar like local ones (`remote:listThreads` → store
+`syncRemoteMachineThreads`): filed under the local project with the same
+Durango Source repository (the host's snapshot carries repo ids), else the same
+name or folder, else No project labeled with the host's project name. They are
+listed again after the host's `workspaceChanged` events and every minute;
+opening one fetches its transcript. A thread the host deletes leaves the list
+(after two listings without it; an empty listing removes nothing);
+deleting one here only hides it here (the host keeps it). The host's untouched
+drafts and threads that are themselves mirrors are not listed.
+
+**Attachments.** A turn's files are uploaded to the host first
+(`attachmentUpload`, 3 MiB chunks, 100 MB per file) into its attachment folder,
+and the turn names them by upload id, so the host's agent gets them exactly
+like files attached there. The mirror shows this machine's own copies; the
+host's other attachments are fetched once into
+`<attachments>/remote/` (`attachmentRead`, which serves only files in the
+host's attachment folder).
+
+**Questions and user actions.** A host thread's pending agent questions and
+approvals (`questions`, from main's pending Codex and Claude requests) and its
+"Needs you" actions (`userActions`, mirrored with the thread) show here and are
+answered here. `answerQuestion` and `userAction` run on the host through the
+same handlers as its own cards (renderer remote commands, atomically claimed);
+a Reply's files upload first. The local check-watcher never runs a mirrored
+action's `check`: Watch toggles it on the host. The host snapshot says which
+threads wait on a question or action, so the sidebar shows "Needs you" for
+them.
+
+**Branch.** In place of this machine's branch picker, a thread on another
+machine shows where it works there: its Durango workspace and branch, and a
+dot for uncommitted changes (`threadGit`, refreshed after host events). Read
+only.
 
 Both machines must be signed in to the **same Orion account** the whole time.
 Signing out on either end drops every session immediately and stops the
@@ -43,7 +102,7 @@ encryption, the authentication, or what a controller may do.
 | Mode | What happens |
 |---|---|
 | **Off** — `'direct'` (default) | The host binds a local TCP listener (default port 47615) and the controller dials an address you type. LAN, VPN, or Tailscale. Nothing leaves your network: the engine makes **zero** requests to Orion Cloud's relay, and never even resolves its URL. |
-| **On** — `'relay'` | The host additionally holds an **outbound** WebSocket to Orion Cloud's relay and controllers reach it by machine ID. No port forwarding, no inbound firewall rule, no NAT traversal. The host keeps listening locally too. |
+| **On** — `'relay'` | The host additionally holds an **outbound** WebSocket to Orion Cloud's relay and controllers find it by its pairing code, then reach it by machine ID. No port forwarding, no inbound firewall rule, no NAT traversal. The host keeps listening locally too. |
 
 In internet mode, the host registers itself (`POST /api/relay/devices`) and
 mints a short-lived relay ticket per socket (`POST /api/relay/ticket`), both
@@ -88,9 +147,19 @@ bearer token goes to Orion Cloud's API and nowhere else — never to the relay,
 never to a peer. A peer only ever receives an account *proof* bound to that
 connection's challenge and to the host's machine ID.
 
-**Pairing.** The host shows a single-use 16-character code (~78 bits over a
-30-symbol unambiguous alphabet). Both sides run an ephemeral X25519 exchange
-and derive keys with HKDF-SHA256 over `ECDH-shared-secret || PSK`, salted with
+Pairing by code knocks on every online machine of the account that is new
+enough (`canOfferCodeTo`, by the version it registered with: older hosts would
+count the knock against their relay rate limit); on new hosts a pairing
+attempt against a machine showing no code never counts toward that limit (it
+can't succeed), so mistyped codes don't lock machines out. Projects are matched by Durango Source repository first; a name or folder
+match never overrides two different repositories, and the first turn says
+which project it runs in there.
+
+**Pairing.** The host shows a single-use 10-character code (`XXXXX-XXXXX`,
+~49 bits over a 30-symbol unambiguous alphabet), short enough to type. It is one of two
+factors: the host also requires a fresh Durango account proof for its own
+account (below), so a code alone pairs nothing. Both sides run an ephemeral
+X25519 exchange and derive keys with HKDF-SHA256 over `ECDH-shared-secret || PSK`, salted with
 a hash of the full handshake transcript (both raw messages, so protocol
 version, mode, and device id are all bound into the keys). Each side then
 proves it holds the PSK by MACing the transcript. A man-in-the-middle without
@@ -99,6 +168,16 @@ is retired the moment one pairing completes, and is cancelled after 5 failed
 *confirmations* — connection attempts that never prove anything don't count,
 so a stranger cannot burn codes the user generates. Success mints a 256-bit
 per-device secret stored on both ends.
+
+The controller confirms first and the host answers only a correct
+confirmation, so a fake *controller* gets one guess per connection. A fake
+*host* on the path (someone who can intercept the connection: the relay, or an
+attacker on the LAN in direct mode) does receive the controller's confirmation
+and could search the code space offline (~49 bits: far from instant, and it
+would have to finish while the controller's handshake waits), and it would
+still need to relay the real host's account challenge through it. That is the
+trade made for a code short enough to type (it was 16 characters, ~78 bits); a
+PAKE (SPAKE2/CPace) would remove it if it ever matters.
 
 **Sessions.** The same handshake keyed by the stored device secret. Ephemeral
 keys per connection give forward secrecy. After the handshake, frames are
@@ -157,8 +236,9 @@ up locally.
 | IPC handlers (`remote:*`), event tap, account hook | `src/main.js` |
 | Renderer API | `src/preload.js`, types in `src/types.d.ts` |
 | Settings tab | `src/app/RemoteControlSettings.tsx` |
-| Sidebar Machines section | `src/app/AgentsSidebar.tsx` |
-| Remote workspace view | `src/app/RemoteMachineView.tsx` |
+| Machine picker (above the prompt box) | `src/app/MachinePicker.tsx` |
+| Threads on another machine (send, stop, mirror, listing) | `src/App.tsx` (`startRemoteTurn`), `src/app/useRemoteThreadSync.ts`, `src/app/remoteThreads.ts`, `syncRemoteMachineThreads` in `src/store.ts` |
+| Branch of a thread on another machine | `src/app/RemoteBranchPill.tsx` |
 | Host-side command execution | `src/App.tsx` (`remoteCommandHandlerRef`) |
 | Settings persistence | `remoteControlSettings` in `src/store.ts` |
 | Pairings on disk | `<userData>/orion-remote-control.json` |

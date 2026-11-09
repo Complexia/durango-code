@@ -12,6 +12,7 @@ import {
   type ThreadSummary,
 } from './thread-shell.js';
 import { defaultWorkspaceSyncConsentSettings, migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent';
+import { adoptRemoteSettings, remoteSettingsOf } from './app/remoteThreads';
 
 export type Project = {
   id: string;
@@ -714,6 +715,103 @@ export type Thread = {
    * on every turn here (even when switched off in Settings) until detached.
    */
   mcpServerIds?: string[];
+  /**
+   * Set when the thread's agents run on another machine (remote control):
+   * the prompt box sends its turns there and the transcript is a mirror of
+   * that machine's copy. Absent = this machine.
+   */
+  remote?: ThreadRemote;
+};
+
+export type ThreadRemote = {
+  /** The paired machine's id (remote control). */
+  machineId: string;
+  /** Its name when chosen, for the sidebar and the prompt box. */
+  machineName: string;
+  /** The thread's id on that machine; absent until its first turn starts there. */
+  threadId?: string;
+  /** The project on that machine the thread runs in. */
+  projectId?: string;
+  /** Its name there; shown when no project here matches it (filed under No project). */
+  projectName?: string;
+  /** Started on that machine and listed here from it (not from this machine's prompt box). */
+  imported?: boolean;
+  /** That machine's path of an attachment → this machine's copy, for showing the mirror. */
+  attachmentPaths?: Record<string, string>;
+  /**
+   * The thread's agent settings as that machine last reported them (model,
+   * access, effort). A turn sends only the settings changed here since.
+   */
+  hostSettings?: Partial<Record<string, string>>;
+  /** Since when its agent waits there on a question or approval (sidebar "Needs you"). */
+  needsInputSince?: string;
+  /** Its title there when last seen: a rename here stands until it changes there. */
+  hostTitle?: string;
+};
+
+/** One of a paired machine's threads, as remote:listThreads lists it. */
+export type RemoteThreadListing = {
+  id: string;
+  projectId: string;
+  title: string;
+  status: Thread['status'];
+  modelId: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+  summary?: ThreadSummary;
+  settledAt?: string | null;
+  hiddenFromRecent?: boolean;
+  settings?: Record<string, string>;
+  userActions?: UserAction[];
+  waitingOnQuestion?: boolean;
+  localProjectId: string | null;
+  projectName: string | null;
+};
+
+/** What the other machine says the thread waits on the user for, as a mirror patch. */
+export const remoteAttentionPatch = (
+  current: Pick<Thread, 'userActions' | 'remote'>,
+  userActions: UserAction[] | undefined,
+  waitingOnQuestion: boolean
+): Partial<Thread> => {
+  const patch: Partial<Thread> = {};
+  const next = userActions && userActions.length > 0 ? userActions : undefined;
+  if (JSON.stringify(next ?? null) !== JSON.stringify(current.userActions ?? null)) patch.userActions = next;
+  const since = current.remote?.needsInputSince;
+  if (waitingOnQuestion !== Boolean(since) && current.remote) {
+    patch.remote = { ...current.remote, needsInputSince: waitingOnQuestion ? new Date().toISOString() : undefined };
+  }
+  return patch;
+};
+
+const REMOTE_SETTING_KEYS = [
+  'accessMode',
+  'codexReasoningEffort',
+  'codexServiceTier',
+  'claudeReasoningEffort',
+  'claudeContextWindow',
+  'grokReasoningEffort',
+  'museReasoningEffort',
+  'openCodeReasoningEffort',
+] as const;
+
+// That machine's thread ids missing from its last listing, per machine: a
+// mirror goes only when its thread is missing twice in a row, so one odd
+// listing (a host mid-write) can't drop it.
+const remoteMissingLastTime = new Map<string, Set<string>>();
+
+const remoteListingSummary = (entry: RemoteThreadListing): ThreadSummary => {
+  if (entry.summary && typeof entry.summary === 'object' && Number.isSafeInteger(entry.summary.messageCount)) {
+    return entry.summary;
+  }
+  // An older host lists counts and times only.
+  return {
+    ...summarizeThreadMessages([]),
+    messageCount: entry.messageCount,
+    lastMessage: entry.updatedAt ? { id: `remote:${entry.id}`, role: 'agent', ts: entry.updatedAt } : null,
+    hasUserMessage: entry.messageCount > 0,
+  };
 };
 
 /**
@@ -1003,6 +1101,18 @@ interface OrionState {
   setNoProjectPath: (path: string) => void;
   /** Adds imported threads (and the projects created for them) without changing selection. */
   importThreads: (input: { projects: Project[]; threads: ThreadRecord[] }) => void;
+  /**
+   * List a paired machine's threads here, like this machine's own: add a
+   * mirror for each new one, keep the rest current, and drop the mirrors of
+   * threads that machine no longer has. `skip` = mirrors kept current one by
+   * one (open or running: useRemoteThreadSync); `dismissed` = that machine's
+   * thread ids deleted here.
+   */
+  syncRemoteMachineThreads: (
+    machine: { id: string; name: string },
+    listed: RemoteThreadListing[],
+    options: { skip: Set<string>; dismissed: Set<string> }
+  ) => void;
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
@@ -1554,6 +1664,9 @@ const restoreShellFromPreviousRun = (input: Thread): Thread => {
     thread = rest;
   }
   if (!thread.summary) thread = { ...thread, summary: summarizeThreadMessages([]) };
+  // A thread running on another machine kept running there: its mirror is
+  // brought up to date from that machine (useRemoteThreadSync), not here.
+  if (thread.remote) return thread;
   // A summary stored while a run was going still counts it as running (the
   // sidebar's "Worked" time would keep growing); its transcript says
   // 'stopped' once loaded.
@@ -2211,6 +2324,131 @@ export const useOrionStore = create<OrionState>()(
           };
         });
       },
+      syncRemoteMachineThreads: (machine, listed, { skip, dismissed }) => {
+        const removed: string[] = [];
+        set((state) => {
+          const mirrors = new Map<string, number>();
+          state.threads.forEach((thread, index) => {
+            if (thread.remote?.machineId === machine.id && thread.remote.threadId) {
+              mirrors.set(thread.remote.threadId, index);
+            }
+          });
+          let threads = state.threads;
+          const write = (index: number, next: Thread) => {
+            if (threads === state.threads) threads = [...state.threads];
+            threads[index] = next;
+          };
+          const added: Thread[] = [];
+          const listedIds = new Set<string>();
+          for (const entry of listed) {
+            if (!entry || typeof entry.id !== 'string') continue;
+            listedIds.add(entry.id);
+            const index = mirrors.get(entry.id);
+            if (index !== undefined) {
+              const current = threads[index];
+              if (skip.has(current.id)) continue;
+              const patch: Partial<Thread> = {};
+              // A rename here stands until that machine renames it.
+              if (
+                entry.title &&
+                entry.title !== current.title &&
+                entry.title !== current.remote?.hostTitle &&
+                !/^Thread \d{1,2}:\d{2}/i.test(entry.title)
+              ) {
+                patch.title = entry.title;
+              }
+              if (entry.status && entry.status !== current.status) patch.status = entry.status;
+              // A loaded transcript keeps its own summary; one that isn't
+              // loaded takes that machine's.
+              if (!(current.id in state.transcripts)) {
+                const summary = remoteListingSummary(entry);
+                if (!sameThreadSummary(summary, current.summary)) patch.summary = summary;
+              }
+              // That machine's settings for the thread, unless changed here.
+              const hostSettings = remoteSettingsOf({ ...entry.settings, modelId: entry.modelId });
+              const adopted = adoptRemoteSettings(current, hostSettings);
+              Object.assign(patch, adopted.patch);
+              const sameKnown =
+                JSON.stringify(adopted.hostSettings) === JSON.stringify(current.remote?.hostSettings ?? {});
+              if (current.remote?.machineName !== machine.name || !sameKnown || current.remote?.hostTitle !== entry.title) {
+                patch.remote = {
+                  ...current.remote!,
+                  machineName: machine.name,
+                  hostSettings: adopted.hostSettings,
+                  ...(entry.title ? { hostTitle: entry.title } : {}),
+                };
+              }
+              // What it waits on the user for there (actions, questions).
+              if (Array.isArray(entry.userActions) || typeof entry.waitingOnQuestion === 'boolean' || current.userActions) {
+                const attention = remoteAttentionPatch(
+                  { userActions: current.userActions, remote: patch.remote ?? current.remote },
+                  entry.userActions,
+                  entry.waitingOnQuestion === true
+                );
+                if ('userActions' in attention) patch.userActions = attention.userActions;
+                if (attention.remote) patch.remote = attention.remote;
+              }
+              if (Object.keys(patch).length > 0) write(index, { ...current, ...patch });
+              continue;
+            }
+            // That machine's untouched drafts stay there; so do threads
+            // deleted here.
+            if (entry.messageCount === 0 || dismissed.has(entry.id)) continue;
+            const settings = Object.fromEntries(
+              REMOTE_SETTING_KEYS.filter((key) => typeof entry.settings?.[key] === 'string').map((key) => [
+                key,
+                entry.settings![key],
+              ])
+            ) as Partial<Thread>;
+            const shell = {
+              // An older host doesn't list settings; nothing here is sent
+              // unless changed here (hostSettings below), and opening the
+              // thread brings that machine's values.
+              accessMode: 'read-only' as const,
+              ...settings,
+              id: crypto.randomUUID(),
+              projectId: entry.localProjectId ?? NO_PROJECT_ID,
+              title: entry.title || 'Thread',
+              status: entry.status ?? 'idle',
+              modelId: entry.modelId,
+              createdAt: entry.createdAt,
+              summary: remoteListingSummary(entry),
+              ...(entry.settledAt ? { settledAt: entry.settledAt } : {}),
+              ...(entry.hiddenFromRecent ? { hiddenFromRecent: true } : {}),
+              ...(entry.userActions?.length ? { userActions: entry.userActions } : {}),
+              remote: {
+                machineId: machine.id,
+                machineName: machine.name,
+                threadId: entry.id,
+                projectId: entry.projectId,
+                ...(entry.projectName ? { projectName: entry.projectName } : {}),
+                ...(entry.waitingOnQuestion ? { needsInputSince: new Date().toISOString() } : {}),
+                ...(entry.title ? { hostTitle: entry.title } : {}),
+                imported: true,
+              },
+            } satisfies Thread;
+            added.push({ ...shell, remote: { ...shell.remote, hostSettings: remoteSettingsOf(shell) } });
+          }
+          // A thread that machine deleted goes here too, unless it is open or
+          // running (kept current one by one) or was started from here. An
+          // empty listing is more likely a failed read than a machine with
+          // no threads left: it removes nothing.
+          const missingBefore = remoteMissingLastTime.get(machine.id) ?? new Set<string>();
+          const missingNow = new Set<string>();
+          if (listedIds.size > 0) {
+            for (const [hostId, index] of mirrors) {
+              const thread = state.threads[index];
+              if (listedIds.has(hostId) || !thread.remote?.imported || skip.has(thread.id)) continue;
+              if (missingBefore.has(hostId)) removed.push(thread.id);
+              else missingNow.add(hostId);
+            }
+          }
+          if (listedIds.size > 0) remoteMissingLastTime.set(machine.id, missingNow);
+          if (threads === state.threads && added.length === 0) return {};
+          return { threads: added.length > 0 ? [...threads, ...added] : threads };
+        });
+        for (const id of removed) get().deleteThread(id);
+      },
       removeProject: (id) => {
         set((state) => {
           const removedProject = state.projects.find((p) => p.id === id);
@@ -2443,6 +2681,12 @@ export const useOrionStore = create<OrionState>()(
       },
 
       branchThread: async (sourceThreadId) => {
+        // A thread on another machine has its context there (its agent
+        // sessions); a copy here would start without it. Not yet.
+        const source = get().threads.find((thread) => thread.id === sourceThreadId);
+        if (source?.remote) {
+          throw new Error(`Branching a thread that runs on ${source.remote.machineName} isn’t supported yet.`);
+        }
         // The copy needs the transcripts of the thread and of the subagents
         // it carries along: load them, and keep them loaded until copied.
         const familyIds = branchFamilyThreadIds(get().threads, sourceThreadId);
@@ -3423,7 +3667,7 @@ const resolveLoadedThread = (
   // A thread that was never stored has nothing on disk to lose.
   let transcript: ThreadTranscript = record ? transcriptOfRecord(record) : { messages: [] };
   let changed = false;
-  if (record && !transcriptsWrittenThisSession.has(threadId)) {
+  if (record && !shell.remote && !transcriptsWrittenThisSession.has(threadId)) {
     const restored = restoreTranscriptFromPreviousRun(transcript, interruptedAtStartup.has(threadId), sessionStartedAt);
     if (restored !== transcript) {
       transcript = restored;

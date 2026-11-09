@@ -1,5 +1,5 @@
 import React from 'react';
-import { Cast, KeyRound, Link2, Plus, RefreshCw, Trash2, Unplug } from 'lucide-react';
+import { Cast, KeyRound, Link2, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import type { RemoteControlSettings as RemoteControlSettingsValue } from '../store';
 import type { RemoteControlState } from '../types';
 import type { OrionAccountState } from './appTypes';
@@ -33,7 +33,6 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
   const [pairHost, setPairHost] = React.useState('');
   const [pairPort, setPairPort] = React.useState(String(remoteControlSettings.port));
   const [portDraft, setPortDraft] = React.useState(String(remoteControlSettings.port));
-  const [pairMachineId, setPairMachineId] = React.useState('');
   const [pairCode, setPairCode] = React.useState('');
   const [pairing, setPairing] = React.useState(false);
   const [busyId, setBusyId] = React.useState<string | null>(null);
@@ -138,16 +137,15 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
     try {
       const result = await window.orion?.remotePair?.(
         overInternet
-          ? { machineId: pairMachineId.trim(), code: pairCode }
+          ? { code: pairCode }
           : { host: pairHost.trim(), port: directPort as number, code: pairCode }
       );
       if (!mountedRef.current) return;
       if (result?.ok) {
         setNotice(
-          `Paired with ${result.machine?.name ?? (overInternet ? pairMachineId.trim() : pairHost.trim())}. It now appears under Machines in the sidebar.`
+          `Paired with ${result.machine?.name ?? (overInternet ? 'your machine' : pairHost.trim())}. Pick it from the machine menu above the prompt box to run agents there.`
         );
         setPairHost('');
-        setPairMachineId('');
         setPairCode('');
       } else {
         setError(result?.error ?? 'Pairing failed.');
@@ -239,23 +237,6 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
     }
   };
 
-  const handleDisconnectMachine = async (machineId: string) => {
-    setBusyId(machineId);
-    setError(null);
-    try {
-      const result = await window.orion?.remoteDisconnectMachine?.({ machineId });
-      if (!result?.ok && mountedRef.current) {
-        setError('Could not disconnect this machine.');
-      }
-    } catch (cause) {
-      if (mountedRef.current) {
-        setError(remoteControlErrorMessage(cause, 'Could not disconnect this machine.'));
-      }
-    } finally {
-      if (mountedRef.current) setBusyId(null);
-    }
-  };
-
   return (
     <>
       <div className="settings-group-label">Remote control</div>
@@ -313,11 +294,6 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                 </>
               )}
             </div>
-            {overInternet && remoteState?.machineId && (
-              <div className="setting-label-desc">
-                Machine ID: <code>{remoteState.machineId}</code>
-              </div>
-            )}
           </div>
           <label
             className="provider-toggle"
@@ -408,9 +384,9 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                   {activePairing ? (
                     overInternet ? (
                       <>
-                        Enter this single-use code on the other machine within 10 minutes, together
-                        with this machine’s ID {remoteState?.machineId ? <code>{remoteState.machineId}</code> : null}.
-                        Expires {formatCheckedTime(activePairing.expiresAt)}.
+                        Enter this single-use code on the other machine (signed in to the same
+                        Durango account, with an up-to-date Durango Code). Expires{' '}
+                        {formatCheckedTime(activePairing.expiresAt)}.
                       </>
                     ) : (
                       <>
@@ -515,17 +491,10 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                     {machine.error ? ` — ${machine.error}` : ''}
                   </div>
                 </div>
-                {machine.status === 'connected' ? (
-                  <button
-                    type="button"
-                    className="settings-item-action"
-                    title="Disconnect"
-                    disabled={busyId === machine.id}
-                    onClick={() => void handleDisconnectMachine(machine.id)}
-                  >
-                    <Unplug size={13} />
-                  </button>
-                ) : (
+                {/* Paired machines stay connected while remote control is on
+                    (their threads are listed in the sidebar); an offline one
+                    is retried every minute, or now from here. */}
+                {machine.status !== 'connected' && (
                   <button
                     type="button"
                     className="settings-item-action"
@@ -553,18 +522,11 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                 <div className="setting-label-title">Add a machine</div>
                 <div className="setting-label-desc">
                   {overInternet
-                    ? 'The machine ID and pairing code shown on the machine you want to control.'
+                    ? 'The pairing code shown on the machine you want to control. It must be signed in to this Durango account.'
                     : 'Address, port, and the pairing code shown on the machine you want to control.'}
                 </div>
                 <div className="remote-pair-inputs">
-                  {overInternet ? (
-                    <input
-                      type="text"
-                      placeholder="Machine ID"
-                      value={pairMachineId}
-                      onChange={(e) => setPairMachineId(e.target.value)}
-                    />
-                  ) : (
+                  {!overInternet && (
                     <>
                       <input
                         type="text"
@@ -583,9 +545,18 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                   )}
                   <input
                     type="text"
+                    className="remote-pair-code-input"
                     placeholder="Pairing code"
+                    autoCapitalize="characters"
+                    spellCheck={false}
+                    maxLength={24}
                     value={pairCode}
-                    onChange={(e) => setPairCode(e.target.value)}
+                    onChange={(e) => setPairCode(e.target.value.toUpperCase())}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && pairCode.trim() && (overInternet || pairHost.trim()) && !pairing) {
+                        void handlePair();
+                      }
+                    }}
                   />
                   <button
                     type="button"
@@ -594,7 +565,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                       pairing ||
                       !authenticated ||
                       !pairCode.trim() ||
-                      (overInternet ? !pairMachineId.trim() : !pairHost.trim())
+                      (!overInternet && !pairHost.trim())
                     }
                     onClick={() => void handlePair()}
                   >
@@ -614,7 +585,7 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
             <div className="setting-label">
               <div className="setting-label-desc">
                 <Cast size={13} className="remote-inline-icon" /> Remote control is off. Nothing
-                listens, nothing connects, and the Machines section stays out of the sidebar.
+                listens, nothing connects, and the prompt box offers only this machine.
               </div>
             </div>
           </div>

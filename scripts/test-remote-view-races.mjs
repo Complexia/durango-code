@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { createLatestOperationGate } from '../src/app/remote-operation-gate.ts';
 import {
   canGenerateRemotePairingCode,
   claimRemoteSideEffect,
@@ -273,30 +272,6 @@ assert.equal(remoteControlIsAuthenticated(true, undefined), false);
 assert.equal(remoteControlIsAuthenticated(false, true), false);
 console.log('ok  remote UI authorization requires live engine authentication');
 
-const snapshotGate = createLatestOperationGate();
-const olderSnapshot = snapshotGate.begin();
-const newerSnapshot = snapshotGate.begin();
-assert.equal(snapshotGate.isCurrent(olderSnapshot), false);
-assert.equal(snapshotGate.isCurrent(newerSnapshot), true);
-console.log('ok  a newer same-machine refresh supersedes an older response');
-
-const threadGate = createLatestOperationGate();
-const olderThread = threadGate.begin();
-const newerThread = threadGate.begin();
-assert.equal(threadGate.isCurrent(olderThread), false);
-assert.equal(threadGate.isCurrent(newerThread), true);
-console.log('ok  a newer same-thread refresh supersedes an older response');
-
-const commandGate = createLatestOperationGate();
-const pendingSend = commandGate.begin();
-commandGate.invalidate();
-assert.equal(commandGate.isCurrent(pendingSend), false);
-console.log('ok  changing selection invalidates a pending send completion');
-
-const independentSnapshot = snapshotGate.begin();
-threadGate.begin();
-assert.equal(snapshotGate.isCurrent(independentSnapshot), true);
-console.log('ok  transcript refreshes do not supersede workspace snapshots');
 
 const synchronouslyTrackedRuns = mergeSynchronouslyTrackedRuns(
   { 'settled-thread': 'settled-run' },

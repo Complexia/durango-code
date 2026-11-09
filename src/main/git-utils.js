@@ -339,7 +339,7 @@ export const getCurrentGitBranch = async (gitRoot) => {
   return branch || null;
 };
 
-const getDetachedGitHead = async (gitRoot) => {
+export const getDetachedGitHead = async (gitRoot) => {
   try {
     const { stdout } = await execFileAsync('git', ['-C', gitRoot, 'rev-parse', '--short', 'HEAD']);
     return stdout.trim() || null;

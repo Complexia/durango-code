@@ -7787,28 +7787,11 @@ body {
 }
 
 /* ============================================================
-   Remote control (Settings > Remote Control, sidebar Machines,
-   remote machine view)
+   Remote control (Settings > Remote Control, the prompt box's
+   machine picker)
    ============================================================ */
 
-.hidden-for-remote {
-  display: none !important;
-}
-
-/* Sidebar Machines section */
-.machines-list .machine-item .thread-item-select {
-  gap: 7px;
-}
-
-.machine-item-icon {
-  flex-shrink: 0;
-  color: var(--text-muted);
-}
-
-.machine-item.selected .machine-item-icon {
-  color: var(--accent);
-}
-
+/* Machine status dots (the prompt box's machine picker) */
 .machine-status-dot {
   flex-shrink: 0;
   width: 7px;
@@ -7917,266 +7900,6 @@ body {
   margin-right: 4px;
 }
 
-/* Remote machine view */
-.remote-machine-panel {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.remote-machine-header {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border-default);
-}
-
-.remote-machine-title {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  flex: 1;
-  min-width: 0;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.remote-machine-error {
-  margin: 8px 14px;
-  padding: 7px 10px;
-  border: 1px solid rgb(248 113 113 / 30%);
-  border-radius: 6px;
-  background: rgb(248 113 113 / 8%);
-  color: var(--danger);
-  font-size: 12px;
-}
-
-.remote-machine-body {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-
-.remote-machine-list {
-  width: 250px;
-  flex-shrink: 0;
-  overflow-y: auto;
-  padding: 8px;
-  border-right: 1px solid var(--border-default);
-}
-
-.remote-machine-hint {
-  padding: 10px;
-  color: var(--text-muted);
-  font-size: 12px;
-}
-
-.remote-project-section {
-  margin-bottom: 6px;
-}
-
-.remote-project-header-row {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.remote-project-header-row .remote-project-header {
-  flex: 1;
-  min-width: 0;
-  width: auto;
-}
-
-.remote-project-header {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  padding: 5px 7px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  text-align: left;
-}
-
-.remote-project-header:hover {
-  background: var(--bg-hover);
-}
-
-.remote-project-header.selected {
-  color: var(--text-primary);
-  background: var(--bg-surface);
-}
-
-.remote-thread-item {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  width: 100%;
-  padding: 4px 7px 4px 24px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  text-align: left;
-}
-
-.remote-thread-item:hover {
-  background: var(--bg-hover);
-}
-
-.remote-thread-item.selected {
-  background: var(--accent-soft);
-  color: var(--text-primary);
-}
-
-.remote-thread-dot {
-  flex-shrink: 0;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--text-muted);
-}
-
-.remote-thread-dot.running {
-  background: var(--accent);
-}
-
-.remote-thread-dot.done {
-  background: var(--success);
-}
-
-.remote-thread-dot.error {
-  background: var(--danger);
-}
-
-.remote-thread-time {
-  margin-left: auto;
-  flex-shrink: 0;
-  color: var(--text-muted);
-  font-size: 10px;
-}
-
-.remote-machine-main {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-width: 0;
-}
-
-.remote-machine-empty {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  color: var(--text-muted);
-  font-size: 13px;
-  padding: 24px;
-  text-align: center;
-}
-
-.remote-transcript {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding: 14px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.remote-message {
-  max-width: 860px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  background: var(--bg-raised);
-  padding: 8px 12px;
-}
-
-.remote-message-user {
-  border-color: rgb(77 141 255 / 22%);
-  background: var(--accent-soft);
-}
-
-.remote-message-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
-}
-
-.remote-message-role {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.remote-message-time {
-  margin-left: auto;
-  font-size: 10px;
-  color: var(--text-muted);
-}
-
-.remote-message-activities {
-  margin-bottom: 4px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.remote-message-content {
-  font-size: 13px;
-  line-height: 1.5;
-  color: var(--text-primary);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.remote-composer {
-  border-top: 1px solid var(--border-default);
-  padding: 10px 14px 12px;
-}
-
-.remote-composer-row {
-  display: flex;
-  gap: 8px;
-  align-items: flex-end;
-}
-
-.remote-composer-row textarea {
-  flex: 1;
-  resize: none;
-  padding: 8px 10px;
-  border: 1px solid var(--border-default);
-  border-radius: 8px;
-  background: var(--bg-raised);
-  color: var(--text-primary);
-  font-size: 13px;
-  font-family: inherit;
-  line-height: 1.4;
-}
-
-.remote-composer-row textarea:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-
-.remote-composer-caption {
-  margin-top: 6px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
 /* Questions the agent is waiting on (AskUserQuestion, request_user_input):
    pinned above the composer in the chat column, styled like the composer.
    Long questions scroll inside the card; the send row always stays visible. */
@@ -8415,6 +8138,58 @@ body {
   display: flex;
   justify-content: flex-end;
   font-size: 12px;
+}
+.composer-git-bar .machine-picker + .shell-branch-control,
+.composer-git-bar .machine-picker + * {
+  margin-left: 4px;
+}
+/* The branch of a thread on another machine (read only). */
+.remote-branch-pill {
+  max-width: 320px;
+  cursor: default;
+}
+.remote-branch-pill:hover {
+  background: transparent !important;
+  border-color: transparent !important;
+  color: var(--text-muted) !important;
+}
+.remote-branch-pill-branch {
+  color: var(--text-muted);
+  opacity: 0.75;
+  font-weight: 400;
+}
+.remote-branch-pill-dirty {
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--warning, #f5a524);
+}
+/* The machine picker (remote control), left of the branch picker. */
+.machine-picker-trigger.remote {
+  color: var(--text-secondary);
+}
+.machine-picker-trigger[aria-disabled="true"] {
+  cursor: default;
+}
+.machine-picker-trigger[aria-disabled="true"]:hover {
+  background: transparent;
+  border-color: transparent;
+}
+.machine-picker-trigger .machine-status-dot,
+.machine-picker-hint .machine-status-dot {
+  width: 6px;
+  height: 6px;
+  margin-left: 0;
+}
+.machine-picker-hint {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
 }
 .composer-git-bar .shell-branch-trigger {
   height: 24px;

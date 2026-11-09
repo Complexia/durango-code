@@ -4,10 +4,11 @@ import { wrapTcpSocket } from './remote-transport.js';
 // Wire protocol for Orion remote control (desktop ↔ desktop).
 //
 // Security model
-// - Pairing: the host displays a short-lived, single-use, high-entropy code
-//   (~78 bits). Both sides run an ephemeral X25519 exchange and prove
-//   knowledge of the code by MACing the handshake transcript, so a
-//   man-in-the-middle without the code cannot complete either confirmation.
+// - Pairing: the host displays a short-lived, single-use 10-character code
+//   and also requires a Durango account proof for its own account. Both
+//   sides run an ephemeral X25519 exchange and prove knowledge of the code
+//   by MACing the handshake transcript, so a man-in-the-middle without the
+//   code cannot complete either confirmation.
 //   Success mints a 256-bit per-device secret that both sides store.
 // - Sessions: the same handshake, keyed by the stored device secret instead
 //   of a pairing code. Ephemeral keys give forward secrecy; the transcript
@@ -247,16 +248,19 @@ export class SecureChannel {
   }
 }
 
-// Pairing codes avoid ambiguous characters (0/O, 1/I/L); 16 symbols over a
-// 30-character alphabet is ~78 bits — far beyond online guessing, and the
-// host caps failed attempts and expires the code anyway.
+// Pairing codes avoid ambiguous characters (0/O, 1/I/L): 10 symbols over a
+// 30-character alphabet (~49 bits), shown as two groups of five so they are
+// easy to read out and type. The code is one factor of two: the host also
+// requires a fresh Durango account proof for its own account, caps failed
+// attempts (PAIRING_MAX_ATTEMPTS) and expires the code after 10 minutes.
 const PAIRING_ALPHABET = 'ABCDEFGHJKMNPQRSTVWXYZ23456789';
+export const PAIRING_CODE_LENGTH = 10;
 
 export const generatePairingCode = () => {
   let code = '';
-  for (let index = 0; index < 16; index += 1) {
+  for (let index = 0; index < PAIRING_CODE_LENGTH; index += 1) {
+    if (index === PAIRING_CODE_LENGTH / 2) code += '-';
     code += PAIRING_ALPHABET[crypto.randomInt(PAIRING_ALPHABET.length)];
-    if (index % 4 === 3 && index < 15) code += '-';
   }
   return code;
 };

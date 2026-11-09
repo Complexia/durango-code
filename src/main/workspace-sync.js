@@ -86,9 +86,18 @@ const repoLinkOwners = new Map();
 let syncOwnerId = null;
 let totals = { projects: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
 
+// Threads that run on another machine (remote control) are mirrors of that
+// machine's threads, which that machine syncs itself: syncing them here too
+// would list them twice and count their usage twice.
+const isRemoteMirror = (shell) => Boolean(shell?.remote);
+
 const readThreadIndex = async () => {
-  if (deps.readThreadsIndex) return deps.readThreadsIndex();
-  const threads = (await deps.readThreadsFile?.())?.threads ?? [];
+  if (deps.readThreadsIndex) {
+    const index = await deps.readThreadsIndex();
+    const entries = Array.isArray(index?.entries) ? index.entries : [];
+    return { ...index, entries: entries.filter((entry) => !isRemoteMirror(entry?.shell)) };
+  }
+  const threads = ((await deps.readThreadsFile?.())?.threads ?? []).filter((thread) => !isRemoteMirror(thread));
   return {
     entries: threads.map((thread) => ({
       id: thread.id,

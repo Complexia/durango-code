@@ -22,6 +22,13 @@ export type CodexQuestionRequest = {
 
 type AsyncAnswerHandler = (request: CodexQuestionRequest, answers: Record<string, string[]>) => Promise<boolean>;
 
+/**
+ * A thread that runs on another machine (remote control): its questions are
+ * read from and answered on that machine, which handles them exactly as its
+ * own question card would (async ones included).
+ */
+export type RemoteQuestionSource = { machineId: string; machineName: string; threadId: string };
+
 export const asyncAnswerText = (request: CodexQuestionRequest, answers: Record<string, string[]>) =>
   request.questions.map((question) => `${question.question}\n${answers[question.id].join(', ')}`).join('\n\n');
 
@@ -94,10 +101,12 @@ const QuestionCard = ({
   request,
   refresh,
   onAsyncAnswer,
+  remote,
 }: {
   request: CodexQuestionRequest;
   refresh: () => void;
   onAsyncAnswer?: AsyncAnswerHandler;
+  remote?: RemoteQuestionSource;
 }) => {
   const [answers, setAnswers] = useState<Record<string, string[]>>({});
   const [customAnswers, setCustomAnswers] = useState<Record<string, string>>({});
@@ -111,9 +120,21 @@ const QuestionCard = ({
     setSending(true);
     setError('');
     try {
+      const answers = Object.fromEntries(request.questions.map((question) => [question.id, answerFor(question.id)]));
+      if (remote) {
+        const result = await window.orion?.remoteAnswerQuestion?.({
+          machineId: remote.machineId,
+          threadId: remote.threadId,
+          runId: request.runId,
+          requestId: request.requestId,
+          answers,
+        });
+        if (!result?.ok) setError(result?.error ?? `Could not reach ${remote.machineName}. Try again.`);
+        refresh();
+        return;
+      }
       if (request.async && !onAsyncAnswer) throw new Error('No async answer handler');
       const send = request.providerId === 'claude' ? window.orion?.answerClaudeQuestions : window.orion?.answerCodexQuestions;
-      const answers = Object.fromEntries(request.questions.map((question) => [question.id, answerFor(question.id)]));
       // The owner captures cancellation before any async submission work.
       const accepted = request.async
         ? await onAsyncAnswer?.(request, answers)
@@ -195,32 +216,72 @@ const QuestionCard = ({
   );
 };
 
-export const CodexQuestions = ({ threadId, onAsyncAnswer }: { threadId: string; onAsyncAnswer?: AsyncAnswerHandler }) => {
+// A remote machine's questions are also re-read now and then, in case one of
+// its push events was missed.
+const REMOTE_QUESTION_POLL_MS = 20_000;
+
+export const CodexQuestions = ({
+  threadId,
+  onAsyncAnswer,
+  remote,
+}: {
+  threadId: string;
+  onAsyncAnswer?: AsyncAnswerHandler;
+  remote?: RemoteQuestionSource;
+}) => {
   const [requests, setRequests] = useState<CodexQuestionRequest[]>([]);
   const [revision, setRevision] = useState(0);
+  const remoteMachineId = remote?.machineId;
+  const remoteThreadId = remote?.threadId;
   useEffect(() => {
     let disposed = false;
     let generation = 0;
     const refresh = async () => {
       const current = ++generation;
       try {
-        const [codex, claude] = await Promise.all([
-          window.orion?.getCodexQuestions?.(threadId),
-          window.orion?.getClaudeQuestions?.(threadId),
-        ]);
-        const pending = [...(codex ?? []), ...(claude ?? [])];
+        let pending: CodexQuestionRequest[];
+        if (remoteMachineId && remoteThreadId) {
+          const result = await window.orion?.remoteListQuestions?.({ machineId: remoteMachineId, threadId: remoteThreadId });
+          if (!result?.ok) return;
+          pending = result.questions ?? [];
+        } else {
+          const [codex, claude] = await Promise.all([
+            window.orion?.getCodexQuestions?.(threadId),
+            window.orion?.getClaudeQuestions?.(threadId),
+          ]);
+          pending = [...(codex ?? []), ...(claude ?? [])];
+        }
         if (!disposed && current === generation) setRequests(pending ?? []);
       } catch {
         // Keep existing answers available during a transient IPC failure.
       }
     };
-    const unsubscribe = window.orion?.onAgentTurnEvent?.((event) => {
-      if (event.threadId === threadId && ['user-input', 'done', 'error'].includes(event.type)) void refresh();
-    });
+    let unsubscribe: (() => void) | undefined;
+    let poll: number | undefined;
+    if (remoteMachineId && remoteThreadId) {
+      unsubscribe = window.orion?.onRemoteEvent?.((event) => {
+        if (event.machineId !== remoteMachineId || event.kind !== 'turnEvent') return;
+        const payload = event.payload;
+        if (payload?.threadId === remoteThreadId && ['user-input', 'done', 'error'].includes(payload.type ?? '')) {
+          void refresh();
+        }
+      });
+      poll = window.setInterval(() => void refresh(), REMOTE_QUESTION_POLL_MS);
+    } else {
+      unsubscribe = window.orion?.onAgentTurnEvent?.((event) => {
+        if (event.threadId === threadId && ['user-input', 'done', 'error'].includes(event.type)) void refresh();
+      });
+    }
     void refresh();
-    return () => { disposed = true; unsubscribe?.(); };
-  }, [threadId, revision]);
-  const visible = requests.filter((request) => request.threadId === threadId);
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+      if (poll !== undefined) window.clearInterval(poll);
+    };
+  }, [threadId, remoteMachineId, remoteThreadId, revision]);
+  // That machine's requests name its own thread id.
+  const ownerThreadId = remoteThreadId ?? threadId;
+  const visible = requests.filter((request) => request.threadId === ownerThreadId);
   if (!visible.length) return null;
   return (
     <div className="codex-questions" aria-label="Agent questions and approvals">
@@ -230,6 +291,7 @@ export const CodexQuestions = ({ threadId, onAsyncAnswer }: { threadId: string; 
           request={request}
           refresh={() => setRevision((value) => value + 1)}
           onAsyncAnswer={onAsyncAnswer}
+          remote={remote}
         />
       ))}
     </div>
