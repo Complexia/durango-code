@@ -9,6 +9,7 @@ import React, {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { CodexQuestions, asyncAnswerText, type CodexQuestionRequest } from './app/CodexQuestions';
+import type { ExplainApproval } from './app/ApprovalCard';
 import {
   Plus,
   Trash2,
@@ -7733,6 +7734,28 @@ const App: React.FC = () => {
     );
   };
 
+  // The approval card's "What it will do": a hidden turn on the
+  // text-generation model. Without one, the card shows the call as is.
+  const explainApproval: ExplainApproval | undefined =
+    window.orion?.explainApproval && resolveUtilityTurn().modelId
+      ? (approval, key) => {
+          const turn = resolveUtilityTurn();
+          const thread = selectedThread;
+          if (!turn.modelId || !thread) return Promise.resolve(null);
+          return (
+            window.orion?.explainApproval?.({
+              key,
+              threadId: thread.id,
+              approval,
+              modelId: turn.modelId,
+              reasoningEffort: turn.reasoningEffort,
+              // A remote thread's folder is on its own machine.
+              projectPath: thread.remote ? undefined : (activeWorkingDir ?? undefined),
+            }) ?? Promise.resolve(null)
+          );
+        }
+      : undefined;
+
   const answerAsyncQuestion = (
     request: CodexQuestionRequest,
     answers: Record<string, string[]>
@@ -9521,6 +9544,7 @@ const App: React.FC = () => {
       <CodexQuestions
         threadId={selectedThread.id}
         onAsyncAnswer={answerAsyncQuestion}
+        explainApproval={explainApproval}
         remote={
           selectedThread.remote?.threadId
             ? {

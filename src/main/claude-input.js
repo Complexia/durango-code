@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
 import { snapShotOutlinePromptText } from './snapshot-format.js';
+import { approvalView } from './approval-explainer.js';
 
 // Preserve the original files for Read/crop tools while also delivering vision
 // inputs on the user turn, as Claude Code does for pasted images and PDFs.
@@ -126,7 +127,12 @@ export const createClaudeInputRequests = (session) => {
       }], options.signal, (answers) => answers.permission[0] === 'Allow once'
         ? { behavior: 'allow', updatedInput: input }
         : { behavior: 'deny', message: 'The user denied this tool call.' }, cancelled,
-      { detail: [options.description, options.decisionReason, JSON.stringify(input, null, 2)].filter(Boolean).join('\n\n') });
+      {
+        // `approval` drives the approval card; `detail` stays for controllers
+        // (remote machines, older builds) that only know the generic card.
+        approval: approvalView(toolName, input, options),
+        detail: [options.description, options.decisionReason, JSON.stringify(input, null, 2)].filter(Boolean).join('\n\n'),
+      });
     },
   };
 };

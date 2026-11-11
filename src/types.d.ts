@@ -1630,6 +1630,15 @@ type OrionCodexBrowserIntegrationStatus = {
         reasoningEffort?: string | null;
         projectPath?: string;
       }) => Promise<string>;
+      /** Plain-English explanation of a tool call waiting for approval (text-generation model). */
+      explainApproval?: (input: {
+        key: string;
+        threadId: string;
+        approval: import('./app/CodexQuestions').ToolApproval;
+        modelId: string;
+        reasoningEffort?: string | null;
+        projectPath?: string;
+      }) => Promise<import('./app/CodexQuestions').ApprovalExplanation | null>;
       findProjectIcon: (projectPath: string) => Promise<string | null>;
       listOpenWithApps: () => Promise<Array<{ id: string; name: string; icon: string | null }>>;
       openProjectWith: (input: { appId: string; projectPath: string }) => Promise<{ ok: boolean; error?: string }>;

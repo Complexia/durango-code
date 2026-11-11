@@ -136,6 +136,7 @@ contextBridge.exposeInMainWorld('orion', {
   codexGoalCommand: (input) => ipcRenderer.invoke('agent:codexGoal', input),
   disposeAgentThread: (threadId) => ipcRenderer.invoke('agent:disposeThread', threadId),
   generateThreadTitle: (input) => ipcRenderer.invoke('agent:generateTitle', input),
+  explainApproval: (input) => ipcRenderer.invoke('agent:explainApproval', input),
   getProviderStatus: () => ipcRenderer.invoke('providers:getStatus'),
 
   // Claude Code CLI embedded terminal (one PTY per thread, lives in main)

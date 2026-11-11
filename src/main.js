@@ -47,6 +47,7 @@ import {
 } from './cloud-sync.js';
 import { getWhatsNew, markWhatsNewSeen } from './main/whats-new.js';
 import { browseDirectories, resolveProjectDirectory } from './main/project-browse.js';
+import { approvalExplainPrompt, approvalExplainTruncated, parseApprovalExplanation } from './main/approval-explainer.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, installDownloadedLinuxUpdate, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, notifyClaudeSession, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
@@ -7456,6 +7457,61 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
     threadGenerations.delete(generation);
     if (threadGenerations.size === 0) titleGenerationsByThread.delete(threadId);
   }
+});
+
+// Plain-English explanation of a tool call waiting for approval, written by
+// the text-generation model. Keyed by the request so both panes of a split
+// view, a remount, or a reopened window share one hidden turn.
+const approvalExplanations = new Map(); // key -> Promise<explanation | null>
+ipcMain.handle('agent:explainApproval', async (_event, input) => {
+  if (appShutdownRequested) return null;
+  const key = typeof input?.key === 'string' ? input.key : '';
+  const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
+  const approval = input?.approval;
+  if (!key || !threadId || !input?.modelId || typeof approval?.toolName !== 'string') return null;
+  const cached = approvalExplanations.get(key);
+  if (cached) return cached;
+  const controller = new AbortController();
+  const generation = { controller, promise: null };
+  let threadGenerations = titleGenerationsByThread.get(threadId);
+  if (!threadGenerations) {
+    threadGenerations = new Set();
+    titleGenerationsByThread.set(threadId, threadGenerations);
+  }
+  threadGenerations.add(generation);
+  const operation = (async () => {
+    // The call's text is untrusted and reaches a hidden read-only turn, so
+    // that turn runs in an empty folder (no project files or instructions in
+    // reach by relative path); the real folder is only named in the prompt.
+    let scratch = '';
+    try {
+      scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-approval-'));
+      const text = await runOneShotForModelId(
+        input.modelId,
+        approvalExplainPrompt(approval, typeof input.projectPath === 'string' ? input.projectPath : ''),
+        scratch,
+        { signal: controller.signal, threadId, reasoningEffort: input.reasoningEffort }
+      );
+      const explanation = parseApprovalExplanation(text);
+      // A clipped call was only partly explained: no verdict on the whole.
+      return explanation && approvalExplainTruncated(approval) ? { ...explanation, risk: null, partial: true } : explanation;
+    } catch (error) {
+      console.error('agent:explainApproval error', error);
+      return null;
+    } finally {
+      if (scratch) void fs.rm(scratch, { recursive: true, force: true }).catch(() => {});
+      threadGenerations.delete(generation);
+      if (threadGenerations.size === 0) titleGenerationsByThread.delete(threadId);
+    }
+  })();
+  generation.promise = operation;
+  approvalExplanations.set(key, operation);
+  // Only a handful are ever live; drop the oldest past that, and forget a
+  // failure so a reopened card can try again.
+  if (approvalExplanations.size > 40) approvalExplanations.delete(approvalExplanations.keys().next().value);
+  const result = await operation;
+  if (!result && approvalExplanations.get(key) === operation) approvalExplanations.delete(key);
+  return result;
 });
 
 // Path helpers (so renderer doesn't need node path)

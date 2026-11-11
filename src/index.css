@@ -8028,6 +8028,175 @@ body {
 
 .agent-request-detail { margin: 0 0 12px; padding: 8px 10px; border-radius: var(--radius-md); background: var(--bg-surface); color: var(--text-secondary); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font-size: 12px; }
 
+/* Tool approval (Claude's canUseTool): what wants to run and why, a
+   plain-English "What it will do", the exact call, one-click Allow / Deny. */
+.approval-card { max-height: min(60vh, 560px); }
+.approval-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.approval-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.approval-card.risk-changes .approval-icon { background: rgb(244 162 97 / 14%); color: var(--warning); }
+.approval-card.risk-destructive .approval-icon { background: rgb(248 113 113 / 14%); color: var(--danger); }
+.approval-heading { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.approval-title { font-size: 13.5px; font-weight: 600; line-height: 1.4; color: var(--text-primary); }
+.approval-purpose { font-size: 13px; line-height: 1.45; color: var(--text-secondary); }
+.approval-tool-chip {
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  padding: 2px 7px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.approval-body {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  padding: 12px 14px 4px;
+}
+.approval-explain p { margin: 0; font-size: 13px; line-height: 1.55; color: var(--text-primary); }
+.approval-explain ol { margin: 6px 0 0; padding-left: 20px; font-size: 12.5px; line-height: 1.55; color: var(--text-secondary); }
+.approval-explain li + li { margin-top: 2px; }
+.approval-explain p.approval-explain-partial { margin-top: 6px; font-size: 12px; color: var(--warning); }
+.approval-section-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.approval-section-label svg { color: var(--accent); }
+.approval-risk {
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+}
+.approval-risk.risk-read-only { background: rgb(52 211 153 / 12%); color: var(--success); }
+.approval-risk.risk-changes { background: rgb(244 162 97 / 14%); color: var(--warning); }
+.approval-risk.risk-destructive { background: rgb(248 113 113 / 14%); color: var(--danger); }
+.approval-explain-loading { display: flex; flex-direction: column; gap: 6px; padding: 2px 0; }
+.approval-explain-loading span {
+  height: 10px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--bg-surface) 0%, var(--bg-elevated) 50%, var(--bg-surface) 100%);
+  background-size: 200% 100%;
+  animation: approval-shimmer 1.4s ease-in-out infinite;
+}
+.approval-explain-loading span:last-child { width: 62%; }
+@keyframes approval-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.approval-reason {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgb(244 162 97 / 25%);
+  border-radius: var(--radius-md);
+  background: rgb(244 162 97 / 8%);
+  color: var(--warning);
+}
+.approval-reason svg { flex-shrink: 0; margin-top: 2px; }
+.approval-reason div { display: flex; flex-direction: column; gap: 1px; font-size: 12.5px; line-height: 1.5; }
+.approval-reason strong { font-weight: 500; }
+.approval-reason span { color: var(--text-secondary); }
+.approval-code { border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-surface); overflow: hidden; }
+.approval-code-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px 4px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+.approval-code-meta { min-width: 0; overflow: hidden; font-weight: 400; text-overflow: ellipsis; white-space: nowrap; }
+.approval-code-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
+  border: none;
+  border-radius: var(--radius-sm, 4px);
+  background: transparent;
+  color: var(--text-muted);
+}
+.approval-code-copy:hover { background: var(--bg-elevated); color: var(--text-primary); }
+.approval-code pre {
+  margin: 0;
+  padding: 8px 10px;
+  color: var(--text-primary);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.approval-code pre.collapsed {
+  max-height: calc(6 * 1.6em + 16px);
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(180deg, #000 70%, transparent);
+  mask-image: linear-gradient(180deg, #000 70%, transparent);
+}
+.approval-code-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 5px 10px;
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+.approval-code-toggle:hover { background: var(--bg-elevated); color: var(--text-primary); }
+.approval-code-toggle svg { transition: transform var(--transition-fast); }
+.approval-code-toggle svg.flipped { transform: rotate(180deg); }
+.approval-footer { border-top: 1px solid var(--border-subtle); margin-top: 8px; }
+.approval-footnote { margin-right: auto; font-size: 11.5px; color: var(--text-muted); }
+.approval-deny {
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  font-weight: 500;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.approval-deny:hover:not(:disabled) { background: var(--bg-elevated); border-color: var(--border-strong); }
+.approval-deny:disabled { opacity: .45; cursor: not-allowed; }
+.approval-card.risk-destructive .approval-allow { background: var(--danger); }
+
 /* A clickable @thread reference in chat: an inline chip that opens the
    referenced thread. */
 .thread-reference {

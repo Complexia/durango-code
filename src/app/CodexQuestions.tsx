@@ -1,11 +1,38 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Check, MessageCircleQuestion } from 'lucide-react';
+import { ApprovalCard, type ExplainApproval } from './ApprovalCard';
+
+/** A tool call waiting for approval, as the approval card shows it (main/approval-explainer.js). */
+export type ToolApproval = {
+  toolName: string;
+  title: string;
+  /** The agent's own one-line reason, e.g. Bash's description. */
+  purpose?: string;
+  /** Why the agent's harness asked instead of running it. */
+  reason?: string;
+  blockedPath?: string;
+  command?: string;
+  path?: string;
+  url?: string;
+  /** The rest of the tool input, as JSON. */
+  input?: string;
+};
+
+export type ApprovalExplanation = {
+  summary: string;
+  steps: string[];
+  risk: 'read-only' | 'changes' | 'destructive' | null;
+  /** The call was too long to explain whole: only its start was read. */
+  partial?: boolean;
+};
 
 export type CodexQuestionRequest = {
   providerId?: 'codex' | 'claude';
   /** Astra's request_user_input_async: answered with an ordinary steered user message. */
   async?: boolean;
   detail?: string;
+  /** Set on tool approvals (one Allow once / Deny question): rendered as the approval card. */
+  approval?: ToolApproval;
   runId: string;
   requestId: string | number;
   threadId: string;
@@ -102,11 +129,13 @@ const QuestionCard = ({
   refresh,
   onAsyncAnswer,
   remote,
+  explain,
 }: {
   request: CodexQuestionRequest;
   refresh: () => void;
   onAsyncAnswer?: AsyncAnswerHandler;
   remote?: RemoteQuestionSource;
+  explain?: ExplainApproval;
 }) => {
   const [answers, setAnswers] = useState<Record<string, string[]>>({});
   const [customAnswers, setCustomAnswers] = useState<Record<string, string>>({});
@@ -115,12 +144,13 @@ const QuestionCard = ({
   const [error, setError] = useState('');
   const complete = request.questions.every((question) => answerFor(question.id).length > 0);
 
-  const submit = async () => {
-    if (sending || !complete) return;
+  const [approvalAnswer, setApprovalAnswer] = useState<'Allow once' | 'Deny' | null>(null);
+  const submit = async (override?: Record<string, string[]>) => {
+    if (sending || (!override && !complete)) return;
     setSending(true);
     setError('');
     try {
-      const answers = Object.fromEntries(request.questions.map((question) => [question.id, answerFor(question.id)]));
+      const answers = override ?? Object.fromEntries(request.questions.map((question) => [question.id, answerFor(question.id)]));
       if (remote) {
         const result = await window.orion?.remoteAnswerQuestion?.({
           machineId: remote.machineId,
@@ -145,8 +175,27 @@ const QuestionCard = ({
       setError('Could not send your answers. Try again.');
     } finally {
       setSending(false);
+      setApprovalAnswer(null);
     }
   };
+
+  const approvalQuestion = request.questions.length === 1 ? request.questions[0] : null;
+  if (request.approval && approvalQuestion && !request.async) {
+    return (
+      <ApprovalCard
+        approval={request.approval}
+        explainKey={`${remote?.machineId ?? 'local'}:${request.providerId ?? 'codex'}:${request.runId}:${request.requestId}`}
+        explain={explain}
+        sending={approvalAnswer}
+        error={error}
+        onAnswer={(answer) => {
+          if (sending) return;
+          setApprovalAnswer(answer);
+          void submit({ [approvalQuestion.id]: [answer] });
+        }}
+      />
+    );
+  }
 
   return (
     <div className="codex-question-card">
@@ -224,10 +273,13 @@ export const CodexQuestions = ({
   threadId,
   onAsyncAnswer,
   remote,
+  explainApproval,
 }: {
   threadId: string;
   onAsyncAnswer?: AsyncAnswerHandler;
   remote?: RemoteQuestionSource;
+  /** Writes the approval card's plain-English "What it will do"; absent without a text-generation model. */
+  explainApproval?: ExplainApproval;
 }) => {
   const [requests, setRequests] = useState<CodexQuestionRequest[]>([]);
   const [revision, setRevision] = useState(0);
@@ -292,6 +344,7 @@ export const CodexQuestions = ({
           refresh={() => setRevision((value) => value + 1)}
           onAsyncAnswer={onAsyncAnswer}
           remote={remote}
+          explain={explainApproval}
         />
       ))}
     </div>
