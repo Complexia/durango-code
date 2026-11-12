@@ -3,7 +3,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
+
+import { linuxRelaunchCommand, relaunchApp } from '../src/main/linux-relaunch.js';
 import {
+  hasNoNewPrivs,
   installLinuxPackage,
   linuxInstallCommand,
   manualInstallCommand,
@@ -59,6 +64,7 @@ const ok = await installLinuxPackage({
   type: 'pacman',
   file,
   isRoot: false,
+  noNewPrivs: false,
   findExecutable: executables(['pacman', 'pkexec']),
   run: recorder({ code: 0, stderr: '' }),
 });
@@ -126,5 +132,80 @@ assert.match(
   (await installLinuxPackage({ type: 'pacman', file: null, isRoot: false, findExecutable: executables(['pacman', 'pkexec']) })).error,
   /could not be found/
 );
+
+// no_new_privs (an app restarted by Electron's app.relaunch()): setuid pkexec
+// cannot work in this process, so it runs through systemd-run --user.
+assert.equal(await hasNoNewPrivs(async () => 'Name:\tx\nNoNewPrivs:\t1\nSeccomp:\t0\n'), true);
+assert.equal(await hasNoNewPrivs(async () => 'Name:\tx\nNoNewPrivs:\t0\nSeccomp:\t0\n'), false);
+assert.equal(await hasNoNewPrivs(async () => { throw new Error('ENOENT'); }), false, 'no /proc (macOS)');
+
+calls.length = 0;
+const viaSystemdRun = await installLinuxPackage({
+  type: 'pacman',
+  file,
+  isRoot: false,
+  noNewPrivs: true,
+  findExecutable: executables(['pacman', 'pkexec', 'systemd-run']),
+  run: recorder({ code: 0, stderr: '' }),
+});
+assert.deepEqual(viaSystemdRun, { ok: true });
+assert.deepEqual(calls, [
+  ['/usr/bin/systemd-run', '--user', '--pipe', '--wait', '--collect', '--quiet', '--', '/usr/bin/pkexec', '--disable-internal-agent', '/usr/bin/pacman', '-U', '--noconfirm', file],
+]);
+const dismissedViaSystemdRun = await installLinuxPackage({
+  type: 'pacman',
+  file,
+  isRoot: false,
+  noNewPrivs: true,
+  findExecutable: executables(['pacman', 'pkexec', 'systemd-run']),
+  run: recorder({ code: 126, stderr: '' }),
+});
+assert.deepEqual(dismissedViaSystemdRun, { ok: false, cancelled: true }, "systemd-run --wait passes pkexec's exit code on");
+const noSystemdRun = await installLinuxPackage({
+  type: 'pacman',
+  file,
+  isRoot: false,
+  noNewPrivs: true,
+  findExecutable: executables(['pacman', 'pkexec']),
+  run: recorder({ code: 0, stderr: '' }),
+});
+assert.match(noSystemdRun.error, /no_new_privs.*open it again.*sudo pacman -U/);
+
+// Linux restarts go through a detached shell, not app.relaunch().
+const relaunchCalls = [];
+const fakeApp = { relaunch: () => relaunchCalls.push('app.relaunch') };
+const fakeSpawn = (program, args, options) => {
+  relaunchCalls.push([program, args, options.detached, options.stdio]);
+  return { on() {}, unref() {} };
+};
+relaunchApp(fakeApp, { platform: 'darwin', spawnProcess: fakeSpawn });
+assert.deepEqual(relaunchCalls, ['app.relaunch']);
+relaunchCalls.length = 0;
+relaunchApp(fakeApp, {
+  platform: 'linux',
+  env: {},
+  argv: ['/usr/lib/durango-code/durango-code', '--flag'],
+  execPath: '/usr/lib/durango-code/durango-code',
+  pid: 42,
+  spawnProcess: fakeSpawn,
+});
+assert.equal(relaunchCalls.length, 1);
+assert.deepEqual(relaunchCalls[0][1].slice(2), ['durango-code-relaunch', '42', '/usr/lib/durango-code/durango-code', '--flag']);
+assert.deepEqual(relaunchCalls[0].slice(2), [true, 'ignore']);
+relaunchCalls.length = 0;
+relaunchApp(fakeApp, { platform: 'linux', env: { APPIMAGE: '/home/u/Durango.AppImage' }, argv: ['/tmp/.mount_x/durango-code'], execPath: '/tmp/.mount_x/durango-code', pid: 42, spawnProcess: fakeSpawn });
+assert.deepEqual(relaunchCalls[0][1].slice(4), ['/home/u/Durango.AppImage'], 'an AppImage restarts from the AppImage file');
+relaunchCalls.length = 0;
+relaunchApp(fakeApp, { platform: 'linux', env: {}, argv: ['x'], execPath: 'x', pid: 42, spawnProcess: () => { throw new Error('EAGAIN'); } });
+assert.deepEqual(relaunchCalls, ['app.relaunch'], 'falls back to app.relaunch() if the shell cannot start');
+
+// The real shell: waits for the old process to exit, then runs the app with its arguments.
+const oldProcess = spawn('/bin/sh', ['-c', 'sleep 0.5'], { stdio: 'ignore' });
+const oldExited = new Promise((resolve) => oldProcess.on('exit', () => resolve(Date.now())));
+const [program, args] = linuxRelaunchCommand({ pid: oldProcess.pid, execPath: '/bin/echo', args: ['restarted', 'with spaces'] });
+const { stdout } = await promisify(execFile)(program, args);
+const shellDone = Date.now();
+assert.equal(stdout, 'restarted with spaces\n');
+assert.ok(shellDone >= (await oldExited), 'the new app starts only after the old process exited');
 
 console.log('Linux package install tests passed.');

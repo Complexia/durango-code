@@ -6,6 +6,12 @@
 // without what pkexec said. Here a single pkexec call runs the package
 // manager directly, without blocking, and a failure says why and what to run
 // by hand.
+//
+// When this process has the kernel's no_new_privs flag (an app restarted by
+// Electron's app.relaunch() before linux-relaunch.js, or one started from a
+// sandbox), setuid programs run without their privileges and pkexec fails with
+// "pkexec must be setuid root". pkexec then runs through `systemd-run --user`,
+// which starts it from the user's systemd manager, outside this process.
 
 import { spawn } from 'node:child_process';
 import { access, readFile } from 'node:fs/promises';
@@ -26,6 +32,15 @@ export const readLinuxPackageType = async (resourcesPath) => {
     return type === 'pacman' || type === 'deb' ? type : null;
   } catch {
     return null;
+  }
+};
+
+/** Whether this process has the no_new_privs flag (Linux; false elsewhere). */
+export const hasNoNewPrivs = async (readStatus = () => readFile('/proc/self/status', 'utf8')) => {
+  try {
+    return /^NoNewPrivs:\s*1\s*$/m.test(await readStatus());
+  } catch {
+    return false;
   }
 };
 
@@ -130,6 +145,7 @@ export const installLinuxPackage = async ({
   findExecutable = defaultFindExecutable,
   run = runCommand,
   env = process.env,
+  noNewPrivs,
 }) => {
   if (!file) return { ok: false, error: 'The downloaded update could not be found. Download it again.' };
   const command = await linuxInstallCommand(type, file, findExecutable);
@@ -159,6 +175,18 @@ export const installLinuxPackage = async ({
     args = ['--disable-internal-agent', ...command];
     program = pkexec;
     viaPkexec = true;
+    if (noNewPrivs ?? (await hasNoNewPrivs())) {
+      const systemdRun = await findExecutable('systemd-run');
+      if (!systemdRun) {
+        return {
+          ok: false,
+          error: `Durango Code is running without permission to ask for administrator rights (it was started with no_new_privs), so pkexec cannot work. Quit Durango Code and open it again from your app launcher, or to install it from a terminal, run: ${manualInstallCommand(command)}`,
+        };
+      }
+      // --pipe passes pkexec's stderr through and --wait its exit code.
+      args = ['--user', '--pipe', '--wait', '--collect', '--quiet', '--', pkexec, ...args];
+      program = systemdRun;
+    }
   }
 
   const { code, stderr } = await run(program, args, { env });

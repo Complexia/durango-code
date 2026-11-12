@@ -50,6 +50,7 @@ import {
   setCloudRepoLink,
 } from './cloud-sync.js';
 import { getWhatsNew, markWhatsNewSeen } from './main/whats-new.js';
+import { relaunchApp } from './main/linux-relaunch.js';
 import { browseDirectories, resolveProjectDirectory } from './main/project-browse.js';
 import { approvalExplainPrompt, approvalExplainTruncated, parseApprovalExplanation } from './main/approval-explainer.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, installDownloadedLinuxUpdate, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
@@ -4610,7 +4611,7 @@ ipcMain.handle('computerUse:openChromeDebugSetup', async () => {
 registerSnapShotIpc({ createWindow: () => (appShutdownRequested ? null : createWindow()) });
 
 ipcMain.handle('app:relaunch', () => {
-  app.relaunch();
+  relaunchApp(app);
   app.exit(0);
   return true;
 });
@@ -5163,7 +5164,7 @@ const restartForAppUpdate = async () => {
 
     await settleQuitBarrierForUpdate();
     if (linuxInstall) {
-      app.relaunch();
+      relaunchApp(app);
       app.quit();
       return { ok: true };
     }
