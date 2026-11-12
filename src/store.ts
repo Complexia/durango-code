@@ -663,6 +663,12 @@ export type Thread = {
   branchedFromThreadId?: string;
   /** Driver thread that spawned this one as a subagent, if any. */
   parentThreadId?: string;
+  /**
+   * Started here by an agent on a paired machine (machine_run_agent): it is
+   * that agent's subagent, listed to that machine under its thread there
+   * and kept out of Recent here.
+   */
+  spawnedBy?: ThreadSpawnedBy;
   /** Set when this thread is a provider-native subagent's live transcript (read-only). */
   subagent?: NativeSubagentInfo;
   /** Native subagent metadata retained by an editable branch copy. */
@@ -723,6 +729,14 @@ export type Thread = {
   remote?: ThreadRemote;
 };
 
+export type ThreadSpawnedBy = {
+  /** The paired machine whose agent started it. */
+  machineId: string;
+  machineName: string;
+  /** The thread on that machine whose agent started it. */
+  threadId: string;
+};
+
 export type ThreadRemote = {
   /** The paired machine's id (remote control). */
   machineId: string;
@@ -767,6 +781,8 @@ export type RemoteThreadListing = {
   waitingOnQuestion?: boolean;
   localProjectId: string | null;
   projectName: string | null;
+  /** The thread here whose agent started it there (machine_run_agent): it shows as its subagent. */
+  localParentThreadId?: string | null;
 };
 
 /** What the other machine says the thread waits on the user for, as a mirror patch. */
@@ -1139,6 +1155,8 @@ interface OrionState {
       durangoWorkspace?: ThreadDurangoWorkspace | null;
       /** false = don't switch the UI to the new thread (background spawns). */
       select?: boolean;
+      /** Started by an agent on a paired machine (machine_run_agent). */
+      spawnedBy?: ThreadSpawnedBy;
     }
   ) => string; // returns new thread id
   /**
@@ -2340,6 +2358,14 @@ export const useOrionStore = create<OrionState>()(
           };
           const added: Thread[] = [];
           const listedIds = new Set<string>();
+          // Started there by an agent here (machine_run_agent): that agent's
+          // thread is its parent, so it shows among the thread's subagents
+          // and not in the sidebar. Only while that thread is still here.
+          const localIds = new Set(state.threads.map((thread) => thread.id));
+          const localParentOf = (entry: RemoteThreadListing) =>
+            typeof entry.localParentThreadId === 'string' && localIds.has(entry.localParentThreadId)
+              ? entry.localParentThreadId
+              : undefined;
           for (const entry of listed) {
             if (!entry || typeof entry.id !== 'string') continue;
             listedIds.add(entry.id);
@@ -2348,6 +2374,10 @@ export const useOrionStore = create<OrionState>()(
               const current = threads[index];
               if (skip.has(current.id)) continue;
               const patch: Partial<Thread> = {};
+              const parentThreadId = localParentOf(entry);
+              if (parentThreadId && !current.parentThreadId && parentThreadId !== current.id) {
+                patch.parentThreadId = parentThreadId;
+              }
               // A rename here stands until that machine renames it.
               if (
                 entry.title &&
@@ -2415,6 +2445,7 @@ export const useOrionStore = create<OrionState>()(
               summary: remoteListingSummary(entry),
               ...(entry.settledAt ? { settledAt: entry.settledAt } : {}),
               ...(entry.hiddenFromRecent ? { hiddenFromRecent: true } : {}),
+              ...(localParentOf(entry) ? { parentThreadId: localParentOf(entry) } : {}),
               ...(entry.userActions?.length ? { userActions: entry.userActions } : {}),
               remote: {
                 machineId: machine.id,
@@ -2625,6 +2656,15 @@ export const useOrionStore = create<OrionState>()(
           parentThread ??
           projectThreads
             .filter((t) => !t.parentThreadId && !t.subagent)
+            .sort((a, b) => threadActivityTime(b) - threadActivityTime(a))[0] ??
+          // A project with no thread yet (No project on a fresh machine, a
+          // project just added) takes what was last run anywhere on this
+          // machine rather than a fixed provider that may not even be
+          // installed here. Mirrors of other machines' threads ran there.
+          get()
+            .threads.filter(
+              (t) => !t.parentThreadId && !t.subagent && !t.remote && !t.spawnedBy && t.summary.messageCount > 0
+            )
             .sort((a, b) => threadActivityTime(b) - threadActivityTime(a))[0];
 
         // Claude Code CLI is a terminal-hosted pseudo-model; it must be picked
@@ -2652,6 +2692,7 @@ export const useOrionStore = create<OrionState>()(
           createdAt: new Date().toISOString(),
           parentThreadId: options?.parentThreadId,
           spawnId: options?.spawnId,
+          ...(options?.spawnedBy ? { spawnedBy: options.spawnedBy } : {}),
           hiddenFromRecent: options?.hiddenFromRecent,
           subagent: options?.subagent,
           // Subagents work in their driver's directory. A workspace the driver's
@@ -2950,8 +2991,11 @@ export const useOrionStore = create<OrionState>()(
             {
               // New activity puts a thread back in Recent agents even if it was
               // removed — except subagent children, which render nested under
-              // their parent and never as top-level Recent rows.
-              shellPatch: (thread) => ({ hiddenFromRecent: thread.parentThreadId ? thread.hiddenFromRecent : false }),
+              // their parent and never as top-level Recent rows, and threads an
+              // agent on another machine started here (that agent's subagents).
+              shellPatch: (thread) => ({
+                hiddenFromRecent: thread.parentThreadId || thread.spawnedBy ? thread.hiddenFromRecent : false,
+              }),
             }
           )
         );

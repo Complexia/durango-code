@@ -1801,11 +1801,15 @@ const App: React.FC = () => {
   // so streaming output doesn't hand the sidebar a new map every token.
   const awaitingUserAction = threadsAwaitingUserAction(threads);
   const awaitingUserActionKey = [...awaitingUserAction].map(([id, since]) => `${id}:${since}`).join(',');
-  // Threads on another machine whose agent waits there on a question.
+  // Threads on another machine whose agent waits there on a question, on
+  // the row the sidebar shows for them (a parent here, for one an agent of
+  // it started there).
   const remoteNeedingInput = new Map<string, number>();
   for (const thread of threads) {
     const since = thread.remote?.needsInputSince;
-    if (since) remoteNeedingInput.set(thread.id, Date.parse(since) || 0);
+    if (!since) continue;
+    const rootId = sidebarRootThread(threads, thread).id;
+    remoteNeedingInput.set(rootId, Math.max(remoteNeedingInput.get(rootId) ?? 0, Date.parse(since) || 0));
   }
   const remoteNeedingInputKey = [...remoteNeedingInput].map(([id, since]) => `${id}:${since}`).join(',');
   const attentionThreadIds = useMemo(
@@ -2506,6 +2510,13 @@ const App: React.FC = () => {
       }
 
       const removedThreads = state.threads.filter((thread) => threadIds.has(thread.id));
+      // Other machines' threads an agent of it started there go with it here
+      // too, and must not come back as top-level threads with the next listing.
+      for (const thread of removedThreads) {
+        if (thread.id !== threadId && thread.remote?.threadId) {
+          dismissRemoteThread(thread.remote.machineId, thread.remote.threadId);
+        }
+      }
       const runIds: string[] = [];
       const spawnIds: string[] = [];
       for (const thread of removedThreads) {
@@ -6090,10 +6101,12 @@ const App: React.FC = () => {
       };
 
       // Native subagent mirrors have no independent runtime to stop; the provider CLI owns that subagent.
+      // Threads on other machines (machine_run_agent) stop with machine_stop_agent.
       const running = state.threads.filter(
         (thread) =>
           thread.parentThreadId === request.threadId &&
           !thread.subagent &&
+          !thread.remote &&
           (thread.status === 'running' || runsByThread.has(thread.id))
       );
       if (running.length === 0) {
@@ -6144,7 +6157,14 @@ const App: React.FC = () => {
         }
       }
 
-      const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
+      // Threads on other machines keep the status that machine reports; their
+      // queued follow-ups go, or they'd start again once that machine is idle.
+      for (const candidate of state.threads) {
+        if (candidate.remote && threadIds.has(candidate.id) && (candidate.queuedMessages?.length ?? 0) > 0) {
+          updateThread(candidate.id, { queuedMessages: [] });
+        }
+      }
+      const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id) && !candidate.remote);
       const runsToStop: Array<{ threadId: string; runId: string }> = [];
       for (const candidate of stoppedThreads) {
         const runId = runsByThread.get(candidate.id);
@@ -7996,7 +8016,24 @@ const App: React.FC = () => {
     const rootThread = state.threads.find((thread) => thread.id === rootThreadId);
     if (!rootThread) return false;
     const threadIds = descendantThreadIds(state.threads, rootThread.id);
-    const stoppedThreads = state.threads.filter((candidate) => threadIds.has(candidate.id));
+    // Turns its agent started on other machines (machine_run_agent) stop
+    // there, and their queued follow-ups go (or they'd start again once that
+    // machine reports them idle); their mirrors here keep the status that
+    // machine reports.
+    for (const candidate of state.threads) {
+      if (candidate.id === rootThread.id || !threadIds.has(candidate.id) || !candidate.remote) continue;
+      if ((candidate.queuedMessages?.length ?? 0) > 0) updateThread(candidate.id, { queuedMessages: [] });
+      const hostThreadId = candidate.remote.threadId;
+      if (candidate.status === 'running' && hostThreadId && window.orion?.remoteStopTurn) {
+        void window.orion
+          .remoteStopTurn({ machineId: candidate.remote.machineId, threadId: hostThreadId })
+          .catch(() => undefined)
+          .finally(() => remoteThreadSync.refreshSoon(candidate.id));
+      }
+    }
+    const stoppedThreads = state.threads.filter(
+      (candidate) => threadIds.has(candidate.id) && (candidate.id === rootThread.id || !candidate.remote)
+    );
     const runsByThread = mergeSynchronouslyTrackedRuns(
       activeRunsByThreadRef.current,
       runOutputMessages.current
@@ -8326,6 +8363,10 @@ const App: React.FC = () => {
               ? { modelId: command.modelId }
               : {}),
             ...(requestedAccessMode ? { accessMode: requestedAccessMode } : {}),
+            // An agent on the controller started it (machine_run_agent): its
+            // subagent, not something the user started, so not in Recent here
+            // either (still listed under its project).
+            ...(command.spawnedBy ? { spawnedBy: command.spawnedBy, hiddenFromRecent: true } : {}),
             select: false,
           });
           createdThread = true;

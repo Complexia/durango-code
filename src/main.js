@@ -155,7 +155,7 @@ import {
   steerRemoteTurn,
   waitForRemoteControlPersistence,
 } from './main/remote-control.js';
-import { configureMachineTools } from './main/machine-tools.js';
+import { configureMachineTools, remoteThreadSpawner } from './main/machine-tools.js';
 import { readThreadForAgent, setThreadReaderRemoteFetch } from './main/thread-reader.js';
 import {
   configureWorkspaceSync,
@@ -1955,6 +1955,13 @@ const listRemoteThreads = async ({ machineId } = {}) => {
     );
   };
   const hostProjects = new Map((snapshot.snapshot.projects ?? []).map((project) => [project.id, project]));
+  const ownMachineId = getRemoteControlState()?.machineId ?? null;
+  // A thread an agent here started there (machine_run_agent) shows under
+  // that agent's thread, like its other subagents: the host says so (it
+  // knows this machine as the device that asked), else this run remembers.
+  const localParentOf = (thread) =>
+    (ownMachineId && thread.spawnedBy?.machineId === ownMachineId ? thread.spawnedBy.threadId : null) ??
+    remoteThreadSpawner(String(machineId ?? ''), thread.id);
   return {
     ok: true,
     machine: snapshot.snapshot.machine,
@@ -1966,6 +1973,7 @@ const listRemoteThreads = async ({ machineId } = {}) => {
           ...thread,
           localProjectId: localFor(hostProject),
           projectName: hostProject?.name ?? null,
+          localParentThreadId: localParentOf(thread),
         };
       }),
   };
@@ -5479,6 +5487,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             runId,
             projectPath: input.projectPath,
             providerId: model.providerId,
+            modelId: model.id,
             accessMode: input.accessMode || 'full-access',
             browserMode: browserModeFor(model.providerId, input.providerOptions, input.accessMode || 'full-access'),
             // Not in the provider's config: the bridge connects them when the

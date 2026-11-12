@@ -221,4 +221,20 @@ assert.equal(
   'a source whose transcript is not loaded is not branched (empty) by mistake'
 );
 
+// A thread an agent started on another machine (machine_run_agent) is a
+// child here, but its context lives there: a branch never copies it.
+{
+  const remoteChild = {
+    ...child,
+    id: 'remote-child',
+    title: 'On omarchy',
+    remote: { machineId: 'm-omarchy', machineName: 'omarchy', threadId: 'host-thread', imported: true },
+  };
+  const threads = [root, remoteChild];
+  assert.deepEqual(branchFamilyThreadIds(threads.map(shellOf), root.id), [root.id]);
+  const copy = createThreadBranchFamily(threads.map(shellOf), transcriptsOf(threads), root.id);
+  assert.equal(copy.threads.length, 1, 'the remote child is not copied as a local thread');
+  assert.ok(copy.threads.every((thread) => !thread.parentThreadId || thread.parentThreadId === copy.rootId));
+}
+
 console.log('thread branching regressions passed');

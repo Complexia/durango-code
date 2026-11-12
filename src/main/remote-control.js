@@ -1655,6 +1655,11 @@ const buildSnapshot = async () => {
           projectId: shell.projectId,
           parentThreadId: shell.parentThreadId ?? null,
           subagent: Boolean(shell.subagent),
+          // Started by an agent on a paired machine: that machine lists it
+          // under the thread there instead of in its sidebar.
+          ...(typeof shell.spawnedBy?.machineId === 'string' && typeof shell.spawnedBy?.threadId === 'string'
+            ? { spawnedBy: { machineId: shell.spawnedBy.machineId, threadId: shell.spawnedBy.threadId } }
+            : {}),
           title: shell.title,
           status: shell.status,
           modelId: shell.modelId,
@@ -2390,6 +2395,20 @@ const handleHostRequest = async (session, message) => {
             codexServiceTier: sanitizeCodexServiceTier(message?.codexServiceTier),
             claudeContextWindow: sanitizeClaudeContextWindow(message?.claudeContextWindow),
             source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
+            // A new thread an agent of the controller started (machine_run_agent):
+            // its subagent, listed back to that controller under the thread there.
+            ...(typeof message?.spawnedBy?.threadId === 'string' &&
+            message.spawnedBy.threadId &&
+            message.spawnedBy.threadId.length <= 200 &&
+            typeof message?.threadId !== 'string'
+              ? {
+                  spawnedBy: {
+                    machineId: session.deviceId,
+                    machineName: session.device?.name ?? 'Remote',
+                    threadId: message.spawnedBy.threadId,
+                  },
+                }
+              : {}),
           },
           Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS,
           session,
@@ -3505,6 +3524,7 @@ export const runRemoteTurn = async ({
   reasoningEffort,
   codexServiceTier,
   claudeContextWindow,
+  spawnedBy,
 } = {}) => {
   try {
     const targetMachineId = String(machineId ?? '');
@@ -3548,6 +3568,9 @@ export const runRemoteTurn = async ({
           : {}),
         prompt: String(prompt ?? ''),
         ...(typeof context === 'string' && context.trim() ? { context: context.slice(0, MAX_TURN_CONTEXT_CHARS) } : {}),
+        ...(!threadId && typeof spawnedBy?.threadId === 'string' && spawnedBy.threadId
+          ? { spawnedBy: { threadId: spawnedBy.threadId } }
+          : {}),
       },
       (Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS) +
         (Number.isFinite(deps?.clientResponseGraceMs)

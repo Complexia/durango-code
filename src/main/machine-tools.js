@@ -184,7 +184,7 @@ export const MACHINE_TOOL_DEFINITIONS = Object.freeze([
     name: 'machine_run_agent',
     readOnly: false,
     description:
-      "Run a Durango Code agent turn on another of the user's machines: a new thread there (in a project there), or a follow-up in one of its threads (thread_id). The agent works there with that machine's files, tools and logins; the thread shows in the user's sidebar here, labeled with the machine. By default this waits until the turn ends and returns the agent's final reply; pass wait: false to start it and move on (check on it later with machine_read_thread). Give a complete, self-contained prompt: that agent does not see this conversation. Without project, a new thread runs in this thread's project there (the same Durango Source repository, cloned there if missing, else a project of the same name).",
+      "Run a Durango Code agent turn on another of the user's machines: a new thread there (in a project there), or a follow-up in one of its threads (thread_id). The agent works there with that machine's files, tools and logins; a thread you start shows here as a subagent of this thread (not in the user's sidebar). By default this waits until the turn ends and returns the agent's final reply; pass wait: false to start it and move on (check on it later with machine_read_thread). Give a complete, self-contained prompt: that agent does not see this conversation. Without project, a new thread runs in this thread's project there (the same Durango Source repository, cloned there if missing, else a project of the same name).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -197,7 +197,8 @@ export const MACHINE_TOOL_DEFINITIONS = Object.freeze([
         },
         model: {
           type: 'string',
-          description: "Model there: id, slug or label (default: the project's usual model there)",
+          description:
+            "Model there: id, slug or label. Default: your own model there (else your provider's model last used there) when your provider works there, else the model last used on that machine",
         },
         effort: { type: 'string', description: 'Reasoning effort, e.g. "low", "medium", "high", "xhigh"' },
         access_mode: {
@@ -549,6 +550,54 @@ const matchModel = (models, ref) => {
   };
 };
 
+const providerOfModelId = (modelId) => (typeof modelId === 'string' && modelId.includes(':') ? modelId.split(':')[0] : '');
+const listedTime = (thread) => Date.parse(thread?.updatedAt ?? thread?.createdAt ?? '') || 0;
+
+/**
+ * The model a new thread there runs when the caller names none. The calling
+ * agent's own model when that machine has it, else the model of the same
+ * provider last used there, else any model of that provider there (a Claude
+ * agent starts Claude there); without one, the model last used on that
+ * machine. null = leave it to that machine (its project's last model).
+ */
+export const defaultRemoteModel = ({ models, threads, callerModelId, callerProviderId }) => {
+  const usable = (Array.isArray(models) ? models : []).filter(
+    (model) => model && typeof model.id === 'string' && model.available !== false
+  );
+  const byId = new Map(usable.map((model) => [model.id, model]));
+  // Threads someone actually ran (not untouched drafts), newest first.
+  const recent = (Array.isArray(threads) ? threads : [])
+    .filter(
+      (thread) =>
+        thread &&
+        !thread.parentThreadId &&
+        !thread.subagent &&
+        thread.messageCount !== 0 &&
+        byId.has(thread.modelId)
+    )
+    .sort((a, b) => listedTime(b) - listedTime(a));
+  const provider = callerProviderId || providerOfModelId(callerModelId);
+  if (provider) {
+    if (callerModelId && byId.get(callerModelId)?.providerId === provider) return byId.get(callerModelId);
+    const used = recent.find((thread) => byId.get(thread.modelId).providerId === provider);
+    if (used) return byId.get(used.modelId);
+    const ofProvider = usable.filter((model) => model.providerId === provider);
+    const pick = ofProvider.find((model) => model.favorite) ?? ofProvider[0];
+    if (pick) return pick;
+  }
+  return recent.length > 0 ? byId.get(recent[0].modelId) : null;
+};
+
+// Threads started here by machine_run_agent, by machine and that machine's
+// thread id → the thread here whose agent started it. A host lists its
+// own record of this (`spawnedBy`); this covers an older one that doesn't.
+const spawnedRemoteThreads = new Map();
+const spawnKey = (machineId, hostThreadId) => `${machineId}\u0000${hostThreadId}`;
+
+/** The thread here that started `hostThreadId` on that machine with machine_run_agent, if known. */
+export const remoteThreadSpawner = (machineId, hostThreadId) =>
+  spawnedRemoteThreads.get(spawnKey(machineId, hostThreadId)) ?? null;
+
 /**
  * The reply to `prompt` in a thread: the agent messages after the user
  * message with that text, up to the next user message (a later follow-up's
@@ -706,6 +755,23 @@ const machineRunAgent = async (args, context) => {
     const match = matchModel(catalog.models, args.model.trim());
     if (!match.model) return fail(match.error);
     modelId = match.model.id;
+  } else if (!threadId) {
+    // No model named: this agent's provider when it works there, else what
+    // that machine ran last; never a model nobody uses there. Unreadable →
+    // that machine's own default.
+    const [catalog, listing] = await Promise.all([
+      deps.remote.fetchRemoteModels({ machineId: machine.id }).catch(() => null),
+      snapshotOf(machine).catch(() => ({})),
+    ]);
+    if (catalog?.ok) {
+      modelId =
+        defaultRemoteModel({
+          models: catalog.models,
+          threads: listing?.snapshot?.threads,
+          callerModelId: context?.modelId,
+          callerProviderId: context?.providerId,
+        })?.id ?? undefined;
+    }
   }
 
   // A follow-up's reply comes after the transcript as it is now: an earlier
@@ -742,15 +808,23 @@ const machineRunAgent = async (args, context) => {
       ...(modelId ? { modelId } : {}),
       accessMode: capAccessMode(args.access_mode, context?.accessMode),
       ...(typeof args.effort === 'string' && args.effort.trim() ? { reasoningEffort: args.effort.trim().toLowerCase() } : {}),
+      // A new thread there is this thread's subagent: shown under it here,
+      // not in the sidebars.
+      ...(!threadId && typeof context?.threadId === 'string' && context.threadId
+        ? { spawnedBy: { threadId: context.threadId } }
+        : {}),
     });
     if (!started.ok || !started.threadId) {
       return fail(`Could not start the turn on ${machine.name}: ${started.error ?? 'no thread was started.'}`);
+    }
+    if (!threadId && typeof context?.threadId === 'string' && context.threadId) {
+      spawnedRemoteThreads.set(spawnKey(machine.id, started.threadId), context.threadId);
     }
     const where = threadId ? `thread ${started.threadId}` : `a new thread (id: ${started.threadId}) in ${projectName ?? 'a project'}`;
     if (!wait) {
       return {
         ok: true,
-        text: `Started a turn on ${machine.name} in ${where}. It shows in the user's sidebar under that machine. Check on it with machine_read_thread (machine: "${machine.name}", thread_id: "${started.threadId}").`,
+        text: `Started a turn on ${machine.name} in ${where}.${threadId ? '' : ' It shows here as a subagent of this thread.'} Check on it with machine_read_thread (machine: "${machine.name}", thread_id: "${started.threadId}").`,
       };
     }
     const outcome = await waitForTurn({

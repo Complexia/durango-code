@@ -583,6 +583,11 @@ const claudeMachineTools = (tool, z, session) =>
           await runMachineTool(definition.name, args, {
             accessMode: session.accessMode,
             projectPath: session.projectPath,
+            // Who is calling: an agent turn started there runs under this
+            // thread here, with this model's provider by default.
+            threadId: session.threadId,
+            providerId: 'claude',
+            modelId: session.createParams?.model?.id,
             signal: extra?.signal instanceof AbortSignal ? extra.signal : undefined,
           })
         ),

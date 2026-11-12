@@ -313,6 +313,9 @@ export const handleMcpBridgeConnection = (socket) => {
         void runMachineTool(message.tool, args, {
           accessMode: session.accessMode,
           projectPath: session.projectPath,
+          threadId: session.threadId,
+          providerId: session.providerId,
+          modelId: session.modelId,
           // These providers can't be relied on to ask before a command
           // (Codex approves every orion tool): Full access only.
           requireFullAccess: true,
@@ -438,6 +441,7 @@ export const registerMcpBridgeForRun = async ({
   runId,
   projectPath,
   providerId,
+  modelId,
   accessMode,
   browserMode = 'off',
   userServers = [],
@@ -468,6 +472,7 @@ export const registerMcpBridgeForRun = async ({
       runId,
       projectPath,
       providerId,
+      modelId,
       accessMode,
       browserMode,
       onDemandMcps,

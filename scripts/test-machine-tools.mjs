@@ -7,6 +7,8 @@ import os from 'node:os';
 
 const {
   MACHINE_TOOL_DEFINITIONS,
+  defaultRemoteModel,
+  remoteThreadSpawner,
   machineMcpToolDefinitions,
   machineToolsForAccessMode,
   machineToolsPromptHint,
@@ -47,8 +49,9 @@ const remote = {
   fetchRemoteModels: async () => ({
     ok: true,
     models: [
-      { id: 'claude:opus', label: 'Claude Opus', slug: 'opus', available: true },
-      { id: 'codex:gpt', label: 'GPT', slug: 'gpt', available: true },
+      { id: 'claude:opus', providerId: 'claude', label: 'Claude Opus', slug: 'opus', available: true },
+      { id: 'codex:gpt', providerId: 'codex', label: 'GPT', slug: 'gpt', available: true },
+      { id: 'grok:grok-4.7', providerId: 'grok', label: 'Grok 4.7', slug: 'grok-4.7', available: false },
     ],
   }),
   execOnRemoteMachine: async (input) => {
@@ -260,6 +263,67 @@ process.on('unhandledRejection', (error) => {
   assert.equal(abandoned.ok, false);
   assert.match(abandoned.text, /This run was stopped; the turn there keeps running/);
   console.log('ok  machine_run_agent');
+}
+
+// A new thread there without a model: the caller's provider when it works
+// there, else what that machine ran last; it is the caller thread's subagent.
+{
+  calls = [];
+  const started = await runMachineTool(
+    'machine_run_agent',
+    { machine: 'omarchy', prompt: 'Diagnose the updater.', project: 'No project', wait: false },
+    { ...full, threadId: 'local-driver', providerId: 'codex', modelId: 'codex:gpt-other' }
+  );
+  assert.equal(started.ok, true, started.text);
+  assert.match(started.text, /It shows here as a subagent of this thread/);
+  const run = calls.find((call) => call.kind === 'runTurn').input;
+  assert.equal(run.modelId, 'codex:gpt', "the caller's provider there");
+  assert.deepEqual(run.spawnedBy, { threadId: 'local-driver' });
+  assert.equal(remoteThreadSpawner('m-omarchy', 't-new'), 'local-driver');
+  assert.equal(remoteThreadSpawner('m-studio', 't-new'), null);
+
+  calls = [];
+  await runMachineTool(
+    'machine_run_agent',
+    { machine: 'omarchy', prompt: 'x', project: 'No project', wait: false },
+    { ...full, threadId: 'local-driver', providerId: 'grok', modelId: 'grok:grok-4.7' }
+  );
+  assert.equal(
+    calls.find((call) => call.kind === 'runTurn').input.modelId,
+    'claude:opus',
+    'a provider not usable there falls back to the model last used there'
+  );
+
+  calls = [];
+  await runMachineTool('machine_run_agent', { machine: 'omarchy', thread_id: 't-run', prompt: 'more', wait: false }, {
+    ...full,
+    threadId: 'local-driver',
+    providerId: 'codex',
+  });
+  const followUp = calls.find((call) => call.kind === 'runTurn').input;
+  assert.equal(followUp.modelId, undefined, 'a follow-up keeps its thread\'s model');
+  assert.equal(followUp.spawnedBy, undefined);
+
+  const models = [
+    { id: 'claude:opus', providerId: 'claude', available: true },
+    { id: 'claude:sonnet', providerId: 'claude', available: true },
+    { id: 'codex:gpt', providerId: 'codex', available: true },
+    { id: 'grok:grok-4.7', providerId: 'grok', available: false },
+  ];
+  const threads = [
+    { id: 'a', modelId: 'codex:gpt', updatedAt: '2026-11-10T00:00:00Z', messageCount: 3 },
+    { id: 'b', modelId: 'claude:sonnet', updatedAt: '2026-11-09T00:00:00Z', messageCount: 3 },
+    { id: 'c', modelId: 'claude:opus', updatedAt: '2026-11-11T00:00:00Z', messageCount: 0 },
+    { id: 'd', modelId: 'grok:grok-4.7', updatedAt: '2026-11-12T00:00:00Z', messageCount: 5 },
+  ];
+  const pick = (caller) => defaultRemoteModel({ models, threads, ...caller })?.id ?? null;
+  assert.equal(pick({ callerModelId: 'claude:opus' }), 'claude:opus', 'the same model when it is there');
+  assert.equal(pick({ callerModelId: 'claude:fable', callerProviderId: 'claude' }), 'claude:sonnet', "the provider's last used there");
+  assert.equal(pick({}), 'codex:gpt', 'no caller: last used there (not drafts, not unusable models)');
+  assert.equal(pick({ callerProviderId: 'kimi' }), 'codex:gpt');
+  assert.equal(defaultRemoteModel({ models, threads: [], callerProviderId: 'claude' })?.id, 'claude:opus');
+  assert.equal(defaultRemoteModel({ models, threads: [] }), null, "nothing to go on: that machine's default");
+  console.log('ok  machine_run_agent default model and subagent link');
 }
 
 // A follow-up returns its own reply: not an earlier turn with the same text,

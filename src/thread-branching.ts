@@ -153,7 +153,9 @@ const isSettledChild = (child: Thread) => {
 const childrenByParentOf = (threads: Thread[]) => {
   const childrenByParent = new Map<string, Thread[]>();
   for (const thread of threads) {
-    if (!thread.parentThreadId) continue;
+    // A thread on another machine an agent started (machine_run_agent) has
+    // its context there; a copy here would be a local thread without it.
+    if (!thread.parentThreadId || thread.remote) continue;
     const children = childrenByParent.get(thread.parentThreadId);
     if (children) children.push(thread);
     else childrenByParent.set(thread.parentThreadId, [thread]);

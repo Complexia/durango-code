@@ -165,9 +165,13 @@ export const AgentFamilySwitcher: React.FC<{
       : '';
     const tokens = lastRun?.totalTokens;
     const active = thread.id === currentThread.id;
+    const modelName = thread.modelId.split(':')[1] ?? 'agent';
     const name = isMain
       ? 'main'
-      : thread.subagent?.kind ?? thread.inheritedSubagent?.kind ?? thread.modelId.split(':')[1] ?? 'agent';
+      : thread.subagent?.kind ??
+        thread.inheritedSubagent?.kind ??
+        // Started on another machine (machine_run_agent): say where.
+        (thread.remote ? `${thread.remote.machineName} · ${modelName}` : modelName);
     const detail = thread.title;
     return (
       <button

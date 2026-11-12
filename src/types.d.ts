@@ -382,6 +382,8 @@ export type RemoteThreadMeta = {
   projectId: string;
   parentThreadId: string | null;
   subagent: boolean;
+  /** Started by an agent on a paired machine (machine_run_agent), from its thread there. */
+  spawnedBy?: { machineId: string; threadId: string };
   title: string;
   status: 'idle' | 'running' | 'done' | 'error';
   modelId: string;
@@ -480,6 +482,11 @@ export type RemoteCommandRequest = {
     /** Claude-only context window. Ignored for other providers. */
     claudeContextWindow?: '200k' | '1m';
     source?: { machineId: string; machineName: string };
+    /**
+     * runTurn, new thread: an agent on the controller started it
+     * (machine_run_agent) from its thread `threadId` there.
+     */
+    spawnedBy?: import('./store').ThreadSpawnedBy;
     /**
      * Set when Durango started this run (dispatch worker in main): the
      * renderer creates the thread exactly like a remote runTurn (or, for a

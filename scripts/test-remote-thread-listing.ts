@@ -114,5 +114,57 @@ console.log('ok  threads that machine deleted leave this list');
   console.log('ok  listed threads say what they wait on the user for');
 }
 
+// Started there by an agent here (machine_run_agent): listed under that
+// agent's thread as its subagent, not as a top-level thread.
+{
+  const driver = useOrionStore.getState().createThread('local-durango', 'Fix the updater', { select: false });
+  sync([
+    listing('h1'),
+    listing('h2'),
+    listing('spawned', { localParentThreadId: driver }),
+    listing('orphan', { localParentThreadId: 'not-here' }),
+  ]);
+  const spawned = mirrors().find((thread) => thread.remote?.threadId === 'spawned')!;
+  assert.equal(spawned.parentThreadId, driver);
+  const orphan = mirrors().find((thread) => thread.remote?.threadId === 'orphan')!;
+  assert.equal(orphan.parentThreadId, undefined, 'a parent no longer here leaves it top-level');
+  // A mirror listed before the link was known gets it later.
+  sync([listing('h1', { localParentThreadId: driver }), listing('h2'), listing('spawned'), listing('orphan')]);
+  assert.equal(mirrors().find((thread) => thread.remote?.threadId === 'h1')?.parentThreadId, driver);
+  assert.equal(
+    mirrors().find((thread) => thread.remote?.threadId === 'spawned')?.parentThreadId,
+    driver,
+    'a later listing without the link keeps it'
+  );
+  console.log('ok  threads an agent here started there are its subagents');
+}
+
+// A new thread in a project with no threads takes the model last run on this
+// machine, not a fixed default.
+{
+  const store = useOrionStore.getState();
+  const used = store.createThread('local-durango', 'Used', { select: false, modelId: 'codex:gpt-5.5' });
+  store.updateThread(used, {
+    summary: { ...summary, lastMessage: { ...summary.lastMessage, ts: new Date(Date.now() + 60_000).toISOString() } },
+  });
+  const fresh = useOrionStore.getState().createThread(NO_PROJECT_ID, undefined, { select: false });
+  assert.equal(useOrionStore.getState().threads.find((thread) => thread.id === fresh)?.modelId, 'codex:gpt-5.5');
+  console.log('ok  an empty project starts with the model last used on this machine');
+}
+
+// A thread an agent on another machine started here stays out of Recent
+// once its first message lands.
+{
+  const store = useOrionStore.getState();
+  const spawned = store.createThread('local-durango', undefined, {
+    select: false,
+    hiddenFromRecent: true,
+    spawnedBy: { machineId: 'm-mac', machineName: 'Mac', threadId: 'mac-thread' },
+  });
+  store.addMessageToThread(spawned, { role: 'user', content: 'Diagnose the updater.' });
+  assert.equal(useOrionStore.getState().threads.find((thread) => thread.id === spawned)?.hiddenFromRecent, true);
+  console.log('ok  threads an agent elsewhere started here stay out of Recent');
+}
+
 console.log('All remote thread listing tests passed.');
 process.exit(0);
