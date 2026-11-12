@@ -1,7 +1,7 @@
 import { app } from 'electron';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -88,6 +88,27 @@ childProcess.spawn = function (command, args, options) {
 };
 syncBuiltinESMExports();
 
+// Run by the app binary started as the CLI (runBundledCliInForeground), which
+// waits in spawnSync and cannot forward signals: if it is killed, stop too
+// rather than keep running unowned. Not inherited by the CLI's own children.
+const foregroundParent = Number(process.env.DURANGO_CODE_FOREGROUND_PARENT);
+delete process.env.DURANGO_CODE_FOREGROUND_PARENT;
+const parentAlive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+};
+if (foregroundParent > 0) {
+  // ppid catches reparenting on POSIX; the liveness probe covers Windows,
+  // which never reparents.
+  setInterval(() => {
+    if (process.ppid !== foregroundParent || !parentAlive(foregroundParent)) process.kill(process.pid, 'SIGTERM');
+  }, 1000).unref();
+}
+
 // The CLI words its hints after the alias it was invoked as (ui.ts).
 const invokedAs = process.env.DURANGO_CODE_INVOKED_AS;
 delete process.env.DURANGO_CODE_INVOKED_AS;
@@ -111,6 +132,20 @@ set DURANGO_CODE_INVOKED_AS=${alias}
 "${process.execPath}" "${wrapperPath()}" %*
 `;
 
+/** The wrapper and alias launchers to write into the bin directory. */
+const bundledCliFiles = (entry) => {
+  const binDir = bundledCliBinDir();
+  const files = [{ target: wrapperPath(), content: wrapperSource(entry), mode: null }];
+  for (const alias of CLI_ALIASES) {
+    files.push(
+      process.platform === 'win32'
+        ? { target: path.join(binDir, `${alias}.cmd`), content: windowsShim(alias), mode: null }
+        : { target: path.join(binDir, alias), content: posixShim(alias), mode: 0o755 }
+    );
+  }
+  return files;
+};
+
 const writeIfChanged = async (target, content, mode) => {
   try {
     if ((await fs.readFile(target, 'utf8')) === content) {
@@ -123,6 +158,18 @@ const writeIfChanged = async (target, content, mode) => {
   await fs.rename(temporary, target);
 };
 
+const writeIfChangedSync = (target, content, mode) => {
+  try {
+    if (readFileSync(target, 'utf8') === content) {
+      if (mode) chmodSync(target, mode);
+      return;
+    }
+  } catch {}
+  const temporary = `${target}.${process.pid}.tmp`;
+  writeFileSync(temporary, content, { mode: mode ?? 0o644 });
+  renameSync(temporary, target);
+};
+
 /**
  * Writes the wrapper and the alias launchers. The app path and Electron
  * binary change with every update (and differ between dev and packaged
@@ -132,17 +179,50 @@ const writeIfChanged = async (target, content, mode) => {
 export const installBundledCliShims = async () => {
   const entry = bundledCliEntry();
   if (!entry) return null;
-  const binDir = bundledCliBinDir();
-  await fs.mkdir(binDir, { recursive: true });
-  await writeIfChanged(wrapperPath(), wrapperSource(entry));
-  for (const alias of CLI_ALIASES) {
-    if (process.platform === 'win32') {
-      await writeIfChanged(path.join(binDir, `${alias}.cmd`), windowsShim(alias));
-    } else {
-      await writeIfChanged(path.join(binDir, alias), posixShim(alias), 0o755);
-    }
+  await fs.mkdir(bundledCliBinDir(), { recursive: true });
+  for (const file of bundledCliFiles(entry)) await writeIfChanged(file.target, file.content, file.mode);
+  return bundledCliBinDir();
+};
+
+/**
+ * Runs the bundled CLI in the foreground, attached to this process's terminal,
+ * and returns the exit code for process.exit. For launches of the app binary
+ * that are really CLI calls (cli-argv.js, run-cli-from-argv.js): it runs before
+ * `ready`, so it writes the launchers itself (synchronously, the same files
+ * installBundledCliShims writes) rather than relying on an earlier launch.
+ */
+export const runBundledCliInForeground = (args) => {
+  const entry = bundledCliEntry();
+  if (!entry) {
+    process.stderr.write('This Durango Code build does not include the durango-code CLI.\n');
+    return 1;
   }
-  return binDir;
+  try {
+    // All launchers, not just the wrapper: the CLI names <userData>/bin/<alias>
+    // as itself (e.g. the git credential helper `setup-git` registers).
+    mkdirSync(bundledCliBinDir(), { recursive: true });
+    for (const file of bundledCliFiles(entry)) writeIfChangedSync(file.target, file.content, file.mode);
+  } catch (error) {
+    process.stderr.write(`Could not prepare the durango-code CLI: ${error?.message ?? error}\n`);
+    return 1;
+  }
+  const cli = bundledCliCommand();
+  const result = spawnSync(cli.command, [...cli.args, ...args], {
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      ...cli.env,
+      DURANGO_CODE_INVOKED_AS: 'durango-code',
+      DURANGO_CODE_FOREGROUND_PARENT: String(process.pid),
+    },
+    windowsHide: false,
+  });
+  if (result.error) {
+    process.stderr.write(`Could not run the durango-code CLI: ${result.error.message}\n`);
+    return 1;
+  }
+  if (result.signal) return 128 + (os.constants.signals[result.signal] ?? 0);
+  return result.status ?? 1;
 };
 
 /** How to start the bundled CLI as a child process: `spawn(command, [...args, ...cliArgs], { env })`. */

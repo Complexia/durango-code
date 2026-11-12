@@ -1,6 +1,9 @@
 // Must stay the first import: pins the internal app name and legacy userData
 // path before any other module evaluates (see docs/durango-rebrand.md).
 import './main/pin-app-identity.js';
+// Then: a launch that is really a `durango-code` CLI call (/usr/bin/durango-code
+// on Linux is this app) runs the bundled CLI and exits.
+import './main/run-cli-from-argv.js';
 import './main/linux-password-store.js';
 // Then: a legacy /Applications/Orion.app renames itself to Durango Code.app
 // and relaunches (Dock/Finder show the bundle file name).
@@ -2922,8 +2925,10 @@ const writeGitCommitMessage = async ({ gitRoot, entries, modelId, reasoningEffor
 
 // Launchers for the CLI bundled with the app (src/main/bundled-cli.js), on PATH
 // for agents and the embedded terminal. Appended, so a globally installed CLI
-// still wins. The shell PATH sync merges the user's shell PATH in front of
-// whatever process.env.PATH holds, which keeps this directory last either way.
+// still wins. On Linux /usr/bin/durango-code (the app itself) comes first; it
+// runs this same bundled CLI (src/main/run-cli-from-argv.js). The shell PATH
+// sync merges the user's shell PATH in front of whatever process.env.PATH
+// holds, which keeps this directory last either way.
 let bundledCliBinDirPromise = null;
 const installBundledCli = () => {
   bundledCliBinDirPromise ??= installBundledCliShims()

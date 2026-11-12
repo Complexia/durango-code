@@ -86,6 +86,19 @@ app's own workspace features always run the bundled copy. A small wrapper keeps
 `ELECTRON_RUN_AS_NODE` away from the processes the CLI starts (dev servers,
 `ws run` commands), except the CLI's own background train.
 
+On Linux the `.deb` and `.pacman` packages install the app itself as
+`/usr/bin/durango-code` (they always name the `/usr/bin` link after the package),
+which comes before `<userData>/bin` on `PATH`. So the app binary doubles as the
+CLI: started with a CLI command word (after any leading options, as in
+`--json ws list`) or `--version` / `--help` (`src/main/cli-argv.js`), it writes
+the launchers, runs the bundled CLI in the foreground and exits with its code,
+before any window or single-instance lock exists
+(`src/main/run-cli-from-argv.js`). Any other launch (no arguments, an `orion://`
+URL, Chromium switches) starts the app as usual. Before this, such calls found
+the running instance and quit silently with exit 0. The app process waits in
+`spawnSync` and cannot forward signals, so the wrapper stops the CLI when that
+process dies. A dev build run this way uses its own profile's `bin`.
+
 Agents need a signed-in CLI to open and land changes. When the CLI has no
 credential, the app signs it in with the Durango account (Settings → Workspaces
 → Sign in the CLI, or automatically before creating a workspace): it mints a
