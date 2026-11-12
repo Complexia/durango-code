@@ -6,6 +6,7 @@ import './main/linux-password-store.js';
 // and relaunches (Dock/Finder show the bundle file name).
 import './main/rename-legacy-bundle-on-start.js';
 import { createRepositoryCredentials } from './main/repository-credentials.js';
+import { reloadWhenRendererGone } from './main/renderer-recovery.js';
 import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main/app-identity.js';
 import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
 import { isPreviewFilePath } from './app/codeFiles.ts';
@@ -1117,6 +1118,22 @@ const createWindow = () => {
     mainWindow.loadFile(path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`));
   }
 
+  // A renderer that dies (crash, OOM, stray signal) would leave a blank window.
+  // Recover like closing the window and opening a new one (window-all-closed,
+  // then activate): stop the work the dead renderer was following, and let
+  // goal pauses and transcript saves land before the new renderer hydrates.
+  reloadWhenRendererGone(mainWindow, {
+    isShuttingDown: () => appShutdownRequested,
+    reload: () => {
+      disposeRendererBoundWork();
+      void waitForPendingAgentShutdowns()
+        .then(() => threadsSaveQueue.catch(() => {}))
+        .then(() => {
+          if (!mainWindow.isDestroyed() && !appShutdownRequested) mainWindow.webContents.reload();
+        });
+    },
+  });
+
   // DevTools can still be opened manually from the Electron menu when needed.
   browserMainWindow = mainWindow;
   mainWindow.on('closed', () => {
@@ -1574,15 +1591,21 @@ const reapActiveAgentRuns = () => {
   }
 };
 
-app.on('window-all-closed', () => {
-  // On macOS the main process remains alive after the last window closes.
-  // Tear down persistent sessions so their output is not sent to destroyed
-  // webContents and background agents cannot keep working invisibly.
+// Work only a live renderer can follow. Once the renderer is gone (window
+// closed, or its process died and the window reloads), tear it down so its
+// output is not sent to destroyed webContents and background agents cannot
+// keep working invisibly: a fresh renderer cannot reattach to these runs.
+const disposeRendererBoundWork = () => {
   disposeAllClaudeSdkSessions();
   disposeAllTerminalSessions();
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
   reapActiveAgentRuns();
+};
+
+app.on('window-all-closed', () => {
+  // On macOS the main process remains alive after the last window closes.
+  disposeRendererBoundWork();
   if (process.platform !== 'darwin') {
     app.quit();
   }
