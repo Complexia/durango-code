@@ -765,6 +765,9 @@ const settleWaitingOnUserCaptions = (threadId: string) => {
   }
 };
 
+/** How a steer ended: in the turn, queued for its end, handed back, or cancelled by Stop. */
+type SteerOutcome = 'steered' | 'queued' | 'unsteered' | 'cancelled';
+
 const App: React.FC = () => {
   const {
     activeTab,
@@ -6700,11 +6703,19 @@ const App: React.FC = () => {
   // That thread's queue then waits a while before trying again.
   const queueRetryAfterRef = useRef(new Map<string, number>());
   const [queueRetryTick, setQueueRetryTick] = useState(0);
+  // Remote threads with a "Steer now" on its way to their machine (count per
+  // thread): their queue waits, so it can't overtake the steer.
+  const pendingRemoteSteersRef = useRef(new Map<string, number>());
   useEffect(() => {
     for (const thread of threads) {
       const next = thread.queuedMessages?.[0];
       if (!next) continue;
-      if (thread.status === 'running' || activeRunsByThread[thread.id] || pendingTurnStartsRef.current.has(thread.id)) {
+      if (
+        thread.status === 'running' ||
+        activeRunsByThread[thread.id] ||
+        pendingTurnStartsRef.current.has(thread.id) ||
+        pendingRemoteSteersRef.current.has(thread.id)
+      ) {
         continue;
       }
       if ((queueRetryAfterRef.current.get(thread.id) ?? 0) > Date.now()) continue;
@@ -7435,9 +7446,16 @@ const App: React.FC = () => {
   // Optional chain: 'orion' has no follow-up-support entry (steering an
   // orchestrated thread would bypass the driver resolution), so treat it as
   // unsupported instead of crashing mid-run.
+  const selectedRemoteRunning = Boolean(selectedThread?.remote) && selectedThread?.status === 'running';
   const steerSupported =
-    isSending && !!selectedAgentModel && providerFollowUpSupport[selectedAgentModel.providerId]?.steer === true;
-  const steerReady = steerSupported && !!window.orion?.steerAgentTurn;
+    (isSending || selectedRemoteRunning) &&
+    !!selectedAgentModel &&
+    providerFollowUpSupport[selectedAgentModel.providerId]?.steer === true;
+  const steerReady =
+    steerSupported &&
+    (selectedRemoteRunning
+      ? Boolean(selectedThread?.remote?.threadId && window.orion?.remoteSteerTurn)
+      : !!window.orion?.steerAgentTurn);
 
   const steerTargetForThread = (threadId: string) => {
     const runId = activeRunsByThreadRef.current[threadId];
@@ -7456,7 +7474,92 @@ const App: React.FC = () => {
     }
     return { runId, agentModel };
   };
-  const canSteerNow = () => !!selectedThreadId && !!steerTargetForThread(selectedThreadId);
+  // A thread on another machine (remote control) is steered there: its turn
+  // runs on that machine, so there is no local run to push into.
+  const remoteSteerTarget = (threadId: string) => {
+    const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+    const remote = thread?.remote;
+    if (!thread || !remote?.threadId || thread.status !== 'running' || !window.orion?.remoteSteerTurn) return null;
+    const agentModel = findAgentModel(agentModels, thread.modelId ?? defaultAgentModelId);
+    if (!agentModel || providerFollowUpSupport[agentModel.providerId]?.steer !== true) return null;
+    return { machineId: remote.machineId, machineName: remote.machineName, threadId: remote.threadId };
+  };
+  const canSteerNow = () =>
+    !!selectedThreadId && !!(steerTargetForThread(selectedThreadId) ?? remoteSteerTarget(selectedThreadId));
+
+  // Steer a remote thread's running turn. The message stays this machine's
+  // until that machine has put it into the turn: anything it refuses goes
+  // back into the queue here (and sends when the turn ends, as an
+  // unsteerable local turn's would), or to the composer after a Stop.
+  // Serialized per thread with the steering coordinator, so steers arrive in
+  // the order they were made, and the queue holds its end-of-turn send while
+  // one is on its way.
+  const steerRemoteThread = (
+    threadId: string,
+    promptText: string,
+    attachments: FileAttachment[],
+    queuedId?: string
+  ): Promise<void> => {
+    const store = useOrionStore.getState();
+    const queue = store.threads.find((candidate) => candidate.id === threadId)?.queuedMessages ?? [];
+    const index = queuedId ? queue.findIndex((queued) => queued.id === queuedId) : queue.length;
+    const message = queuedId ? queue[index] : { id: crypto.randomUUID(), text: promptText, attachments };
+    if (!message) return Promise.resolve();
+    // What followed it, to go back in front of (an index would drift while
+    // other steers are out of the queue too).
+    const followers = queue.slice(index + 1).map((queued) => queued.id);
+    if (queuedId) removeQueuedThreadMessage(threadId, queuedId);
+    const pending = pendingRemoteSteersRef.current;
+    pending.set(threadId, (pending.get(threadId) ?? 0) + 1);
+    const restore = (cancelled: boolean) => {
+      if (cancelled) {
+        // Stopped meanwhile: like the rest of the queue at Stop, back to
+        // the composer rather than out to that machine as a new turn.
+        restoreComposerDraft(threadId, message.text, message.attachments ?? []);
+        return;
+      }
+      const current =
+        useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.queuedMessages ?? [];
+      if (current.some((queued) => queued.id === message.id)) return;
+      const before = current.findIndex((queued) => followers.includes(queued.id));
+      const next = [...current];
+      next.splice(before === -1 ? next.length : before, 0, message);
+      updateThread(threadId, { queuedMessages: next });
+    };
+    pinThreadToBottom(threadId);
+    return steeringCoordinatorRef.current
+      .enqueue(threadId, async (cancelled: () => boolean) => {
+        if (cancelled()) return restore(true);
+        const target = remoteSteerTarget(threadId);
+        if (!target || !window.orion?.remoteSteerTurn) return restore(false);
+        const result = await window.orion
+          .remoteSteerTurn({
+            machineId: target.machineId,
+            threadId: target.threadId,
+            prompt: message.text,
+            attachments: message.attachments ?? [],
+          })
+          .catch((error: unknown) => ({ ok: false, error: error instanceof Error ? error.message : undefined }));
+        if (result?.ok) {
+          // The steered message shows once the mirror has that machine's copy.
+          remoteThreadSyncRef.current?.refreshSoon(threadId, { force: true });
+          return;
+        }
+        restore(cancelled());
+        if (!cancelled()) {
+          toast.info(
+            `Couldn't steer the turn on ${target.machineName}${result?.error ? ` (${result.error})` : ''} — the message will send when it ends.`
+          );
+        }
+      })
+      .finally(() => {
+        const count = (pending.get(threadId) ?? 1) - 1;
+        if (count > 0) pending.set(threadId, count);
+        else pending.delete(threadId);
+        // Let the queue send what it held back.
+        setQueueRetryTick((tick) => tick + 1);
+      });
+  };
 
   const recordSteeredMessage = (
     threadId: string,
@@ -7555,21 +7658,35 @@ const App: React.FC = () => {
     threadId: string,
     promptText: string,
     attachments: FileAttachment[],
-    cancelled: () => boolean
-  ) => {
-    if (!promptText && attachments.length === 0) return;
+    cancelled: () => boolean,
+    {
+      queueFallback = true,
+      beforeInject,
+    }: {
+      /**
+       * false: a message that can't go into the turn is handed back
+       * ('unsteered') instead of queued here (a paired controller's steer,
+       * which stays in that machine's queue).
+       */
+      queueFallback?: boolean;
+      /** Last gate before the message goes into the turn (a remote command's claim). */
+      beforeInject?: () => Promise<boolean>;
+    } = {}
+  ): Promise<SteerOutcome> => {
+    if (!promptText && attachments.length === 0) return 'cancelled';
     // Fallback for every path that can't inject: hold the message and let the
     // queue-dispatch effect send it — immediately if the thread is idle,
     // otherwise the moment the current turn ends. Never interrupts anything.
-    const queueForTurnEnd = () => {
-      if (cancelled()) return;
+    const queueForTurnEnd = (): SteerOutcome => {
+      if (cancelled()) return 'cancelled';
+      if (!queueFallback) return 'unsteered';
       pinThreadToBottom(threadId);
       queueMessageToThread(threadId, { text: promptText, attachments });
+      return 'queued';
     };
     const target = steerTargetForThread(threadId);
     if (!target) {
-      queueForTurnEnd();
-      return;
+      return queueForTurnEnd();
     }
     let prepared:
       | {
@@ -7584,16 +7701,14 @@ const App: React.FC = () => {
       // and resolve mention tokens exactly as an ordinary turn does before
       // handing the text to Claude's live input stream.
       await refreshLinkedTasksBeforeDispatch(threadId);
-      if (cancelled()) return;
+      if (cancelled()) return 'cancelled';
       if (activeRunsByThreadRef.current[threadId] !== target.runId) {
-        queueForTurnEnd();
-        return;
+        return queueForTurnEnd();
       }
       let state = useOrionStore.getState();
       let thread = state.threads.find((candidate) => candidate.id === threadId);
       if (!thread) {
-        queueForTurnEnd();
-        return;
+        return queueForTurnEnd();
       }
       const mentionedThreads = promptText
         ? parseThreadMentions(promptText, state.threads, threadId)
@@ -7602,37 +7717,32 @@ const App: React.FC = () => {
       if (mentionedThreads.length > 0 || mentionedChats.length > 0) {
         const supportsThreadReader =
           (await window.orion?.supportsThreadReader?.(target.agentModel.providerId)) === true;
-        if (cancelled()) return;
+        if (cancelled()) return 'cancelled';
         if (activeRunsByThreadRef.current[threadId] !== target.runId) {
-          queueForTurnEnd();
-          return;
+          return queueForTurnEnd();
         }
         if (
           !supportsThreadReader ||
           (mentionedThreads.length > 0 && !(await flushOrionThreadsSave()))
         ) {
-          queueForTurnEnd();
-          return;
+          return queueForTurnEnd();
         }
-        if (cancelled()) return;
+        if (cancelled()) return 'cancelled';
         if (activeRunsByThreadRef.current[threadId] !== target.runId) {
-          queueForTurnEnd();
-          return;
+          return queueForTurnEnd();
         }
         state = useOrionStore.getState();
         thread = state.threads.find((candidate) => candidate.id === threadId);
         if (!thread) {
-          queueForTurnEnd();
-          return;
+          return queueForTurnEnd();
         }
       }
 
       // Inherited subagent context comes from the transcript.
       const threadMessages = await loadThreadMessages(thread.id);
-      if (cancelled()) return;
+      if (cancelled()) return 'cancelled';
       if (!threadMessages || activeRunsByThreadRef.current[threadId] !== target.runId) {
-        queueForTurnEnd();
-        return;
+        return queueForTurnEnd();
       }
       const tasksToInject = (thread.linkedTasks ?? []).filter((task) => !task.injected);
       const taskAttachments = linkedTaskAttachments(tasksToInject);
@@ -7657,8 +7767,7 @@ const App: React.FC = () => {
       const mentionedMcps = promptText ? parseMcpMentions(promptText, orionMcpsRef.current) : [];
       if (mentionedMcps.some((server) => !(thread?.mcpServerIds ?? []).includes(server.id))) {
         // A newly attached MCP server can only be loaded when a turn starts.
-        queueForTurnEnd();
-        return;
+        return queueForTurnEnd();
       }
       if (mentionedMcps.length > 0) {
         addAgentContext(buildMcpMentionsContext(mentionedMcps));
@@ -7683,17 +7792,19 @@ const App: React.FC = () => {
     } catch {
       prepared = undefined;
     }
-    if (cancelled()) return;
+    if (cancelled()) return 'cancelled';
     if (!prepared) {
-      queueForTurnEnd();
-      return;
+      return queueForTurnEnd();
     }
     // Preparation may have outlived the run it targeted. A natural finish
     // becomes an ordinary queued follow-up; Stop is distinguished by the
     // generation check above and discards the pending steer instead.
     if (activeRunsByThreadRef.current[threadId] !== target.runId) {
-      queueForTurnEnd();
-      return;
+      return queueForTurnEnd();
+    }
+    if (beforeInject) {
+      if (!(await beforeInject()) || cancelled()) return 'cancelled';
+      if (activeRunsByThreadRef.current[threadId] !== target.runId) return queueForTurnEnd();
     }
     let injected = false;
     try {
@@ -7706,26 +7817,40 @@ const App: React.FC = () => {
     } catch {
       injected = false;
     }
-    if (cancelled()) return;
+    if (cancelled()) {
+      // Stopped while the push was landing. A paired controller's message
+      // that did go in is delivered: say so (and show it), or that machine
+      // would send it again. The stopped run itself is left as Stop left it.
+      if (injected && !queueFallback) {
+        addMessageToThread(threadId, {
+          role: 'user',
+          content: prepared.userContent,
+          attachments: prepared.turnAttachments,
+          steer: true,
+        });
+        return 'steered';
+      }
+      return 'cancelled';
+    }
     // The run settled (or its session vanished) before the push could land —
     // the message becomes an ordinary follow-up turn instead.
     if (!injected) {
       // A run that already finished dispatches the queue right away; only a
       // rejection while it is still running needs explaining.
-      if (activeRunsByThreadRef.current[threadId] === target.runId) {
+      if (queueFallback && activeRunsByThreadRef.current[threadId] === target.runId) {
         toast.info("Couldn't steer the running turn — the message will send when it ends.");
       }
-      queueForTurnEnd();
-      return;
+      return queueForTurnEnd();
     }
     recordSteeredMessage(threadId, target.runId, prepared);
+    return 'steered';
   };
 
   const steerWithContent = (
     threadId: string,
     promptText: string,
     attachments: FileAttachment[]
-  ): Promise<void> => {
+  ): Promise<SteerOutcome> => {
     // enqueue captures cancellation identity and publishes the reservation
     // synchronously. Later submissions preserve user order through preflight,
     // IPC dispatch, and linked-task consumption.
@@ -7784,6 +7909,10 @@ const App: React.FC = () => {
     composerDraft.clear();
     composerDraft.flush();
     if (!selectedThreadId) return;
+    if (selectedThread?.remote) {
+      await steerRemoteThread(selectedThreadId, promptText, attachments);
+      return;
+    }
     await steerWithContent(selectedThreadId, promptText, attachments);
   };
 
@@ -7794,6 +7923,15 @@ const App: React.FC = () => {
   );
   useLayoutEffect(() => {
     steerQueuedMessageRef.current = async (threadId: string, queuedId: string) => {
+      if (useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.remote) {
+        const queued = useOrionStore
+          .getState()
+          .threads.find((candidate) => candidate.id === threadId)
+          ?.queuedMessages?.find((q) => q.id === queuedId);
+        if (!queued) return;
+        await steerRemoteThread(threadId, queued.text, queued.attachments ?? [], queuedId);
+        return;
+      }
       if (!steerTargetForThread(threadId)) return;
       const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
       const queued = thread?.queuedMessages?.find((q) => q.id === queuedId);
@@ -7905,6 +8043,8 @@ const App: React.FC = () => {
     const remote = selectedThread?.remote;
     if (remote && selectedThreadId) {
       const stoppedThreadId = selectedThreadId;
+      // Steers still on their way go back to the composer, not out to it.
+      cancelPendingSteers([stoppedThreadId]);
       // Like a local Stop: the follow-ups waiting on this run go back to the
       // composer rather than out to that machine once it stops.
       const queued = selectedThread?.queuedMessages ?? [];
@@ -8037,7 +8177,13 @@ const App: React.FC = () => {
       command: RemoteCommandRequest['command'],
       canPrepare: () => boolean,
       claimStart: () => Promise<boolean>
-    ) => Promise<{ ok: boolean; threadId?: string; threadTitle?: string; projectId?: string; error?: string }>
+    ) => Promise<{
+      ok: boolean;
+      threadId?: string;
+      threadTitle?: string;
+      projectId?: string;
+      error?: string;
+    }>
   >(async () => ({ ok: false, error: 'Remote commands are unavailable.' }));
   useLayoutEffect(() => {
     remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
@@ -8406,6 +8552,42 @@ const App: React.FC = () => {
         });
         if (!stopped) return { ok: false, error: 'No running turn on that thread.' };
         return { ok: true, threadId };
+      }
+      if (command.kind === 'steerTurn') {
+        // A paired controller's "Steer now": the same steer as this machine's
+        // own, so the steered message shows here and in every mirror. The
+        // controller keeps the message until it is in the turn: anything that
+        // can't go in is handed back, never queued here.
+        const threadId = command.threadId ?? '';
+        const promptText = (command.prompt ?? '').trim();
+        const attachments = command.attachments ?? [];
+        if (!promptText && attachments.length === 0) return { ok: false, error: 'Empty prompt.' };
+        if (!state.threads.some((candidate) => candidate.id === threadId)) {
+          return { ok: false, error: 'Thread not found on this machine.' };
+        }
+        if (!steerTargetForThread(threadId)) {
+          return { ok: false, threadId, error: 'That turn cannot be steered.' };
+        }
+        // Reserved now, before any await, so a Stop from here on cancels it.
+        // The claim is the commit point, right before the message goes in:
+        // a command that expired first never reaches the turn.
+        let claimed = true;
+        const outcome = await steeringCoordinatorRef.current.enqueue(threadId, (cancelled: () => boolean) =>
+          performSteerWithContent(threadId, promptText, attachments, cancelled, {
+            queueFallback: false,
+            beforeInject: async () => (claimed = await claimRemoteSideEffect(canPrepare, claimStart)),
+          })
+        );
+        if (outcome === 'steered') return { ok: true, threadId };
+        return {
+          ok: false,
+          threadId,
+          error: !claimed
+            ? 'The steer expired or was cancelled.'
+            : outcome === 'cancelled'
+              ? 'The turn was stopped before the message reached it.'
+              : 'That turn cannot be steered.',
+        };
       }
       if (command.kind === 'answerQuestion') {
         // A paired controller answering a question this machine's agent asked:
@@ -8919,7 +9101,11 @@ const App: React.FC = () => {
           isTerminal: agentModel?.id === claudeCodeCliModelId,
           isSending: paneSending,
           steerSupported: paneSteerSupported,
-          steerReady: paneSteerSupported && !!window.orion?.steerAgentTurn,
+          steerReady:
+            paneSteerSupported &&
+            (thread.remote
+              ? Boolean(thread.remote.threadId && window.orion?.remoteSteerTurn)
+              : !!window.orion?.steerAgentTurn),
           // Retargeting an empty thread's project runs through the composer's
           // handler, which only ever addresses the focused thread.
           canChangeProject: focused && canChangeSelectedThreadProject,

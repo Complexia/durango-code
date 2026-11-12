@@ -151,6 +151,7 @@ import {
   shutdownRemoteControl,
   startRemotePairing,
   stopRemoteTurn,
+  steerRemoteTurn,
   waitForRemoteControlPersistence,
 } from './main/remote-control.js';
 import {
@@ -2024,6 +2025,7 @@ ipcMain.handle('remote:fetchThread', afterRemoteControlInit((_event, input) => f
 ipcMain.handle('remote:runTurn', afterRemoteControlInit((_event, input) => runRemoteTurn(input)));
 ipcMain.handle('remote:checkoutSource', afterRemoteControlInit((_event, input) => checkoutRemoteSource(input)));
 ipcMain.handle('remote:stopTurn', afterRemoteControlInit((_event, input) => stopRemoteTurn(input)));
+ipcMain.handle('remote:steerTurn', afterRemoteControlInit((_event, input) => steerRemoteTurn(input)));
 ipcMain.handle('remote:resolveProject', afterRemoteControlInit((_event, input) => resolveRemoteProject(input)));
 ipcMain.handle('remote:listThreads', afterRemoteControlInit((_event, input) => listRemoteThreads(input)));
 ipcMain.handle('remote:fetchAttachment', afterRemoteControlInit((_event, input) => fetchRemoteAttachment(input)));

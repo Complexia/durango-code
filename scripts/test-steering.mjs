@@ -90,7 +90,7 @@ assert.match(
 );
 assert.match(
   steerRenderer,
-  /steerAgentTurn[\s\S]*if \(cancelled\(\)\) return;[\s\S]*if \(!injected\)/,
+  /steerAgentTurn[\s\S]*if \(cancelled\(\)\) \{[\s\S]*return 'cancelled';[\s\S]*if \(!injected\)/,
   'A Stop generation must suppress both late IPC success and fallback queueing'
 );
 const stopThreadTree = section(

@@ -2360,6 +2360,38 @@ const handleHostRequest = async (session, message) => {
         }
         return;
       }
+      case 'steerTurn': {
+        // A message for the turn running here right now: delivered into it
+        // like this machine's own "Steer now", or refused (never queued here).
+        const prompt = typeof message?.prompt === 'string' ? message.prompt.trim() : '';
+        const hasAttachments = Array.isArray(message?.attachments) && message.attachments.length > 0;
+        if (!prompt && !hasAttachments) {
+          respond({ ok: false, error: 'Empty prompt.' });
+          return;
+        }
+        let attachments;
+        try {
+          attachments = resolveUploadedAttachments(session, message?.attachments);
+        } catch (error) {
+          respond({ ok: false, error: error?.message ?? String(error) });
+          return;
+        }
+        const result = await requestRendererCommand(
+          {
+            kind: 'steerTurn',
+            threadId: String(message?.threadId ?? ''),
+            prompt: prompt.slice(0, 200_000),
+            ...(attachments.length > 0 ? { attachments } : {}),
+            source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
+          },
+          Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
+          session,
+          acknowledgeClaim
+        );
+        settleUploadedAttachments(session, attachments, result?.ok === true);
+        respond(result);
+        return;
+      }
       case 'stopTurn': {
         const result = await requestRendererCommand(
           {
@@ -3632,6 +3664,43 @@ export const checkoutRemoteSource = async ({ machineId, repoId, name } = {}) => 
     return response.ok
       ? { ok: true, projectId: typeof response.projectId === 'string' ? response.projectId : undefined }
       : { ok: false, error: response.error ?? 'The host could not check out the repository.' };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/**
+ * Send a message into a host thread's running turn ("Steer now"). ok = it is
+ * in the turn; anything else stays the controller's to send later.
+ */
+export const steerRemoteTurn = async ({ machineId, threadId, prompt, attachments } = {}) => {
+  try {
+    const targetMachineId = String(machineId ?? '');
+    const uploaded = [];
+    for (const attachment of Array.isArray(attachments) ? attachments.slice(0, 32) : []) {
+      const { uploadId } = await uploadAttachmentToHost(targetMachineId, attachment);
+      uploaded.push({
+        uploadId,
+        name: String(attachment?.name ?? ''),
+        ...(attachment?.snapshot ? { snapshot: attachment.snapshot } : {}),
+      });
+    }
+    const response = await clientRequest(
+      targetMachineId,
+      {
+        t: 'steerTurn',
+        threadId: String(threadId ?? ''),
+        prompt: String(prompt ?? ''),
+        ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
+      },
+      (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
+        (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),
+      { extendOnClaim: true }
+    );
+    if (!response.ok) {
+      return { ok: false, error: unsupportedMessage(response, 'take steering messages') ?? response.error ?? 'Steer failed.' };
+    }
+    return { ok: true };
   } catch (error) {
     return clientErrorResult(error);
   }

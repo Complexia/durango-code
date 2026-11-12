@@ -436,7 +436,7 @@ export type RemoteCommandRequest = {
      * cloned, main/source-checkout.js) as a project named `projectName`, or
      * find the project that already has that path; reports `projectId`.
      */
-    kind: 'runTurn' | 'stopTurn' | 'addProject' | 'answerQuestion' | 'userAction';
+    kind: 'runTurn' | 'stopTurn' | 'steerTurn' | 'addProject' | 'answerQuestion' | 'userAction';
     /** answerQuestion: which question, and the answers per question id. */
     runId?: string;
     requestId?: string | number;
@@ -1949,6 +1949,13 @@ type OrionCodexBrowserIntegrationStatus = {
       remoteStopTurn?: (input: {
         machineId: string;
         threadId: string;
+      }) => Promise<{ ok: boolean; error?: string }>;
+      /** Message into a host thread's running turn; ok = it is in the turn. */
+      remoteSteerTurn?: (input: {
+        machineId: string;
+        threadId: string;
+        prompt: string;
+        attachments?: import('./store').FileAttachment[];
       }) => Promise<{ ok: boolean; error?: string }>;
       remoteRendererReady?: () => Promise<{ ok: boolean }>;
       remoteClaimCommand?: (input: { commandId: string }) => Promise<{ ok: boolean }>;
