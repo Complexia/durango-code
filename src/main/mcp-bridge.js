@@ -14,6 +14,7 @@ import { SECRET_TOOL_NAMES, cancelSecretRequests, redactSecrets, resolveSecretRe
 import { VISUAL_TOOL_NAMES, runVisualTool } from './visual-tools.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
+import { MACHINE_TOOL_NAMES, machineMcpToolDefinitions, machineToolsAvailable, runMachineTool } from './machine-tools.js';
 import {
   CALL_APP_TOOL_NAME,
   LOAD_TOOLS_TOOL_NAME,
@@ -167,6 +168,8 @@ export const handleMcpBridgeConnection = (socket) => {
         reply(true, '', {
           tools: [
             ...(hasBuiltinBrowser(session.browserMode) ? browserMcpToolDefinitions(session.accessMode) : []),
+            // The user's other machines, while remote control can reach one.
+            ...(session.machinesEnabled ? machineMcpToolDefinitions(session.accessMode) : []),
             // The run's MCP servers load on demand (mcp-on-demand.js).
             ...onDemandMcpToolDefinitions(session.onDemandMcps?.names() ?? []),
           ],
@@ -298,6 +301,24 @@ export const handleMcpBridgeConnection = (socket) => {
         }).then(({ ok, text, content }) =>
           reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
         );
+        continue;
+      }
+      if (MACHINE_TOOL_NAMES.includes(message.tool)) {
+        if (!session.machinesEnabled) {
+          reply(false, 'No other machine was reachable when this run started.');
+          continue;
+        }
+        // Re-checks remote control and the run's access mode; resolves,
+        // never rejects.
+        void runMachineTool(message.tool, args, {
+          accessMode: session.accessMode,
+          projectPath: session.projectPath,
+          // These providers can't be relied on to ask before a command
+          // (Codex approves every orion tool): Full access only.
+          requireFullAccess: true,
+          // Stopping the run cancels a command there and ends a wait.
+          signal: session.abortController.signal,
+        }).then(({ ok, text }) => reply(ok, text));
         continue;
       }
       reply(false, `Unknown tool: ${message.tool}`);
@@ -450,6 +471,10 @@ export const registerMcpBridgeForRun = async ({
       accessMode,
       browserMode,
       onDemandMcps,
+      // Fixed for the run, like the device tools (each call re-checks).
+      machinesEnabled: machineToolsAvailable(),
+      // Aborted when the run ends: tool calls still in flight stop.
+      abortController: new AbortController(),
     };
     mcpBridgeSessions.set(token, session);
     return {
@@ -471,6 +496,7 @@ export const registerMcpBridgeForRun = async ({
       },
       release: () => {
         mcpBridgeSessions.delete(token);
+        session.abortController.abort();
         cancelSecretRequests({ owner: session });
         void onDemandMcps.close();
         void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});

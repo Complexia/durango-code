@@ -195,6 +195,7 @@ import {
   buildModelMentionsContext,
   buildOrchestrationContext,
   buildReviewThreadContext,
+  buildRemoteThreadMentionsContext,
   buildThreadMentionsContext,
   linkedTaskFromBoardTask,
   linkedTaskAttachments,
@@ -202,6 +203,7 @@ import {
   orchestrationRoleMeta,
   parseModelMentions,
   parseThreadMentions,
+  retargetThreadMention,
 } from './app/promptContext';
 import { durangoWorkspaceName } from './app/durangoWorkspace';
 import { hasThreadReaderSupport } from './app/chatMentions';
@@ -1109,7 +1111,8 @@ const App: React.FC = () => {
         promptText: string,
         attachments: FileAttachment[],
         claimStart?: () => Promise<boolean>,
-        applyClaimedSettings?: () => void
+        applyClaimedSettings?: () => void,
+        extraContext?: string
       ) => Promise<ThreadTurnStartResult>)
     | null
   >(null);
@@ -5419,7 +5422,10 @@ const App: React.FC = () => {
       promptText: string,
       attachments: FileAttachment[],
       claimStart?: () => Promise<boolean>,
-      applyClaimedSettings?: () => void
+      applyClaimedSettings?: () => void,
+      // Agent context the transcript doesn't show (a controller's copies of
+      // threads its prompt mentions that this machine can't read).
+      extraContext?: string
     ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
       if (claimStart && !(await claimRemoteThreadStart(claimStart, applyClaimedSettings))) {
@@ -5655,6 +5661,7 @@ const App: React.FC = () => {
       if (mentionedChats.length > 0) {
         addAgentContext(buildChatMentionsContext(mentionedChats));
       }
+      addAgentContext(extraContext?.trim() ? extraContext : null);
       // A fresh session in a Durango workspace is told it is already in one.
       if (thread.durangoWorkspace && !thread.agentSessionIds?.[model.providerId]) {
         addAgentContext(buildDurangoWorkspaceContext(thread.durangoWorkspace));
@@ -5846,7 +5853,10 @@ const App: React.FC = () => {
       promptText: string,
       attachments: FileAttachment[],
       claimStart?: () => Promise<boolean>,
-      applyClaimedSettings?: () => void
+      applyClaimedSettings?: () => void,
+      // Agent context the transcript doesn't show (a controller's copies of
+      // threads its prompt mentions that this machine can't read).
+      extraContext?: string
     ): Promise<ThreadTurnStartResult> => {
       // A thread on another machine starts its turns there, whichever path
       // (retry, follow-up, composer) asked for one.
@@ -5873,7 +5883,8 @@ const App: React.FC = () => {
               promptText,
               attachments,
               claimStart,
-              applyClaimedSettings
+              applyClaimedSettings,
+              extraContext
             );
           } finally {
             release();
@@ -7077,6 +7088,30 @@ const App: React.FC = () => {
       }
     };
     try {
+      // @-mentioned threads: that machine reads its own (the mention is
+      // pointed at its id there); this machine's and other machines' threads
+      // can't be read there, so their newest page goes along as context.
+      let hostPrompt = promptText;
+      let mentionContext: string | undefined;
+      const mentioned = promptText ? parseThreadMentions(promptText, state.threads, threadId) : [];
+      const readHere: typeof mentioned = [];
+      for (const mention of mentioned) {
+        const hostThreadId =
+          mention.thread.remote?.machineId === remote.machineId ? mention.thread.remote.threadId : undefined;
+        if (hostThreadId) hostPrompt = retargetThreadMention(hostPrompt, mention.thread, hostThreadId);
+        else readHere.push(mention);
+      }
+      if (readHere.length > 0 && window.orion.readThreadsForMention) {
+        // read_thread reads the saved copy: save what changed here first.
+        if (!(await flushOrionThreadsSave())) {
+          dropUserMessage();
+          return { ok: false, error: 'Referenced threads could not be saved before sending this turn.' };
+        }
+        const pages = await window.orion.readThreadsForMention({
+          threadIds: readHere.map((mention) => mention.thread.id),
+        });
+        mentionContext = buildRemoteThreadMentionsContext(readHere, pages, remote.machineName);
+      }
       let hostProjectId = remote.projectId;
       if (!remote.threadId && !hostProjectId) {
         const project = findProjectById(state, thread.projectId);
@@ -7095,7 +7130,8 @@ const App: React.FC = () => {
       const result = await window.orion.remoteRunTurn({
         machineId: remote.machineId,
         ...(remote.threadId ? { threadId: remote.threadId } : { projectId: hostProjectId }),
-        prompt: promptText,
+        prompt: hostPrompt,
+        ...(mentionContext ? { context: mentionContext } : {}),
         // Uploaded to that machine first (main).
         ...(attachments.length > 0 ? { attachments } : {}),
         // Only what changed here (all of it for a new thread there), so a
@@ -8452,7 +8488,8 @@ const App: React.FC = () => {
               // Files the controller sent, already saved here (main).
               Array.isArray(command.attachments) ? command.attachments : [],
               claimStart,
-              applyClaimedSettings
+              applyClaimedSettings,
+              typeof command.context === 'string' ? command.context : undefined
             )
           : undefined;
         if (!start) {

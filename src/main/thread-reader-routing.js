@@ -48,12 +48,27 @@ export const orionDeviceToolNamesForAccessMode = (accessMode) =>
     ? ORION_DEVICE_TOOL_NAMES.filter((name) => name === 'device_list' || name === 'device_screenshot')
     : ORION_DEVICE_TOOL_NAMES;
 
+// The user's other machines (machine-tools.js), offered while remote control
+// can reach one. Listing and reading are pre-approved in every mode; running
+// commands and agents there only in Full access, so Workspace write asks for
+// each (Read only refuses them in the tool itself).
+export const ORION_MACHINE_READ_TOOL_NAMES = Object.freeze(['machine_list', 'machine_threads', 'machine_read_thread']);
+export const ORION_MACHINE_TOOL_NAMES = Object.freeze([
+  ...ORION_MACHINE_READ_TOOL_NAMES,
+  'machine_exec',
+  'machine_run_agent',
+  'machine_stop_agent',
+]);
+export const orionMachineToolNamesForAccessMode = (accessMode) =>
+  accessMode === 'full-access' ? ORION_MACHINE_TOOL_NAMES : ORION_MACHINE_READ_TOOL_NAMES;
+
 /** `name` is the unqualified orion tool name (e.g. `read_chat`). */
 export const isPreapprovedOrionTool = (name, accessMode) =>
   typeof name === 'string' &&
   (orionBuiltinToolNamesForAccessMode(accessMode).includes(name) ||
     (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))) ||
-    orionDeviceToolNamesForAccessMode(accessMode).includes(name));
+    orionDeviceToolNamesForAccessMode(accessMode).includes(name) ||
+    orionMachineToolNamesForAccessMode(accessMode).includes(name));
 
 const runPluginHelpCommand = (providerId) =>
   providerId === 'cursor'

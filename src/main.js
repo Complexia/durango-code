@@ -154,6 +154,8 @@ import {
   steerRemoteTurn,
   waitForRemoteControlPersistence,
 } from './main/remote-control.js';
+import { configureMachineTools } from './main/machine-tools.js';
+import { readThreadForAgent, setThreadReaderRemoteFetch } from './main/thread-reader.js';
 import {
   configureWorkspaceSync,
   getWorkspaceSyncStatus,
@@ -1292,6 +1294,13 @@ app.whenReady().then(async () => {
     hasPendingQuestions: (threadId) => listAgentQuestions(threadId).length > 0,
     getAppVersion: () => app.getVersion(),
   }).catch((error) => console.error('Could not start remote control', error));
+  // read_thread reads threads of other machines from them.
+  void remoteControlReady.then(() => setThreadReaderRemoteFetch(fetchRemoteThread));
+  // Agents reach the user's other machines through it (machine-tools.js).
+  configureMachineTools({
+    ready: remoteControlReady,
+    resolveCallerProject: ({ machineId, projectPath }) => resolveCallerProjectOnMachine({ machineId, projectPath }),
+  });
   addAgentEventListener((event) => forwardAgentEventToRemote(event));
   // Durango Chat dispatch (off by default). Seed from the persisted store so
   // an enabled worker resumes before the renderer hydrates; the renderer
@@ -2000,6 +2009,19 @@ const resolveRemoteProject = async ({ machineId, project } = {}) => {
     ok: false,
     error: `${name || 'This project'} is not on that machine. Add it there, or publish it to Durango Source so it can be cloned there.`,
   };
+};
+
+// Where an agent's machine_run_agent runs on another machine when it names no
+// project: the agent's own project there (resolveRemoteProject), else that
+// machine's No project.
+const resolveCallerProjectOnMachine = async ({ machineId, projectPath }) => {
+  const byPath = (projects) =>
+    (Array.isArray(projects) ? projects : []).find((candidate) => candidate?.path === projectPath) ?? null;
+  const project =
+    typeof projectPath === 'string' && projectPath
+      ? (byPath(configuredProjects) ?? byPath((await readPersistedStoreState().catch(() => null))?.projects))
+      : null;
+  return resolveRemoteProject({ machineId, project: project ?? null });
 };
 
 const afterRemoteControlInit =
@@ -4683,6 +4705,18 @@ ipcMain.handle('agent:listModels', async (_event, input) => {
 ipcMain.handle('agent:supportsThreadReader', async (_event, providerId) =>
   providerSupportsThreadReader(providerId)
 );
+
+// A turn on another machine that @-mentions threads that machine can't read
+// (this machine's own, or a third machine's): read_thread's newest page of
+// each goes along as context (startRemoteTurn in App.tsx).
+ipcMain.handle('agent:readThreadsForMention', async (_event, input) => {
+  const threadIds = (Array.isArray(input?.threadIds) ? input.threadIds : [])
+    .filter((id) => typeof id === 'string' && id)
+    .slice(0, 8);
+  return Promise.all(
+    threadIds.map(async (threadId) => ({ threadId, text: await readThreadForAgent({ thread_id: threadId }) }))
+  );
+});
 
 ipcMain.handle('agent:listSlashCommands', async (event, input) =>
   listClaudeSlashCommands({

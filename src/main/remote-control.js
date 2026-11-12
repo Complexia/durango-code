@@ -19,6 +19,7 @@ import {
   pairingCodeToPsk,
 } from './remote-crypto.js';
 import { sanitizeAttachmentName } from './media.js';
+import { EXEC_MAX_TIMEOUT_MS, runExecCommand } from './remote-exec.js';
 import {
   createRelayListener,
   createRelayTransport,
@@ -53,6 +54,8 @@ const RUN_TURN_TIMEOUT_MS = 120_000;
 /** A Durango Source clone on the host (checkoutSource). */
 const SOURCE_CHECKOUT_TIMEOUT_MS = 65 * 60_000;
 const CLIENT_RESPONSE_GRACE_MS = 10_000;
+/** Hidden agent context a controller may send with a turn (runTurn `context`). */
+const MAX_TURN_CONTEXT_CHARS = 400_000;
 const WORKSPACE_EVENT_DEBOUNCE_MS = 1500;
 // Failed-handshake rate limit per remote IP (brute-force backstop; the real
 // guard is the 78+ bit code / 256-bit secret).
@@ -1167,6 +1170,8 @@ const handleInboundConnection = (transport, { ip = null } = {}) => {
     threadTransfers: new Map(),
     // Attachments the controller uploaded in this session: uploadId → file.
     uploads: new Map(),
+    // Shell commands running for this controller (exec): execId → AbortController.
+    execs: new Map(),
   };
   // A peer that opens a slot and then says nothing is as much of an abuse as a
   // bad MAC — it just costs the attacker less. Count it, so repeat offenders
@@ -2064,6 +2069,52 @@ const threadResponseFitsFrame = (reqId, serialized) =>
     ENCRYPTED_FRAME_OVERHEAD_BYTES <=
   MAX_FRAME_BYTES;
 
+// Shell commands running at once for one controller.
+const MAX_EXECS_PER_SESSION = 16;
+
+const handleExec = async (session, message) => {
+  // The slot is taken before anything is awaited: the limit holds for
+  // requests that arrive together, and an execCancel that comes while the
+  // project is looked up still finds the command.
+  if (session.execs.size >= MAX_EXECS_PER_SESSION) {
+    return { ok: false, error: `${MAX_EXECS_PER_SESSION} commands are already running here for that machine.` };
+  }
+  const execId =
+    typeof message?.execId === 'string' && message.execId && message.execId.length <= 128
+      ? message.execId
+      : crypto.randomUUID();
+  if (session.execs.has(execId)) return { ok: false, error: 'A command with that id is already running.' };
+  const controller = new AbortController();
+  session.execs.set(execId, controller);
+  try {
+    // A project of this machine (its id, from the snapshot) is the base
+    // folder for a relative cwd.
+    let baseDir = null;
+    if (typeof message?.projectId === 'string' && message.projectId) {
+      const state = (await deps.readStoreState()) ?? {};
+      const project = [
+        ...(state.noProject ? [state.noProject] : []),
+        ...(Array.isArray(state.projects) ? state.projects : []),
+      ].find((candidate) => candidate?.id === message.projectId);
+      if (!project?.path) return { ok: false, error: 'Project not found on this machine.' };
+      baseDir = project.path;
+    }
+    return await runExecCommand({
+      command: message?.command,
+      cwd: typeof message?.cwd === 'string' ? message.cwd.slice(0, 4096) : undefined,
+      baseDir,
+      stdin: typeof message?.stdin === 'string' ? message.stdin : undefined,
+      timeoutMs: Number(message?.timeoutMs),
+      signal: AbortSignal.any([controller.signal, session.abortController.signal]),
+      env: {
+        DURANGO_REMOTE_MACHINE: String(session.device?.name ?? 'Remote').slice(0, 120),
+      },
+    });
+  } finally {
+    if (session.execs.get(execId) === controller) session.execs.delete(execId);
+  }
+};
+
 const handleHostRequest = async (session, message) => {
   if (!currentHostSessionDevice(session)) {
     session.channel.destroy();
@@ -2325,6 +2376,12 @@ const handleHostRequest = async (session, message) => {
             kind: 'runTurn',
             prompt: prompt.slice(0, 200_000),
             ...(attachments.length > 0 ? { attachments } : {}),
+            // Context the agent gets but the transcript doesn't show: the
+            // controller's copies of threads the prompt @-mentions that this
+            // machine can't read itself.
+            ...(typeof message?.context === 'string' && message.context.trim()
+              ? { context: message.context.slice(0, MAX_TURN_CONTEXT_CHARS) }
+              : {}),
             threadId: typeof message?.threadId === 'string' ? message.threadId : undefined,
             projectId: typeof message?.projectId === 'string' ? message.projectId : undefined,
             modelId: typeof message?.modelId === 'string' ? message.modelId : undefined,
@@ -2390,6 +2447,18 @@ const handleHostRequest = async (session, message) => {
         );
         settleUploadedAttachments(session, attachments, result?.ok === true);
         respond(result);
+        return;
+      }
+      case 'exec': {
+        // A shell command (the controller's machine_exec agent tool). No
+        // renderer in the loop: it is not a turn. A paired controller can
+        // already start Full access turns here, so this grants nothing new.
+        respond(await handleExec(session, message));
+        return;
+      }
+      case 'execCancel': {
+        session.execs.get(String(message?.execId ?? ''))?.abort();
+        respond({ ok: true });
         return;
       }
       case 'stopTurn': {
@@ -3160,11 +3229,9 @@ const ensureClientSession = async (machineId) => {
         return;
       }
       if (message?.t === 'event') {
-        deps.broadcast('remote:event', {
-          machineId,
-          kind: message.kind,
-          payload: message.payload ?? null,
-        });
+        const event = { machineId, kind: message.kind, payload: message.payload ?? null };
+        deps.broadcast('remote:event', event);
+        notifyRemoteEventListeners(event);
       }
     };
     while (beforeRouter.length > 0) routeMessage(beforeRouter.shift());
@@ -3213,9 +3280,11 @@ const clientRequest = async (
   machineId,
   message,
   timeoutMs = REQUEST_TIMEOUT_MS,
-  { extendOnClaim = false } = {}
+  { extendOnClaim = false, signal, onDispatch } = {}
 ) => {
   const session = await ensureClientSession(machineId);
+  // Stopped while connecting: never sent.
+  if (signal?.aborted) throw new Error('Cancelled before it started.');
   // `await ensureClientSession` yields even for an already-ready session. The
   // settings/account reconciliation may close it during that gap, so dispatch
   // must verify live ownership instead of sending on the stale object.
@@ -3240,10 +3309,35 @@ const clientRequest = async (
     pending = { resolve, reject, timer, onTimeout, extendOnClaim, claimed: false };
     session.pending.set(reqId, pending);
     session.channel.send({ ...message, reqId });
+    onDispatch?.();
   });
 };
 
 const clientErrorResult = (error) => ({ ok: false, error: error?.message ?? String(error) });
+
+// Main-process taps on events pushed by the machines this one controls
+// (machine-tools.js waits on a remote turn's end through them).
+const remoteEventListeners = new Set();
+export const addRemoteEventListener = (listener) => {
+  remoteEventListeners.add(listener);
+  return () => remoteEventListeners.delete(listener);
+};
+const notifyRemoteEventListeners = (event) => {
+  for (const listener of remoteEventListeners) {
+    try {
+      listener(event);
+    } catch (error) {
+      console.error('remote event listener error', error);
+    }
+  }
+};
+
+/**
+ * Whether this machine can drive another one now: remote control is on and
+ * at least one machine is paired (whether or not it is online).
+ */
+export const canControlRemoteMachines = () =>
+  Boolean(stateLoaded && identity && settings.enabled && currentUserId && remoteMachines.length > 0);
 
 export const connectRemoteMachine = async ({ machineId } = {}) => {
   try {
@@ -3404,6 +3498,7 @@ export const runRemoteTurn = async ({
   threadId,
   projectId,
   prompt,
+  context,
   attachments,
   modelId,
   accessMode,
@@ -3452,6 +3547,7 @@ export const runRemoteTurn = async ({
             }
           : {}),
         prompt: String(prompt ?? ''),
+        ...(typeof context === 'string' && context.trim() ? { context: context.slice(0, MAX_TURN_CONTEXT_CHARS) } : {}),
       },
       (Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS) +
         (Number.isFinite(deps?.clientResponseGraceMs)
@@ -3721,6 +3817,74 @@ export const stopRemoteTurn = async ({ machineId, threadId } = {}) => {
       { extendOnClaim: true }
     );
     return response.ok ? { ok: true } : { ok: false, error: response.error ?? 'Stop failed.' };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/**
+ * Runs a shell command on a paired host (its `exec` request) →
+ * { ok, exitCode, stdout, stderr, … } (see remote-exec.js) or { ok: false, error }.
+ * Aborting `signal` cancels the command there.
+ */
+export const execOnRemoteMachine = async ({ machineId, command, cwd, projectId, stdin, timeoutMs, signal } = {}) => {
+  const targetMachineId = String(machineId ?? '');
+  const execId = crypto.randomUUID();
+  const limit = Math.min(EXEC_MAX_TIMEOUT_MS, Math.max(1_000, Number(timeoutMs) || 120_000));
+  if (signal?.aborted) return { ok: false, error: 'Cancelled before it started.' };
+  // Cancel there only once the command was sent: clientRequest itself
+  // refuses to send it after an abort.
+  let dispatched = false;
+  const onAbort = () => {
+    if (dispatched) void clientRequest(targetMachineId, { t: 'execCancel', execId }).catch(() => {});
+  };
+  signal?.addEventListener?.('abort', onAbort, { once: true });
+  try {
+    const response = await clientRequest(
+      targetMachineId,
+      {
+        t: 'exec',
+        execId,
+        command: String(command ?? ''),
+        ...(typeof cwd === 'string' && cwd ? { cwd } : {}),
+        ...(typeof projectId === 'string' && projectId ? { projectId } : {}),
+        ...(typeof stdin === 'string' ? { stdin } : {}),
+        timeoutMs: limit,
+      },
+      // The host ends the command at its timeout and kills it within a few
+      // seconds; the reply may take that long on top.
+      limit + 15_000 + CLIENT_RESPONSE_GRACE_MS,
+      {
+        signal,
+        onDispatch: () => {
+          dispatched = true;
+        },
+      }
+    );
+    if (!response.ok) {
+      return {
+        ok: false,
+        error:
+          response.error === 'Unsupported request.'
+            ? 'That machine cannot run commands for other machines yet. Update Durango Code on it.'
+            : (response.error ?? 'The command could not run.'),
+      };
+    }
+    return response;
+  } catch (error) {
+    return clientErrorResult(error);
+  } finally {
+    signal?.removeEventListener?.('abort', onAbort);
+  }
+};
+
+/** A paired host's agent models (its `models` request) → { ok, models }. */
+export const fetchRemoteModels = async ({ machineId } = {}) => {
+  try {
+    const response = await clientRequest(String(machineId ?? ''), { t: 'models' });
+    return response.ok && Array.isArray(response.models)
+      ? { ok: true, models: response.models }
+      : { ok: false, error: response.error ?? 'Could not list the models there.' };
   } catch (error) {
     return clientErrorResult(error);
   }

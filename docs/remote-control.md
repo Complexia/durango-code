@@ -89,6 +89,55 @@ machine shows where it works there: its Durango workspace and branch, and a
 dot for uncommitted changes (`threadGit`, refreshed after host events). Read
 only.
 
+**Referencing threads across machines.** Dragging a thread into the prompt
+box (or `@`-mentioning it) works whichever machine either thread is on:
+
+- A thread here mentions a thread of another machine: `read_thread` sees
+  that the mentioned thread is a mirror (`remote` on the thread) and reads its
+  transcript from that machine (`setThreadReaderRemoteFetch`, main.js). If the
+  machine can't be reached it says so and shows the copy this machine last
+  fetched.
+- A thread on machine B mentions one of B's threads: `startRemoteTurn` points
+  the mention at the thread's id there (`retargetThreadMention`), so B's own
+  `read_thread` finds it.
+- A thread on B mentions a thread of this machine (or of a third machine): B
+  can't read it, so the newest page of each (`agent:readThreadsForMention`,
+  read here) goes with the turn as `context`, which B's agent gets but the
+  transcript doesn't show. Older hosts ignore `context`.
+
+Mentions and `@thread:` links match a mirror by its id on its machine as well,
+so links the other machine's agents write open the mirror here.
+
+**Agents reach other machines too.** While remote control is on and a
+machine is paired, every agent run on this machine gets the `machine_*`
+tools on the built-in `orion` MCP server (`src/main/machine-tools.js`), so a
+thread can work on any machine this one controls, whichever machine the
+thread itself runs on:
+
+| Tool | What it does |
+|---|---|
+| `machine_list` | The paired machines, whether each is reachable, its projects and running threads |
+| `machine_threads` | A machine's threads, most recent first |
+| `machine_read_thread` | One of its transcripts (same pages as `read_thread`) |
+| `machine_exec` | A shell command there (`exec`, `src/main/remote-exec.js`): exit code, stdout, stderr; optional project folder, cwd, stdin, timeout (120 s default, 600 s max) |
+| `machine_run_agent` | An agent turn there: a new thread (the caller's project there by default, resolved like the machine picker's, cloning a Durango Source repository if needed) or a follow-up (`thread_id`). Waits for the turn's end (the host's pushed `done`/`error` event, with a slow poll as a fallback) and returns the final reply, unless `wait: false` |
+| `machine_stop_agent` | Stops a turn there |
+
+Threads an agent starts there show in this machine's sidebar like the host's
+other threads. The agent never gets more there than it has here: Read only
+lists and reads only, and a turn it starts runs with at most its own access
+mode. Listing and reading are pre-approved; commands and turns are
+pre-approved only in Full access, so in Workspace write Claude asks for each.
+Other providers can't be relied on to ask (Codex approves every `orion`
+tool), so for them commands and turns need Full access and aren't listed
+below it. Stopping a run cancels its commands there and ends its waits (the
+bridge session's abort signal); turns it started there keep running. Claude
+runs register the tools in-process and get a short system-prompt note naming
+the machines; other providers list them through the bridge's `__tools`, so the
+schemas live in one place. The set is fixed when a run starts (each call
+re-checks), and pairing is still one-directional: for threads on machine B to
+reach machine A, pair B as a controller of A as well.
+
 Both machines must be signed in to the **same Orion account** the whole time.
 Signing out on either end drops every session immediately and stops the
 listener.
@@ -217,8 +266,14 @@ unencrypted (the stock Electron signature can't match the keychain ACL), same
 tradeoff the account token already makes.
 
 **What a controller can do.** Read the host's project/thread list, read a
-thread's transcript, start a turn, and stop a turn. There is no filesystem,
-shell, or settings access over the wire. Turns are executed by the *host's own
+thread's transcript, start a turn (in any access mode, Full access included),
+stop a turn, and run a shell command (`exec`, for agents' `machine_exec`). A
+paired controller could already run anything through a Full access turn, so
+`exec` grants nothing new; it skips the agent. It runs in the host's main
+process with the user's login shell (no renderer, no thread), at most 16 at a
+time per controller, and is killed with its process group at its timeout, on
+`execCancel`, or when the controller's session closes. There is no settings
+access over the wire. Turns are executed by the *host's own
 renderer* through the same code path as a local user action
 (`remote:commandRequest` → renderer → `remote:commandResult`, mirroring the
 orchestration subagent bridge). Main dispatches only after that renderer has
@@ -233,6 +288,8 @@ up locally.
 | Wire protocol (handshake, framing, pairing codes) | `src/main/remote-crypto.js` |
 | Transports (TCP + relay WebSockets) | `src/main/remote-transport.js` |
 | Engine (server, relay listener, pairing, sessions, persistence) | `src/main/remote-control.js` |
+| Shell commands for controllers (`exec`) | `src/main/remote-exec.js` |
+| Agent tools for other machines (`machine_*`) | `src/main/machine-tools.js` |
 | IPC handlers (`remote:*`), event tap, account hook | `src/main.js` |
 | Renderer API | `src/preload.js`, types in `src/types.d.ts` |
 | Settings tab | `src/app/RemoteControlSettings.tsx` |
@@ -253,7 +310,9 @@ mirrors host state locally, so the two can't diverge.
 ```sh
 npm run test:remote-crypto    # handshake, encryption, replay/tamper rejection
 npm run test:remote-control   # two real processes over TCP: pairing, sessions,
-                              # revocation races, code-burning, flood resistance
+                              # exec, revocation races, code-burning, flood resistance
+npm run test:machine-tools    # machine_* tools against a fake fleet, and the
+                              # host's command runner
 npm run test:remote-relay     # two real processes over a local fake relay:
                               # direct mode makes zero relay calls, pairing and
                               # runTurn by machine ID, relay sees ciphertext

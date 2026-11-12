@@ -17,7 +17,12 @@ import {
   SEARCH_CHATS_MAX_LIMIT,
   runDurangoTool,
 } from './durango-tools.js';
-import { orionBuiltinToolNamesForAccessMode, orionDeviceToolNamesForAccessMode } from './thread-reader-routing.js';
+import {
+  orionBuiltinToolNamesForAccessMode,
+  orionDeviceToolNamesForAccessMode,
+  orionMachineToolNamesForAccessMode,
+} from './thread-reader-routing.js';
+import { machineToolsAvailable, machineToolsForAccessMode, machineToolsPromptHint, runMachineTool } from './machine-tools.js';
 import { browserModeFor, browserToolsForAccessMode, builtinBrowserTips, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOLS_PROMPT_HINT, runDeviceTool } from './device-tools.js';
 import { agentDeviceAccessAllowed, getCachedDeviceSettings } from './devices/device-settings.js';
@@ -555,7 +560,34 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       // 'chrome' adds Claude in Chrome for signed-in sites.
       ...(hasBuiltinBrowser(session.browserMode) ? claudeBrowserTools(tool, z, session) : []),
       ...(claudeDeviceToolsEnabled(session) ? createClaudeDeviceTools(tool, z, session) : []),
+      ...(session.machinesEnabled ? claudeMachineTools(tool, z, session) : []),
     ],
+  });
+
+// The user's other machines (machine-tools.js holds the schemas; the bridge
+// lists the same ones), registered while remote control can reach one.
+const claudeMachineTools = (tool, z, session) =>
+  machineToolsForAccessMode(session.accessMode).map((definition) => {
+    const required = new Set(definition.inputSchema.required ?? []);
+    const shape = {};
+    for (const [key, property] of Object.entries(definition.inputSchema.properties ?? {})) {
+      const type = zodForJsonSchema(z, property);
+      shape[key] = required.has(key) ? type : type.optional();
+    }
+    return tool(
+      definition.name,
+      definition.description,
+      shape,
+      async (args, extra) =>
+        durangoToolResult(
+          await runMachineTool(definition.name, args, {
+            accessMode: session.accessMode,
+            projectPath: session.projectPath,
+            signal: extra?.signal instanceof AbortSignal ? extra.signal : undefined,
+          })
+        ),
+      definition.readOnly ? { annotations: { readOnlyHint: true } } : undefined
+    );
   });
 
 // Simulator tools (device-tools.js), registered only while the user lets
@@ -2172,6 +2204,8 @@ export const createClaudeSdkSession = ({
     // Fixed for the session's lifetime (the tools re-check on every call).
     const devicesEnabled = claudeDeviceToolsEnabled(session);
     session.devicesEnabled = devicesEnabled;
+    const machinesEnabled = machineToolsAvailable();
+    session.machinesEnabled = machinesEnabled;
     const orionMcpServer = createOrionMcpServer(sdk, zod, session);
     // setMcpServers replaces every SDK-supplied server, so later syncs must
     // resend this same instance alongside the Orion-connected ones.
@@ -2190,6 +2224,7 @@ export const createClaudeSdkSession = ({
               ...[
                 ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode),
                 ...(devicesEnabled ? orionDeviceToolNamesForAccessMode(sdkOptions.accessMode) : []),
+                ...(machinesEnabled ? orionMachineToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 'wait_for_background_tasks',
                 'load_tools',
                 ...(builtinBrowser
@@ -2233,6 +2268,7 @@ export const createClaudeSdkSession = ({
             ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
             ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
             ...(devicesEnabled ? [DEVICE_TOOLS_PROMPT_HINT] : []),
+            ...(machinesEnabled ? [machineToolsPromptHint()] : []),
           ].join('\n\n'),
         },
         // Match the CLI's behavior: without this the SDK loads no user or

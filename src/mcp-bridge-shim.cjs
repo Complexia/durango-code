@@ -8,9 +8,10 @@
 // calls to the
 // Orion desktop app over a local socket; the app runs the subagent as a
 // visible subthread and returns its final report. Tools that depend on the
-// run (the built-in browser's browser_* tools) are not listed here: tools/list
-// asks the app for them over the socket (`__tools`), so their schemas have one
-// source (src/main/browser-tools.js). Claude runs use the
+// run (the built-in browser's browser_* tools, the machine_* tools for the
+// user's other machines) are not listed here: tools/list asks the app for them
+// over the socket (`__tools`), so their schemas have one source
+// (src/main/browser-tools.js, src/main/machine-tools.js). Claude runs use the
 // in-process SDK server in main.js instead — this file is copied to userData
 // and never bundled.
 //

@@ -450,6 +450,11 @@ export type RemoteCommandRequest = {
     projectPath?: string;
     projectName?: string;
     prompt?: string;
+    /**
+     * runTurn: context for the agent that the transcript doesn't show (the
+     * controller's copies of @-mentioned threads this machine can't read).
+     */
+    context?: string;
     /** Files a controller sent with the turn, already saved on this machine. */
     attachments?: import('./store').FileAttachment[];
     threadId?: string;
@@ -1282,6 +1287,8 @@ type OrionCodexBrowserIntegrationStatus = {
       }>>;
       onAgentModelsChanged?: (callback: () => void) => () => void;
       supportsThreadReader?: (providerId: string) => Promise<boolean>;
+      /** read_thread's newest page of each thread, for a turn on another machine that mentions them. */
+      readThreadsForMention?: (input: { threadIds: string[] }) => Promise<Array<{ threadId: string; text: string }>>;
       getProviderStatus: () => Promise<{
         checkedAt: string;
         updatesAvailable: number;
@@ -1939,6 +1946,8 @@ type OrionCodexBrowserIntegrationStatus = {
         codexServiceTier?: 'default' | 'priority';
         claudeContextWindow?: '200k' | '1m';
         prompt: string;
+        /** Agent context the transcript there doesn't show (mentioned threads it can't read). */
+        context?: string;
       }) => Promise<{
         ok: boolean;
         threadId?: string;

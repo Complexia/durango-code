@@ -174,6 +174,40 @@ try {
   assert.match(recoveredBeginning, /### Message 1\/12/);
   assert.match(recoveredBeginning, /page marker 1/);
 
+  // A thread of another machine (a remote-control mirror) is read from it.
+  {
+    const { setThreadReaderRemoteFetch } = await import('../src/main/thread-reader.js');
+    const mirror = {
+      id: 'mirror-aaaabbbb',
+      projectId: 'project-1',
+      title: 'On omarchy',
+      status: 'idle',
+      modelId: 'claude:opus',
+      createdAt: '2026-11-12T00:00:00.000Z',
+      remote: { machineId: 'm-omarchy', machineName: 'omarchy', threadId: 'host-ccccdddd' },
+      messages: [],
+    };
+    await writeThreadsPatch({ version: 2, upserts: [mirror], deletes: [], order: [thread.id, mirror.id] });
+    const asked = [];
+    setThreadReaderRemoteFetch(async (input) => {
+      asked.push(input);
+      return {
+        ok: true,
+        thread: { ...mirror, id: 'host-ccccdddd', remote: undefined, messages: [{ role: 'agent', content: 'from the host' }] },
+      };
+    });
+    const remotePage = await readThreadForAgent({ thread_id: mirror.id });
+    assert.deepEqual(asked, [{ machineId: 'm-omarchy', threadId: 'host-ccccdddd' }]);
+    assert.match(remotePage, /thread_id: mirror-aaaabbbb/, 'paging keeps the id listed here');
+    assert.match(remotePage, /machine: omarchy \(this thread runs there; transcript read from it just now\)/);
+    assert.match(remotePage, /from the host/);
+    setThreadReaderRemoteFetch(async () => ({ ok: false, error: 'The host is offline.' }));
+    const offlinePage = await readThreadForAgent({ thread_id: mirror.id });
+    assert.match(offlinePage, /could not be reached: The host is offline\./);
+    assert.match(offlinePage, /This thread has no messages yet/);
+    setThreadReaderRemoteFetch(null);
+  }
+
   console.log('Thread reader regression checks passed.');
 } finally {
   await fs.rm(testDataDir, { recursive: true, force: true });

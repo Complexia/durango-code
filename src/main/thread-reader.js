@@ -137,6 +137,23 @@ const formatMessage = (message, index, total) => {
   return `${formatted.slice(0, MAX_FORMATTED_MESSAGE_CHARS - notice.length)}${notice}`;
 };
 
+// A thread listed here that runs on another machine (a remote-control mirror,
+// `remote: { machineId, machineName, threadId }`) is read from that machine:
+// this machine's copy is only what was last fetched (often nothing, for a
+// thread never opened here). main.js installs the fetcher
+// (remote-control.js fetchRemoteThread, after the engine starts).
+let fetchRemoteThreadForReader = null;
+export const setThreadReaderRemoteFetch = (fetcher) => {
+  fetchRemoteThreadForReader = typeof fetcher === 'function' ? fetcher : null;
+};
+
+const remoteOf = (entry) => {
+  const remote = entry?.remote ?? entry?.shell?.remote;
+  return remote && typeof remote.machineId === 'string' && typeof remote.threadId === 'string' && remote.threadId
+    ? remote
+    : null;
+};
+
 // Always resolves to readable text (never rejects) so every caller — the
 // Claude SDK tool and the socket bridge — hands the model an outcome it can
 // act on instead of a protocol error.
@@ -176,6 +193,47 @@ export const readThreadForAgent = async (args = {}) => {
     ? storeState.projects.find((candidate) => candidate?.id === thread.projectId)
     : undefined;
 
+  const remote = remoteOf(thread) ?? remoteOf(matches[0]);
+  if (remote) {
+    const machineName = String(remote.machineName ?? 'another machine');
+    let fetched = null;
+    let error = 'remote control is not running';
+    if (fetchRemoteThreadForReader) {
+      try {
+        const result = await fetchRemoteThreadForReader({ machineId: remote.machineId, threadId: remote.threadId });
+        if (result?.ok && result.thread) fetched = result.thread;
+        else error = result?.error ?? 'no transcript';
+      } catch (fetchError) {
+        error = fetchError?.message ?? String(fetchError);
+      }
+    }
+    // The host's transcript under this machine's id, so paging and links
+    // keep pointing at the thread as listed here.
+    const source = fetched ? { ...fetched, id: thread.id, title: fetched.title || thread.title } : thread;
+    return formatThreadForAgent(source, {
+      project,
+      offset: args.offset,
+      limit: args.limit,
+      extraHeader: [
+        fetched
+          ? `machine: ${machineName} (this thread runs there; transcript read from it just now)`
+          : `machine: ${machineName} (this thread runs there, but it could not be reached: ${error}. Showing the copy this machine last fetched, which may be incomplete.)`,
+      ],
+    });
+  }
+  return formatThreadForAgent(thread, { project, offset: args.offset, limit: args.limit });
+};
+
+/**
+ * One page of a thread's transcript for an agent (read_thread, and
+ * machine_read_thread for a thread on another machine). `toolCall` names how
+ * to read more pages; `extraHeader` adds lines under the title.
+ */
+export const formatThreadForAgent = (
+  thread,
+  { project, offset, limit: requestedLimit, toolCall = 'read_thread', extraHeader = [], link = true } = {}
+) => {
+  const args = { offset, limit: requestedLimit };
   const messages = Array.isArray(thread.messages) ? thread.messages : [];
   const total = messages.length;
   const limit = Math.min(
@@ -189,7 +247,10 @@ export const readThreadForAgent = async (args = {}) => {
   const header = [
     `# Durango Code thread "${thread.title}"`,
     `thread_id: ${thread.id}`,
-    `link: @thread:${thread.id} (write this in your reply to give the user a clickable link to the thread)`,
+    ...extraHeader,
+    ...(link
+      ? [`link: @thread:${thread.id} (write this in your reply to give the user a clickable link to the thread)`]
+      : []),
     `status: ${thread.status}; model: ${thread.modelId}; created: ${thread.createdAt}`,
     ...(project ? [`project: ${project.name} (${project.path})`] : []),
     ...(thread.status === 'running'
@@ -221,10 +282,10 @@ export const readThreadForAgent = async (args = {}) => {
           ]
         : []),
       ...(shownStart > 0 && dropped === 0
-        ? [`Earlier messages exist — call read_thread with offset (1-based message index) to read them, e.g. offset=${Math.max(1, shownStart + 1 - limit)}, limit=${limit}.`]
+        ? [`Earlier messages exist — call ${toolCall} with offset (1-based message index) to read them, e.g. offset=${Math.max(1, shownStart + 1 - limit)}, limit=${limit}.`]
         : []),
       ...(shownStart + shownCount < total
-        ? [`Later messages exist — call read_thread with offset=${shownStart + shownCount + 1} to continue.`]
+        ? [`Later messages exist — call ${toolCall} with offset=${shownStart + shownCount + 1} to continue.`]
         : []),
     ];
   };

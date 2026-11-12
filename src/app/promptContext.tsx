@@ -420,6 +420,29 @@ export const threadMentionToken = (thread: Thread) => {
   return `thread:${slug ? `${slug}-` : ''}${threadMentionIdFragment(thread.id)}`;
 };
 
+// A thread of another machine (a remote-control mirror) is also known by its
+// id there, which is how that machine's transcripts and agents write it. That
+// alias never wins over a thread's own id (a synced copy of a thread can have
+// the same id on both machines) and is dropped when two mirrors share it.
+const hostAliasFragment = (thread: Thread) =>
+  thread.remote?.threadId ? threadMentionIdFragment(thread.remote.threadId) : '';
+
+const usableHostAliases = (threads: Thread[]) => {
+  const own = new Set(threads.map((thread) => threadMentionIdFragment(thread.id)));
+  const counts = new Map<string, number>();
+  for (const thread of threads) {
+    const alias = hostAliasFragment(thread);
+    if (alias) counts.set(alias, (counts.get(alias) ?? 0) + 1);
+  }
+  return (thread: Thread) => {
+    const alias = hostAliasFragment(thread);
+    return alias && !own.has(alias) && counts.get(alias) === 1 ? alias : '';
+  };
+};
+
+const threadMentionPattern = (fragment: string, flags = 'i') =>
+  new RegExp(`(^|\\s)@thread:[A-Za-z0-9-]*${escapeRegExp(fragment)}(?![A-Za-z0-9._:/-])`, flags);
+
 // Scan the user's original text for @thread mention tokens. Matching keys off
 // the trailing id fragment so a mention still resolves if the thread was
 // retitled between typing and sending.
@@ -429,20 +452,50 @@ export const parseThreadMentions = (
   excludeThreadId?: string
 ): ThreadMention[] => {
   if (!/@thread:/i.test(text)) return [];
+  const aliasOf = usableHostAliases(threads);
   const mentions: ThreadMention[] = [];
   for (const thread of threads) {
     if (thread.id === excludeThreadId) continue;
-    const fragment = threadMentionIdFragment(thread.id);
-    if (!fragment) continue;
-    const pattern = new RegExp(
-      `(?:^|\\s)@thread:[A-Za-z0-9-]*${escapeRegExp(fragment)}(?![A-Za-z0-9._:/-])`,
-      'i'
-    );
-    if (pattern.test(text)) {
+    const fragments = [threadMentionIdFragment(thread.id), aliasOf(thread)].filter(Boolean);
+    if (fragments.some((fragment) => threadMentionPattern(fragment).test(text))) {
       mentions.push({ thread, token: threadMentionToken(thread) });
     }
   }
   return mentions;
+};
+
+/**
+ * `text` with its mentions of `thread` (by its own id) pointed at `targetId`
+ * instead: a turn sent to the machine a mirrored thread runs on names the
+ * thread by its id there, so that machine's read_thread finds it. Mentions
+ * already written with that id stay as they are.
+ */
+export const retargetThreadMention = (text: string, thread: Thread, targetId: string) => {
+  const fragment = threadMentionIdFragment(thread.id);
+  if (!fragment) return text;
+  const token = `@${threadMentionToken({ ...thread, id: targetId })}`;
+  return text.replace(threadMentionPattern(fragment, 'gi'), (_match, lead: string) => `${lead}${token}`);
+};
+
+/**
+ * Context for a turn on another machine whose prompt mentions threads that
+ * machine can't read (this machine's own, or a third machine's): read_thread's
+ * newest page of each, read here when the message was sent.
+ */
+export const buildRemoteThreadMentionsContext = (
+  mentions: ThreadMention[],
+  pages: Array<{ threadId: string; text: string }>,
+  targetMachineName: string
+) => {
+  const byId = new Map(pages.map((page) => [page.threadId, page.text]));
+  return [
+    '[Thread mentions from another machine]',
+    `The user referenced these Durango Code threads with @-mentions. They live on the machine the user is typing on, not on ${targetMachineName} where you run, so read_thread cannot open them here. The newest page of each transcript is included below as it was when the message was sent. If you can reach that machine with the machine_* tools (machine_list), machine_read_thread reads earlier pages.`,
+    ...mentions.map(({ thread, token }) =>
+      [`## @${token} → "${thread.title}"`, byId.get(thread.id) ?? '(Could not read this thread.)'].join('\n')
+    ),
+    '[/Thread mentions from another machine]',
+  ].join('\n\n');
 };
 
 // `@thread:<ref>` references in chat text, where <ref> is a full thread id or
@@ -456,11 +509,15 @@ export const resolveThreadReference = (reference: string, threads: Thread[]) => 
   const ref = reference.toLowerCase();
   const exact = threads.find((thread) => thread.id.toLowerCase() === ref);
   if (exact) return exact;
-  const matches = threads.filter((thread) => {
-    const fragment = threadMentionIdFragment(thread.id);
-    return fragment.length === 8 && (ref === fragment || ref.endsWith(`-${fragment}`));
-  });
-  return matches.length === 1 ? matches[0] : undefined;
+  const endsWith = (fragment: string) => fragment.length === 8 && (ref === fragment || ref.endsWith(`-${fragment}`));
+  const matches = threads.filter((thread) => endsWith(threadMentionIdFragment(thread.id)));
+  if (matches.length > 0) return matches.length === 1 ? matches[0] : undefined;
+  // A thread of another machine, by its id there (its agents write that).
+  const byHostId = threads.filter((thread) => thread.remote?.threadId?.toLowerCase() === ref);
+  if (byHostId.length > 0) return byHostId.length === 1 ? byHostId[0] : undefined;
+  const aliasOf = usableHostAliases(threads);
+  const aliased = threads.filter((thread) => endsWith(aliasOf(thread)));
+  return aliased.length === 1 ? aliased[0] : undefined;
 };
 
 // Context block prepended when the user @-mentions other Orion threads. It

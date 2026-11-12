@@ -986,6 +986,7 @@ if (
       machineId: results.pair.machine?.id,
       projectId: 'p1',
       prompt: 'build the thing',
+      context: '[Thread mentions from another machine]\nnewest page',
     });
     results.continueTurn = await engine.runRemoteTurn({
       machineId: results.pair.machine?.id,
@@ -994,6 +995,61 @@ if (
     });
     results.stopTurn = await engine.stopRemoteTurn({ machineId: results.pair.machine?.id, threadId: 't1' });
     results.emptyPrompt = await engine.runRemoteTurn({ machineId: results.pair.machine?.id, prompt: '   ' });
+    // Shell commands on the host (the machine_exec agent tool). Only where
+    // they are checked: they take a few seconds, which timing checks of other
+    // runs would count.
+    if (process.env.ORION_REMOTE_TEST_EXEC === '1') {
+    results.exec = await engine.execOnRemoteMachine({
+      machineId: results.pair.machine?.id,
+      command: 'printf "%s|%s" "$PWD" "$DURANGO_REMOTE_MACHINE"; echo oops >&2; exit 3',
+      cwd: os.tmpdir(),
+    });
+    results.execStdin = await engine.execOnRemoteMachine({
+      machineId: results.pair.machine?.id,
+      command: 'cat',
+      stdin: 'hello from the controller',
+    });
+    results.execTimeout = await engine.execOnRemoteMachine({
+      machineId: results.pair.machine?.id,
+      command: 'sleep 20',
+      timeoutMs: 1000,
+    });
+    results.execMissingProject = await engine.execOnRemoteMachine({
+      machineId: results.pair.machine?.id,
+      command: 'true',
+      projectId: 'no-such-project',
+    });
+    // Requests that arrive together (each awaiting its project lookup) still
+    // share the 16-command limit.
+    results.execBurst = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        engine.execOnRemoteMachine({
+          machineId: results.pair.machine?.id,
+          command: 'sleep 1',
+          projectId: 'p1',
+          cwd: os.tmpdir(),
+        })
+      )
+    );
+    {
+      const stopped = new AbortController();
+      stopped.abort();
+      results.execStoppedFirst = await engine.execOnRemoteMachine({
+        machineId: results.pair.machine?.id,
+        command: 'true',
+        signal: stopped.signal,
+      });
+    }
+    {
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(), 500);
+      results.execCancelled = await engine.execOnRemoteMachine({
+        machineId: results.pair.machine?.id,
+        command: 'sleep 20',
+        signal: cancel.signal,
+      });
+    }
+    }
     results.state = engine.getRemoteControlState();
     send({ kind: 'results', results });
     if (process.env.ORION_REMOTE_TEST_STAY_CONNECTED !== '1') process.exit(0);
@@ -1891,6 +1947,7 @@ if (
       ORION_REMOTE_TEST_CODE: ready2.code,
       ORION_REMOTE_TEST_STAY_CONNECTED: '1',
       ORION_REMOTE_TEST_LARGE_THREAD: '1',
+      ORION_REMOTE_TEST_EXEC: '1',
     });
     establishedController = controller;
     const commandSeen = host.waitFor('commandSeen');
@@ -1921,11 +1978,37 @@ if (
     assert.equal(results.continueTurn.threadId, 't1');
     assert.equal(results.stopTurn.ok, true, `stopTurn failed: ${results.stopTurn.error}`);
     assert.equal(results.emptyPrompt.ok, false);
+    assert.equal(results.exec.ok, true, `exec failed: ${results.exec.error}`);
+    assert.equal(results.exec.exitCode, 3);
+    {
+      const [cwd, sender] = results.exec.stdout.split('|');
+      assert.equal(fs.realpathSync(cwd), fs.realpathSync(os.tmpdir()), 'the command runs in the requested folder');
+      assert.ok(sender, 'the command learns which machine sent it');
+    }
+    assert.equal(results.exec.stderr.trim(), 'oops');
+    assert.equal(results.execStdin.ok, true);
+    assert.equal(results.execStdin.stdout, 'hello from the controller');
+    assert.equal(results.execTimeout.ok, true);
+    assert.equal(results.execTimeout.timedOut, true);
+    assert.ok(results.execTimeout.durationMs < 10_000, 'a timed-out command is stopped promptly');
+    assert.equal(results.execMissingProject.ok, false);
+    assert.match(results.execMissingProject.error, /Project not found/);
+    assert.equal(results.execBurst.filter((result) => result.ok).length, 16, 'the limit holds for a burst');
+    assert.ok(
+      results.execBurst.filter((result) => !result.ok).every((result) => /already running/.test(result.error)),
+      'the rest are refused'
+    );
+    assert.equal(results.execStoppedFirst.ok, false);
+    assert.match(results.execStoppedFirst.error, /Cancelled before it started/);
+    assert.equal(results.execCancelled.ok, true);
+    assert.equal(results.execCancelled.cancelled, true);
+    console.log('ok  exec runs shell commands on the host (exit code, stderr, stdin, timeout, cancel)');
     assert.equal(results.state.machines.length, 1);
     assert.equal(results.state.machines[0].status, 'connected');
     const seen = await commandSeen;
     assert.equal(seen.command.kind, 'runTurn');
     assert.equal(seen.command.prompt, 'build the thing');
+    assert.equal(seen.command.context, '[Thread mentions from another machine]\nnewest page', 'hidden context reaches the host renderer');
     console.log('ok  live large-thread transfer uses one stable snapshot across chunks');
 
     for (const [mode, errorPattern] of [

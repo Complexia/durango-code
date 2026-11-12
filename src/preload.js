@@ -114,6 +114,7 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('agent:modelsChanged', listener);
   },
   supportsThreadReader: (providerId) => ipcRenderer.invoke('agent:supportsThreadReader', providerId),
+  readThreadsForMention: (input) => ipcRenderer.invoke('agent:readThreadsForMention', input),
   runAgentTurn: (input) => ipcRenderer.invoke('agent:runTurn', input),
   // Claude slash commands (built-ins + .claude/commands + skills + plugins)
   listSlashCommands: (input) => ipcRenderer.invoke('agent:listSlashCommands', input),
