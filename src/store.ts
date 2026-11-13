@@ -817,16 +817,47 @@ const REMOTE_SETTING_KEYS = [
 // listing (a host mid-write) can't drop it.
 const remoteMissingLastTime = new Map<string, Set<string>>();
 
+// Whether that machine listed the thread's full summary. An older host, or
+// one whose listing was too large to send whole (fitSnapshot), gives only its
+// message count and last activity time.
+const hasListedSummary = (entry: RemoteThreadListing) =>
+  Boolean(entry.summary && typeof entry.summary === 'object' && Number.isSafeInteger(entry.summary.messageCount));
+
 const remoteListingSummary = (entry: RemoteThreadListing): ThreadSummary => {
-  if (entry.summary && typeof entry.summary === 'object' && Number.isSafeInteger(entry.summary.messageCount)) {
-    return entry.summary;
-  }
+  if (hasListedSummary(entry)) return entry.summary!;
   // An older host lists counts and times only.
   return {
     ...summarizeThreadMessages([]),
     messageCount: entry.messageCount,
     lastMessage: entry.updatedAt ? { id: `remote:${entry.id}`, role: 'agent', ts: entry.updatedAt } : null,
     hasUserMessage: entry.messageCount > 0,
+  };
+};
+
+// Whether summary `a` is of a later point in the thread than `b`: more
+// messages, or a newer last message (sent or completed).
+const summaryAhead = (a: ThreadSummary, b: ThreadSummary) => {
+  if (a.messageCount !== b.messageCount) return a.messageCount > b.messageCount;
+  const at = (summary: ThreadSummary) =>
+    Math.max(Date.parse(summary.lastMessage?.ts ?? '') || 0, Date.parse(summary.lastMessage?.completedAt ?? '') || 0);
+  return at(a) > at(b);
+};
+
+/**
+ * The summary a listing gives a mirror here, or null to keep its own. A full
+ * summary from that machine always counts. A count-and-time one only once
+ * that machine has moved on, and it keeps the worked time and last run this
+ * machine already knows (it has none of its own).
+ */
+const listedMirrorSummary = (entry: RemoteThreadListing, current: ThreadSummary): ThreadSummary | null => {
+  const listed = remoteListingSummary(entry);
+  if (hasListedSummary(entry)) return sameThreadSummary(listed, current) ? null : listed;
+  if (listed.messageCount === current.messageCount && !summaryAhead(listed, current)) return null;
+  return {
+    ...listed,
+    agentRunCount: Math.max(listed.agentRunCount, current.agentRunCount),
+    lastAgentRun: current.lastAgentRun,
+    workedMs: current.workedMs,
   };
 };
 
@@ -1035,6 +1066,44 @@ export const isAgentsPanelVisible = (state: {
   activeTab: 'agents' | 'code';
   settingsOpen: boolean;
 }) => state.activeTab === 'agents' && !state.settingsOpen;
+
+/**
+ * A thread with `updates` applied, plus what a change of status brings with
+ * it. Every status change goes through here (updateThread, and the listings
+ * of threads that run on another machine), so a run that ends wakes and flags
+ * a thread the same way wherever it ran.
+ */
+const withThreadUpdates = (
+  state: { activeTab: 'agents' | 'code'; settingsOpen: boolean; paneThreadIds: string[] },
+  t: Thread,
+  updates: Partial<Thread>
+): Thread => {
+  const next = { ...t, ...updates };
+  if (!updates.status || updates.status === t.status) return next;
+  const onScreen = isAgentsPanelVisible(state) && state.paneThreadIds.includes(t.id);
+  // A run that ends while the user is elsewhere leaves a dot in the sidebar
+  // until the thread is opened; starting a new run (or finishing one in the
+  // open thread) clears it again. Only a run that ran to completion counts —
+  // a stop (-> idle) was deliberate, so it needs no follow-up marker.
+  const ranToEnd = t.status === 'running' && (updates.status === 'done' || updates.status === 'error');
+  next.finishedUnseenAt = ranToEnd && !onScreen ? new Date().toISOString() : undefined;
+  // A snoozed thread wakes when its run ends: finished, or (on a failure)
+  // needing the user. A stop was deliberate and keeps it snoozed. Questions
+  // and approvals wake it too (App).
+  if (t.snoozedAt && !('snoozedAt' in updates) && ranToEnd) {
+    next.snoozedAt = undefined;
+    // Already on screen: nothing to flag, it just rejoins the list.
+    if (!onScreen) {
+      next.wokeAt = new Date().toISOString();
+      next.wokeReason = updates.status === 'error' ? 'attention' : 'finished';
+    }
+  }
+  // New work in a settled thread brings it back to the sidebar.
+  if (t.settledAt && updates.status === 'running' && !('settledAt' in updates)) {
+    next.settledAt = undefined;
+  }
+  return next;
+};
 
 interface OrionState {
   // Tabs
@@ -2388,12 +2457,12 @@ export const useOrionStore = create<OrionState>()(
                 patch.title = entry.title;
               }
               if (entry.status && entry.status !== current.status) patch.status = entry.status;
-              // A loaded transcript keeps its own summary; one that isn't
-              // loaded takes that machine's.
-              if (!(current.id in state.transcripts)) {
-                const summary = remoteListingSummary(entry);
-                if (!sameThreadSummary(summary, current.summary)) patch.summary = summary;
-              }
+              // That machine's summary places the row (and says how long it
+              // has worked). A loaded transcript here is only a cache of that
+              // machine's: it isn't open (open ones are skipped), so it may
+              // be behind, and it is fetched again when the thread opens.
+              const summary = listedMirrorSummary(entry, current.summary);
+              if (summary) patch.summary = summary;
               // That machine's settings for the thread, unless changed here.
               const hostSettings = remoteSettingsOf({ ...entry.settings, modelId: entry.modelId });
               const adopted = adoptRemoteSettings(current, hostSettings);
@@ -2418,7 +2487,9 @@ export const useOrionStore = create<OrionState>()(
                 if ('userActions' in attention) patch.userActions = attention.userActions;
                 if (attention.remote) patch.remote = attention.remote;
               }
-              if (Object.keys(patch).length > 0) write(index, { ...current, ...patch });
+              // A run that ended there wakes and flags the thread here like
+              // one that ran here.
+              if (Object.keys(patch).length > 0) write(index, withThreadUpdates(state, current, patch));
               continue;
             }
             // That machine's untouched drafts stay there; so do threads
@@ -2885,44 +2956,7 @@ export const useOrionStore = create<OrionState>()(
         set((state) => {
           const index = threadIndexById(state.threads).get(id);
           if (index === undefined) return {};
-          const update = (t: Thread) => {
-            const next = { ...t, ...updates };
-            // A run that ends while the user is elsewhere leaves a dot in the
-            // sidebar until the thread is opened; starting a new run (or
-            // finishing one in the open thread) clears it again. Only a run
-            // that ran to completion counts — a stop (-> idle) was deliberate,
-            // so it needs no follow-up marker.
-            if (updates.status && updates.status !== t.status) {
-              next.finishedUnseenAt =
-                t.status === 'running' &&
-                (updates.status === 'done' || updates.status === 'error') &&
-                (!isAgentsPanelVisible(state) || !state.paneThreadIds.includes(id))
-                  ? new Date().toISOString()
-                  : undefined;
-              // A snoozed thread wakes when its run ends: finished, or (on a
-              // failure) needing the user. A stop was deliberate and keeps it
-              // snoozed. Questions and approvals wake it too (App).
-              if (
-                t.snoozedAt &&
-                !('snoozedAt' in updates) &&
-                t.status === 'running' &&
-                (updates.status === 'done' || updates.status === 'error')
-              ) {
-                next.snoozedAt = undefined;
-                // Already on screen: nothing to flag, it just rejoins the list.
-                if (!isAgentsPanelVisible(state) || !state.paneThreadIds.includes(id)) {
-                  next.wokeAt = new Date().toISOString();
-                  next.wokeReason = updates.status === 'error' ? 'attention' : 'finished';
-                }
-              }
-              // New work in a settled thread brings it back to the sidebar.
-              if (t.settledAt && updates.status === 'running' && !('settledAt' in updates)) {
-                next.settledAt = undefined;
-              }
-            }
-            return next;
-          };
-          const threads = replaceThreadAt(state.threads, index, update(state.threads[index]));
+          const threads = replaceThreadAt(state.threads, index, withThreadUpdates(state, state.threads[index], updates));
           return {
             threads,
             // Saved-view labels are derived from their current thread titles,
@@ -3726,8 +3760,14 @@ const resolveLoadedThread = (
     }
   }
   let nextShell = shell;
+  // A thread that runs on another machine keeps the summary that machine's
+  // listing gave it while its copy stored here is behind that (it is fetched
+  // again once open): its row must not drop back to where that copy left it.
+  // A copy as new as the listing gives the fuller summary; changes made here
+  // (ops) are newer than either.
   const summary = summarizeThreadMessages(transcript.messages);
-  if (!sameThreadSummary(summary, shell.summary)) nextShell = { ...nextShell, summary };
+  const keepRemoteSummary = Boolean(shell.remote) && ops.length === 0 && summaryAhead(shell.summary, summary);
+  if (!keepRemoteSummary && !sameThreadSummary(summary, shell.summary)) nextShell = { ...nextShell, summary };
   // The manifest's shell leaves out subagent prompts and reports; take them
   // from the stored thread so a whole-thread save keeps them.
   if (record) nextShell = withStoredSubagentDetails(nextShell, record);
@@ -3905,7 +3945,9 @@ const scheduleTranscriptEviction = () => {
 };
 
 // What is on screen loads (and counts as recently opened); threads that start
-// running load too, since their events will write to them.
+// running load too, since their events will write to them. A thread running
+// on another machine gets no events here (useRemoteThreadSync fetches it while
+// open), so it doesn't.
 useOrionStore.subscribe((state, previous) => {
   if (!useOrionStore.persist.hasHydrated()) return;
   if (state.paneThreadIds !== previous.paneThreadIds || state.selectedThreadId !== previous.selectedThreadId) {
@@ -3917,7 +3959,7 @@ useOrionStore.subscribe((state, previous) => {
   if (state.threads !== previous.threads) {
     const running: string[] = [];
     for (const thread of state.threads) {
-      if (thread.status === 'running' && !(thread.id in state.transcripts)) running.push(thread.id);
+      if (thread.status === 'running' && !thread.remote && !(thread.id in state.transcripts)) running.push(thread.id);
     }
     if (running.length > 0) void ensureThreadTranscripts(running);
   }

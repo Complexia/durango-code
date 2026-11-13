@@ -24,7 +24,7 @@ const bridge = {
 Object.assign(globalThis, {
   window: { addEventListener() {}, localStorage: { getItem: () => null }, orion: bridge },
 });
-const { useOrionStore, NO_PROJECT_ID } = await import('../src/store');
+const { useOrionStore, NO_PROJECT_ID, ensureThreadTranscript } = await import('../src/store');
 await new Promise<void>((resolve) => {
   if (useOrionStore.persist.hasHydrated()) resolve();
   else useOrionStore.persist.onFinishHydration(() => resolve());
@@ -164,6 +164,109 @@ console.log('ok  threads that machine deleted leave this list');
   store.addMessageToThread(spawned, { role: 'user', content: 'Diagnose the updater.' });
   assert.equal(useOrionStore.getState().threads.find((thread) => thread.id === spawned)?.hiddenFromRecent, true);
   console.log('ok  threads an agent elsewhere started here stay out of Recent');
+}
+
+// A run there (started from here by an agent, or there) moves, wakes and
+// flags the thread here the way a run here does, even when this machine
+// still has an older copy of its transcript loaded.
+{
+  const stale = [
+    { id: 's1', role: 'user' as const, content: 'Build it', ts: '2026-11-09T09:00:00.000Z' },
+    { id: 's2', role: 'agent' as const, content: 'Built', ts: '2026-11-09T09:00:00.000Z', status: 'done' as const },
+  ];
+  sync([listing('h1'), listing('h2'), listing('h7')]);
+  const h7 = mirrors().find((thread) => thread.remote?.threadId === 'h7')!;
+  useOrionStore.getState().updateThread(h7.id, { snoozedAt: '2026-11-09T10:30:00.000Z' });
+  useOrionStore.setState((state) => ({ transcripts: { ...state.transcripts, [h7.id]: { messages: stale } } }));
+  const runStart = '2026-11-10T08:00:00.000Z';
+  const running = {
+    ...summary,
+    messageCount: 6,
+    lastMessage: { id: 'm6', role: 'agent' as const, ts: runStart, status: 'running' as const },
+    runningRunStarts: [Date.parse(runStart)],
+  };
+  sync([listing('h1'), listing('h2'), listing('h7', { status: 'running', summary: running })]);
+  let current = mirrors().find((thread) => thread.id === h7.id)!;
+  assert.equal(current.status, 'running');
+  assert.equal(current.summary.lastMessage?.ts, runStart, 'the new run places the row, loaded transcript or not');
+  assert.ok(current.snoozedAt, 'a snoozed thread stays snoozed while it runs');
+  const finished = { ...running, lastMessage: { ...running.lastMessage, status: 'done' as const, completedAt: '2026-11-10T08:10:00.000Z' }, runningRunStarts: [] };
+  sync([listing('h1'), listing('h2'), listing('h7', { status: 'done', summary: finished })]);
+  current = mirrors().find((thread) => thread.id === h7.id)!;
+  assert.equal(current.status, 'done');
+  assert.equal(current.snoozedAt, undefined, 'its run ending there wakes it');
+  assert.equal(current.wokeReason, 'finished');
+  assert.ok(current.finishedUnseenAt, 'and marks it finished until opened');
+  console.log('ok  a run there moves, wakes and flags its thread here');
+
+  // Its older copy stored here loads without moving the row back.
+  const fresh = { ...listing('h8'), summary: finished, messageCount: 6 };
+  sync([listing('h1'), listing('h2'), listing('h7', { status: 'done', summary: finished }), fresh]);
+  const h8 = mirrors().find((thread) => thread.remote?.threadId === 'h8')!;
+  const loadBatch = bridge.loadThreadsBatch;
+  bridge.loadThreadsBatch = async () => ({
+    ok: true,
+    value: JSON.stringify({ version: 2, consumed: 1, threads: [{ ...h8, summary: undefined, messages: stale }] }),
+  });
+  await ensureThreadTranscript(h8.id);
+  bridge.loadThreadsBatch = loadBatch;
+  assert.equal(useOrionStore.getState().transcripts[h8.id]?.messages.length, 2);
+  assert.equal(
+    mirrors().find((thread) => thread.id === h8.id)?.summary.lastMessage?.completedAt,
+    finished.lastMessage.completedAt,
+    'loading its stored copy keeps that machine’s summary'
+  );
+  console.log('ok  a stale stored copy of a remote thread keeps its row in place');
+}
+
+// A listing with counts and times only (an older host, or one too large to
+// send whole) never wipes what this machine knows of the thread's work.
+{
+  const worked = {
+    ...summary,
+    messageCount: 6,
+    lastMessage: { id: 'w6', role: 'agent' as const, ts: '2026-11-10T09:00:00.000Z', status: 'done' as const },
+    lastAgentRun: { id: 'w6', ts: '2026-11-10T09:00:00.000Z', status: 'done' as const },
+    agentRunCount: 3,
+    workedMs: 600_000,
+  };
+  sync([listing('h1'), listing('h2'), listing('w1', { summary: worked, messageCount: 6 })]);
+  const w1 = mirrors().find((thread) => thread.remote?.threadId === 'w1')!;
+  const countsOnly = { summary: undefined, messageCount: 6, updatedAt: '2026-11-10T09:00:00.000Z' };
+  sync([listing('h1'), listing('h2'), listing('w1', countsOnly)]);
+  assert.deepEqual(mirrors().find((thread) => thread.id === w1.id)?.summary, worked, 'nothing new there: kept');
+  sync([listing('h1'), listing('h2'), listing('w1', { ...countsOnly, messageCount: 8, updatedAt: '2026-11-10T10:00:00.000Z' })]);
+  const moved = mirrors().find((thread) => thread.id === w1.id)!.summary;
+  assert.equal(moved.messageCount, 8);
+  assert.equal(moved.lastMessage?.ts, '2026-11-10T10:00:00.000Z', 'moved on there: the row moves');
+  assert.equal(moved.workedMs, 600_000, 'and keeps the worked time known here');
+  assert.equal(moved.lastAgentRun?.id, 'w6');
+
+  // Its stored copy, as new as that listing, gives the fuller summary.
+  const copy = [
+    { id: 'c1', role: 'user' as const, content: 'Go', ts: '2026-11-10T09:59:00.000Z' },
+    {
+      id: 'c2',
+      role: 'agent' as const,
+      kind: 'agent-run' as const,
+      content: 'Done',
+      ts: '2026-11-10T10:00:00.000Z',
+      status: 'done' as const,
+      startedAt: '2026-11-10T10:00:00.000Z',
+      completedAt: '2026-11-10T10:05:00.000Z',
+    },
+  ];
+  sync([listing('h1'), listing('h2'), listing('w2', { summary: undefined, messageCount: 2, updatedAt: '2026-11-10T10:00:00.000Z' })]);
+  const w2 = mirrors().find((thread) => thread.remote?.threadId === 'w2')!;
+  const loadBatch = bridge.loadThreadsBatch;
+  bridge.loadThreadsBatch = async () => ({
+    ok: true,
+    value: JSON.stringify({ version: 2, consumed: 1, threads: [{ ...w2, summary: undefined, messages: copy }] }),
+  });
+  await ensureThreadTranscript(w2.id);
+  bridge.loadThreadsBatch = loadBatch;
+  assert.equal(mirrors().find((thread) => thread.id === w2.id)?.summary.lastAgentRun?.id, 'c2');
+  console.log('ok  count-only listings keep the work known here');
 }
 
 console.log('All remote thread listing tests passed.');
