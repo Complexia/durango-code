@@ -37,18 +37,23 @@ export const DISPATCH_CAPABILITIES = ['thread-follow-up'];
  * repositories, and prefers a machine that already has the project.
  */
 export const SOURCE_CHECKOUT_CAPABILITY = 'source-checkout';
+/**
+ * With it: this build also checks out for runs started with an API key (the
+ * Durango MCP). Builds before it advertise only source-checkout and refuse
+ * those, so Durango sends API checkouts only to machines with this.
+ */
+export const API_SOURCE_CHECKOUT_CAPABILITY = 'api-source-checkout';
 
 /**
  * Whether a dispatch that matched no local project may be checked out of
- * Durango Source here. Never for API runs (an API key or the Durango MCP):
- * cloning decrypts the repository's env files on this machine, and a key with
- * the `code` scope must not reach every repository's vault. Chat and Tasks
- * runs are confirmed by the user in Durango.
+ * Durango Source here, whoever started it (Chat, Tasks, or an API key such as
+ * the Durango MCP). The clone, and the env files it restores, use this app's
+ * own sign-in and stay on this machine, exactly as for a project the user
+ * added by hand; the run's API key never touches them.
  */
 export const canCheckoutDispatch = (dispatch, allowedProjectIds, checkoutAvailable) =>
   Boolean(
     checkoutAvailable &&
-      dispatch?.origin !== 'api' &&
       (allowedProjectIds === null || allowedProjectIds === undefined) &&
       !dispatch?.threadId &&
       typeof dispatch?.project?.repoId === 'string' &&
@@ -182,7 +187,7 @@ export const buildMachinePayload = ({ machineId, name, platform, projects, allow
     })),
   capabilities:
     sourceCheckout && (allowedProjectIds === null || allowedProjectIds === undefined)
-      ? [...DISPATCH_CAPABILITIES, SOURCE_CHECKOUT_CAPABILITY]
+      ? [...DISPATCH_CAPABILITIES, SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
       : DISPATCH_CAPABILITIES,
 });
 

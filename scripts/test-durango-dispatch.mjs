@@ -24,6 +24,7 @@ import {
   resolveDispatchProject,
   resolveFollowUpProject,
   SOURCE_CHECKOUT_CAPABILITY,
+  API_SOURCE_CHECKOUT_CAPABILITY,
   canCheckoutDispatch,
 } from '../src/main/durango-dispatch.js';
 import { checkoutFolderName, chooseCheckoutDir, cliSupportsClone, createSourceCheckout, sourceCheckoutRoot } from '../src/main/source-checkout.js';
@@ -553,11 +554,11 @@ try {
     assert.ok(!canCheckoutDispatch({ project: { name: 'x' } }, null, true), 'nothing to clone without a repo id');
     assert.ok(!canCheckoutDispatch({ project: { repoId: 'r' }, threadId: 't' }, null, true), 'follow-ups need their thread');
     assert.ok(!canCheckoutDispatch({ project: { repoId: 'r' } }, null, false));
-    assert.ok(!canCheckoutDispatch({ origin: 'api', project: { repoId: 'repo_new' } }, null, true), 'API keys never trigger a clone');
+    assert.ok(canCheckoutDispatch({ origin: 'api', project: { repoId: 'repo_new' } }, null, true), 'API runs clone with this machine sign-in');
     assert.ok(canCheckoutDispatch({ origin: 'tasks', project: { repoId: 'repo_new' } }, null, true));
     assert.deepEqual(
       buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], sourceCheckout: true }).capabilities,
-      ['thread-follow-up', SOURCE_CHECKOUT_CAPABILITY]
+      ['thread-follow-up', SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
     );
     assert.deepEqual(
       buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], allowedProjectIds: ['p1'], sourceCheckout: true }).capabilities,
