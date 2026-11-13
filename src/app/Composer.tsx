@@ -176,6 +176,10 @@ export type ComposerProps = {
   onOpenAccountSettings: () => void;
   // A sidebar thread is being dragged over the composer.
   onThreadDragOver: () => void;
+  // The agent's predicted next prompt for this thread, or null. Shown in the
+  // empty composer: Tab fills it in, Escape dismisses it.
+  promptSuggestion: string | null;
+  onDismissPromptSuggestion: (threadId: string) => void;
 };
 
 export const Composer = ({
@@ -212,6 +216,8 @@ export const Composer = ({
   onDispatchReview,
   onOpenAccountSettings,
   onThreadDragOver,
+  promptSuggestion,
+  onDismissPromptSuggestion,
 }: ComposerProps) => {
   const draft = useComposerDraft(controller);
   const chatInput = draft.text;
@@ -219,6 +225,21 @@ export const Composer = ({
   const starting = draft.starting.has(threadId);
   const hasPendingLinkedTasks = pendingLinkedTaskCount > 0;
   const hasDraftContent = !!chatInput.trim() || chatAttachments.length > 0;
+  // Offered only where the default placeholder would show, so it never hides
+  // a run's state, a workspace notice, or a draft the user started.
+  const offeredPromptSuggestion =
+    promptSuggestion &&
+    chatInput === '' &&
+    chatAttachments.length === 0 &&
+    !isSending &&
+    !starting &&
+    !hasPendingLinkedTasks &&
+    !isTerminalThread &&
+    !isNativeSubagentThread &&
+    !workspaceUnavailable &&
+    modelAvailable
+      ? promptSuggestion
+      : null;
 
   // Active @-mention token in the composer: index of the '@' and the query
   // typed after it (null when the caret isn't inside a mention token). `mode`
@@ -764,6 +785,24 @@ export const Composer = ({
 
   // Handle chat submit: ⏎ sends (or queues mid-run), ⌘⏎ steers mid-run.
   const handleChatKeyDown = (e: React.KeyboardEvent) => {
+    // The suggestion only shows in an empty composer, where neither menu can
+    // be open. Tab fills it in for editing; Escape hides it so Tab moves focus
+    // again. IME composition keeps its own Tab/Escape.
+    if (offeredPromptSuggestion && !e.nativeEvent.isComposing) {
+      if (e.key === 'Tab' && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        setSlashDismissedDraft(null);
+        setLocalText(offeredPromptSuggestion);
+        updateChatMention(offeredPromptSuggestion, offeredPromptSuggestion.length);
+        focusAt(offeredPromptSuggestion.length);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onDismissPromptSuggestion(threadId);
+        return;
+      }
+    }
     // The open slash-command menu captures navigation keys first. It never
     // coexists with the @-mention dropdown: the slash token spans the whole
     // draft and contains no whitespace, so no "@" token can start inside it.
@@ -1211,12 +1250,30 @@ export const Composer = ({
           })}
         </ComposerPopover>
       )}
+      {offeredPromptSuggestion && (
+        // Zero-height anchor at the textarea's top edge, so the suggestion
+        // lines up with where the placeholder would be without changing layout.
+        <div className="relative h-0" aria-hidden="true">
+          {/* One line: a long suggestion truncates so the badge stays visible
+              in narrow split panes. Tab still inserts the full text. */}
+          <div className="pointer-events-none absolute inset-x-0 top-0 flex items-center gap-2 px-[18px] pt-[14px] text-[14px] leading-[1.5] text-[var(--text-muted)]">
+            <span className="min-w-0 truncate">{offeredPromptSuggestion}</span>
+            <kbd className="inline-flex shrink-0 items-center rounded-md border border-[var(--border-strong)] px-1.5 font-sans text-[11px] leading-[18px] text-[var(--text-secondary)]">
+              ⇥ Tab
+            </kbd>
+          </div>
+        </div>
+      )}
       <textarea
         ref={setChatInputRef}
-        className="chat-input min-h-[52px]"
+        className={`chat-input min-h-[52px]${
+          offeredPromptSuggestion ? ' placeholder:!text-transparent' : ''
+        }`}
         disabled={isNativeSubagentThread || workspaceUnavailable}
         placeholder={
-          isNativeSubagentThread
+          offeredPromptSuggestion
+            ? `${offeredPromptSuggestion} (Tab to use)`
+            : isNativeSubagentThread
             ? 'Read-only subagent transcript — steer from the parent thread.'
             : workspaceUnavailable
               ? workspaceRemoving

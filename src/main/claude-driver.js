@@ -1349,6 +1349,8 @@ export const finalizeClaudeTurn = async (session, resultMessage) => {
 };
 
 export const finalizeClaudeTurnInner = async (session, resultMessage, turn) => {
+  // The run a prompt suggestion arriving after this result belongs to.
+  session.lastFinishedRunId = turn.runId;
   finishClaudeTurnReasoning(session, turn);
   let changedFiles = [];
   try {
@@ -1674,6 +1676,22 @@ export const handleClaudeSessionMessage = async (session, message) => {
   }
 
   let turn = session.activeTurns[0];
+
+  // The predicted next prompt (promptSuggestions) arrives after the turn's
+  // `result`. It never opens a turn, and one that lands after the user
+  // already sent again (a turn is live) is stale.
+  if (message?.type === 'prompt_suggestion') {
+    const text = typeof message.suggestion === 'string' ? message.suggestion.trim() : '';
+    if (text && !turn && session.lastFinishedRunId) {
+      emitAgentEvent(session.sender, {
+        runId: session.lastFinishedRunId,
+        threadId: session.threadId,
+        type: 'prompt-suggestion',
+        suggestion: text,
+      });
+    }
+    return;
+  }
 
   // Subagent frames (parent_tool_use_id set) ride the main stream too, but
   // the subagent tracker already renders them from the subagent transcript.
@@ -2254,6 +2272,10 @@ export const createClaudeSdkSession = ({
             ? Promise.resolve({ behavior: 'allow', updatedInput: toolInput })
             : session.userInputs.canUseTool(toolName, toolInput, toolOptions),
         includePartialMessages: true,
+        // A predicted next prompt after each turn, offered in the empty
+        // composer (Tab accepts). It reuses the turn's prompt cache, and the
+        // user's own promptSuggestionEnabled setting still turns it off.
+        promptSuggestions: true,
         // Without this declaration every interrupt kills running background
         // agents/workflows, so steering a turn would silently stop them. Stop
         // still halts everything: it stops each live task explicitly via

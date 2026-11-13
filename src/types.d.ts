@@ -1662,7 +1662,9 @@ type OrionCodexBrowserIntegrationStatus = {
       onAgentTurnEvent?: (cb: (event: {
         runId: string;
         threadId: string;
-        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'subagent' | 'subagent-chunk' | 'subagent-activity' | 'user-input';
+        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'subagent' | 'subagent-chunk' | 'subagent-activity' | 'user-input' | 'prompt-suggestion';
+        /** prompt-suggestion events only: the agent's predicted next user prompt for this thread. */
+        suggestion?: string;
         /** started events only: the persistent claude session opened this turn itself (background task finished). */
         background?: boolean;
         /** subagent events: lifecycle upsert for a provider-native subagent of this thread's run. */

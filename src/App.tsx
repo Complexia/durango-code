@@ -925,6 +925,14 @@ const App: React.FC = () => {
   // One agent run may be active per thread; runs in other threads are
   // independent, so starting/stopping one never blocks the rest.
   const [activeRunsByThread, setActiveRunsByThread] = useState<Record<string, string>>({});
+  // The agent's predicted next prompt per thread (Claude's promptSuggestions),
+  // offered in the empty composer until the thread's next turn starts or the
+  // user dismisses it. Kept in memory only.
+  const [promptSuggestions, setPromptSuggestions] = useState<Record<string, string>>({});
+  // The run that most recently started on each thread. A suggestion lands a
+  // moment after its run's result; one from an older run (the user already
+  // sent again, maybe on another provider) is stale.
+  const latestStartedRunByThread = useRef(new Map<string, string>());
   const activeRunsByThreadRef = useRef(activeRunsByThread);
   useEffect(() => {
     activeRunsByThreadRef.current = activeRunsByThread;
@@ -4023,6 +4031,26 @@ const App: React.FC = () => {
     if (!window.orion?.onAgentTurnEvent) return undefined;
     type AgentTurnEvent = Parameters<Parameters<NonNullable<typeof window.orion.onAgentTurnEvent>>[0]>[0];
     const handleEvent = (event: AgentTurnEvent) => {
+      if (event.type === 'prompt-suggestion') {
+        const suggestion = event.suggestion?.trim();
+        if (
+          event.threadId &&
+          suggestion &&
+          latestStartedRunByThread.current.get(event.threadId) === event.runId
+        ) {
+          setPromptSuggestions((current) => ({ ...current, [event.threadId]: suggestion }));
+        }
+        return;
+      }
+      // Any new turn on the thread makes its suggestion stale.
+      if (event.type === 'started' && event.threadId) {
+        latestStartedRunByThread.current.set(event.threadId, event.runId);
+        setPromptSuggestions((current) => {
+          if (!(event.threadId in current)) return current;
+          const { [event.threadId]: _stale, ...rest } = current;
+          return rest;
+        });
+      }
       // `/btw` aside runs stream into their exchange, not the transcript.
       // Their `session` events are deliberately dropped: the fork's id must
       // never replace the thread's real session id.
@@ -7427,6 +7455,14 @@ const App: React.FC = () => {
       const clearedThreadId = selectedThreadId;
       const clearedThread = selectedThread;
       composerDraft.setText('');
+      // The fresh session can't see what the old suggestion refers to; a late
+      // one from the cleared session is dropped as a superseded run.
+      latestStartedRunByThread.current.delete(clearedThreadId);
+      setPromptSuggestions((current) => {
+        if (!(clearedThreadId in current)) return current;
+        const { [clearedThreadId]: _cleared, ...rest } = current;
+        return rest;
+      });
       void window.orion?.clearClaudeSession?.(clearedThreadId).catch(() => {});
       updateThread(clearedThreadId, {
         agentSessionIds: { ...clearedThread.agentSessionIds, claude: undefined },
@@ -9780,6 +9816,13 @@ const App: React.FC = () => {
     dispatchReview(rawText, review)
   );
   const hideThreadDropHint = useCallback(() => setThreadDropActive(false), []);
+  const dismissPromptSuggestion = useCallback((threadId: string) => {
+    setPromptSuggestions((current) => {
+      if (!(threadId in current)) return current;
+      const { [threadId]: _dismissed, ...rest } = current;
+      return rest;
+    });
+  }, []);
   // Base branches the Codex "/review base" picker offers.
   const reviewBranches = useMemo(
     () => (gitState?.branches ?? []).filter((branch) => !branch.current).map((branch) => branch.name),
@@ -9929,6 +9972,8 @@ const App: React.FC = () => {
         onDispatchReview={dispatchReviewFromComposer}
         onOpenAccountSettings={openAccountSettings}
         onThreadDragOver={hideThreadDropHint}
+        promptSuggestion={promptSuggestions[selectedThread.id] ?? null}
+        onDismissPromptSuggestion={dismissPromptSuggestion}
       >
         <>
           <div className="model-picker-anchor" ref={modelPickerRef}>

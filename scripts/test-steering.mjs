@@ -1003,7 +1003,7 @@ for (const { session } of [busyUserAction, idleUserAction, steeringUserAction, f
 
 assert.match(
   claudeDriverSource,
-  /preset: 'claude_code',\s*append: \[CLAUDE_BACKGROUND_WAIT_TIP/,
+  /preset: 'claude_code',\s*append: \[\s*CLAUDE_BACKGROUND_WAIT_TIP/,
   'Every Claude SDK session learns when to call wait_for_background_tasks'
 );
 
@@ -1075,7 +1075,42 @@ assert.match(
   'Claude sessions must declare per-task stop so a steer interrupt spares background agents'
 );
 
-for (const { session } of [active, retained, idleSubagent, liveSubagent, monitoredTurn, mixedBackground, expiredMonitor]) {
+// Prompt suggestions (promptSuggestions) arrive after a turn's `result`. They
+// reach the renderer for the run that just finished, never open a turn, and a
+// stale one that lands while the user's next turn already runs is dropped.
+const suggested = createSession({ threadId: 'thread-prompt-suggestion', runId: 'run-suggested' });
+suggested.session.sessionId = 'sdk-session-prompt-suggestion';
+const promptSuggestion = (suggestion) => ({
+  type: 'prompt_suggestion',
+  suggestion,
+  uuid: crypto.randomUUID(),
+  session_id: 'sdk-session-prompt-suggestion',
+});
+await handleClaudeSessionMessage(suggested.session, promptSuggestion('stale while running'));
+assert.equal(
+  suggested.events.some((event) => event.type === 'prompt-suggestion'),
+  false,
+  'A suggestion that lands while a turn runs must be dropped'
+);
+suggested.session.resultsOwed = 0;
+await finalizeClaudeTurn(suggested.session, { type: 'result', subtype: 'success', is_error: false });
+await handleClaudeSessionMessage(suggested.session, promptSuggestion('  run the tests next  '));
+await handleClaudeSessionMessage(suggested.session, promptSuggestion('   '));
+const suggestionEvents = suggested.events.filter((event) => event.type === 'prompt-suggestion');
+assert.deepEqual(
+  suggestionEvents.map(({ runId, threadId, suggestion }) => ({ runId, threadId, suggestion })),
+  [{ runId: 'run-suggested', threadId: 'thread-prompt-suggestion', suggestion: 'run the tests next' }],
+  'A suggestion after the result must reach the renderer for the finished run, trimmed; blank ones are dropped'
+);
+assert.equal(suggested.session.activeTurns.length, 0, 'A prompt suggestion must not open a turn');
+assert.equal(suggested.session.resultsOwed, 0, 'A prompt suggestion must not create result debt');
+assert.match(
+  claudeDriverSource,
+  /promptSuggestions: true/,
+  'Claude sessions must ask the SDK for prompt suggestions'
+);
+
+for (const { session } of [active, retained, idleSubagent, liveSubagent, monitoredTurn, mixedBackground, expiredMonitor, suggested]) {
   if (session.backgroundSettleTimer) clearTimeout(session.backgroundSettleTimer);
 }
 claudeSdkSessions.clear();
