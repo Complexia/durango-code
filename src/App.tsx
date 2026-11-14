@@ -7225,12 +7225,61 @@ const App: React.FC = () => {
     if (pendingTurnStartsRef.current.has(threadId)) return { ok: false, error: 'This thread is already starting a turn.' };
     pendingTurnStartsRef.current.add(threadId);
     stopRemoteAfterStartRef.current.delete(threadId);
+    // Linked tasks not sent yet go with this turn, as on a local thread: the
+    // agent there gets them as context and the prompt box drops their chips.
+    // Their snapshots are refreshed first so the agent sees the current card.
+    await refreshLinkedTasksBeforeDispatch(threadId).catch(() => undefined);
+    const tasksToInject = (
+      useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.linkedTasks ?? []
+    ).filter((task) => !task.injected);
+    if (!promptText && attachments.length === 0 && tasksToInject.length === 0) {
+      pendingTurnStartsRef.current.delete(threadId);
+      return { ok: false, error: 'Type a message first' };
+    }
+    const injectedTaskIds = new Set(tasksToInject.map((task) => task.id));
+    const setTasksInjected = (injected: boolean) => {
+      if (injectedTaskIds.size === 0) return;
+      const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.linkedTasks;
+      if (!current?.some((task) => injectedTaskIds.has(task.id))) return;
+      updateThread(threadId, {
+        linkedTasks: current.map((task) => (injectedTaskIds.has(task.id) ? { ...task, injected } : task)),
+      });
+    };
+    // Their files are uploaded with the turn and listed in the prompt there
+    // with that machine's paths, so the context leaves out this machine's.
+    const taskAttachments = linkedTaskAttachments(tasksToInject);
+    const turnAttachments = [...taskAttachments, ...attachments];
+    const taskContext =
+      tasksToInject.length > 0
+        ? buildLinkedTaskContext(
+            tasksToInject.map((task) => ({ ...task, attachments: [] })),
+            true
+          )
+        : '';
+    // That machine refuses an empty prompt: tasks sent alone ask for them.
+    const turnPrompt =
+      promptText ||
+      (tasksToInject.length === 1
+        ? `Work on the linked task: ${tasksToInject[0].title}`
+        : tasksToInject.length > 1
+          ? `Work on the ${tasksToInject.length} linked tasks.`
+          : '');
     const agentModel = findAgentModel(agentModelsRef.current, thread.modelId);
     const userMessageId = addMessageToThread(threadId, {
       role: 'user',
-      content: promptText,
-      ...(attachments.length > 0 ? { attachments } : {}),
+      content: turnPrompt,
+      ...(turnAttachments.length > 0 ? { attachments: turnAttachments } : {}),
+      ...(tasksToInject.length > 0
+        ? {
+            linkedTasks: tasksToInject.map((task) => ({
+              id: task.id,
+              title: task.title,
+              description: task.description,
+            })),
+          }
+        : {}),
     });
+    setTasksInjected(true);
     const derivedTitle = isDefaultTitle(thread.title) && promptText ? deriveTitle(promptText) : null;
     if (derivedTitle && isPlausibleTitle(derivedTitle)) updateThread(threadId, { title: derivedTitle });
     // Working from the moment it is sent, like a local turn: reaching that
@@ -7261,13 +7310,15 @@ const App: React.FC = () => {
       }
       stopRemoteAfterStartRef.current.delete(threadId);
       remoteThreadSync.clearStarted(threadId);
+      // Not sent: the tasks go back to the prompt box.
+      setTasksInjected(false);
     };
     let unsubscribeClaim: (() => void) | undefined;
     try {
       // @-mentioned threads: that machine reads its own (the mention is
       // pointed at its id there); this machine's and other machines' threads
       // can't be read there, so their newest page goes along as context.
-      let hostPrompt = promptText;
+      let hostPrompt = turnPrompt;
       let mentionContext: string | undefined;
       const mentioned = promptText ? parseThreadMentions(promptText, state.threads, threadId) : [];
       const readHere: typeof mentioned = [];
@@ -7325,9 +7376,11 @@ const App: React.FC = () => {
         ...(remote.threadId ? { threadId: remote.threadId } : { projectId: hostProjectId }),
         turnKey,
         prompt: hostPrompt,
-        ...(mentionContext ? { context: mentionContext } : {}),
+        ...(mentionContext || taskContext
+          ? { context: [mentionContext, taskContext].filter(Boolean).join('\n\n') }
+          : {}),
         // Uploaded to that machine first (main).
-        ...(attachments.length > 0 ? { attachments } : {}),
+        ...(turnAttachments.length > 0 ? { attachments: turnAttachments } : {}),
         // Only what changed here (all of it for a new thread there), so a
         // stale value here never overrides a change made there.
         ...(remoteTurnSettingsToSend(thread, agentModel?.providerId) as Partial<
@@ -7398,6 +7451,15 @@ const App: React.FC = () => {
           remoteThreadSync.markStarted(threadId);
         }
       }
+      if (injectedTaskIds.size > 0) {
+        pushLinkedTaskStatus(threadId, 'running', undefined, [...injectedTaskIds]);
+        // Stopped while starting, or already over: the watcher for the end of
+        // remote turns saw no running task, so settle them here.
+        const after = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.status;
+        if (after && after !== 'running') {
+          pushLinkedTaskStatus(threadId, after === 'error' ? 'error' : 'finished', undefined, [...injectedTaskIds]);
+        }
+      }
       return { ok: true };
     } catch (error) {
       dropUserMessage();
@@ -7446,8 +7508,11 @@ const App: React.FC = () => {
     // The thread runs on another machine: the turn starts there.
     if (selectedThread.remote) {
       const machineName = selectedThread.remote.machineName;
-      if (!promptText && draftAttachments.length === 0) return;
-      if (selectedThread.status === 'running' || pendingTurnStartsRef.current.has(selectedThreadId)) {
+      const remoteStarting = selectedThread.status === 'running' || pendingTurnStartsRef.current.has(selectedThreadId);
+      // Linked tasks alone start a turn there too, but a queued follow-up
+      // needs its own text.
+      if (!promptText && draftAttachments.length === 0 && (remoteStarting || !hasPendingLinkedTasks)) return;
+      if (remoteStarting) {
         pinThreadToBottom(selectedThreadId);
         queueMessageToThread(selectedThreadId, { text: promptText, attachments: draftAttachments });
         composerDraft.clear();
@@ -9138,6 +9203,30 @@ const App: React.FC = () => {
       if (state.threads !== previous.threads) check(state.threads);
     });
   }, [updateThread]);
+
+  // A thread on another machine ends its turn there and its synced copy
+  // brings the new status here: the linked tasks that turn carried leave
+  // "running" on the board, as they do when a local turn ends.
+  useEffect(
+    () =>
+      useOrionStore.subscribe((state, previous) => {
+        if (state.threads === previous.threads) return;
+        for (const thread of state.threads) {
+          if (!thread.remote || thread.status === 'running') continue;
+          const running = (thread.linkedTasks ?? []).filter((task) => task.lastStatus === 'running');
+          if (running.length === 0) continue;
+          const before = previous.threads.find((candidate) => candidate.id === thread.id);
+          if (before?.status !== 'running') continue;
+          pushLinkedTaskStatus(
+            thread.id,
+            thread.status === 'error' ? 'error' : 'finished',
+            undefined,
+            running.map((task) => task.id)
+          );
+        }
+      }),
+    [pushLinkedTaskStatus]
+  );
 
   // Clicking the "Durango Chat started an agent" notification.
   useEffect(
