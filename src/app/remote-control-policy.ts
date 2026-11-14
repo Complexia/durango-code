@@ -68,6 +68,53 @@ type RemoteAgentSettingsModel = {
   reasoningEfforts?: string[];
 };
 
+const EFFORT_FIELD: Record<
+  string,
+  | 'grokReasoningEffort'
+  | 'museReasoningEffort'
+  | 'claudeReasoningEffort'
+  | 'codexReasoningEffort'
+  | 'openCodeReasoningEffort'
+> = {
+  grok: 'grokReasoningEffort',
+  muse: 'museReasoningEffort',
+  claude: 'claudeReasoningEffort',
+  codex: 'codexReasoningEffort',
+  opencode: 'openCodeReasoningEffort',
+};
+
+/**
+ * The provider-agnostic effort values a model accepts from a controller or a
+ * Durango dispatch, in picker order; empty when the model has no effort
+ * setting. Live-catalog tiers replace the static sets when present.
+ */
+export const remoteModelEfforts = (model: RemoteAgentSettingsModel | undefined): string[] => {
+  if (!model?.providerId) return [];
+  const live = model.reasoningEfforts && model.reasoningEfforts.length > 0 ? model.reasoningEfforts : null;
+  switch (model.providerId) {
+    case 'grok':
+      return live ?? [...(model.slug && GROK_XHIGH_SLUGS.has(model.slug) ? GROK_XHIGH_REASONING : GROK_REASONING)];
+    case 'muse':
+      return live ?? [...MUSE_REASONING];
+    case 'claude':
+      return [...CLAUDE_REASONING].filter((effort) => !live || live.includes(CLAUDE_CLI_EFFORT[effort] ?? effort));
+    case 'codex':
+      return (
+        live ?? [
+          ...(model.slug && CODEX_LUNA_SLUGS.has(model.slug)
+            ? GPT6_LUNA_CODEX_REASONING
+            : model.slug && GPT6_CODEX_SLUGS.has(model.slug)
+              ? GPT6_CODEX_REASONING
+              : CODEX_REASONING),
+        ]
+      );
+    case 'opencode':
+      return ['default', ...(model.reasoningVariants ?? [])];
+    default:
+      return [];
+  }
+};
+
 /**
  * Map provider-agnostic remote runTurn settings onto the thread fields the
  * local composer would have written. Unknown / wrong-provider values are
@@ -86,47 +133,9 @@ export const remoteAgentSettingsPatch = (
   const patch: RemoteAgentSettingsThread = {};
   if (!model?.providerId) return patch;
 
-  if (input.reasoningEffort) {
-    const liveEfforts =
-      model.reasoningEfforts && model.reasoningEfforts.length > 0 ? new Set(model.reasoningEfforts) : null;
-    if (model.providerId === 'grok') {
-      const allowed =
-        liveEfforts ?? (model.slug && GROK_XHIGH_SLUGS.has(model.slug) ? GROK_XHIGH_REASONING : GROK_REASONING);
-      if (allowed.has(input.reasoningEffort) && thread.grokReasoningEffort !== input.reasoningEffort) {
-        patch.grokReasoningEffort = input.reasoningEffort;
-      }
-    } else if (model.providerId === 'muse') {
-      if ((liveEfforts ?? MUSE_REASONING).has(input.reasoningEffort) && thread.museReasoningEffort !== input.reasoningEffort) {
-        patch.museReasoningEffort = input.reasoningEffort;
-      }
-    } else if (model.providerId === 'claude') {
-      if (
-        CLAUDE_REASONING.has(input.reasoningEffort) &&
-        (!liveEfforts || liveEfforts.has(CLAUDE_CLI_EFFORT[input.reasoningEffort] ?? input.reasoningEffort)) &&
-        thread.claudeReasoningEffort !== input.reasoningEffort
-      ) {
-        patch.claudeReasoningEffort = input.reasoningEffort;
-      }
-    } else if (model.providerId === 'codex') {
-      const allowed =
-        liveEfforts ??
-        (model.slug && CODEX_LUNA_SLUGS.has(model.slug)
-          ? GPT6_LUNA_CODEX_REASONING
-          : model.slug && GPT6_CODEX_SLUGS.has(model.slug)
-            ? GPT6_CODEX_REASONING
-            : CODEX_REASONING);
-      if (allowed.has(input.reasoningEffort) && thread.codexReasoningEffort !== input.reasoningEffort) {
-        patch.codexReasoningEffort = input.reasoningEffort;
-      }
-    } else if (model.providerId === 'opencode') {
-      const allowed = new Set(['default', ...(model.reasoningVariants ?? [])]);
-      if (
-        allowed.has(input.reasoningEffort) &&
-        thread.openCodeReasoningEffort !== input.reasoningEffort
-      ) {
-        patch.openCodeReasoningEffort = input.reasoningEffort;
-      }
-    }
+  if (input.reasoningEffort && remoteModelEfforts(model).includes(input.reasoningEffort)) {
+    const field = EFFORT_FIELD[model.providerId];
+    if (field && thread[field] !== input.reasoningEffort) patch[field] = input.reasoningEffort;
   }
 
   if (input.codexServiceTier && model.providerId === 'codex') {

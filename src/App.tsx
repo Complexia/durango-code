@@ -164,6 +164,7 @@ import {
   persistSuccessfulRemoteCommand,
   remoteAgentSettingsPatch,
   remoteControlIsAuthenticated,
+  remoteModelEfforts,
   remoteThreadRunError,
   remoteThreadRuntime,
   reportedSubagentSettingsPatch,
@@ -8425,6 +8426,31 @@ const App: React.FC = () => {
         if (unsupportedError) {
           if (createdThread) useOrionStore.getState().deleteThread(threadId);
           return { ok: false, ...(createdThread ? {} : { threadId }), error: unsupportedError };
+        }
+        // A Durango dispatch (API / Durango MCP) that names a model or effort
+        // this machine can't apply fails here rather than quietly running the
+        // thread's own model or effort (main already resolved the model id).
+        if (command.durangoDispatch && thread) {
+          const dispatchModelId = turnModelId ?? thread.modelId;
+          const dispatchModel = findAgentModel(agentModelsRef.current, dispatchModelId);
+          let dispatchError: string | null = null;
+          // findAgentModel maps a retired id to its successor: that is not the model asked for.
+          if (command.modelId && dispatchModel?.id !== command.modelId) {
+            dispatchError = `Durango Code on this machine has no model "${command.modelId}".`;
+          } else if (command.reasoningEffort) {
+            const efforts = remoteModelEfforts(dispatchModel);
+            const label = dispatchModel?.label ?? dispatchModelId;
+            if (!requestedReasoningEffort || !efforts.includes(requestedReasoningEffort)) {
+              dispatchError =
+                efforts.length > 0
+                  ? `${label} takes effort ${efforts.join(', ')}, not "${command.reasoningEffort}".`
+                  : `${label} has no effort setting; leave effort out.`;
+            }
+          }
+          if (dispatchError) {
+            if (createdThread) useOrionStore.getState().deleteThread(threadId);
+            return { ok: false, ...(createdThread ? {} : { threadId }), error: dispatchError };
+          }
         }
         // Orion-native slash commands do not belong to an agent's ordinary
         // prompt stream. In particular, Codex `/review` must use

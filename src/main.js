@@ -14,6 +14,7 @@ import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main
 import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
 import { isPreviewFilePath } from './app/codeFiles.ts';
 import { migrateWorkspaceSyncSettings } from './app/workspaceSyncConsent.ts';
+import { remoteModelEfforts, remoteThreadRuntime } from './app/remote-control-policy.ts';
 import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, dialog, Menu, nativeImage, net, Notification, powerMonitor, protocol, safeStorage, shell, systemPreferences, webFrameMain } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
@@ -4237,6 +4238,31 @@ const checkoutSourceProject = createSourceCheckout({
 });
 const sourceCheckoutAvailable = () => Boolean(bundledCliEntry()) && cliSupportsClone(bundledCliVersion());
 
+// The models dispatched runs may use, with the effort levels each takes. The
+// worker reads this before every claim (to register changes), so it is cached
+// and refreshed every few minutes or when the catalog changes.
+const DISPATCH_MODELS_TTL_MS = 5 * 60_000;
+let dispatchModelsCache = null;
+onAgentModelsChanged(() => {
+  dispatchModelsCache = null;
+});
+const listDispatchModels = async () => {
+  if (dispatchModelsCache && Date.now() - dispatchModelsCache.at < DISPATCH_MODELS_TTL_MS) return dispatchModelsCache.models;
+  const models = (await listAgentModelsWithAvailability())
+    .filter((model) => typeof model?.id === 'string' && remoteThreadRuntime(model.id) === 'agent')
+    .map((model) => ({
+      id: model.id,
+      label: String(model.label || model.id),
+      slug: typeof model.slug === 'string' ? model.slug : undefined,
+      provider: String(model.providerLabel || model.providerId || ''),
+      efforts: remoteModelEfforts(model),
+      available: model.available !== false,
+      ...(typeof model.unavailableReason === 'string' ? { unavailableReason: model.unavailableReason } : {}),
+    }));
+  dispatchModelsCache = { at: Date.now(), models };
+  return models;
+};
+
 const dispatchWorker = createDispatchWorker({
   client: durangoClient,
   getMachineId: () => getDurangoDeviceId(),
@@ -4254,12 +4280,14 @@ const dispatchWorker = createDispatchWorker({
       accessMode: typeof thread.accessMode === 'string' ? thread.accessMode : undefined,
     };
   },
-  startRun: ({ dispatch, project, threadId, prompt, accessMode, modelId }) =>
+  listModels: listDispatchModels,
+  startRun: ({ dispatch, project, threadId, prompt, accessMode, modelId, reasoningEffort }) =>
     requestDispatchRendererCommand({
       kind: 'runTurn',
       ...(threadId ? { threadId } : { projectId: project.id }),
       prompt: prompt.slice(0, 200_000),
       ...(modelId ? { modelId } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
       accessMode,
       source: { machineId: 'durango-chat', machineName: dispatchSourceLabel(dispatch) },
       durangoDispatch: {

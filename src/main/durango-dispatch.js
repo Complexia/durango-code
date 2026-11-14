@@ -28,8 +28,15 @@ export const DISPATCH_ACCESS_MODES = ['read-only', 'workspace-write', 'full-acce
 // choosing Full access in Settings is what a Tasks run gets (Workspace write
 // makes Claude ask before every Bash command, which no one is there to answer).
 
-/** What this build can do beyond new threads (agentDispatchPolicy.MACHINE_CAPABILITIES on Durango). */
-export const DISPATCH_CAPABILITIES = ['thread-follow-up'];
+/**
+ * What this build can do beyond new threads (agentDispatchPolicy.MACHINE_CAPABILITIES on Durango).
+ * "model-choice": it lists its models (with their effort levels) when it
+ * registers, applies a dispatch's `reasoningEffort`, and fails a run whose
+ * model or effort it doesn't have instead of quietly using its default.
+ */
+export const DISPATCH_CAPABILITIES = ['thread-follow-up', 'model-choice'];
+/** Most models a machine lists to Durango (OpenCode alone can have hundreds). */
+export const MAX_REGISTERED_MODELS = 1000;
 /**
  * Advertised as well when this machine can clone a Durango Source repository
  * it doesn't have (main/source-checkout.js) and every project may run agents
@@ -173,23 +180,107 @@ export const resolveFollowUpProject = (dispatch, threadProjectId, projects, allo
 };
 
 /** `POST /api/v1/code/machines` body. Only allowlisted projects are advertised. */
-export const buildMachinePayload = ({ machineId, name, platform, projects, allowedProjectIds = null, sourceCheckout = false }) => ({
-  machineId,
-  name: String(name ?? '').trim().slice(0, 120) || 'Mac',
-  platform: String(platform ?? '').slice(0, 40) || 'unknown',
-  projects: (Array.isArray(projects) ? projects : [])
-    .filter((project) => project?.id && project?.name && isProjectAllowed(project.id, allowedProjectIds))
-    .slice(0, 500)
-    .map((project) => ({
-      id: String(project.id).slice(0, 200),
-      name: String(project.name).slice(0, 200),
-      repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null,
-    })),
-  capabilities:
-    sourceCheckout && (allowedProjectIds === null || allowedProjectIds === undefined)
-      ? [...DISPATCH_CAPABILITIES, SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
-      : DISPATCH_CAPABILITIES,
-});
+/**
+ * The models this machine can run, as Durango lists them to API callers:
+ * `[{ id, label, provider, efforts }]`, available ones only. `models` come
+ * from the deps' listModels() (main shapes the catalog, efforts included).
+ */
+export const registeredModels = (models) => {
+  const out = [];
+  const seen = new Set();
+  for (const model of Array.isArray(models) ? models : []) {
+    const id = typeof model?.id === 'string' ? model.id.trim() : '';
+    // Ids are never cut: a cut id would not resolve here. Too long = not listed.
+    if (!id || id.length > 120 || seen.has(id) || model.available === false) continue;
+    seen.add(id);
+    out.push({
+      id,
+      label: String(model.label ?? id).trim().slice(0, 120) || id,
+      provider: String(model.provider ?? '').trim().slice(0, 80),
+      efforts: (Array.isArray(model.efforts) ? model.efforts : [])
+        .filter((effort) => typeof effort === 'string' && effort)
+        .slice(0, 16)
+        .map((effort) => effort.slice(0, 40)),
+    });
+    if (out.length >= MAX_REGISTERED_MODELS) break;
+  }
+  return out;
+};
+
+const modelKey = (value) => String(value ?? '').trim().toLowerCase();
+
+/**
+ * The model a dispatch asked for, from `models` (main's listModels()):
+ * its id exactly, else a unique case-insensitive match on id, slug or label
+ * (so "Haiku 5.5" or "claude-haiku-5-5" work as well as the full id).
+ * `{ ok: true, model: null }` when the dispatch named none.
+ */
+export const resolveDispatchModel = (modelId, models, machineName = 'this machine') => {
+  const wanted = String(modelId ?? '').trim();
+  if (!wanted) return { ok: true, model: null };
+  const list = Array.isArray(models) ? models : [];
+  const key = modelKey(wanted);
+  const exact = list.find((model) => model.id === wanted);
+  const loose = exact
+    ? [exact]
+    : list.filter((model) => [model.id, model.slug, model.label].some((value) => value && modelKey(value) === key));
+  const usable = loose.filter((model) => model.available !== false);
+  if (usable.length === 1) return { ok: true, model: usable[0] };
+  const choices = list
+    .filter((model) => model.available !== false)
+    .map((model) => model.id)
+    .slice(0, 60)
+    .join(', ');
+  if (usable.length > 1) {
+    return { ok: false, error: `"${wanted}" matches several models on ${machineName} (${usable.map((model) => model.id).join(', ')}). Pass the full model id.` };
+  }
+  if (loose.length > 0) {
+    const reason = loose[0].unavailableReason ? ` ${loose[0].unavailableReason}` : '';
+    return { ok: false, error: `${loose[0].label || loose[0].id} isn't available on ${machineName}.${reason}` };
+  }
+  return { ok: false, error: `${machineName} has no model "${wanted}". Models there: ${choices || 'none'}.` };
+};
+
+/**
+ * The effort to run with, spelled as the turn's model lists it ("HIGH" →
+ * "high"); without a known model, lowercase, as Durango Code's levels are.
+ * The renderer still checks it against the model the turn runs on.
+ */
+export const dispatchEffort = (effort, model) => {
+  const wanted = String(effort ?? '').trim();
+  if (!wanted) return null;
+  const listed = Array.isArray(model?.efforts) ? model.efforts : [];
+  return listed.find((entry) => entry === wanted) ?? listed.find((entry) => modelKey(entry) === modelKey(wanted)) ?? (model ? wanted : wanted.toLowerCase());
+};
+
+export const buildMachinePayload = ({ machineId, name, platform, projects, allowedProjectIds = null, sourceCheckout = false, models = [] }) => {
+  const listed = registeredModels(models);
+  const available = new Set(
+    (Array.isArray(models) ? models : [])
+      .filter((model) => typeof model?.id === 'string' && model.id.trim() && model.available !== false)
+      .map((model) => model.id.trim())
+  );
+  return {
+    machineId,
+    name: String(name ?? '').trim().slice(0, 120) || 'Mac',
+    platform: String(platform ?? '').slice(0, 40) || 'unknown',
+    projects: (Array.isArray(projects) ? projects : [])
+      .filter((project) => project?.id && project?.name && isProjectAllowed(project.id, allowedProjectIds))
+      .slice(0, 500)
+      .map((project) => ({
+        id: String(project.id).slice(0, 200),
+        name: String(project.name).slice(0, 200),
+        repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null,
+      })),
+    capabilities:
+      sourceCheckout && (allowedProjectIds === null || allowedProjectIds === undefined)
+        ? [...DISPATCH_CAPABILITIES, SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
+        : DISPATCH_CAPABILITIES,
+    models: listed,
+    // Models left out (cap or overlong ids): Durango lets this machine judge unlisted ones.
+    ...(listed.length < available.size ? { modelsTruncated: true } : {}),
+  };
+};
 
 /**
  * Where a dispatch was started: Run in Durango Code on a task, a chat, or the
@@ -247,7 +338,10 @@ const isAbort = (error) =>
  * - getMachineName(): string|Promise<string>
  * - platform: string
  * - isSignedIn(): Promise<boolean>
- * - startRun({ dispatch, project, threadId, prompt, accessMode, modelId }): Promise<{ ok, threadId?, threadTitle?, error? }>
+ * - startRun({ dispatch, project, threadId, prompt, accessMode, modelId, reasoningEffort }): Promise<{ ok, threadId?, threadTitle?, error? }>
+ *     The renderer fails the start when reasoningEffort isn't one the turn's model takes.
+ * - listModels(): Promise<Array<{ id, label, slug?, provider, efforts, available, unavailableReason? }>>
+ *     this machine's agent models (cached; cheap enough to call before every claim)
  *     threadId set = a follow-up in that thread (project may be null)
  * - getThread(threadId): Promise<{ projectId: string|null, accessMode?: string }|undefined>   undefined = no such thread here
  * - stopRun(threadId, reason): Promise<void>     cancelled from Durango Chat
@@ -263,6 +357,7 @@ export const createDispatchWorker = ({
   platform = process.platform,
   isSignedIn,
   startRun,
+  listModels = async () => [],
   /**
    * ({ repoId, name, signal }) → { id, name, path, repoId }: clones a Durango
    * Source repository this machine doesn't have and adds it as a project.
@@ -333,6 +428,7 @@ export const createDispatchWorker = ({
       projects,
       allowedProjectIds: settings.allowedProjectIds,
       sourceCheckout: Boolean(checkoutProject),
+      models: await listModels().catch(() => []),
     });
     return { payload, signature: JSON.stringify(payload) };
   };
@@ -524,6 +620,29 @@ export const createDispatchWorker = ({
         return;
       }
       entry.project = resolved.project;
+      // A model the caller named must exist here: running the thread's or
+      // project's usual model instead would quietly ignore what they asked for.
+      const requestedModelId = dispatch.modelId ?? (followUpThreadId ? null : settings.modelId) ?? null;
+      let modelId = null;
+      let resolvedModel = null;
+      const models = requestedModelId ? await listModels().catch(() => []) : [];
+      if (requestedModelId && models.length === 0) {
+        // No catalog to check against (it failed to load): let the renderer decide.
+        modelId = requestedModelId;
+      } else if (requestedModelId) {
+        const model = resolveDispatchModel(requestedModelId, models, await getMachineName());
+        if (!model.ok) {
+          // The Settings default is this machine's own choice: fall back to the
+          // project's usual model when it's gone, as before.
+          if (dispatch.modelId) {
+            await fail(entry, model.error);
+            return;
+          }
+        } else {
+          modelId = model.model?.id ?? null;
+          resolvedModel = model.model;
+        }
+      }
       const accessMode =
         followUpThread && !dispatch.accessMode
           ? capThreadAccessMode(followUpThread.accessMode, settings.accessMode)
@@ -537,7 +656,8 @@ export const createDispatchWorker = ({
           prompt: buildDispatchPrompt(dispatch),
           accessMode,
           // A follow-up keeps its thread's model unless the caller named one.
-          modelId: dispatch.modelId ?? (followUpThreadId ? null : settings.modelId) ?? null,
+          modelId,
+          reasoningEffort: dispatchEffort(dispatch.reasoningEffort, dispatch.modelId ? resolvedModel : null),
         });
       } catch (error) {
         result = { ok: false, error: error?.message ?? String(error) };

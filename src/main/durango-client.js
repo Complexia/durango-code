@@ -378,6 +378,8 @@ const normalizeDispatch = (dispatch) => {
     taskUrl: optional(dispatch.taskUrl),
     project: { id: optional(project.id), name: optional(project.name), repoId: optional(project.repoId) },
     modelId: optional(dispatch.modelId),
+    /** Provider-agnostic effort ("low" … "max"); the renderer checks it against the turn's model. */
+    reasoningEffort: optional(dispatch.reasoningEffort),
     accessMode: dispatch.accessMode === 'ask' || dispatch.accessMode === 'auto-edit' ? dispatch.accessMode : null,
     sourceChat:
       source && typeof source.threadId === 'string'
@@ -529,7 +531,7 @@ export const createDurangoClient = ({
       return Buffer.from(await response.arrayBuffer());
     },
     // --- Dispatch: agents started from Durango Chat (contracts §7) -----------
-    async registerMachine({ machineId, name, platform, projects, capabilities }) {
+    async registerMachine({ machineId, name, platform, projects, capabilities, models, modelsTruncated }) {
       await request('POST', '/code/machines', {
         body: {
           machineId,
@@ -541,6 +543,8 @@ export const createDurangoClient = ({
             repoId: project.repoId ?? null,
           })),
           ...(Array.isArray(capabilities) ? { capabilities } : {}),
+          ...(Array.isArray(models) ? { models } : {}),
+          ...(modelsTruncated ? { modelsTruncated: true } : {}),
         },
       });
       return { ok: true };

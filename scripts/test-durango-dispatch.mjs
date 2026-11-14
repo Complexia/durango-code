@@ -26,6 +26,9 @@ import {
   SOURCE_CHECKOUT_CAPABILITY,
   API_SOURCE_CHECKOUT_CAPABILITY,
   canCheckoutDispatch,
+  registeredModels,
+  resolveDispatchModel,
+  dispatchEffort,
 } from '../src/main/durango-dispatch.js';
 import { checkoutFolderName, chooseCheckoutDir, cliSupportsClone, createSourceCheckout, sourceCheckoutRoot } from '../src/main/source-checkout.js';
 import { linuxPasswordStore } from '../src/main/linux-password-store-policy.js';
@@ -310,7 +313,8 @@ try {
         { id: 'p1', name: 'futuremail', repoId: 'repo_fm' },
         { id: 'p2', name: 'Billing', repoId: null },
       ],
-      capabilities: ['thread-follow-up'],
+      capabilities: ['thread-follow-up', 'model-choice'],
+      models: [],
     });
     assert.equal(buildMachinePayload({ machineId: 'd', name: '', platform: 'darwin', projects }).projects.length, 3, 'null allowlist = all projects');
     assert.equal(buildMachinePayload({ machineId: 'd', name: '  ', platform: '', projects: [] }).name, 'Mac');
@@ -558,11 +562,11 @@ try {
     assert.ok(canCheckoutDispatch({ origin: 'tasks', project: { repoId: 'repo_new' } }, null, true));
     assert.deepEqual(
       buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], sourceCheckout: true }).capabilities,
-      ['thread-follow-up', SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
+      ['thread-follow-up', 'model-choice', SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
     );
     assert.deepEqual(
       buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], allowedProjectIds: ['p1'], sourceCheckout: true }).capabilities,
-      ['thread-follow-up']
+      ['thread-follow-up', 'model-choice']
     );
 
     let claims = 0;
@@ -804,6 +808,63 @@ try {
     await worker.idle();
   });
 
+  const MODELS = [
+    { id: 'claude:claude-haiku-5-5', label: 'Haiku 5.5', slug: 'claude-haiku-5-5', provider: 'Claude', efforts: ['low', 'medium', 'high'], available: true },
+    { id: 'codex:gpt-6-luna', label: 'GPT-6 Luna', slug: 'gpt-6-luna', provider: 'Codex', efforts: ['low', 'max'], available: true },
+    { id: 'grok:grok-4.7', label: 'Grok 4.7', slug: 'grok-4.7', provider: 'Grok', efforts: ['low'], available: false, unavailableReason: 'Install or authenticate grok on PATH.' },
+  ];
+
+  await test('models: registration lists available ones; a requested model resolves by id, slug or label', () => {
+    assert.deepEqual(registeredModels(MODELS), [
+      { id: 'claude:claude-haiku-5-5', label: 'Haiku 5.5', provider: 'Claude', efforts: ['low', 'medium', 'high'] },
+      { id: 'codex:gpt-6-luna', label: 'GPT-6 Luna', provider: 'Codex', efforts: ['low', 'max'] },
+    ]);
+    assert.deepEqual(buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], models: MODELS }).models.map((model) => model.id), ['claude:claude-haiku-5-5', 'codex:gpt-6-luna']);
+    assert.equal(resolveDispatchModel('claude:claude-haiku-5-5', MODELS).model.id, 'claude:claude-haiku-5-5');
+    assert.equal(resolveDispatchModel('claude-haiku-5-5', MODELS).model.id, 'claude:claude-haiku-5-5', 'slug');
+    assert.equal(resolveDispatchModel('haiku 5.5', MODELS).model.id, 'claude:claude-haiku-5-5', 'label, any case');
+    assert.deepEqual(resolveDispatchModel(null, MODELS), { ok: true, model: null });
+    const unknown = resolveDispatchModel('claude:claude-haiku-9', MODELS, 'omarchy');
+    assert.equal(unknown.ok, false);
+    assert.match(unknown.error, /omarchy has no model "claude:claude-haiku-9". Models there: claude:claude-haiku-5-5, codex:gpt-6-luna\./);
+    assert.match(resolveDispatchModel('grok:grok-4.7', MODELS, 'omarchy').error, /Grok 4.7 isn't available on omarchy. Install or authenticate grok/);
+    // Ids are never cut; leaving models out marks the list partial.
+    const long = { id: `opencode:${'x'.repeat(130)}`, label: 'Long', provider: 'OpenCode', efforts: [], available: true };
+    assert.deepEqual(registeredModels([MODELS[0], long]).map((model) => model.id), ['claude:claude-haiku-5-5']);
+    assert.equal(buildMachinePayload({ machineId: 'm', name: 'x', platform: 'linux', projects: [], models: [MODELS[0], long] }).modelsTruncated, true);
+    assert.equal(buildMachinePayload({ machineId: 'm', name: 'x', platform: 'linux', projects: [], models: MODELS }).modelsTruncated, undefined, 'unavailable ones are not "left out"');
+    assert.equal(dispatchEffort('HIGH', MODELS[0]), 'high');
+    assert.equal(dispatchEffort('HIGH', null), 'high');
+    assert.equal(dispatchEffort('', MODELS[0]), null);
+  });
+
+  await test('a dispatch runs the model and effort it named; an unknown model fails without starting', async () => {
+    let claims = 0;
+    server.always('POST', '/api/v1/code/machines', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/claim', async () => {
+      claims += 1;
+      if (claims === 1) return { json: { dispatch: dispatchWire({ id: 'disp_model', origin: 'api', modelId: 'Haiku 5.5', reasoningEffort: 'High' }) } };
+      if (claims === 2) return { json: { dispatch: dispatchWire({ id: 'disp_nomodel', origin: 'api', modelId: 'claude:claude-haiku-9' }) } };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { json: { dispatch: null } };
+    });
+    server.always('POST', '/api/v1/code/dispatches/disp_model', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/disp_nomodel', () => ({ json: { ok: true } }));
+    const { worker, calls } = makeWorker({ deps: { listModels: async () => MODELS } });
+    worker.configure({ settings: { enabled: true, accessMode: 'full-access', modelId: 'claude:gone' }, projects });
+    worker.accountChanged(true);
+    await waitUntil(() => reports('disp_model').length && reports('disp_nomodel').length, 'model reports');
+    const registration = server.requests.find((request) => request.path === '/api/v1/code/machines');
+    assert.deepEqual(registration.body.models, registeredModels(MODELS), 'registers its models');
+    assert.equal(calls.starts.length, 1);
+    assert.equal(calls.starts[0].modelId, 'claude:claude-haiku-5-5', 'resolved to the exact id');
+    assert.equal(calls.starts[0].reasoningEffort, 'high');
+    assert.equal(reports('disp_nomodel')[0].status, 'failed');
+    assert.match(reports('disp_nomodel')[0].error, /Test Mac has no model "claude:claude-haiku-9"/);
+    worker.stop();
+    await worker.idle();
+  });
+
   await test('renderer start failure → failed; heartbeat 409 (cancelled in chat) stops the run', async () => {
     // Start failure.
     {
@@ -890,7 +951,7 @@ try {
       json: { dispatch: { id: 'd', prompt: 'p', taskId: null, project: { id: null, name: 'x', repoId: null }, modelId: '', accessMode: 'weird', sourceChat: null, createdAt: 'now' } },
     }));
     const { dispatch } = await client.claimDispatch({ machineId: 'm' });
-    assert.deepEqual(dispatch, { id: 'd', origin: 'chat', prompt: 'p', taskId: null, taskUrl: null, project: { id: null, name: 'x', repoId: null }, modelId: null, accessMode: null, sourceChat: null, threadId: null, sourceLabel: null, createdAt: 'now' });
+    assert.deepEqual(dispatch, { id: 'd', origin: 'chat', prompt: 'p', taskId: null, taskUrl: null, project: { id: null, name: 'x', repoId: null }, modelId: null, reasoningEffort: null, accessMode: null, sourceChat: null, threadId: null, sourceLabel: null, createdAt: 'now' });
     server.on('POST', '/api/v1/code/dispatches/claim', () => ({
       json: { dispatch: { id: 'd2', origin: 'api', prompt: 'more', project: {}, threadId: 'thread-9', sourceLabel: 'Grok (MCP)' } },
     }));
