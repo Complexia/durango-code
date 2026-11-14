@@ -702,9 +702,15 @@ const waitForTurn = async ({ machine, threadId, prompt, fromIndex, signal, ended
   }
 };
 
-const formatTurnResult = (machine, thread, prompt, fromIndex) => {
+const lastTurnReply = (thread, prompt, fromIndex) => {
   const reply = replyAfterPrompt(thread, prompt, fromIndex);
-  const last = reply?.replies.at(-1) ?? [...(thread.messages ?? [])].reverse().find((message) => message?.role === 'agent');
+  return reply?.replies.at(-1) ?? [...(thread.messages ?? [])].reverse().find((message) => message?.role === 'agent');
+};
+
+const turnWasStopped = (thread, prompt, fromIndex) => lastTurnReply(thread, prompt, fromIndex)?.status === 'stopped';
+
+const formatTurnResult = (machine, thread, prompt, fromIndex) => {
+  const last = lastTurnReply(thread, prompt, fromIndex);
   const status = last?.status === 'error' ? 'failed' : last?.status === 'stopped' ? 'was stopped' : 'finished';
   const content = String(last?.content ?? '').trim();
   return [
@@ -842,7 +848,12 @@ const machineRunAgent = async (args, context) => {
         text: `${outcome.stopped} Started on ${machine.name} in ${where}; check on it with machine_read_thread.`,
       };
     }
-    return { ok: true, text: formatTurnResult(machine, outcome.thread, prompt, fromIndex) };
+    // `stopped`: the turn there was stopped (by the user), not finished.
+    return {
+      ok: true,
+      text: formatTurnResult(machine, outcome.thread, prompt, fromIndex),
+      ...(turnWasStopped(outcome.thread, prompt, fromIndex) ? { stopped: true } : {}),
+    };
   } finally {
     unsubscribe();
   }

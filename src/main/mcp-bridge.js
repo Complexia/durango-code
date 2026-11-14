@@ -47,7 +47,9 @@ export const pendingSubagentStops = new Map(); // stopId -> { resolve }
 // report. Failures resolve as text (never reject) so every caller — the
 // Claude SDK tool and the socket bridge below — hands the model a readable
 // outcome instead of a protocol error.
-export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessMode }, args) =>
+// `onOutcome({ stopped })` hears, just before the report resolves, whether
+// the user stopped or deleted the subagent.
+export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessMode }, args, { onOutcome } = {}) =>
   new Promise((resolve) => {
     // Read the sender at call time: sessions rebind it when the window
     // closes and reopens.
@@ -57,7 +59,7 @@ export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessM
       return;
     }
     const spawnId = crypto.randomUUID();
-    pendingSubagentSpawns.set(spawnId, { resolve });
+    pendingSubagentSpawns.set(spawnId, { resolve, onOutcome });
     try {
       sender.send('orchestration:spawnRequest', {
         spawnId,

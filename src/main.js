@@ -5242,6 +5242,8 @@ ipcMain.handle('orchestration:subagentResult', (_event, payload) => {
   const pending = pendingSubagentSpawns.get(payload?.spawnId);
   if (!pending) return { ok: false };
   pendingSubagentSpawns.delete(payload.spawnId);
+  // Stopped or deleted by the user (not a failure of its own).
+  pending.onOutcome?.({ stopped: payload.stopped === true });
   pending.resolve(
     payload.ok
       ? payload.result || '(subagent returned no output)'

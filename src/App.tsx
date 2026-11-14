@@ -2606,6 +2606,7 @@ const App: React.FC = () => {
         void window.orion?.reportSubagentResult?.({
           spawnId,
           ok: false,
+          stopped: true,
           result: 'Subagent thread was deleted by the user.',
         });
       }
@@ -2740,6 +2741,7 @@ const App: React.FC = () => {
         void window.orion?.reportSubagentResult?.({
           spawnId: thread.spawnId,
           ok: false,
+          stopped: true,
           result: 'Subagent project was removed by the user.',
         });
       }
@@ -6348,6 +6350,7 @@ const App: React.FC = () => {
         void window.orion?.reportSubagentResult?.({
           spawnId,
           ok: false,
+          stopped: true,
           result: 'Subagent run was stopped by the orchestrator.',
         });
       }
@@ -7706,10 +7709,12 @@ const App: React.FC = () => {
     setAccessModeOpen(false);
   };
 
-  // Steering = redirect the run in flight immediately. Main interrupts the
-  // current Claude loop, hides that transport-only result boundary, and
-  // continues under the same visible run id. If the interrupt cannot land,
-  // the message falls back to the ordinary end-of-turn queue.
+  // Steering = tell the run in flight without stopping it, like typing into
+  // Claude Code while it works: the agent reads the message once its current
+  // command or tool call finishes (Codex and fx at their next model step;
+  // Claude at its next tool call, or as the turn's continuation under the
+  // same visible run id). Stop is the only interrupt. If the run can't take
+  // it, the message falls back to the ordinary end-of-turn queue.
   // Optional chain: 'orion' has no follow-up-support entry (steering an
   // orchestrated thread would bypass the driver resolution), so treat it as
   // unsupported instead of crashing mid-run.
@@ -7857,11 +7862,30 @@ const App: React.FC = () => {
       !!splitMessage &&
       splitMessage.content.length === 0 &&
       (splitMessage.activities?.length ?? 0) === 0;
+    // A steer doesn't interrupt: a command or subagent still running keeps
+    // going after the message, so its row moves below it with the rest of
+    // the run (its keyed updates land in the continuation bubble).
+    const carriedActivities =
+      splitMessage && !moveSplitMessage
+        ? (splitMessage.activities ?? []).filter(
+            (activity) =>
+              activity.type !== 'plan' &&
+              Boolean(activity.key) &&
+              (activity.status === 'running' || activity.status === 'waiting')
+          )
+        : [];
     if (splitMessage && !moveSplitMessage) {
       updateThreadMessage(threadId, splitMessage.id, {
         status: 'done',
         completedAt: new Date().toISOString(),
         statusText: STEERED_RUN_CAPTION,
+        ...(carriedActivities.length > 0
+          ? {
+              activities: (splitMessage.activities ?? []).filter(
+                (activity) => !carriedActivities.includes(activity)
+              ),
+            }
+          : {}),
       });
     }
     if (prepared.tasksToInject.length > 0) {
@@ -7910,7 +7934,7 @@ const App: React.FC = () => {
         status: 'running',
         statusText: "I'm working on this now.",
         startedAt: new Date().toISOString(),
-        activities: [],
+        activities: carriedActivities.map((activity) => ({ ...activity, contentOffset: 0 })),
         ...(splitMessage.command ? { command: splitMessage.command } : {}),
         ...(splitMessage.modelId ? { modelId: splitMessage.modelId } : {}),
       });
@@ -8317,6 +8341,7 @@ const App: React.FC = () => {
       void window.orion?.reportSubagentResult?.({
         spawnId,
         ok: false,
+        stopped: true,
         result: spawnStoppedText,
       });
     }

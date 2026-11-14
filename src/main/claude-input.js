@@ -68,9 +68,15 @@ export const createClaudeInputRequests = (session) => {
       // fetches pending requests from the live session again.
     }
   };
-  const request = (questions, signal, resolveAnswer, cancelled, extra = {}) => {
+  const request = (questions, signal, resolveAnswer, cancelled, extra = {}, { agentId } = {}) => {
     const runId = session.activeTurns[0]?.runId ?? session.backgroundRunId;
     if (!runId || session.disposed || session.ended || signal?.aborted) return Promise.resolve(cancelled);
+    // Opened while a steer waits: the steer is the reply, at once (the model
+    // would otherwise sit on this card and never read it).
+    if (!agentId) {
+      const steerReply = session.takeSteerReply?.();
+      if (steerReply) return Promise.resolve({ ...cancelled, message: steerReply });
+    }
     const requestId = crypto.randomUUID();
     return new Promise((resolve) => {
       const settle = (value) => {
@@ -79,9 +85,13 @@ export const createClaudeInputRequests = (session) => {
         resolve(value);
         notify(runId);
       };
-      const abort = () => settle(cancelled);
+      // `reason` (a steer) replaces the denial's message: the model reads it
+      // as the tool's result. Called bare as the signal's abort listener.
+      const abort = (reason) =>
+        settle(typeof reason === 'string' && reason ? { ...cancelled, message: reason } : cancelled);
       pending.set(requestId, {
         view: { providerId: 'claude', runId, requestId, threadId: session.threadId, questions, ...extra },
+        mainLoop: !agentId,
         answer: (answers) => settle(resolveAnswer(answers)), abort,
       });
       signal?.addEventListener('abort', abort, { once: true });
@@ -103,6 +113,17 @@ export const createClaudeInputRequests = (session) => {
       return true;
     },
     cancelAll() { for (const entry of [...pending.values()]) entry.abort(); },
+    /**
+     * A steer while the main loop waits on a question or approval: decline
+     * it with `message` (the user's new instruction) so the model reads it
+     * now instead of after an answer that will never come. Subagents' cards
+     * stay. True when the main loop got the message.
+     */
+    declineMainLoop(message) {
+      const entries = [...pending.values()].filter((entry) => entry.mainLoop);
+      for (const entry of entries) entry.abort(message);
+      return entries.length > 0;
+    },
     canUseTool(toolName, input, options = {}) {
       const cancelled = { behavior: 'deny', message: 'The user input request was cancelled.' };
       if (toolName === 'AskUserQuestion') {
@@ -116,7 +137,7 @@ export const createClaudeInputRequests = (session) => {
           behavior: 'allow', updatedInput: { ...input, answers: Object.fromEntries(
             questions.map((q) => [q.question, answers[q.id].join(', ')])
           ) },
-        }), cancelled);
+        }), cancelled, {}, { agentId: options.agentID });
       }
       // This callback is reached only after Claude Code's permission policy.
       // An unanswered approval must never become an implicit allow.
@@ -132,7 +153,7 @@ export const createClaudeInputRequests = (session) => {
         // (remote machines, older builds) that only know the generic card.
         approval: approvalView(toolName, input, options),
         detail: [options.description, options.decisionReason, JSON.stringify(input, null, 2)].filter(Boolean).join('\n\n'),
-      });
+      }, { agentId: options.agentID });
     },
   };
 };

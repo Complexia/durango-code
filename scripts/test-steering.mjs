@@ -8,8 +8,12 @@ import {
   CLAUDE_SESSION_IDLE_EVICT_MS,
   claudeBackgroundRunSessions,
   claudeSdkSessions,
+  claudeSteerHooks,
   claudeUserActionHooks,
   createClaudeTurnState,
+  interruptClaudeSdkRun,
+  runClaudeDetachableCall,
+  takeClaudeSteerReply,
   discardClaudeBackgroundShellTasks,
   discardableClaudeBackgroundShellTasks,
   endClaudeSession,
@@ -477,6 +481,7 @@ const createSession = ({ threadId, runId, retained = false }) => {
   const events = [];
   const pushed = [];
   const stoppedTasks = [];
+  const backgrounded = [];
   let interruptCount = 0;
   let resolveEnded;
   const endedPromise = new Promise((resolve) => {
@@ -493,7 +498,6 @@ const createSession = ({ threadId, runId, retained = false }) => {
     tasks: new Map(),
     pendingTaskToolUses: new Map(),
     taskToolUseIds: new Set(),
-    pendingSteerBoundary: null,
     lastTurnEndSnapshot: { baseline: 'background' },
     resultsOwed: 1,
     ended: false,
@@ -515,6 +519,10 @@ const createSession = ({ threadId, runId, retained = false }) => {
         stoppedTasks.push(taskId);
         session.backgroundTasks.delete(taskId);
       },
+      backgroundTasks: async (toolUseId) => {
+        backgrounded.push(toolUseId);
+        return true;
+      },
     },
     sender: {
       isDestroyed: () => false,
@@ -535,6 +543,7 @@ const createSession = ({ threadId, runId, retained = false }) => {
     events,
     pushed,
     stoppedTasks,
+    backgrounded,
     get interruptCount() { return interruptCount; },
   };
 };
@@ -542,87 +551,194 @@ const createSession = ({ threadId, runId, retained = false }) => {
 claudeSdkSessions.clear();
 claudeBackgroundRunSessions.clear();
 
+// Steering never interrupts (like typing into Claude Code while it works):
+// the running command finishes and the model reads the message at its next
+// tool call.
+const steerHook = (session, event) => claudeSteerHooks(session)[event][0].hooks[0];
+const doneNoticeForSteer = (title) => ({
+  text: `Done: ${title}`,
+  activity: { key: `ua-steer-${title}`, type: 'result', title: 'You marked it done', detail: title, status: 'done' },
+});
 const active = createSession({ threadId: 'thread-active', runId: 'run-active' });
 claudeSdkSessions.set(active.session.threadId, active.session);
+await steerHook(active.session, 'PreToolUse')({ tool_name: 'Bash', tool_use_id: 'toolu_ws_new' });
 assert.equal(await steerClaudeSdkRun('run-active', 'change direction'), true);
-assert.equal(active.interruptCount, 1, 'An active steer must interrupt a blocking Claude loop');
-assert.equal(active.session.activeTurns.length, 1, 'An active steer must replace the interrupted owner');
-assert.equal(active.session.resultsOwed, 1, 'The continuation must own exactly one SDK result');
-assert.deepEqual(active.pushed, ['change direction']);
-assert.equal(active.session.backgroundSettleTimer, null, 'A live steer must disarm background settlement');
-assert.equal(active.events.length, 0, 'The interrupted transport boundary must not settle the visible run');
+assert.equal(active.interruptCount, 0, 'A steer must not interrupt the running command');
+assert.deepEqual(active.pushed, [], 'Nothing is pushed into a working turn');
+assert.deepEqual(active.backgrounded, [], 'A plain command is left to finish in the foreground');
+assert.equal(active.session.activeTurns.length, 1);
+assert.equal(active.session.resultsOwed, 1);
+assert.deepEqual(
+  await steerHook(active.session, 'PostToolUse')({ agent_id: 'sub', tool_name: 'Read', tool_use_id: 'toolu_sub' }),
+  { continue: true },
+  "A subagent's tool call does not take the main loop's steer"
+);
+const steerDelivered = await steerHook(active.session, 'PostToolUse')({ tool_name: 'Bash', tool_use_id: 'toolu_ws_new' });
+assert.equal(steerDelivered.hookSpecificOutput.hookEventName, 'PostToolUse');
+assert.match(steerDelivered.hookSpecificOutput.additionalContext, /sent a new message while you were working/);
+assert.match(steerDelivered.hookSpecificOutput.additionalContext, /change direction/);
+assert.equal(active.session.mainToolCalls.size, 0, 'The finished call is no longer in flight');
+assert.deepEqual(
+  active.events.map((event) => [event.type, event.runId, event.activity?.title]),
+  [['activity', 'run-active', 'Read your message']],
+  'The run shows where the agent read the message'
+);
+assert.deepEqual(
+  await steerHook(active.session, 'PostToolUseFailure')({ tool_name: 'Bash', tool_use_id: 'toolu_next' }),
+  { continue: true },
+  'A steer is delivered once'
+);
 active.session.resultsOwed -= 1;
 await finalizeClaudeTurn(active.session, {
   usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2 },
 });
-assert.equal(active.session.activeTurns.length, 0, 'The continuation result must settle the visible run');
-assert.equal(active.session.resultsOwed, 0, 'The continuation result must clear all result debt');
-assert.equal(active.events.length, 1, 'The continuation result must emit a terminal event');
-assert.equal(active.events[0]?.type, 'done');
-assert.deepEqual(active.events[0]?.stats, {
+assert.equal(active.session.activeTurns.length, 0, 'The turn settles normally');
+assert.equal(active.events.at(-1)?.type, 'done');
+assert.deepEqual(active.events.at(-1)?.stats, {
   totalTokens: 16,
   inputTokens: 12,
   outputTokens: 4,
   cachedReadTokens: 2,
 });
 
-const failedInterrupt = createSession({
-  threadId: 'thread-interrupt-failed',
-  runId: 'run-interrupt-failed',
-});
-failedInterrupt.session.query.interrupt = async () => {
-  throw new Error('control channel unavailable');
-};
-claudeSdkSessions.set(failedInterrupt.session.threadId, failedInterrupt.session);
-assert.equal(await steerClaudeSdkRun('run-interrupt-failed', 'preserve me'), false);
-assert.equal(
-  failedInterrupt.session.pendingSteerBoundary,
-  null,
-  'A failed interrupt must restore ordinary terminal handling'
-);
-assert.equal(failedInterrupt.session.activeTurns.length, 1, 'A failed interrupt must retain its owner');
-assert.deepEqual(failedInterrupt.pushed, [], 'A failed interrupt must leave the prompt for renderer fallback');
+// Steered after the model's last tool call: the turn's result is only a
+// boundary, and the message continues the same visible run.
+const turnEnd = createSession({ threadId: 'thread-steer-turn-end', runId: 'run-steer-turn-end' });
+claudeSdkSessions.set(turnEnd.session.threadId, turnEnd.session);
+turnEnd.session.activeTurns[0].toolWrittenPaths.add('/tmp/steer-written.txt');
+assert.equal(await steerClaudeSdkRun('run-steer-turn-end', 'one more thing'), true);
+turnEnd.session.resultsOwed -= 1;
+await finalizeClaudeTurn(turnEnd.session, { usage: { input_tokens: 1, output_tokens: 1 } });
+assert.equal(turnEnd.events.length, 0, 'The boundary must not settle the visible run');
+assert.deepEqual(turnEnd.pushed, ['one more thing'], 'The steer becomes the next turn');
+assert.equal(turnEnd.session.activeTurns.length, 1);
+assert.equal(turnEnd.session.activeTurns[0].runId, 'run-steer-turn-end', 'under the same run id');
+assert.ok(turnEnd.session.activeTurns[0].toolWrittenPaths.has('/tmp/steer-written.txt'), 'changed files span both halves');
+assert.equal(turnEnd.session.resultsOwed, 1, 'The continuation owns exactly one SDK result');
+turnEnd.session.resultsOwed -= 1;
+await finalizeClaudeTurn(turnEnd.session, { usage: { input_tokens: 1, output_tokens: 1 } });
+assert.equal(turnEnd.events.at(-1)?.type, 'done', 'The continuation settles the run');
 
-const releasedBeforeControlFailure = createSession({
-  threadId: 'thread-released-before-control-failure',
-  runId: 'run-released-before-control-failure',
-});
-releasedBeforeControlFailure.session.query.interrupt = async () => {
-  releasedBeforeControlFailure.session.resultsOwed = 0;
-  await finalizeClaudeTurn(releasedBeforeControlFailure.session, {
-    subtype: 'interrupted',
-    is_error: true,
-  });
-  throw new Error('late control failure');
-};
-claudeSdkSessions.set(
-  releasedBeforeControlFailure.session.threadId,
-  releasedBeforeControlFailure.session
-);
-assert.equal(
-  await steerClaudeSdkRun('run-released-before-control-failure', 'continue anyway'),
-  true,
-  'A released hidden boundary must continue even if the control request reports a late failure'
-);
-assert.equal(releasedBeforeControlFailure.session.activeTurns.length, 1);
-assert.equal(releasedBeforeControlFailure.session.resultsOwed, 1);
-assert.deepEqual(releasedBeforeControlFailure.pushed, ['continue anyway']);
+// Waiting on a question or approval card: the message answers it now.
+const asking = createSession({ threadId: 'thread-steer-question', runId: 'run-steer-question' });
+const declined = [];
+asking.session.userInputs = { declineMainLoop: (message) => (declined.push(message), true), cancelAll: () => {} };
+claudeSdkSessions.set(asking.session.threadId, asking.session);
+assert.equal(await steerClaudeSdkRun('run-steer-question', 'skip that, do X'), true);
+assert.equal(declined.length, 1);
+assert.match(declined[0], /skip that, do X/);
+assert.equal(asking.session.steerInbox?.length ?? 0, 0, 'Delivered through the card, not queued');
+assert.equal(asking.events[0]?.activity?.title, 'Read your message');
 
-const lostHandoff = createSession({
-  threadId: 'thread-lost-handoff',
-  runId: 'run-lost-handoff',
+// A foreground Claude subagent would hold the steer for minutes: it moves to
+// the background (still running) instead of being interrupted.
+const withSubagent = createSession({ threadId: 'thread-steer-subagent', runId: 'run-steer-subagent' });
+claudeSdkSessions.set(withSubagent.session.threadId, withSubagent.session);
+await steerHook(withSubagent.session, 'PreToolUse')({ tool_name: 'Agent', tool_use_id: 'toolu_agent_fg' });
+await steerHook(withSubagent.session, 'PreToolUse')({ tool_name: 'Bash', tool_use_id: 'toolu_bash_fg' });
+assert.equal(await steerClaudeSdkRun('run-steer-subagent', 'also check Y'), true);
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.deepEqual(withSubagent.backgrounded, ['toolu_agent_fg'], 'Only the subagent call is backgrounded');
+assert.equal(withSubagent.interruptCount, 0);
+
+// Durango Code's own waits on another agent (spawn_subagent,
+// machine_run_agent) return at once; the agent's report comes later.
+const detaching = createSession({ threadId: 'thread-steer-detach', runId: 'run-steer-detach' });
+detaching.session.userActionInbox = [];
+claudeSdkSessions.set(detaching.session.threadId, detaching.session);
+let finishSubagent;
+const subagentWork = new Promise((resolve) => {
+  finishSubagent = resolve;
 });
-const lostOwner = lostHandoff.session.activeTurns.shift();
-lostHandoff.session.pendingSteerBoundary = lostOwner;
-lostHandoff.session.stderrTail = '';
-claudeSdkSessions.set(lostHandoff.session.threadId, lostHandoff.session);
-endClaudeSession(lostHandoff.session, new Error('session exited after interrupt'));
-assert.ok(
-  lostHandoff.events.some(
-    (event) => event.runId === 'run-lost-handoff' && event.type === 'error'
-  ),
-  'A session lost after the hidden boundary must still settle the visible run'
+const detachableCall = runClaudeDetachableCall(detaching.session, subagentWork, {
+  detachedText: 'still running',
+  reportLabel: 'The subagent "review"',
+});
+assert.equal(detaching.session.detachableCalls.size, 1);
+assert.equal(await steerClaudeSdkRun('run-steer-detach', 'stop waiting'), true);
+assert.deepEqual(await detachableCall, { content: [{ type: 'text', text: 'still running' }] });
+assert.equal(detaching.session.detachableCalls.size, 0);
+assert.equal((await steerHook(detaching.session, 'PostToolUse')({ tool_name: 'mcp__orion__spawn_subagent', tool_use_id: 'toolu_spawn' })).hookSpecificOutput.additionalContext.includes('stop waiting'), true);
+detaching.session.resultsOwed -= 1;
+await finalizeClaudeTurn(detaching.session, { usage: { input_tokens: 1, output_tokens: 1 } });
+finishSubagent({ content: [{ type: 'text', text: 'LGTM, two nits' }] });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(detaching.pushed.length, 1, 'The late report re-invokes the idle agent');
+assert.match(detaching.pushed[0], /The subagent "review", which you stopped waiting on/);
+assert.match(detaching.pushed[0], /LGTM, two nits/);
+assert.doesNotMatch(detaching.pushed[0], /The user answered/);
+assert.equal(detaching.events.find((event) => event.type === 'started')?.command, 'claude — a subagent reported back');
+// Started while a steer already waits: detached at once.
+const lateCall = createSession({ threadId: 'thread-steer-late-call', runId: 'run-steer-late-call' });
+claudeSdkSessions.set(lateCall.session.threadId, lateCall.session);
+await steerClaudeSdkRun('run-steer-late-call', 'heads up');
+assert.deepEqual(
+  await runClaudeDetachableCall(lateCall.session, new Promise(() => {}), { detachedText: 'detached', reportLabel: 'x' }),
+  { content: [{ type: 'text', text: 'detached' }] }
 );
+
+// A card the main loop opens while a steer waits takes the steer as its
+// reply (claude-input.js asks through session.takeSteerReply).
+const cardAfterSteer = createSession({ threadId: 'thread-steer-card-later', runId: 'run-steer-card-later' });
+claudeSdkSessions.set(cardAfterSteer.session.threadId, cardAfterSteer.session);
+await steerClaudeSdkRun('run-steer-card-later', 'skip the question');
+cardAfterSteer.session.steerInbox[0].content.push({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: '' } });
+const cardReply = takeClaudeSteerReply(cardAfterSteer.session);
+assert.match(cardReply, /skip the question/);
+assert.match(cardReply, /open them with Read/, 'attachments are named for the model to open');
+assert.equal(cardAfterSteer.session.steerInbox.length, 0);
+assert.equal(cardAfterSteer.events[0]?.activity?.title, 'Read your message');
+assert.equal(takeClaudeSteerReply(cardAfterSteer.session), null, 'Nothing waits: the card opens normally');
+
+// A subagent the user stopped (or deleted) never re-invokes its idle parent;
+// its report waits for the parent's next turn. Until a detached report is
+// in, idle eviction keeps the parent.
+const stoppedChild = createSession({ threadId: 'thread-steer-stopped-child', runId: 'run-steer-stopped-child' });
+stoppedChild.session.userActionInbox = [];
+claudeSdkSessions.set(stoppedChild.session.threadId, stoppedChild.session);
+let finishStoppedChild;
+const stoppedChildCall = runClaudeDetachableCall(
+  stoppedChild.session,
+  new Promise((resolve) => {
+    finishStoppedChild = resolve;
+  }),
+  { detachedText: 'detached', reportLabel: 'The subagent "child"', wasStopped: () => true }
+);
+await steerClaudeSdkRun('run-steer-stopped-child', 'keep going');
+await stoppedChildCall;
+await steerHook(stoppedChild.session, 'PostToolUse')({ tool_name: 'Read', tool_use_id: 'toolu_read' });
+stoppedChild.session.resultsOwed -= 1;
+await finalizeClaudeTurn(stoppedChild.session, { usage: { input_tokens: 1, output_tokens: 1 } });
+assert.equal(stoppedChild.session.detachedReportsDue, 1);
+stoppedChild.session.lastActivityAt = 0;
+evictIdleClaudeSdkSessions(CLAUDE_SESSION_IDLE_EVICT_MS + 1);
+assert.equal(stoppedChild.session.disposed, false, 'A detached report still due keeps the session');
+finishStoppedChild({ content: [{ type: 'text', text: 'Subagent run was stopped.' }], isError: true });
+await new Promise((resolve) => setTimeout(resolve, 0));
+assert.equal(stoppedChild.session.detachedReportsDue, 0);
+assert.equal(stoppedChild.pushed.length, 0, 'A stopped subagent does not re-invoke the idle parent');
+assert.equal(stoppedChild.session.userActionInbox.length, 1, 'Its report waits for the next turn');
+notifyClaudeSession('thread-steer-stopped-child', doneNoticeForSteer('npm login'));
+assert.equal(stoppedChild.pushed.length, 1, 'An ordinary notice still opens a turn');
+assert.match(stoppedChild.pushed[0], /Done: npm login/);
+assert.match(stoppedChild.pushed[0], /The subagent "child", which you stopped waiting on/, 'and carries the waiting report along');
+
+// A session that dies before the model read a steer hands it back; Stop
+// drops it with the run.
+const lostSteer = createSession({ threadId: 'thread-steer-lost', runId: 'run-steer-lost' });
+claudeSdkSessions.set(lostSteer.session.threadId, lostSteer.session);
+await steerClaudeSdkRun('run-steer-lost', 'did you get this?');
+endClaudeSession(lostSteer.session, new Error('crashed'));
+assert.deepEqual(
+  lostSteer.events.find((event) => event.type === 'undelivered'),
+  { type: 'undelivered', threadId: 'thread-steer-lost', texts: ['did you get this?'] }
+);
+const stoppedSteer = createSession({ threadId: 'thread-steer-stopped', runId: 'run-steer-stopped' });
+claudeSdkSessions.set(stoppedSteer.session.threadId, stoppedSteer.session);
+await steerClaudeSdkRun('run-steer-stopped', 'never mind');
+await interruptClaudeSdkRun('run-steer-stopped');
+assert.equal(stoppedSteer.session.steerInbox.length, 0, 'Stop drops the steers of its run');
+assert.equal(stoppedSteer.pushed.length, 0, 'and they never continue the stopped run');
 
 const retained = createSession({
   threadId: 'thread-retained',
@@ -959,14 +1075,6 @@ assert.equal(idleUserAction.events[0]?.type, 'started', 'An idle agent is re-inv
 assert.equal(idleUserAction.events[0]?.runId, 'run-user-action-idle', 'It continues the retained run');
 assert.match(idleUserAction.pushed[0], /Done: device code/);
 
-const steeringUserAction = createSession({ threadId: 'thread-user-action-steer', runId: 'run-user-action-steer' });
-steeringUserAction.session.userActionInbox = [];
-steeringUserAction.session.pendingSteerBoundary = steeringUserAction.session.activeTurns.shift();
-claudeSdkSessions.set(steeringUserAction.session.threadId, steeringUserAction.session);
-notifyClaudeSession('thread-user-action-steer', doneNotice('approve'));
-assert.equal(steeringUserAction.pushed.length, 0, "Mid-steer, the notice waits for the steer's continuation");
-assert.equal(steeringUserAction.session.userActionInbox.length, 1);
-
 assert.equal(notifyClaudeSession('thread-without-session', doneNotice('x')), false, 'No live session: the renderer sends it');
 assert.equal(
   notifyClaudeSession('thread-user-action-busy', doneNotice('x'), { runId: 'run-of-another-provider' }),
@@ -995,7 +1103,7 @@ assert.deepEqual(
   { type: 'undelivered', threadId: 'thread-user-action-ended', texts: ['Done: sign in'] },
   'A session that dies before delivering hands the answer back to the renderer'
 );
-for (const { session } of [busyUserAction, idleUserAction, steeringUserAction, finishingUserAction]) {
+for (const { session } of [busyUserAction, idleUserAction, finishingUserAction]) {
   session.activeTurns.splice(0);
   if (session.backgroundSettleTimer) clearTimeout(session.backgroundSettleTimer);
   claudeSdkSessions.delete(session.threadId);
@@ -1064,15 +1172,20 @@ assert.equal(
   'An idle shell-only Claude runtime must be reaped instead of surviving indefinitely'
 );
 
+assert.doesNotMatch(
+  section(claudeDriverSource, 'export const steerClaudeSdkRun', '\n};\n'),
+  /interrupt\(/,
+  'Steering must never interrupt the running turn'
+);
 assert.match(
   claudeDriverSource,
-  /if \(activeOwner\) \{[\s\S]*session\.query\.interrupt\(\)[\s\S]*createClaudeTurnState\(runId[\s\S]*session\.pushUserMessage\(text, \{ content \}\)[\s\S]*return true;/,
-  'An active steer must interrupt the blocked loop before pushing its continuation'
+  /claudeSteerHooks\(session\),/,
+  'Claude sessions must deliver steers at the next tool call'
 );
 assert.match(
   claudeDriverSource,
   /perTaskStopAffordance: true/,
-  'Claude sessions must declare per-task stop so a steer interrupt spares background agents'
+  'Claude sessions must declare per-task stop so an in-place interrupt spares background agents'
 );
 
 // Prompt suggestions (promptSuggestions) arrive after a turn's `result`. They
@@ -1110,7 +1223,7 @@ assert.match(
   'Claude sessions must ask the SDK for prompt suggestions'
 );
 
-for (const { session } of [active, retained, idleSubagent, liveSubagent, monitoredTurn, mixedBackground, expiredMonitor, suggested]) {
+for (const { session } of [active, turnEnd, asking, withSubagent, detaching, lateCall, stoppedSteer, cardAfterSteer, stoppedChild, retained, idleSubagent, liveSubagent, monitoredTurn, mixedBackground, expiredMonitor, suggested]) {
   if (session.backgroundSettleTimer) clearTimeout(session.backgroundSettleTimer);
 }
 claudeSdkSessions.clear();

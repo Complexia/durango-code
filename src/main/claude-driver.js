@@ -199,16 +199,27 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
             .describe(SPAWN_SUBAGENT_EFFORT_DESCRIPTION),
         },
         async (args) => {
-          const resultText = await requestSubagentSpawn(
+          const name = String(args.title || args.model || 'subagent');
+          let stopped = false;
+          // A steer stops the wait, not the subagent (steerClaudeSdkRun).
+          return runClaudeDetachableCall(
+            session,
+            requestSubagentSpawn(
+              {
+                getSender: () => session.sender,
+                threadId: session.threadId,
+                projectPath: session.projectPath,
+                accessMode: session.accessMode,
+              },
+              args,
+              { onOutcome: (outcome) => (stopped = outcome?.stopped === true) }
+            ).then((resultText) => ({ content: [{ type: 'text', text: resultText }] })),
             {
-              getSender: () => session.sender,
-              threadId: session.threadId,
-              projectPath: session.projectPath,
-              accessMode: session.accessMode,
-            },
-            args
+              wasStopped: () => stopped,
+              detachedText: `The subagent "${name}" is still running. The user sent you a message while you waited, so Durango Code stopped waiting without stopping the subagent. Its final report reaches you on its own when it finishes; it shows under this thread's subagents meanwhile.`,
+              reportLabel: `The subagent "${name}"`,
+            }
           );
-          return { content: [{ type: 'text', text: resultText }] };
         },
         {
           // INTENTIONAL, NOT A BUG — do not remove this annotation. It has
@@ -578,19 +589,41 @@ const claudeMachineTools = (tool, z, session) =>
       definition.name,
       definition.description,
       shape,
-      async (args, extra) =>
-        durangoToolResult(
-          await runMachineTool(definition.name, args, {
-            accessMode: session.accessMode,
-            projectPath: session.projectPath,
-            // Who is calling: an agent turn started there runs under this
-            // thread here, with this model's provider by default.
-            threadId: session.threadId,
-            providerId: 'claude',
-            modelId: session.createParams?.model?.id,
-            signal: extra?.signal instanceof AbortSignal ? extra.signal : undefined,
-          })
-        ),
+      async (args, extra) => {
+        // Once a steer stops the wait, this call's own abort (the turn here
+        // ending) must not end the wait for the agent's reply.
+        let detached = false;
+        let stopped = false;
+        const controller = new AbortController();
+        const callSignal = extra?.signal instanceof AbortSignal ? extra.signal : undefined;
+        if (callSignal?.aborted) controller.abort();
+        callSignal?.addEventListener('abort', () => !detached && controller.abort(), { once: true });
+        const result = runMachineTool(definition.name, args, {
+          accessMode: session.accessMode,
+          projectPath: session.projectPath,
+          // Who is calling: an agent turn started there runs under this
+          // thread here, with this model's provider by default.
+          threadId: session.threadId,
+          providerId: 'claude',
+          modelId: session.createParams?.model?.id,
+          signal: controller.signal,
+        }).then((outcome) => {
+          stopped = outcome?.stopped === true;
+          return durangoToolResult(outcome);
+        });
+        // Waiting on an agent turn there: a steer stops the wait, not the
+        // agent (steerClaudeSdkRun).
+        if (definition.name !== 'machine_run_agent' || args?.wait === false) return result;
+        const where = typeof args?.machine === 'string' && args.machine ? args.machine : 'the other machine';
+        return runClaudeDetachableCall(session, result, {
+          detachedText: `The agent turn on ${where} is still running. The user sent you a message while you waited, so Durango Code stopped waiting without stopping that agent. Its final reply reaches you on its own when the turn ends; check on it meanwhile with machine_threads and machine_read_thread.`,
+          reportLabel: `The agent turn you started on ${where}`,
+          onDetach: () => {
+            detached = true;
+          },
+          wasStopped: () => stopped,
+        });
+      },
       definition.readOnly ? { annotations: { readOnlyHint: true } } : undefined
     );
   });
@@ -1321,15 +1354,28 @@ export const updateClaudeBackgroundSettle = (session) => {
 export const finalizeClaudeTurn = async (session, resultMessage) => {
   const turn = session.activeTurns.shift();
   if (!turn) return;
-  // Steering interrupts the current Claude loop so a user instruction can
-  // take effect immediately, even while the model is blocked in a long tool
-  // call. That interrupted result is only a transport boundary: the visible
-  // Orion run continues with the same run id, so do not emit a terminal event
-  // that would clear the renderer's owner before the continuation is pushed.
-  if (session.pendingSteerBoundary === turn) {
+  // The main loop is between turns: no tool call of it is in flight.
+  session.mainToolCalls?.clear();
+  // Steered after the model's last tool call: the visible run goes on with
+  // the message as its next turn, under the same run id, so this result is
+  // only a boundary and emits no terminal event. Synchronous from the shift
+  // above, so nothing can slip in between.
+  const steers = takeClaudeSteers(session, turn);
+  if (steers.length && !session.ended && !session.disposed && session.query) {
     finishClaudeTurnReasoning(session, turn);
-    turn.resolveSteerBoundary?.(true);
-    turn.resolveSteerBoundary = null;
+    const continuation = createClaudeTurnState(turn.runId, turn.snapshot);
+    // Changed-file attribution spans both halves of the visible run.
+    for (const filePath of turn.toolWrittenPaths) continuation.toolWrittenPaths.add(filePath);
+    // Behind any turn already queued: results arrive in input order.
+    session.activeTurns.push(continuation);
+    updateClaudeBackgroundSettle(session);
+    flushPendingClaudeTaskNotifications(session, continuation);
+    session.pushUserMessage(steers.map((steer) => steer.text).join('\n\n'), {
+      content: steers.flatMap((steer, index) => [
+        ...(index > 0 ? [{ type: 'text', text: '\n\n' }] : []),
+        ...steer.content,
+      ]),
+    });
     return;
   }
   // The turn is forgotten but its terminal event still awaits git
@@ -1859,7 +1905,16 @@ export const endClaudeSession = (session, error) => {
   session.userInputs?.cancelAll();
   // Answers the model never got go back to the renderer, which sends them as
   // ordinary messages. Stop (disposed) drops them with the rest of the work.
-  const undeliveredUserActions = session.userActionInbox?.splice(0) ?? [];
+  // Steers the model never read go back the same way (their attachments
+  // are named in the text).
+  // Passive reports (a subagent the user stopped) are dropped: handed back
+  // they would start a turn.
+  const undeliveredUserActions = [
+    ...(session.userActionInbox?.splice(0) ?? []).filter((notice) => !notice.passive),
+    ...(session.steerInbox?.splice(0) ?? []),
+  ];
+  session.mainToolCalls?.clear();
+  session.detachableCalls?.clear();
   if (undeliveredUserActions.length > 0 && !session.disposed && !session.sender?.isDestroyed?.()) {
     try {
       session.sender?.send('agent:userAction', {
@@ -1888,10 +1943,6 @@ export const endClaudeSession = (session, error) => {
     claudeSdkSessions.delete(session.threadId);
   }
 
-  const interruptedSteer = session.pendingSteerBoundary;
-  session.pendingSteerBoundary = null;
-  interruptedSteer?.resolveSteerBoundary?.(false);
-  if (interruptedSteer) interruptedSteer.resolveSteerBoundary = null;
   const pendingTurns = session.activeTurns.splice(0);
 
   // The stored session may be gone (harness cache cleared, expired, or a CLI
@@ -1947,28 +1998,6 @@ export const endClaudeSession = (session, error) => {
       // Lets the renderer offer the Authenticate button when the failure text
       // reads as a logged-out CLI (e.g. "OAuth session expired").
       ...(session.disposed ? {} : { providerId: 'claude' }),
-    });
-  }
-
-  // The interrupted boundary may already have been shifted and deliberately
-  // hidden while steerClaudeSdkRun was preparing its continuation. If the
-  // harness dies in that narrow gap, give the renderer a terminal event so
-  // it can dispatch the steer's queued fallback instead of retaining a run
-  // that can no longer produce output.
-  if (interruptedSteer && !pendingTurns.includes(interruptedSteer)) {
-    const errorText =
-      !session.disposed && error
-        ? [error.message ?? 'Claude session ended unexpectedly.', session.stderrTail.trim()]
-            .filter(Boolean)
-            .join('\n')
-        : null;
-    emitAgentEvent(session.sender, {
-      runId: interruptedSteer.runId,
-      threadId: session.threadId,
-      type: errorText ? 'error' : 'done',
-      exitCode: errorText ? 1 : 0,
-      changedFiles: [],
-      ...(errorText ? { error: errorText, providerId: 'claude' } : {}),
     });
   }
 
@@ -2161,13 +2190,18 @@ export const createClaudeSdkSession = ({
     pendingTaskNotifications: [],
     // Answered user actions not yet delivered (notifyClaudeSession).
     userActionInbox: [],
-    // Exact foreground owner whose interrupted result is a hidden steering
-    // boundary. Cleared as soon as its continuation is reserved, or by
-    // session teardown so a lost handoff still settles the renderer.
-    pendingSteerBoundary: null,
+    // Steers the model has not read yet ({ runId, text, content }):
+    // delivered at the main loop's next tool call or as the turn's
+    // continuation (steerClaudeSdkRun).
+    steerInbox: [],
+    // The main loop's tool calls in flight: tool_use_id -> tool name.
+    mainToolCalls: new Map(),
+    // Durango Code tool calls waiting on another agent that a steer can stop
+    // waiting on (runClaudeDetachableCall).
+    detachableCalls: new Set(),
     // How many `result` messages the CLI still owes (one per pushed user turn
-    // and per harness-initiated synthetic turn). A steer first consumes the
-    // interrupted turn's result, then reserves one for its continuation. When
+    // and per harness-initiated synthetic turn). A steer left at turn end
+    // consumes that turn's result and reserves one for its continuation. When
     // this hits zero, any turn still queued
     // can never finalize on its own — see
     // interruptClaudeSdkRun, which uses it to recover instead of interrupting.
@@ -2204,6 +2238,7 @@ export const createClaudeSdkSession = ({
   };
 
   session.userInputs = createClaudeInputRequests(session);
+  session.takeSteerReply = () => takeClaudeSteerReply(session);
   session.pushUserMessage = (text, { expectResult = true, content = [{ type: 'text', text }] } = {}) => {
     if (session.firstPrompt === null) {
       session.firstPrompt = text;
@@ -2277,7 +2312,7 @@ export const createClaudeSdkSession = ({
         // user's own promptSuggestionEnabled setting still turns it off.
         promptSuggestions: true,
         // Without this declaration every interrupt kills running background
-        // agents/workflows, so steering a turn would silently stop them. Stop
+        // agents/workflows, so an in-place interrupt would silently stop them. Stop
         // still halts everything: it stops each live task explicitly via
         // stopTask and then disposes the session.
         perTaskStopAffordance: true,
@@ -2302,11 +2337,12 @@ export const createClaudeSdkSession = ({
         // project settings — no CLAUDE.md, no skills, no MCP servers.
         settingSources: ['user', 'project', 'local'],
         mcpServers: { orion: orionMcpServer },
-        // Refuses long foreground waits, delivers answered user actions at
-        // the next tool call, and serializes Claude in Chrome across Orion's
+        // Refuses long foreground waits, delivers steers and answered user
+        // actions at the next tool call, and serializes Claude in Chrome across Orion's
         // Claude threads.
         hooks: mergeClaudeHooks(
           claudeForegroundWaitHooks(),
+          claudeSteerHooks(session),
           claudeUserActionHooks(session),
           claudeSecretRefHooks(session),
           builtinBrowser ? claudeBrowserAgentHooks() : {},
@@ -2508,18 +2544,6 @@ export const runClaudeSdkTurn = async ({ sender, input, model, runId, initialSna
   return { ok: true, runId };
 };
 
-// Steering must redirect a live run immediately. Streaming a second user
-// message alone is insufficient: Claude does not consume that input while a
-// blocking tool call (notably a delegated Orion subagent) is in flight, which
-// leaves the renderer's split continuation bubble waiting indefinitely. End
-// the current loop through the SDK control channel, suppress that intermediate
-// result boundary, then push the instruction as a continuation owned by the
-// same Orion run id.
-//
-// With only a retained background handle there is no foreground loop to
-// interrupt, so open one and use normal result accounting. Returns false when
-// the run/session disappears or an interrupt cannot be completed promptly;
-// the renderer then preserves the message as an ordinary queued follow-up.
 // Open a foreground turn on an idle session that only holds background work
 // (retained run id, or none), for input Durango Code pushes on its own.
 const openClaudeBackgroundTurn = (session, runId, command) => {
@@ -2544,11 +2568,21 @@ const openClaudeBackgroundTurn = (session, runId, command) => {
 // a turn of their own, opened at once on an idle session or as soon as the
 // current turn ends. Notices are { text, activity }: the activity marks in
 // the receiving turn where the model learned it.
-export const claudeUserActionNoticeText = (notices) =>
-  [
-    `[Durango Code] ${notices.length === 1 ? 'The user answered an action you asked them for' : 'The user answered actions you asked them for'}. This reached you without interrupting your work; act on it when it fits.`,
-    ...notices.map((notice) => notice.text),
+// Reports of agents a steer stopped the wait on (runClaudeDetachableCall)
+// share the inbox; they carry their own introduction.
+export const claudeUserActionNoticeText = (notices) => {
+  const answers = notices.filter((notice) => notice.kind !== 'report');
+  const reports = notices.filter((notice) => notice.kind === 'report');
+  return [
+    ...(answers.length
+      ? [
+          `[Durango Code] ${answers.length === 1 ? 'The user answered an action you asked them for' : 'The user answered actions you asked them for'}. This reached you without interrupting your work; act on it when it fits.`,
+          ...answers.map((notice) => notice.text),
+        ]
+      : []),
+    ...reports.map((notice) => notice.text),
   ].join('\n\n');
+};
 
 const emitClaudeUserActionNotices = (session, turn, notices) => {
   for (const notice of notices) {
@@ -2562,15 +2596,12 @@ const emitClaudeUserActionNotices = (session, turn, notices) => {
   }
 };
 
-// Mid-steer the interrupted turn has left activeTurns but its continuation
-// is not pushed yet; the continuation's end flushes instead. A finishing
-// turn has left activeTurns too but not emitted `done` yet; it flushes once
-// it has.
+// A finishing turn has left activeTurns but not emitted `done` yet; it
+// flushes once it has.
 export const flushClaudeUserActionNotices = (session) => {
   if (
-    !session.userActionInbox?.length ||
+    !session.userActionInbox?.some((notice) => !notice.passive) ||
     session.activeTurns.length > 0 ||
-    session.pendingSteerBoundary ||
     session.finalizingTurns > 0 ||
     session.ended ||
     session.disposed ||
@@ -2582,7 +2613,7 @@ export const flushClaudeUserActionNotices = (session) => {
   const turn = openClaudeBackgroundTurn(
     session,
     session.backgroundRunId ?? crypto.randomUUID(),
-    'claude — the user answered'
+    notices.every((notice) => notice.kind === 'report') ? 'claude — a subagent reported back' : 'claude — the user answered'
   );
   emitClaudeUserActionNotices(session, turn, notices);
   session.pushUserMessage(claudeUserActionNoticeText(notices));
@@ -2627,6 +2658,216 @@ export const notifyClaudeSession = (threadId, notice, { runId } = {}) => {
   return true;
 };
 
+// Steering works like typing into Claude Code while it works: it never
+// interrupts. A running command finishes; the model reads the message at its
+// next tool call (PostToolUse context, claudeSteerHooks), or, when the turn
+// ends first, as a continuation of the same Durango Code run. Three things
+// would hold it back for long, so a steer clears them without killing
+// anything:
+// - a question or approval card of the main loop: declined with the message,
+//   which the model reads as that tool's result;
+// - a foreground Claude subagent (Agent/Task): moved to the background
+//   (Ctrl+B, query.backgroundTasks); it keeps running and reports when done;
+// - Durango Code's own tools that wait on another agent (spawn_subagent,
+//   machine_run_agent): the call returns at once, the agent keeps running,
+//   and its report arrives later like an answered user action.
+// Stop is the only interrupt.
+export const CLAUDE_STEER_HEADER = 'The user sent a new message while you were working:';
+
+// Mid-turn this is text only, so files attached to the message (images, PDFs,
+// snapshots) reach the model by their paths, which the message lists.
+const claudeSteerText = (steers) =>
+  [
+    `[Durango Code] ${CLAUDE_STEER_HEADER}`,
+    ...steers.map((steer) => steer.text),
+    ...(steers.some((steer) => steer.content?.some((part) => part?.type !== 'text'))
+      ? ['Its attachments are the local files listed above: open them with Read to see them (images and PDFs included).']
+      : []),
+    'It reached you without interrupting your work: take it into account now.',
+  ].join('\n\n');
+
+const claudeSteerActivity = (steers) => ({
+  key: `steer-${crypto.randomUUID()}`,
+  type: 'result',
+  title: steers.length === 1 ? 'Read your message' : `Read your ${steers.length} messages`,
+  status: 'done',
+});
+
+/** Steers waiting for `turn` (the session's running main-loop turn). */
+const takeClaudeSteers = (session, turn) => {
+  if (!turn || !session.steerInbox?.length) return [];
+  const steers = session.steerInbox.filter((steer) => steer.runId === turn.runId);
+  if (steers.length) session.steerInbox = session.steerInbox.filter((steer) => steer.runId !== turn.runId);
+  return steers;
+};
+
+/**
+ * A question or approval card the main loop opens while a steer waits: the
+ * steer is its reply (claude-input.js), or the model would sit on the card
+ * and never read the steer. Null when none waits.
+ */
+export const takeClaudeSteerReply = (session) => {
+  const turn = session.activeTurns[0];
+  const steers = takeClaudeSteers(session, turn);
+  if (!steers.length) return null;
+  emitAgentEvent(session.sender, {
+    runId: turn.runId,
+    threadId: session.threadId,
+    type: 'activity',
+    activity: claudeSteerActivity(steers),
+  });
+  return claudeSteerText(steers);
+};
+
+const hasClaudeSteerFor = (session, runId) =>
+  Boolean(runId) && Boolean(session.steerInbox?.some((steer) => steer.runId === runId));
+
+// Claude Code's own subagent tools, which block the main loop until the
+// subagent ends unless they run in the background.
+const CLAUDE_SUBAGENT_TOOLS = new Set(['Agent', 'Task']);
+
+// A foreground subagent call only becomes a backgroundable task a moment after
+// PreToolUse, so retry briefly; false (no such task) is not an error.
+const backgroundClaudeSubagentCall = (session, toolUseId, attempt = 0) => {
+  if (!session.mainToolCalls?.has(toolUseId) || session.ended || session.disposed) return;
+  Promise.resolve()
+    .then(() => session.query?.backgroundTasks?.(toolUseId))
+    .then(
+      (moved) => {
+        if (moved === false && attempt < 5) {
+          setTimeout(() => backgroundClaudeSubagentCall(session, toolUseId, attempt + 1), 400);
+        }
+      },
+      () => {}
+    );
+};
+
+// Clear what holds a pending steer back (see above): subagent calls that
+// would block the main loop for minutes.
+const releaseClaudeBlockingCalls = (session) => {
+  for (const [toolUseId, toolName] of session.mainToolCalls ?? []) {
+    if (CLAUDE_SUBAGENT_TOOLS.has(toolName)) backgroundClaudeSubagentCall(session, toolUseId);
+  }
+  for (const call of [...(session.detachableCalls ?? [])]) call.detach();
+};
+
+// Main-loop tool calls in flight (PreToolUse → PostToolUse/Failure), and the
+// steer delivery. Subagents' tool calls (agent_id) don't carry it: the steer
+// is for the main loop.
+export const claudeSteerHooks = (session) => {
+  const started = async (input) => {
+    if (input?.agent_id || !input?.tool_use_id) return { continue: true };
+    session.mainToolCalls ??= new Map();
+    session.mainToolCalls.set(input.tool_use_id, input.tool_name);
+    // Started while a steer waits: don't let it block that steer.
+    if (CLAUDE_SUBAGENT_TOOLS.has(input.tool_name) && hasClaudeSteerFor(session, session.activeTurns[0]?.runId)) {
+      setTimeout(() => backgroundClaudeSubagentCall(session, input.tool_use_id), 400);
+    }
+    return { continue: true };
+  };
+  const ended = (hookEventName) => async (input) => {
+    if (input?.agent_id) return { continue: true };
+    if (input?.tool_use_id) session.mainToolCalls?.delete(input.tool_use_id);
+    const turn = session.activeTurns[0];
+    const steers = takeClaudeSteers(session, turn);
+    if (!steers.length) return { continue: true };
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity: claudeSteerActivity(steers),
+    });
+    return { hookSpecificOutput: { hookEventName, additionalContext: claudeSteerText(steers) } };
+  };
+  return {
+    PreToolUse: [{ hooks: [started] }],
+    PostToolUse: [{ hooks: [ended('PostToolUse')] }],
+    PostToolUseFailure: [{ hooks: [ended('PostToolUseFailure')] }],
+  };
+};
+
+/**
+ * Runs one of Durango Code's own tool calls that waits on another agent
+ * (`work`, resolving to an MCP tool result) so a steer can stop the waiting
+ * without stopping the agent: the call then returns `detachedText` at once,
+ * and the agent's result reaches the model later through the notice inbox
+ * (as `reportLabel` reporting back).
+ */
+//
+// `wasStopped()` tells, once `work` settles, that the user stopped or deleted
+// that agent: its report then never re-invokes an idle parent (the user is
+// halting work, not asking for more); it waits for the parent's next turn.
+// Until a detached report is in, idle eviction keeps the session.
+export const runClaudeDetachableCall = (session, work, { detachedText, reportLabel, onDetach, wasStopped }) =>
+  new Promise((resolve) => {
+    let settled = false;
+    const call = {
+      detach: () => {
+        if (settled) return;
+        settled = true;
+        onDetach?.();
+        session.detachableCalls?.delete(call);
+        session.detachedReportsDue = (session.detachedReportsDue ?? 0) + 1;
+        resolve({ content: [{ type: 'text', text: detachedText }] });
+        Promise.resolve(work)
+          .then(
+            (result) =>
+              deliverClaudeDetachedReport(session, reportLabel, result, { passive: wasStopped?.() === true }),
+            (error) =>
+              deliverClaudeDetachedReport(session, reportLabel, {
+                content: [{ type: 'text', text: `It failed: ${error?.message ?? error}` }],
+                isError: true,
+              })
+          )
+          .finally(() => {
+            session.detachedReportsDue = Math.max(0, (session.detachedReportsDue ?? 1) - 1);
+          });
+      },
+    };
+    session.detachableCalls ??= new Set();
+    session.detachableCalls.add(call);
+    Promise.resolve(work).then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        session.detachableCalls.delete(call);
+        resolve(result);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        session.detachableCalls.delete(call);
+        resolve({ content: [{ type: 'text', text: `Failed: ${error?.message ?? error}` }], isError: true });
+      }
+    );
+    if (hasClaudeSteerFor(session, session.activeTurns[0]?.runId)) call.detach();
+  });
+
+const deliverClaudeDetachedReport = (session, label, result, { passive = false } = {}) => {
+  if (session.ended || session.disposed) return;
+  const text = (Array.isArray(result?.content) ? result.content : [])
+    .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('\n\n')
+    .trim();
+  session.userActionInbox ??= [];
+  session.userActionInbox.push({
+    kind: 'report',
+    passive,
+    text: `[Durango Code] ${label}, which you stopped waiting on when the user messaged you, has finished${
+      result?.isError ? ' with an error' : ''
+    }. Its result:\n\n${text || '(no text)'}`,
+    activity: {
+      key: `report-${crypto.randomUUID()}`,
+      type: 'result',
+      title: 'A subagent reported back',
+      detail: label,
+      status: 'done',
+    },
+  });
+  flushClaudeUserActionNotices(session);
+};
+
 export const steerClaudeSdkRun = async (runId, text, attachments) => {
   const content = await claudeUserContent(text, attachments);
   for (const session of claudeSdkSessions.values()) {
@@ -2636,71 +2877,20 @@ export const steerClaudeSdkRun = async (runId, text, attachments) => {
     if (!ownsRun) continue;
     if (session.ended || session.disposed || !session.query) return false;
     if (activeOwner) {
-      session.userInputs?.cancelAll();
-      let resolveSteerBoundary;
-      const steerBoundary = new Promise((resolve) => {
-        resolveSteerBoundary = resolve;
-      });
-      activeOwner.resolveSteerBoundary = resolveSteerBoundary;
-      session.pendingSteerBoundary = activeOwner;
-      try {
-        await Promise.race([
-          session.query.interrupt(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Claude steer interrupt timed out.')), 3000)
-          ),
-        ]);
-      } catch {
-        // A natural result can release the owner while the control request is
-        // failing or timing out. In that case the hidden boundary already
-        // committed and must continue; only fall back while the exact owner
-        // is still live, which is a synchronous/atomic check here.
-        if (session.activeTurns.includes(activeOwner)) {
-          if (session.pendingSteerBoundary === activeOwner) {
-            session.pendingSteerBoundary = null;
-          }
-          activeOwner.resolveSteerBoundary = null;
-          return false;
-        }
+      session.lastActivityAt = Date.now();
+      // Waiting on the user: the message is the answer, delivered now.
+      if (activeOwner === session.activeTurns[0] && session.userInputs?.declineMainLoop?.(claudeSteerText([{ text, content }]))) {
+        emitAgentEvent(session.sender, {
+          runId,
+          threadId: session.threadId,
+          type: 'activity',
+          activity: claudeSteerActivity([{ text }]),
+        });
+        return true;
       }
-
-      // The control response can arrive before the interrupted `result` that
-      // releases the FIFO owner. The explicit settlement signal makes the
-      // timeout atomic with finalize/teardown; polling the array left a race
-      // where finalize could suppress the boundary just after a timeout had
-      // decided to fall back.
-      const boundaryReleased = await Promise.race([
-        steerBoundary,
-        new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
-      ]);
-      if (
-        boundaryReleased !== true ||
-        session.ended ||
-        session.disposed ||
-        claudeSdkSessions.get(session.threadId) !== session
-      ) {
-        // Let a late result settle normally if the interrupt acknowledgement
-        // did not produce a boundary. The renderer will queue the steer, so
-        // no instruction is lost and no empty continuation bubble is opened.
-        if (session.pendingSteerBoundary === activeOwner) {
-          session.pendingSteerBoundary = null;
-        }
-        activeOwner.resolveSteerBoundary = null;
-        return false;
-      }
-
-      const continuation = createClaudeTurnState(runId, activeOwner.snapshot);
-      // Changed-file attribution spans both halves of the visible run. Carry
-      // explicit tool writes forward because the intermediate boundary was
-      // intentionally hidden from the renderer.
-      for (const filePath of activeOwner.toolWrittenPaths) {
-        continuation.toolWrittenPaths.add(filePath);
-      }
-      session.pendingSteerBoundary = null;
-      session.activeTurns.push(continuation);
-      updateClaudeBackgroundSettle(session);
-      flushPendingClaudeTaskNotifications(session, continuation);
-      session.pushUserMessage(text, { content });
+      session.steerInbox ??= [];
+      session.steerInbox.push({ runId, text, content });
+      releaseClaudeBlockingCalls(session);
       return true;
     }
     openClaudeBackgroundTurn(session, runId, 'claude — steered background work');
@@ -2759,6 +2949,9 @@ export const interruptClaudeSdkRun = async (runId, { terminateBackground = false
   for (const session of claudeSdkSessions.values()) {
     if (session.activeTurns.some((turn) => turn.runId === runId)) {
       session.userInputs?.cancelAll();
+      // Stopped: messages steered into this run go with it (the renderer
+      // cancels its own pending steers on Stop too).
+      session.steerInbox = (session.steerInbox ?? []).filter((steer) => steer.runId !== runId);
       // The CLI owes no results: nothing is running, so there is nothing to
       // interrupt and the queued turns can never finalize on their own (a
       // legacy dangling turn, e.g. opened by a task_notification that never
@@ -2795,11 +2988,11 @@ export const interruptClaudeSdkRun = async (runId, { terminateBackground = false
         await disposeClaudeSdkSessionAndWait(session.threadId);
         return true;
       }
-      // Steer: interrupt the turn in place; the session and any background
+      // Interrupt the turn in place; the session and any background
       // subagents it spawned keep running. Await the CLI's acknowledgement so
-      // the steer's follow-up prompt (pushed right after stopTurn resolves)
-      // can't race the interrupt and be swallowed with the aborted turn —
-      // but cap the wait so a wedged process can never hang the renderer.
+      // a follow-up prompt (pushed right after stopTurn resolves) can't race
+      // the interrupt and be swallowed with the aborted turn — but cap the
+      // wait so a wedged process can never hang the renderer.
       try {
         await Promise.race([
           session.query?.interrupt?.(),
@@ -2937,6 +3130,8 @@ export const evictIdleClaudeSdkSessions = (now = Date.now()) => {
     if (session.ended || session.disposed) continue;
     if (session.activeTurns.length > 0 || session.resultsOwed > 0) continue;
     if (pendingClaudeBackgroundTasks(session).length > 0) continue;
+    // A subagent a steer stopped the wait on still owes this session its report.
+    if (session.detachedReportsDue > 0) continue;
     if (now - session.lastActivityAt < CLAUDE_SESSION_IDLE_EVICT_MS) continue;
     // dispose() aborts the SDK query; the pump loop then runs
     // endClaudeSession, which removes the session from the map and settles

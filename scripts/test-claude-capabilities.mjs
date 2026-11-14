@@ -77,6 +77,24 @@ try {
   const stopped = requests.canUseTool('AskUserQuestion', input);
   requests.cancelAll();
   assert.equal((await stopped).behavior, 'deny');
+  // A steer answers the main loop's card with the user's message; a
+  // subagent's card stays for the user.
+  const mainAsk = requests.canUseTool('AskUserQuestion', input, {});
+  const subagentAsk = requests.canUseTool('Bash', { command: 'rm -rf build' }, { agentID: 'agent-1' });
+  assert.equal(requests.declineMainLoop('The user sent a new message: do X instead'), true);
+  assert.deepEqual(await mainAsk, { behavior: 'deny', message: 'The user sent a new message: do X instead' });
+  assert.equal(requests.list().length, 1, "the subagent's approval is still waiting");
+  assert.equal(requests.declineMainLoop('again'), false, 'no main-loop card left');
+  requests.cancelAll();
+  assert.equal((await subagentAsk).behavior, 'deny');
+  // A card opened while a steer waits is answered by it at once.
+  session.takeSteerReply = () => 'The user sent a new message: stop asking';
+  assert.deepEqual(await requests.canUseTool('AskUserQuestion', input, {}), { behavior: 'deny', message: 'The user sent a new message: stop asking' });
+  const subagentCard = requests.canUseTool('AskUserQuestion', input, { agentID: 'agent-1' });
+  assert.equal(requests.list().length, 1, "a subagent's card is not answered by the parent's steer");
+  requests.cancelAll();
+  await subagentCard;
+  delete session.takeSteerReply;
   session.sender = { isDestroyed: () => false, send: () => { throw new Error('window closed'); } };
   const windowRace = requests.canUseTool('AskUserQuestion', input);
   const stillPending = requests.list()[0];
@@ -100,7 +118,7 @@ try {
   sdkSession.dispose();
   claudeSdkSessions.delete('native');
   const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
-  assert.match(appSource, /\['kimi', 'claude', 'codex'\]\.includes\(model\.providerId\)[\s\S]{0,100}attachments: turnAttachments/, 'ordinary composer turns must forward attachment metadata to native providers');
+  assert.match(appSource, /\['kimi', 'fx', 'claude', 'codex'\]\.includes\(model\.providerId\)[\s\S]{0,100}attachments: turnAttachments/, 'ordinary composer turns must forward attachment metadata to native providers');
   for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
     assert.equal(claudeSdkOptionsForInput(model, { claudeReasoningEffort: effort }).effort, effort);
   }
