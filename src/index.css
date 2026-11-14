@@ -8160,6 +8160,42 @@ body {
 }
 .approval-explain-loading span:last-child { width: 62%; }
 @keyframes approval-shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+
+/* A remote thread whose transcript is still on its way from the other machine:
+   a user bubble and a few reply lines, shimmering, in place of the messages. */
+.chat-remote-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  animation: message-in 320ms var(--ease-out) both;
+}
+.chat-remote-loading span {
+  display: block;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--bg-surface) 0%, var(--bg-elevated) 50%, var(--bg-surface) 100%);
+  background-size: 200% 100%;
+  animation: approval-shimmer 1.4s ease-in-out infinite;
+}
+.chat-remote-loading .chat-remote-loading-bubble {
+  align-self: flex-end;
+  width: min(46%, 320px);
+  height: 44px;
+  margin-bottom: 14px;
+  border-radius: var(--radius-lg) var(--radius-lg) 4px var(--radius-lg);
+}
+.chat-remote-loading-line { width: 88%; height: 12px; }
+.chat-remote-loading-line.short { width: 54%; }
+/* Its machine can't be reached: the outline holds still, with a note. */
+.chat-remote-loading.unreachable span { animation: none; opacity: 0.6; }
+.chat-remote-loading-note {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-remote-loading,
+  .chat-remote-loading span { animation: none; }
+}
 .approval-reason {
   display: flex;
   align-items: flex-start;

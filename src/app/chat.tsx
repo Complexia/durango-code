@@ -655,6 +655,16 @@ export type PaneChatRefs = {
   chatScrollTopRef: React.MutableRefObject<number>;
 };
 
+/** Why a remote thread's machine can't send its copy now. */
+export type RemoteMachineUnreachable = 'offline' | 'unpaired' | 'disabled';
+
+const remoteUnreachableNote = (reason: RemoteMachineUnreachable, machineName: string) =>
+  reason === 'disabled'
+    ? `Remote control is off. Turn it on in Settings → Remote Control to load this thread from ${machineName}.`
+    : reason === 'unpaired'
+      ? `${machineName} isn't paired with this machine any more. Pair it again in Settings → Remote Control to load this thread.`
+      : `Waiting for ${machineName} to come online. This thread loads when it reconnects.`;
+
 export type ChatTranscriptProps = {
   threadId: string;
   projectName?: string | null;
@@ -665,6 +675,8 @@ export type ChatTranscriptProps = {
   agentModels?: AgentModel[];
   mediaBaseDirs: string[];
   isSending: boolean;
+  /** Why a thread on another machine can't load from it now; absent while it can. */
+  remoteMachineUnreachable?: RemoteMachineUnreachable;
   steerSupported: boolean;
   steerReady: boolean;
   authenticatingProviderId: string | null;
@@ -702,6 +714,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   agentModels,
   mediaBaseDirs,
   isSending,
+  remoteMachineUnreachable,
   steerSupported,
   steerReady,
   authenticatingProviderId,
@@ -738,6 +751,15 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   );
   // The thread's transcript. Everything below reads messages from here only.
   const messages = thread?.messages ?? NO_MESSAGES;
+  // A thread on another machine whose copy hasn't been read here yet (a
+  // subagent there opened for the first time, say): it fills in once that
+  // machine answers (useRemoteThreadSync). Until then it shows a skeleton,
+  // not "Starting agent..." for a run long under way, nor the empty-thread
+  // welcome. (A turn started from here already shows its message.)
+  const awaitingRemoteCopy =
+    Boolean(shell?.remote?.threadId) &&
+    messages.length === 0 &&
+    (isSending || (shell?.summary.messageCount ?? 0) > 0);
   const latestAgentRun = useMemo(() => {
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
@@ -1091,7 +1113,30 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       >
         <MarkdownBaseDirContext.Provider value={mediaBaseDirs}>
           <div className="chat-container">
-            {messages.length === 0 && (
+            {awaitingRemoteCopy && (
+              <div
+                className={`chat-remote-loading${remoteMachineUnreachable ? ' unreachable' : ''}`}
+                role="status"
+                aria-busy={!remoteMachineUnreachable}
+                aria-label={
+                  remoteMachineUnreachable
+                    ? undefined
+                    : `Loading this thread from ${shell?.remote?.machineName ?? 'the other machine'}`
+                }
+              >
+                <span className="chat-remote-loading-bubble" />
+                <span className="chat-remote-loading-line" />
+                <span className="chat-remote-loading-line" />
+                <span className="chat-remote-loading-line short" />
+                {/* Nothing to load until that changes: say what it waits for. */}
+                {remoteMachineUnreachable && (
+                  <p className="chat-remote-loading-note">
+                    {remoteUnreachableNote(remoteMachineUnreachable, shell?.remote?.machineName ?? 'the other machine')}
+                  </p>
+                )}
+              </div>
+            )}
+            {messages.length === 0 && !awaitingRemoteCopy && (
               <AgentsWelcome
                 projectName={projectName}
                 selectedProjectId={thread.projectId}
@@ -1143,6 +1188,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
             })}
 
             {isSending &&
+              !awaitingRemoteCopy &&
               messages.at(-1)?.role !== 'agent' &&
               messages.at(-1)?.kind !== 'claude-background-intervention' && (
               <div className="message agent opacity-70">Starting agent...</div>

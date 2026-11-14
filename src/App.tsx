@@ -184,6 +184,7 @@ import {
   ChatTranscript,
   isProviderAuthErrorText,
   type PaneChatRefs,
+  type RemoteMachineUnreachable,
 } from './app/chat';
 import { InlineRenameInput } from './app/fileTree';
 import {
@@ -3106,6 +3107,19 @@ const App: React.FC = () => {
   // stopped rather than running forever. Turning remote control back on and
   // reaching the machine brings its real status back.
   const remoteEngineReady = Boolean(remoteControlState && !remoteControlState.starting);
+  // Why a remote thread's copy can't come from its machine now; undefined
+  // while it can (connected, connecting) or the pairings are still loading.
+  const remoteMachineStatusById = useMemo(
+    () => new Map(remoteMachines.map((machine) => [machine.id, machine.status])),
+    [remoteMachines]
+  );
+  const remoteMachineUnreachableReason = (machineId: string): RemoteMachineUnreachable | undefined => {
+    if (!remoteEngineReady) return undefined;
+    if (!remoteControlSettings.enabled) return 'disabled';
+    const status = remoteMachineStatusById.get(machineId);
+    if (!status) return 'unpaired';
+    return status === 'offline' || status === 'error' ? 'offline' : undefined;
+  };
   useEffect(() => {
     if (!storeHydrated || (remoteControlSettings.enabled && !remoteEngineReady)) return;
     const paired = new Set(remoteControlSettings.enabled ? remoteMachines.map((machine) => machine.id) : []);
@@ -11207,6 +11221,11 @@ const App: React.FC = () => {
                               agentModels={agentModels}
                               mediaBaseDirs={pane.mediaBaseDirs}
                               isSending={pane.isSending}
+                              remoteMachineUnreachable={
+                                pane.thread.remote
+                                  ? remoteMachineUnreachableReason(pane.thread.remote.machineId)
+                                  : undefined
+                              }
                               steerSupported={pane.steerSupported}
                               steerReady={pane.steerReady}
                               authenticatingProviderId={authenticatingProviderId}
