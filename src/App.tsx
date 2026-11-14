@@ -7300,8 +7300,6 @@ const App: React.FC = () => {
           return { ok: false, error: resolved?.error ?? `Could not reach ${remote.machineName}.` };
         }
         hostProjectId = resolved.projectId;
-        // Say where it runs: the project there was matched, not chosen.
-        if (resolved.projectName) toast.message(`Running in ${resolved.projectName} on ${remote.machineName}`);
       }
       // That machine has made the new thread and is starting the agent
       // (workspace, process): point the mirror at it now, so the turn streams
