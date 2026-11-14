@@ -56,6 +56,7 @@ import { browseDirectories, resolveProjectDirectory } from './main/project-brows
 import { approvalExplainPrompt, approvalExplainTruncated, parseApprovalExplanation } from './main/approval-explainer.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, installDownloadedLinuxUpdate, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
+import { cancelClaudePromptCompletion, completeClaudePrompt, disposeClaudeAutocomplete } from './main/claude-autocomplete.js';
 import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, notifyClaudeSession, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { unwatchUserActions, watchUserAction } from './main/user-actions.js';
 import { answerSecretRequest, listPendingSecretRequests, startSecretFileSweeps } from './main/secret-requests.js';
@@ -1612,6 +1613,7 @@ const reapActiveAgentRuns = () => {
 // keep working invisibly: a fresh renderer cannot reattach to these runs.
 const disposeRendererBoundWork = () => {
   disposeAllClaudeSdkSessions();
+  disposeClaudeAutocomplete();
   disposeAllTerminalSessions();
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
@@ -1632,6 +1634,7 @@ const disposeForQuit = (reason = 'quit') => {
   appShutdownRequested = true;
   appShutdownReason ??= reason;
   disposeAllClaudeSdkSessions();
+  disposeClaudeAutocomplete();
   disposeAllTerminalSessions();
   disposeAllCodexGoalOps();
   disposeAllTitleGenerations();
@@ -4766,6 +4769,20 @@ ipcMain.handle('agent:listSlashCommands', async (event, input) =>
 // `/clear` in the composer: tear down only the thread's persistent Claude SDK
 // session (not the terminal PTY / goal ops that full thread disposal reaps),
 // so the next turn starts a fresh conversation.
+// Live composer autocomplete (Claude Haiku through Claude Code): the rest of
+// the prompt the user is typing. A new request supersedes the one in flight.
+ipcMain.handle('agent:completePrompt', (_event, input) =>
+  completeClaudePrompt({
+    draft: typeof input?.draft === 'string' ? input.draft : '',
+    context: Array.isArray(input?.context) ? input.context.slice(-12) : [],
+  })
+);
+ipcMain.handle('agent:cancelPromptCompletion', (_event, input) => {
+  if (input?.dispose) disposeClaudeAutocomplete();
+  else cancelClaudePromptCompletion();
+  return true;
+});
+
 ipcMain.handle('agent:clearClaudeSession', (_event, threadId) =>
   typeof threadId === 'string' && threadId ? disposeClaudeSdkSession(threadId) : false
 );

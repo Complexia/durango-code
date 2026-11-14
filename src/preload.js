@@ -119,6 +119,8 @@ contextBridge.exposeInMainWorld('orion', {
   // Claude slash commands (built-ins + .claude/commands + skills + plugins)
   listSlashCommands: (input) => ipcRenderer.invoke('agent:listSlashCommands', input),
   clearClaudeSession: (threadId) => ipcRenderer.invoke('agent:clearClaudeSession', threadId),
+  completePrompt: (input) => ipcRenderer.invoke('agent:completePrompt', input),
+  cancelPromptCompletion: (input) => ipcRenderer.invoke('agent:cancelPromptCompletion', input),
   onSlashCommands: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('agent:slashCommands', listener);

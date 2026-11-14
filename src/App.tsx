@@ -51,6 +51,7 @@ import {
   holdThreadTranscript,
   defaultProviderSettings,
   defaultOrchestrationSettings,
+  defaultComposerSettings,
   defaultNotificationSettings,
   defaultDurangoSettings,
   defaultDurangoDispatchSettings,
@@ -270,6 +271,30 @@ const threadFamilyIds = (threads: Thread[], rootId: string) => {
 // ensureThreadTranscript loads it).
 const loadedMessages = (threadId: string): Message[] | undefined =>
   useOrionStore.getState().transcripts[threadId]?.messages;
+
+// The last few exchanges of a thread, as live autocomplete's context. Long
+// messages keep their end, where a reply's summary and the latest ask are.
+const AUTOCOMPLETE_CONTEXT_MESSAGES = 6;
+const AUTOCOMPLETE_CONTEXT_MESSAGE_CHARS = 1500;
+const getAutocompleteContext = (threadId: string) =>
+  (loadedMessages(threadId) ?? [])
+    .filter(
+      (message) =>
+        (message.role === 'user' || message.role === 'agent') &&
+        message.kind !== 'claude-background-intervention' &&
+        message.content.trim()
+    )
+    .slice(-AUTOCOMPLETE_CONTEXT_MESSAGES)
+    .map((message) => {
+      const text = message.content.trim();
+      return {
+        role: message.role === 'user' ? ('user' as const) : ('agent' as const),
+        text:
+          text.length > AUTOCOMPLETE_CONTEXT_MESSAGE_CHARS
+            ? `…${text.slice(-AUTOCOMPLETE_CONTEXT_MESSAGE_CHARS)}`
+            : text,
+      };
+    });
 
 // How long a thread's queue waits after a queued message couldn't start.
 const QUEUE_RETRY_DELAY_MS = 30_000;
@@ -827,6 +852,8 @@ const App: React.FC = () => {
     setOrchestrationGeneralInstructions,
     notificationSettings,
     setNotificationSettings,
+    composerSettings,
+    setComposerSettings,
     textGenerationSettings,
     setTextGenerationSettings,
     setThreadAgentSession,
@@ -892,6 +919,8 @@ const App: React.FC = () => {
       setOrchestrationGeneralInstructions: state.setOrchestrationGeneralInstructions,
       notificationSettings: state.notificationSettings,
       setNotificationSettings: state.setNotificationSettings,
+      composerSettings: state.composerSettings,
+      setComposerSettings: state.setComposerSettings,
       textGenerationSettings: state.textGenerationSettings,
       setTextGenerationSettings: state.setTextGenerationSettings,
       setThreadAgentSession: state.setThreadAgentSession,
@@ -8955,6 +8984,8 @@ const App: React.FC = () => {
   const settingsPageModel: SettingsPageProps = {
     notificationSettings,
     setNotificationSettings,
+    composerSettings,
+    setComposerSettings,
     setTextGenerationSettings,
     splitViewSettings,
     setSplitViewSettings,
@@ -9842,13 +9873,11 @@ const App: React.FC = () => {
     dispatchReview(rawText, review)
   );
   const hideThreadDropHint = useCallback(() => setThreadDropActive(false), []);
-  const dismissPromptSuggestion = useCallback((threadId: string) => {
-    setPromptSuggestions((current) => {
-      if (!(threadId in current)) return current;
-      const { [threadId]: _dismissed, ...rest } = current;
-      return rest;
-    });
-  }, []);
+  const liveAutocomplete = composerSettings?.liveAutocomplete ?? defaultComposerSettings.liveAutocomplete;
+  // Turning live autocomplete off also closes its pre-warmed Claude process.
+  useEffect(() => {
+    if (!liveAutocomplete) void window.orion?.cancelPromptCompletion?.({ dispose: true }).catch(() => {});
+  }, [liveAutocomplete]);
   // Base branches the Codex "/review base" picker offers.
   const reviewBranches = useMemo(
     () => (gitState?.branches ?? []).filter((branch) => !branch.current).map((branch) => branch.name),
@@ -9999,7 +10028,8 @@ const App: React.FC = () => {
         onOpenAccountSettings={openAccountSettings}
         onThreadDragOver={hideThreadDropHint}
         promptSuggestion={promptSuggestions[selectedThread.id] ?? null}
-        onDismissPromptSuggestion={dismissPromptSuggestion}
+        liveAutocomplete={liveAutocomplete}
+        getAutocompleteContext={getAutocompleteContext}
       >
         <>
           <div className="model-picker-anchor" ref={modelPickerRef}>
