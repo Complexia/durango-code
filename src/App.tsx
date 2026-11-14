@@ -7219,6 +7219,10 @@ const App: React.FC = () => {
             duplicate.remote.machineId === remote.machineId &&
             duplicate.remote.threadId === hostThreadId
           ) {
+            // Its subagents' mirrors (listed with it) go under this one.
+            for (const child of useOrionStore.getState().threads) {
+              if (child.parentThreadId === duplicate.id) updateThread(child.id, { parentThreadId: threadId });
+            }
             useOrionStore.getState().deleteThread(duplicate.id);
           }
         }

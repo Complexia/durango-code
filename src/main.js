@@ -1963,11 +1963,12 @@ const listRemoteThreads = async ({ machineId } = {}) => {
   const localParentOf = (thread) =>
     (ownMachineId && thread.spawnedBy?.machineId === ownMachineId ? thread.spawnedBy.threadId : null) ??
     remoteThreadSpawner(String(machineId ?? ''), thread.id);
+  // Subagent threads come too (`parentThreadId` = their parent's id there):
+  // the store lists them under their parent's mirror, like subagents here.
   return {
     ok: true,
     machine: snapshot.snapshot.machine,
     threads: (snapshot.snapshot.threads ?? [])
-      .filter((thread) => !thread.parentThreadId && !thread.subagent)
       .map((thread) => {
         const hostProject = hostProjects.get(thread.projectId);
         return {

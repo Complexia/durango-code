@@ -382,6 +382,8 @@ export type RemoteThreadMeta = {
   projectId: string;
   parentThreadId: string | null;
   subagent: boolean;
+  /** A provider-native subagent's type (Explore, …); newer hosts only. */
+  subagentKind?: string;
   /** Started by an agent on a paired machine (machine_run_agent), from its thread there. */
   spawnedBy?: { machineId: string; threadId: string };
   title: string;

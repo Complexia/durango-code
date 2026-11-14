@@ -1655,6 +1655,10 @@ const buildSnapshot = async () => {
           projectId: shell.projectId,
           parentThreadId: shell.parentThreadId ?? null,
           subagent: Boolean(shell.subagent),
+          // Its type (Explore, general-purpose, …), for a controller's subagent switcher.
+          ...(typeof shell.subagent?.kind === 'string' && shell.subagent.kind
+            ? { subagentKind: shell.subagent.kind.slice(0, 200) }
+            : {}),
           // Started by an agent on a paired machine: that machine lists it
           // under the thread there instead of in its sidebar.
           ...(typeof shell.spawnedBy?.machineId === 'string' && typeof shell.spawnedBy?.threadId === 'string'
@@ -1672,8 +1676,9 @@ const buildSnapshot = async () => {
               : Array.isArray(shell.messages) ? shell.messages.length : 0,
         };
         // Subagent threads ride along for clients that show them under their
-        // parent (app.durango.sh); the details below are for listing threads
-        // in a controller's sidebar, which never lists them.
+        // parent (app.durango.sh, a desktop's subagent switcher); the details
+        // below are for listing threads in a controller's sidebar, which
+        // never lists them.
         if (base.parentThreadId || base.subagent) return base;
         const userActions = actionsByRoot.get(shell.id) ?? [];
         return {

@@ -783,6 +783,14 @@ export type RemoteThreadListing = {
   projectName: string | null;
   /** The thread here whose agent started it there (machine_run_agent): it shows as its subagent. */
   localParentThreadId?: string | null;
+  /**
+   * A subagent of one of that machine's threads: the parent's id there (not
+   * here). It is listed under the parent's mirror, not in the sidebar.
+   */
+  parentThreadId?: string | null;
+  /** A provider-native subagent there (read-only), and its type. */
+  subagent?: boolean;
+  subagentKind?: string;
 };
 
 /** What the other machine says the thread waits on the user for, as a mirror patch. */
@@ -849,6 +857,37 @@ const summaryAhead = (a: ThreadSummary, b: ThreadSummary) => {
  * that machine has moved on, and it keeps the worked time and last run this
  * machine already knows (it has none of its own).
  */
+// The id there of the thread `entry` is a subagent of, if any.
+const remoteListingParentOf = (entry: RemoteThreadListing): string | null =>
+  typeof entry.parentThreadId === 'string' && entry.parentThreadId && entry.parentThreadId !== entry.id
+    ? entry.parentThreadId
+    : null;
+
+/**
+ * A machine's listing with each thread after the thread it is a subagent of
+ * (subagents can have subagents), so a parent's mirror exists before its
+ * subagents are filed under it. Subagents of threads not in the listing (or
+ * in a cycle) come last.
+ */
+export const remoteListingParentsFirst = (listed: RemoteThreadListing[]): RemoteThreadListing[] => {
+  const valid = listed.filter((entry) => entry && typeof entry.id === 'string');
+  const ordered: RemoteThreadListing[] = [];
+  const placed = new Set<string>();
+  let pending = valid;
+  for (;;) {
+    const next: RemoteThreadListing[] = [];
+    for (const entry of pending) {
+      const parentId = remoteListingParentOf(entry);
+      if (!parentId || placed.has(parentId)) {
+        ordered.push(entry);
+        placed.add(entry.id);
+      } else next.push(entry);
+    }
+    if (next.length === 0 || next.length === pending.length) return [...ordered, ...next];
+    pending = next;
+  }
+};
+
 const listedMirrorSummary = (entry: RemoteThreadListing, current: ThreadSummary): ThreadSummary | null => {
   const listed = remoteListingSummary(entry);
   if (hasListedSummary(entry)) return sameThreadSummary(listed, current) ? null : listed;
@@ -2435,18 +2474,43 @@ export const useOrionStore = create<OrionState>()(
             typeof entry.localParentThreadId === 'string' && localIds.has(entry.localParentThreadId)
               ? entry.localParentThreadId
               : undefined;
-          for (const entry of listed) {
-            if (!entry || typeof entry.id !== 'string') continue;
+          // A subagent of a thread there goes under that thread's mirror
+          // here (in its subagent switcher, not the sidebar), so parents are
+          // handled before their subagents. `mirrorOf`: a thread's mirror
+          // here by its id there, those added below included.
+          const mirrorOf = new Map<string, Thread>();
+          for (const [hostId, index] of mirrors) mirrorOf.set(hostId, state.threads[index]);
+          for (const entry of remoteListingParentsFirst(listed)) {
             listedIds.add(entry.id);
+            const hostParentId = remoteListingParentOf(entry);
+            const parentMirror = hostParentId ? mirrorOf.get(hostParentId) : undefined;
+            // Its parent isn't listed here (deleted here, a draft there):
+            // neither is it.
+            if (hostParentId && !parentMirror) continue;
+            const nativeSubagent =
+              parentMirror && entry.subagent
+                ? {
+                    id: entry.id,
+                    providerId: (entry.modelId?.split(':')[0] || 'claude') as ProviderId,
+                    ...(entry.subagentKind ? { kind: entry.subagentKind } : {}),
+                  }
+                : undefined;
             const index = mirrors.get(entry.id);
             if (index !== undefined) {
               const current = threads[index];
               if (skip.has(current.id)) continue;
               const patch: Partial<Thread> = {};
+              // A subagent there follows its parent's mirror here (which may
+              // have been replaced since: a duplicate dropped after a turn
+              // started from here).
+              if (parentMirror && current.parentThreadId !== parentMirror.id && parentMirror.id !== current.id) {
+                patch.parentThreadId = parentMirror.id;
+              }
               const parentThreadId = localParentOf(entry);
-              if (parentThreadId && !current.parentThreadId && parentThreadId !== current.id) {
+              if (!parentMirror && parentThreadId && !current.parentThreadId && parentThreadId !== current.id) {
                 patch.parentThreadId = parentThreadId;
               }
+              if (nativeSubagent && !current.subagent) patch.subagent = nativeSubagent;
               // A rename here stands until that machine renames it.
               if (
                 entry.title &&
@@ -2493,8 +2557,8 @@ export const useOrionStore = create<OrionState>()(
               continue;
             }
             // That machine's untouched drafts stay there; so do threads
-            // deleted here.
-            if (entry.messageCount === 0 || dismissed.has(entry.id)) continue;
+            // deleted here. (A subagent there is listed from its start.)
+            if ((entry.messageCount === 0 && !parentMirror) || dismissed.has(entry.id)) continue;
             const settings = Object.fromEntries(
               REMOTE_SETTING_KEYS.filter((key) => typeof entry.settings?.[key] === 'string').map((key) => [
                 key,
@@ -2508,15 +2572,20 @@ export const useOrionStore = create<OrionState>()(
               accessMode: 'read-only' as const,
               ...settings,
               id: crypto.randomUUID(),
-              projectId: entry.localProjectId ?? NO_PROJECT_ID,
+              projectId: parentMirror?.projectId ?? entry.localProjectId ?? NO_PROJECT_ID,
               title: entry.title || 'Thread',
               status: entry.status ?? 'idle',
               modelId: entry.modelId,
               createdAt: entry.createdAt,
               summary: remoteListingSummary(entry),
               ...(entry.settledAt ? { settledAt: entry.settledAt } : {}),
-              ...(entry.hiddenFromRecent ? { hiddenFromRecent: true } : {}),
-              ...(localParentOf(entry) ? { parentThreadId: localParentOf(entry) } : {}),
+              ...(entry.hiddenFromRecent || parentMirror ? { hiddenFromRecent: true } : {}),
+              ...(parentMirror
+                ? { parentThreadId: parentMirror.id }
+                : localParentOf(entry)
+                  ? { parentThreadId: localParentOf(entry) }
+                  : {}),
+              ...(nativeSubagent ? { subagent: nativeSubagent } : {}),
               ...(entry.userActions?.length ? { userActions: entry.userActions } : {}),
               remote: {
                 machineId: machine.id,
@@ -2529,7 +2598,9 @@ export const useOrionStore = create<OrionState>()(
                 imported: true,
               },
             } satisfies Thread;
-            added.push({ ...shell, remote: { ...shell.remote, hostSettings: remoteSettingsOf(shell) } });
+            const mirror = { ...shell, remote: { ...shell.remote, hostSettings: remoteSettingsOf(shell) } };
+            added.push(mirror);
+            mirrorOf.set(entry.id, mirror);
           }
           // A thread that machine deleted goes here too, unless it is open or
           // running (kept current one by one) or was started from here. An

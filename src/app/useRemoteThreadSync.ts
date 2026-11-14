@@ -155,15 +155,36 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
         const latestRemote = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.remote;
         if (latestRemote) settingsPatch.remote = { ...latestRemote, hostSettings: adopted.hostSettings, hostTitle };
       }
+      // A provider-native subagent there (listed under its parent's mirror):
+      // its type, prompt and report, which the listing leaves out.
+      const hostSubagent = (host as { subagent?: Thread['subagent'] }).subagent;
+      if (
+        current.parentThreadId &&
+        hostSubagent &&
+        typeof hostSubagent.id === 'string' &&
+        typeof hostSubagent.providerId === 'string' &&
+        JSON.stringify(hostSubagent) !== JSON.stringify(current.subagent ?? null)
+      ) {
+        settingsPatch.subagent = hostSubagent;
+      }
       // The actions it waits on the user for there (request_user_action).
       // Its subagents' too, as that machine rolls them up (older hosts: its own).
+      // A subagent there whose parent is mirrored here keeps none: that
+      // machine rolls them up to the thread it lists, whose mirror has them,
+      // and a second copy would show every card twice.
+      const parentMirror = current.parentThreadId
+        ? state.threads.find((candidate) => candidate.id === current.parentThreadId)
+        : undefined;
+      const rolledUpThere = parentMirror?.remote?.machineId === remote.machineId;
       const attention = remoteAttentionPatch(
         { userActions: current.userActions, remote: settingsPatch.remote ?? current.remote },
-        Array.isArray(result.pendingUserActions)
-          ? result.pendingUserActions
-          : Array.isArray(host.userActions)
-            ? host.userActions
-            : undefined,
+        rolledUpThere
+          ? undefined
+          : Array.isArray(result.pendingUserActions)
+            ? result.pendingUserActions
+            : Array.isArray(host.userActions)
+              ? host.userActions
+              : undefined,
         Boolean(current.remote.needsInputSince)
       );
       // A run that ended there lets the thread's queued follow-ups go out

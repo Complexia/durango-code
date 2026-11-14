@@ -139,6 +139,93 @@ console.log('ok  threads that machine deleted leave this list');
   console.log('ok  threads an agent here started there are its subagents');
 }
 
+// A thread there with subagents (provider-native or spawned there): they are
+// listed under its mirror here, in its subagent switcher, not the sidebar,
+// even when the listing names a subagent before its parent.
+{
+  const subagentListing = (id: string, parentThreadId: string, extra: Record<string, unknown> = {}) =>
+    listing(id, {
+      parentThreadId,
+      subagent: true,
+      summary: undefined,
+      settings: undefined,
+      localProjectId: null,
+      projectName: 'durango',
+      ...extra,
+    });
+  sync([
+    listing('h1'),
+    listing('h2'),
+    subagentListing('sub-of-sub', 'sub1', { subagentKind: 'general-purpose', modelId: 'codex:gpt-5.5' }),
+    subagentListing('sub1', 'p1', { subagentKind: 'Explore', messageCount: 0, status: 'running' }),
+    subagentListing('spawned-there', 'p1', { subagent: false }),
+    subagentListing('parent-not-here', 'gone-here'),
+    listing('p1'),
+  ], new Set(), new Set(['gone-here']));
+  const p1 = mirrors().find((thread) => thread.remote?.threadId === 'p1')!;
+  const sub1 = mirrors().find((thread) => thread.remote?.threadId === 'sub1')!;
+  assert.ok(sub1, 'a subagent that has only just started is listed');
+  assert.equal(sub1.parentThreadId, p1.id, 'under its parent’s mirror');
+  assert.equal(sub1.projectId, p1.projectId, 'in its parent’s project');
+  assert.equal(sub1.hiddenFromRecent, true);
+  assert.equal(sub1.status, 'running');
+  assert.deepEqual(sub1.subagent, { id: 'sub1', providerId: 'claude', kind: 'Explore' }, 'read-only, with its type');
+  const subOfSub = mirrors().find((thread) => thread.remote?.threadId === 'sub-of-sub')!;
+  assert.equal(subOfSub.parentThreadId, sub1.id, 'a subagent’s subagent goes under it');
+  assert.equal(subOfSub.subagent?.providerId, 'codex');
+  const spawnedThere = mirrors().find((thread) => thread.remote?.threadId === 'spawned-there')!;
+  assert.equal(spawnedThere.parentThreadId, p1.id);
+  assert.equal(spawnedThere.subagent, undefined, 'a thread spawned there (not provider-native) can be written to');
+  assert.equal(
+    mirrors().some((thread) => thread.remote?.threadId === 'parent-not-here'),
+    false,
+    'a subagent of a thread not listed here is not listed either'
+  );
+
+  // Kept current like other mirrors, and not duplicated.
+  const family = () =>
+    mirrors().filter((thread) => ['p1', 'sub1', 'sub-of-sub', 'spawned-there'].includes(thread.remote?.threadId ?? ''));
+  sync([
+    listing('h1'),
+    listing('h2'),
+    listing('p1'),
+    subagentListing('sub1', 'p1', { subagentKind: 'Explore', messageCount: 3, status: 'done' }),
+    subagentListing('sub-of-sub', 'sub1'),
+    subagentListing('spawned-there', 'p1', { subagent: false }),
+  ]);
+  assert.equal(family().length, 4);
+  assert.equal(mirrors().find((thread) => thread.id === sub1.id)?.status, 'done');
+
+  // Its parent's mirror replaced (a duplicate dropped once a turn started
+  // here got its id there): the next listing puts it back under the parent.
+  useOrionStore.getState().updateThread(sub1.id, { parentThreadId: 'deleted-duplicate' });
+  sync([
+    listing('h1'),
+    listing('h2'),
+    listing('p1'),
+    subagentListing('sub1', 'p1'),
+    subagentListing('sub-of-sub', 'sub1'),
+    subagentListing('spawned-there', 'p1', { subagent: false }),
+  ]);
+  assert.equal(mirrors().find((thread) => thread.id === sub1.id)?.parentThreadId, p1.id);
+
+  // Deleted here (the parent, which takes its subagents): kept out.
+  for (const id of [p1.id, sub1.id, subOfSub.id, spawnedThere.id]) {
+    useOrionStore.setState((state) => ({ threads: state.threads.filter((thread) => thread.id !== id) }));
+  }
+  sync(
+    [listing('h1'), listing('h2'), subagentListing('sub1', 'p1'), subagentListing('sub-of-sub', 'sub1'), listing('p1')],
+    new Set(),
+    new Set(['p1'])
+  );
+  assert.equal(
+    mirrors().some((thread) => ['p1', 'sub1', 'sub-of-sub'].includes(thread.remote?.threadId ?? '')),
+    false,
+    'a parent deleted here keeps its subagents out'
+  );
+  console.log('ok  a thread there lists its subagents under its mirror here');
+}
+
 // A new thread in a project with no threads takes the model last run on this
 // machine, not a fixed default.
 {

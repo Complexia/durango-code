@@ -170,8 +170,11 @@ export const AgentFamilySwitcher: React.FC<{
       ? 'main'
       : thread.subagent?.kind ??
         thread.inheritedSubagent?.kind ??
-        // Started on another machine (machine_run_agent): say where.
-        (thread.remote ? `${thread.remote.machineName} · ${modelName}` : modelName);
+        // Started on another machine (machine_run_agent): say where. (Not
+        // for a subagent there of a thread there: the whole family is.)
+        (thread.remote && root.remote?.machineId !== thread.remote.machineId
+          ? `${thread.remote.machineName} · ${modelName}`
+          : modelName);
     const detail = thread.title;
     return (
       <button
