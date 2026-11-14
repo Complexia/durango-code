@@ -137,6 +137,7 @@ import {
   pendingUserActions,
   sidebarRootThread,
   sidebarV2ThreadLists,
+  subagentQuestionSources,
   threadsAwaitingUserAction,
   useStableIdList,
   useThreadsNeedingInput,
@@ -1262,6 +1263,24 @@ const App: React.FC = () => {
     () => selectedThreadUserActionsNow,
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [selectedThreadUserActionsKey]
+  );
+  // Its running subagents' questions show above its composer too.
+  const selectedThreadQuestionSubagentsNow = selectedThreadId ? subagentQuestionSources(threads, selectedThreadId) : [];
+  const selectedThreadQuestionSubagentsKey = JSON.stringify(selectedThreadQuestionSubagentsNow);
+  const selectedThreadQuestionSubagents = useMemo(
+    () => selectedThreadQuestionSubagentsNow,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [selectedThreadQuestionSubagentsKey]
+  );
+  // A thread on another machine by its id there (names the subagent there
+  // that asked a question).
+  const remoteThreadTitle = useCallback(
+    (machineId: string, hostThreadId: string) =>
+      useOrionStore
+        .getState()
+        .threads.find((thread) => thread.remote?.machineId === machineId && thread.remote.threadId === hostThreadId)
+        ?.title,
+    []
   );
   const selectedThreadProject = selectedThreadContext.project;
   const selectedThreadWorkspacePending = selectedThreadContext.workspacePending;
@@ -10085,6 +10104,8 @@ const App: React.FC = () => {
         threadId={selectedThread.id}
         onAsyncAnswer={answerAsyncQuestion}
         explainApproval={explainApproval}
+        subagents={selectedThreadQuestionSubagents}
+        remoteTitle={remoteThreadTitle}
         remote={
           selectedThread.remote?.threadId
             ? {

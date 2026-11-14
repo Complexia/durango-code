@@ -269,83 +269,150 @@ const QuestionCard = ({
 // its push events was missed.
 const REMOTE_QUESTION_POLL_MS = 20_000;
 
+/**
+ * A running subagent of the open thread whose questions show on it too (like
+ * its "Needs you" action cards), so a question asked deep in a family is
+ * answered where the user is looking. `remote`: it runs on another machine.
+ */
+export type SubagentQuestionSource = { threadId: string; title: string; remote?: RemoteQuestionSource };
+
+type Source = { threadId: string; title?: string; remote?: RemoteQuestionSource };
+type Pending = { request: CodexQuestionRequest; remote?: RemoteQuestionSource; from?: string };
+
+const sourceKey = (source: Source) =>
+  source.remote ? `${source.remote.machineId}:${source.remote.threadId}` : `local:${source.threadId}`;
+
 export const CodexQuestions = ({
   threadId,
   onAsyncAnswer,
   remote,
+  subagents,
+  remoteTitle,
   explainApproval,
 }: {
   threadId: string;
   onAsyncAnswer?: AsyncAnswerHandler;
   remote?: RemoteQuestionSource;
+  /** Running subagents (any depth) whose questions show here too. */
+  subagents?: SubagentQuestionSource[];
+  /**
+   * The title of a thread on another machine, by its id there: names the
+   * subagent there that asked (that machine lists its subagents' questions
+   * with the thread's own).
+   */
+  remoteTitle?: (machineId: string, hostThreadId: string) => string | undefined;
   /** Writes the approval card's plain-English "What it will do"; absent without a text-generation model. */
   explainApproval?: ExplainApproval;
 }) => {
-  const [requests, setRequests] = useState<CodexQuestionRequest[]>([]);
+  const [pending, setPending] = useState<Pending[]>([]);
   const [revision, setRevision] = useState(0);
-  const remoteMachineId = remote?.machineId;
-  const remoteThreadId = remote?.threadId;
+  const sources: Source[] = [{ threadId, remote }, ...(subagents ?? [])];
+  const sourcesKey = sources.map((source) => `${sourceKey(source)}\u0000${source.title ?? ''}`).join('\u0001');
+  const sourcesRef = useRef(sources);
+  sourcesRef.current = sources;
+  const remoteTitleRef = useRef(remoteTitle);
+  remoteTitleRef.current = remoteTitle;
   useEffect(() => {
     let disposed = false;
     let generation = 0;
-    const refresh = async () => {
-      const current = ++generation;
-      try {
-        let pending: CodexQuestionRequest[];
-        if (remoteMachineId && remoteThreadId) {
-          const result = await window.orion?.remoteListQuestions?.({ machineId: remoteMachineId, threadId: remoteThreadId });
-          if (!result?.ok) return;
-          pending = result.questions ?? [];
-        } else {
-          const [codex, claude] = await Promise.all([
-            window.orion?.getCodexQuestions?.(threadId),
-            window.orion?.getClaudeQuestions?.(threadId),
-          ]);
-          pending = [...(codex ?? []), ...(claude ?? [])];
-        }
-        if (!disposed && current === generation) setRequests(pending ?? []);
-      } catch {
-        // Keep existing answers available during a transient IPC failure.
+    const current = sourcesRef.current;
+    const read = async (source: Source, own: boolean): Promise<Pending[]> => {
+      if (source.remote) {
+        const result = await window.orion?.remoteListQuestions?.({
+          machineId: source.remote.machineId,
+          threadId: source.remote.threadId,
+        });
+        if (!result?.ok) throw new Error('unreachable');
+        // That machine sends the thread's questions and its subagents' there.
+        return (result.questions ?? []).map((request) => ({
+          request,
+          remote: source.remote,
+          from:
+            request.threadId !== source.remote!.threadId
+              ? (remoteTitleRef.current?.(source.remote!.machineId, request.threadId) ?? 'a subagent')
+              : own
+                ? undefined
+                : source.title,
+        }));
       }
+      const [codex, claude] = await Promise.all([
+        window.orion?.getCodexQuestions?.(source.threadId),
+        window.orion?.getClaudeQuestions?.(source.threadId),
+      ]);
+      return [...(codex ?? []), ...(claude ?? [])]
+        .filter((request) => request.threadId === source.threadId)
+        .map((request) => ({ request, from: own ? undefined : source.title }));
     };
-    let unsubscribe: (() => void) | undefined;
-    let poll: number | undefined;
-    if (remoteMachineId && remoteThreadId) {
-      unsubscribe = window.orion?.onRemoteEvent?.((event) => {
-        if (event.machineId !== remoteMachineId || event.kind !== 'turnEvent') return;
-        const payload = event.payload;
-        if (payload?.threadId === remoteThreadId && ['user-input', 'done', 'error'].includes(payload.type ?? '')) {
-          void refresh();
+    // What each source last listed: one that can't be read right now keeps
+    // its questions (a transient IPC or network failure).
+    const known = new Map<string, Pending[]>();
+    const refresh = async () => {
+      const mine = ++generation;
+      const results = await Promise.all(
+        current.map((source, index) =>
+          read(source, index === 0).then(
+            (list) => ({ key: sourceKey(source), list }),
+            () => ({ key: sourceKey(source), list: null })
+          )
+        )
+      );
+      if (disposed || mine !== generation) return;
+      for (const { key, list } of results) if (list) known.set(key, list);
+      const seen = new Set<string>();
+      const next: Pending[] = [];
+      for (const source of current) {
+        for (const item of known.get(sourceKey(source)) ?? []) {
+          const id = `${item.remote?.machineId ?? 'local'}:${item.request.runId}:${item.request.requestId}`;
+          if (seen.has(id)) continue;
+          seen.add(id);
+          next.push(item);
         }
-      });
+      }
+      setPending(next);
+    };
+    const localIds = new Set(current.filter((source) => !source.remote).map((source) => source.threadId));
+    const machineIds = new Set(current.flatMap((source) => (source.remote ? [source.remote.machineId] : [])));
+    const unsubscribers: Array<(() => void) | undefined> = [];
+    let poll: number | undefined;
+    if (machineIds.size > 0) {
+      // A subagent there names its own thread: any of that machine's
+      // question events may be one of these.
+      unsubscribers.push(
+        window.orion?.onRemoteEvent?.((event) => {
+          if (!machineIds.has(event.machineId) || event.kind !== 'turnEvent') return;
+          if (['user-input', 'done', 'error'].includes(event.payload?.type ?? '')) void refresh();
+        })
+      );
       poll = window.setInterval(() => void refresh(), REMOTE_QUESTION_POLL_MS);
-    } else {
-      unsubscribe = window.orion?.onAgentTurnEvent?.((event) => {
-        if (event.threadId === threadId && ['user-input', 'done', 'error'].includes(event.type)) void refresh();
-      });
+    }
+    if (localIds.size > 0) {
+      unsubscribers.push(
+        window.orion?.onAgentTurnEvent?.((event) => {
+          if (localIds.has(event.threadId) && ['user-input', 'done', 'error'].includes(event.type)) void refresh();
+        })
+      );
     }
     void refresh();
     return () => {
       disposed = true;
-      unsubscribe?.();
+      for (const unsubscribe of unsubscribers) unsubscribe?.();
       if (poll !== undefined) window.clearInterval(poll);
     };
-  }, [threadId, remoteMachineId, remoteThreadId, revision]);
-  // That machine's requests name its own thread id.
-  const ownerThreadId = remoteThreadId ?? threadId;
-  const visible = requests.filter((request) => request.threadId === ownerThreadId);
-  if (!visible.length) return null;
+  }, [sourcesKey, revision]);
+  if (!pending.length) return null;
   return (
     <div className="codex-questions" aria-label="Agent questions and approvals">
-      {visible.map((request) => (
-        <QuestionCard
-          key={`${request.runId}:${request.requestId}`}
-          request={request}
-          refresh={() => setRevision((value) => value + 1)}
-          onAsyncAnswer={onAsyncAnswer}
-          remote={remote}
-          explain={explainApproval}
-        />
+      {pending.map(({ request, remote: requestRemote, from }) => (
+        <div key={`${requestRemote?.machineId ?? 'local'}:${request.runId}:${request.requestId}`}>
+          {from && <div className="codex-question-from">From subagent {from}</div>}
+          <QuestionCard
+            request={request}
+            refresh={() => setRevision((value) => value + 1)}
+            onAsyncAnswer={onAsyncAnswer}
+            remote={requestRemote}
+            explain={explainApproval}
+          />
+        </div>
       ))}
     </div>
   );

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { type Thread, type UserAction } from '../store';
+import type { SubagentQuestionSource } from './CodexQuestions';
 import { workStartedAt } from '../thread-shell.js';
 import { getThreadActivityTime } from './time';
 
@@ -240,6 +241,49 @@ export const pendingUserActions = (threads: Thread[], threadId: string): Pending
       (thread.userActions ?? []).map((action) => ({ ...action, threadId: thread.id, threadTitle: thread.title }))
     )
     .sort((a, b) => Date.parse(a.requestedAt) - Date.parse(b.requestedAt));
+};
+
+/**
+ * The running subagents of `threadId` (at any depth) whose questions and
+ * approvals show above its composer too, the way their action cards do, each
+ * with where to read them. Left out: a provider's own subagents (their
+ * questions come through their parent's session), and a subagent on another
+ * machine whose parent runs there too (that machine lists it with its parent's
+ * questions).
+ */
+export const subagentQuestionSources = (threads: Thread[], threadId: string): SubagentQuestionSource[] => {
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  const ids = new Set([threadId]);
+  const family: Thread[] = [];
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const thread of threads) {
+      if (thread.parentThreadId && ids.has(thread.parentThreadId) && !ids.has(thread.id)) {
+        ids.add(thread.id);
+        family.push(thread);
+        grew = true;
+      }
+    }
+  }
+  return family
+    .filter((thread) => thread.status === 'running' && !thread.subagent)
+    .flatMap((thread): SubagentQuestionSource[] => {
+      if (!thread.remote) return [{ threadId: thread.id, title: thread.title }];
+      if (!thread.remote.threadId) return [];
+      const parent = thread.parentThreadId ? byId.get(thread.parentThreadId) : undefined;
+      if (parent?.remote?.machineId === thread.remote.machineId) return [];
+      return [
+        {
+          threadId: thread.id,
+          title: thread.title,
+          remote: {
+            machineId: thread.remote.machineId,
+            machineName: thread.remote.machineName,
+            threadId: thread.remote.threadId,
+          },
+        },
+      ];
+    });
 };
 
 /** Stable Set identity for an id list, so memoized consumers don't churn. */

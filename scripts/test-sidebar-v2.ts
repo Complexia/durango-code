@@ -20,6 +20,7 @@ const {
   mergeAttentionSince,
   pendingUserActions,
   sidebarV2ThreadLists,
+  subagentQuestionSources,
   threadSidebarTone,
   threadWorkedMs,
   threadsAwaitingUserAction,
@@ -287,6 +288,29 @@ assert.deepEqual(
   'the driver shows its subagents\' actions, oldest first'
 );
 assert.deepEqual(pendingUserActions(actionThreads, 'quiet'), []);
+
+// Questions of a thread's running subagents show on it too: local ones, and
+// ones on another machine unless that machine lists them with their parent.
+const omarchy = (threadId: string) => ({ machineId: 'm1', machineName: 'omarchy', threadId });
+const questionThreads = [
+  make('lead', {}),
+  make('local-sub', { parentThreadId: 'lead', status: 'running', title: 'Local helper' }),
+  make('local-done', { parentThreadId: 'lead', status: 'done' }),
+  make('native', { parentThreadId: 'lead', status: 'running', subagent: { id: 'n1', providerId: 'claude' } }),
+  make('remote-sub', { parentThreadId: 'lead', status: 'running', title: 'On omarchy', remote: omarchy('h1') }),
+  make('remote-sub-sub', { parentThreadId: 'remote-sub', status: 'running', remote: omarchy('h2') }),
+  make('deep-local', { parentThreadId: 'local-sub', status: 'running', title: 'Deep' }),
+] as typeof actionThreads;
+assert.deepEqual(
+  subagentQuestionSources(questionThreads, 'lead'),
+  [
+    { threadId: 'local-sub', title: 'Local helper' },
+    { threadId: 'remote-sub', title: 'On omarchy', remote: omarchy('h1') },
+    { threadId: 'deep-local', title: 'Deep' },
+  ],
+  'running subagents at any depth; not finished, provider-native or rolled up there'
+);
+assert.deepEqual(subagentQuestionSources(questionThreads, 'local-done'), []);
 const questions = new Map([['quiet', 5], ['solo', 1]]);
 const merged = mergeAttentionSince(questions, awaiting);
 assert.equal(merged.get('quiet'), 5);
