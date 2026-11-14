@@ -1552,7 +1552,7 @@ const requestRendererCommand = (command, timeoutMs, session, onClaim = null) => 
 // immediately before it starts the actual turn. Once claimed, the startup
 // deadline can no longer report a timeout before that start; a shorter result
 // deadline still protects against a renderer disappearing mid-response.
-export const claimRemoteCommand = ({ commandId } = {}) => {
+export const claimRemoteCommand = ({ commandId, threadId } = {}) => {
   const pending = pendingRendererCommands.get(commandId);
   if (!pending || pending.claimed) return { ok: false };
   if (!pendingRendererCommandIsAuthorized(pending)) {
@@ -1574,7 +1574,7 @@ export const claimRemoteCommand = ({ commandId } = {}) => {
   }, completionTimeoutMs);
   pending.timer.unref?.();
   try {
-    pending.onClaim?.(completionTimeoutMs);
+    pending.onClaim?.(completionTimeoutMs, typeof threadId === 'string' ? threadId : null);
   } catch {}
   return { ok: true };
 };
@@ -2157,10 +2157,21 @@ const handleHostRequest = async (session, message) => {
   const respond = (payload) => {
     if (!session.channel.closed) session.channel.send({ t: 'res', reqId, ...payload });
   };
-  const acknowledgeClaim = (completionTimeoutMs) => {
-    if (!session.channel.closed) {
-      session.channel.send({ t: 'claimed', reqId, completionTimeoutMs });
+  const acknowledgeClaim = (completionTimeoutMs, threadId = null) => {
+    if (session.channel.closed) return;
+    const claimedThreadId =
+      typeof threadId === 'string' && threadId && threadId.length <= 128 ? threadId : null;
+    // The turn's thread streams to this controller from the start (it can't
+    // follow a new thread before it knows its id).
+    if (claimedThreadId && session.followedThreads && session.followedThreads.size < 128) {
+      session.followedThreads.add(claimedThreadId);
     }
+    session.channel.send({
+      t: 'claimed',
+      reqId,
+      completionTimeoutMs,
+      ...(claimedThreadId ? { threadId: claimedThreadId } : {}),
+    });
   };
   try {
     switch (message?.t) {
@@ -2577,15 +2588,69 @@ const LIFECYCLE_EVENT_TYPES = new Set(['started', 'done', 'error', 'user-input']
  * of those only; one that never did (app.durango.sh, older desktops) gets all.
  */
 export const forwardAgentEventToRemote = (event) => {
+  const runId = typeof event?.runId === 'string' ? event.runId : null;
+  // Only the run's own thread writes into its message (subagent threads
+  // have messages of their own).
+  const tracked = runId ? runOutputs.get(runId) : undefined;
+  const output = tracked && tracked.threadId === event?.threadId ? tracked : undefined;
+  const ended = event?.type === 'done' || event?.type === 'error';
+  if (ended && runId) runOutputs.delete(runId);
+  // Numbered whether or not a controller is connected, so a controller
+  // that joins mid-run sees it did not get the message from its start.
+  const streamed = event?.type === 'chunk' || event?.type === 'activity';
+  const streamSeq = output && streamed ? output.seq++ : undefined;
   if (hostSessions.size === 0) return;
-  const payload = { t: 'event', kind: 'turnEvent', payload: event };
+  // The transcript message the run writes to here: a controller following
+  // the thread streams text and tool activity straight into its copy of it,
+  // as long as it got every one of them (streamSeq 0, 1, 2…).
+  const payload = {
+    t: 'event',
+    kind: 'turnEvent',
+    payload:
+      output && event?.threadId
+        ? { ...event, outputMessageId: output.messageId, ...(streamSeq !== undefined ? { streamSeq } : {}) }
+        : event,
+  };
   const lifecycle = LIFECYCLE_EVENT_TYPES.has(event?.type);
+  let followedHere = false;
   for (const session of hostSessions) {
     if (!session.ready || session.channel.closed) continue;
     const followed = session.followedThreads;
-    if (followed && !lifecycle && !followed.has(event?.threadId) && !followed.has(event?.parentThreadId)) continue;
+    const following = !followed || followed.has(event?.threadId) || followed.has(event?.parentThreadId);
+    if (!following && !lifecycle) continue;
+    if (following) followedHere = true;
     session.channel.send(payload);
   }
+  // Controllers read a finished run from the saved threads file, which a
+  // running thread only reaches every few seconds: save it now.
+  if (ended && followedHere && event?.threadId) deps?.flushRendererThreads?.();
+};
+
+// Which transcript message each agent run writes to (main.js agent:runTurn),
+// and how many text/activity events it has streamed into it.
+const runOutputs = new Map(); // runId -> { messageId, threadId, seq }
+const MAX_TRACKED_RUN_OUTPUTS = 256;
+
+/** The renderer started run `runId` of thread `threadId` writing into message `messageId`. */
+export const noteAgentRunOutputMessage = (runId, messageId, threadId) => {
+  if (typeof runId !== 'string' || !runId || runId.length > 128) return;
+  if (typeof messageId !== 'string' || !messageId || messageId.length > 128) return;
+  if (typeof threadId !== 'string' || !threadId) return;
+  runOutputs.delete(runId);
+  runOutputs.set(runId, { messageId, threadId, seq: 0 });
+  // Runs that never report an end (failed starts) must not pile up.
+  while (runOutputs.size > MAX_TRACKED_RUN_OUTPUTS) {
+    runOutputs.delete(runOutputs.keys().next().value);
+  }
+};
+
+/**
+ * The run may write elsewhere from now on (a steer can continue it in a new
+ * message): its events go out untagged, and controllers read the rest from
+ * this machine's saved copy.
+ */
+export const forgetAgentRunOutputMessage = (runId) => {
+  if (typeof runId === 'string') runOutputs.delete(runId);
 };
 
 /** Store or threads file changed on disk — tell controllers to refresh. */
@@ -3277,6 +3342,11 @@ const ensureClientSession = async (machineId) => {
     routeMessage = (message) => {
       if (message?.t === 'claimed' && typeof message.reqId === 'string') {
         const pending = session.pending.get(message.reqId);
+        if (pending?.onClaimed && typeof message.threadId === 'string' && message.threadId && message.threadId.length <= 128) {
+          try {
+            pending.onClaimed(message.threadId);
+          } catch {}
+        }
         const completionTimeoutMs = Math.min(
           REQUEST_TIMEOUT_MS,
           Math.max(1, Number(message.completionTimeoutMs))
@@ -3356,7 +3426,7 @@ const clientRequest = async (
   machineId,
   message,
   timeoutMs = REQUEST_TIMEOUT_MS,
-  { extendOnClaim = false, signal, onDispatch } = {}
+  { extendOnClaim = false, signal, onDispatch, onClaimed } = {}
 ) => {
   const session = await ensureClientSession(machineId);
   // Stopped while connecting: never sent.
@@ -3382,7 +3452,7 @@ const clientRequest = async (
       reject(new Error('The host did not respond in time.'));
     };
     const timer = setTimeout(onTimeout, timeoutMs);
-    pending = { resolve, reject, timer, onTimeout, extendOnClaim, claimed: false };
+    pending = { resolve, reject, timer, onTimeout, extendOnClaim, claimed: false, onClaimed };
     session.pending.set(reqId, pending);
     session.channel.send({ ...message, reqId });
     onDispatch?.();
@@ -3590,6 +3660,7 @@ export const runRemoteTurn = async ({
   codexServiceTier,
   claudeContextWindow,
   spawnedBy,
+  turnKey,
 } = {}) => {
   try {
     const targetMachineId = String(machineId ?? '');
@@ -3641,7 +3712,20 @@ export const runRemoteTurn = async ({
         (Number.isFinite(deps?.clientResponseGraceMs)
           ? Math.max(0, deps.clientResponseGraceMs)
           : CLIENT_RESPONSE_GRACE_MS),
-      { extendOnClaim: true }
+      {
+        extendOnClaim: true,
+        // The host made (or found) the turn's thread and is starting it: tell
+        // the renderer its id now, so the turn streams here while it starts.
+        onClaimed:
+          typeof turnKey === 'string' && turnKey
+            ? (hostThreadId) =>
+                deps.broadcast('remote:event', {
+                  machineId: targetMachineId,
+                  kind: 'turnClaimed',
+                  payload: { turnKey, threadId: hostThreadId },
+                })
+            : undefined,
+      }
     );
     return {
       ok: response.ok === true,

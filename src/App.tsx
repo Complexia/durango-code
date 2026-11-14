@@ -1121,7 +1121,7 @@ const App: React.FC = () => {
         threadId: string,
         promptText: string,
         attachments: FileAttachment[],
-        claimStart?: () => Promise<boolean>,
+        claimStart?: (threadId?: string) => Promise<boolean>,
         applyClaimedSettings?: () => void,
         extraContext?: string
       ) => Promise<ThreadTurnStartResult>)
@@ -1133,6 +1133,9 @@ const App: React.FC = () => {
   // competing mutations for the same thread/task pair.
   const linkedTaskUnlinksRef = useRef(new Map<string, Promise<boolean>>());
   const pendingTurnStartsRef = useRef(new Set<string>());
+  // Threads on another machine stopped here while their turn was still
+  // starting there: stopped there once the start completes.
+  const stopRemoteAfterStartRef = useRef(new Set<string>());
   // A steer reserves its thread synchronously, before linked-task refreshes or
   // transcript saves yield. This preserves submission order and prevents two
   // steers from consuming the same uninjected Board context.
@@ -5499,14 +5502,14 @@ const App: React.FC = () => {
       threadId: string,
       promptText: string,
       attachments: FileAttachment[],
-      claimStart?: () => Promise<boolean>,
+      claimStart?: (threadId?: string) => Promise<boolean>,
       applyClaimedSettings?: () => void,
       // Agent context the transcript doesn't show (a controller's copies of
       // threads its prompt mentions that this machine can't read).
       extraContext?: string
     ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
-      if (claimStart && !(await claimRemoteThreadStart(claimStart, applyClaimedSettings))) {
+      if (claimStart && !(await claimRemoteThreadStart(() => claimStart(threadId), applyClaimedSettings))) {
         return { ok: false, error: 'The remote command expired before the turn started.' };
       }
       let state = useOrionStore.getState();
@@ -5825,6 +5828,7 @@ const App: React.FC = () => {
       const startup = window.orion.runAgentTurn({
         runId,
         threadId,
+        outputMessageId: messageId,
         projectPath: workingDir,
         prompt: agentPrompt,
         modelId: model.id,
@@ -5930,7 +5934,7 @@ const App: React.FC = () => {
       threadId: string,
       promptText: string,
       attachments: FileAttachment[],
-      claimStart?: () => Promise<boolean>,
+      claimStart?: (threadId?: string) => Promise<boolean>,
       applyClaimedSettings?: () => void,
       // Agent context the transcript doesn't show (a controller's copies of
       // threads its prompt mentions that this machine can't read).
@@ -7155,6 +7159,7 @@ const App: React.FC = () => {
     // follow-up before this turn shows as running.
     if (pendingTurnStartsRef.current.has(threadId)) return { ok: false, error: 'This thread is already starting a turn.' };
     pendingTurnStartsRef.current.add(threadId);
+    stopRemoteAfterStartRef.current.delete(threadId);
     const agentModel = findAgentModel(agentModelsRef.current, thread.modelId);
     const userMessageId = addMessageToThread(threadId, {
       role: 'user',
@@ -7163,17 +7168,36 @@ const App: React.FC = () => {
     });
     const derivedTitle = isDefaultTitle(thread.title) && promptText ? deriveTitle(promptText) : null;
     if (derivedTitle && isPlausibleTitle(derivedTitle)) updateThread(threadId, { title: derivedTitle });
-    // A start that fails leaves the thread as it was: no prompt, its old title.
+    // Working from the moment it is sent, like a local turn: reaching that
+    // machine and starting the agent there takes a few round trips. Refreshes
+    // of that machine's copy that predate the turn are ignored meanwhile.
+    const statusBefore = thread.status;
+    updateThread(threadId, { status: 'running' });
+    remoteThreadSync.clearStarted(threadId);
+    remoteThreadSync.markStarted(threadId);
+    // The host thread id told early (turnClaimed), for a thread new there.
+    let claimedHostThreadId: string | null = null;
+    // A start that fails leaves the thread as it was: no prompt, its old title
+    // and status.
     const dropUserMessage = () => {
       const store = useOrionStore.getState();
       store.updateThreadTranscript(threadId, (transcript) => ({
         ...transcript,
         messages: transcript.messages.filter((message) => message.id !== userMessageId),
       }));
-      if (derivedTitle && store.threads.find((candidate) => candidate.id === threadId)?.title === derivedTitle) {
+      const current = store.threads.find((candidate) => candidate.id === threadId);
+      if (derivedTitle && current?.title === derivedTitle) {
         updateThread(threadId, { title: thread.title });
       }
+      if (current?.status === 'running') updateThread(threadId, { status: statusBefore === 'running' ? 'idle' : statusBefore });
+      // That machine drops a new thread whose turn failed to start.
+      if (claimedHostThreadId && current?.remote?.threadId === claimedHostThreadId) {
+        updateThread(threadId, { remote: { ...current.remote, threadId: undefined } });
+      }
+      stopRemoteAfterStartRef.current.delete(threadId);
+      remoteThreadSync.clearStarted(threadId);
     };
+    let unsubscribeClaim: (() => void) | undefined;
     try {
       // @-mentioned threads: that machine reads its own (the mention is
       // pointed at its id there); this machine's and other machines' threads
@@ -7214,9 +7238,29 @@ const App: React.FC = () => {
         // Say where it runs: the project there was matched, not chosen.
         if (resolved.projectName) toast.message(`Running in ${resolved.projectName} on ${remote.machineName}`);
       }
+      // That machine has made the new thread and is starting the agent
+      // (workspace, process): point the mirror at it now, so the turn streams
+      // here from its first output instead of after the start completes.
+      const turnKey = crypto.randomUUID();
+      if (!remote.threadId) {
+        unsubscribeClaim = window.orion.onRemoteEvent?.((event) => {
+          if (event.kind !== 'turnClaimed' || event.machineId !== remote.machineId) return;
+          const hostThreadId = event.payload?.threadId;
+          if (event.payload?.turnKey !== turnKey || !hostThreadId) return;
+          const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+          if (current?.remote?.machineId !== remote.machineId || current.remote.threadId) return;
+          claimedHostThreadId = hostThreadId;
+          updateThread(threadId, {
+            remote: { ...current.remote, threadId: hostThreadId, projectId: hostProjectId ?? current.remote.projectId },
+          });
+          // Its copy there predates the turn until saved: the grace runs from here.
+          remoteThreadSync.markStarted(threadId);
+        });
+      }
       const result = await window.orion.remoteRunTurn({
         machineId: remote.machineId,
         ...(remote.threadId ? { threadId: remote.threadId } : { projectId: hostProjectId }),
+        turnKey,
         prompt: hostPrompt,
         ...(mentionContext ? { context: mentionContext } : {}),
         // Uploaded to that machine first (main).
@@ -7228,16 +7272,29 @@ const App: React.FC = () => {
         >),
       });
       if (!result?.ok) {
+        // Started there, then it failed to report (its threads could not be
+        // saved): the thread is there and may be running, so it stays linked.
+        const keptThere = Boolean(claimedHostThreadId && result?.threadId === claimedHostThreadId);
+        const stopThere = stopRemoteAfterStartRef.current.has(threadId);
+        if (keptThere) claimedHostThreadId = null;
         dropUserMessage();
+        if (keptThere && result?.threadId) {
+          if (stopThere && window.orion.remoteStopTurn) {
+            void window.orion.remoteStopTurn({ machineId: remote.machineId, threadId: result.threadId }).catch(() => undefined);
+          }
+          remoteThreadSync.refreshSoon(threadId, { force: true });
+        }
         return { ok: false, error: result?.error ?? `${remote.machineName} could not start the agent.` };
       }
       const fresh = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      // Stopped here while it was starting there: stop it there now.
+      const stopNow = stopRemoteAfterStartRef.current.delete(threadId);
       if (fresh?.remote?.machineId === remote.machineId) {
         const hostThreadId = result.threadId ?? fresh.remote.threadId;
         // This machine's copies of the files it sent, for showing the mirror.
         const sentPaths = Object.fromEntries((result.attachments ?? []).map((item) => [item.hostPath, item.localPath]));
         updateThread(threadId, {
-          status: 'running',
+          status: stopNow ? 'idle' : 'running',
           remote: {
             ...fresh.remote,
             threadId: hostThreadId,
@@ -7264,13 +7321,26 @@ const App: React.FC = () => {
             useOrionStore.getState().deleteThread(duplicate.id);
           }
         }
-        remoteThreadSync.markStarted(threadId);
+        if (stopNow && hostThreadId && window.orion.remoteStopTurn) {
+          void window.orion
+            .remoteStopTurn({ machineId: remote.machineId, threadId: hostThreadId })
+            .catch(() => undefined)
+            .finally(() => {
+              remoteThreadSync.clearStarted(threadId);
+              remoteThreadSync.refreshSoon(threadId);
+            });
+        } else {
+          // Started there now (the start may have taken a while): the grace
+          // for its copy to show the turn runs from here.
+          remoteThreadSync.markStarted(threadId);
+        }
       }
       return { ok: true };
     } catch (error) {
       dropUserMessage();
       return { ok: false, error: error instanceof Error ? error.message : `Could not reach ${remote.machineName}.` };
     } finally {
+      unsubscribeClaim?.();
       pendingTurnStartsRef.current.delete(threadId);
     }
   };
@@ -8205,6 +8275,13 @@ const App: React.FC = () => {
         composerDraft.setText((current) => [...queued.map((q) => q.text), current].filter(Boolean).join('\n\n'));
         composerDraft.setAttachments((current) => [...queued.flatMap((q) => q.attachments ?? []), ...current]);
       }
+      // Still starting there: stop it as soon as it has started (a stop that
+      // arrives first would find nothing to stop).
+      if (pendingTurnStartsRef.current.has(stoppedThreadId)) {
+        stopRemoteAfterStartRef.current.add(stoppedThreadId);
+        updateThread(stoppedThreadId, { status: 'idle' });
+        return;
+      }
       if (!remote.threadId || !window.orion?.remoteStopTurn) {
         updateThread(stoppedThreadId, { status: 'idle' });
         return;
@@ -8328,7 +8405,7 @@ const App: React.FC = () => {
     (
       command: RemoteCommandRequest['command'],
       canPrepare: () => boolean,
-      claimStart: () => Promise<boolean>
+      claimStart: (threadId?: string) => Promise<boolean>
     ) => Promise<{
       ok: boolean;
       threadId?: string;
@@ -8515,7 +8592,7 @@ const App: React.FC = () => {
               error: reviewCommand.error,
             };
           }
-          if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          if (!(await claimRemoteSideEffect(canPrepare, () => claimStart(threadId)))) {
             if (createdThread) useOrionStore.getState().deleteThread(threadId);
             return { ok: false, error: 'The remote review command expired or was cancelled.' };
           }
@@ -8878,11 +8955,12 @@ const App: React.FC = () => {
         let outcome: { ok: boolean; threadId?: string; threadTitle?: string; projectId?: string; error?: string };
         const canPrepare = () => Date.now() < request.expiresAt;
         let claimPromise: Promise<boolean> | null = null;
-        const claimStart = () => {
+        // `threadId`: the turn's thread, told to the controller with the claim.
+        const claimStart = (threadId?: string) => {
           if (!canPrepare()) return Promise.resolve(false);
           claimPromise ??=
             window.orion
-              ?.remoteClaimCommand?.({ commandId: request.commandId })
+              ?.remoteClaimCommand?.({ commandId: request.commandId, ...(threadId ? { threadId } : {}) })
               .then((result) => result.ok)
               .catch(() => false) ?? Promise.resolve(false);
           return claimPromise;
@@ -8904,6 +8982,13 @@ const App: React.FC = () => {
     void window.orion.remoteRendererReady?.();
     return () => unsubscribe?.();
   }, []);
+
+  // A run a paired machine follows ended here: it reads the finished turn
+  // from the saved threads, so save them now rather than at the next tick.
+  useEffect(
+    () => window.orion?.onRemoteFlushThreads?.(() => void flushOrionThreadsSave().catch(() => false)),
+    []
+  );
 
   // Durango Chat dispatch: report each dispatched thread's outcome back to the
   // chat once its run settles (finished → summary, error/stop → failed). Runs

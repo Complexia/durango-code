@@ -131,6 +131,8 @@ import {
   fetchRemoteSnapshot,
   fetchRemoteThread,
   forwardAgentEventToRemote,
+  noteAgentRunOutputMessage,
+  forgetAgentRunOutputMessage,
   getRemoteControlState,
   initRemoteControl,
   migrateRemoteControlUserId,
@@ -1281,6 +1283,9 @@ app.whenReady().then(async () => {
     listAgentModels: () => listAgentModelsWithAvailability(),
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
     dispatchRendererCommand: (payload) => dispatchRemoteCommand(payload),
+    // A run a controller follows ended: the renderer saves its threads now
+    // (controllers read the finished turn from the saved file).
+    flushRendererThreads: () => sendToAllWindows('remote:flushThreads', null),
     // Paired machines may ask this one to clone a Source repository it lacks.
     ...(sourceCheckoutAvailable() ? { checkoutSourceProject: (input) => checkoutSourceProject(input) } : {}),
     createRemotePairingProof,
@@ -5273,6 +5278,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     threadId: input?.threadId,
     abortController: startupController,
   });
+  // Paired controllers stream the run's events into their copy of this message.
+  noteAgentRunOutputMessage(runId, input?.outputMessageId, input?.threadId);
   try {
     if (!input?.threadId || !input?.projectPath || !input?.prompt || !input?.modelId) {
       return { ok: false, error: 'Missing threadId, projectPath, prompt, or modelId.' };
@@ -6468,6 +6475,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 // blocking SDK loop and immediately continues it. False preserves the message as an ordinary queued follow-up.
 ipcMain.handle('agent:steerTurn', async (_event, runId, text, attachments) => {
   if (typeof runId !== 'string' || typeof text !== 'string' || !text) return false;
+  // A steered turn may continue in a new transcript message.
+  forgetAgentRunOutputMessage(runId);
   if (await steerCodexAppServerRun(runId, text, attachments)) return true;
   if (await steerFxRun(runId, text, attachments)) return true;
   return await steerClaudeSdkRun(runId, text, attachments);

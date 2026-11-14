@@ -80,13 +80,16 @@ export const remoteMirrorUpdate = (
   mirrorMessageCount: number,
   host: Pick<ThreadRecord, 'status' | 'title' | 'messages'>,
   startedAt: number | null,
-  now = Date.now()
+  now = Date.now(),
+  // That machine reported the turn's run ended (its events): a copy that
+  // has the turn may show it finished.
+  runEnded = false
 ): { status?: Thread['status']; title?: string } | null => {
   const hostMessages = Array.isArray(host.messages) ? host.messages.length : 0;
   if (
     startedAt !== null &&
     now - startedAt < REMOTE_START_GRACE_MS &&
-    (host.status !== 'running' || hostMessages < mirrorMessageCount)
+    ((host.status !== 'running' && !runEnded) || hostMessages < mirrorMessageCount)
   ) {
     return null;
   }
@@ -252,4 +255,57 @@ export const remoteTurnSettingsToSend = (thread: Thread, providerId: ProviderId 
       return value !== undefined && field !== null && field !== undefined && known[field] !== value;
     })
   );
+};
+
+/**
+ * A message that machine is streaming here (its turn events), shown before
+ * that machine has saved it. `streamed` is this machine's copy as it stands.
+ */
+const isAhead = (streamed: Message, saved: Message) =>
+  streamed.content.length >= saved.content.length &&
+  streamed.content.startsWith(saved.content) &&
+  (streamed.activities?.length ?? 0) >= (saved.activities?.length ?? 0);
+
+/**
+ * That machine's saved copy of a thread, with the messages streamed here
+ * (`live`: their ids) kept as they show here where the saved copy is behind
+ * them: that machine saves a running thread only every few seconds, so its
+ * copy must not roll back text that already streamed in. A streamed message
+ * the saved copy settled (not running any more), or that is not ahead of
+ * the saved copy, takes the saved copy and is returned in `settled`: it is
+ * no longer streamed into (as is one missing from a copy saved when nothing
+ * runs there, after it ended here). `predatesRun`: the copy was saved before
+ * a run streaming here started, so its status is out of date too.
+ */
+export const keepStreamedMessages = (
+  incoming: Message[],
+  mirrored: Message[] | undefined,
+  live: ReadonlySet<string>,
+  hostRunning: boolean
+): { messages: Message[]; settled: string[]; predatesRun: boolean } => {
+  if (live.size === 0 || !mirrored?.length) return { messages: incoming, settled: [], predatesRun: false };
+  const here = new Map(mirrored.filter((message) => live.has(message.id)).map((message) => [message.id, message]));
+  const settled: string[] = [];
+  const seen = new Set<string>();
+  const messages = incoming.map((message) => {
+    if (!live.has(message.id)) return message;
+    seen.add(message.id);
+    const streamed = here.get(message.id);
+    if (streamed && message.status === 'running' && isAhead(streamed, message)) return { ...message, ...streamed };
+    // Finished there, or the copies went apart: the saved copy from now on.
+    settled.push(message.id);
+    return message;
+  });
+  // Started there after its copy was saved: still only here while it runs
+  // (that copy predates the run, whatever status it shows). Once it ended
+  // here, a copy saved when nothing runs there and without it means it is
+  // gone.
+  let predatesRun = false;
+  for (const [id, streamed] of here) {
+    if (seen.has(id)) continue;
+    if (streamed.status === 'running') predatesRun = true;
+    if (hostRunning || streamed.status === 'running') messages.push(streamed);
+    else settled.push(id);
+  }
+  return { messages, settled, predatesRun };
 };

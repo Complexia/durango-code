@@ -423,8 +423,21 @@ export type RemoteSnapshot = {
 /** Push from a controlled host, forwarded to the controller's renderer. */
 export type RemoteEvent = {
   machineId: string;
-  kind: 'turnEvent' | 'workspaceChanged';
-  payload: { threadId?: string; runId?: string; type?: string } | null;
+  kind: 'turnEvent' | 'workspaceChanged' | 'turnClaimed';
+  payload: {
+    threadId?: string;
+    runId?: string;
+    type?: string;
+    /** turnEvent: the host transcript message the run writes to. */
+    outputMessageId?: string;
+    /** turnEvent: the number of the run's text/activity event (0 first). */
+    streamSeq?: number;
+    chunk?: string;
+    activity?: Omit<import('./store').AgentActivity, 'id' | 'ts'>;
+    parentThreadId?: string;
+    /** turnClaimed: the key the renderer passed to remoteRunTurn. */
+    turnKey?: string;
+  } | null;
 };
 
 // A paired controller asked this (host) machine to run or stop a turn; the
@@ -1489,6 +1502,8 @@ type OrionCodexBrowserIntegrationStatus = {
       runAgentTurn: (input: {
         runId?: string;
         threadId: string;
+        /** The transcript message the run writes to (forwarded to remote controllers). */
+        outputMessageId?: string;
         projectPath: string;
         prompt: string;
         modelId: string;
@@ -1969,6 +1984,8 @@ type OrionCodexBrowserIntegrationStatus = {
         prompt: string;
         /** Agent context the transcript there doesn't show (mentioned threads it can't read). */
         context?: string;
+        /** Echoed in a `turnClaimed` remote event once that machine has the turn's thread. */
+        turnKey?: string;
       }) => Promise<{
         ok: boolean;
         threadId?: string;
@@ -1988,7 +2005,7 @@ type OrionCodexBrowserIntegrationStatus = {
         attachments?: import('./store').FileAttachment[];
       }) => Promise<{ ok: boolean; error?: string }>;
       remoteRendererReady?: () => Promise<{ ok: boolean }>;
-      remoteClaimCommand?: (input: { commandId: string }) => Promise<{ ok: boolean }>;
+      remoteClaimCommand?: (input: { commandId: string; threadId?: string }) => Promise<{ ok: boolean }>;
       reportRemoteCommandResult?: (payload: {
         commandId: string;
         ok: boolean;
@@ -1997,6 +2014,8 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => Promise<{ ok: boolean }>;
       onRemoteState?: (cb: (state: RemoteControlState) => void) => () => void;
       onRemoteEvent?: (cb: (event: RemoteEvent) => void) => () => void;
+      /** A run a paired controller follows ended here: save the threads now. */
+      onRemoteFlushThreads?: (cb: () => void) => () => void;
       onRemoteCommandRequest?: (cb: (request: RemoteCommandRequest) => void) => () => void;
     };
   }

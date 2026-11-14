@@ -384,6 +384,11 @@ contextBridge.exposeInMainWorld('orion', {
     ipcRenderer.on('remote:state', listener);
     return () => ipcRenderer.removeListener('remote:state', listener);
   },
+  onRemoteFlushThreads: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('remote:flushThreads', listener);
+    return () => ipcRenderer.removeListener('remote:flushThreads', listener);
+  },
   onRemoteEvent: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('remote:event', listener);

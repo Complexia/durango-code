@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import {
   adoptRemoteSettings,
+  keepStreamedMessages,
   mapRemoteAttachments,
   remoteTurnSettingsToSend,
   REMOTE_START_GRACE_MS,
@@ -149,6 +150,75 @@ console.log('ok  refreshes wait for a just-started turn and keep this machine’
   const fresh = { ...mirror, remote: { machineId: 'm', machineName: 'omarchy' } } as unknown as Thread;
   assert.equal(remoteTurnSettingsToSend(fresh, 'claude').accessMode, 'full-access');
   console.log('ok  that machine’s settings win unless changed here; turns send only changes');
+}
+
+{
+  // A run streaming here (its events) is ahead of that machine's saved copy.
+  const run = (content: string, status: Message['status'], activities = 0) =>
+    ({
+      id: 'run-1',
+      role: 'agent',
+      kind: 'agent-run',
+      content,
+      ts: 't',
+      status,
+      activities: Array.from({ length: activities }, (_, index) => ({ id: `a${index}` })),
+    }) as unknown as Message;
+  const prompt = { id: 'u-1', role: 'user', content: 'go', ts: 't' } as Message;
+  const live = new Set(['run-1']);
+  const mirrored = [prompt, run('Hello there, streaming', 'running', 2)];
+
+  // Saved copy behind: the streamed text and activity stay.
+  let kept = keepStreamedMessages([prompt, run('Hello', 'running', 1)], mirrored, live, true);
+  assert.equal(kept.messages[1].content, 'Hello there, streaming');
+  assert.equal(kept.messages[1].activities?.length, 2);
+  assert.deepEqual(kept.settled, []);
+
+  // Saved copy ahead (or different): it wins, and streaming into it stops.
+  kept = keepStreamedMessages([prompt, run('Hello there, streaming more', 'running', 2)], mirrored, live, true);
+  assert.equal(kept.messages[1].content, 'Hello there, streaming more');
+  assert.deepEqual(kept.settled, ['run-1']);
+  kept = keepStreamedMessages([prompt, run('Goodbye', 'running', 2)], mirrored, live, true);
+  assert.equal(kept.messages[1].content, 'Goodbye');
+  assert.deepEqual(kept.settled, ['run-1']);
+
+  // Saved after the run ended: the saved copy, and the message is settled.
+  kept = keepStreamedMessages([prompt, run('Hello', 'done', 1)], mirrored, live, false);
+  assert.equal(kept.messages[1].content, 'Hello');
+  assert.deepEqual(kept.settled, ['run-1']);
+
+  // Saved before the run started there: the streamed message is kept at the
+  // end while it runs here, even if that copy shows nothing running...
+  for (const hostRunning of [true, false]) {
+    kept = keepStreamedMessages([prompt], mirrored, live, hostRunning);
+    assert.equal(kept.messages.length, 2);
+    assert.equal(kept.messages[1].id, 'run-1');
+    assert.equal(kept.predatesRun, true);
+  }
+  // ...and dropped once it ended here and nothing runs there.
+  kept = keepStreamedMessages([prompt], [prompt, run('Hello there', 'done', 2)], live, false);
+  assert.equal(kept.messages.length, 1);
+  assert.deepEqual(kept.settled, ['run-1']);
+  assert.equal(kept.predatesRun, false);
+
+  // Nothing streamed: the saved copy as is.
+  const incoming = [prompt];
+  assert.equal(keepStreamedMessages(incoming, mirrored, new Set(), true).messages, incoming);
+  console.log('ok  streamed messages are not rolled back by an older saved copy');
+}
+
+{
+  // A turn that already ended there (its done event): a saved copy with the
+  // turn, showing it finished, is taken within the start grace.
+  const local = { status: 'running', title: 'x' } as Thread;
+  const now = Date.now();
+  const finished = { status: 'idle', title: 'x', messages: [message('a'), message('b')] } as never;
+  assert.equal(remoteMirrorUpdate(local, 2, finished, now - 1_000, now), null);
+  assert.deepEqual(remoteMirrorUpdate(local, 2, finished, now - 1_000, now, true), { status: 'idle' });
+  // A copy saved before the turn (fewer messages) is still ignored.
+  const before = { status: 'idle', title: 'x', messages: [message('a')] } as never;
+  assert.equal(remoteMirrorUpdate(local, 2, before, now - 1_000, now, true), null);
+  console.log('ok  a run that ended there ends the start grace');
 }
 
 console.log('All remote-threads tests passed.');

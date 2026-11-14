@@ -37,6 +37,8 @@ if (
   const { register } = await import('node:module');
   register('./remote-control-loader.mjs', import.meta.url);
   const engine = await import('../src/main/remote-control.js');
+  // remote:event broadcasts this process received (a controller's view).
+  const remoteEventsSeen = [];
 
   const userId = process.env.ORION_REMOTE_TEST_USER ?? 'user_test_1';
   const testSessionToken = `test-token:${userId}`;
@@ -772,7 +774,10 @@ if (
       },
     ],
     broadcast: (channel, payload) => {
-      if (channel === 'remote:event') send({ kind: 'remoteEvent', event: payload });
+      if (channel === 'remote:event') {
+        remoteEventsSeen.push(payload);
+        send({ kind: 'remoteEvent', event: payload });
+      }
       return rendererAvailable ? 1 : 0;
     },
     // Host side: stand in for a renderer only after its command listener has
@@ -821,7 +826,18 @@ if (
         return 1;
       }
       if (command.kind === 'runTurn') {
-        engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId ?? 't-new' });
+        const threadId = command.threadId ?? 't-new';
+        if (command.prompt === 'build the thing') {
+          // The renderer claims the start naming the turn's thread, then the
+          // run streams into its message before the start completes.
+          engine.claimRemoteCommand({ commandId, threadId });
+          engine.noteAgentRunOutputMessage('run-stream', 'msg-stream', threadId);
+          engine.forwardAgentEventToRemote({ runId: 'run-stream', threadId, type: 'chunk', chunk: 'hello' });
+          // Another thread's event on the same run: not numbered with this message.
+          engine.forwardAgentEventToRemote({ runId: 'run-stream', threadId: 't-unfollowed', type: 'chunk', chunk: 'x' });
+          engine.forwardAgentEventToRemote({ runId: 'run-stream', threadId, type: 'chunk', chunk: ' world' });
+        }
+        engine.resolveRemoteCommand({ commandId, ok: true, threadId });
       } else if (command.kind === 'stopTurn') {
         engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId });
       }
@@ -988,12 +1004,16 @@ if (
       machineId: results.pair.machine?.id,
       threadId: 'nope',
     });
+    // Following nothing: only lifecycle events, and the thread a turn claims.
+    await engine.followRemoteThreads({ machineId: results.pair.machine?.id, threadIds: [] });
     results.runTurn = await engine.runRemoteTurn({
       machineId: results.pair.machine?.id,
       projectId: 'p1',
+      turnKey: 'turn-key-1',
       prompt: 'build the thing',
       context: '[Thread mentions from another machine]\nnewest page',
     });
+    results.runTurnEvents = remoteEventsSeen.splice(0);
     results.continueTurn = await engine.runRemoteTurn({
       machineId: results.pair.machine?.id,
       threadId: 't1',
@@ -1991,6 +2011,19 @@ if (
     assert.equal(results.missingThread.ok, false);
     assert.equal(results.runTurn.ok, true, `runTurn failed: ${results.runTurn.error}`);
     assert.equal(results.runTurn.threadId, 't-new');
+    {
+      const claimed = results.runTurnEvents.find((event) => event.kind === 'turnClaimed');
+      assert.deepEqual(claimed?.payload, { turnKey: 'turn-key-1', threadId: 't-new' }, 'the claim names the new thread');
+      const streamed = results.runTurnEvents.filter((event) => event.kind === 'turnEvent');
+      assert.equal(streamed.length, 2, 'only the claimed thread streams to a controller following nothing');
+      assert.equal(streamed[0].payload.threadId, 't-new');
+      assert.equal(streamed[0].payload.outputMessageId, 'msg-stream', 'events name the message the run writes to');
+      assert.deepEqual(
+        streamed.map((event) => event.payload.streamSeq),
+        [0, 1],
+        'streamed events are numbered from the start of the message, without other threads’ events'
+      );
+    }
     assert.equal(results.continueTurn.ok, true);
     assert.equal(results.continueTurn.threadId, 't1');
     assert.equal(results.stopTurn.ok, true, `stopTurn failed: ${results.stopTurn.error}`);

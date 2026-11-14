@@ -2,7 +2,9 @@ import React from 'react';
 import { remoteAttentionPatch, remoteSidebarStatePatch, useOrionStore, type Thread } from '../store';
 import type { RemoteEvent, RemoteMachineEntry } from '../types';
 import {
+  REMOTE_START_GRACE_MS,
   adoptRemoteSettings,
+  keepStreamedMessages,
   mapRemoteAttachments,
   readDismissedRemoteThreads,
   remoteMirrorUpdate,
@@ -24,6 +26,9 @@ import {
 // ones, and keeps every paired machine connected while remote control is on.
 
 const EVENT_REFRESH_DELAY_MS = 1_000;
+// Streamed text is applied in small batches (one store update per batch).
+const STREAM_FLUSH_MS = 50;
+const NO_LIVE_MESSAGES: ReadonlySet<string> = new Set();
 const RUNNING_POLL_MS = 8_000;
 // Right after a turn starts there, poll quickly until its copy shows it.
 const STARTING_POLL_MS = 1_500;
@@ -41,8 +46,13 @@ type Options = {
 };
 
 export type RemoteThreadSync = {
-  /** A turn was just started on the other machine for this thread. */
+  /**
+   * A turn is being started (or was just started) on the other machine for
+   * this thread: copies of it that predate the turn are ignored for a while.
+   */
   markStarted: (threadId: string) => void;
+  /** The start failed (or a new one begins): forget the one marked. */
+  clearStarted: (threadId: string) => void;
   /**
    * Refresh this thread soon (after a stop, say). `force` fetches it whole
    * even if that machine's copy didn't change (to undo a change shown here
@@ -51,11 +61,17 @@ export type RemoteThreadSync = {
   refreshSoon: (threadId: string, options?: { force?: boolean }) => void;
 };
 
+/** A turn event the mirror applies itself (text and activity of a run with a known message). */
+const isStreamedEvent = (event: RemoteEvent) =>
+  Boolean(event.payload?.outputMessageId) && (event.payload?.type === 'chunk' || event.payload?.type === 'activity');
+
 export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines }: Options): RemoteThreadSync => {
   const timersRef = React.useRef(new Map<string, number>());
   const inflightRef = React.useRef(new Set<string>());
   const againRef = React.useRef(new Set<string>());
   const startedAtRef = React.useRef(new Map<string, number>());
+  // Mirrors whose just-started turn already ended there (its done event).
+  const endedRef = React.useRef(new Set<string>());
   // The storedVersion of each mirror's last fetched copy: an unchanged thread
   // isn't transferred again (most refreshes while a host streams).
   const versionsRef = React.useRef(new Map<string, string>());
@@ -67,6 +83,15 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
   }, [enabled]);
 
   const refreshRef = React.useRef<(threadId: string) => Promise<void>>(async () => {});
+  const clearStarted = (threadId: string) => {
+    startedAtRef.current.delete(threadId);
+    endedRef.current.delete(threadId);
+  };
+  // Per mirror: the messages streaming in from that machine's turn events,
+  // ahead of its saved copy (see keepStreamedMessages), each with the number
+  // of the next event it expects (streamSeq).
+  const liveRef = React.useRef(new Map<string, Map<string, number>>());
+  const flushStreamRef = React.useRef<() => void>(() => {});
 
   const schedule = React.useCallback((threadId: string, delay = EVENT_REFRESH_DELAY_MS) => {
     if (!enabledRef.current) return;
@@ -100,8 +125,10 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
         ...(knownVersion ? { knownVersion } : {}),
       });
       if (result?.ok && result.unchanged) {
-        // Just started there and not saved yet: look again soon.
-        if (startedAtRef.current.has(threadId)) retrySoon = true;
+        // Just started there and not saved yet: look again soon (for a while).
+        const startedAt = startedAtRef.current.get(threadId);
+        if (startedAt !== undefined && Date.now() - startedAt < REMOTE_START_GRACE_MS) retrySoon = true;
+        else clearStarted(threadId);
         return;
       }
       if (!result?.ok || !result.thread) {
@@ -122,23 +149,40 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
         current,
         mirror?.messages.length ?? current.summary.messageCount,
         host,
-        startedAt
+        startedAt,
+        Date.now(),
+        endedRef.current.has(threadId)
       );
       if (!update) {
         retrySoon = true;
         return;
       }
       startedAtRef.current.delete(threadId);
+      endedRef.current.delete(threadId);
       if (result.storedVersion) versionsRef.current.set(threadId, result.storedVersion);
       else versionsRef.current.delete(threadId);
       const hostMessages = Array.isArray(host.messages) ? host.messages : [];
       const { messages, missing } = mapRemoteAttachments(hostMessages, current.remote.attachmentPaths);
       // A new version there is a changed thread, wherever in it the change is
       // (the cheap check only looks at its end, for hosts without versions).
+      let copyPredatesRun = false;
       if (result.storedVersion || remoteTranscriptChanged(mirror, host)) {
+        // Text streamed in since that copy was saved stays.
+        flushStreamRef.current();
+        const live = liveRef.current.get(threadId);
+        const kept = keepStreamedMessages(
+          messages,
+          useOrionStore.getState().transcripts[threadId]?.messages,
+          live ? new Set(live.keys()) : NO_LIVE_MESSAGES,
+          host.status === 'running'
+        );
+        // Settled, or the saved copy took over: no longer streamed into.
+        for (const id of kept.settled) live?.delete(id);
+        copyPredatesRun = kept.predatesRun;
+        if (live?.size === 0) liveRef.current.delete(threadId);
         state.updateThreadTranscript(threadId, (transcript) => ({
           ...transcript,
-          messages,
+          messages: kept.messages,
           btwExchanges: host.btwExchanges,
         }));
       }
@@ -190,6 +234,12 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       // A run that ended there lets the thread's queued follow-ups go out
       // (App's queued-message effect).
       const patch = { ...update, ...settingsPatch, ...attention };
+      // Saved before a run that is streaming here: it runs, whatever that
+      // copy says.
+      if (copyPredatesRun) {
+        if (current.status === 'running') delete patch.status;
+        else patch.status = 'running';
+      }
       if (Object.keys(patch).length > 0) state.updateThread(threadId, patch);
       // Settled, snoozed or pinned there, as of the status just applied: on
       // top of what that status did here (a run ending wakes a snoozed
@@ -311,6 +361,9 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
   React.useEffect(() => {
     if (!enabled) return undefined;
     const unsubscribe = window.orion?.onRemoteEvent?.((event: RemoteEvent) => {
+      if (event.kind !== 'workspaceChanged' && event.kind !== 'turnEvent') return;
+      // Streamed into the mirror as it comes (below): no refresh needed.
+      if (event.kind === 'turnEvent' && isStreamedEvent(event)) return;
       for (const thread of watchedRef.current) {
         if (thread.remote?.machineId !== event.machineId) continue;
         if (event.kind === 'workspaceChanged' || event.payload?.threadId === thread.remote.threadId) {
@@ -319,6 +372,141 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       }
     });
     return () => unsubscribe?.();
+  }, [enabled, schedule]);
+
+  // The turn streaming there, as it streams: its text and tool activity go
+  // straight into the mirror's copy of the run's message (the host names it:
+  // outputMessageId), the way a local run's events do. Refreshes from that
+  // machine's saved copy then settle the message (keepStreamedMessages).
+  React.useEffect(() => {
+    if (!enabled) return undefined;
+    const buffers = new Map<string, { threadId: string; messageId: string; text: string }>();
+    let timer: number | null = null;
+    const flush = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+      const pending = [...buffers.values()];
+      buffers.clear();
+      const store = useOrionStore.getState();
+      for (const { threadId, messageId, text } of pending) store.appendToThreadMessage(threadId, messageId, text);
+    };
+    flushStreamRef.current = flush;
+    const unsubscribe = window.orion?.onRemoteEvent?.((event: RemoteEvent) => {
+      if (event.kind !== 'turnEvent' || !event.payload) return;
+      const { type, threadId: hostThreadId, outputMessageId: messageId, streamSeq } = event.payload;
+      if (!hostThreadId) return;
+      if (type !== 'chunk' && type !== 'activity' && type !== 'done' && type !== 'error') return;
+      const store = useOrionStore.getState();
+      if (type === 'done' || type === 'error') {
+        // A turn just started from here ended there (streamed or not): its
+        // saved copy may now show it finished within the start grace.
+        for (const thread of store.threads) {
+          if (
+            thread.remote?.machineId === event.machineId &&
+            thread.remote.threadId === hostThreadId &&
+            startedAtRef.current.has(thread.id)
+          ) {
+            endedRef.current.add(thread.id);
+          }
+        }
+      }
+      if (!messageId) return;
+      // A listing may have imported a second copy for a moment: the one
+      // loaded here.
+      const mirror = store.threads.find(
+        (thread) =>
+          thread.remote?.machineId === event.machineId &&
+          thread.remote.threadId === hostThreadId &&
+          Boolean(store.transcripts[thread.id])
+      );
+      // Not loaded here: it is read whole when opened.
+      const transcript = mirror ? store.transcripts[mirror.id] : undefined;
+      if (!mirror || !transcript) return;
+      const live = liveRef.current.get(mirror.id);
+      if (type === 'done' || type === 'error') {
+        if (!live?.has(messageId)) return;
+        flush();
+        // Shown finished now; that machine's saved copy (saved as the run
+        // ended) brings its final state.
+        store.updateThreadMessage(mirror.id, messageId, {
+          status: type === 'done' ? 'done' : 'error',
+          completedAt: new Date().toISOString(),
+        });
+        return;
+      }
+      // Streamed only into a message seen from its first event on, with none
+      // missed; anything else is read from that machine's saved copy.
+      const fallBack = () => {
+        live?.delete(messageId);
+        schedule(mirror.id);
+      };
+      if (typeof streamSeq !== 'number') {
+        fallBack();
+        return;
+      }
+      let expected = live?.get(messageId);
+      if (expected === undefined) {
+        const existing = transcript.messages.find((message) => message.id === messageId);
+        if (streamSeq !== 0 || existing?.content || existing?.activities?.length) {
+          fallBack();
+          return;
+        }
+        if (!existing) {
+          // The run's message as that machine starts it.
+          const now = new Date().toISOString();
+          store.updateThreadTranscript(mirror.id, (current) =>
+            current.messages.some((message) => message.id === messageId)
+              ? current
+              : {
+                  ...current,
+                  messages: [
+                    ...current.messages,
+                    {
+                      id: messageId,
+                      role: 'agent',
+                      kind: 'agent-run',
+                      content: '',
+                      ts: now,
+                      status: 'running',
+                      statusText: "I'm working on this now.",
+                      startedAt: now,
+                      activities: [],
+                    },
+                  ],
+                }
+          );
+        }
+        expected = 0;
+      }
+      if (streamSeq !== expected) {
+        // One went missing (not followed for a moment): the saved copy takes over.
+        flush();
+        fallBack();
+        return;
+      }
+      let streams = live;
+      if (!streams) {
+        streams = new Map();
+        liveRef.current.set(mirror.id, streams);
+      }
+      streams.set(messageId, expected + 1);
+      if (type === 'chunk' && typeof event.payload.chunk === 'string' && event.payload.chunk) {
+        const key = `${mirror.id}\n${messageId}`;
+        const buffer = buffers.get(key);
+        if (buffer) buffer.text += event.payload.chunk;
+        else buffers.set(key, { threadId: mirror.id, messageId, text: event.payload.chunk });
+        if (timer === null) timer = window.setTimeout(flush, STREAM_FLUSH_MS);
+      } else if (type === 'activity' && event.payload.activity) {
+        // After the text that streamed before it.
+        flush();
+        store.addActivityToThreadMessage(mirror.id, messageId, event.payload.activity);
+      }
+    });
+    return () => {
+      unsubscribe?.();
+      flush();
+      flushStreamRef.current = () => {};
+    };
   }, [enabled, schedule]);
 
   // A question or approval asked (or answered) there: re-read whether the
@@ -458,6 +646,10 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       markStarted: (threadId: string) => {
         startedAtRef.current.set(threadId, Date.now());
         schedule(threadId, STARTING_POLL_MS);
+      },
+      clearStarted: (threadId: string) => {
+        startedAtRef.current.delete(threadId);
+        endedRef.current.delete(threadId);
       },
       refreshSoon: (threadId: string, options?: { force?: boolean }) => {
         if (options?.force) versionsRef.current.delete(threadId);
