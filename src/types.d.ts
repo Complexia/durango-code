@@ -440,7 +440,9 @@ export type RemoteCommandRequest = {
      * cloned, main/source-checkout.js) as a project named `projectName`, or
      * find the project that already has that path; reports `projectId`.
      */
-    kind: 'runTurn' | 'stopTurn' | 'steerTurn' | 'addProject' | 'answerQuestion' | 'userAction';
+    kind: 'runTurn' | 'stopTurn' | 'steerTurn' | 'addProject' | 'answerQuestion' | 'userAction' | 'threadState';
+    /** threadState: settle, snooze or pin the thread (null = undo); absent keys stay. */
+    sidebarState?: import('./store').ThreadSidebarState;
     /** answerQuestion: which question, and the answers per question id. */
     runId?: string;
     requestId?: string | number;
@@ -1875,6 +1877,8 @@ type OrionCodexBrowserIntegrationStatus = {
         storedVersion?: string;
         /** Its and its subagents' pending user actions there. */
         pendingUserActions?: import('./store').UserAction[];
+        /** Settled, snoozed and pinned there, as of `thread` (absent from older hosts). */
+        sidebarState?: import('./store').ThreadSidebarState;
         error?: string;
       }>;
       /**
@@ -1933,6 +1937,12 @@ type OrionCodexBrowserIntegrationStatus = {
         watching?: boolean;
         /** op 'secret': the answer to a request_secret card (sent to that machine only). */
         secretAnswer?: { type: 'save'; value: string } | { type: 'decline' };
+      }) => Promise<{ ok: boolean; error?: string }>;
+      /** Settle, snooze or pin (null = undo) a host thread like its mirror here. */
+      remoteThreadState?: (input: {
+        machineId: string;
+        threadId: string;
+        state: import('./store').ThreadSidebarState;
       }) => Promise<{ ok: boolean; error?: string }>;
       remoteRunTurn?: (input: {
         machineId: string;

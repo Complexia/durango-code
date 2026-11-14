@@ -24,7 +24,7 @@ const bridge = {
 Object.assign(globalThis, {
   window: { addEventListener() {}, localStorage: { getItem: () => null }, orion: bridge },
 });
-const { useOrionStore, NO_PROJECT_ID, ensureThreadTranscript } = await import('../src/store');
+const { useOrionStore, NO_PROJECT_ID, ensureThreadTranscript, remoteSidebarStatePatch } = await import('../src/store');
 await new Promise<void>((resolve) => {
   if (useOrionStore.persist.hasHydrated()) resolve();
   else useOrionStore.persist.onFinishHydration(() => resolve());
@@ -354,6 +354,92 @@ console.log('ok  threads that machine deleted leave this list');
   bridge.loadThreadsBatch = loadBatch;
   assert.equal(mirrors().find((thread) => thread.id === w2.id)?.summary.lastAgentRun?.id, 'c2');
   console.log('ok  count-only listings keep the work known here');
+}
+
+// Settled, snoozed or pinned there: the same here (and only what changed
+// there, so filing it differently here sticks until that machine changes it).
+{
+  const filed = (extra: Record<string, unknown> = {}) =>
+    listing('f1', { settledAt: null, snoozedAt: null, pinnedAt: null, ...extra });
+  const find = () => mirrors().find((thread) => thread.remote?.threadId === 'f1')!;
+  sync([listing('h1'), listing('h2'), filed({ pinnedAt: '2026-11-10T07:00:00.000Z' })]);
+  assert.equal(find().pinnedAt, '2026-11-10T07:00:00.000Z', 'a new mirror is filed as it is there');
+  assert.deepEqual(find().remote?.hostSidebarState, { settledAt: null, snoozedAt: null, pinnedAt: '2026-11-10T07:00:00.000Z' });
+
+  sync([listing('h1'), listing('h2'), filed({ snoozedAt: '2026-11-10T08:00:00.000Z', pinnedAt: '2026-11-10T07:00:00.000Z' })]);
+  assert.equal(find().snoozedAt, '2026-11-10T08:00:00.000Z', 'snoozed there: snoozed here');
+  sync([listing('h1'), listing('h2'), filed({ settledAt: '2026-11-10T09:00:00.000Z', pinnedAt: null })]);
+  assert.equal(find().settledAt, '2026-11-10T09:00:00.000Z', 'settled there: settled here');
+  assert.equal(find().snoozedAt, undefined, 'and no longer snoozed');
+  assert.equal(find().pinnedAt, undefined, 'unpinned there: unpinned here');
+  assert.ok(find().unpinnedAt);
+
+  // Restored here only (that machine unreachable): the next listing, still
+  // settled there, doesn't settle it again.
+  useOrionStore.getState().updateThread(find().id, { settledAt: undefined });
+  sync([listing('h1'), listing('h2'), filed({ settledAt: '2026-11-10T09:00:00.000Z' })]);
+  assert.equal(find().settledAt, undefined, 'nothing changed there: the choice here stands');
+  sync([listing('h1'), listing('h2'), filed()]);
+  assert.equal(find().settledAt, undefined, 'restored there too');
+
+  // Open here (kept current one by one): still filed like there.
+  sync([listing('h1'), listing('h2'), filed({ settledAt: '2026-11-10T11:00:00.000Z' })], new Set([find().id]));
+  assert.equal(find().settledAt, '2026-11-10T11:00:00.000Z', 'open here: settled all the same');
+  console.log('ok  settling, snoozing and pinning there files the thread the same way here');
+
+  // A mirror listed before the other machine shared this (or by an older
+  // one): its first report only sets what is known, nothing moves.
+  sync([listing('h1'), listing('h2'), listing('f2')]);
+  const f2 = () => mirrors().find((thread) => thread.remote?.threadId === 'f2')!;
+  useOrionStore.getState().updateThread(f2().id, { settledAt: '2026-11-10T12:00:00.000Z' });
+  sync([listing('h1'), listing('h2'), listing('f2', { settledAt: null, snoozedAt: null, pinnedAt: null })]);
+  assert.equal(f2().settledAt, '2026-11-10T12:00:00.000Z', 'settled here before: stays settled');
+  assert.deepEqual(f2().remote?.hostSidebarState, { settledAt: null, snoozedAt: null, pinnedAt: null });
+  sync([listing('h1'), listing('h2'), listing('f2', { settledAt: null, snoozedAt: '2026-11-10T13:00:00.000Z', pinnedAt: null })]);
+  assert.equal(f2().snoozedAt, '2026-11-10T13:00:00.000Z', 'later changes there follow');
+  console.log('ok  mirrors filed before keep their place until a machine changes it');
+
+  // A snoozed thread whose run ends there wakes here with its flag, even
+  // though that machine un-snoozed it as well.
+  sync([listing('h1'), listing('h2'), listing('f3', { snoozedAt: null })]);
+  const f3 = () => mirrors().find((thread) => thread.remote?.threadId === 'f3')!;
+  sync([listing('h1'), listing('h2'), listing('f3', { status: 'running', snoozedAt: '2026-11-10T14:00:00.000Z' })]);
+  assert.ok(f3().snoozedAt);
+  sync([listing('h1'), listing('h2'), listing('f3', { status: 'done', snoozedAt: null })]);
+  assert.equal(f3().snoozedAt, undefined);
+  assert.equal(f3().wokeReason, 'finished', 'woken here too, flag kept');
+  console.log('ok  a run ending there wakes the snoozed thread here');
+
+  // Snoozed here while it ran; it finished there before the snooze arrived,
+  // and that machine took the snooze after: it stays snoozed here as well.
+  sync([listing('h1'), listing('h2'), listing('f4', { status: 'running', snoozedAt: null })]);
+  const f4 = () => mirrors().find((thread) => thread.remote?.threadId === 'f4')!;
+  useOrionStore.getState().updateThread(f4().id, { snoozedAt: '2026-11-10T15:00:00.000Z' });
+  sync([listing('h1'), listing('h2'), listing('f4', { status: 'done', snoozedAt: '2026-11-10T15:00:00.000Z' })]);
+  assert.equal(f4().status, 'done');
+  assert.equal(f4().snoozedAt, '2026-11-10T15:00:00.000Z', 'snoozed there after the run ended: still snoozed here');
+  assert.equal(f4().wokeAt, undefined, 'and not flagged as woken');
+  console.log('ok  a snooze that landed after the run ended there holds here');
+
+  // An open mirror: a refresh read before it was settled there arrives after
+  // the listing that settled it. The refresh undoes it here for a moment;
+  // the next report from that machine settles it again.
+  sync([listing('h1'), listing('h2'), listing('f5', { status: 'running', settledAt: null })]);
+  const f5 = () => mirrors().find((thread) => thread.remote?.threadId === 'f5')!;
+  sync([listing('h1'), listing('h2'), listing('f5', { status: 'done', settledAt: '2026-11-10T16:00:00.000Z' })], new Set([f5().id]));
+  assert.equal(f5().settledAt, '2026-11-10T16:00:00.000Z');
+  // What useRemoteThreadSync does with the older refresh: its status, then
+  // the sidebar state read with it.
+  useOrionStore.getState().updateThread(f5().id, { status: 'running' });
+  {
+    const latest = f5();
+    const stale = remoteSidebarStatePatch(latest, { settledAt: null, snoozedAt: null, pinnedAt: null });
+    useOrionStore.getState().updateThread(latest.id, { ...stale.patch, remote: { ...latest.remote!, hostSidebarState: stale.hostSidebarState } });
+  }
+  assert.equal(f5().settledAt, undefined, 'the older refresh restores it here for now');
+  sync([listing('h1'), listing('h2'), listing('f5', { status: 'done', settledAt: '2026-11-10T16:00:00.000Z' })], new Set([f5().id]));
+  assert.equal(f5().settledAt, '2026-11-10T16:00:00.000Z', 'the next listing settles it again');
+  console.log('ok  an out-of-date refresh never leaves a mirror filed differently for good');
 }
 
 console.log('All remote thread listing tests passed.');

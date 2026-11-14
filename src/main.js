@@ -149,6 +149,7 @@ import {
   listRemoteQuestions,
   answerRemoteQuestion,
   remoteUserAction,
+  setRemoteThreadState,
   followRemoteThreads,
   shutdownRemoteControl,
   startRemotePairing,
@@ -2066,6 +2067,7 @@ ipcMain.handle('remote:threadGit', afterRemoteControlInit((_event, input) => fet
 ipcMain.handle('remote:listQuestions', afterRemoteControlInit((_event, input) => listRemoteQuestions(input)));
 ipcMain.handle('remote:answerQuestion', afterRemoteControlInit((_event, input) => answerRemoteQuestion(input)));
 ipcMain.handle('remote:userAction', afterRemoteControlInit((_event, input) => remoteUserAction(input)));
+ipcMain.handle('remote:threadState', afterRemoteControlInit((_event, input) => setRemoteThreadState(input)));
 ipcMain.handle('remote:followThreads', afterRemoteControlInit((_event, input) => followRemoteThreads(input)));
 // Registered only after the renderer has installed onRemoteCommandRequest.
 // did-start-loading/destroyed clear this authority until the next mount.

@@ -374,6 +374,7 @@ contextBridge.exposeInMainWorld('orion', {
   remoteListQuestions: (input) => ipcRenderer.invoke('remote:listQuestions', input),
   remoteAnswerQuestion: (input) => ipcRenderer.invoke('remote:answerQuestion', input),
   remoteUserAction: (input) => ipcRenderer.invoke('remote:userAction', input),
+  remoteThreadState: (input) => ipcRenderer.invoke('remote:threadState', input),
   remoteFollowThreads: (input) => ipcRenderer.invoke('remote:followThreads', input),
   remoteRendererReady: () => ipcRenderer.invoke('remote:rendererReady'),
   remoteClaimCommand: (input) => ipcRenderer.invoke('remote:claimCommand', input),

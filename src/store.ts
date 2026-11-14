@@ -761,6 +761,72 @@ export type ThreadRemote = {
   needsInputSince?: string;
   /** Its title there when last seen: a rename here stands until it changes there. */
   hostTitle?: string;
+  /**
+   * Whether it was settled, snoozed or pinned there when last seen. A change
+   * there is applied here (remoteSidebarStatePatch); the same on the mirror
+   * here is sent there (remote:threadState).
+   */
+  hostSidebarState?: ThreadSidebarState;
+};
+
+/**
+ * Where a thread sits in the sidebar, as paired machines tell each other:
+ * when it was settled, snoozed or pinned, or null for not. A key left out is
+ * not known (an older machine) or not changed.
+ */
+export type ThreadSidebarState = {
+  settledAt?: string | null;
+  snoozedAt?: string | null;
+  pinnedAt?: string | null;
+};
+export const THREAD_SIDEBAR_STATE_KEYS = ['settledAt', 'snoozedAt', 'pinnedAt'] as const;
+
+/** The sidebar state a thread itself has (what a mirror sends its machine). */
+export const threadSidebarStateOf = (
+  thread: Pick<Thread, 'settledAt' | 'snoozedAt' | 'pinnedAt'>,
+  keys: readonly (typeof THREAD_SIDEBAR_STATE_KEYS)[number][] = THREAD_SIDEBAR_STATE_KEYS
+): ThreadSidebarState => Object.fromEntries(keys.map((key) => [key, thread[key] || null]));
+
+/**
+ * What a mirror takes from its machine (a listing, or a refresh of the
+ * thread): each of settle, snooze and pin that changed there since it was
+ * last seen. Every report is recorded, an out-of-date one too, so the next
+ * report puts right whatever an out-of-date one changed. The first report of
+ * a key only records it, so a mirror filed differently before both machines
+ * shared this keeps its place until one of them changes it.
+ */
+export const remoteSidebarStatePatch = (
+  current: Pick<Thread, 'settledAt' | 'snoozedAt' | 'pinnedAt' | 'remote'>,
+  entry: Partial<Record<(typeof THREAD_SIDEBAR_STATE_KEYS)[number], unknown>>
+): { patch: Partial<Thread>; hostSidebarState?: ThreadSidebarState } => {
+  const known = current.remote?.hostSidebarState;
+  const seen: ThreadSidebarState = { ...known };
+  const patch: Partial<Thread> = {};
+  let changed = false;
+  for (const key of THREAD_SIDEBAR_STATE_KEYS) {
+    if (!(key in entry)) continue;
+    const value = typeof entry[key] === 'string' && entry[key] ? (entry[key] as string) : null;
+    if (known && key in known && known[key] === value) continue;
+    seen[key] = value;
+    changed = true;
+    // Never seen before: recorded, not applied.
+    if (!known || !(key in known)) continue;
+    // Even when this mirror has it already: the caller applies the patch
+    // after the run's own updates, which may undo it here (a run that ended
+    // wakes a snoozed thread; one that started restores a settled one) while
+    // that machine took it after those.
+    patch[key] = value ?? undefined;
+  }
+  // The same side effects as doing it here (App's settle, snooze, unpin).
+  if (patch.settledAt) {
+    Object.assign(patch, { snoozedAt: undefined, wokeAt: undefined, wokeReason: undefined, finishedUnseenAt: undefined });
+  } else if (patch.snoozedAt) {
+    Object.assign(patch, { wokeAt: undefined, wokeReason: undefined });
+  }
+  if ('pinnedAt' in patch && !patch.pinnedAt && current.pinnedAt) {
+    Object.assign(patch, { unpinnedAt: new Date().toISOString(), hiddenFromRecent: false });
+  }
+  return changed ? { patch, hostSidebarState: seen } : { patch };
 };
 
 /** One of a paired machine's threads, as remote:listThreads lists it. */
@@ -775,6 +841,9 @@ export type RemoteThreadListing = {
   messageCount: number;
   summary?: ThreadSummary;
   settledAt?: string | null;
+  /** Absent from an older machine's listing. */
+  snoozedAt?: string | null;
+  pinnedAt?: string | null;
   hiddenFromRecent?: boolean;
   settings?: Record<string, string>;
   userActions?: UserAction[];
@@ -2498,7 +2567,21 @@ export const useOrionStore = create<OrionState>()(
             const index = mirrors.get(entry.id);
             if (index !== undefined) {
               const current = threads[index];
-              if (skip.has(current.id)) continue;
+              // Settled, snoozed or pinned there since last seen: the same
+              // here, open or not.
+              const sidebar = remoteSidebarStatePatch(current, entry);
+              const withSidebar = (next: Thread): Thread =>
+                sidebar.hostSidebarState
+                  ? {
+                      ...next,
+                      ...sidebar.patch,
+                      remote: { ...next.remote!, hostSidebarState: sidebar.hostSidebarState },
+                    }
+                  : next;
+              if (skip.has(current.id)) {
+                if (sidebar.hostSidebarState) write(index, withSidebar(current));
+                continue;
+              }
               const patch: Partial<Thread> = {};
               // A subagent there follows its parent's mirror here (which may
               // have been replaced since: a duplicate dropped after a turn
@@ -2552,8 +2635,11 @@ export const useOrionStore = create<OrionState>()(
                 if (attention.remote) patch.remote = attention.remote;
               }
               // A run that ended there wakes and flags the thread here like
-              // one that ran here.
-              if (Object.keys(patch).length > 0) write(index, withThreadUpdates(state, current, patch));
+              // one that ran here (and it un-snoozes there too: nothing left
+              // to apply then).
+              if (Object.keys(patch).length > 0 || sidebar.hostSidebarState) {
+                write(index, withSidebar(Object.keys(patch).length > 0 ? withThreadUpdates(state, current, patch) : current));
+              }
               continue;
             }
             // That machine's untouched drafts stay there; so do threads
@@ -2578,7 +2664,11 @@ export const useOrionStore = create<OrionState>()(
               modelId: entry.modelId,
               createdAt: entry.createdAt,
               summary: remoteListingSummary(entry),
+              // Filed as it is there; later changes there follow
+              // (remoteSidebarStatePatch).
               ...(entry.settledAt ? { settledAt: entry.settledAt } : {}),
+              ...(entry.snoozedAt && !entry.settledAt ? { snoozedAt: entry.snoozedAt } : {}),
+              ...(entry.pinnedAt ? { pinnedAt: entry.pinnedAt } : {}),
               ...(entry.hiddenFromRecent || parentMirror ? { hiddenFromRecent: true } : {}),
               ...(parentMirror
                 ? { parentThreadId: parentMirror.id }
@@ -2595,6 +2685,10 @@ export const useOrionStore = create<OrionState>()(
                 ...(entry.projectName ? { projectName: entry.projectName } : {}),
                 ...(entry.waitingOnQuestion ? { needsInputSince: new Date().toISOString() } : {}),
                 ...(entry.title ? { hostTitle: entry.title } : {}),
+                ...(() => {
+                  const { hostSidebarState } = remoteSidebarStatePatch({}, entry);
+                  return hostSidebarState ? { hostSidebarState } : {};
+                })(),
                 imported: true,
               },
             } satisfies Thread;

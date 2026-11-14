@@ -66,6 +66,25 @@ opening one fetches its transcript. A thread the host deletes leaves the list
 deleting one here only hides it here (the host keeps it). The host's untouched
 drafts and threads that are themselves mirrors are not listed.
 
+**Settle, snooze and pin.** These follow the thread across machines. The
+host's snapshot says when each thread was settled, snoozed and pinned
+(`settledAt`, `snoozedAt`, `pinnedAt`; null when not). A mirror remembers the
+values it last saw (`remote.hostSidebarState`) and applies only what changed
+there since (`remoteSidebarStatePatch` in `store.ts`), so a listing that
+predates a change made here never undoes it. A thread refresh (`thread`)
+carries the same values as of its read (`sidebarState`), applied the same
+way. Changed values go on after the run's own updates (a run ending wakes a
+snoozed thread), and every report is recorded, an out-of-date one too, so
+the next report from that machine puts right whatever an out-of-date one
+changed. Settling, snoozing or pinning a
+mirror here (or undoing it) sends `threadState` with the new values, which
+the host applies through the same rules as its own buttons (a running thread
+isn't settled) and saves before it answers. If the host can't be reached or is
+too old, the change stays on this machine only. The first listing that
+reports these values only records them: mirrors filed differently before
+both machines shared this keep their place until either machine changes them.
+Deleting a thread still only hides it here.
+
 **Attachments.** A turn's files are uploaded to the host first
 (`attachmentUpload`, 3 MiB chunks, 100 MB per file) into its attachment folder,
 and the turn names them by upload id, so the host's agent gets them exactly

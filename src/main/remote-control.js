@@ -1593,6 +1593,23 @@ export const resolveRemoteCommand = (payload) => {
 
 const optionalString = (value) => (typeof value === 'string' && value ? value : null);
 
+// Where a thread sits in the sidebar (settled, snoozed, pinned), as paired
+// machines send it to each other: each key present is a time it was set, or
+// null for cleared; absent keys stay as they are. Null when nothing valid.
+export const THREAD_SIDEBAR_STATE_KEYS = ['settledAt', 'snoozedAt', 'pinnedAt'];
+export const sanitizeThreadSidebarState = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const state = {};
+  for (const key of THREAD_SIDEBAR_STATE_KEYS) {
+    if (!(key in value)) continue;
+    const time = value[key];
+    if (time === null) state[key] = null;
+    else if (typeof time === 'string' && time.length <= 64 && Number.isFinite(Date.parse(time))) state[key] = time;
+    else return null;
+  }
+  return Object.keys(state).length > 0 ? state : null;
+};
+
 const buildSnapshot = async () => {
   const state = (await deps.readStoreState()) ?? {};
   const threadIndex = deps.readThreadsIndex
@@ -1688,7 +1705,12 @@ const buildSnapshot = async () => {
           // controller's sidebar can say "Needs you" without opening it.
           ...(userActions.length > 0 ? { userActions } : {}),
           ...(waitingRoots.has(shell.id) ? { waitingOnQuestion: true } : {}),
+          // Where the thread sits in the sidebar there. A controller follows
+          // changes to these (settle, snooze, pin) and sends its own back
+          // (`threadState`), so both machines file the thread the same way.
           settledAt: optionalString(shell.settledAt),
+          snoozedAt: optionalString(shell.snoozedAt),
+          pinnedAt: optionalString(shell.pinnedAt),
           hiddenFromRecent: shell.hiddenFromRecent === true,
           workspaceName: optionalString(shell.durangoWorkspace?.name),
           // What the controller's prompt box shows for the thread.
@@ -2332,10 +2354,17 @@ const handleHostRequest = async (session, message) => {
           return;
         }
         const pendingUserActions = await pendingUserActionsOf(threadId);
+        // Settled, snoozed and pinned, read with the status the thread
+        // carries: the controller records it like a listing's, so an older
+        // response never leaves the mirror filed differently for good.
+        const sidebarState = Object.fromEntries(
+          THREAD_SIDEBAR_STATE_KEYS.map((key) => [key, optionalString(thread[key])])
+        );
         const directPayload = {
           ok: true,
           thread,
           pendingUserActions,
+          sidebarState,
           ...(storedVersion ? { storedVersion } : {}),
         };
         // Keep the original response shape for ordinary transcripts and older
@@ -2363,6 +2392,7 @@ const handleHostRequest = async (session, message) => {
           threadVersion: transfer.version,
           threadBytes: serialized.length,
           pendingUserActions,
+          sidebarState,
           ...(storedVersion ? { storedVersion } : {}),
         });
         return;
@@ -2490,6 +2520,28 @@ const handleHostRequest = async (session, message) => {
           {
             kind: 'stopTurn',
             threadId: String(message?.threadId ?? ''),
+            source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
+          },
+          Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
+          session,
+          acknowledgeClaim
+        );
+        respond(result);
+        return;
+      }
+      case 'threadState': {
+        // Settle, snooze or pin (or undo one) on a controller's mirror of a
+        // thread here: this machine's sidebar files it the same way.
+        const sidebarState = sanitizeThreadSidebarState(message?.state);
+        if (!sidebarState) {
+          respond({ ok: false, error: 'Invalid thread state.' });
+          return;
+        }
+        const result = await requestRendererCommand(
+          {
+            kind: 'threadState',
+            threadId: String(message?.threadId ?? '').slice(0, 128),
+            sidebarState,
             source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
           },
           Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
@@ -3403,6 +3455,7 @@ export const fetchRemoteThread = async ({ machineId, threadId, knownVersion } = 
     let expectedBytes;
     let storedVersion;
     let pendingUserActions;
+    let sidebarState;
     for (;;) {
       const response = await clientRequest(targetMachineId, {
         t: 'thread',
@@ -3425,8 +3478,15 @@ export const fetchRemoteThread = async ({ machineId, threadId, knownVersion } = 
       if (expectedOffset === undefined && Array.isArray(response.pendingUserActions)) {
         pendingUserActions = response.pendingUserActions;
       }
+      // Absent from older hosts: the mirror then keeps what listings say.
+      if (expectedOffset === undefined) sidebarState = sanitizeThreadSidebarState(response.sidebarState) ?? undefined;
+      const extras = () => ({
+        ...(storedVersion ? { storedVersion } : {}),
+        ...(pendingUserActions ? { pendingUserActions } : {}),
+        ...(sidebarState ? { sidebarState } : {}),
+      });
       if (response.thread !== undefined && expectedOffset === undefined) {
-        return { ok: true, thread: response.thread, ...(storedVersion ? { storedVersion } : {}), ...(pendingUserActions ? { pendingUserActions } : {}) };
+        return { ok: true, thread: response.thread, ...extras() };
       }
       if (
         typeof response.threadChunk !== 'string' ||
@@ -3457,7 +3517,7 @@ export const fetchRemoteThread = async ({ machineId, threadId, knownVersion } = 
         } catch {
           throw new Error('The host sent a malformed thread.');
         }
-        return { ok: true, thread, ...(storedVersion ? { storedVersion } : {}), ...(pendingUserActions ? { pendingUserActions } : {}) };
+        return { ok: true, thread, ...extras() };
       }
       if (
         !Number.isSafeInteger(response.nextThreadOffset) ||
@@ -3845,6 +3905,35 @@ export const stopRemoteTurn = async ({ machineId, threadId } = {}) => {
       { extendOnClaim: true }
     );
     return response.ok ? { ok: true } : { ok: false, error: response.error ?? 'Stop failed.' };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/**
+ * Settles, snoozes or pins (or undoes it for) a host thread, so that machine
+ * files it like the mirror here: `state` as sanitizeThreadSidebarState.
+ */
+export const setRemoteThreadState = async ({ machineId, threadId, state } = {}) => {
+  const sidebarState = sanitizeThreadSidebarState(state);
+  if (!sidebarState) return { ok: false, error: 'Invalid thread state.' };
+  try {
+    const response = await clientRequest(
+      String(machineId ?? ''),
+      { t: 'threadState', threadId: String(threadId ?? ''), state: sidebarState },
+      (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
+        (Number.isFinite(deps?.clientResponseGraceMs)
+          ? Math.max(0, deps.clientResponseGraceMs)
+          : CLIENT_RESPONSE_GRACE_MS),
+      { extendOnClaim: true }
+    );
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: unsupportedMessage(response, 'settle or snooze threads from here') ?? response.error ?? 'That machine did not take it.',
+      };
+    }
+    return { ok: true };
   } catch (error) {
     return clientErrorResult(error);
   }

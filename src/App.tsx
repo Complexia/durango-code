@@ -62,6 +62,8 @@ import {
   isNoProjectId,
   MAX_THREAD_PANES,
   settleThreadsForSidebarV2,
+  threadSidebarStateOf,
+  type ThreadSidebarState,
   STEERED_RUN_CAPTION,
   type AgentActivity,
   type BtwExchange,
@@ -1757,21 +1759,48 @@ const App: React.FC = () => {
     [childThreadIds, threads]
   );
 
+  // Settle, snooze or pin (or undo it) on a thread that runs on a paired
+  // machine: that machine files it the same way, and its listing then shows
+  // the change (remoteSidebarStatePatch). Unreachable or too old: it stays
+  // filed this way here only.
+  const sendSidebarStateToHost = useCallback(
+    (threadId: string, keys: readonly (keyof ThreadSidebarState)[]) => {
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const remote = thread?.remote;
+      if (!thread || !remote?.threadId || !window.orion?.remoteThreadState) return;
+      void window.orion
+        .remoteThreadState({
+          machineId: remote.machineId,
+          threadId: remote.threadId,
+          state: threadSidebarStateOf(thread, keys),
+        })
+        .then((result) => {
+          if (!result.ok) console.warn(`[remote] ${remote.machineName} kept its sidebar as it was: ${result.error}`);
+        })
+        .catch(() => {});
+    },
+    []
+  );
   const pinThread = useCallback(
-    (threadId: string) => updateThread(threadId, { pinnedAt: new Date().toISOString() }),
-    [updateThread]
+    (threadId: string) => {
+      updateThread(threadId, { pinnedAt: new Date().toISOString() });
+      sendSidebarStateToHost(threadId, ['pinnedAt']);
+    },
+    [sendSidebarStateToHost, updateThread]
   );
   // Unpinning surfaces the thread at the top of Recent agents (see the
   // recentThreads sort) so an accidental unpin of an old thread is easy to
   // recover instead of sinking back to its chronological spot.
   const unpinThread = useCallback(
-    (threadId: string) =>
+    (threadId: string) => {
       updateThread(threadId, {
         pinnedAt: undefined,
         unpinnedAt: new Date().toISOString(),
         hiddenFromRecent: false,
-      }),
-    [updateThread]
+      });
+      sendSidebarStateToHost(threadId, ['pinnedAt']);
+    },
+    [sendSidebarStateToHost, updateThread]
   );
 
   const runningAgentCount = useMemo(() => threads.filter((t) => t.status === 'running').length, [threads]);
@@ -2211,13 +2240,18 @@ const App: React.FC = () => {
     [setSidebarV2Settings]
   );
   const snoozeThread = useCallback(
-    (threadId: string) =>
-      updateThread(threadId, { snoozedAt: new Date().toISOString(), wokeAt: undefined, wokeReason: undefined }),
-    [updateThread]
+    (threadId: string) => {
+      updateThread(threadId, { snoozedAt: new Date().toISOString(), wokeAt: undefined, wokeReason: undefined });
+      sendSidebarStateToHost(threadId, ['snoozedAt']);
+    },
+    [sendSidebarStateToHost, updateThread]
   );
   const unsnoozeThread = useCallback(
-    (threadId: string) => updateThread(threadId, { snoozedAt: undefined }),
-    [updateThread]
+    (threadId: string) => {
+      updateThread(threadId, { snoozedAt: undefined });
+      sendSidebarStateToHost(threadId, ['snoozedAt']);
+    },
+    [sendSidebarStateToHost, updateThread]
   );
   // A thread still running can't be settled; it would leave the sidebar
   // mid-run.
@@ -2232,12 +2266,16 @@ const App: React.FC = () => {
         wokeReason: undefined,
         finishedUnseenAt: undefined,
       });
+      sendSidebarStateToHost(threadId, ['settledAt', 'snoozedAt']);
     },
-    [updateThread]
+    [sendSidebarStateToHost, updateThread]
   );
   const unsettleThread = useCallback(
-    (threadId: string) => updateThread(threadId, { settledAt: undefined }),
-    [updateThread]
+    (threadId: string) => {
+      updateThread(threadId, { settledAt: undefined });
+      sendSidebarStateToHost(threadId, ['settledAt']);
+    },
+    [sendSidebarStateToHost, updateThread]
   );
 
   const projectThreadsByProject = useMemo(() => {
@@ -8791,6 +8829,43 @@ const App: React.FC = () => {
           const error = await answerSecretRequest(threadId, actionId, command.secretAnswer);
           if (error) return { ok: false, error };
         } else return { ok: false, error: 'Invalid user action operation.' };
+        return { ok: true, threadId };
+      }
+      if (command.kind === 'threadState') {
+        // Settle, snooze or pin (or undo it) from a paired controller's
+        // mirror: filed here exactly as this machine's own buttons would.
+        const threadId = command.threadId ?? '';
+        const sidebarState = command.sidebarState ?? {};
+        if (!state.threads.some((candidate) => candidate.id === threadId)) {
+          return { ok: false, error: 'Thread not found on this machine.' };
+        }
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The command expired or was cancelled.' };
+        }
+        const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+        const updates: Partial<Thread> = {};
+        if (sidebarState.settledAt) {
+          // Like settleThread: a running thread stays in the sidebar.
+          if (thread.status === 'running') return { ok: false, threadId, error: 'That thread is still running there.' };
+          Object.assign(updates, {
+            settledAt: sidebarState.settledAt,
+            snoozedAt: undefined,
+            wokeAt: undefined,
+            wokeReason: undefined,
+            finishedUnseenAt: undefined,
+          });
+        } else if ('settledAt' in sidebarState) updates.settledAt = undefined;
+        if ('snoozedAt' in sidebarState && !updates.settledAt) {
+          if (sidebarState.snoozedAt) {
+            Object.assign(updates, { snoozedAt: sidebarState.snoozedAt, wokeAt: undefined, wokeReason: undefined });
+          } else updates.snoozedAt = undefined;
+        }
+        if (sidebarState.pinnedAt) updates.pinnedAt = sidebarState.pinnedAt;
+        else if ('pinnedAt' in sidebarState && thread.pinnedAt) {
+          Object.assign(updates, { pinnedAt: undefined, unpinnedAt: new Date().toISOString(), hiddenFromRecent: false });
+        }
+        if (Object.keys(updates).length > 0) updateThread(threadId, updates);
         return { ok: true, threadId };
       }
       return { ok: false, error: 'Unsupported remote command.' };

@@ -631,6 +631,7 @@ if (
       status: 'idle',
       modelId: 'claude:sonnet',
       createdAt: '2026-08-01T10:00:00.000Z',
+      snoozedAt: '2026-08-01T11:00:00.000Z',
       messages: [
         { id: 'm1', role: 'user', content: 'hello from the host', ts: '2026-08-01T10:00:01.000Z' },
         { id: 'm2', role: 'agent', content: 'done', ts: '2026-08-01T10:00:05.000Z', kind: 'agent-run', status: 'done' },
@@ -814,6 +815,11 @@ if (
         send({ kind: 'stopCommandSeen', commandId, expiresAt, command });
         return 1;
       }
+      if (command.kind === 'threadState') {
+        engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId });
+        send({ kind: 'threadStateSeen', command });
+        return 1;
+      }
       if (command.kind === 'runTurn') {
         engine.resolveRemoteCommand({ commandId, ok: true, threadId: command.threadId ?? 't-new' });
       } else if (command.kind === 'stopTurn') {
@@ -994,6 +1000,16 @@ if (
       prompt: 'keep going',
     });
     results.stopTurn = await engine.stopRemoteTurn({ machineId: results.pair.machine?.id, threadId: 't1' });
+    results.threadState = await engine.setRemoteThreadState({
+      machineId: results.pair.machine?.id,
+      threadId: 't1',
+      state: { settledAt: '2026-08-02T09:00:00.000Z', snoozedAt: null, ignored: 'x' },
+    });
+    results.badThreadState = await engine.setRemoteThreadState({
+      machineId: results.pair.machine?.id,
+      threadId: 't1',
+      state: { settledAt: 'not a time' },
+    });
     results.emptyPrompt = await engine.runRemoteTurn({ machineId: results.pair.machine?.id, prompt: '   ' });
     // Shell commands on the host (the machine_exec agent tool). Only where
     // they are checked: they take a few seconds, which timing checks of other
@@ -1951,6 +1967,7 @@ if (
     });
     establishedController = controller;
     const commandSeen = host.waitFor('commandSeen');
+    const threadStateSeen = host.waitFor('threadStateSeen');
     const { results } = await controller.waitFor('results', 30_000);
     await largeThreadMutated;
 
@@ -1977,6 +1994,23 @@ if (
     assert.equal(results.continueTurn.ok, true);
     assert.equal(results.continueTurn.threadId, 't1');
     assert.equal(results.stopTurn.ok, true, `stopTurn failed: ${results.stopTurn.error}`);
+    {
+      const t1 = results.snapshot.snapshot.threads.find((thread) => thread.id === 't1');
+      assert.equal(t1.snoozedAt, '2026-08-01T11:00:00.000Z', 'the snapshot says where a thread sits in the sidebar');
+      assert.equal(t1.settledAt, null);
+      assert.equal(t1.pinnedAt, null);
+      assert.deepEqual(
+        results.thread.sidebarState,
+        { settledAt: null, snoozedAt: '2026-08-01T11:00:00.000Z', pinnedAt: null },
+        'a thread refresh says where it sits as of that read'
+      );
+      assert.equal(results.threadState.ok, true, `threadState failed: ${results.threadState.error}`);
+      const { command } = await threadStateSeen;
+      assert.equal(command.threadId, 't1');
+      assert.deepEqual(command.sidebarState, { settledAt: '2026-08-02T09:00:00.000Z', snoozedAt: null }, 'only known keys, as sent');
+      assert.equal(results.badThreadState.ok, false, 'an invalid time is refused before it is sent');
+      console.log('ok  settling or snoozing a mirror reaches the host renderer');
+    }
     assert.equal(results.emptyPrompt.ok, false);
     assert.equal(results.exec.ok, true, `exec failed: ${results.exec.error}`);
     assert.equal(results.exec.exitCode, 3);

@@ -1,5 +1,5 @@
 import React from 'react';
-import { remoteAttentionPatch, useOrionStore, type Thread } from '../store';
+import { remoteAttentionPatch, remoteSidebarStatePatch, useOrionStore, type Thread } from '../store';
 import type { RemoteEvent, RemoteMachineEntry } from '../types';
 import {
   adoptRemoteSettings,
@@ -191,6 +191,23 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       // (App's queued-message effect).
       const patch = { ...update, ...settingsPatch, ...attention };
       if (Object.keys(patch).length > 0) state.updateThread(threadId, patch);
+      // Settled, snoozed or pinned there, as of the status just applied: on
+      // top of what that status did here (a run ending wakes a snoozed
+      // thread, one starting restores a settled one), and recorded even when
+      // this response is older than the last listing, so the next report
+      // puts right anything it got wrong.
+      if (result.sidebarState) {
+        const latest = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        if (latest?.remote) {
+          const sidebar = remoteSidebarStatePatch(latest, result.sidebarState);
+          if (sidebar.hostSidebarState) {
+            state.updateThread(threadId, {
+              ...sidebar.patch,
+              remote: { ...latest.remote, hostSidebarState: sidebar.hostSidebarState },
+            });
+          }
+        }
+      }
     } catch {
       // Unreachable for now: the next event or poll tries again.
     } finally {
