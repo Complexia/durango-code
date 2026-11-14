@@ -12,6 +12,7 @@ import {
   REMOTE_START_GRACE_MS,
   remoteMirrorUpdate,
   remoteTranscriptChanged,
+  remoteThreadsToReadAhead,
   remoteTurnSettings,
 } from '../src/app/remoteThreads';
 import type { Message, Thread } from '../src/store';
@@ -219,6 +220,52 @@ console.log('ok  refreshes wait for a just-started turn and keep this machine’
   const before = { status: 'idle', title: 'x', messages: [message('a')] } as never;
   assert.equal(remoteMirrorUpdate(local, 2, before, now - 1_000, now, true), null);
   console.log('ok  a run that ended there ends the start grace');
+}
+
+{
+  // Reading ahead: a mirror that finished there, or waits on the user, is
+  // read before it is opened; one still running, open, or unchanged is not.
+  const mirror = (id: string, patch: Record<string, unknown> = {}) =>
+    ({
+      id,
+      status: 'running',
+      remote: { machineId: 'omarchy', threadId: `host-${id}` },
+      summary: { messageCount: 3, lastMessage: { id: `${id}-m3`, role: 'agent', ts: '2026-11-14T10:00:00.000Z' } },
+      ...patch,
+    }) as unknown as Thread;
+  const seen = new Map<string, string>();
+  const before = [mirror('a'), mirror('b'), mirror('c'), mirror('local', { remote: undefined }), mirror('sub', { parentThreadId: 'a' })];
+  // The first pass only records where each one is.
+  assert.deepEqual(remoteThreadsToReadAhead(before, seen, false, new Set(), 12), []);
+  const finishedAt = { id: 'a-m4', role: 'agent', ts: '2026-11-14T10:05:00.000Z', completedAt: '2026-11-14T10:06:00.000Z' };
+  const after = [
+    mirror('a', { status: 'idle', summary: { messageCount: 4, lastMessage: finishedAt } }),
+    mirror('b', { summary: { messageCount: 5, lastMessage: { id: 'b-m5', role: 'agent', ts: '2026-11-14T10:01:00.000Z' } } }),
+    mirror('c', { remote: { machineId: 'omarchy', threadId: 'host-c', needsInputSince: '2026-11-14T10:02:00.000Z' } }),
+    mirror('local', { remote: undefined, status: 'idle' }),
+    mirror('sub', { parentThreadId: 'a', status: 'idle' }),
+    mirror('new', { status: 'idle' }),
+  ];
+  // Waiting on the user first; the one still running (b), the local thread
+  // and the subagent of a parent that isn't open are left.
+  assert.deepEqual(
+    remoteThreadsToReadAhead(after, seen, true, new Set(), 12).map((thread) => thread.id),
+    ['c', 'a', 'new']
+  );
+  // Nothing moved since: nothing to read.
+  assert.deepEqual(remoteThreadsToReadAhead(after, seen, true, new Set(), 12), []);
+  // Open ones are kept current already; a subagent of an open parent is read.
+  const later = after.map((thread) =>
+    thread.id === 'a' || thread.id === 'sub' ? { ...thread, summary: { ...thread.summary, messageCount: 9 } } : thread
+  );
+  assert.deepEqual(
+    remoteThreadsToReadAhead(later, seen, true, new Set(['a']), 12).map((thread) => thread.id),
+    ['sub']
+  );
+  // A burst is capped.
+  const many = Array.from({ length: 5 }, (_, index) => mirror(`m${index}`, { status: 'idle' }));
+  assert.equal(remoteThreadsToReadAhead(many, new Map(), true, new Set(), 2).length, 2);
+  console.log('ok  finished and waiting mirrors are read ahead, once per change');
 }
 
 console.log('All remote-threads tests passed.');

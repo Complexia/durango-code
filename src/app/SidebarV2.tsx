@@ -78,6 +78,8 @@ export type SidebarV2Actions = {
   settleThread: (threadId: string) => void;
   unsettleThread: (threadId: string) => void;
   deleteThreadWithRuntime: (threadId: string) => Promise<void>;
+  /** A thread on another machine is likely to be opened: read its copy now. */
+  readAheadRemoteThread: (threadId: string) => void;
   modelLabel: (thread: Thread) => string | null;
   renderThreadCliBadge: (thread: Thread) => React.JSX.Element | null;
 };
@@ -494,6 +496,9 @@ const ThreadRow = React.memo(function ThreadRow({
       }}
       onMouseEnter={() => {
         clearHoverTimer();
+        // Hovered on the way to a click: another machine's thread starts
+        // loading now, so it opens current.
+        if (thread.remote) model.readAheadRemoteThread(thread.id);
         hoverTimerRef.current = window.setTimeout(() => {
           if (rowRef.current) setHoverAnchor(rowRef.current.getBoundingClientRect());
         }, HOVER_CARD_DELAY_MS);

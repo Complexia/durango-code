@@ -9506,6 +9506,9 @@ const App: React.FC = () => {
     },
     [putAwayThread, settleThread]
   );
+  const readAheadRemoteThread = useCallback((threadId: string) => {
+    remoteThreadSyncRef.current?.readAhead(threadId);
+  }, []);
   const sidebarV2Actions = useMemo<SidebarV2Actions>(
     () => ({
       selectThread,
@@ -9519,6 +9522,7 @@ const App: React.FC = () => {
       settleThread: settleThreadFromSidebar,
       unsettleThread,
       deleteThreadWithRuntime,
+      readAheadRemoteThread,
       modelLabel: sidebarV2ModelLabel,
       renderThreadCliBadge,
     }),
@@ -9526,6 +9530,7 @@ const App: React.FC = () => {
       branchThreadWithFeedback,
       deleteThreadWithRuntime,
       pinThread,
+      readAheadRemoteThread,
       selectThread,
       setActiveTab,
       settleThreadFromSidebar,

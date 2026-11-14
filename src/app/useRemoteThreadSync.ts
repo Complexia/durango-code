@@ -1,5 +1,12 @@
 import React from 'react';
-import { remoteAttentionPatch, remoteSidebarStatePatch, useOrionStore, type Thread } from '../store';
+import {
+  allThreadsLoaded,
+  onAllThreadsLoaded,
+  remoteAttentionPatch,
+  remoteSidebarStatePatch,
+  useOrionStore,
+  type Thread,
+} from '../store';
 import type { RemoteEvent, RemoteMachineEntry } from '../types';
 import {
   REMOTE_START_GRACE_MS,
@@ -8,6 +15,8 @@ import {
   mapRemoteAttachments,
   readDismissedRemoteThreads,
   remoteMirrorUpdate,
+  remoteThreadWaitsOnUser,
+  remoteThreadsToReadAhead,
   remoteSettingsOf,
   remoteTranscriptChanged,
 } from './remoteThreads';
@@ -37,6 +46,15 @@ const STARTING_POLL_MS = 1_500;
 const LIST_MIN_INTERVAL_MS = 4_000;
 const LIST_POLL_MS = 60_000;
 const RECONNECT_MS = 60_000;
+// Reading ahead (see below): how many threads one change may queue, and how
+// long a copy read ahead stays current enough that hovering its row doesn't
+// read it again. One copy is read ahead at a time: a host keeps only two large
+// transfers per connection (remote-control.js MAX_THREAD_TRANSFERS), and the
+// thread being opened must have one.
+const READ_AHEAD_BURST = 12;
+// An open thread whose transfer the host dropped asks again this many times.
+const TRANSFER_RETRIES = 3;
+const READ_AHEAD_FRESH_MS = 5_000;
 
 type Options = {
   enabled: boolean;
@@ -59,6 +77,11 @@ export type RemoteThreadSync = {
    * that didn't go through).
    */
   refreshSoon: (threadId: string, options?: { force?: boolean }) => void;
+  /**
+   * The user is likely to open this thread (its sidebar row is hovered):
+   * read that machine's copy now, so it opens as it is there.
+   */
+  readAhead: (threadId: string) => void;
 };
 
 /** A turn event the mirror applies itself (text and activity of a run with a known message). */
@@ -81,8 +104,25 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
   React.useEffect(() => {
     if (enabled) versionsRef.current.clear();
   }, [enabled]);
+  // Unmounting (or turned off): fetches under way apply nothing and start
+  // nothing after them. First of the effects, so a remount (StrictMode
+  // replays effects without rendering again) is enabled again before the
+  // effects below schedule anything.
+  React.useEffect(() => {
+    enabledRef.current = enabled;
+    return () => {
+      enabledRef.current = false;
+    };
+  }, [enabled]);
 
   const refreshRef = React.useRef<(threadId: string) => Promise<void>>(async () => {});
+  // Reading ahead (below): the mirrors being read ahead now, and the pump that
+  // starts the next one once nothing else is being fetched.
+  const readingAheadRef = React.useRef(new Set<string>());
+  const pumpReadAheadRef = React.useRef<() => void>(() => {});
+  // Set where the threads open here are known (below); refresh reads it.
+  const openIdsRef = React.useRef<ReadonlySet<string>>(new Set());
+  const transferRetriesRef = React.useRef(new Map<string, number>());
   const clearStarted = (threadId: string) => {
     startedAtRef.current.delete(threadId);
     endedRef.current.delete(threadId);
@@ -124,6 +164,8 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
         threadId: remote.threadId,
         ...(knownVersion ? { knownVersion } : {}),
       });
+      // Remote control turned off (or the app closing) meanwhile.
+      if (!enabledRef.current) return;
       if (result?.ok && result.unchanged) {
         // Just started there and not saved yet: look again soon (for a while).
         const startedAt = startedAtRef.current.get(threadId);
@@ -132,6 +174,15 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
         return;
       }
       if (!result?.ok || !result.thread) {
+        // The host keeps only a couple of large transfers per connection and
+        // drops the oldest (more open panes, or a read ahead): an open
+        // thread asks again, a few times.
+        if (result?.error && /thread transfer expired/i.test(result.error) && openIdsRef.current.has(threadId)) {
+          const attempts = (transferRetriesRef.current.get(threadId) ?? 0) + 1;
+          transferRetriesRef.current.set(threadId, attempts);
+          if (attempts <= TRANSFER_RETRIES) retrySoon = true;
+          return;
+        }
         // Started here, then deleted there: it isn't running anywhere.
         if (result?.error && /not found on the host/i.test(result.error) && !startedAtRef.current.has(threadId)) {
           const gone = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
@@ -159,6 +210,7 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       }
       startedAtRef.current.delete(threadId);
       endedRef.current.delete(threadId);
+      transferRetriesRef.current.delete(threadId);
       if (result.storedVersion) versionsRef.current.set(threadId, result.storedVersion);
       else versionsRef.current.delete(threadId);
       const hostMessages = Array.isArray(host.messages) ? host.messages : [];
@@ -264,6 +316,8 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       inflightRef.current.delete(threadId);
       if (againRef.current.delete(threadId)) schedule(threadId);
       else if (retrySoon) schedule(threadId, STARTING_POLL_MS);
+      // A fetch for a thread on screen held reading ahead back.
+      if (!readingAheadRef.current.has(threadId)) pumpReadAheadRef.current();
     }
   };
 
@@ -553,10 +607,132 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
     return () => window.clearInterval(timer);
   }, [anyRunning, enabled, schedule]);
 
+  // --- Reading ahead ---------------------------------------------------
+  // Only open mirrors are fetched (above); the rest have just the listing's
+  // status and summary, over the transcript stored when they were last open.
+  // Opening one would show that old copy (a run long finished still working)
+  // until the fetch lands. So a mirror the user is likely to open next has its
+  // copy read ahead, into the transcript stored here: one that finished there,
+  // or now waits on the user, and one whose row is hovered. A subagent there
+  // only while its parent is open (its switcher is on screen).
+  openIdsRef.current = openIds;
+  const readAheadQueueRef = React.useRef<string[]>([]);
+  const readAheadAtRef = React.useRef(new Map<string, number>());
+  // When each read ahead ended: a listing asked for before then may be older
+  // than its copy.
+  const readAheadDoneAtRef = React.useRef(new Map<string, number>());
+  const readAheadTimersRef = React.useRef(new Map<string, number>());
+  // Read ahead while a listing skipped them: that machine is listed again
+  // once they are read, so what the listing had for them isn't lost.
+  const relistAfterReadRef = React.useRef(new Set<string>());
+  const scheduleListRef = React.useRef<(machineId: string) => void>(() => {});
+  const pumpReadAhead = React.useCallback(() => {
+    const queue = readAheadQueueRef.current;
+    if (!enabledRef.current) {
+      queue.length = 0;
+      return;
+    }
+    // One at a time, and never alongside a fetch for a thread on screen.
+    if (readingAheadRef.current.size > 0) return;
+    if ([...inflightRef.current].some((id) => !readingAheadRef.current.has(id))) return;
+    while (queue.length > 0) {
+      const threadId = queue.shift()!;
+      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      const machineId = thread?.remote?.threadId ? thread.remote.machineId : null;
+      // Open ones are kept current already; an unreachable machine waits for
+      // the next change.
+      if (!machineId || openIdsRef.current.has(threadId) || inflightRef.current.has(threadId)) continue;
+      if (machinesRef.current.find((machine) => machine.id === machineId)?.status !== 'connected') continue;
+      readingAheadRef.current.add(threadId);
+      readAheadAtRef.current.set(threadId, Date.now());
+      void refreshRef.current(threadId).finally(() => {
+        readAheadDoneAtRef.current.set(threadId, Date.now());
+        readingAheadRef.current.delete(threadId);
+        if (relistAfterReadRef.current.delete(threadId) && enabledRef.current) scheduleListRef.current(machineId);
+        pumpReadAheadRef.current();
+      });
+      return;
+    }
+  }, []);
+  pumpReadAheadRef.current = pumpReadAhead;
+  const queueReadAhead = React.useCallback(
+    (threadId: string, options: { delay?: number; first?: boolean } = {}) => {
+      if (!enabledRef.current || openIdsRef.current.has(threadId) || startedAtRef.current.has(threadId)) return;
+      const enqueue = () => {
+        const queue = readAheadQueueRef.current;
+        if (queue.includes(threadId)) return;
+        if (options.first) queue.unshift(threadId);
+        else queue.push(threadId);
+        pumpReadAhead();
+      };
+      if (!options.delay) {
+        enqueue();
+        return;
+      }
+      const timers = readAheadTimersRef.current;
+      if (timers.has(threadId)) return;
+      timers.set(
+        threadId,
+        window.setTimeout(() => {
+          timers.delete(threadId);
+          enqueue();
+        }, options.delay)
+      );
+    },
+    [pumpReadAhead]
+  );
+
+  // A mirror that finished there or now waits on the user (its listing, or a
+  // copy read, says so). The shells as they are when this starts are the
+  // baseline: only changes from there on are read ahead.
+  React.useEffect(() => {
+    if (!enabled) return undefined;
+    const seen = new Map<string, string>();
+    let seeded = false;
+    const consider = (threads: Thread[]) => {
+      if (!allThreadsLoaded()) return;
+      const picked = remoteThreadsToReadAhead(threads, seen, seeded, openIdsRef.current, READ_AHEAD_BURST);
+      seeded = true;
+      for (const thread of picked) queueReadAhead(thread.id, { first: remoteThreadWaitsOnUser(thread) });
+    };
+    const stopWaiting = onAllThreadsLoaded(() => consider(useOrionStore.getState().threads));
+    const unsubscribe = useOrionStore.subscribe((state, previous) => {
+      if (state.threads !== previous.threads) consider(state.threads);
+    });
+    return () => {
+      stopWaiting();
+      unsubscribe();
+    };
+  }, [enabled, queueReadAhead]);
+
+  // A run there ended, or asked the user something: read its copy once that
+  // machine has saved it, ahead of the listing that follows.
+  React.useEffect(() => {
+    if (!enabled) return undefined;
+    const unsubscribe = window.orion?.onRemoteEvent?.((event: RemoteEvent) => {
+      if (event.kind !== 'turnEvent') return;
+      const hostThreadId = event.payload?.threadId;
+      const type = event.payload?.type;
+      if (!hostThreadId || (type !== 'user-input' && type !== 'done' && type !== 'error')) return;
+      const threads = useOrionStore.getState().threads;
+      const mirror = threads.find(
+        (thread) => thread.remote?.machineId === event.machineId && thread.remote.threadId === hostThreadId
+      );
+      if (!mirror) return;
+      if (mirror.parentThreadId) {
+        const parent = threads.find((candidate) => candidate.id === mirror.parentThreadId);
+        if (parent?.remote && !openIdsRef.current.has(parent.id)) return;
+      }
+      queueReadAhead(mirror.id, { delay: EVENT_REFRESH_DELAY_MS, first: type === 'user-input' });
+    });
+    return () => unsubscribe?.();
+  }, [enabled, queueReadAhead]);
+
   // --- Machine thread lists --------------------------------------------
   const listTimersRef = React.useRef(new Map<string, number>());
   const lastListedRef = React.useRef(new Map<string, number>());
   const listingRef = React.useRef(new Set<string>());
+  const relistAfterListRef = React.useRef(new Set<string>());
   const listMachineRef = React.useRef<(machineId: string) => Promise<void>>(async () => {});
   listMachineRef.current = async (machineId: string) => {
     const machine = machines.find((candidate) => candidate.id === machineId);
@@ -566,18 +742,39 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
     // Failed or not, the next listing waits its turn (no tight retry loop).
     lastListedRef.current.set(machineId, Date.now());
     try {
+      const listedFrom = Date.now();
       const result = await window.orion.remoteListThreads({ machineId });
       if (!result?.ok || !Array.isArray(result.threads) || !enabledRef.current) return;
+      // Being read ahead, or read ahead after this listing was asked for:
+      // their copy may be newer than the listing, so it leaves them, and that
+      // machine is listed again once they are read.
+      const readingAhead: string[] = [...readingAheadRef.current];
+      for (const threadId of readingAhead) relistAfterReadRef.current.add(threadId);
+      let relistNow = false;
+      for (const [threadId, doneAt] of readAheadDoneAtRef.current) {
+        if (doneAt < listedFrom || readingAheadRef.current.has(threadId)) continue;
+        readingAhead.push(threadId);
+        relistNow = true;
+      }
+      if (relistNow) relistAfterListRef.current.add(machineId);
       useOrionStore.getState().syncRemoteMachineThreads({ id: machine.id, name: machine.name }, result.threads, {
         // Kept current one by one, or just started here (the listing may
         // predate the turn): left alone.
-        skip: new Set([...watchedRef.current.map((thread) => thread.id), ...startedAtRef.current.keys()]),
+        // Being read ahead: that copy is applied as it lands, so the listing
+        // must not apply an older or newer state under it (listed again
+        // after it, below).
+        skip: new Set([
+          ...watchedRef.current.map((thread) => thread.id),
+          ...startedAtRef.current.keys(),
+          ...readingAhead,
+        ]),
         dismissed: readDismissedRemoteThreads(machineId),
       });
     } catch {
       // Unreachable for now: its next event or the poll tries again.
     } finally {
       listingRef.current.delete(machineId);
+      if (relistAfterListRef.current.delete(machineId)) scheduleListRef.current(machineId);
     }
   };
   const scheduleList = React.useCallback((machineId: string) => {
@@ -591,6 +788,7 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       }, Math.max(0, LIST_MIN_INTERVAL_MS - since))
     );
   }, []);
+  scheduleListRef.current = scheduleList;
 
   // List a machine as soon as it is connected, and on a slow poll.
   React.useEffect(() => {
@@ -631,12 +829,23 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, pairedKey]);
 
+  // Turned off: nothing waits to be read ahead.
+  React.useEffect(() => {
+    if (enabled) return;
+    readAheadQueueRef.current.length = 0;
+    for (const timer of readAheadTimersRef.current.values()) window.clearTimeout(timer);
+    readAheadTimersRef.current.clear();
+  }, [enabled]);
+
   React.useEffect(
     () => () => {
+      readAheadQueueRef.current.length = 0;
       for (const timer of timersRef.current.values()) window.clearTimeout(timer);
       timersRef.current.clear();
       for (const timer of listTimersRef.current.values()) window.clearTimeout(timer);
       listTimersRef.current.clear();
+      for (const timer of readAheadTimersRef.current.values()) window.clearTimeout(timer);
+      readAheadTimersRef.current.clear();
     },
     []
   );
@@ -655,7 +864,12 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
         if (options?.force) versionsRef.current.delete(threadId);
         schedule(threadId);
       },
+      readAhead: (threadId: string) => {
+        // Read a moment ago (or reading now): that copy is current enough.
+        if (Date.now() - (readAheadAtRef.current.get(threadId) ?? 0) < READ_AHEAD_FRESH_MS) return;
+        queueReadAhead(threadId, { first: true });
+      },
     }),
-    [schedule]
+    [queueReadAhead, schedule]
   );
 };

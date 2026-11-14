@@ -64,6 +64,59 @@ export const remoteTranscriptChanged = (mirror: ThreadTranscript | undefined, ho
   return (mirror?.btwExchanges?.length ?? 0) !== (host.btwExchanges?.length ?? 0);
 };
 
+// What a mirror's shell says about where its thread is there (from a listing,
+// or a copy read): a change in it means that machine's copy moved on.
+const readAheadSignature = (thread: Thread) =>
+  [
+    thread.status,
+    thread.summary.messageCount,
+    thread.summary.lastMessage?.id ?? '',
+    thread.summary.lastMessage?.ts ?? '',
+    thread.summary.lastMessage?.completedAt ?? '',
+    thread.remote?.needsInputSince ? 'input' : '',
+    thread.userActions?.length ?? 0,
+  ].join('|');
+
+/** Whether a mirror's thread waits on the user there (a question, approval or action). */
+export const remoteThreadWaitsOnUser = (thread: Thread) =>
+  Boolean(thread.remote?.needsInputSince) || (thread.userActions?.length ?? 0) > 0;
+
+/**
+ * The mirrors whose copy to read ahead, before the user opens them: those not
+ * open whose shell moved on since `seen` (updated here) and that finished
+ * there or wait on the user. A subagent there only while its parent is open.
+ * Until `seeded`, this only records where each one is. At most `limit`, the
+ * ones waiting on the user first, then the latest.
+ */
+export const remoteThreadsToReadAhead = (
+  threads: Thread[],
+  seen: Map<string, string>,
+  seeded: boolean,
+  openIds: ReadonlySet<string>,
+  limit: number
+): Thread[] => {
+  const candidates: Thread[] = [];
+  const byId = new Map(threads.map((thread) => [thread.id, thread]));
+  for (const thread of threads) {
+    if (!thread.remote?.threadId) continue;
+    const signature = readAheadSignature(thread);
+    const before = seen.get(thread.id);
+    seen.set(thread.id, signature);
+    if (!seeded || before === signature || openIds.has(thread.id)) continue;
+    if (thread.status === 'running' && !remoteThreadWaitsOnUser(thread)) continue;
+    if (thread.summary.messageCount === 0) continue;
+    const parent = thread.parentThreadId ? byId.get(thread.parentThreadId) : undefined;
+    if (parent?.remote && !openIds.has(parent.id)) continue;
+    candidates.push(thread);
+  }
+  const latest = (thread: Thread) =>
+    Date.parse(thread.summary.lastMessage?.completedAt ?? thread.summary.lastMessage?.ts ?? '') || 0;
+  candidates.sort(
+    (a, b) => Number(remoteThreadWaitsOnUser(b)) - Number(remoteThreadWaitsOnUser(a)) || latest(b) - latest(a)
+  );
+  return candidates.slice(0, limit);
+};
+
 /**
  * How long after this machine started a turn there a refresh that doesn't
  * show it yet is ignored: the other machine saves its threads shortly after a
