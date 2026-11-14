@@ -46,6 +46,7 @@
     "test:sidebar-v2": "bun scripts/test-sidebar-v2.ts && bun scripts/test-sidebar-v2-update.ts && bun scripts/test-sidebar-v2-update.ts --failed-backfill",
     "test:thread-transcripts": "bun scripts/test-thread-transcripts.ts",
     "test:workspace-sync-threads": "node --no-warnings scripts/test-workspace-sync-threads.mjs",
+    "test:workspace-sync-removals": "node --no-warnings scripts/test-workspace-sync-removals.mjs",
     "test:composer-drafts": "bun scripts/test-composer-drafts.ts && bun scripts/test-composer-drafts.ts --failed-backfill && bun scripts/test-composer-drafts.ts --cleared-backfill && bun scripts/test-composer-draft-controller.ts",
     "test:work-log": "bun scripts/test-work-log.tsx",
     "test:html-visuals": "bun scripts/test-html-visuals.tsx",

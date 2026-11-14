@@ -103,7 +103,7 @@ import {
   listAgentModelsWithAvailability,
   onAgentModelsChanged,
 } from './main/models.js';
-import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
+import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, getSyncLedgerFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellPathSyncPromise, shellQuote, startShellPathSync } from './main/shell-env.js';
@@ -1251,6 +1251,7 @@ app.whenReady().then(async () => {
     readThreadsIndex,
     readThreadsByIds,
     readThreadsForSync,
+    getSyncLedgerPath: () => getSyncLedgerFilePath(),
     pushOrionSourceControl: async ({ gitRoot, token, signal }) => {
       const branch = await getCurrentGitBranch(gitRoot);
       if (!branch) throw new Error('Cannot push from a detached HEAD.');

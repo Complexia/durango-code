@@ -32,6 +32,12 @@ const execFileAsync = promisify(execFile);
 // — prompt enough for digests, while a streaming turn's many saves coalesce
 // into one pass. SYNC_MAX_WAIT_MS caps the debounce: another thread streaming
 // continuously cannot postpone a finished thread's sync for longer than 60 s.
+//
+// Removals: the server is told about a deleted project or thread explicitly,
+// and only by the machine that had it (a persisted ledger of what this machine
+// synced). Removal only hides it from lists on the web; usage counts it still.
+// There is no full-list reconciliation, so several machines never remove each
+// other's work.
 
 const THREAD_SYNC_BATCH = 50;
 const SYNC_DEBOUNCE_MS = 15_000;
@@ -39,6 +45,8 @@ const SYNC_MAX_WAIT_MS = 60_000;
 const CODE_POLL_MS = 60_000;
 const MIN_SYNC_GAP_MS = 5_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const PROJECT_RESCAN_MS = 10 * 60_000;
+const MAX_REMOVALS_PER_SNAPSHOT = 20_000;
 
 // Injected by main.js at startup so this module needs no knowledge of Electron
 // state: { getWebUrl, readSession, readStoreState, readThreadsIndex,
@@ -71,6 +79,21 @@ let lastSyncStartedAt = 0;
 // once so older Codex threads can be backfilled from their provider rollout.
 let knownThreadStates = new Map();
 let serverStateSeeded = false;
+// Threads the server has marked removed. This machine's local ones among them
+// are restored (an older client on another machine reconciled them away).
+let serverRemovedThreadIds = new Set();
+// The projects and threads this machine had at its last snapshot, persisted
+// (deps.getSyncLedgerPath) so a deletion made while the app was closed still
+// reaches the server. A deletion is sent only for ids this machine had: one
+// machine never removes another machine's work.
+let ledger = null;
+let ledgerDirty = false;
+// The project payload last sent, and the last scan of the projects' git state
+// (git root + Cloud repo link per project), reused while the project list is
+// unchanged, nothing was published, and it is under PROJECT_RESCAN_MS old.
+let sentProjectsKey = null;
+let projectScan = null;
+let projectLinksDirty = false;
 // gitRoot -> complete refs/heads state successfully pushed.
 const pushedBranchStates = new Map();
 // gitRoot -> { message, branchState } of the last failed auto publish/push.
@@ -174,6 +197,12 @@ const resetAccountScopedState = (ownerId) => {
   syncOwnerId = ownerId;
   serverStateSeeded = false;
   knownThreadStates = new Map();
+  serverRemovedThreadIds = new Set();
+  ledger = null;
+  ledgerDirty = false;
+  sentProjectsKey = null;
+  projectScan = null;
+  projectLinksDirty = false;
   pushedBranchStates.clear();
   publishFailures.clear();
   totals = { projects: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
@@ -525,14 +554,22 @@ const threadPayload = async (thread, transcriptHash, options = {}) => {
 
 // --- Sync passes --------------------------------------------------------------
 
-const syncSnapshot = async (token, storeState, threads, { ownerId, generation, signal }) => {
-  const projects = Array.isArray(storeState?.projects) ? storeState.projects : [];
-
-  // Resolve each project's cloud repo link so the web UI can cross-link the
-  // synced code. Cheap local git config reads; failures just leave it null.
-  const projectPayloads = [];
+// Each project's Cloud repo link, so the web UI can cross-link the synced code.
+// Cheap local git reads, but they ran for every project on every pass (each
+// minute): reuse the last scan while nothing that feeds it changed.
+const scanProjects = async (projects, ownerId, { generation, signal }) => {
+  const inputsKey = JSON.stringify(projects.map((project) => [project.id, project.name ?? '', project.path ?? '']));
+  if (
+    projectScan &&
+    !projectLinksDirty &&
+    projectScan.inputsKey === inputsKey &&
+    Date.now() - projectScan.at < PROJECT_RESCAN_MS
+  ) {
+    return projectScan.payloads;
+  }
+  projectLinksDirty = false;
+  const payloads = [];
   for (const project of projects) {
-    if (typeof project?.id !== 'string') continue;
     let repoId = null;
     try {
       const gitRoot = await getGitRootSafe(project.path);
@@ -544,19 +581,123 @@ const syncSnapshot = async (token, storeState, threads, { ownerId, generation, s
     } catch (error) {
       if (isCancelledSync(error, generation, signal)) throw error;
     }
-    projectPayloads.push({ id: project.id, name: project.name ?? '', path: project.path ?? '', repoId });
+    payloads.push({ id: project.id, name: project.name ?? '', path: project.path ?? '', repoId });
+  }
+  projectScan = { inputsKey, at: Date.now(), payloads };
+  return payloads;
+};
+
+// The ledger file holds one entry per account signed in on this machine, so
+// switching accounts never loses another account's pending deletions.
+const readLedgerFile = async (ledgerPath) => {
+  try {
+    const saved = JSON.parse(await fs.readFile(ledgerPath, 'utf8'));
+    if (saved?.version === 2 && saved.accounts && typeof saved.accounts === 'object') return saved.accounts;
+    // Version 1: a single account.
+    if (typeof saved?.ownerId === 'string') return { [saved.ownerId]: saved };
+  } catch {
+    // Missing or unreadable: no ledger yet.
+  }
+  return {};
+};
+
+const validLedger = (entry) =>
+  Array.isArray(entry?.threadIds) && Array.isArray(entry?.projectIds)
+    ? { threadIds: entry.threadIds, projectIds: entry.projectIds }
+    : null;
+
+const readLedger = async (ownerId) => {
+  const ledgerPath = deps.getSyncLedgerPath?.();
+  if (!ledgerPath) return null;
+  return validLedger((await readLedgerFile(ledgerPath))[ownerId]);
+};
+
+// The in-memory ledger is current; `ledgerDirty` stays set until a write of it
+// succeeds, so a failed write (or a pass that failed before writing) retries.
+const persistLedger = async (ownerId) => {
+  const ledgerPath = deps.getSyncLedgerPath?.();
+  if (!ledgerPath) {
+    ledgerDirty = false;
+    return;
+  }
+  const temporary = `${ledgerPath}.${process.pid}.tmp`;
+  try {
+    const accounts = await readLedgerFile(ledgerPath);
+    accounts[ownerId] = { threadIds: ledger.threadIds, projectIds: ledger.projectIds };
+    await fs.writeFile(temporary, JSON.stringify({ version: 2, accounts }));
+    await fs.rename(temporary, ledgerPath);
+    ledgerDirty = false;
+  } catch (error) {
+    console.warn(`Workspace sync could not save its ledger: ${error?.message || error}`);
+  }
+};
+
+const sameIds = (ids, set) => ids.length === set.size && ids.every((id) => set.has(id));
+
+// Projects (when they changed) and this machine's removals and restorations.
+// Nothing is reconciled against a full list: deletions are explicit, and only
+// for ids this machine had, so another machine's work is never touched.
+const syncSnapshot = async (token, storeState, threads, { ownerId, generation, signal }) => {
+  const projects = (Array.isArray(storeState?.projects) ? storeState.projects : []).filter(
+    (project) => typeof project?.id === 'string'
+  );
+  const projectPayloads = await scanProjects(projects, ownerId, { generation, signal });
+  ensureCurrentSync(generation, signal);
+
+  // The index read throws when thread storage is damaged, so an empty index
+  // here really is "no threads": deleting the last one is a deletion too.
+  const localThreads = new Set(threads.map((thread) => thread?.id).filter((id) => typeof id === 'string'));
+  const localProjects = new Set(projects.map((project) => project.id));
+  if (!ledger) {
+    const saved = await readLedger(ownerId);
+    ensureCurrentSync(generation, signal);
+    // First run on this machine (or for this account): what it has now is its
+    // baseline, with nothing to remove.
+    ledger = saved ?? { threadIds: [...localThreads], projectIds: [...localProjects] };
+    ledgerDirty = !saved;
   }
 
-  ensureCurrentSync(generation, signal);
-  await api(token, '/api/sync/snapshot', {
-    method: 'POST',
-    signal,
-    body: JSON.stringify({
-      projects: projectPayloads,
-      threadIds: threads.map((thread) => thread.id),
-      complete: true,
-    }),
-  });
+  const removedThreadIds = ledger.threadIds.filter((id) => !localThreads.has(id)).slice(0, MAX_REMOVALS_PER_SNAPSHOT);
+  const removedProjectIds = ledger.projectIds.filter((id) => !localProjects.has(id));
+  const restoredThreadIds = [...localThreads].filter((id) => serverRemovedThreadIds.has(id)).slice(0, MAX_REMOVALS_PER_SNAPSHOT);
+  const projectsKey = JSON.stringify(projectPayloads);
+  const sendProjects = projectsKey !== sentProjectsKey;
+  const changes = removedThreadIds.length + removedProjectIds.length + restoredThreadIds.length;
+
+  // Removals leave the ledger only once the server says it applied them: a
+  // server from before explicit removals answers ok and ignores the fields,
+  // and those deletions must still be sent once it can apply them.
+  let applied = false;
+  if (sendProjects || changes > 0) {
+    const response = await api(token, '/api/sync/snapshot', {
+      method: 'POST',
+      signal,
+      body: JSON.stringify({
+        projects: sendProjects ? projectPayloads : [],
+        removedProjectIds,
+        removedThreadIds,
+        restoredThreadIds,
+      }),
+    });
+    ensureCurrentSync(generation, signal);
+    sentProjectsKey = projectsKey;
+    applied = response?.removals === true;
+    if (applied) {
+      for (const id of restoredThreadIds) serverRemovedThreadIds.delete(id);
+      for (const id of removedThreadIds) serverRemovedThreadIds.add(id);
+    }
+  }
+
+  // Ids over the per-snapshot cap, and any the server didn't apply, stay for
+  // the next pass.
+  const sentThreads = new Set(applied ? removedThreadIds : []);
+  const nextThreadIds = [...localThreads, ...ledger.threadIds.filter((id) => !localThreads.has(id) && !sentThreads.has(id))];
+  const nextProjectIds = applied ? [...localProjects] : [...localProjects, ...removedProjectIds];
+  if (!sameIds(ledger.threadIds, new Set(nextThreadIds)) || !sameIds(ledger.projectIds, new Set(nextProjectIds))) {
+    ledger = { threadIds: nextThreadIds, projectIds: nextProjectIds };
+    ledgerDirty = true;
+  }
+  if (ledgerDirty) await persistLedger(ownerId);
   totals.projects = projectPayloads.length;
 };
 
@@ -830,6 +971,8 @@ const syncCode = async (
         if (result.repo?.id) {
           repoLinkOwners.set(gitRoot, { ownerId, repoId: result.repo.id });
         }
+        // A new link: the next snapshot rescans so the web can cross-link it.
+        projectLinksDirty = true;
         publishFailures.delete(gitRoot);
         pushedBranchStates.set(gitRoot, branchState);
         totals.codePushes += 1;
@@ -864,7 +1007,12 @@ const syncCode = async (
 
 const seedServerState = async (token, signal) => {
   if (serverStateSeeded) return;
-  const state = await api(token, '/api/sync/state', { signal });
+  const state = await api(token, '/api/sync/state?removed=1', { signal });
+  serverRemovedThreadIds = new Set(
+    (state?.threads ?? [])
+      .filter((thread) => typeof thread?.id === 'string' && thread.removed === true)
+      .map((thread) => thread.id)
+  );
   knownThreadStates = new Map(
     (state?.threads ?? [])
       .filter((thread) => typeof thread?.id === 'string')
