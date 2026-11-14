@@ -31,10 +31,14 @@ const run = (command, args, { timeout = 30_000, encoding = 'utf8', maxBuffer = 3
 
 const RUNTIME_PREFIX = 'com.apple.CoreSimulator.SimRuntime.';
 
-/** "com.apple.CoreSimulator.SimRuntime.iOS-26-3" → { os: 'iOS', version: '26.3' }. */
+/**
+ * "com.apple.CoreSimulator.SimRuntime.iOS-26-3" → { os: 'iOS', version: '26.3' }.
+ * Runtimes built for one device carry its model after the version
+ * ("iOS-27-2-iPhone19-4" is iPhone Duo's own iOS 27.2) and parse the same way.
+ */
 export const parseSimRuntime = (key) => {
   const name = String(key || '').startsWith(RUNTIME_PREFIX) ? key.slice(RUNTIME_PREFIX.length) : String(key || '');
-  const match = name.match(/^([A-Za-z]+)-(\d+(?:-\d+)*)$/);
+  const match = name.match(/^([A-Za-z]+)-(\d+(?:-\d+)*)(?:-[A-Za-z][\w-]*)?$/);
   if (!match) return { os: name, version: '' };
   return { os: match[1], version: match[2].replace(/-/g, '.') };
 };

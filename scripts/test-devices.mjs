@@ -106,6 +106,11 @@ try {
   // --- simctl / adb parsing -----------------------------------------------------------------
   assert.deepEqual(parseSimRuntime('com.apple.CoreSimulator.SimRuntime.iOS-26-3'), { os: 'iOS', version: '26.3' });
   assert.deepEqual(parseSimRuntime('com.apple.CoreSimulator.SimRuntime.watchOS-11-0'), { os: 'watchOS', version: '11.0' });
+  assert.deepEqual(
+    parseSimRuntime('com.apple.CoreSimulator.SimRuntime.iOS-27-2-iPhone19-4'),
+    { os: 'iOS', version: '27.2' },
+    'a device-specific runtime (iPhone Duo) is still iOS'
+  );
   const simctl = {
     devices: {
       'com.apple.CoreSimulator.SimRuntime.iOS-18-2': [
@@ -117,13 +122,16 @@ try {
         { udid: 'GONE', name: 'iPhone X', state: 'Shutdown', isAvailable: false },
         { udid: 'BOOT', name: 'iPhone 17 Pro', state: 'Booted', isAvailable: true, deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro' },
       ],
+      'com.apple.CoreSimulator.SimRuntime.iOS-26-3-iPhone19-4': [
+        { udid: 'DUO', name: 'iPhone Duo', state: 'Shutdown', isAvailable: true, deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-Duo' },
+      ],
       'com.apple.CoreSimulator.SimRuntime.watchOS-11-0': [
         { udid: 'WATCH', name: 'Apple Watch', state: 'Shutdown', isAvailable: true },
       ],
     },
   };
   const sims = parseSimctlDevices(JSON.stringify(simctl));
-  assert.deepEqual(sims.map((device) => device.id), ['BOOT', 'NEW', 'PAD', 'OLD'], 'booted, newest runtime, phones before tablets');
+  assert.deepEqual(sims.map((device) => device.id), ['BOOT', 'NEW', 'DUO', 'PAD', 'OLD'], 'booted, newest runtime (a device-specific one too), phones before tablets, then name');
   assert.deepEqual(sims[0], { id: 'BOOT', name: 'iPhone 17 Pro', platform: 'ios', version: '26.3', state: 'booted', kind: 'phone' });
   assert.equal(sims.find((device) => device.id === 'PAD').kind, 'tablet');
   assert.deepEqual(parseSimctlDevices('not json'), []);
