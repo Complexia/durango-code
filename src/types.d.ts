@@ -435,6 +435,8 @@ export type RemoteEvent = {
     chunk?: string;
     activity?: Omit<import('./store').AgentActivity, 'id' | 'ts'>;
     parentThreadId?: string;
+    /** turnEvent `prompt-suggestion`: the agent's guess at the next prompt. */
+    suggestion?: string;
     /** turnClaimed: the key the renderer passed to remoteRunTurn. */
     turnKey?: string;
   } | null;

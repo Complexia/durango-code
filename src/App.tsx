@@ -4069,6 +4069,49 @@ const App: React.FC = () => {
     }
   }, [appendToThreadMessage]);
 
+  // Threads running on another machine: that machine's agent makes the
+  // suggestion and forwards it with the run's other events (to controllers
+  // following the thread). Its runs are tracked under the mirror's id, so a
+  // suggestion from a run the host has since superseded is dropped too.
+  useEffect(() => {
+    if (!window.orion?.onRemoteEvent) return undefined;
+    return window.orion.onRemoteEvent((event) => {
+      if (event.kind !== 'turnEvent' || !event.payload) return;
+      const { type, threadId: hostThreadId, runId } = event.payload;
+      if (!hostThreadId || !runId || (type !== 'started' && type !== 'prompt-suggestion')) return;
+      const mirrorIds = useOrionStore
+        .getState()
+        .threads.filter((thread) => thread.remote?.machineId === event.machineId && thread.remote.threadId === hostThreadId)
+        .map((thread) => thread.id);
+      if (mirrorIds.length === 0) return;
+      if (type === 'started') {
+        for (const id of mirrorIds) latestStartedRunByThread.current.set(id, runId);
+        setPromptSuggestions((current) => {
+          if (!mirrorIds.some((id) => id in current)) return current;
+          const next = { ...current };
+          for (const id of mirrorIds) delete next[id];
+          return next;
+        });
+        return;
+      }
+      const suggestion = event.payload.suggestion?.trim();
+      if (!suggestion) return;
+      // Following since before the run started: it must be the latest one.
+      // (Following only since after it started: the host already drops a
+      // suggestion that lands while a newer turn runs.)
+      const accepted = mirrorIds.filter((id) => {
+        const latest = latestStartedRunByThread.current.get(id);
+        return latest === undefined || latest === runId;
+      });
+      if (accepted.length === 0) return;
+      setPromptSuggestions((current) => {
+        const next = { ...current };
+        for (const id of accepted) next[id] = suggestion;
+        return next;
+      });
+    });
+  }, []);
+
   useEffect(() => {
     if (!window.orion?.onAgentTurnEvent) return undefined;
     type AgentTurnEvent = Parameters<Parameters<NonNullable<typeof window.orion.onAgentTurnEvent>>[0]>[0];
