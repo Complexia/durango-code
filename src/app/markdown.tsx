@@ -383,15 +383,21 @@ export const remarkMediaPathPreviews = () => (tree: MarkdownNode) => {
 export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink };
 const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences, remarkMediaPathPreviews];
 
+// The rendered blocks of one markdown document, without a container, so the
+// segments of a streaming message can share one `.markdown-content`.
+const MarkdownBlocks: React.FC<{ content: string }> = React.memo(({ content }) => (
+  <ReactMarkdown
+    remarkPlugins={markdownRemarkPlugins}
+    urlTransform={markdownUrlTransform}
+    components={markdownComponents}
+  >
+    {content}
+  </ReactMarkdown>
+));
+
 export const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (
   <div className="markdown-content">
-    <ReactMarkdown
-      remarkPlugins={markdownRemarkPlugins}
-      urlTransform={markdownUrlTransform}
-      components={markdownComponents}
-    >
-      {content}
-    </ReactMarkdown>
+    <MarkdownBlocks content={content} />
   </div>
 ));
 
@@ -474,12 +480,17 @@ export const StreamingMarkdownContent: React.FC<{ content: string }> = React.mem
       tail = content.slice(frozen.joined.length);
     }
   }
+  // One container for every segment: the blocks are siblings exactly as if the
+  // text had been parsed whole, so a heading that opens a segment keeps its top
+  // margin (`.markdown-content > :first-child` would zero it in a container of
+  // its own) and margins between segments collapse as usual.
+  if (!frozen.segments.length && !tail.trim()) return null;
   return (
-    <>
+    <div className="markdown-content">
       {frozen.segments.map((segment, index) => (
-        <MarkdownContent key={index} content={segment} />
+        <MarkdownBlocks key={index} content={segment} />
       ))}
-      {tail.trim() ? <MarkdownContent content={tail} /> : null}
-    </>
+      {tail.trim() ? <MarkdownBlocks content={tail} /> : null}
+    </div>
   );
 });

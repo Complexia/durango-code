@@ -4730,8 +4730,48 @@ body {
   padding-left: 22px;
 }
 
+/* Tailwind's preflight sets `list-style: none` on every list. */
+.markdown-content ul {
+  list-style: disc;
+}
+
+.markdown-content ol {
+  list-style: decimal;
+}
+
+.markdown-content ul ul,
+.markdown-content ol ul {
+  list-style: circle;
+}
+
+.markdown-content ul.contains-task-list {
+  list-style: none;
+}
+
+.markdown-content li::marker {
+  color: #8a8a90;
+}
+
 .markdown-content li + li {
   margin-top: 0.25em;
+}
+
+/* Nested lists sit tight under their item, like the items themselves. */
+.markdown-content li > ul,
+.markdown-content li > ol {
+  margin: 0.25em 0;
+}
+
+.markdown-content blockquote {
+  padding-left: 12px;
+  border-left: 3px solid #3a3a40;
+  color: #aaaab0;
+}
+
+.markdown-content hr {
+  margin: 1.25em 0;
+  border: 0;
+  border-top: 1px solid #343438;
 }
 
 .markdown-content a {
