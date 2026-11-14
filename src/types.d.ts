@@ -1588,6 +1588,19 @@ type OrionCodexBrowserIntegrationStatus = {
       onSlashCommands: (cb: (event: { projectPath: string; commands: SlashCommandInfo[] }) => void) => () => void;
       /** `/clear`: dispose only the thread's persistent Claude SDK session so the next turn starts fresh. */
       clearClaudeSession: (threadId: string) => Promise<boolean>;
+      /**
+       * Live composer autocomplete: Claude Haiku (via Claude Code) guesses the
+       * rest of `draft`. A newer request supersedes the one in flight.
+       */
+      completePrompt?: (input: {
+        draft: string;
+        context: Array<{ role: 'user' | 'agent'; text: string }>;
+      }) => Promise<
+        | { ok: true; completion: string }
+        | { ok: false; reason: 'superseded' | 'unavailable' | 'error' }
+      >;
+      /** Stops the in-flight completion; `dispose` also closes the warm process. */
+      cancelPromptCompletion?: (input?: { dispose?: boolean }) => Promise<boolean>;
       /** True while a forgotten run's terminal event is still being prepared. */
       isRunFinalizing?: (runId: string) => Promise<boolean>;
       /** Dispose any persistent agent runtime owned by a deleted thread. */

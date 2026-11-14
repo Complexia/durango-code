@@ -63,6 +63,7 @@
     "test:remote-view-races": "node --no-warnings --experimental-strip-types scripts/test-remote-view-races.mjs",
     "test:remote-threads": "bun scripts/test-remote-threads.ts && bun scripts/test-remote-thread-listing.ts && bun scripts/test-remote-thread-mentions.ts",
     "test:steering": "node scripts/run-electron-test.mjs scripts/test-steering.mjs",
+    "test:claude-autocomplete": "node scripts/run-electron-test.mjs scripts/test-claude-autocomplete.mjs",
     "test:claude-chrome": "node --no-warnings scripts/test-claude-chrome.mjs",
     "test:claude-foreground-wait": "node --no-warnings scripts/test-claude-foreground-wait.mjs",
     "test:claude-capabilities": "node scripts/run-electron-test.mjs scripts/test-claude-capabilities.mjs",

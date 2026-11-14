@@ -29,9 +29,11 @@ import {
   defaultAppearanceSettings,
   UI_SCALE_OPTIONS,
   useOrionStore,
+  defaultComposerSettings,
   defaultSplitViewSettings,
   MAX_THREAD_PANES,
   type BrowserUseMode,
+  type ComposerSettings,
   type DeploymentSettings,
   type NotificationSettings,
   type OrchestrationRoleId,
@@ -96,6 +98,8 @@ const formatSessionExpiry = (iso: string | null | undefined) => {
 export type SettingsPageProps = {
   notificationSettings: NotificationSettings;
   setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
+  composerSettings: ComposerSettings;
+  setComposerSettings: (updates: Partial<ComposerSettings>) => void;
   setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
   splitViewSettings: SplitViewSettings;
   setSplitViewSettings: (updates: Partial<SplitViewSettings>) => void;
@@ -183,6 +187,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
   const {
     notificationSettings,
     setNotificationSettings,
+    composerSettings,
+    setComposerSettings,
     setTextGenerationSettings,
     splitViewSettings,
     setSplitViewSettings,
@@ -676,6 +682,29 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   </div>
                   <label className="provider-toggle" title="Assistant output">
                     <input type="checkbox" disabled />
+                    <span />
+                  </label>
+                </div>
+              </div>
+
+              <div className="settings-group-label">Composer</div>
+              <div className="settings-group">
+                <div className="setting-row">
+                  <div className="setting-label">
+                    <div className="setting-label-title">Live autocomplete</div>
+                    <div className="setting-label-desc">
+                      As you type a prompt, Claude Haiku suggests the rest in grey. Tab accepts it, Escape
+                      hides it until you delete something. It runs through your Claude Code sign-in and
+                      counts toward that plan's usage. Turning it off keeps the agent's own suggestion after
+                      a Claude turn, which costs nothing extra.
+                    </div>
+                  </div>
+                  <label className="provider-toggle" title="Live autocomplete">
+                    <input
+                      type="checkbox"
+                      checked={composerSettings?.liveAutocomplete ?? defaultComposerSettings.liveAutocomplete}
+                      onChange={(e) => setComposerSettings({ liveAutocomplete: e.target.checked })}
+                    />
                     <span />
                   </label>
                 </div>

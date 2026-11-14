@@ -1031,6 +1031,19 @@ export const defaultNotificationSettings: NotificationSettings = {
   sound: true,
 };
 
+export type ComposerSettings = {
+  /**
+   * Live autocomplete: while the user types, Claude Haiku (through Claude
+   * Code) suggests the rest of the prompt as ghost text. Off keeps only the
+   * agent's own after-turn suggestion, which costs nothing extra.
+   */
+  liveAutocomplete: boolean;
+};
+
+export const defaultComposerSettings: ComposerSettings = {
+  liveAutocomplete: true,
+};
+
 /** Hard ceiling on the split view: past six the panes are too small to read. */
 export const MAX_THREAD_PANES = 6;
 
@@ -1169,6 +1182,7 @@ interface OrionState {
   providerSettings: ProviderSettings;
   orchestrationSettings: OrchestrationSettings;
   notificationSettings: NotificationSettings;
+  composerSettings: ComposerSettings;
   textGenerationSettings: TextGenerationSettings;
 
   // Actions
@@ -1179,6 +1193,7 @@ interface OrionState {
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
   setOrchestrationGeneralInstructions: (text: string) => void;
   setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
+  setComposerSettings: (updates: Partial<ComposerSettings>) => void;
   setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
 
@@ -2140,6 +2155,7 @@ const PERSISTED_SOURCE_KEYS = [
   'expandedProjects',
   'noProject',
   'notificationSettings',
+  'composerSettings',
   'orchestrationSettings',
   'paneThreadIds',
   'projects',
@@ -2225,6 +2241,10 @@ const buildPersistedSettings = (state: OrionState) => ({
           ...defaultNotificationSettings,
           ...state.notificationSettings,
         },
+        composerSettings: {
+          ...defaultComposerSettings,
+          ...state.composerSettings,
+        },
         textGenerationSettings: {
           ...defaultTextGenerationSettings,
           ...state.textGenerationSettings,
@@ -2263,6 +2283,7 @@ export const useOrionStore = create<OrionState>()(
       providerSettings: defaultProviderSettings,
       orchestrationSettings: defaultOrchestrationSettings,
       notificationSettings: defaultNotificationSettings,
+      composerSettings: defaultComposerSettings,
       textGenerationSettings: defaultTextGenerationSettings,
 
       setActiveTab: (tab) =>
@@ -2338,6 +2359,14 @@ export const useOrionStore = create<OrionState>()(
           notificationSettings: {
             ...defaultNotificationSettings,
             ...state.notificationSettings,
+            ...updates,
+          },
+        })),
+      setComposerSettings: (updates) =>
+        set((state) => ({
+          composerSettings: {
+            ...defaultComposerSettings,
+            ...state.composerSettings,
             ...updates,
           },
         })),
@@ -3422,6 +3451,10 @@ export const useOrionStore = create<OrionState>()(
         // value, so those users simply fall into the new default order.
         const legacyCommitModelId = (persisted as { epicsSettings?: { commitModelId?: unknown } })
           ?.epicsSettings?.commitModelId;
+        merged.composerSettings = {
+          ...defaultComposerSettings,
+          ...merged.composerSettings,
+        };
         merged.textGenerationSettings = {
           ...defaultTextGenerationSettings,
           ...(typeof legacyCommitModelId === 'string' && legacyCommitModelId
