@@ -3,19 +3,21 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
   STOCK_THEME_ID,
+  checkThemeValuePatch,
   isThemeAssetName,
   isThemeId,
   mergeTheme,
+  resolveThemeValues,
   sanitizeTheme,
 } from '../ui-themes.js';
 import { BUILTIN_THEMES } from '../ui-themes-builtin.js';
 
-// Theme storage for Settings → Customizations (src/ui-themes.js holds the
+// Theme storage for Settings → Themes (src/ui-themes.js holds the
 // format). The main process owns it so agent tools (theme-tools.js), the
 // renderer (IPC in main.js) and the "Use Stock Theme" shortcut all see one
 // state:
 //
-//   <userData>/themes/state.json          { activeId }  (null = stock)
+//   <userData>/themes/state.json          { activeId (null = stock), values: { <themeId>: { name: value } } }
 //   <userData>/themes/<id>/theme.json      one theme (built-ins are code)
 //   <userData>/themes/<id>/history.json    earlier revisions, for Undo
 //   <userData>/themes/<id>/<asset>         backdrop images and videos
@@ -39,6 +41,8 @@ let loaded = null;
 const themes = new Map();
 const sceneErrors = new Map();
 let activeId = null;
+/** The user's current choice for each theme's values (controls), by theme id. */
+let storedValues = {};
 let writeChain = Promise.resolve();
 
 /** Wire the store (main.js): where themes live and how to tell the renderer. */
@@ -48,6 +52,7 @@ export const configureThemeStore = ({ dir, send }) => {
   loaded = null;
   themes.clear();
   activeId = null;
+  storedValues = {};
 };
 
 const builtInById = new Map(
@@ -100,6 +105,12 @@ const ensureLoaded = () => {
     }
     const wanted = typeof state?.activeId === 'string' ? state.activeId : null;
     activeId = wanted && (themes.has(wanted) || builtInById.has(wanted)) ? wanted : null;
+    storedValues = {};
+    if (state?.values && typeof state.values === 'object') {
+      for (const [id, values] of Object.entries(state.values)) {
+        if (isThemeId(id) && values && typeof values === 'object' && !Array.isArray(values)) storedValues[id] = values;
+      }
+    }
     // Unsaved drafts nobody kept.
     const cutoff = Date.now() - UNSAVED_TTL_MS;
     for (const theme of [...themes.values()]) {
@@ -113,9 +124,19 @@ const ensureLoaded = () => {
   return loaded;
 };
 
+/** Each theme's resolved values (declared ones only, defaults filled in). */
+const resolvedValues = () => {
+  const out = {};
+  for (const theme of [...builtInById.values(), ...themes.values()]) {
+    if (theme.values) out[theme.id] = resolveThemeValues(theme, storedValues[theme.id]);
+  }
+  return out;
+};
+
 const snapshot = () => ({
   activeId,
   dir: themesDir,
+  values: resolvedValues(),
   themes: [...builtInById.values(), ...[...themes.values()].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''))],
 });
 
@@ -149,7 +170,54 @@ export const getActiveThemeId = async () => {
 export const themeAssetPath = (id, asset) =>
   isThemeId(id) && isThemeAssetName(asset) ? path.join(themeDir(id), asset) : null;
 
-const persistState = () => queueWrite(() => writeJson(path.join(themesDir, STATE_FILE), { activeId }));
+const persistState = () => {
+  const values = {};
+  for (const [id, entry] of Object.entries(storedValues)) {
+    if ((themes.has(id) || builtInById.has(id)) && Object.keys(entry).length) values[id] = entry;
+  }
+  return queueWrite(() => writeJson(path.join(themesDir, STATE_FILE), { activeId, ...(Object.keys(values).length ? { values } : {}) }));
+};
+
+/**
+ * Change the current choice of some of a theme's values (a control, a scene,
+ * or the agent). `patch` is `{ name: value }`; null returns one to its
+ * default. Returns `{ values, ignored }`: the theme's values now.
+ */
+export const setThemeValues = (id, patch) => exclusive(async () => {
+  await ensureLoaded();
+  const theme = builtInById.get(id) ?? themes.get(id);
+  if (!theme) throw new Error('That theme no longer exists.');
+  const { values, ignored } = checkThemeValuePatch(theme, patch);
+  const current = resolveThemeValues(theme, storedValues[id]);
+  const changed = Object.entries(values).some(([name, value]) => current[name] !== value);
+  if (changed) {
+    const next = { ...(storedValues[id] ?? {}) };
+    for (const [name, value] of Object.entries(values)) {
+      if (value === theme.values[name].default) delete next[name];
+      else next[name] = value;
+    }
+    storedValues[id] = next;
+    await persistState();
+    notify();
+  }
+  return { values: resolveThemeValues(theme, storedValues[id]), ignored };
+});
+
+/** Every value of a theme back to its default. */
+export const resetThemeValues = (id) => exclusive(async () => {
+  await ensureLoaded();
+  if (!storedValues[id]) return snapshot();
+  delete storedValues[id];
+  await persistState();
+  notify();
+  return snapshot();
+});
+
+export const themeValuesFor = async (id) => {
+  await ensureLoaded();
+  const theme = builtInById.get(id) ?? themes.get(id);
+  return theme ? resolveThemeValues(theme, storedValues[id]) : {};
+};
 
 /** Apply a theme (or stock: null / 'stock'). */
 export const setActiveTheme = (id) => exclusive(async () => {
@@ -279,8 +347,10 @@ export const deleteTheme = (id) => exclusive(async () => {
   if (!themes.has(id)) throw new Error('Built-in themes cannot be deleted.');
   themes.delete(id);
   sceneErrors.delete(id);
-  if (activeId === id) {
-    activeId = null;
+  const hadValues = Boolean(storedValues[id]);
+  delete storedValues[id];
+  if (activeId === id || hadValues) {
+    if (activeId === id) activeId = null;
     await persistState();
   }
   await queueWrite(() => fs.rm(themeDir(id), { recursive: true, force: true }));

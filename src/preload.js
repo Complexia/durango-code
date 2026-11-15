@@ -10,7 +10,7 @@ contextBridge.exposeInMainWorld('orion', {
       webFrame.setZoomFactor(factor);
     }
   },
-  // Settings → Customizations themes (src/main/ui-themes-store.js).
+  // Settings → Themes themes (src/main/ui-themes-store.js).
   themes: {
     list: () => ipcRenderer.invoke('themes:list'),
     setActive: (id) => ipcRenderer.invoke('themes:setActive', id),
@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('orion', {
     remove: (id) => ipcRenderer.invoke('themes:delete', id),
     undo: (id) => ipcRenderer.invoke('themes:undo', id),
     canUndo: (id) => ipcRenderer.invoke('themes:canUndo', id),
+    setValues: (id, values) => ipcRenderer.invoke('themes:setValues', id, values),
+    resetValues: (id) => ipcRenderer.invoke('themes:resetValues', id),
     reportSceneError: (id, message) => ipcRenderer.send('themes:sceneError', id, message),
     onChanged: (callback) => {
       const listener = (_event, snapshot) => callback(snapshot);

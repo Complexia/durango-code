@@ -8,7 +8,7 @@ import { runThemeAction, useThemeById, useThemeState } from './themeState';
 /**
  * The card set_app_theme / generate_theme_media leave in the transcript
  * (src/main/theme-tools.js): the theme as it is now, with Save (keeps it in
- * Settings → Customizations), Use, Undo and Stock. A thread's cards follow
+ * Settings → Themes), Use, Undo and Stock. A thread's cards follow
  * its one working theme, so every card shows the latest look. On a computer
  * without the theme (another machine's thread) it shows the summary only.
  */
@@ -43,6 +43,7 @@ export const ThemeCard: React.FC<{ summary: ThemeSummary; note?: string; compact
   const features = [
     summary.backdrop === 'html' ? 'animated backdrop' : summary.backdrop ? `${summary.backdrop} backdrop` : null,
     summary.overlay ? 'effects overlay' : null,
+    summary.controls ? `${summary.controls} control${summary.controls === 1 ? '' : 's'}` : null,
   ].filter(Boolean);
 
   if (compact) {
@@ -94,7 +95,7 @@ export const ThemeCard: React.FC<{ summary: ThemeSummary; note?: string; compact
             </div>
           </div>
           {theme && !theme.builtIn && (
-            <label className="flex shrink-0 cursor-pointer items-center gap-2 text-[12px] text-[var(--text-secondary)]" title="Keep this theme in Settings → Customizations">
+            <label className="flex shrink-0 cursor-pointer items-center gap-2 text-[12px] text-[var(--text-secondary)]" title="Keep this theme in Settings → Themes">
               {theme.saved ? 'Saved' : 'Save'}
               <span className="provider-toggle">
                 <input
@@ -103,7 +104,7 @@ export const ThemeCard: React.FC<{ summary: ThemeSummary; note?: string; compact
                   onChange={(event) => {
                     const saved = event.target.checked;
                     void act((api) => api.setSaved(theme.id, saved));
-                    if (saved) toast.success(`Saved “${theme.name}” to Settings → Customizations`);
+                    if (saved) toast.success(`Saved “${theme.name}” to Settings → Themes`);
                   }}
                 />
                 <span />

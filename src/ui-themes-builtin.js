@@ -1,4 +1,4 @@
-// Prebuilt themes for Settings → Customizations. Plain data in the format of
+// Prebuilt themes for Settings → Themes. Plain data in the format of
 // src/ui-themes.js (sanitizeTheme passes every field through unchanged).
 //
 // Each animated backdrop is a self-contained canvas scene: no network, no

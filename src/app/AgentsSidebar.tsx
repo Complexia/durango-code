@@ -22,6 +22,7 @@ import { SidebarSearchPanel, warmSearchIndex } from './threadSearch';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { useSidebarResize } from './useSidebarResize';
+import ThemeSlot from './themes/ThemeSlot';
 
 const THREADS_VISIBLE_LIMIT = 5;
 const AGENTS_SIDEBAR_STORAGE_KEY = 'orion.agentsSidebarWidth';
@@ -357,6 +358,7 @@ export const AgentsSidebar = React.memo(function AgentsSidebar(props: AgentsSide
               />
             )}
           </div>
+          <ThemeSlot name="sidebar-top" />
         </div>
 
         <SavedViewsSection {...props} />

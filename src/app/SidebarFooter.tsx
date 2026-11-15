@@ -2,6 +2,7 @@ import React from 'react';
 import { Download, LogIn, RefreshCw, Settings, TriangleAlert } from 'lucide-react';
 import type { AppUpdateState, OrionAccountState } from './appTypes';
 import { AppUpdateHoverCard } from './AppUpdateUi';
+import ThemeSlot from './themes/ThemeSlot';
 
 export type SidebarFooterProps = {
   appUpdateVisible: boolean;
@@ -90,6 +91,7 @@ export const SidebarFooter = React.memo(function SidebarFooter({
           <LogIn size={16} />
         )}
       </button>
+      <ThemeSlot name="sidebar-bottom" />
       <button type="button" className="sidebar-settings-button" onClick={onOpenSettings} title="Settings">
         <Settings size={16} />
       </button>

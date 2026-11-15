@@ -9048,7 +9048,7 @@ body {
 }
 
 
-/* --- Themes (Settings → Customizations; src/app/themes/ThemeLayer.tsx) --- */
+/* --- Themes (Settings → Themes; src/app/themes/ThemeLayer.tsx) --- */
 .theme-backdrop {
   position: fixed;
   inset: 0;
@@ -9093,6 +9093,153 @@ video.theme-backdrop-fill {
   inset: 0;
   z-index: 2147483000;
   pointer-events: none;
+}
+
+/* Backdrop looks (base and value variants): a new look fades in over the old. */
+.theme-backdrop-look {
+  position: absolute;
+  inset: 0;
+}
+
+.theme-backdrop-look.entering {
+  animation: theme-backdrop-in 700ms ease both;
+}
+
+@keyframes theme-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Theme controls (ThemeControls.tsx): slots, hosts and the app-drawn controls.
+   Themes restyle them with [data-theme-control="<id>"] in their CSS. */
+.theme-slot {
+  display: contents;
+}
+
+.theme-slot-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 14px 0;
+}
+
+.theme-slot-row:empty {
+  display: none;
+}
+
+.theme-control-host {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: 4px;
+  -webkit-app-region: no-drag;
+}
+
+.theme-control-host * {
+  -webkit-app-region: no-drag;
+}
+
+.theme-controls-float {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483050;
+  pointer-events: none;
+}
+
+.theme-control-floating {
+  position: fixed;
+  pointer-events: auto;
+}
+
+.theme-control-button {
+  height: 30px;
+  min-width: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.theme-control-button:hover {
+  background: rgb(255 255 255 / 6%);
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+
+.theme-control-button.is-on {
+  color: var(--accent);
+}
+
+.theme-control-button:focus-visible,
+.theme-control-slider input:focus-visible,
+.theme-control-widget:focus-visible {
+  outline: 2px solid var(--accent-glow);
+  outline-offset: 1px;
+}
+
+.theme-control-floating .theme-control-button,
+.theme-control-floating .theme-control-slider,
+.theme-control-floating .theme-control-segmented {
+  background: var(--bg-elevated);
+  border-color: var(--border-default);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 35%);
+}
+
+.theme-control-label {
+  white-space: nowrap;
+}
+
+.theme-control-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
+.theme-control-segmented .theme-control-button {
+  height: 24px;
+  min-width: 26px;
+}
+
+.theme-control-segmented .theme-control-button.is-on {
+  background: var(--accent-soft);
+}
+
+.theme-control-slider {
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.theme-control-slider input[type='range'] {
+  accent-color: var(--accent);
+  height: 4px;
+  cursor: pointer;
+}
+
+.theme-control-widget {
+  display: block;
+  border: 0;
+  background: transparent;
+  color-scheme: normal;
 }
 
 html.has-theme-backdrop body {

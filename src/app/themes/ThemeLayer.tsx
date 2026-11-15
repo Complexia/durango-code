@@ -1,108 +1,46 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useOrionStore } from '../../store';
 import {
-  THEME_SCENE_SOURCE,
-  buildSceneDocument,
-  parseSceneMessage,
+  effectiveBackdrop,
+  isValueName,
   themeToCss,
+  themeValueSpec,
+  themeValueAttribute,
+  themeValuesCss,
+  type ThemeBackdrop,
+  type ThemeSnapshot,
   type UiTheme,
 } from '../../ui-themes.js';
-import { startThemeSync, themeAssetUrl, useActiveTheme, useThemeState } from './themeState';
+import { ThemeSceneFrame, runningThreadIds } from './ThemeSceneFrame';
+import {
+  broadcastScene,
+  startThemeSync,
+  themeAssetUrl,
+  useActiveTheme,
+  useThemeState,
+  useThemeValues,
+} from './themeState';
 
 /**
- * Applies the active theme (Settings → Customizations) to the whole window:
- * a <style> with its tokens and CSS, a backdrop layer behind the app, and an
- * optional overlay scene above it with pointer events off. Stock = nothing
- * here at all. HTML scenes run in sandboxed frames with no network
- * (ui-themes.js buildSceneDocument); the main window refuses any navigation
- * of an about:srcdoc frame (main.js guardVisualFrames). Scenes hear what the
- * app is doing (agents working, turns ending, the pointer) through messages.
+ * Applies the active theme (Settings → Themes) to the whole window:
+ * a <style> with its tokens and CSS, a backdrop layer behind the app, an
+ * optional overlay scene above it with pointer events off, and the theme's
+ * own controls (ThemeControls). Stock = nothing here at all. HTML scenes run
+ * in sandboxed frames with no network (ThemeSceneFrame). The theme's values
+ * are reflected as `data-tv-<name>` on <html> and `--tv-<name>` custom
+ * properties, so its CSS can follow them, and pick the backdrop variant.
  */
 
+// Loaded only for a theme with controls (it brings the Lucide icon index).
+const ThemeControls = lazy(() => import('./ThemeControls'));
+
 const STYLE_ID = 'durango-theme-style';
-const SANDBOX = 'allow-scripts';
-
-type SceneEvent = { event: string; detail?: Record<string, unknown> };
-type SceneListener = (message: SceneEvent) => void;
-
-const sceneListeners = new Set<SceneListener>();
-const broadcastScene = (message: SceneEvent) => {
-  for (const listener of sceneListeners) listener(message);
-};
+const VALUES_STYLE_ID = 'durango-theme-values';
+const BACKDROP_FADE_MS = 700;
 
 /** Settings' "Preview celebration" button. */
 export const previewThemeCelebration = () => broadcastScene({ event: 'celebrate', detail: {} });
-
-const prefersReducedMotion = () =>
-  typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
-
-const SceneFrame: React.FC<{ theme: UiTheme; html: string; role: 'backdrop' | 'overlay'; animate: boolean }> = ({
-  theme,
-  html,
-  role,
-  animate,
-}) => {
-  const frameRef = useRef<HTMLIFrameElement | null>(null);
-  const srcDoc = useMemo(() => buildSceneDocument(html), [html]);
-  const themeId = theme.id;
-  const appearance = theme.appearance;
-
-  useEffect(() => {
-    const frame = frameRef.current;
-    if (!frame) return undefined;
-    const post = (message: SceneEvent) => {
-      try {
-        frame.contentWindow?.postMessage({ source: THEME_SCENE_SOURCE, type: 'event', ...message }, '*');
-      } catch {}
-    };
-    const sendState = () => {
-      const running = runningThreadIds();
-      post({
-        event: 'state',
-        detail: {
-          working: running.length > 0,
-          count: running.length,
-          focused: document.hasFocus(),
-          reducedMotion: !animate || prefersReducedMotion(),
-          appearance,
-        },
-      });
-    };
-    const onMessage = (event: MessageEvent) => {
-      if (event.source !== frame.contentWindow) return;
-      const message = parseSceneMessage(event.data);
-      if (!message) return;
-      if (message.type === 'ready') sendState();
-      else window.orion?.themes?.reportSceneError(themeId, `${role}: ${message.message}`);
-    };
-    window.addEventListener('message', onMessage);
-    sceneListeners.add(post);
-    sendState();
-    return () => {
-      window.removeEventListener('message', onMessage);
-      sceneListeners.delete(post);
-    };
-  }, [themeId, role, animate, appearance, srcDoc]);
-
-  return (
-    <iframe
-      ref={frameRef}
-      className={`theme-scene theme-scene-${role}`}
-      title={`${theme.name} ${role}`}
-      sandbox={SANDBOX}
-      srcDoc={srcDoc}
-      tabIndex={-1}
-      aria-hidden="true"
-    />
-  );
-};
-
-const runningThreadIds = () =>
-  useOrionStore
-    .getState()
-    .threads.filter((thread) => thread.status === 'running')
-    .map((thread) => thread.id);
 
 /** Turn starts/ends, the pointer, focus and typing → every scene frame. */
 const useSceneEvents = (enabled: boolean) => {
@@ -177,10 +115,14 @@ const useSceneEvents = (enabled: boolean) => {
   }, [enabled]);
 };
 
-const Backdrop: React.FC<{ theme: UiTheme; animate: boolean }> = ({ theme, animate }) => {
-  const snapshot = useThemeState((state) => state.snapshot);
-  const backdrop = theme.backdrop;
-  if (!backdrop) return null;
+/** One look of the backdrop (the base or a variant), with its veil. */
+const BackdropLook: React.FC<{ theme: UiTheme; backdrop: ThemeBackdrop; snapshot: ThemeSnapshot | null; animate: boolean; entering: boolean }> = ({
+  theme,
+  backdrop,
+  snapshot,
+  animate,
+  entering,
+}) => {
   const filters = [
     backdrop.blur ? `blur(${backdrop.blur}px)` : '',
     backdrop.saturate !== undefined && backdrop.saturate !== 1 ? `saturate(${backdrop.saturate})` : '',
@@ -203,7 +145,8 @@ const Backdrop: React.FC<{ theme: UiTheme; animate: boolean }> = ({ theme, anima
   const poster = backdrop.poster ? themeAssetUrl(snapshot, theme, backdrop.poster) : '';
   let content: React.ReactNode = null;
   if (backdrop.type === 'css') {
-    content = <div className="theme-backdrop-fill theme-backdrop-css" style={fillStyle} />;
+    // A variant's css is inline: the stylesheet only carries the base one.
+    content = <div className="theme-backdrop-fill theme-backdrop-css" style={{ ...fillStyle, background: backdrop.css }} />;
   } else if (backdrop.type === 'image' && backdrop.asset) {
     content = <img className="theme-backdrop-fill" src={themeAssetUrl(snapshot, theme, backdrop.asset)} alt="" draggable={false} style={mediaStyle} />;
   } else if (backdrop.type === 'video' && backdrop.asset) {
@@ -236,17 +179,81 @@ const Backdrop: React.FC<{ theme: UiTheme; animate: boolean }> = ({ theme, anima
   } else if (backdrop.type === 'html' && backdrop.html) {
     content = (
       <div className="theme-backdrop-fill" style={fillStyle}>
-        <SceneFrame theme={theme} html={backdrop.html} role="backdrop" animate={animate} />
+        <ThemeSceneFrame theme={theme} html={backdrop.html} role="backdrop" />
       </div>
     );
   }
   return (
-    <div className="theme-backdrop" aria-hidden="true">
+    <div className={`theme-backdrop-look${entering ? ' entering' : ''}`}>
       {content}
       {backdrop.dim ? <div className="theme-backdrop-dim" style={{ opacity: backdrop.dim }} /> : null}
     </div>
   );
 };
+
+/** What makes two looks different pictures (a crossfade), not just a different veil. */
+const lookKey = (backdrop: ThemeBackdrop) =>
+  `${backdrop.type}:${backdrop.asset ?? ''}:${backdrop.type === 'css' ? backdrop.css : ''}:${backdrop.type === 'html' ? backdrop.html?.length : ''}`;
+
+const Backdrop: React.FC<{ theme: UiTheme; animate: boolean }> = ({ theme, animate }) => {
+  const snapshot = useThemeState((state) => state.snapshot);
+  const values = useThemeValues(theme.id);
+  const backdrop = useMemo(() => effectiveBackdrop(theme.backdrop, values), [theme.backdrop, values]);
+  const key = backdrop ? lookKey(backdrop) : '';
+  // The look before a switch stays underneath while the new one fades in
+  // (derived during render, so the new look's first frame already fades).
+  const [fade, setFade] = useState<{ key: string; backdrop: ThemeBackdrop | null; leaving: { key: string; backdrop: ThemeBackdrop } | null }>({
+    key,
+    backdrop,
+    leaving: null,
+  });
+  if (fade.key !== key) {
+    setFade({ key, backdrop, leaving: fade.backdrop && backdrop && animate ? { key: fade.key, backdrop: fade.backdrop } : null });
+  } else if (fade.backdrop !== backdrop) {
+    setFade({ ...fade, backdrop });
+  }
+  const leaving = fade.key === key ? fade.leaving : null;
+  useEffect(() => {
+    if (!leaving) return undefined;
+    const timer = setTimeout(() => setFade((current) => (current.leaving === leaving ? { ...current, leaving: null } : current)), BACKDROP_FADE_MS);
+    return () => clearTimeout(timer);
+  }, [leaving]);
+  if (!backdrop) return null;
+  return (
+    <div className="theme-backdrop" aria-hidden="true">
+      {leaving ? (
+        <BackdropLook key={`leaving:${leaving.key}`} theme={theme} backdrop={leaving.backdrop} snapshot={snapshot} animate={animate} entering={false} />
+      ) : null}
+      <BackdropLook key={key} theme={theme} backdrop={backdrop} snapshot={snapshot} animate={animate} entering={Boolean(leaving)} />
+    </div>
+  );
+};
+
+/** `data-tv-<name>` on <html> and the --tv-<name> stylesheet, for the active theme's values. */
+const useValueHooks = (theme: UiTheme | null) => {
+  const values = useThemeValues(theme?.id);
+  const applied = useRef<string[]>([]);
+  useEffect(() => {
+    const root = document.documentElement;
+    const names = theme?.values ? Object.keys(values).filter((name) => isValueName(name) && themeValueSpec(theme, name)) : [];
+    // The literal attribute name: dataset would fold "snow-3d" into data-tv-snow3d.
+    for (const name of applied.current) if (!names.includes(name)) root.removeAttribute(`data-tv-${name}`);
+    for (const name of names) root.setAttribute(`data-tv-${name}`, themeValueAttribute(values[name]));
+    applied.current = names;
+    let style = document.getElementById(VALUES_STYLE_ID) as HTMLStyleElement | null;
+    const css = names.length ? themeValuesCss(Object.fromEntries(names.map((name) => [name, values[name]]))) : '';
+    if (!css) style?.remove();
+    else {
+      if (!style) {
+        style = document.createElement('style');
+        style.id = VALUES_STYLE_ID;
+        document.head.appendChild(style);
+      }
+      style.textContent = css;
+    }
+  }, [theme, values]);
+};
+
 
 const ThemeLayer: React.FC = () => {
   const theme = useActiveTheme();
@@ -285,20 +292,33 @@ const ThemeLayer: React.FC = () => {
     else delete root.dataset.theme;
   }, [css, theme]);
 
-  const hasScene = Boolean(theme && (theme.backdrop?.type === 'html' || theme.overlay));
+  useValueHooks(theme);
+
+  const hasScene = Boolean(
+    theme && (theme.backdrop?.type === 'html' || theme.backdrop?.variants?.some((variant) => variant.type === 'html') || theme.overlay || theme.controls?.some((control) => control.kind === 'html'))
+  );
   useSceneEvents(hasScene);
 
   if (!theme) return null;
-  return createPortal(
+  return (
     <>
-      {theme.backdrop ? <Backdrop key={`${theme.id}-backdrop`} theme={theme} animate={animate} /> : null}
-      {theme.overlay?.html && animate ? (
-        <div className="theme-overlay" aria-hidden="true">
-          <SceneFrame key={`${theme.id}-overlay`} theme={theme} html={theme.overlay.html} role="overlay" animate={animate} />
-        </div>
+      {createPortal(
+        <>
+          {theme.backdrop ? <Backdrop key={`${theme.id}-backdrop`} theme={theme} animate={animate} /> : null}
+          {theme.overlay?.html && animate ? (
+            <div className="theme-overlay" aria-hidden="true">
+              <ThemeSceneFrame key={`${theme.id}-overlay`} theme={theme} html={theme.overlay.html} role="overlay" />
+            </div>
+          ) : null}
+        </>,
+        document.body
+      )}
+      {theme.controls?.length ? (
+        <Suspense fallback={null}>
+          <ThemeControls key={`${theme.id}-controls`} theme={theme} />
+        </Suspense>
       ) : null}
-    </>,
-    document.body
+    </>
   );
 };
 

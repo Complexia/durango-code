@@ -1020,9 +1020,9 @@ type OrionCodexBrowserIntegrationStatus = {
         | { ok: true; sessions: Array<ImportedSessionTranscript | null> }
         | { ok: false; error: string }
       >;
-      /** Zooms the whole window (Settings → Customizations → Text size). */
+      /** Zooms the whole window (Settings → Themes → Text size). */
       setZoomFactor?: (factor: number) => void;
-      /** Settings → Customizations themes (src/main/ui-themes-store.js). */
+      /** Settings → Themes themes (src/main/ui-themes-store.js). */
       themes?: {
         list: () => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
         setActive: (id: string | null) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
@@ -1032,6 +1032,11 @@ type OrionCodexBrowserIntegrationStatus = {
         remove: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
         undo: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').UiTheme>>;
         canUndo: (id: string) => Promise<ThemeIpcResult<boolean>>;
+        setValues: (
+          id: string,
+          values: Record<string, import('./ui-themes.js').ThemeValue | null>
+        ) => Promise<ThemeIpcResult<{ values: Record<string, import('./ui-themes.js').ThemeValue>; ignored: string[] }>>;
+        resetValues: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
         reportSceneError: (id: string, message: string) => void;
         onChanged: (callback: (snapshot: import('./ui-themes.js').ThemeSnapshot) => void) => () => void;
       };

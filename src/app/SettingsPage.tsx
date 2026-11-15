@@ -139,9 +139,9 @@ export type SettingsPageProps = {
   setSettingsTab: React.Dispatch<React.SetStateAction<SettingsTab>>;
   /** Opens a skill's folder in the Code tab with its SKILL.md active. */
   handleOpenSkillInEditor: (skill: { path: string; skillFile?: string; name: string }) => void;
-  /** Customizations: a new thread with this prompt in its composer. */
+  /** Themes: a new thread with this prompt in its composer. */
   handleCustomizeWithAgent?: (prompt: string) => void;
-  /** Customizations: open the thread a theme was made in. */
+  /** Themes: open the thread a theme was made in. */
   handleOpenThreadFromSettings?: (threadId: string) => void;
   hasThread?: (threadId: string) => boolean;
   authenticatingProviderId: string | null;
@@ -184,6 +184,8 @@ export type SettingsPageProps = {
   formatCheckedTime: (iso: string) => string;
   formatBytes: (bytes: number | null | undefined) => string;
 };
+
+const THEMES_SEEN_KEY = 'durango.settings.themesSeen';
 
 const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) {
   const {
@@ -277,6 +279,21 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     'permissions'
   );
   const [skillsAndMcpsSubtab, setSkillsAndMcpsSubtab] = React.useState<'skills' | 'mcps'>('skills');
+  // "New" on the Themes tab until the user has opened it once (this computer).
+  const [themesNew, setThemesNew] = React.useState(() => {
+    try {
+      return window.localStorage.getItem(THEMES_SEEN_KEY) !== '1';
+    } catch {
+      return false;
+    }
+  });
+  React.useEffect(() => {
+    if (settingsTab !== 'cosmetics' || !themesNew) return;
+    setThemesNew(false);
+    try {
+      window.localStorage.setItem(THEMES_SEEN_KEY, '1');
+    } catch {}
+  }, [settingsTab, themesNew]);
   // The fx row's Install button opens fx's options and starts the install
   // in its setup card.
   const [fxInstallOnOpen, setFxInstallOnOpen] = React.useState(false);
@@ -386,9 +403,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             { id: 'devices', label: 'Devices', Icon: Smartphone },
             { id: 'dev-servers', label: 'Dev Servers', Icon: Server },
             { id: 'workspaces', label: 'Workspaces', Icon: FolderGit2 },
-            { id: 'cosmetics', label: 'Customizations', Icon: Palette },
+            { id: 'cosmetics', label: 'Themes', Icon: Palette, isNew: themesNew },
             { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
-          ].map(({ id, label, Icon }) => (
+          ].map(({ id, label, Icon, isNew }: { id: string; label: string; Icon: typeof Palette; isNew?: boolean }) => (
             <button
               key={id}
               type="button"
@@ -397,6 +414,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             >
               <Icon size={15} />
               <span>{label}</span>
+              {isNew ? (
+                <span className="ml-auto rounded-full bg-[var(--accent-soft)] px-1.5 py-px text-[10px] font-semibold uppercase tracking-[0.04em] text-[var(--accent)]">
+                  New
+                </span>
+              ) : null}
             </button>
           ))}
         </div>
@@ -422,7 +444,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'devices' && 'DEVICES'}
           {settingsTab === 'dev-servers' && 'DEV SERVERS'}
           {settingsTab === 'workspaces' && 'WORKSPACES'}
-          {settingsTab === 'cosmetics' && 'CUSTOMIZATIONS'}
+          {settingsTab === 'cosmetics' && 'THEMES'}
           {settingsTab === 'experimental' && 'EXPERIMENTAL'}
         </div>
 

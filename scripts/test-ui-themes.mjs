@@ -1,4 +1,4 @@
-// Themes (Settings → Customizations): the shared format (src/ui-themes.js),
+// Themes (Settings → Themes): the shared format (src/ui-themes.js),
 // the built-ins, the main-process store (src/main/ui-themes-store.js) and the
 // agent tools (src/main/theme-tools.js). Plain Node: no Electron needed.
 //
@@ -10,9 +10,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  THEME_SCENE_BOOTSTRAP,
+  THEME_SCENE_SOURCE,
+  THEME_SLOTS,
   THEME_TOKENS,
+  THEME_UI_MAP_SCRIPT,
   buildSceneDocument,
+  checkThemeValuePatch,
+  effectiveBackdrop,
   mergeTheme,
+  resolveThemeValues,
+  themeValuesCss,
   parseSceneMessage,
   sanitizeTheme,
   sanitizeThemeCss,
@@ -357,6 +365,268 @@ await test('tool schemas: one source for Claude and the bridge; read-only drops 
   for (const name of THEME_TOOL_NAMES) assert.equal(THEME_TOOL_INPUT_SCHEMAS[name].type, 'object');
   const noThread = await runThemeTool('set_app_theme', {}, { threadId: '' });
   assert.equal(noThread.ok, false);
+});
+
+// --- values and controls -----------------------------------------------------------
+
+const SNOW = {
+  values: {
+    snow: { type: 'boolean', default: true, label: 'Snow' },
+    time: { type: 'choice', options: [{ value: 'day', icon: 'sun' }, { value: 'night', icon: 'moon' }], default: 'day' },
+    glow: { min: 0, max: 1, step: 0.05, default: 0.6 },
+  },
+  controls: [
+    { id: 'snow', kind: 'toggle', icon: 'snowflake', placement: { slot: 'titlebar-right' } },
+    { id: 'time', kind: 'choice', placement: { selector: '.composer-controls .model-trigger', position: 'before' } },
+    { id: 'glow', kind: 'slider', placement: { position: 'float', corner: 'bottom-left', x: 12, y: 12 } },
+    { id: 'burst', kind: 'button', icon: 'sparkles', action: 'burst', set: { snow: true } },
+    { id: 'clock', kind: 'html', html: '<b>12:00</b>', width: 60, height: 24, placement: { slot: 'sidebar-bottom' } },
+  ],
+};
+
+await test('values and controls: declared, checked, and tied together', () => {
+  const theme = sanitizeTheme({ id: 'tv1', name: 'Snow', ...SNOW });
+  assert.deepEqual(Object.keys(theme.values), ['snow', 'time', 'glow']);
+  assert.equal(theme.values.glow.type, 'number', 'type inferred from min/max');
+  assert.deepEqual(theme.controls.map((control) => control.id), ['snow', 'time', 'glow', 'burst', 'clock']);
+  assert.equal(theme.controls[0].value, 'snow');
+  assert.deepEqual(theme.controls[0].placement, { slot: 'titlebar-right', position: 'end' });
+  assert.equal(theme.controls[2].placement.position, 'float');
+  assert.equal(theme.controls[3].placement.position, 'float', 'no slot or selector floats over the window');
+  assert.deepEqual(theme.controls[3].set, { snow: true });
+  assert.equal(theme.controls[4].width, 60);
+  // A control needs a value of its kind; a selector can never become a rule.
+  const bad = sanitizeTheme({
+    id: 'tv2',
+    name: 'x',
+    values: SNOW.values,
+    controls: [
+      { id: 'a', kind: 'slider', value: 'snow' },
+      { id: 'b', kind: 'toggle' },
+      { id: 'c', kind: 'toggle', value: 'snow', placement: { selector: 'body} * { display:none' } },
+      { id: 'Bad Id', kind: 'toggle', value: 'snow' },
+      { id: 'd', kind: 'button' },
+    ],
+  });
+  assert.deepEqual(bad.controls.map((control) => control.id), ['c']);
+  assert.equal(bad.controls[0].placement.selector, undefined);
+  assert.equal(bad.controls[0].placement.position, 'float');
+  assert.equal(sanitizeTheme({ id: 'tv3', name: 'x', values: { 'Bad Name': { default: true }, ok: { default: false } } }).values.ok.type, 'boolean');
+});
+
+await test('values resolve against their declarations; CSS and attributes follow', () => {
+  const theme = sanitizeTheme({ id: 'tv1', name: 'Snow', ...SNOW });
+  assert.deepEqual(resolveThemeValues(theme, {}), { snow: true, time: 'day', glow: 0.6 });
+  assert.deepEqual(resolveThemeValues(theme, { snow: 'false', time: 'dusk', glow: 7, extra: 1 }), { snow: false, time: 'day', glow: 1 });
+  const { values, ignored } = checkThemeValuePatch(theme, { time: 'night', glow: 'loud', nope: true, snow: null });
+  assert.deepEqual(values, { time: 'night', snow: true });
+  assert.equal(ignored.length, 2);
+  const css = themeValuesCss({ snow: false, time: 'night"; } body { x', glow: 0.25 });
+  assert.match(css, /--tv-snow: 0;/);
+  assert.match(css, /--tv-glow: 0\.25;/);
+  assert.ok(!/[;{}]\s*body/.test(css.replace(/--tv-time: "[^"]*";/, '')), 'a choice cannot leave its declaration');
+  assert.match(css, /--tv-time: "night  body  x";/);
+});
+
+await test('backdrop variants follow the values', () => {
+  const theme = sanitizeTheme({
+    id: 'tv4',
+    name: 'x',
+    values: SNOW.values,
+    backdrop: {
+      type: 'image',
+      asset: 'day.jpg',
+      dim: 0.3,
+      variants: [
+        { when: { time: 'night' }, asset: 'night.jpg', dim: 0.5 },
+        { when: { time: 'night', snow: false }, type: 'css', css: '#000' },
+        { when: {}, asset: 'never.jpg' },
+        { when: { time: 'x' }, asset: '../escape.jpg' },
+      ],
+    },
+  });
+  assert.equal(theme.backdrop.variants.length, 2);
+  assert.equal(effectiveBackdrop(theme.backdrop, { time: 'day' }).asset, 'day.jpg');
+  assert.deepEqual(effectiveBackdrop(theme.backdrop, { time: 'night', snow: true }), { type: 'image', asset: 'night.jpg', dim: 0.5 });
+  assert.equal(effectiveBackdrop(theme.backdrop, { time: 'night', snow: false }).asset, 'night.jpg', 'first match wins');
+  // A dim tweak to the base keeps the variants.
+  const { theme: tuned } = mergeTheme(theme, { backdrop: { dim: 0.1 } });
+  assert.equal(tuned.backdrop.dim, 0.1);
+  assert.equal(tuned.backdrop.variants.length, 2);
+  const { theme: cleared } = mergeTheme(theme, { backdrop: { variants: [] } });
+  assert.equal(cleared.backdrop.variants, undefined);
+});
+
+await test('mergeTheme: controls by id, remove, values by name', () => {
+  const base = sanitizeTheme({ id: 'tv5', name: 'x', ...SNOW });
+  const { theme, ignored } = mergeTheme(base, {
+    values: { glow: null, wind: { type: 'number', min: 0, max: 10, default: 2 } },
+    controls: [
+      { id: 'snow', kind: 'toggle', icon: 'cloud-snow', placement: { slot: 'sidebar-top' } },
+      { id: 'burst', remove: true },
+      { id: 'wind', kind: 'slider', width: 120 },
+      { id: 'oops', kind: 'toggle', value: 'missing' },
+    ],
+  });
+  assert.equal(theme.controls.find((control) => control.id === 'snow').icon, 'cloud-snow');
+  assert.ok(!theme.controls.some((control) => control.id === 'burst'));
+  assert.ok(!theme.controls.some((control) => control.id === 'glow'), 'a control whose value went away goes too');
+  assert.equal(theme.controls.find((control) => control.id === 'wind').width, 120);
+  assert.match(ignored.join(' '), /oops.*declare value "missing"/);
+  const { theme: none } = mergeTheme(theme, { controls: null, values: null });
+  assert.equal(none.controls, undefined);
+  assert.equal(none.values, undefined);
+});
+
+await test('scene messages: set, action, resize are checked', () => {
+  const S = THEME_SCENE_SOURCE;
+  assert.deepEqual(parseSceneMessage({ source: S, type: 'set', name: 'snow', value: false }), { type: 'set', name: 'snow', value: false });
+  assert.equal(parseSceneMessage({ source: S, type: 'set', name: 'snow', value: { a: 1 } }), null);
+  assert.equal(parseSceneMessage({ source: S, type: 'set', name: '__proto__', value: 1 }), null);
+  assert.deepEqual(parseSceneMessage({ source: S, type: 'action', name: 'burst', detail: { n: 3 } }), { type: 'action', name: 'burst', detail: { n: 3 } });
+  assert.deepEqual(parseSceneMessage({ source: S, type: 'resize', width: 5000, height: 2 }), { type: 'resize', width: 2000, height: 8 });
+  assert.ok(THEME_SCENE_BOOTSTRAP.includes('set:function') && THEME_SCENE_BOOTSTRAP.includes('"value"'));
+  new Function(THEME_SCENE_BOOTSTRAP);
+  new Function(`return ${THEME_UI_MAP_SCRIPT}`);
+  assert.ok(Object.keys(THEME_SLOTS).includes('composer-toolbar'));
+});
+
+await test('store: the user\'s choice is kept per theme, outside the theme, and survives a restart', async () => {
+  store.configureThemeStore({ dir, send: (snapshot) => broadcasts.push(snapshot) });
+  const { theme } = await store.updateTheme({ patch: { name: 'Snow controls', ...SNOW }, threadId: 'thread-v' });
+  assert.deepEqual((await store.listThemes()).values[theme.id], { snow: true, time: 'day', glow: 0.6 });
+  const before = theme.revision;
+  const result = await store.setThemeValues(theme.id, { time: 'night', glow: 0.2, nope: 1 });
+  assert.deepEqual(result.values, { snow: true, time: 'night', glow: 0.2 });
+  assert.equal(result.ignored.length, 1);
+  assert.equal((await store.getTheme(theme.id)).revision, before, 'a value change is not a theme revision');
+  assert.deepEqual(broadcasts.at(-1).values[theme.id].time, 'night');
+  const state = JSON.parse(await fs.readFile(path.join(dir, 'state.json'), 'utf8'));
+  assert.deepEqual(state.values[theme.id], { time: 'night', glow: 0.2 });
+  store.configureThemeStore({ dir, send: (snapshot) => broadcasts.push(snapshot) });
+  assert.equal((await store.themeValuesFor(theme.id)).time, 'night');
+  await store.setThemeValues(theme.id, { time: 'day' });
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(dir, 'state.json'), 'utf8')).values[theme.id], { glow: 0.2 }, 'defaults are not stored');
+  await store.resetThemeValues(theme.id);
+  assert.equal((await store.themeValuesFor(theme.id)).glow, 0.6);
+  await store.deleteTheme(theme.id);
+});
+
+await test('set_app_theme: values, controls, set_values and a variant from a file', async () => {
+  const night = path.join(dir, 'night.png');
+  await fs.writeFile(night, Buffer.from([137, 80, 78, 71, 1]));
+  const placedSender = {
+    ...sender,
+    executeJavaScript: async (script) => (script.includes('data-theme-control') && !script.includes('MAX_LINES') ? { snow: [[900, 8, 30, 30]], time: [null] } : 'Window 1440x900\n◆ slot titlebar-right'),
+  };
+  const ctx = context('thread-w', { getSender: () => placedSender });
+  const result = await runThemeTool(
+    'set_app_theme',
+    {
+      name: 'Snowfall',
+      ...SNOW,
+      backdrop: { type: 'css', css: '#123', variants: [{ when: { time: 'night' }, image_path: night, dim: 0.4 }] },
+      set_values: { time: 'night', snow: 'maybe' },
+    },
+    ctx
+  );
+  assert.equal(result.ok, true, result.text);
+  const theme = await store.workingThemeFor('thread-w');
+  assert.equal(theme.controls.length, 5);
+  assert.equal(theme.backdrop.type, 'css');
+  assert.match(theme.backdrop.variants[0].asset, /^backdrop-.*\.png$/);
+  await fs.access(path.join(dir, theme.id, theme.backdrop.variants[0].asset));
+  assert.equal((await store.themeValuesFor(theme.id)).time, 'night');
+  assert.match(result.text, /set_values snow/, 'a bad value is reported');
+  assert.match(result.text, /snow \(toggle → snow\) in slot titlebar-right — on screen \[900,8 30x30\]/);
+  assert.match(result.text, /time \(choice → time\) before ".composer-controls .model-trigger" — placed but not visible/);
+  assert.match(result.text, /clock \(html\) in slot sidebar-bottom — not on screen now/);
+  const read = await runThemeTool('get_app_theme', { ui_map: true }, ctx);
+  assert.match(read.text, /Values \(current\): snow = true .*time = "night"/);
+  assert.match(read.text, /UI map:\nWindow 1440x900/);
+  assert.match(read.text, /Theme slots for controls: titlebar-left/);
+  const ignored = await runThemeTool('set_app_theme', { controls: [{ id: 'x', kind: 'menu', value: 'snow' }] }, ctx);
+  assert.match(ignored.text, /control "x" \(value "snow" is boolean; a menu needs a choice value\)/);
+});
+
+await test('generate_theme_media variant_when adds a variant and keeps the backdrop', async () => {
+  setThemeToolsClient({ generateImage: async () => ({ data: Buffer.from([9, 9, 9]), mimeType: 'image/png', creditsUsed: 4 }) });
+  const before = await store.workingThemeFor('thread-w');
+  const result = await runThemeTool('generate_theme_media', { prompt: 'same forest at night', variant_when: { time: 'night' } }, context('thread-w'));
+  assert.equal(result.ok, true, result.text);
+  const after = await store.workingThemeFor('thread-w');
+  assert.equal(after.backdrop.css, before.backdrop.css, 'main backdrop unchanged');
+  assert.equal(after.backdrop.variants.length, 1, 'the variant for the same condition is replaced');
+  assert.notEqual(after.backdrop.variants[0].asset, before.backdrop.variants[0].asset);
+  assert.match(result.text, /backdrop variant shown while time = "night"/);
+  assert.ok(!/It is the backdrop now/.test(result.text));
+  const undeclared = await runThemeTool('generate_theme_media', { prompt: 'storm', variant_when: { weather: 'storm' } }, context('thread-w'));
+  assert.match(undeclared.text, /Declare weather in values/);
+});
+
+// --- review fixes ---------------------------------------------------------------------
+
+await test('inherited names are never value declarations ("constructor", __proto__)', () => {
+  const theme = sanitizeTheme({
+    id: 'tv6',
+    name: 'x',
+    values: { snow: { default: true } },
+    controls: [
+      { id: 'a', kind: 'button', icon: 'x', set: { constructor: true, snow: false } },
+      { id: 'constructor', kind: 'toggle' },
+      { id: 'b', kind: 'toggle', value: 'constructor' },
+    ],
+  });
+  assert.deepEqual(theme.controls.map((control) => control.id), ['a']);
+  assert.deepEqual(theme.controls[0].set, { snow: false });
+  const patch = checkThemeValuePatch(theme, JSON.parse('{"constructor": true, "__proto__": 1, "snow": true}'));
+  assert.deepEqual(patch.values, { snow: true });
+  assert.equal(patch.ignored.length, 2);
+  // A declared "constructor" value is a real, own declaration.
+  const own = sanitizeTheme({ id: 'tv7', name: 'x', values: { constructor: { default: false } }, controls: [{ id: 'constructor', kind: 'toggle' }] });
+  assert.equal(own.controls.length, 1);
+  assert.deepEqual(resolveThemeValues(own, {}), { constructor: false });
+});
+
+await test('scenes and widgets get their values at load, through state and value listeners', async () => {
+  const vm = await import('node:vm');
+  const sent = [];
+  const listeners = [];
+  const parent = { postMessage: (message) => sent.push(message) };
+  const window = {
+    parent,
+    addEventListener: (type, fn) => type === 'message' && listeners.push(fn),
+  };
+  window.window = window;
+  vm.runInNewContext(THEME_SCENE_BOOTSTRAP, window);
+  const seen = [];
+  window.durango.on('value', (detail) => seen.push(['value', detail.values.snow]));
+  window.durango.on('state', (state) => seen.push(['state', state.values.snow]));
+  for (const fn of listeners) {
+    fn({ source: parent, data: { source: THEME_SCENE_SOURCE, type: 'event', event: 'state', detail: { values: { snow: false }, working: false } } });
+  }
+  assert.deepEqual(seen, [['state', false], ['value', false]]);
+  assert.equal(window.durango.values.snow, false);
+  window.durango.set('snow', true);
+  assert.deepEqual(JSON.parse(JSON.stringify(sent.at(-1))), { type: 'set', name: 'snow', value: true, source: THEME_SCENE_SOURCE });
+});
+
+await test('backdrop variants past the limit are reported, and generation refuses before spending', async () => {
+  const many = Array.from({ length: 9 }, (_, index) => ({ when: { glow: index }, type: 'css', css: '#000' }));
+  const { ignored } = mergeTheme(sanitizeTheme({ id: 'tv8', name: 'x', backdrop: { type: 'css', css: '#111' } }), { backdrop: { variants: many } });
+  assert.match(ignored.join(' '), /past the first 8/);
+  const ctx = context('thread-x');
+  await runThemeTool('set_app_theme', { values: { glow: { min: 0, max: 10, default: 0 } }, backdrop: { type: 'css', css: '#111', variants: many.slice(0, 8) } }, ctx);
+  let generated = 0;
+  setThemeToolsClient({ generateImage: async () => (generated++, { data: Buffer.from([1]), mimeType: 'image/png' }) });
+  const full = await runThemeTool('generate_theme_media', { prompt: 'x', variant_when: { glow: 9 } }, ctx);
+  assert.equal(full.ok, false);
+  assert.match(full.text, /already has 8 variants/);
+  const replace = await runThemeTool('generate_theme_media', { prompt: 'x', variant_when: { glow: 3 } }, ctx);
+  assert.equal(replace.ok, true, 'replacing an existing condition is fine');
+  const badWhen = await runThemeTool('generate_theme_media', { prompt: 'x', variant_when: { 'Bad Name': 1 } }, ctx);
+  assert.equal(badWhen.ok, false);
+  assert.equal(generated, 1, 'refusals spend nothing');
 });
 
 await fs.rm(dir, { recursive: true, force: true });

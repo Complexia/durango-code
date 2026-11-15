@@ -2,12 +2,13 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Check, Copy, MessageSquare, MoreHorizontal, Pencil, PartyPopper, RotateCcw, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { UiTheme } from '../../ui-themes.js';
+import { ThemeControlsSettings } from './ThemeControlsSettings';
 import { ThemePreview } from './ThemePreview';
 import { previewThemeCelebration } from './ThemeLayer';
 import { runThemeAction, startThemeSync, useThemeState } from './themeState';
 
 /**
- * Settings → Customizations: switch between themes (Stock, the built-ins and
+ * Settings → Themes: switch between themes (Stock, the built-ins and
  * the ones the user saved from threads), manage them, and start a new one by
  * asking an agent in a regular thread (src/main/theme-tools.js does the
  * restyling). Stock is always first and always one click away.
@@ -216,6 +217,7 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
   const themes = snapshot?.themes ?? [];
   const builtIns = themes.filter((theme) => theme.builtIn);
   const saved = themes.filter((theme) => !theme.builtIn && theme.saved).reverse();
+  const activeTheme = themes.find((theme) => theme.id === activeId) ?? null;
   const activeDraft = themes.find((theme) => theme.id === activeId && !theme.builtIn && !theme.saved) ?? null;
   const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
 
@@ -315,7 +317,7 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
       </div>
 
       <div className="settings-group-label flex items-center justify-between">
-        <span>Themes</span>
+        <span>Your themes</span>
         {activeId && (
           <button
             type="button"
@@ -352,6 +354,8 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
           Themes you save from a thread show up here.
         </p>
       )}
+
+      {activeTheme ? <ThemeControlsSettings key={activeTheme.id} theme={activeTheme} /> : null}
 
       <div className="settings-group-label">Prebuilt</div>
       <div className="grid grid-cols-[repeat(auto-fill,minmax(210px,1fr))] gap-3">

@@ -31,6 +31,7 @@ import { formatShortTime, getThreadActivityTime } from './time';
 import { useSidebarResize } from './useSidebarResize';
 import { THREAD_DRAG_MIME } from './AgentsSidebar';
 import { formatWorkedDuration, threadSidebarTone, threadWorkedMs, type SidebarV2Lists, type SidebarV2View, type SidebarV2ViewsSettings } from './threadLists';
+import ThemeSlot from './themes/ThemeSlot';
 
 // Sidebar v2 (Settings → Experimental), after T3 Code's: one flat list of
 // threads instead of project groups. The header holds search, New agent, Add
@@ -820,7 +821,7 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
   return (
     <div className="sidebar agents-sidebar" ref={sidebarRef}>
       {/* The header row anchors the search results. */}
-      <div className="relative flex items-center gap-1 px-2.5 pb-2 pt-2.5" ref={threadSearchRef}>
+      <div className="sidebar-top-row relative flex items-center gap-1 px-2.5 pb-2 pt-2.5" ref={threadSearchRef}>
         <button
           type="button"
           className={`flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors duration-100 ${
@@ -864,6 +865,7 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
           <FolderPlus size={15} />
         </HeaderIconButton>
         <ViewsMenu views={views} counts={counts} setViewVisible={setViewVisible} />
+        <ThemeSlot name="sidebar-top" />
       </div>
 
       <div className="sidebar-content agents-sidebar-content !pt-0">

@@ -126,8 +126,10 @@ import {
   listThemes,
   recordSceneError,
   renameTheme,
+  resetThemeValues,
   setActiveTheme,
   setThemeSaved,
+  setThemeValues,
   undoTheme,
 } from './main/ui-themes-store.js';
 import { setThemeToolsClient } from './main/theme-tools.js';
@@ -1258,7 +1260,7 @@ let remoteControlReady = Promise.resolve();
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
-  // Settings → Customizations themes (ui-themes-store.js): agents' theme
+  // Settings → Themes themes (ui-themes-store.js): agents' theme
   // tools and the renderer share this one store.
   configureThemeStore({
     dir: path.join(app.getPath('userData'), 'themes'),
@@ -1785,7 +1787,7 @@ const settleQuitBarrierForUpdate = async () => {
 
 // -------------------- IPC Handlers --------------------
 
-// Settings → Customizations (ui-themes-store.js). Each change broadcasts
+// Settings → Themes (ui-themes-store.js). Each change broadcasts
 // 'themes:changed' with the full list, so these only return for errors.
 const themeIpc = (channel, run) =>
   ipcMain.handle(channel, async (_event, ...args) => {
@@ -1803,6 +1805,8 @@ themeIpc('themes:duplicate', (id) => duplicateTheme(String(id)));
 themeIpc('themes:delete', (id) => deleteTheme(String(id)));
 themeIpc('themes:undo', (id) => undoTheme(String(id)));
 themeIpc('themes:canUndo', (id) => canUndoTheme(String(id)));
+themeIpc('themes:setValues', (id, values) => setThemeValues(String(id), values && typeof values === 'object' ? values : {}));
+themeIpc('themes:resetValues', (id) => resetThemeValues(String(id)));
 ipcMain.on('themes:sceneError', (_event, id, message) => recordSceneError(id, message));
 
 ipcMain.handle('storage:load', async () => {

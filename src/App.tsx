@@ -130,6 +130,7 @@ import { removeBootSkeleton } from './app/bootSkeleton';
 import { CodeWorkspace } from './app/CodeWorkspace';
 import { AgentsSidebar, type AgentsSidebarModel, SavedViewsSection, THREAD_DRAG_MIME } from './app/AgentsSidebar';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
+import ThemeSlot from './app/themes/ThemeSlot';
 import { ProjectPickerModal, type ProjectPickerView } from './app/ProjectPickerModal';
 import {
   compareSidebarV2Recent,
@@ -9310,7 +9311,7 @@ const App: React.FC = () => {
     ]
   );
 
-  // Settings → Customizations: a regular new thread, its composer filled
+  // Settings → Themes: a regular new thread, its composer filled
   // with the look the user described (theme-tools.js does the restyling).
   // Not tied to a project when the no-project space exists.
   const handleCustomizeWithAgent = (prompt: string) => {
@@ -10787,6 +10788,7 @@ const App: React.FC = () => {
             <img src={orionIconUrl} alt="Durango Code" className="shell-brand-logo" width={28} height={28} draggable={false} />
             <span className="shell-brand-name">Code</span>
           </div>
+          <ThemeSlot name="titlebar-left" />
         </div>
 
         <div className="shell-main-chrome">
@@ -10983,9 +10985,11 @@ const App: React.FC = () => {
             {activeTab === 'agents' && selectedThread && (
               <span className={`status-dot shell-status-dot ${selectedThread.status}`} />
             )}
+            <ThemeSlot name="titlebar-center" />
           </div>
 
           <div className="shell-right-group">
+            <ThemeSlot name="titlebar-right" />
             {openWithApps.length > 0 && activeWorkingDir && (
               <div className="shell-openwith-control" ref={openWithRef}>
                 <button

@@ -2,6 +2,7 @@ import React from 'react';
 import { X } from 'lucide-react';
 import type { Project, Thread } from '../store';
 import { ProjectIcon } from './ProjectIcon';
+import ThemeSlot from './themes/ThemeSlot';
 
 export type ThreadPaneProps = {
   thread: Thread;
@@ -75,6 +76,7 @@ export const ThreadPane: React.FC<ThreadPaneProps> = ({
             <span className="truncate">{project.name}</span>
           </span>
         )}
+        <ThemeSlot name="thread-header" />
         <button
           type="button"
           className="thread-pane-close"

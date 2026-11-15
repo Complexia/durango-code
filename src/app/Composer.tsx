@@ -50,6 +50,7 @@ import {
 } from './slashCommands';
 import { formatShortTime, getThreadActivityTime } from './time';
 import type { ComposerDraftController } from './composerDraft';
+import ThemeSlot from './themes/ThemeSlot';
 
 // The composer: draft text, attachments, the @-mention and slash-command
 // dropdowns, and the send/queue/steer/stop buttons. It owns everything that
@@ -1250,6 +1251,7 @@ export const Composer = ({
           })}
         </ComposerPopover>
       )}
+      <ThemeSlot name="composer-top" row />
       {offeredPromptSuggestion && (
         // Zero-height anchor at the textarea's top edge, so the suggestion
         // lines up with where the placeholder would be without changing layout.
@@ -1315,6 +1317,7 @@ export const Composer = ({
       />
       <div className={controlsClassName} ref={controlsRef}>
         {children}
+        <ThemeSlot name="composer-toolbar" />
         {isSending ? (
           <>
             {hasDraftContent && (
