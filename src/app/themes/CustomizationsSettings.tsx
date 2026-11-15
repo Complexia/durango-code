@@ -158,13 +158,14 @@ const ThemeTile: React.FC<{
           onApply();
         }
       }}
-      className={`group flex cursor-pointer flex-col overflow-hidden rounded-[var(--radius-lg)] border bg-[var(--bg-raised)] text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
+      className={`group flex cursor-pointer flex-col rounded-[var(--radius-lg)] border bg-[var(--bg-raised)] text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
         active
           ? 'border-[var(--accent)] shadow-[0_0_0_3px_var(--accent-soft)]'
           : 'border-[var(--border-default)] hover:border-[var(--border-strong)]'
       }`}
     >
-      <ThemePreview theme={theme} className="aspect-[16/10] w-full" />
+      {/* The card does not clip, so its ⋯ menu can hang below it; the preview rounds its own corners. */}
+      <ThemePreview theme={theme} className="aspect-[16/10] w-full rounded-t-[calc(var(--radius-lg)-1px)]" />
       <div className="flex min-h-[58px] items-start gap-2 px-3 py-2.5">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
