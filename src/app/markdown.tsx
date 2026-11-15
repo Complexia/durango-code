@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import { type Thread, useOrionStore } from '../store';
 import { imageFileNamePattern, isLocalFilePath, localMediaSrc, videoFileNamePattern } from './attachments';
 import { handleLightboxImageClick } from './imageLightbox';
+import { sourceAttachmentSrc, useSourceAttachmentAccount } from './sourceAttachments';
 import { resolveThreadReference, threadReferencePattern } from './promptContext';
 import { chatIdFromReference, chatReferencePattern, knownDurangoChat, knownDurangoChats, knownDurangoChatUrl } from './durangoChats';
 
@@ -33,6 +34,7 @@ export const MarkdownMedia: React.FC<{
   'data-path-preview'?: unknown;
 }> = ({ src, alt, title, 'data-path-preview': pathPreview }) => {
   const baseDirs = useContext(MarkdownBaseDirContext);
+  const sourceAccount = useSourceAttachmentAccount();
   const [failed, setFailed] = useState(false);
   if (!src) return null;
   // A preview of a path the agent only mentioned disappears when the file
@@ -41,9 +43,11 @@ export const MarkdownMedia: React.FC<{
   const isPathPreview = pathPreview !== undefined;
   const handleError = isPathPreview ? () => setFailed(true) : undefined;
 
-  const resolvedSrc = /^(https?|data|blob|orion-attachment):/i.test(src)
-    ? src
-    : localMediaSrc(src, baseDirs);
+  // Durango Source description images load through the main process with
+  // the device's repository token (./sourceAttachments.ts).
+  const resolvedSrc =
+    sourceAttachmentSrc(src, sourceAccount) ??
+    (/^(https?|data|blob|orion-attachment|orion-source-attachment):/i.test(src) ? src : localMediaSrc(src, baseDirs));
 
   if (videoFileNamePattern.test(src)) {
     return (

@@ -75,6 +75,7 @@
     "build:snapshot-helper": "node scripts/build-snapshot-helper.mjs",
     "test:image-lightbox": "bun scripts/test-image-lightbox.tsx",
     "test:media-path-previews": "bun scripts/test-media-path-previews.tsx",
+    "test:source-attachments": "bun scripts/test-source-attachments.tsx",
     "test:slash-commands": "node --no-warnings --experimental-strip-types scripts/test-slash-commands.mjs",
     "test:codex-personalization": "node --no-warnings scripts/test-codex-personalization.mjs",
     "test:codex-app-server": "node --no-warnings scripts/test-codex-app-server-manager.mjs",

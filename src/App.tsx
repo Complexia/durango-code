@@ -90,6 +90,7 @@ import {
   inheritedSubagentResumeContext,
 } from './thread-branching';
 import { createThreadSteeringCoordinator } from './app/thread-steering';
+import { setSourceAttachmentAccount } from './app/sourceAttachments';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
@@ -1090,6 +1091,9 @@ const App: React.FC = () => {
     expiresAt: null,
   });
   const [accountLoading, setAccountLoading] = useState(true);
+  // Durango Source images in Markdown load as this account (./app/sourceAttachments.ts).
+  const sourceAttachmentAccount = accountState.authenticated ? accountState.user?.id ?? null : null;
+  useEffect(() => setSourceAttachmentAccount(sourceAttachmentAccount), [sourceAttachmentAccount]);
   const [accountBusy, setAccountBusy] = useState(false);
   const [computerUsePerms, setComputerUsePerms] = useState<OrionComputerUsePermissions | null>(null);
   const [computerUseBusyKind, setComputerUseBusyKind] = useState<OrionComputerUsePermissionKind | null>(null);

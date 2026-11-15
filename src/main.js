@@ -9,6 +9,7 @@ import './main/linux-password-store.js';
 // and relaunches (Dock/Finder show the bundle file name).
 import './main/rename-legacy-bundle-on-start.js';
 import { createRepositoryCredentials } from './main/repository-credentials.js';
+import { SOURCE_ATTACHMENT_PROTOCOL, createSourceAttachmentHandler } from './main/source-attachments.js';
 import { reloadWhenRendererGone } from './main/renderer-recovery.js';
 import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main/app-identity.js';
 import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
@@ -388,6 +389,15 @@ protocol.registerSchemesAsPrivileged([
       stream: true,
     },
   },
+  {
+    // Durango Source change-description images (src/main/source-attachments.js).
+    scheme: SOURCE_ATTACHMENT_PROTOCOL,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+    },
+  },
 ]);
 
 const sanitizeStoreValue = (value) => {
@@ -657,6 +667,10 @@ const repositoryCredentials = createRepositoryCredentials({
   removeStored: () => fs.rm(`${getAccountSessionFilePath()}.repositories`, { force: true }),
 });
 const readRepositorySession = () => repositoryCredentials.get();
+const sourceAttachments = createSourceAttachmentHandler({
+  credentials: repositoryCredentials,
+  webOrigin: () => getDurangoWebUrl().toString(),
+});
 
 // Durango (durango.sh) device key for the chats/memory API (contracts §7–8).
 // Stored beside the account session like the repository credential: the key
@@ -787,6 +801,7 @@ const clearAccountSession = async ({ preserveRepository = false } = {}) => {
     : durangoCredentials.clear({ revokeRemote: true, session: inMemoryAccountSession });
   durangoProfileMemory.clear();
   accountConnectors.clear();
+  sourceAttachments.clear();
   inMemoryAccountSession = null;
   // Authorization ends when sign-out begins, not after the session file has
   // finished being removed. This synchronously closes remote listeners and
@@ -981,6 +996,7 @@ const handleDesktopAuthCallback = async (rawUrl) => {
     await durangoCredentials.clear({ revokeRemote: true, session }).catch(() => {});
     durangoProfileMemory.clear();
     accountConnectors.clear();
+    sourceAttachments.clear();
     await writeAccountSession(session);
     repositoryCredentials.resume();
     await publishAccountState(session);
@@ -1431,6 +1447,8 @@ app.whenReady().then(async () => {
       ])
     );
   }
+
+  protocol.handle(SOURCE_ATTACHMENT_PROTOCOL, sourceAttachments.handle);
 
   protocol.handle(attachmentProtocol, async (request) => {
     try {
