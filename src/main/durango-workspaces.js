@@ -134,6 +134,48 @@ export const removeDurangoWorkspace = async ({ name, repo, force = false }) => {
   return { ok: false, error, unlanded: /unlanded change/i.test(error) };
 };
 
+const PRUNE_TIMEOUT_MS = 10 * 60_000;
+let pruneTail = Promise.resolve();
+const pruneRuns = new Map(); // args key -> pending result
+
+/**
+ * `ws prune` (docs/workspaces.md): the CLI decides which workspaces are done
+ * with (change merged or abandoned, or idle with no change and no edits) and
+ * never touches one a process runs in. `keep` names the workspaces of threads
+ * that are running; `only` limits it to the given workspaces; `dryRun` asks
+ * what it would remove. Runs go one at a time; an identical pending one is shared.
+ * `unsupported` means the bundled CLI predates `ws prune`.
+ */
+export const pruneDurangoWorkspaces = ({ keep = [], only = [], dryRun = false, idleDays } = {}) => {
+  const args = ['ws', 'prune', '--json'];
+  if (dryRun) args.push('--dry-run');
+  if (Number.isFinite(idleDays) && idleDays >= 0) args.push('--idle-days', String(idleDays));
+  for (const dir of keep) args.push('--keep', dir);
+  for (const dir of only) args.push('--only', dir);
+  const key = JSON.stringify(args);
+  const pending = pruneRuns.get(key);
+  if (pending) return pending;
+  const run = pruneTail
+    .then(() => runBundledCli(args, { cwd: os.homedir(), timeout: PRUNE_TIMEOUT_MS }))
+    .then((result) => {
+      if (result.json && Array.isArray(result.json.removed)) {
+        return {
+          ok: result.json.ok !== false,
+          removed: result.json.removed,
+          kept: result.json.kept ?? [],
+          failed: result.json.failed ?? [],
+        };
+      }
+      const error = bundledCliError(result, 'durango-code ws prune failed.');
+      return { ok: false, error, unsupported: /Unknown ws command/i.test(error) };
+    })
+    .catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
+    .finally(() => pruneRuns.delete(key));
+  pruneRuns.set(key, run);
+  pruneTail = run.then(() => undefined);
+  return run;
+};
+
 /**
  * The workspace directories in `paths` that no longer exist: removed by an
  * agent's own `ws rm`, or outside the app. Cheap enough to poll.

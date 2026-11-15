@@ -205,6 +205,7 @@ import {
   inspectDurangoWorkspaceProject,
   landDurangoWorkspace,
   missingDurangoWorkspaces,
+  pruneDurangoWorkspaces,
   removeDurangoWorkspace,
   serveDurangoWorkspace,
   stopAllDurangoWorkspaceServers,
@@ -3243,6 +3244,21 @@ ipcMain.handle('durangoWorkspace:status', async (_event, input) => {
       name: typeof input.name === 'string' ? input.name : undefined,
       repo: typeof input.repo === 'string' ? input.repo : undefined,
       remote: input.remote === true,
+    });
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+});
+
+ipcMain.handle('durangoWorkspace:prune', async (_event, input) => {
+  const paths = (value) => (Array.isArray(value) ? value.filter(isPathInput).slice(0, 500) : []);
+  try {
+    await installBundledCli();
+    return await pruneDurangoWorkspaces({
+      keep: paths(input?.keep),
+      only: paths(input?.only),
+      dryRun: input?.dryRun === true,
+      idleDays: typeof input?.idleDays === 'number' ? input.idleDays : undefined,
     });
   } catch (error) {
     return { ok: false, error: error?.message || String(error) };

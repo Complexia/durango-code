@@ -74,6 +74,47 @@ once no agent is running in it.
 Deleting the last thread that uses a workspace removes it too, unless it holds
 unlanded work, which is never discarded silently.
 
+## Cleaning up finished workspaces
+
+Workspaces used to pile up: agents finish with the change open, the landing
+happens later (another thread, `land <id>`), and nobody came back to `ws rm`.
+Now:
+
+- `land` removes the workspace after the merge (its own, and any other holding a
+  change it merged) when it holds nothing beyond the change and no process but
+  `land` and the command-scoped shells that started it (`zsh -c …`, how agents
+  run commands) is in it. An agent process, an interactive terminal shell or a
+  dev server there keeps it. `--keep-workspace` opts out.
+- The app sweeps (`sweepDurangoWorkspaces` in `src/App.tsx`, the
+  `durangoWorkspace:prune` IPC) three minutes after launch and every three hours.
+  It asks `ws prune --dry-run` what may go, passing the workspaces of running
+  threads (including turns still starting, `pendingTurnStartsRef`) as `--keep`,
+  then skips any workspace whose threads were active in the
+  last hour (merged or abandoned) or the last three days (idle with no change).
+  It marks those threads "workspace being removed" and re-checks them in the
+  same synchronous step (a turn reserved before the mark is seen; one after it
+  refuses to start), disposes their runtimes, runs `ws prune --only …`, releases the
+  threads like any removed workspace, and shows a toast naming what it removed.
+- `durango-code ws prune [--dry-run] [--idle-days n] [--keep path] [--only name|path]`
+  is the same decision by hand (`cli/orion/src/ws-prune.ts`). It removes
+  workspaces whose change was merged or abandoned and whose tree is exactly that
+  change (for a merge, also: the tree's patch reverse-applies to the merged
+  commit, so a stale revision of a change amended elsewhere stays), ones with no change and no edits idle for `--idle-days` (default 3; last
+  use is the newest of creation, `.durango/change.json` and the worktree's git
+  `index`/`HEAD`), half-created ones and registry entries whose directory is
+  gone. It keeps anything a process has its cwd in (`lsof` on macOS, `/proc` on
+  Linux; where it can't tell, as on Windows, it keeps everything), a running dev
+  server, open or archived changes, and edits not in a change (a nested
+  repository counts as one). A runner pool (`train-pool-*`, `deploy-pool-*` with
+  a clean tree at a commit on a ref) stays while a train or deploy runner is
+  alive and goes after the idle period otherwise; one that only has the name is
+  judged like any workspace. Each removal is judged again just before it, then
+  claimed in the registry (status `removing`) only if it is still the same
+  registration, so a `ws new` that reclaimed the name meanwhile is never touched;
+  a removal that dies half-way is finished by the next prune or `ws new`.
+
+The sweep needs a bundled CLI with `ws prune`; with an older one it does nothing.
+
 ## The bundled CLI
 
 The app ships the `durango-code` CLI (the pinned `durango-code` npm dependency,
@@ -115,7 +156,7 @@ the `package-lock.json` entry.
 
 - `src/main/bundled-cli.js`: launchers, `runBundledCli`, CLI sign-in.
 - `src/main/durango-workspaces.js`: eligibility, `ws new` / `ws rm` /
-  `ws list` / `ws serve` / `ws stop` / `change show` / `land`, all with `--json`.
+  `ws list` / `ws serve` / `ws stop` / `ws prune` / `change show` / `land`, all with `--json`.
 - IPC: `durangoCli:*` and `durangoWorkspace:*` in `src/main.js`.
 - Renderer: `ensureThreadDurangoWorkspace` and `handleRemoveThreadWorkspace` in
   `src/App.tsx`, `Thread.durangoWorkspace` in `src/store.ts`, the header pill in

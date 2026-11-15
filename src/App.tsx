@@ -474,6 +474,13 @@ const lastWorkspaceCommand = (activities: AgentActivity[], turnOver: boolean) =>
 };
 
 const WORKSPACE_PRESENCE_POLL_MS = 15_000;
+/** The finished-workspace sweep (sweepDurangoWorkspaces): soon after launch, then every few hours. */
+const WORKSPACE_SWEEP_FIRST_MS = 3 * 60_000;
+const WORKSPACE_SWEEP_EVERY_MS = 3 * 60 * 60_000;
+/** A workspace whose change merged or was abandoned goes once its threads have been quiet this long. */
+const WORKSPACE_SWEEP_GRACE_MS = 60 * 60_000;
+/** A workspace with no change and no edits goes after this many idle days. */
+const WORKSPACE_SWEEP_IDLE_DAYS = 3;
 
 /**
  * Threads whose workspace directory is gone (the agent ran `ws rm`, or it was
@@ -2651,6 +2658,101 @@ const App: React.FC = () => {
       window.removeEventListener('focus', check);
     };
   }, []);
+
+  // Finished Durango workspaces are swept now and then, so they stop piling up
+  // on disk: `ws prune` removes the ones whose change was merged or abandoned
+  // and the ones that sat idle with no change and no edits, never one a process
+  // runs in. On top of that, a workspace stays while a thread using it is
+  // running, or was active recently (the user may still ask for more), and the
+  // threads that used it start a fresh session in a new one next time.
+  const sweepDurangoWorkspaces = useCallback(async () => {
+    const orion = window.orion;
+    if (!orion?.pruneDurangoWorkspaces) return;
+    // A turn holds pendingTurnStartsRef from before its "workspace is being
+    // removed" check until it shows as running, so a start in preflight counts.
+    const busy = (thread: Thread, ownRemoval: Set<string> = new Set()) =>
+      thread.status === 'running' ||
+      Boolean(activeRunsByThreadRef.current[thread.id]) ||
+      pendingTurnStartsRef.current.has(thread.id) ||
+      workspaceSetupThreadIdsRef.current.has(thread.id) ||
+      (workspaceRemovalThreadIdsRef.current.has(thread.id) && !ownRemoval.has(thread.id));
+    const busyPaths = (exceptIds: Set<string> = new Set()) => [
+      ...new Set(
+        useOrionStore
+          .getState()
+          .threads.flatMap((thread) =>
+            thread.durangoWorkspace && !exceptIds.has(thread.id) && busy(thread) ? [thread.durangoWorkspace.path] : []
+          )
+      ),
+    ];
+    const plan = await orion.pruneDurangoWorkspaces({
+      dryRun: true,
+      keep: busyPaths(),
+      idleDays: WORKSPACE_SWEEP_IDLE_DAYS,
+    });
+    if (!plan.ok || !plan.removed?.length) return;
+    const now = Date.now();
+    const sharing = (workspacePath: string) =>
+      useOrionStore.getState().threads.filter((thread) => thread.durangoWorkspace?.path === workspacePath);
+    const quietFor = (reason: string) =>
+      reason === 'idle' ? WORKSPACE_SWEEP_IDLE_DAYS * 24 * 60 * 60_000 : reason === 'missing' ? 0 : WORKSPACE_SWEEP_GRACE_MS;
+    const candidates = plan.removed.filter((verdict) =>
+      sharing(verdict.path).every(
+        (thread) => !busy(thread) && now - getThreadActivityTime(thread).getTime() >= quietFor(verdict.reason)
+      )
+    );
+    if (candidates.length === 0) return;
+    const marked = new Set(candidates.flatMap((verdict) => sharing(verdict.path).map((thread) => thread.id)));
+    markWorkspaceThreads('removal', marked, true);
+    // Marked and re-checked in one synchronous step: a turn that reserved its
+    // start before the mark is seen here, one after it refuses to start.
+    const stillQuiet = candidates.filter((verdict) => sharing(verdict.path).every((thread) => !busy(thread, marked)));
+    const threadIds = new Set(stillQuiet.flatMap((verdict) => sharing(verdict.path).map((thread) => thread.id)));
+    markWorkspaceThreads(
+      'removal',
+      [...marked].filter((id) => !threadIds.has(id)),
+      false
+    );
+    if (stillQuiet.length === 0) return;
+    try {
+      await Promise.all([...threadIds].map((id) => disposeThreadRuntime(id)));
+      const result = await orion.pruneDurangoWorkspaces({
+        only: stillQuiet.map((verdict) => verdict.path),
+        keep: busyPaths(threadIds),
+        idleDays: WORKSPACE_SWEEP_IDLE_DAYS,
+      });
+      if (!result.removed?.length) return;
+      await releaseMissingDurangoWorkspaces(result.removed.map((verdict) => verdict.path));
+      const shown = result.removed.filter((verdict) => verdict.reason !== 'missing');
+      if (shown.length > 0) {
+        toast(`Removed ${shown.length} finished Durango workspace${shown.length === 1 ? '' : 's'}`, {
+          description: shown.map((verdict) => verdict.name).join(', '),
+        });
+      }
+    } finally {
+      markWorkspaceThreads('removal', threadIds, false);
+    }
+  }, [disposeThreadRuntime, markWorkspaceThreads]);
+
+  useEffect(() => {
+    if (!window.orion?.pruneDurangoWorkspaces) return;
+    let sweeping = false;
+    const sweep = () => {
+      if (sweeping) return;
+      sweeping = true;
+      void sweepDurangoWorkspaces()
+        .catch((error) => console.error('Durango workspace sweep failed', error))
+        .finally(() => {
+          sweeping = false;
+        });
+    };
+    const first = window.setTimeout(sweep, WORKSPACE_SWEEP_FIRST_MS);
+    const timer = window.setInterval(sweep, WORKSPACE_SWEEP_EVERY_MS);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(timer);
+    };
+  }, [sweepDurangoWorkspaces]);
 
   // Removes a thread's Durango workspace (and with it, the workspace of every
   // branch or subagent sharing it). Their sessions were recorded inside it, so

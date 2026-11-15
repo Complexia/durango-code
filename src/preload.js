@@ -104,6 +104,7 @@ contextBridge.exposeInMainWorld('orion', {
   removeDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:remove', input),
   durangoWorkspaceStatus: (input) => ipcRenderer.invoke('durangoWorkspace:status', input),
   missingDurangoWorkspaces: (input) => ipcRenderer.invoke('durangoWorkspace:missing', input),
+  pruneDurangoWorkspaces: (input) => ipcRenderer.invoke('durangoWorkspace:prune', input),
   landDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:land', input),
   serveDurangoWorkspace: (input) => ipcRenderer.invoke('durangoWorkspace:serve', input),
   stopDurangoWorkspaceServer: (input) => ipcRenderer.invoke('durangoWorkspace:stopServer', input),

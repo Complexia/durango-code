@@ -105,6 +105,20 @@ export type DurangoWorkspaceStatus = {
  * source of truth — nothing about skills is persisted in the Orion store.
  */
 /** A slash command reported by the Claude CLI (mirror of the SDK's SlashCommand). */
+/** One workspace in `durango-code ws prune --json`: removed with a reason code, or kept with a sentence. */
+export type DurangoWorkspacePruneVerdict = {
+  name: string;
+  repo: string;
+  repoName: string;
+  path: string;
+  threadId: string | null;
+  changeId: string | null;
+  lastUsedAt: string | null;
+} & (
+  | { remove: true; reason: 'merged' | 'abandoned' | 'idle' | 'interrupted' | 'missing' }
+  | { remove: false; reason: string }
+);
+
 export type SlashCommandInfo = {
   /** Command name without the leading slash. */
   name: string;
@@ -1236,6 +1250,23 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => Promise<DurangoWorkspaceStatus>;
       /** The workspace directories in `paths` that no longer exist. */
       missingDurangoWorkspaces?: (input: { paths: string[] }) => Promise<string[]>;
+      /** `durango-code ws prune`: removes workspaces whose change merged or was abandoned, or that sat idle with no change. */
+      pruneDurangoWorkspaces?: (input: {
+        keep?: string[];
+        only?: string[];
+        dryRun?: boolean;
+        idleDays?: number;
+      }) => Promise<
+        | {
+            ok: boolean;
+            removed: DurangoWorkspacePruneVerdict[];
+            kept: DurangoWorkspacePruneVerdict[];
+            failed: Array<DurangoWorkspacePruneVerdict & { error: string }>;
+            error?: undefined;
+            unsupported?: undefined;
+          }
+        | { ok: false; error: string; unsupported?: boolean; removed?: undefined; kept?: undefined; failed?: undefined }
+      >;
       landDurangoWorkspace?: (input: { path: string }) => Promise<{
         ok: boolean;
         changeId?: string | null;

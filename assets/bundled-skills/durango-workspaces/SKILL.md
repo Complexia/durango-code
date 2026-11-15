@@ -115,4 +115,9 @@ for what they asked.
 ## Clean up
 
 Keep the workspace until its change is merged or abandoned (the user may ask for
-more edits), then remove it: `durango-code ws rm <name>`.
+more edits). `land` removes it after the merge when it holds nothing beyond the
+change and nothing else runs in it (`--keep-workspace` keeps it); if it says it
+kept it, run later commands from the base checkout and leave it. Durango Code
+sweeps finished workspaces periodically, and `durango-code ws prune` (with
+`--dry-run` to see why each stays) does the same by hand. Remove one yourself
+with `durango-code ws rm <name>`.
