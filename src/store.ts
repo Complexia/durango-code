@@ -371,6 +371,8 @@ export type AgentActivity = {
   status?: 'running' | 'done' | 'error' | 'waiting';
   /** An inline HTML page from show_html, rendered as its own block (HtmlVisual). */
   visual?: AgentVisual;
+  /** A theme an agent applied (src/main/theme-tools.js), rendered as a card (ThemeCard). */
+  theme?: import('./ui-themes.js').ThemeSummary;
   ts: string;
   /**
    * Length of the message content when this activity was added — lets the

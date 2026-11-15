@@ -6,6 +6,7 @@ import type { AgentModel } from '../agentCatalog';
 import { SessionImportCard } from './SessionImport';
 import { agentProviders } from '../agentCatalog';
 import { HtmlVisual } from './HtmlVisual';
+import { ThemeCard } from './themes/ThemeCard';
 import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, ThinkingRow, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
 import {
@@ -343,13 +344,22 @@ const AgentRunMessage: React.FC<{
   );
   // Folded: only what came after the last step (the answer). With no steps
   // there is nothing to fold.
+  // A run that changes one theme several times shows its full card (with Save)
+  // once, on the last change; earlier ones shrink to a line.
+  const latestThemeCards = useMemo(() => {
+    const latest = new Map<string, string>();
+    for (const segment of segments) {
+      if (segment.kind === 'theme') latest.set(segment.activity.theme.id, segment.activity.id);
+    }
+    return new Set(latest.values());
+  }, [segments]);
   const lastStepIndex = segments.reduce((last, segment, index) => (segment.kind === 'activities' ? index : last), -1);
   const foldable = !isRunning && lastStepIndex >= 0;
   const folded = foldable && !stepsOpen;
   // Visuals (show_html) stay visible when the steps around them fold.
   const visibleSegments = folded
     ? [
-        ...segments.slice(0, lastStepIndex + 1).filter((segment) => segment.kind === 'visual'),
+        ...segments.slice(0, lastStepIndex + 1).filter((segment) => segment.kind === 'visual' || segment.kind === 'theme'),
         ...segments.slice(lastStepIndex + 1),
       ]
     : segments;
@@ -359,6 +369,7 @@ const AgentRunMessage: React.FC<{
     isRunning &&
     (!lastSegment ||
       lastSegment.kind === 'visual' ||
+      lastSegment.kind === 'theme' ||
       (lastSegment.kind === 'activities' &&
         !lastSegment.activities.some((activity) => activity.status === 'running' || activity.status === 'waiting')));
 
@@ -404,6 +415,15 @@ const AgentRunMessage: React.FC<{
           // One stable element: remounting the frame would reload the page.
           <React.Fragment key={segment.activity.id}>
             <HtmlVisual visual={segment.activity.visual} />
+            {thinking && index === visibleSegments.length - 1 && <ThinkingRow />}
+          </React.Fragment>
+        ) : segment.kind === 'theme' ? (
+          <React.Fragment key={segment.activity.id}>
+            <ThemeCard
+              summary={segment.activity.theme}
+              note={segment.activity.detail}
+              compact={!latestThemeCards.has(segment.activity.id)}
+            />
             {thinking && index === visibleSegments.length - 1 && <ThinkingRow />}
           </React.Fragment>
         ) : segment.kind === 'btw' ? (

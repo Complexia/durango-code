@@ -1,3 +1,4 @@
+type ThemeIpcResult<T> = { ok: true; value: T } | { ok: false; error: string };
 export {};
 
 type AppUpdateState = {
@@ -1017,8 +1018,21 @@ type OrionCodexBrowserIntegrationStatus = {
         | { ok: true; sessions: Array<ImportedSessionTranscript | null> }
         | { ok: false; error: string }
       >;
-      /** Zooms the whole window (Settings → Cosmetics → Text size). */
+      /** Zooms the whole window (Settings → Customizations → Text size). */
       setZoomFactor?: (factor: number) => void;
+      /** Settings → Customizations themes (src/main/ui-themes-store.js). */
+      themes?: {
+        list: () => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
+        setActive: (id: string | null) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
+        setSaved: (id: string, saved: boolean) => Promise<ThemeIpcResult<import('./ui-themes.js').UiTheme>>;
+        rename: (id: string, name: string) => Promise<ThemeIpcResult<import('./ui-themes.js').UiTheme>>;
+        duplicate: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').UiTheme>>;
+        remove: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
+        undo: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').UiTheme>>;
+        canUndo: (id: string) => Promise<ThemeIpcResult<boolean>>;
+        reportSceneError: (id: string, message: string) => void;
+        onChanged: (callback: (snapshot: import('./ui-themes.js').ThemeSnapshot) => void) => () => void;
+      };
       openDirectory: () => Promise<string | null>;
       /** Lists the directories in a typed path (project picker's Add project view). */
       browseDirectories?: (requestedPath: string) => Promise<{

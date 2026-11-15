@@ -10,6 +10,23 @@ contextBridge.exposeInMainWorld('orion', {
       webFrame.setZoomFactor(factor);
     }
   },
+  // Settings → Customizations themes (src/main/ui-themes-store.js).
+  themes: {
+    list: () => ipcRenderer.invoke('themes:list'),
+    setActive: (id) => ipcRenderer.invoke('themes:setActive', id),
+    setSaved: (id, saved) => ipcRenderer.invoke('themes:setSaved', id, saved),
+    rename: (id, name) => ipcRenderer.invoke('themes:rename', id, name),
+    duplicate: (id) => ipcRenderer.invoke('themes:duplicate', id),
+    remove: (id) => ipcRenderer.invoke('themes:delete', id),
+    undo: (id) => ipcRenderer.invoke('themes:undo', id),
+    canUndo: (id) => ipcRenderer.invoke('themes:canUndo', id),
+    reportSceneError: (id, message) => ipcRenderer.send('themes:sceneError', id, message),
+    onChanged: (callback) => {
+      const listener = (_event, snapshot) => callback(snapshot);
+      ipcRenderer.on('themes:changed', listener);
+      return () => ipcRenderer.removeListener('themes:changed', listener);
+    },
+  },
   // App persistence
   loadStore: () => ipcRenderer.invoke('storage:load'),
   saveStore: (value) => ipcRenderer.invoke('storage:save', value),

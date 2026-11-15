@@ -404,6 +404,12 @@ export const activityLabel = (activity: AgentActivity): { text: string; code?: b
       return { text: 'Loaded tools' };
     case 'mcp__orion__show_html':
       return { text: 'Showed a visual' };
+    case 'mcp__orion__set_app_theme':
+      return { text: 'Restyled Durango Code' };
+    case 'mcp__orion__get_app_theme':
+      return { text: 'Looked at the app theme' };
+    case 'mcp__orion__generate_theme_media':
+      return { text: 'Generated a theme backdrop' };
     case 'mcp__orion__request_secret':
       return { text: 'Asked for a secret' };
     case 'Skill':
@@ -832,6 +838,7 @@ export type AgentRunSegment =
   | { kind: 'text'; text: string }
   | { kind: 'activities'; activities: AgentActivity[] }
   | { kind: 'visual'; activity: AgentActivity & { visual: AgentVisual } }
+  | { kind: 'theme'; activity: AgentActivity & { theme: NonNullable<AgentActivity['theme']> } }
   | { kind: 'btw'; exchange: BtwExchange };
 
 export const buildAgentRunSegments = (
@@ -872,6 +879,14 @@ export const buildAgentRunSegments = (
     // A show_html page stands on its own between the steps around it.
     if (marker.value.visual) {
       segments.push({ kind: 'visual', activity: marker.value as AgentActivity & { visual: AgentVisual } });
+      continue;
+    }
+    // So does a theme an agent applied (set_app_theme), with its Save toggle.
+    if (marker.value.theme) {
+      segments.push({
+        kind: 'theme',
+        activity: marker.value as AgentActivity & { theme: NonNullable<AgentActivity['theme']> },
+      });
       continue;
     }
     const last = segments[segments.length - 1];

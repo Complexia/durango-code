@@ -249,6 +249,7 @@ import type {
 // counterpart, node-pty, is likewise only import()ed on first terminal:ensure.)
 const TerminalView = React.lazy(() => import('./TerminalView'));
 const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
+import ThemeLayer from './app/themes/ThemeLayer';
 // Remote control is opt-in and rarely on screen; keep its view out of the
 // startup chunk like the settings page.
 
@@ -9304,7 +9305,31 @@ const App: React.FC = () => {
     ]
   );
 
+  // Settings → Customizations: a regular new thread, its composer filled
+  // with the look the user described (theme-tools.js does the restyling).
+  // Not tied to a project when the no-project space exists.
+  const handleCustomizeWithAgent = (prompt: string) => {
+    const projectId = noProject?.id ?? defaultNewThreadProject?.id ?? projects[0]?.id;
+    if (!projectId) {
+      toast.error('Add a project first');
+      return;
+    }
+    setSettingsOpen(false);
+    const threadId = handleCreateThread(projectId);
+    if (!threadId) return;
+    composerDraft.updateThreadDraft(threadId, (current) => ({ text: prompt, attachments: current.attachments }));
+  };
+  const handleOpenThreadFromSettings = (threadId: string) => {
+    setSettingsOpen(false);
+    setActiveTab('agents');
+    selectThread(threadId);
+  };
+  const hasThread = (threadId: string) => useOrionStore.getState().threads.some((thread) => thread.id === threadId);
+
   const settingsPageModel: SettingsPageProps = {
+    handleCustomizeWithAgent,
+    handleOpenThreadFromSettings,
+    hasThread,
     notificationSettings,
     setNotificationSettings,
     setTextGenerationSettings,
@@ -10725,6 +10750,7 @@ const App: React.FC = () => {
       onDrop={handleRootDrop}
     >
       <Toaster position="top-center" richColors closeButton />
+      <ThemeLayer />
       <ProjectPickerModal
         open={projectPickerOpen && !repositoryOperationBusy}
         initialView={projectPickerView}

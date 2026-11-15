@@ -117,6 +117,19 @@ import { createAccountConnectors } from './main/account-connectors.js';
 import { listProviderMcps, shareProviderMcp, withoutClaudeNativeMcps, withoutCodexNativeMcps } from './main/provider-mcps.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
+import {
+  canUndoTheme,
+  configureThemeStore,
+  deleteTheme,
+  duplicateTheme,
+  listThemes,
+  recordSceneError,
+  renameTheme,
+  setActiveTheme,
+  setThemeSaved,
+  undoTheme,
+} from './main/ui-themes-store.js';
+import { setThemeToolsClient } from './main/theme-tools.js';
 import { createBrowserManager } from './main/browser/manager.js';
 import { browserScreenshotsDirectory } from './main/browser/security.js';
 import { browserModeFor, setBrowserManager } from './main/browser-tools.js';
@@ -707,6 +720,8 @@ const durangoClient = durangoMock
       webOrigin: () => getDurangoWebUrl().toString(),
     });
 setDurangoToolsClient(durangoClient);
+// generate_theme_media makes theme backdrops with Durango inference.
+setThemeToolsClient(durangoClient);
 // fx's own Vercel AI Gateway key, saved from Settings → Providers → fx. Stored
 // like the Durango key (safeStorage-encrypted in packaged builds) and only
 // handed to fx processes whose route is AI Gateway.
@@ -1106,6 +1121,20 @@ const createWindow = () => {
     }
     return { action: 'deny' };
   });
+  // Cmd/Ctrl+Alt+Shift+0 always returns to the stock look, even when a theme's
+  // CSS hides Settings (ui-themes-store.js).
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (
+      input.type === 'keyDown' &&
+      input.alt &&
+      input.shift &&
+      (input.meta || input.control) &&
+      (input.code === 'Digit0' || input.code === 'Numpad0')
+    ) {
+      event.preventDefault();
+      void setActiveTheme(null).catch(() => {});
+    }
+  });
   // show_html visuals (about:srcdoc frames) may never navigate: that would
   // send a request the frame's CSP cannot stop (visual-tools.js).
   guardVisualFrames(mainWindow.webContents, webFrameMain);
@@ -1213,6 +1242,12 @@ let remoteControlReady = Promise.resolve();
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  // Settings → Customizations themes (ui-themes-store.js): agents' theme
+  // tools and the renderer share this one store.
+  configureThemeStore({
+    dir: path.join(app.getPath('userData'), 'themes'),
+    send: (snapshot) => sendToAllWindows('themes:changed', snapshot),
+  });
   bundledSkillsReady = ensureBundledSkills()
     .then(() => {})
     .catch((error) => console.error('Could not install bundled agent skills', error));
@@ -1372,6 +1407,12 @@ app.whenReady().then(async () => {
           label: PRODUCT_DISPLAY_NAME,
           submenu: [
             { role: 'about', label: `About ${PRODUCT_DISPLAY_NAME}` },
+            { type: 'separator' },
+            {
+              label: 'Use Stock Theme',
+              accelerator: 'CmdOrCtrl+Alt+Shift+0',
+              click: () => void setActiveTheme(null).catch(() => {}),
+            },
             { type: 'separator' },
             { role: 'services' },
             { type: 'separator' },
@@ -1725,6 +1766,26 @@ const settleQuitBarrierForUpdate = async () => {
 // code. You can also put them in separate files and import them here.
 
 // -------------------- IPC Handlers --------------------
+
+// Settings → Customizations (ui-themes-store.js). Each change broadcasts
+// 'themes:changed' with the full list, so these only return for errors.
+const themeIpc = (channel, run) =>
+  ipcMain.handle(channel, async (_event, ...args) => {
+    try {
+      return { ok: true, value: await run(...args) };
+    } catch (error) {
+      return { ok: false, error: error?.message ?? String(error) };
+    }
+  });
+themeIpc('themes:list', () => listThemes());
+themeIpc('themes:setActive', (id) => setActiveTheme(typeof id === 'string' ? id : null));
+themeIpc('themes:setSaved', (id, saved) => setThemeSaved(String(id), saved === true));
+themeIpc('themes:rename', (id, name) => renameTheme(String(id), String(name ?? '')));
+themeIpc('themes:duplicate', (id) => duplicateTheme(String(id)));
+themeIpc('themes:delete', (id) => deleteTheme(String(id)));
+themeIpc('themes:undo', (id) => undoTheme(String(id)));
+themeIpc('themes:canUndo', (id) => canUndoTheme(String(id)));
+ipcMain.on('themes:sceneError', (_event, id, message) => recordSceneError(id, message));
 
 ipcMain.handle('storage:load', async () => {
   try {

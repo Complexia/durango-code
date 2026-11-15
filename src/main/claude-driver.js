@@ -19,6 +19,7 @@ import {
 } from './durango-tools.js';
 import {
   orionBuiltinToolNamesForAccessMode,
+  orionThemeToolNamesForAccessMode,
   orionDeviceToolNamesForAccessMode,
   orionMachineToolNamesForAccessMode,
 } from './thread-reader-routing.js';
@@ -26,6 +27,7 @@ import { machineToolsAvailable, machineToolsForAccessMode, machineToolsPromptHin
 import { browserModeFor, browserToolsForAccessMode, builtinBrowserTips, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOLS_PROMPT_HINT, runDeviceTool } from './device-tools.js';
 import { agentDeviceAccessAllowed, getCachedDeviceSettings } from './devices/device-settings.js';
+import { THEME_TOOLS_PROMPT_HINT, themeMcpToolDefinitions, runThemeTool } from './theme-tools.js';
 import { VISUAL_MAX_HEIGHT, VISUAL_MIN_HEIGHT, VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, runVisualTool } from './visual-tools.js';
 import {
   USER_ACTION_CHECK_MAX_CHARS,
@@ -572,8 +574,59 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       ...(hasBuiltinBrowser(session.browserMode) ? claudeBrowserTools(tool, z, session) : []),
       ...(claudeDeviceToolsEnabled(session) ? createClaudeDeviceTools(tool, z, session) : []),
       ...(session.machinesEnabled ? claudeMachineTools(tool, z, session) : []),
+      ...claudeThemeTools(tool, z, session),
     ],
   });
+
+// Theme tools (theme-tools.js holds the schemas; the bridge lists the same
+// ones through `__tools`): an agent restyles Durango Code live.
+const claudeThemeTools = (tool, z, session) =>
+  themeMcpToolDefinitions(session.accessMode).map((definition) => {
+    const required = new Set(definition.inputSchema.required ?? []);
+    const shape = {};
+    for (const [key, property] of Object.entries(definition.inputSchema.properties ?? {})) {
+      const type = zodForThemeSchema(z, property);
+      shape[key] = required.has(key) ? type : type.optional();
+    }
+    return tool(
+      definition.name,
+      definition.description,
+      shape,
+      async (args, extra) =>
+        durangoToolResultWithImages(
+          await runThemeTool(definition.name, args, {
+            getSender: () => session.sender,
+            threadId: session.threadId,
+            runId: session.activeTurns?.[0]?.runId,
+            accessMode: session.accessMode,
+            signal: extra?.signal instanceof AbortSignal ? extra.signal : undefined,
+          })
+        ),
+      definition.annotations ? { annotations: definition.annotations } : undefined
+    );
+  });
+
+// zodForJsonSchema plus the object shapes the theme tools use (nested
+// objects, string maps, nullable unions).
+const zodForThemeSchema = (z, schema) => {
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+  const nullable = types.includes('null');
+  const main = types.find((type) => type !== 'null');
+  let type;
+  if (main === 'object' && schema.properties) {
+    const shape = {};
+    for (const [key, property] of Object.entries(schema.properties)) {
+      shape[key] = zodForThemeSchema(z, property).optional();
+    }
+    type = z.object(shape);
+  } else if (main === 'object') {
+    type = z.record(z.string(), z.string().nullable());
+  } else {
+    type = zodForJsonSchema(z, { ...schema, type: main, description: undefined });
+  }
+  if (nullable) type = type.nullable();
+  return schema.description ? type.describe(schema.description) : type;
+};
 
 // The user's other machines (machine-tools.js holds the schemas; the bridge
 // lists the same ones), registered while remote control can reach one.
@@ -2281,6 +2334,7 @@ export const createClaudeSdkSession = ({
               ...sdkOptions.allowedTools,
               ...[
                 ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode),
+                ...orionThemeToolNamesForAccessMode(sdkOptions.accessMode),
                 ...(devicesEnabled ? orionDeviceToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 ...(machinesEnabled ? orionMachineToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 'wait_for_background_tasks',
@@ -2327,6 +2381,7 @@ export const createClaudeSdkSession = ({
             CLAUDE_USER_ACTION_TIP,
             CLAUDE_SECRET_TIP,
             CLAUDE_VISUALS_TIP,
+            THEME_TOOLS_PROMPT_HINT,
             ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
             ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
             ...(devicesEnabled ? [DEVICE_TOOLS_PROMPT_HINT] : []),

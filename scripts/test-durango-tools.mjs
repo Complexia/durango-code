@@ -65,6 +65,8 @@ import { handleMcpBridgeConnection, mcpBridgeSessions, pendingSubagentSpawns } f
 import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOL_NAMES } from '../src/main/device-tools.js';
 import { ORION_DEVICE_TOOL_NAMES } from '../src/main/thread-reader-routing.js';
 import { VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, VISUAL_TOOL_NAMES } from '../src/main/visual-tools.js';
+import { THEME_TOOL_DESCRIPTIONS, THEME_TOOL_INPUT_SCHEMAS } from '../src/main/theme-tools.js';
+import { orionThemeToolNamesForAccessMode } from '../src/main/thread-reader-routing.js';
 import { setDeviceDataRootForTests } from '../src/main/devices/device-settings.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
 
@@ -393,6 +395,26 @@ try {
   assert.equal(turnEvents[0].channel, 'agent:turnEvent');
   assert.equal(turnEvents[0].payload.runId, 'run-vis');
   assert.equal(turnEvents[0].payload.activity.visual.html, '<p>x</p>');
+
+  // --- Theme tools: Claude registers the same ones, read-only drops generation -----------------
+  for (const name of orionThemeToolNamesForAccessMode('read-only')) {
+    const entry = registered.find((candidate) => candidate.name === name);
+    assert.ok(entry, `Claude registers ${name}`);
+    assert.equal(entry.description, THEME_TOOL_DESCRIPTIONS[name]);
+    assert.deepEqual(Object.keys(entry.schema).sort(), Object.keys(THEME_TOOL_INPUT_SCHEMAS[name].properties).sort());
+  }
+  assert.equal(registered.some((entry) => entry.name === 'generate_theme_media'), false);
+  {
+    const setTheme = registered.find((entry) => entry.name === 'set_app_theme');
+    const parsed = z.object(setTheme.schema).parse({
+      tokens: { accent: '#ff4fd8', danger: null },
+      backdrop: { type: 'html', html: '<canvas></canvas>', dim: 0.2 },
+      overlay: null,
+    });
+    assert.equal(parsed.tokens.accent, '#ff4fd8');
+    assert.equal(parsed.backdrop.type, 'html');
+    assert.throws(() => z.object(setTheme.schema).parse({ backdrop: { type: 'bogus' } }));
+  }
 
   // --- Device tools: Claude registers them only with agent access, mirroring device-tools.js ---
   setDeviceDataRootForTests(path.join(testRoot, 'device-data'));
@@ -865,7 +887,14 @@ try {
       assert.equal(tool.description, VISUAL_TOOL_DESCRIPTIONS[name], `${name} description matches visual-tools.js`);
       assert.deepEqual(tool.inputSchema, VISUAL_TOOL_INPUT_SCHEMAS[name], `${name} schema matches visual-tools.js`);
     }
-    assert.deepEqual(shimTools.map((tool) => tool.name), ORION_BUILTIN_TOOL_NAMES);
+    // Theme tools come from the app (`__tools`), after the shim's own.
+    const themeNames = orionThemeToolNamesForAccessMode('read-only');
+    assert.deepEqual(shimTools.map((tool) => tool.name), [...ORION_BUILTIN_TOOL_NAMES, ...themeNames]);
+    for (const name of themeNames) {
+      const tool = shimTools.find((candidate) => candidate.name === name);
+      assert.equal(tool.description, THEME_TOOL_DESCRIPTIONS[name], `${name} description matches theme-tools.js`);
+      assert.deepEqual(tool.inputSchema, THEME_TOOL_INPUT_SCHEMAS[name], `${name} schema matches theme-tools.js`);
+    }
     const shimVisual = await call('tools/call', { name: 'show_html', arguments: { html: '<p>x</p>', title: 'X' } });
     assert.equal(shimVisual.result.isError, true, 'the bridge routes show_html (no window here)');
     assert.match(shimVisual.result.content[0].text, /Describe it in your reply/);

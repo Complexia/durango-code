@@ -12,6 +12,7 @@ import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
 import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
 import { SECRET_TOOL_NAMES, cancelSecretRequests, redactSecrets, resolveSecretRefs, runSecretTool } from './secret-requests.js';
 import { VISUAL_TOOL_NAMES, runVisualTool } from './visual-tools.js';
+import { THEME_TOOL_NAMES, runThemeTool, themeMcpToolDefinitions } from './theme-tools.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
 import { MACHINE_TOOL_NAMES, machineMcpToolDefinitions, machineToolsAvailable, runMachineTool } from './machine-tools.js';
@@ -174,6 +175,8 @@ export const handleMcpBridgeConnection = (socket) => {
             ...(session.machinesEnabled ? machineMcpToolDefinitions(session.accessMode) : []),
             // The run's MCP servers load on demand (mcp-on-demand.js).
             ...onDemandMcpToolDefinitions(session.onDemandMcps?.names() ?? []),
+            // Restyling Durango Code itself (theme-tools.js).
+            ...themeMcpToolDefinitions(session.accessMode),
           ],
         });
         continue;
@@ -287,6 +290,19 @@ export const handleMcpBridgeConnection = (socket) => {
       if (SECRET_TOOL_NAMES.includes(message.tool)) {
         // Blocks until the user answers; the run's release cancels it.
         void runSecretTool(message.tool, args, { ...session, owner: session }).then(({ ok, text }) => reply(ok, text));
+        continue;
+      }
+      if (THEME_TOOL_NAMES.includes(message.tool)) {
+        // Resolves, never rejects; screenshots come back as image blocks.
+        void runThemeTool(message.tool, args, {
+          getSender: session.getSender,
+          threadId: session.threadId,
+          runId: session.runId,
+          accessMode: session.accessMode,
+          signal: session.abortController?.signal,
+        }).then(({ ok, text, content }) =>
+          reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
+        );
         continue;
       }
       if (VISUAL_TOOL_NAMES.includes(message.tool)) {

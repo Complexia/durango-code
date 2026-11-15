@@ -29,6 +29,17 @@ export const orionBuiltinToolNamesForAccessMode = (accessMode) =>
     ? ORION_BUILTIN_TOOL_NAMES.filter((name) => name !== 'remember')
     : ORION_BUILTIN_TOOL_NAMES;
 
+// Theme tools (theme-tools.js): get/set only change how Durango Code looks on
+// this computer, so every mode approves them; generate_theme_media spends
+// Durango credits, an external mutation, so Read only leaves it unapproved
+// (and the tool refuses in that mode). Served through `__tools` for the
+// bridge, so the shim's static list does not include them.
+export const ORION_THEME_TOOL_NAMES = Object.freeze(['get_app_theme', 'set_app_theme', 'generate_theme_media']);
+export const orionThemeToolNamesForAccessMode = (accessMode) =>
+  accessMode === 'read-only'
+    ? ORION_THEME_TOOL_NAMES.filter((name) => name !== 'generate_theme_media')
+    : ORION_THEME_TOOL_NAMES;
+
 // The built-in browser's tools (browser-tools.js) are only listed for runs
 // that use it. Like Claude in Chrome under Workspace write they are
 // pre-approved; Read only lists just these two, which read existing tabs.
@@ -68,7 +79,8 @@ export const isPreapprovedOrionTool = (name, accessMode) =>
   (orionBuiltinToolNamesForAccessMode(accessMode).includes(name) ||
     (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))) ||
     orionDeviceToolNamesForAccessMode(accessMode).includes(name) ||
-    orionMachineToolNamesForAccessMode(accessMode).includes(name));
+    orionMachineToolNamesForAccessMode(accessMode).includes(name) ||
+    orionThemeToolNamesForAccessMode(accessMode).includes(name));
 
 const runPluginHelpCommand = (providerId) =>
   providerId === 'cursor'

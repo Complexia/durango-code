@@ -37,10 +37,21 @@
   --shadow-sm: 0 2px 8px rgb(0 0 0 / 18%);
   --shadow-md: 0 8px 24px rgb(0 0 0 / 28%);
   --shadow-lg: 0 16px 48px rgb(0 0 0 / 42%);
+  /* Theme tokens (src/ui-themes.js THEME_TOKENS; keep stock values equal). */
+  --shell-bg: linear-gradient(180deg, #141416 0%, #111113 100%);
+  --settings-sidebar-bg: #0c0c0e;
+  --font-ui: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --theme-panel-blur: 0px;
+  /* Deeper accents for gradients on primary buttons (themes derive them). */
+  --link: #4da3ff;
+  --on-accent: #fff;
+  --accent-strong: #3b7aed;
+  --accent-deep: #2563eb;
 }
 
 body {
-  font-family: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+  font-family: var(--font-ui);
   margin: 0;
   padding: 0;
   background: var(--bg-base);
@@ -75,7 +86,7 @@ body {
   align-items: center;
   gap: 12px;
   padding: 18px 22px;
-  border: 1px solid rgb(77 141 255 / 55%);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
   border-radius: var(--radius-lg);
   background: rgb(26 26 30 / 92%);
   color: var(--text-primary);
@@ -90,7 +101,7 @@ body {
   display: grid;
   grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   flex-shrink: 0;
-  background: linear-gradient(180deg, #141416 0%, #111113 100%);
+  background: var(--shell-bg);
   -webkit-app-region: drag;
 }
 
@@ -326,7 +337,7 @@ body {
 
 .shell-cloud-button.attention:hover:not(:disabled) {
   background: var(--accent-soft);
-  border-color: rgb(77 141 255 / 35%);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 .shell-cloud-group {
@@ -367,7 +378,7 @@ body {
 
 .shell-cloud-icon-button.attention:hover:not(:disabled) {
   background: var(--accent-soft);
-  border-color: rgb(77 141 255 / 35%);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
 }
 
 /* A queued or running Orion Cloud build. Pulsing rather than spinning: the
@@ -589,9 +600,9 @@ body {
   gap: 8px;
   min-height: 34px;
   padding: 3px 4px 3px 10px;
-  border: 1px solid rgb(77 141 255 / 24%);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, transparent);
   border-radius: var(--radius-sm);
-  background: rgb(20 20 22 / 92%);
+  background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
   box-shadow: var(--shadow-md);
   backdrop-filter: blur(12px);
   -webkit-app-region: no-drag;
@@ -640,7 +651,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 0 10px;
-  border: 1px solid rgb(77 141 255 / 28%);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
   border-radius: var(--radius-sm);
   background: var(--accent-soft);
   color: #dbe7ff;
@@ -652,8 +663,8 @@ body {
 }
 
 .provider-update-button:hover:not(:disabled) {
-  background: rgb(77 141 255 / 22%);
-  border-color: rgb(77 141 255 / 42%);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 42%, transparent);
   color: #f1f6ff;
 }
 
@@ -789,8 +800,8 @@ body {
 
 /* An MCP server only one provider (Claude Code, Codex) loads by itself. */
 .provider-status-chip.limited {
-  border-color: rgb(77 141 255 / 26%);
-  background: rgb(77 141 255 / 10%);
+  border-color: color-mix(in srgb, var(--accent) 26%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
   color: #b3cdff;
 }
 
@@ -832,7 +843,7 @@ body {
 
 .provider-toggle input:checked + span {
   background: var(--accent-soft);
-  border-color: rgb(77 141 255 / 36%);
+  border-color: color-mix(in srgb, var(--accent) 36%, transparent);
 }
 
 .provider-toggle input:checked + span::after {
@@ -1044,7 +1055,7 @@ body {
 }
 
 .providers-action-btn.primary {
-  border-color: rgb(77 141 255 / 32%);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
   background: var(--accent-soft);
   color: #dbe7ff;
 }
@@ -1055,7 +1066,7 @@ body {
   gap: 10px;
   padding: 14px;
   border-bottom: 1px solid var(--border-subtle);
-  background: linear-gradient(180deg, rgb(77 141 255 / 7%), rgb(77 141 255 / 2%));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 7%, transparent), color-mix(in srgb, var(--accent) 2%, transparent));
 }
 
 .provider-update-progress-card.failed,
@@ -1271,7 +1282,7 @@ body {
 }
 
 .provider-option-input:focus {
-  border-color: rgb(77 141 255 / 45%);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .provider-option-textarea {
@@ -1400,7 +1411,7 @@ body {
 .settings-sidebar {
   width: 232px;
   min-width: 232px;
-  background: #0c0c0e;
+  background: var(--settings-sidebar-bg);
   border-right: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
@@ -1566,7 +1577,7 @@ body {
 }
 
 .browser-use-mode-button.active {
-  border-color: rgb(77 141 255 / 55%);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   background: var(--accent-soft);
   color: var(--text-primary);
 }
@@ -1701,7 +1712,7 @@ body {
 }
 
 .setting-textarea:focus {
-  border-color: rgb(77 141 255 / 45%);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 /* Main layout */
@@ -2655,7 +2666,7 @@ body {
   bottom: 6px;
   width: 2px;
   border-radius: 0 2px 2px 0;
-  background: rgb(77 141 255 / 55%);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .thread-item.in-split.selected::before {
@@ -2964,7 +2975,7 @@ body {
 .agents-panel {
   position: relative; /* anchors the drag-a-thread-here hint */
   background:
-    radial-gradient(ellipse 80% 50% at 50% -20%, rgb(77 141 255 / 7%), transparent 60%),
+    radial-gradient(ellipse 80% 50% at 50% -20%, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
     radial-gradient(ellipse 60% 40% at 100% 100%, rgb(139 124 246 / 5%), transparent 50%),
     var(--bg-base);
 }
@@ -3030,14 +3041,14 @@ body {
 .thread-pane.split {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  background: rgb(20 20 22 / 55%);
+  background: color-mix(in srgb, var(--bg-raised) 55%, transparent);
   transition: border-color var(--transition-base), box-shadow var(--transition-base);
 }
 
 /* The focused pane owns the composer and the keyboard; the ring says which
    thread a keystroke will reach. */
 .thread-pane.split.focused {
-  border-color: rgb(77 141 255 / 45%);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   box-shadow: 0 0 0 1px var(--accent-soft);
 }
 
@@ -3180,7 +3191,7 @@ body {
   content: '';
   position: absolute;
   inset: 4px;
-  border: 1.5px dashed rgb(77 141 255 / 45%);
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 45%, transparent);
   border-radius: var(--radius-lg);
   pointer-events: none;
   z-index: 5;
@@ -3195,7 +3206,7 @@ body {
   align-items: center;
   gap: 8px;
   padding: 8px 14px;
-  border: 1px solid rgb(77 141 255 / 40%);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
   border-radius: var(--radius-lg);
   background: rgb(26 26 30 / 94%);
   box-shadow: var(--shadow-md);
@@ -3227,7 +3238,7 @@ body {
 
 .saved-view-icon {
   flex-shrink: 0;
-  color: rgb(77 141 255 / 70%);
+  color: color-mix(in srgb, var(--accent) 70%, transparent);
 }
 
 .saved-view-item.selected .saved-view-icon {
@@ -3286,7 +3297,7 @@ body {
 }
 
 .agents-panel-header {
-  background: rgb(20 20 22 / 80%);
+  background: color-mix(in srgb, var(--bg-raised) 80%, transparent);
 }
 
 .panel-header-title {
@@ -3389,16 +3400,16 @@ body {
 
 .message.user {
   align-self: flex-end;
-  background: linear-gradient(135deg, #3b7aed 0%, #2563eb 100%);
-  color: #fff;
+  background: linear-gradient(135deg, var(--accent-strong) 0%, var(--accent-deep) 100%);
+  color: var(--on-accent);
   border-bottom-right-radius: 4px;
-  box-shadow: 0 4px 16px rgb(37 99 235 / 22%);
+  box-shadow: 0 4px 16px color-mix(in srgb, var(--accent-deep) 22%, transparent);
 }
 
 /* A follow-up waiting for the current run to finish: same bubble, but visibly
    pending — muted fill, dashed edge — with its queue/steer controls inline. */
 .message.user.queued {
-  background: linear-gradient(135deg, rgb(59 122 237 / 45%), rgb(37 99 235 / 45%));
+  background: linear-gradient(135deg, rgb(59 122 237 / 45%), color-mix(in srgb, var(--accent-deep) 45%, transparent));
   border: 1px dashed rgb(125 165 255 / 60%);
   box-shadow: none;
 }
@@ -3733,7 +3744,7 @@ body {
   border: 1px solid var(--border-default);
   color: var(--accent);
   margin-bottom: 20px;
-  box-shadow: 0 8px 32px rgb(77 141 255 / 12%);
+  box-shadow: 0 8px 32px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .agents-welcome h2 {
@@ -3959,8 +3970,8 @@ body {
 }
 
 .agent-status-line.running {
-  border-color: rgb(77 141 255 / 20%);
-  background: linear-gradient(135deg, rgb(77 141 255 / 6%), rgb(139 124 246 / 4%));
+  border-color: color-mix(in srgb, var(--accent) 20%, transparent);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 6%, transparent), rgb(139 124 246 / 4%));
 }
 
 .agent-status-line.running > span:not(.working-dots) {
@@ -4122,7 +4133,7 @@ body {
   border: 1px solid var(--border-subtle);
   background: rgb(0 0 0 / 25%);
   color: #9a9a9a;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
@@ -4775,7 +4786,7 @@ body {
 }
 
 .markdown-content a {
-  color: #4da3ff;
+  color: var(--link);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -4808,7 +4819,7 @@ body {
   background: #1b1b1d;
   color: #e8e8e8;
   padding: 0.12em 0.32em;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 0.9em;
 }
 
@@ -4854,7 +4865,7 @@ body {
 
 .chat-input-area {
   padding: 12px 32px 18px;
-  background: linear-gradient(180deg, transparent, rgb(20 20 22 / 90%));
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--bg-raised) 90%, transparent));
   position: relative;
   flex-shrink: 0;
   z-index: 2;
@@ -4873,14 +4884,14 @@ body {
 }
 
 .composer-shell:focus-within {
-  border-color: rgb(77 141 255 / 45%);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
   box-shadow: var(--shadow-md), 0 0 0 3px var(--accent-soft);
 }
 
 /* Dragging a sidebar thread over the composer links it as an @thread mention;
    dropping anywhere else in the main view opens a split pane instead. */
 .composer-shell.thread-drop-target {
-  border-color: rgb(77 141 255 / 70%);
+  border-color: color-mix(in srgb, var(--accent) 70%, transparent);
   box-shadow: var(--shadow-md), 0 0 0 3px var(--accent-soft);
 }
 
@@ -4891,7 +4902,7 @@ body {
   left: 50%;
   transform: translate(-50%, -100%);
   padding: 6px 12px;
-  border: 1px solid rgb(77 141 255 / 40%);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
   border-radius: var(--radius-lg);
   background: rgb(26 26 30 / 94%);
   box-shadow: var(--shadow-md);
@@ -4943,7 +4954,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 4px;
-  background: linear-gradient(145deg, rgb(77 141 255 / 16%), rgb(255 255 255 / 5%));
+  background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 16%, transparent), rgb(255 255 255 / 5%));
   color: var(--accent);
 }
 
@@ -5300,7 +5311,7 @@ body {
   gap: 7px;
   color: #f3f0ff;
   background:
-    linear-gradient(135deg, rgb(139 124 246 / 28%) 0%, rgb(77 141 255 / 18%) 55%, rgb(20 20 24 / 72%) 100%);
+    linear-gradient(135deg, rgb(139 124 246 / 28%) 0%, color-mix(in srgb, var(--accent) 18%, transparent) 55%, rgb(20 20 24 / 72%) 100%);
   backdrop-filter: blur(14px) saturate(1.35);
   -webkit-backdrop-filter: blur(14px) saturate(1.35);
   box-shadow:
@@ -5328,7 +5339,7 @@ body {
   z-index: -1;
   background:
     radial-gradient(ellipse at 20% 40%, rgb(167 139 250 / 38%) 0%, transparent 55%),
-    radial-gradient(ellipse at 85% 60%, rgb(77 141 255 / 28%) 0%, transparent 50%);
+    radial-gradient(ellipse at 85% 60%, color-mix(in srgb, var(--accent) 28%, transparent) 0%, transparent 50%);
   opacity: 0.85;
   pointer-events: none;
   transition: opacity 220ms var(--ease-out), transform 320ms var(--ease-out);
@@ -5374,9 +5385,9 @@ body {
 
 .model-cli-overlay.selected {
   border-color: rgb(167 139 250 / 55%);
-  color: #fff;
+  color: var(--on-accent);
   background:
-    linear-gradient(135deg, rgb(139 124 246 / 42%) 0%, rgb(77 141 255 / 28%) 55%, rgb(24 24 30 / 78%) 100%);
+    linear-gradient(135deg, rgb(139 124 246 / 42%) 0%, color-mix(in srgb, var(--accent) 28%, transparent) 55%, rgb(24 24 30 / 78%) 100%);
   box-shadow:
     0 1px 0 rgb(255 255 255 / 14%) inset,
     0 10px 26px rgb(0 0 0 / 36%),
@@ -5913,9 +5924,9 @@ body {
 .send-button {
   width: 36px;
   justify-content: center;
-  background: linear-gradient(135deg, #3b7aed, #2563eb);
+  background: linear-gradient(135deg, var(--accent-strong), var(--accent-deep));
   border-color: transparent;
-  color: #fff;
+  color: var(--on-accent);
   cursor: pointer;
   flex-shrink: 0;
 }
@@ -5933,8 +5944,8 @@ body {
 }
 
 .send-button:hover:not(:disabled) {
-  background: linear-gradient(135deg, #4d8dff, #3b7aed);
-  box-shadow: 0 4px 14px rgb(37 99 235 / 35%);
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--accent-deep) 35%, transparent);
   transform: translateY(-1px);
 }
 
@@ -6296,7 +6307,7 @@ body {
 
 .markdown-preview .markdown-content blockquote {
   padding-left: 14px;
-  border-left: 3px solid #4d8dff;
+  border-left: 3px solid var(--accent);
   color: #aaaab0;
 }
 
@@ -6318,8 +6329,8 @@ body {
 }
 
 .markdown-preview .markdown-content input[type='checkbox']:checked {
-  border-color: #4d8dff;
-  background-color: #4d8dff;
+  border-color: var(--accent);
+  background-color: var(--accent);
   background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 14 14' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M3 7.2 5.6 9.7 11 4.3' fill='none' stroke='white' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
@@ -6358,8 +6369,8 @@ body {
 }
 
 .btn {
-  background: linear-gradient(135deg, #3b7aed, #2563eb);
-  color: white;
+  background: linear-gradient(135deg, var(--accent-strong), var(--accent-deep));
+  color: var(--on-accent);
   border: none;
   padding: 8px 16px;
   border-radius: var(--radius-sm);
@@ -6373,7 +6384,7 @@ body {
 }
 
 .btn:hover {
-  box-shadow: 0 4px 14px rgb(37 99 235 / 30%);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--accent-deep) 30%, transparent);
   transform: translateY(-1px);
 }
 
@@ -6563,7 +6574,7 @@ body {
 }
 
 .task-link-trigger.linked {
-  border-color: rgb(77 141 255 / 40%);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   color: var(--accent);
   background: var(--accent-soft);
 }
@@ -6578,7 +6589,7 @@ body {
   padding: 0 3px;
   border-radius: 999px;
   background: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
   font-size: 9.5px;
   font-weight: 700;
   line-height: 15px;
@@ -6791,7 +6802,7 @@ body {
   border: 0;
   border-radius: 999px;
   background: var(--accent);
-  color: white;
+  color: var(--on-accent);
   font-size: 12.5px;
   font-weight: 600;
   cursor: pointer;
@@ -6982,7 +6993,7 @@ body {
 
 .modal-input:focus,
 .modal-textarea:focus {
-  border-color: rgb(77 141 255 / 50%);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
@@ -7398,7 +7409,7 @@ body {
 }
 
 .skills-filter-input:focus {
-  border-color: rgb(77 141 255 / 45%);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .skills-list {
@@ -7463,7 +7474,7 @@ body {
 }
 
 .skills-row-name:hover {
-  color: var(--accent, #4d8dff);
+  color: var(--accent, var(--accent));
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -7584,7 +7595,7 @@ body {
   padding: 0;
   border: 0;
   background: none;
-  color: var(--accent, #4d8dff);
+  color: var(--accent, var(--accent));
   font-size: 11.5px;
   cursor: pointer;
 }
@@ -7754,7 +7765,7 @@ body {
   padding: 1px 7px;
   border: none;
   border-radius: 999px;
-  background: rgb(77 141 255 / 12%);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
   color: var(--accent);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
@@ -7763,7 +7774,7 @@ body {
 }
 
 .dev-server-port:hover {
-  background: rgb(77 141 255 / 20%);
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .dev-server-live {
@@ -7878,7 +7889,7 @@ body {
   border-radius: 8px;
   background: var(--bg-raised);
   color: var(--text-primary);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 15px;
   letter-spacing: 0.12em;
   user-select: all;
@@ -7905,7 +7916,7 @@ body {
 
 .remote-status-chip.connecting {
   color: var(--accent);
-  border-color: rgb(77 141 255 / 30%);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 .remote-status-chip.error {
@@ -8008,7 +8019,7 @@ body {
   transition: background var(--transition-fast), border-color var(--transition-fast);
 }
 .codex-question-options button[aria-pressed="false"]:hover:not(:disabled) { background: var(--bg-elevated); border-color: var(--border-strong); }
-.codex-question-options button[aria-pressed="true"] { border-color: rgb(77 141 255 / 45%); background: var(--accent-soft); }
+.codex-question-options button[aria-pressed="true"] { border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); }
 .codex-question-options button:disabled { cursor: default; opacity: .6; }
 .codex-question-mark {
   display: inline-flex;
@@ -8052,7 +8063,7 @@ body {
 .codex-question input::placeholder,
 .codex-question textarea::placeholder { color: var(--text-muted); }
 .codex-question input:focus,
-.codex-question textarea:focus { border-color: rgb(77 141 255 / 45%); box-shadow: 0 0 0 3px var(--accent-soft); }
+.codex-question textarea:focus { border-color: color-mix(in srgb, var(--accent) 45%, transparent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .codex-question-footer {
   display: flex;
   flex-shrink: 0;
@@ -8068,7 +8079,7 @@ body {
   border: none;
   border-radius: var(--radius-md);
   background: var(--accent);
-  color: white;
+  color: var(--on-accent);
   font-size: 12.5px;
   font-weight: 500;
   transition: filter var(--transition-fast), opacity var(--transition-fast);
@@ -8292,7 +8303,7 @@ body {
   max-width: 100%;
   margin: 0 1px;
   padding: 0 6px;
-  border: 1px solid rgb(77 141 255 / 32%);
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
   border-radius: var(--radius-sm);
   background: var(--accent-soft);
   color: #8bb8ff;
@@ -8305,7 +8316,7 @@ body {
 }
 
 .thread-reference:hover {
-  border-color: rgb(77 141 255 / 55%);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   background: var(--accent-glow);
 }
 
@@ -8661,4 +8672,98 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .work-row-label.live { animation: none; color: var(--text-secondary); }
+}
+
+
+/* --- Themes (Settings → Customizations; src/app/themes/ThemeLayer.tsx) --- */
+.theme-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.theme-backdrop-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+img.theme-backdrop-fill,
+video.theme-backdrop-fill {
+  display: block;
+  max-width: none;
+}
+
+.theme-backdrop-dim {
+  position: absolute;
+  inset: 0;
+  background: #000;
+}
+
+.theme-scene {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  pointer-events: none;
+  color-scheme: normal;
+}
+
+.theme-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  pointer-events: none;
+}
+
+html.has-theme-backdrop body {
+  background: transparent;
+}
+
+html.has-theme-backdrop .app-container {
+  background: transparent;
+}
+
+html.theme-panel-blur :is(.sidebar, .app-shellbar, .composer-shell, .settings-panel, .settings-sidebar, .thread-pane-header) {
+  -webkit-backdrop-filter: blur(var(--theme-panel-blur)) saturate(1.15);
+  backdrop-filter: blur(var(--theme-panel-blur)) saturate(1.15);
+}
+
+.theme-card-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.theme-card-button:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.theme-card-button-primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+}
+
+.theme-card-button-primary:hover {
+  background: var(--accent-strong);
+  color: var(--on-accent);
 }

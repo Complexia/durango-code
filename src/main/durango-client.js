@@ -623,8 +623,93 @@ export const createDurangoClient = ({
       const data = await request('POST', '/memory/remember', { body: { fact: text } });
       return { id: str(data.id) };
     },
+    // --- Durango inference media (theme backdrops, theme-tools.js) ----------
+    /**
+     * One generated image's bytes: POST /images/generations with b64_json, so
+     * no second download. Spends the user's Durango credits.
+     */
+    async generateImage({ model, prompt, aspectRatio, imageSize, signal }) {
+      const data = await request('POST', '/images/generations', {
+        body: {
+          model,
+          prompt,
+          n: 1,
+          response_format: 'b64_json',
+          ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+          ...(imageSize ? { image_size: imageSize } : {}),
+        },
+        timeout: MEDIA_REQUEST_TIMEOUT_MS,
+        signal,
+      });
+      const entry = Array.isArray(data.data) ? data.data[0] : null;
+      const b64 = typeof entry?.b64_json === 'string' ? entry.b64_json : '';
+      if (!b64) throw new DurangoError('api', 'Durango returned no image.');
+      return {
+        data: Buffer.from(b64, 'base64'),
+        mimeType: str(entry.content_type) || 'image/png',
+        creditsUsed: Number(data.usage?.credits_used ?? data.credits_used ?? 0) || null,
+      };
+    },
+    /** Starts a video generation; resolves `{ runId }` to poll with videoGeneration. */
+    async startVideoGeneration({ model, prompt, aspectRatio, duration, resolution, signal }) {
+      const data = await request('POST', '/videos/generations', {
+        body: {
+          model,
+          prompt,
+          generate_audio: false,
+          ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+          ...(duration ? { duration } : {}),
+          ...(resolution ? { resolution } : {}),
+        },
+        timeout: 60_000,
+        signal,
+      });
+      const runId = str(data.id ?? data.run_id);
+      if (!runId) throw new DurangoError('api', 'Durango did not start the video generation.');
+      return { runId };
+    },
+    /** `{ status: running|completed|failed, videoUrls, error, creditsUsed }`. */
+    async videoGeneration(runId, { signal } = {}) {
+      const data = await request('GET', `/videos/generations/${encodeURIComponent(str(runId))}`, { signal });
+      const urls = Array.isArray(data.data) ? data.data.map((video) => str(video?.url)).filter(Boolean) : [];
+      return {
+        status: str(data.status) || 'running',
+        videoUrls: urls,
+        error: typeof data.error === 'string' ? data.error : str(data.error?.message) || null,
+        creditsUsed: Number(data.usage?.credits_used ?? data.credits_used ?? 0) || null,
+      };
+    },
+    /** Bytes of a generated image or video on Durango (an /api/v1 URL from above). */
+    async downloadGeneratedMedia(mediaUrl, { signal } = {}) {
+      const session = await readSession();
+      if (!session?.token) throw notSignedIn();
+      const credential = await credentials.get();
+      const url = new URL(mediaUrl, credential.baseUrl);
+      if (url.origin !== new URL(credential.baseUrl).origin || !url.pathname.startsWith('/api/v1/')) {
+        throw new DurangoError('api', 'Refusing to download media from outside Durango.');
+      }
+      let response;
+      try {
+        const timeoutSignal = AbortSignal.timeout(MEDIA_REQUEST_TIMEOUT_MS);
+        response = await fetchImpl(url, {
+          headers: { authorization: `Bearer ${credential.key}` },
+          signal: signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal,
+        });
+      } catch (error) {
+        throw networkError('Durango', error);
+      }
+      if (!response.ok) {
+        throw new DurangoError('api', `Media download failed (${response.status}).`, { status: response.status });
+      }
+      return {
+        data: Buffer.from(await response.arrayBuffer()),
+        mimeType: response.headers.get('content-type') || 'application/octet-stream',
+      };
+    },
   };
 };
+
+const MEDIA_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // DURANGO_MOCK=1: fixture client for development, GUI verification and tests.

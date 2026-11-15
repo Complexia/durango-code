@@ -78,6 +78,7 @@ import type {
 } from './appTypes';
 import { ReleaseNotesList } from './AppUpdateUi';
 import { SnapShotSettingsPanel } from './SnapShotSettings';
+import { CustomizationsSettings } from './themes/CustomizationsSettings';
 
 const CODEX_BROWSER_EXTENSION_URL =
   'https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg';
@@ -138,6 +139,11 @@ export type SettingsPageProps = {
   setSettingsTab: React.Dispatch<React.SetStateAction<SettingsTab>>;
   /** Opens a skill's folder in the Code tab with its SKILL.md active. */
   handleOpenSkillInEditor: (skill: { path: string; skillFile?: string; name: string }) => void;
+  /** Customizations: a new thread with this prompt in its composer. */
+  handleCustomizeWithAgent?: (prompt: string) => void;
+  /** Customizations: open the thread a theme was made in. */
+  handleOpenThreadFromSettings?: (threadId: string) => void;
+  hasThread?: (threadId: string) => boolean;
   authenticatingProviderId: string | null;
   accountState: OrionAccountState;
   accountLoading: boolean;
@@ -224,6 +230,9 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     settingsTab,
     setSettingsTab,
     handleOpenSkillInEditor,
+    handleCustomizeWithAgent,
+    handleOpenThreadFromSettings,
+    hasThread,
     authenticatingProviderId,
     accountState,
     accountLoading,
@@ -377,7 +386,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             { id: 'devices', label: 'Devices', Icon: Smartphone },
             { id: 'dev-servers', label: 'Dev Servers', Icon: Server },
             { id: 'workspaces', label: 'Workspaces', Icon: FolderGit2 },
-            { id: 'cosmetics', label: 'Cosmetics', Icon: Palette },
+            { id: 'cosmetics', label: 'Customizations', Icon: Palette },
             { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
           ].map(({ id, label, Icon }) => (
             <button
@@ -413,7 +422,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'devices' && 'DEVICES'}
           {settingsTab === 'dev-servers' && 'DEV SERVERS'}
           {settingsTab === 'workspaces' && 'WORKSPACES'}
-          {settingsTab === 'cosmetics' && 'COSMETICS'}
+          {settingsTab === 'cosmetics' && 'CUSTOMIZATIONS'}
           {settingsTab === 'experimental' && 'EXPERIMENTAL'}
         </div>
 
@@ -1748,7 +1757,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
 
           {settingsTab === 'cosmetics' && (
             <>
-              <div className="settings-group-label">Appearance</div>
+              <CustomizationsSettings
+                onCustomizeWithAgent={handleCustomizeWithAgent}
+                onOpenThread={handleOpenThreadFromSettings}
+                hasThread={hasThread}
+              />
+              <div className="settings-group-label">Text</div>
               <div className="settings-group">
                 <TextSizeSetting />
               </div>
