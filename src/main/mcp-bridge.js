@@ -32,6 +32,7 @@ import {
 import {
   isMcpBridgeProvider,
   probeProviderRunPluginSupport,
+  providerDefersMcpToolsNatively,
 } from './thread-reader-routing.js';
 
 export let legacyMcpCleanupPromise = Promise.resolve();
@@ -474,7 +475,21 @@ export const registerMcpBridgeForRun = async ({
     // --devices: the shim lists the device_* tools (the user let agents use
     // simulators). The tools re-check the setting on every call.
     const devicesEnabled = agentDeviceAccessAllowed(await readDeviceSettings());
-    const args = [shimPath, '--socket', socketPath, '--token', token, ...(devicesEnabled ? ['--devices'] : [])];
+    // --compact-tools: the provider would put every tool's full definition
+    // in each request, so the shim lists summaries and load_tools serves the
+    // rest. Providers that defer MCP tools themselves get the full list.
+    const args = [
+      shimPath,
+      '--socket',
+      socketPath,
+      '--token',
+      token,
+      ...(devicesEnabled ? ['--devices'] : []),
+      ...(providerDefersMcpToolsNatively(providerId) ? [] : ['--compact-tools']),
+      // Codex lists the server as a deferred namespace: give it a one-line
+      // description of what the tools are for.
+      ...(providerId === 'codex' ? ['--instructions'] : []),
+    ];
     // The run's MCP servers stay out of the provider's config: the bridge
     // connects them only when the agent loads them (mcp-on-demand.js).
     const { pluginDir, tokenRoot } = await writeMcpBridgePlugin({

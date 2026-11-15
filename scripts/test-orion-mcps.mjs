@@ -766,8 +766,26 @@ await server.connect(new StdioServerTransport());
     try {
       const session = (await import('../src/main/mcp-bridge.js')).mcpBridgeSessions.get(quiet.token);
       assert.deepEqual(session.onDemandMcps.names(), [], 'no servers: no load_tools');
+      // Kimi sends every listed tool's definition with each request: the
+      // shim lists summaries (mcp-bridge-shim.cjs --compact-tools).
+      assert.ok(quiet.args.includes('--compact-tools'));
+      assert.ok(!quiet.args.includes('--instructions'));
     } finally {
       quiet.release();
+    }
+    // Codex, Grok and Cursor defer MCP tools themselves: the full list. Codex
+    // also gets the server's one-line description for its namespace line.
+    for (const providerId of ['codex', 'grok', 'cursor']) {
+      const native = await registerMcpBridgeForRun({
+        getSender: () => null, threadId: `native-${providerId}`, runId: `native-${providerId}`, projectPath: testRoot,
+        providerId, accessMode: 'full-access', userServers: [],
+      });
+      try {
+        assert.ok(!native.args.includes('--compact-tools'), providerId);
+        assert.equal(native.args.includes('--instructions'), providerId === 'codex', providerId);
+      } finally {
+        native.release();
+      }
     }
   }
 

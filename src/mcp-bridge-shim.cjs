@@ -17,6 +17,13 @@
 //
 // Identity travels out-of-band through --socket/--token argv in the per-run
 // MCP configuration. Environment fallbacks are retained for compatibility.
+//
+// --compact-tools (providers whose CLI puts every listed tool's full
+// definition in each request: Kimi, OpenCode, Muse, fx) lists each tool with
+// a one-line summary and a schema of argument names and types only, plus
+// `load_tools`, which returns full descriptions and schemas on demand, as
+// Claude's deferred tools do. Codex, Grok and Cursor defer MCP tools
+// themselves, so they get the full list (thread-reader-routing.js).
 'use strict';
 const net = require('net');
 
@@ -29,6 +36,12 @@ const socketPath = argValue('--socket') || process.env.ORION_MCP_SOCKET || '';
 const token = argValue('--token') || process.env.ORION_MCP_TOKEN || '';
 // The user let agents use simulators (Settings → Devices); lists device_*.
 const devicesEnabled = argv.includes('--devices');
+// List summaries; full definitions load through load_tools (see above).
+const compactTools = argv.includes('--compact-tools');
+// Send a one-line server description (MCP `instructions`): Codex shows it
+// next to the deferred `mcp__orion` namespace. Not for every provider: fx
+// appends it to each tool's description.
+const describeServer = argv.includes('--instructions');
 
 const spawnSubagentTool = {
   name: 'spawn_subagent',
@@ -510,6 +523,282 @@ const loadExtraTools = async () => {
   return extraTools;
 };
 
+// ----- Compact listing (--compact-tools) -----------------------------------
+const LOAD_TOOLS = 'load_tools';
+const CALL_APP_TOOL = 'call_app_tool';
+// The loaders are short and lead to everything else: always listed in full.
+const FULL_IN_COMPACT = new Set([LOAD_TOOLS, CALL_APP_TOOL]);
+const SUMMARY_MAX_CHARS = 120;
+// Tools whose full definition this run has been given (load_tools, or a
+// call refused for its arguments).
+const loadedTools = new Set();
+
+// The description's first sentence, cut to SUMMARY_MAX_CHARS.
+const summarize = (description) => {
+  const text = String(description || '').replace(/\s+/g, ' ').trim();
+  const sentence = text.match(/^.+?[.!?](?=\s+[A-Z]|$)/)?.[0] ?? text;
+  if (sentence.length <= SUMMARY_MAX_CHARS) return sentence;
+  const cut = sentence.slice(0, SUMMARY_MAX_CHARS - 1);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > SUMMARY_MAX_CHARS / 2 ? cut.slice(0, space) : cut).replace(/[\s,;:(—-]+$/, '')}…`;
+};
+
+// Argument names and types only: no descriptions, enums or nested shapes,
+// nothing required, extra keys allowed. Permissive, so a client that checks
+// calls against the listed schema never rejects a call the full schema
+// allows. The names stay: OpenCode presents an object schema without
+// properties as taking no arguments.
+const compactProperty = (schema) => {
+  const out = {};
+  if (!schema || typeof schema !== 'object') return out;
+  if (typeof schema.type === 'string') out.type = schema.type;
+  if (out.type === 'array') {
+    out.items = schema.items && typeof schema.items.type === 'string' ? { type: schema.items.type } : {};
+  }
+  return out;
+};
+const compactSchema = (schema) => {
+  const properties = schema && schema.properties && typeof schema.properties === 'object' ? schema.properties : {};
+  return {
+    type: 'object',
+    properties: Object.fromEntries(Object.entries(properties).map(([key, value]) => [key, compactProperty(value)])),
+  };
+};
+
+const fullDefinition = (tool) => ({
+  name: tool.name,
+  description: tool.description ?? '',
+  inputSchema: tool.inputSchema ?? { type: 'object' },
+});
+
+const loadToolsTool = (appLoader) => ({
+  name: LOAD_TOOLS,
+  description:
+    'Load the full description and input schema of Durango Code tools. This server lists its tools with a one-line summary only: load a tool with `tools` before you first call it, then call it by its name.' +
+    (appLoader?.description ? ` With \`apps\`: ${appLoader.description}` : ''),
+  inputSchema: {
+    type: 'object',
+    properties: {
+      tools: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Names of the Durango Code tools to load, e.g. ["spawn_subagent"]. Omit tools and apps to list what you can load.',
+      },
+      ...(appLoader?.inputSchema?.properties?.apps ? { apps: appLoader.inputSchema.properties.apps } : {}),
+    },
+  },
+  annotations: { readOnlyHint: true },
+});
+
+const listedTools = (all) => {
+  if (!compactTools) return all;
+  const listed = [loadToolsTool(all.find((tool) => tool.name === LOAD_TOOLS))];
+  for (const tool of all) {
+    if (tool.name === LOAD_TOOLS) continue;
+    if (FULL_IN_COMPACT.has(tool.name)) {
+      listed.push(tool);
+      continue;
+    }
+    listed.push({
+      name: tool.name,
+      description: summarize(tool.description),
+      inputSchema: compactSchema(tool.inputSchema),
+      ...(tool.annotations ? { annotations: tool.annotations } : {}),
+    });
+  }
+  return listed;
+};
+
+const typeMatches = (type, value) => {
+  switch (type) {
+    case 'string':
+      return typeof value === 'string';
+    case 'integer':
+      return Number.isInteger(value);
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'array':
+      return Array.isArray(value);
+    case 'object':
+      return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+    case 'null':
+      return value === null;
+    default:
+      return true;
+  }
+};
+
+const MAX_PROBLEMS = 8;
+const pathOf = (parent, key) => (typeof key === 'number' ? `${parent}[${key}]` : parent ? `${parent}.${key}` : key);
+const isRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+// Checks `value` against `schema` (the JSON Schema subset the orion tools
+// use: type, enum, const, properties, required, additionalProperties, items,
+// minItems/maxItems, minLength/maxLength, minimum/maximum and their exclusive
+// forms, anyOf/oneOf). Unknown keywords pass. `optional` marks a value that
+// is an optional property: null is let through there, because several tools
+// take null as "reset/remove" without declaring it (set_app_theme's
+// surface_opacity); the tool itself decides what null means.
+const checkValue = (schema, value, at, problems, { optional = false } = {}) => {
+  if (problems.length >= MAX_PROBLEMS || !isRecord(schema)) return;
+  if (value === null && optional) return;
+  const label = at || 'arguments';
+  for (const union of ['anyOf', 'oneOf']) {
+    if (!Array.isArray(schema[union]) || schema[union].length === 0) continue;
+    const fits = schema[union].some((branch) => {
+      const branchProblems = [];
+      checkValue(branch, value, at, branchProblems);
+      return branchProblems.length === 0;
+    });
+    if (!fits) {
+      problems.push(`\`${label}\` does not match any allowed shape`);
+      return;
+    }
+  }
+  const types = Array.isArray(schema.type) ? schema.type : typeof schema.type === 'string' ? [schema.type] : [];
+  if (types.length > 0 && !types.some((type) => typeMatches(type, value))) {
+    problems.push(`\`${label}\` must be ${types.join(' or ')}`);
+    return;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((option) => option === value)) {
+    problems.push(`\`${label}\` must be one of ${schema.enum.map((option) => JSON.stringify(option)).join(', ')}`);
+    return;
+  }
+  if (schema.const !== undefined && schema.const !== value) {
+    problems.push(`\`${label}\` must be ${JSON.stringify(schema.const)}`);
+    return;
+  }
+  if (typeof value === 'number') {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) problems.push(`\`${label}\` must be at least ${schema.minimum}`);
+    if (typeof schema.maximum === 'number' && value > schema.maximum) problems.push(`\`${label}\` must be at most ${schema.maximum}`);
+    if (typeof schema.exclusiveMinimum === 'number' && value <= schema.exclusiveMinimum) problems.push(`\`${label}\` must be more than ${schema.exclusiveMinimum}`);
+    if (typeof schema.exclusiveMaximum === 'number' && value >= schema.exclusiveMaximum) problems.push(`\`${label}\` must be less than ${schema.exclusiveMaximum}`);
+  }
+  if (typeof value === 'string') {
+    if (typeof schema.minLength === 'number' && value.length < schema.minLength) problems.push(`\`${label}\` must be at least ${schema.minLength} characters`);
+    if (typeof schema.maxLength === 'number' && value.length > schema.maxLength) problems.push(`\`${label}\` must be at most ${schema.maxLength} characters`);
+  }
+  if (Array.isArray(value)) {
+    if (typeof schema.minItems === 'number' && value.length < schema.minItems) problems.push(`\`${label}\` needs at least ${schema.minItems} items`);
+    if (typeof schema.maxItems === 'number' && value.length > schema.maxItems) problems.push(`\`${label}\` takes at most ${schema.maxItems} items`);
+    if (isRecord(schema.items)) value.forEach((item, index) => checkValue(schema.items, item, pathOf(at, index), problems));
+  }
+  if (isRecord(value)) {
+    const properties = isRecord(schema.properties) ? schema.properties : {};
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    for (const key of required) {
+      if (value[key] === undefined) problems.push(`\`${pathOf(at, key)}\` is required`);
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (item === undefined) continue;
+      if (Object.prototype.hasOwnProperty.call(properties, key)) {
+        checkValue(properties[key], item, pathOf(at, key), problems, { optional: !required.includes(key) });
+      } else if (schema.additionalProperties === false) {
+        problems.push(`\`${pathOf(at, key)}\` is not an argument`);
+      } else if (isRecord(schema.additionalProperties)) {
+        checkValue(schema.additionalProperties, item, pathOf(at, key), problems);
+      }
+    }
+  }
+};
+
+// Checked against the full schema before dispatch, so a call guessed from a
+// summary gets the real definition back instead of running with arguments
+// the tool would misread (a modifier it doesn't know, a nested theme value
+// out of range). Arguments are forwarded unchanged; the tool still
+// validates them itself.
+const argumentProblems = (schema, args) => {
+  const problems = [];
+  checkValue(isRecord(schema) ? schema : { type: 'object' }, args, '', problems);
+  return problems.slice(0, MAX_PROBLEMS);
+};
+
+// Models may pass the qualified names their client shows.
+const bareToolName = (value) =>
+  String(value ?? '')
+    .trim()
+    .replace(/^(mcp__orion__|mcp_orion_|orion__|orion\.)/, '');
+
+const asNameList = (value) => (Array.isArray(value) ? value : typeof value === 'string' ? [value] : []);
+
+const runLoadTools = async (args, all) => {
+  const loadable = new Map(all.filter((tool) => !FULL_IN_COMPACT.has(tool.name)).map((tool) => [tool.name, tool]));
+  const hasApps = all.some((tool) => tool.name === LOAD_TOOLS);
+  const requestedApps = asNameList(args.apps).map((name) => String(name ?? '').trim()).filter(Boolean);
+  // A Durango Code tool passed as an app is loaded as a tool.
+  const apps = requestedApps.filter((name) => !loadable.has(bareToolName(name)));
+  const names = [
+    ...new Set(
+      [...asNameList(args.tools), ...requestedApps.filter((name) => loadable.has(bareToolName(name)))]
+        .map(bareToolName)
+        .filter(Boolean)
+    ),
+  ];
+  if (names.length === 0 && apps.length === 0) {
+    const lines = [`Durango Code tools you can load: ${[...loadable.keys()].join(', ') || 'none'}.`];
+    if (hasApps) {
+      const listing = await callOrion(LOAD_TOOLS, {});
+      if (listing.ok && listing.text) lines.push(listing.text);
+    }
+    return { ok: true, text: lines.join('\n') };
+  }
+  const sections = [];
+  let ok = false;
+  if (names.length > 0) {
+    const found = names.filter((name) => loadable.has(name));
+    const notFound = names.filter((name) => !loadable.has(name));
+    for (const name of found) loadedTools.add(name);
+    ok = found.length > 0;
+    sections.push(
+      JSON.stringify(
+        {
+          tools: found.map((name) => fullDefinition(loadable.get(name))),
+          ...(notFound.length > 0 ? { notFound, available: [...loadable.keys()] } : {}),
+          note:
+            found.length > 0
+              ? 'Call these tools directly by name, with arguments matching their input schema.'
+              : `No tools loaded.${hasApps ? ' For an app the user connected, pass it in `apps`.' : ''}`,
+        },
+        null,
+        2
+      )
+    );
+  }
+  if (apps.length > 0) {
+    const result = await callOrion(LOAD_TOOLS, { apps });
+    ok = ok || result.ok;
+    sections.push(result.text);
+  }
+  return { ok, text: sections.join('\n\n') };
+};
+
+// One line on what this server is for (--instructions): Codex shows it (up
+// to 250 characters) next to the deferred `mcp__orion` namespace, whose
+// tools it does not list.
+const TOOL_AREAS = [
+  [/^spawn_subagent$/, 'subagents on other models'],
+  [/^read_thread$/, 'other threads'],
+  [/^(search_chats|read_chat)$/, 'Durango Chat'],
+  [/^(recall_memory|remember)$/, 'user memory'],
+  [/^(request|resolve)_user_action$/, 'user actions'],
+  [/^request_secret$/, 'secrets'],
+  [/^show_html$/, 'HTML visuals'],
+  [/^browser_/, 'built-in browser'],
+  [/^device_/, 'simulators'],
+  [/^machine_/, 'other machines'],
+  [/_app_theme$|^generate_theme_media$/, 'app theme'],
+  [/^load_tools$/, 'connected apps'],
+];
+const serverInstructions = (all) => {
+  const areas = [];
+  for (const [pattern, area] of TOOL_AREAS) {
+    if (!areas.includes(area) && all.some((tool) => pattern.test(tool.name))) areas.push(area);
+  }
+  return `Durango Code, the app running you: ${areas.join(', ')}.`;
+};
+
 const handleMessage = async (message) => {
   const method = message.method;
   if (method === 'initialize') {
@@ -518,22 +807,53 @@ const handleMessage = async (message) => {
       protocolVersion: typeof requested === 'string' && requested ? requested : '2024-11-05',
       capabilities: { tools: {} },
       serverInfo: { name: 'orion', version: '1.0.0' },
+      ...(describeServer ? { instructions: serverInstructions([...tools, ...(await loadExtraTools())]) } : {}),
     });
     return;
   }
   if (typeof method === 'string' && method.startsWith('notifications/')) return;
   if (method === 'tools/list') {
-    respond(message.id, { tools: [...tools, ...(await loadExtraTools())] });
+    respond(message.id, { tools: listedTools([...tools, ...(await loadExtraTools())]) });
     return;
   }
   if (method === 'tools/call') {
     const name = message.params?.name;
-    if (!toolNames.has(name) && !(await loadExtraTools()).some((tool) => tool.name === name)) {
+    const rawArgs = message.params?.arguments;
+    const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
+    const all = [...tools, ...(await loadExtraTools())];
+    if (compactTools && name === LOAD_TOOLS) {
+      const result = await runLoadTools(Array.isArray(args) ? {} : args, all);
+      respond(message.id, { content: [{ type: 'text', text: result.text }], isError: !result.ok });
+      return;
+    }
+    const tool = all.find((candidate) => candidate.name === name);
+    if (!tool) {
       respondError(message.id, -32602, `Unknown tool: ${name}`);
       return;
     }
-    const rawArgs = message.params?.arguments;
-    const result = await callOrion(name, rawArgs && typeof rawArgs === 'object' ? rawArgs : {});
+    if (compactTools && !FULL_IN_COMPACT.has(name)) {
+      const problems = argumentProblems(tool.inputSchema, args);
+      if (problems.length > 0) {
+        // The first time, hand over the definition the summary left out.
+        const firstSight = !loadedTools.has(name);
+        loadedTools.add(name);
+        respond(message.id, {
+          content: [
+            {
+              type: 'text',
+              text:
+                `${name} did not run: ${problems.join('; ')}.` +
+                (firstSight
+                  ? ` Its full definition (the tool list shows a summary only):\n\n${JSON.stringify(fullDefinition(tool), null, 2)}`
+                  : ''),
+            },
+          ],
+          isError: true,
+        });
+        return;
+      }
+    }
+    const result = await callOrion(name, args);
     respond(message.id, {
       content: result.content ?? [{ type: 'text', text: result.text }],
       isError: !result.ok,

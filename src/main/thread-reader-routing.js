@@ -1,5 +1,16 @@
 const mcpBridgeProviderIds = new Set(['codex', 'cursor', 'grok', 'kimi', 'fx', 'muse', 'opencode']);
 
+// Bridge providers whose CLI keeps MCP tool definitions out of the model's
+// context until the agent looks a tool up, as Claude's deferred tools do:
+// Codex (0.169: deferred `mcp__orion` namespace, searched from code mode),
+// Grok (search_tool / use_tool) and Cursor (MCP meta tool with slim
+// descriptors). The others (Kimi, OpenCode, Muse, fx) send every listed
+// tool's full definition with each request, so their bridge shim lists
+// one-line summaries and serves full definitions through load_tools
+// (--compact-tools in mcp-bridge-shim.cjs).
+const nativeDeferredMcpProviderIds = new Set(['codex', 'grok', 'cursor']);
+export const providerDefersMcpToolsNatively = (providerId) => nativeDeferredMcpProviderIds.has(providerId);
+
 // Tools served by Durango Code's own `orion` MCP server (in-process for
 // Claude, the bridge shim for everyone else).
 export const ORION_BUILTIN_TOOL_NAMES = Object.freeze([
@@ -73,10 +84,16 @@ export const ORION_MACHINE_TOOL_NAMES = Object.freeze([
 export const orionMachineToolNamesForAccessMode = (accessMode) =>
   accessMode === 'full-access' ? ORION_MACHINE_TOOL_NAMES : ORION_MACHINE_READ_TOOL_NAMES;
 
+// load_tools (mcp-on-demand.js, mcp-bridge-shim.cjs) only returns tool
+// definitions and connects servers the user set up; their tools keep their
+// own approval. Claude pre-approves it in every mode too.
+export const ORION_LOADER_TOOL_NAME = 'load_tools';
+
 /** `name` is the unqualified orion tool name (e.g. `read_chat`). */
 export const isPreapprovedOrionTool = (name, accessMode) =>
   typeof name === 'string' &&
-  (orionBuiltinToolNamesForAccessMode(accessMode).includes(name) ||
+  (name === ORION_LOADER_TOOL_NAME ||
+    orionBuiltinToolNamesForAccessMode(accessMode).includes(name) ||
     (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))) ||
     orionDeviceToolNamesForAccessMode(accessMode).includes(name) ||
     orionMachineToolNamesForAccessMode(accessMode).includes(name) ||
