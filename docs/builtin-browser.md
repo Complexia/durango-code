@@ -149,6 +149,22 @@ The user's logins live in their Chrome, never in the built-in browser
   browsing data before the first tab does not turn the question off. Downloads are never opened. `browser_status` and the
   result of the action that started it tell the agent what happened.
 - Limits: 6 tabs per owner, 20 in all. A deleted thread's tabs close.
+- Wake and sleep: tabs are created with `backgroundThrottling: false` so a
+  hidden agent tab paints, runs timers and can be captured. 10 s after its last
+  use (`TAB_AWAKE_IDLE_MS`) a tab goes back to Chromium's normal background
+  throttling and drops CDP focus emulation, which on its own keeps a hidden
+  page rendering. Both are needed: re-enabling throttling alone leaves a hidden
+  focus-emulated tab running its timers at full rate. Every agent tool call
+  (reads included) and every corner-preview `thumbnail` wakes the tab first
+  (`wakeTab`). A visible tab is never throttled by Chromium either way.
+- Idle close: an agent tab nobody has used for 15 minutes
+  (`AGENT_TAB_IDLE_CLOSE_MS`) closes by itself, for agents that forget
+  `browser_close` or die while their thread still looks busy (a finished
+  thread's tabs already close 15 s after it stops). Tabs the person opened or
+  adopted, is driving, has on screen, or that hold a download question or a
+  transfer still in progress stay
+  and are checked again a period later. A later call naming the closed tab
+  says why. `browser_open` reminds the agent to close the new tab.
 
 ## Tests
 

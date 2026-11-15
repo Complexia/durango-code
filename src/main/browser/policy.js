@@ -11,6 +11,12 @@ export const USER_OWNER = 'user';
 // Real input from the person in a guest page counts as them driving it for
 // this long, so an agent action does not land in the middle of their typing.
 export const HUMAN_INPUT_GRACE_MS = 750;
+// Agent tabs nobody has used for this long close by themselves, for when an
+// agent forgets browser_close or its run dies while the thread still looks
+// busy (a finished thread's tabs already close; see closeThreadTabs). Tabs
+// the person opened, is driving, is looking at, or that hold a download
+// question stay.
+export const AGENT_TAB_IDLE_CLOSE_MS = 15 * 60_000;
 
 const isInside = (child, parent) => {
   const relative = path.relative(parent, child);

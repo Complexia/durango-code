@@ -12,6 +12,7 @@ import path from 'node:path';
 import { createCdp } from './cdp.js';
 import { routeGuestDialogs } from './guest-dialogs.js';
 import {
+  AGENT_TAB_IDLE_CLOSE_MS,
   HUMAN_INPUT_GRACE_MS,
   USER_OWNER,
   checkBrowserUrl,
@@ -36,6 +37,17 @@ import { answerTabDialog, describeNavigation, navigationTimeout, settlePendingPr
 
 const HIDDEN_BOUNDS = { x: 0, y: 0, width: 1280, height: 800 };
 const STATE_DEBOUNCE_MS = 40;
+// Tabs are created unthrottled so a hidden agent tab paints, runs its timers
+// and can be captured. Once nothing has used a tab for this long it goes back
+// to Chromium's normal background throttling (and focus emulation is
+// released), so pages nobody watches stop costing CPU: an awake hidden tab
+// keeps running timers at full rate and plays its videos. Any agent action or
+// corner-preview capture wakes it again first.
+export const TAB_AWAKE_IDLE_MS = 10_000;
+// A tab the corner preview captured this recently is on screen there (it
+// refreshes every 1-4 s while shown).
+export const PREVIEW_SEEN_MS = 10_000;
+
 const SCREENSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 // loadURL options for a popup Electron could not create itself: its form POST
@@ -51,8 +63,16 @@ const loadOptionsFor = ({ postBody, referrer }) => {
   return options;
 };
 
-export const createBrowserManager = ({ getWindow, emit }) => {
+export const createBrowserManager = ({
+  getWindow,
+  emit,
+  awakeIdleMs = TAB_AWAKE_IDLE_MS,
+  idleCloseMs = AGENT_TAB_IDLE_CLOSE_MS,
+  previewSeenMs = PREVIEW_SEEN_MS,
+}) => {
   const tabs = new Map(); // id -> tab
+  // Agent tabs closed for sitting unused, so a later call naming one says why.
+  const idleClosedTabIds = new Set();
   const lastTabByOwner = new Map(); // ownerKey -> tab id
   let parents = new Map(); // thread -> parent thread (spawn_subagent children)
   let nextTabNumber = 1;
@@ -156,8 +176,11 @@ export const createBrowserManager = ({ getWindow, emit }) => {
       // Like Chrome asking where to save: the file downloads to a holding
       // path while the user decides in the panel, and moves into place on
       // Save (Settings → Browser use → Ask before downloading files).
-      if (!downloadOptions.askBeforeDownload) return null;
       const owner = [...tabs.values()].find((candidate) => candidate.view.webContents === webContents);
+      // Every transfer, asked about or not, keeps its tab from idle-closing
+      // until it is done, so its result still reaches lastDownload.
+      owner?.activeDownloads.add(item);
+      if (!downloadOptions.askBeforeDownload) return null;
       if (!owner) return null;
       if (owner.pendingDownload) {
         // One question at a time per tab: a second download while one waits is dropped.
@@ -184,6 +207,7 @@ export const createBrowserManager = ({ getWindow, emit }) => {
     },
     onDownload: ({ item, webContents, savePath, state: downloadState }) => {
       const owner = [...tabs.values()].find((candidate) => candidate.view.webContents === webContents);
+      owner?.activeDownloads.delete(item);
       const pending = owner?.pendingDownload?.item === item ? owner.pendingDownload : null;
       if (pending) {
         pending.finished = downloadState;
@@ -239,6 +263,17 @@ export const createBrowserManager = ({ getWindow, emit }) => {
       pendingPress: null,
       crashed: false,
       agentBusy: 0,
+      // Wake/sleep (see TAB_AWAKE_IDLE_MS): open uses, whether background
+      // throttling is back on, whether CDP focus emulation is on.
+      awakeUses: 0,
+      asleep: false,
+      focusEmulated: false,
+      sleepTimer: null,
+      idleCloseTimer: null,
+      // Last corner-preview capture: the person can see the tab there.
+      previewedAt: 0,
+      // Downloads still transferring (DownloadItems).
+      activeDownloads: new Set(),
       humanInputUntil: 0,
       lastAgentActionAt: 0,
       lastUsedAt: Date.now(),
@@ -359,8 +394,88 @@ export const createBrowserManager = ({ getWindow, emit }) => {
     void tab.cdp.attach().catch(() => {});
     tabs.set(id, tab);
     attachToWindow(tab);
+    scheduleSleep(tab);
+    scheduleIdleClose(tab);
     scheduleState();
     return tab;
+  };
+
+  // ---- Wake / sleep / idle close ------------------------------------------------------
+
+  const setFocusEmulation = async (tab, enabled) => {
+    tab.focusEmulated = enabled;
+    await tab.cdp.send('Emulation.setFocusEmulationEnabled', { enabled }).catch(() => {});
+  };
+
+  const sleepTab = (tab) => {
+    tab.sleepTimer = null;
+    if (!tabs.has(tab.id) || tab.awakeUses > 0 || tab.asleep) return;
+    const wc = tab.view.webContents;
+    if (wc.isDestroyed()) return;
+    try {
+      wc.setBackgroundThrottling(true);
+    } catch {}
+    tab.asleep = true;
+    // Focus emulation also keeps a hidden page rendering on its own.
+    if (tab.focusEmulated) void setFocusEmulation(tab, false);
+  };
+
+  const scheduleSleep = (tab) => {
+    if (tab.sleepTimer) clearTimeout(tab.sleepTimer);
+    tab.sleepTimer = setTimeout(() => sleepTab(tab), awakeIdleMs);
+  };
+
+  /**
+   * Holds a tab awake for one use: unthrottled again, and (`focus`) with focus
+   * emulation back on, as an agent-driven tab had it. Returns the release.
+   */
+  const wakeTab = async (tab, { focus = false } = {}) => {
+    tab.awakeUses += 1;
+    if (tab.sleepTimer) {
+      clearTimeout(tab.sleepTimer);
+      tab.sleepTimer = null;
+    }
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      tab.awakeUses = Math.max(0, tab.awakeUses - 1);
+      if (tab.awakeUses === 0 && tabs.has(tab.id)) scheduleSleep(tab);
+    };
+    const wc = tab.view.webContents;
+    if (!wc.isDestroyed() && tab.asleep) {
+      try {
+        wc.setBackgroundThrottling(false);
+      } catch {}
+      tab.asleep = false;
+    }
+    if (focus && !tab.focusEmulated && tab.controller !== 'user') await setFocusEmulation(tab, true);
+    return release;
+  };
+
+  const idleCloseExempt = (tab) =>
+    tab.ownerKey === USER_OWNER ||
+    tab.openedBy === 'user' ||
+    tab.controller === 'user' ||
+    tab.visible ||
+    Date.now() - tab.previewedAt < previewSeenMs ||
+    Boolean(tab.pendingDownload) ||
+    tab.activeDownloads.size > 0 ||
+    tab.awakeUses > 0;
+
+  const scheduleIdleClose = (tab) => {
+    if (tab.idleCloseTimer) clearTimeout(tab.idleCloseTimer);
+    tab.idleCloseTimer = setTimeout(() => {
+      tab.idleCloseTimer = null;
+      if (!tabs.has(tab.id)) return;
+      // Looked at, driven or waiting on the person: check again a period later.
+      if (idleCloseExempt(tab)) {
+        scheduleIdleClose(tab);
+        return;
+      }
+      idleClosedTabIds.add(tab.id);
+      closeTab(tab);
+    }, idleCloseMs);
   };
 
   const loadUrl = async (tab, rawUrl, { waitUntil = 'load', timeoutMs, postBody = null, referrer = null } = {}) => {
@@ -412,6 +527,10 @@ export const createBrowserManager = ({ getWindow, emit }) => {
   const closeTab = (tab) => {
     dropPendingDownload(tab);
     tabs.delete(tab.id);
+    if (tab.sleepTimer) clearTimeout(tab.sleepTimer);
+    if (tab.idleCloseTimer) clearTimeout(tab.idleCloseTimer);
+    tab.sleepTimer = null;
+    tab.idleCloseTimer = null;
     // Settle held dialogs so no renderer stays blocked on them.
     tab.guestDialogs.cancelAll();
     tab.pendingPress = null;
@@ -434,7 +553,15 @@ export const createBrowserManager = ({ getWindow, emit }) => {
   const resolveTabForCaller = (tabArg, caller, { mutating }) => {
     if (tabArg !== undefined && tabArg !== null && String(tabArg).trim() !== '') {
       const tab = findTab(tabArg);
-      if (!tab) throw new Error(`There is no tab ${tabArg}. browser_status lists the tabs you can use.`);
+      if (!tab) {
+        const id = String(tabArg).trim();
+        if (idleClosedTabIds.has(id) || idleClosedTabIds.has(`t${id}`)) {
+          throw new Error(
+            `Tab ${tabArg} was closed after ${Math.round(idleCloseMs / 60_000)} minutes without use. Open the page again with browser_open.`
+          );
+        }
+        throw new Error(`There is no tab ${tabArg}. browser_status lists the tabs you can use.`);
+      }
       const access = checkTabAccess(tab, caller, { mutating, parents });
       if (!access.ok) throw new Error(access.reason);
       return tab;
@@ -492,23 +619,31 @@ export const createBrowserManager = ({ getWindow, emit }) => {
         throw new Error(`Tab ${tab.id} had crashed; it is reloading. Try again after browser_wait_for or browser_snapshot.`);
       }
       touch(tab, caller);
-      if (mutating) {
-        tab.agentBusy += 1;
-        tab.lastAgentActionAt = Date.now();
-        scheduleState();
-        try {
-          await tab.cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
-          checkAccess();
-          // A press still held from a click whose mousedown opened a dialog
-          // is let go before this action sends anything.
-          await settlePendingPress(tab);
-          return await fn(tab);
-        } finally {
-          tab.agentBusy -= 1;
+      // Every agent use, reads included, runs on an awake tab and restarts
+      // its idle-close clock.
+      const release = await wakeTab(tab, { focus: true });
+      try {
+        if (mutating) {
+          tab.agentBusy += 1;
+          tab.lastAgentActionAt = Date.now();
           scheduleState();
+          try {
+            if (tab.controller !== 'user') await setFocusEmulation(tab, true);
+            checkAccess();
+            // A press still held from a click whose mousedown opened a dialog
+            // is let go before this action sends anything.
+            await settlePendingPress(tab);
+            return await fn(tab);
+          } finally {
+            tab.agentBusy -= 1;
+            scheduleState();
+          }
         }
+        return await fn(tab);
+      } finally {
+        release();
+        if (tabs.has(tab.id)) scheduleIdleClose(tab);
       }
-      return fn(tab);
     };
     const result = tab.queue.then(job, job);
     tab.queue = result.catch(() => {});
@@ -644,7 +779,16 @@ export const createBrowserManager = ({ getWindow, emit }) => {
     thumbnail: async ({ tabId, width }) => {
       const tab = findTab(tabId);
       if (!tab || tab.crashed) return { ok: false };
-      let image = await tab.view.webContents.capturePage(undefined, { stayHidden: true });
+      // The preview is on screen, so the tab it shows stays awake while it
+      // refreshes (every few seconds); it sleeps again once the preview goes.
+      tab.previewedAt = Date.now();
+      const release = await wakeTab(tab);
+      let image;
+      try {
+        image = await tab.view.webContents.capturePage(undefined, { stayHidden: true });
+      } finally {
+        release();
+      }
       if (image.isEmpty()) return { ok: false };
       const target = Math.max(120, Math.min(Math.round(Number(width) || 640), 960));
       if (image.getSize().width > target) image = image.resize({ width: target, quality: 'good' });
@@ -659,7 +803,7 @@ export const createBrowserManager = ({ getWindow, emit }) => {
       const tab = findTab(tabId);
       if (!tab) return { ok: false };
       tab.controller = 'user';
-      void tab.cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }).catch(() => {});
+      void setFocusEmulation(tab, false);
       scheduleState();
       return { ok: true };
     },

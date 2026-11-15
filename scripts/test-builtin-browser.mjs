@@ -378,6 +378,8 @@ try {
       <div style="position:relative;height:40px"><button id="hidden-btn">Under</button><div style="position:absolute;inset:0;background:red">cover</div></div>
       <script>document.getElementById('plan').addEventListener('change', (e) => document.getElementById('status').textContent = 'plan:' + e.target.value)</script>`,
     '/two': '<!doctype html><title>Page two</title><h1>Second page</h1>',
+    // Counts 10ms timer ticks: full rate while a hidden tab is awake, ~1/s once it sleeps.
+    '/ticker': '<!doctype html><title>Ticker</title><script>window.ticks = 0; setInterval(() => { ticks += 1; }, 10);</script>',
     // Two frames in different renderer processes with a confirm() each: #fa on
     // the other origin (localhost, an out-of-process frame) and #fb on this one.
     '/frames': `<!doctype html><title>Frames</title>
@@ -413,6 +415,14 @@ try {
         response.writeHead(200, { 'content-type': 'text/html' });
         response.end(`<!doctype html><title>Echo ${body}</title><h1>Posted</h1>`);
       });
+      return;
+    }
+    if (new URL(request.url, 'http://x').pathname === '/slow.bin') {
+      // A download that takes ~4 s: longer than the idle-close test's period.
+      // The first KB lets Chromium decide it is a download before the rest arrives.
+      response.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="slow.bin"', 'content-length': '2048' });
+      response.write(Buffer.alloc(1024, 1));
+      setTimeout(() => response.end(Buffer.alloc(1024, 2)), 4000);
       return;
     }
     if (new URL(request.url, 'http://x').pathname === '/report.txt') {
@@ -998,6 +1008,94 @@ try {
       assert.equal(manager.tabs.size, count, 'a blocked popup opens no tab');
       assert.match(manager.findTab(openerId).lastBlocked ?? '', /Top-level data: URLs are blocked/);
       manager.userActions.closeThreadTabs({ threadId: 'thread-d' });
+    }
+
+    // browser_open reminds the agent to close what it opened.
+    {
+      const fresh = await run('browser_open', { url: `${origin}/two`, new_tab: true });
+      assert.match(fresh.text, /Close it with browser_close when you are done \(unused tabs close after 15 minutes\)\./);
+      assert.match(builtinBrowserTips(), /after 15 minutes without use/);
+      const reused = await run('browser_open', { url: `${origin}/two` });
+      assert.doesNotMatch(reused.text, /Close it with browser_close/, 'only a newly opened tab gets the reminder');
+      assert.match((await run('browser_close', {})).text, /Closed tab/);
+    }
+
+    // Idle tabs sleep (background throttling back on, focus emulation off) and
+    // wake for any agent use; unused agent tabs close by themselves.
+    {
+      const idleManager = createBrowserManager({ getWindow: () => window, emit: () => {}, awakeIdleMs: 400, idleCloseMs: 2500, previewSeenMs: 1000 });
+      const idleCaller = { threadId: 'thread-idle', projectPath: projectDir, accessMode: 'full-access' };
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      try {
+        const { tab } = await idleManager.openTabForAgent(idleCaller, { url: `${origin}/ticker` });
+        const wc = tab.view.webContents;
+        const ticks = () => idleManager.runOnTab(tab, idleCaller, async () => (await tab.cdp.send('Runtime.evaluate', { expression: 'ticks', returnByValue: true })).result.value, { mutating: false });
+        assert.equal(wc.getBackgroundThrottling(), false, 'a new tab starts awake');
+        assert.equal(tab.focusEmulated, true, 'an agent action turns focus emulation on');
+        // Awake and hidden: timers run at (near) full rate.
+        const awakeStart = await ticks();
+        await sleep(1000);
+        const awakeRate = (await ticks()) - awakeStart;
+        await sleep(700);
+        assert.equal(tab.asleep, true, 'unused past awakeIdleMs, the tab sleeps');
+        assert.equal(wc.getBackgroundThrottling(), true);
+        assert.equal(tab.focusEmulated, false, 'sleeping releases focus emulation');
+        const asleepStart = await tab.cdp.send('Runtime.evaluate', { expression: 'ticks', returnByValue: true });
+        await sleep(1500);
+        const asleepEnd = await tab.cdp.send('Runtime.evaluate', { expression: 'ticks', returnByValue: true });
+        const asleepRate = (asleepEnd.result.value - asleepStart.result.value) / 1.5;
+        trace('idle tab timer rates', `awake=${awakeRate}/s`, `asleep=${asleepRate.toFixed(1)}/s`);
+        assert.ok(awakeRate > 20, `awake hidden tab runs its timers (${awakeRate}/s)`);
+        assert.ok(asleepRate < awakeRate / 4, `a sleeping tab is throttled (${asleepRate.toFixed(1)}/s vs ${awakeRate}/s awake)`);
+        // Any agent use wakes it first; a screenshot of the hidden tab still works.
+        const before = await ticks();
+        assert.equal(tab.asleep, false, 'an agent read wakes the tab');
+        assert.equal(wc.getBackgroundThrottling(), false);
+        const shot = await idleManager.runOnTab(tab, idleCaller, () => wc.capturePage(undefined, { stayHidden: true }), { mutating: false });
+        assert.equal(shot.isEmpty(), false, 'a woken hidden tab can be captured');
+        await sleep(300);
+        assert.ok((await ticks()) - before > 10, 'woken, its timers run again');
+        // The corner preview wakes a sleeping tab for its capture.
+        await sleep(800);
+        assert.equal(tab.asleep, true);
+        assert.equal((await idleManager.userActions.thumbnail({ tabId: tab.id, width: 320 })).ok, true, 'a sleeping tab still gives a preview');
+        // Unused agent tabs close; the person's own, a driven one and the one on screen stay.
+        const userTab = await idleManager.userActions.create({ url: `${origin}/two`, threadId: 'thread-idle' });
+        const { tab: driven } = await idleManager.openTabForAgent(idleCaller, { url: `${origin}/two` });
+        idleManager.userActions.takeControl({ tabId: driven.id });
+        const { tab: watched } = await idleManager.openTabForAgent(idleCaller, { url: `${origin}/two` });
+        idleManager.userActions.setBounds({ x: 0, y: 0, width: 400, height: 300 });
+        idleManager.userActions.setVisible(true);
+        idleManager.userActions.select({ tabId: watched.id });
+        await sleep(3700);
+        assert.equal(idleManager.tabs.has(tab.id), false, 'an unused agent tab closed by itself');
+        assert.ok(idleManager.tabs.has(userTab.tabId), "the person's tab stays");
+        assert.ok(idleManager.tabs.has(driven.id), 'a tab the person drives stays');
+        assert.ok(idleManager.tabs.has(watched.id), 'the tab on screen stays');
+        assert.throws(() => idleManager.resolveTabForCaller(tab.id, idleCaller, { mutating: false }), /closed after \d+ minutes without use\. Open the page again with browser_open/);
+        // Once off screen it closes a period later; the corner preview counts as on screen.
+        idleManager.userActions.setVisible(false);
+        const previewing = setInterval(() => void idleManager.userActions.thumbnail({ tabId: watched.id, width: 320 }), 500);
+        await sleep(2800);
+        clearInterval(previewing);
+        assert.ok(idleManager.tabs.has(watched.id), 'a tab in the corner preview stays');
+        await sleep(4500);
+        assert.equal(idleManager.tabs.has(watched.id), false, 'the formerly watched tab closes once off screen');
+        // A transfer still in progress (no download question) keeps its tab until it is done.
+        idleManager.userActions.setOptions({ askBeforeDownload: false });
+        const { tab: downloading } = await idleManager.openTabForAgent(idleCaller, { url: `${origin}/two` });
+        await downloading.cdp.send('Runtime.evaluate', { expression: "location.href = '/slow.bin'" });
+        await waitUntil(() => downloading.activeDownloads.size > 0, 'the slow download to start');
+        await sleep(3000);
+        assert.ok(idleManager.tabs.has(downloading.id), 'a tab with a transfer in progress stays');
+        await waitUntil(async () => downloading.lastDownload?.state === 'completed', 'the slow download to finish', 6000);
+        assert.match(downloading.lastDownload.path, /slow.*\.bin$/, 'its result is recorded');
+        await sleep(2800);
+        assert.equal(idleManager.tabs.has(downloading.id), false, 'once it is done the tab closes');
+        idleManager.userActions.setOptions({ askBeforeDownload: true });
+      } finally {
+        idleManager.closeAll();
+      }
     }
 
     // A finished thread's tabs close, except ones the person opened or is driving.
