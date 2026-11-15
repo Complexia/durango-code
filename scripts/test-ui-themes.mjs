@@ -9,6 +9,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 import {
   THEME_SCENE_BOOTSTRAP,
   THEME_SCENE_SOURCE,
@@ -30,6 +31,7 @@ import {
 } from '../src/ui-themes.js';
 import { BUILTIN_THEMES } from '../src/ui-themes-builtin.js';
 import * as store from '../src/main/ui-themes-store.js';
+import { backdropVideoNote, probeVideo } from '../src/main/video-probe.js';
 import {
   THEME_TOOL_INPUT_SCHEMAS,
   THEME_TOOL_NAMES,
@@ -809,6 +811,155 @@ await test('backdrop variants past the limit are reported, and generation refuse
   const badWhen = await runThemeTool('generate_theme_media', { prompt: 'x', variant_when: { 'Bad Name': 1 } }, ctx);
   assert.equal(badWhen.ok, false);
   assert.equal(generated, 1, 'refusals spend nothing');
+});
+
+// --- motion: video size notes, posters, frozen scenes ---------------------------------
+
+// A minimal MP4: moov > trak > (tkhd, mdia > (mdhd, hdlr 'vide', minf > stbl > stts)).
+const mp4Box = (type, ...parts) => {
+  const body = Buffer.concat(parts.map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(part))));
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(8 + body.length, 0);
+  head.write(type, 4, 'latin1');
+  return Buffer.concat([head, body]);
+};
+const syntheticMp4 = ({ width, height, timescale, delta, frames = 120 }) => {
+  const tkhd = Buffer.alloc(84);
+  tkhd.writeUInt32BE(width * 65536, 76);
+  tkhd.writeUInt32BE(height * 65536, 80);
+  const mdhd = Buffer.alloc(24);
+  mdhd.writeUInt32BE(timescale, 12);
+  const hdlr = Buffer.alloc(24);
+  hdlr.write('vide', 8, 'latin1');
+  const stts = Buffer.alloc(16);
+  stts.writeUInt32BE(1, 4);
+  stts.writeUInt32BE(frames, 8);
+  stts.writeUInt32BE(delta, 12);
+  return Buffer.concat([
+    mp4Box('ftyp', Buffer.from('isom\0\0\0\0isom', 'latin1')),
+    mp4Box('moov', mp4Box('trak', mp4Box('tkhd', tkhd), mp4Box('mdia', mp4Box('mdhd', mdhd), mp4Box('hdlr', hdlr), mp4Box('minf', mp4Box('stbl', mp4Box('stts', stts)))))),
+  ]);
+};
+
+await test('video probe reads size and frame rate; notes only heavy backdrops', () => {
+  assert.deepEqual(probeVideo(syntheticMp4({ width: 3840, height: 2160, timescale: 60000, delta: 1000 })), { width: 3840, height: 2160, fps: 60 });
+  assert.deepEqual(probeVideo(syntheticMp4({ width: 1280, height: 720, timescale: 24000, delta: 1001 })), { width: 1280, height: 720, fps: 23.98 });
+  assert.match(backdropVideoNote(syntheticMp4({ width: 3840, height: 2160, timescale: 60000, delta: 1000 })), /3840×2160 at 60 fps/);
+  assert.match(backdropVideoNote(syntheticMp4({ width: 1920, height: 1080, timescale: 60, delta: 1 })), /1920×1080 at 60 fps/);
+  assert.equal(backdropVideoNote(syntheticMp4({ width: 1920, height: 1080, timescale: 30, delta: 1 })), null);
+  assert.equal(backdropVideoNote(syntheticMp4({ width: 1280, height: 720, timescale: 24000, delta: 1001 })), null);
+  assert.equal(probeVideo(Buffer.from('not a video at all, just text')), null);
+  assert.equal(probeVideo(Buffer.from([0, 0, 0, 24])), null);
+});
+
+await test('a 4K60 backdrop video gets a performance note; a poster is saved once', async () => {
+  const video = path.join(dir, 'big.mp4');
+  await fs.writeFile(video, syntheticMp4({ width: 3840, height: 2160, timescale: 60000, delta: 1000 }));
+  const result = await runThemeTool('set_app_theme', { backdrop: { type: 'video', video_path: video } }, context('thread-motion'));
+  assert.equal(result.ok, true, result.text);
+  assert.match(result.text, /Performance: this video is 3840×2160 at 60 fps/);
+  const theme = await store.workingThemeFor('thread-motion');
+  assert.equal(theme.backdrop.type, 'video');
+  const bytes = await store.videoForPoster(theme.id, theme.backdrop.asset);
+  assert.ok(Buffer.isBuffer(bytes) && bytes.length > 0, 'the posterless video comes back for a frame');
+  assert.equal(await store.videoForPoster(theme.id, 'backdrop-other.mp4'), null, 'only the current backdrop');
+  await assert.rejects(store.setVideoPoster(theme.id, theme.backdrop.asset, new Uint8Array(200)), /JPEG/);
+  const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(200)]);
+  const revision = theme.revision;
+  const historyFile = path.join(dir, theme.id, 'history.json');
+  const historyBefore = await fs.readFile(historyFile, 'utf8').catch(() => '');
+  const poster = await store.setVideoPoster(theme.id, theme.backdrop.asset, jpeg);
+  assert.match(poster, /^poster-.*\.jpg$/);
+  const updated = await store.getTheme(theme.id);
+  assert.equal(updated.backdrop.poster, poster);
+  assert.equal(updated.backdrop.asset, theme.backdrop.asset);
+  assert.equal(updated.revision, revision, 'a poster is not an edit');
+  assert.equal(await fs.readFile(historyFile, 'utf8').catch(() => ''), historyBefore, 'nor an undo step');
+  await fs.access(path.join(dir, theme.id, poster));
+  assert.equal(await store.setVideoPoster(theme.id, theme.backdrop.asset, jpeg), null, 'a theme with a poster keeps it');
+  assert.equal(await store.videoForPoster(theme.id, theme.backdrop.asset), null);
+  const other = path.join(dir, 'other.mp4');
+  await fs.writeFile(other, syntheticMp4({ width: 1280, height: 720, timescale: 30, delta: 1 }));
+  await runThemeTool('set_app_theme', { backdrop: { video_path: other } }, context('thread-motion'));
+  const swapped = await store.getTheme(theme.id);
+  assert.notEqual(swapped.backdrop.asset, theme.backdrop.asset);
+  assert.equal(swapped.backdrop.poster, undefined, "a new video drops the old one's poster");
+  await runThemeTool('set_app_theme', { backdrop: { dim: 0.5 } }, context('thread-motion'));
+  const small = path.join(dir, 'small.mp4');
+  await fs.writeFile(small, syntheticMp4({ width: 1280, height: 720, timescale: 24, delta: 1 }));
+  const light = await runThemeTool('set_app_theme', { backdrop: { type: 'video', video_path: small } }, context('thread-motion'));
+  assert.doesNotMatch(light.text, /Performance:/);
+});
+
+await test('a paused scene freezes: animation frames held, CSS paused, videos paused', async () => {
+  const frames = [];
+  const nativeCancels = [];
+  const listeners = {};
+  const classes = new Set();
+  const docListeners = {};
+  const video = { paused: false, pause() { this.paused = true; }, play() { this.paused = false; return Promise.resolve(); } };
+  const parent = { postMessage() {} };
+  const sandbox = {
+    requestAnimationFrame: (fn) => { frames.push(fn); return frames.length; },
+    cancelAnimationFrame: (id) => { nativeCancels.push(id); },
+    addEventListener: (type, fn) => { (listeners[type] ??= []).push(fn); },
+    document: {
+      documentElement: { classList: { toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)) } },
+      querySelectorAll: (selector) => (selector.split(',').includes('video') ? [video] : []),
+      addEventListener: (type, fn) => { (docListeners[type] ??= []).push(fn); },
+    },
+    setTimeout,
+    clearTimeout,
+    Map,
+    Array,
+    Promise,
+    ErrorEvent: class {},
+  };
+  sandbox.window = sandbox;
+  sandbox.parent = parent;
+  vm.createContext(sandbox);
+  vm.runInContext(THEME_SCENE_BOOTSTRAP, sandbox);
+  const send = (detail) => {
+    for (const fn of listeners.message) fn({ source: parent, data: { source: THEME_SCENE_SOURCE, type: 'event', event: 'state', detail } });
+  };
+  const tick = () => {};
+  sandbox.window.requestAnimationFrame(tick);
+  assert.equal(frames.length, 1, 'running: frames go through');
+  send({ paused: true });
+  assert.equal(sandbox.durango.state.paused, true);
+  sandbox.window.requestAnimationFrame(tick);
+  assert.equal(frames.length, 2, 'for a second, so a still frame can draw');
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.ok(classes.has('durango-paused'), 'CSS animations pause');
+  assert.equal(video.paused, true, 'a playing video pauses');
+  const held = sandbox.window.requestAnimationFrame(tick);
+  assert.ok(held < 0 && frames.length === 2, 'frozen: the frame is held');
+  const cancelled = sandbox.window.requestAnimationFrame(tick);
+  sandbox.window.cancelAnimationFrame(cancelled);
+  for (const fn of listeners.resize) fn();
+  assert.equal(frames.length, 3, 'a resize lets one held frame run (the cancelled one does not)');
+  // A held frame flushed by the resize can still be cancelled by its old id.
+  const late = sandbox.window.requestAnimationFrame(() => assert.fail('a cancelled frame ran'));
+  for (const fn of listeners.resize) fn();
+  const flushed = frames.at(-1);
+  sandbox.window.cancelAnimationFrame(late);
+  assert.equal(nativeCancels.length, 1, 'cancelling a flushed frame cancels its native request');
+  frames.splice(frames.indexOf(flushed), 1);
+  // Media that starts playing while frozen is paused, and resumes with the rest.
+  const late2 = { paused: false, pause() { this.paused = true; }, play() { this.paused = false; return Promise.resolve(); } };
+  for (const fn of docListeners.play) fn({ target: late2 });
+  assert.equal(late2.paused, true, 'a video started while frozen is paused');
+  sandbox.window.requestAnimationFrame(tick);
+  send({ paused: false });
+  assert.equal(classes.has('durango-paused'), false);
+  assert.equal(video.paused, false, 'the video plays again');
+  assert.equal(late2.paused, false, 'so does the one started while frozen');
+  assert.equal(frames.length, 4, 'held frames run on resume');
+  frames[3](0);
+  send({ paused: true });
+  send({ paused: false });
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.equal(classes.has('durango-paused'), false, 'unpausing within the second cancels the freeze');
 });
 
 await fs.rm(dir, { recursive: true, force: true });

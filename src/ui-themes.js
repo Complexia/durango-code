@@ -731,10 +731,13 @@ export const mergeTheme = (base, patch, { id, now = new Date().toISOString(), th
     if (patch.backdrop === null) delete next.backdrop;
     else {
       // Keep the current file when only the look of the backdrop changes.
-      const merged =
-        base?.backdrop && (patch.backdrop.type === undefined || patch.backdrop.type === base.backdrop.type)
-          ? { ...base.backdrop, ...patch.backdrop, type: base.backdrop.type }
-          : patch.backdrop;
+      const sameType = base?.backdrop && (patch.backdrop.type === undefined || patch.backdrop.type === base.backdrop.type);
+      const merged = sameType ? { ...base.backdrop, ...patch.backdrop, type: base.backdrop.type } : patch.backdrop;
+      // A poster is a still of its video: a new file drops the old one's
+      // unless the patch brings its own.
+      if (sameType && patch.backdrop.asset !== undefined && patch.backdrop.asset !== base.backdrop.asset && patch.backdrop.poster === undefined) {
+        delete merged.poster;
+      }
       if (Array.isArray(patch.backdrop.variants) && patch.backdrop.variants.length > THEME_LIMITS.variants) {
         ignored.push(`backdrop variants past the first ${THEME_LIMITS.variants}`);
       }
@@ -864,12 +867,19 @@ export const THEME_SCENE_CSP = [
 /**
  * Runs before the scene's own code. Gives the page `window.durango`:
  *   durango.on(type, fn) / durango.off(type, fn)   (THEME_SCENE_EVENTS)
- *   durango.state  { working, count, pointer: {x, y}, focused, reducedMotion, appearance, values, colors }
+ *   durango.state  { working, count, pointer: {x, y}, focused, reducedMotion, paused, appearance, values, colors }
  *   durango.values                                  the theme's values now
  *   durango.set(name, value)                         change one (checked by the app)
  *   durango.action(name, detail?)                    tell every scene and widget
  *   durango.resize(width, height)                    an HTML widget's own size
  * Uncaught errors go to the app (the agent sees them in get_app_theme).
+ * When the app pauses the scene (state.paused: animation off, reduced motion,
+ * window hidden or unfocused for a while; see app/themes/motionPolicy.ts), a
+ * second later the bootstrap freezes it whatever the scene does: animation
+ * frame callbacks are held (one runs per resize, so a resized canvas redraws;
+ * their ids stay cancellable), CSS animations pause, and media pauses,
+ * including any that starts playing while frozen. The second lets a scene draw
+ * its reduced-motion still frame first. Unpausing resumes all three.
  * Only messages from the app window are accepted.
  */
 export const THEME_SCENE_BOOTSTRAP = `(function(){
@@ -880,7 +890,18 @@ function report(t){t=String(t||"Script error").slice(0,300);if(seen[t]||sent>=8)
 ["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","WebSocket","EventSource","Worker","SharedWorker"].forEach(function(k){try{Object.defineProperty(window,k,{value:undefined,writable:false,configurable:false});}catch(e){}});
 window.addEventListener("error",function(e){if(!(e instanceof ErrorEvent))return;report(e.message||"Script error");e.preventDefault();});
 window.addEventListener("unhandledrejection",function(e){var r=e.reason;report("Unhandled promise rejection: "+(r&&r.message?r.message:String(r)));e.preventDefault();});
-var state={working:false,count:0,pointer:{x:0.5,y:0.5},focused:true,reducedMotion:false,appearance:"dark",values:{},colors:{}};
+var state={working:false,count:0,pointer:{x:0.5,y:0.5},focused:true,reducedMotion:false,paused:false,appearance:"dark",values:{},colors:{}};
+var RAF=typeof window.requestAnimationFrame==="function"?window.requestAnimationFrame.bind(window):null,CAF=typeof window.cancelAnimationFrame==="function"?window.cancelAnimationFrame.bind(window):function(){},held=new Map(),sent=new Map(),hn=0,frozen=false,ft=0,vids=[];
+if(RAF){window.requestAnimationFrame=function(f){if(!frozen)return RAF(f);hn-=1;held.set(hn,f);return hn;};
+window.cancelAnimationFrame=function(id){if(id<0){held.delete(id);if(sent.has(id)){CAF(sent.get(id));sent.delete(id);}}else CAF(id);};}
+function flush(){if(!RAF)return;held.forEach(function(f,id){sent.set(id,RAF(function(t){sent.delete(id);f(t);}));});held.clear();}
+function hold(v){if(vids.indexOf(v)<0)vids.push(v);v.pause();}
+if(typeof document!=="undefined")document.addEventListener("play",function(e){if(frozen&&e.target&&e.target.pause)hold(e.target);},true);
+function freeze(on){if(on===frozen||typeof document==="undefined")return;frozen=on;document.documentElement.classList.toggle("durango-paused",on);
+if(on){vids=[];document.querySelectorAll("video,audio").forEach(function(v){if(!v.paused)hold(v);});}
+else{vids.forEach(function(v){try{var r=v.play();if(r&&r.catch)r.catch(function(){});}catch(e){}});vids=[];flush();}}
+function setPaused(p){if(!p){if(ft){clearTimeout(ft);ft=0;}freeze(false);return;}if(!frozen&&!ft)ft=setTimeout(function(){ft=0;freeze(true);},1000);}
+addEventListener("resize",function(){if(frozen)flush();});
 var api={state:state,on:function(t,f){if(typeof f!=="function")return;(L[t]=L[t]||[]).push(f);},off:function(t,f){var a=L[t];if(!a)return;var i=a.indexOf(f);if(i>=0)a.splice(i,1);},
 set:function(n,v){if(typeof n!=="string")return;if(v!==null&&typeof v==="object")return;state.values[n]=v;post({type:"set",name:n,value:v});},
 action:function(n,x){if(typeof n!=="string")return;var o=null;try{o=x===undefined?null:JSON.parse(JSON.stringify(x));}catch(e){}post({type:"action",name:n,detail:o});},
@@ -888,7 +909,7 @@ resize:function(w,h){post({type:"resize",width:+w||0,height:+h||0});}};
 Object.defineProperty(api,"values",{get:function(){return state.values;}});
 try{Object.defineProperty(window,"durango",{value:api,writable:false,configurable:false});}catch(e){window.durango=api;}
 window.addEventListener("message",function(e){if(e.source!==P)return;var d=e.data;if(!d||d.source!==S||d.type!=="event"||typeof d.event!=="string")return;var x=d.detail&&typeof d.detail==="object"?d.detail:{};
-if(d.event==="state"){for(var k in x){if(Object.prototype.hasOwnProperty.call(state,k))state[k]=x[k];}
+if(d.event==="state"){for(var k in x){if(Object.prototype.hasOwnProperty.call(state,k))state[k]=x[k];}setPaused(!!state.paused);
 var s=(L.state||[]).slice().concat((L.value||[]).slice());var vd={name:null,value:null,values:state.values};
 for(var j=0;j<s.length;j++){try{s[j](j<(L.state||[]).length?state:vd);}catch(err){report(err&&err.message?err.message:String(err));}}return;}
 if(d.event==="working"){state.working=!!x.working;state.count=+x.count||0;}
@@ -901,7 +922,8 @@ post({type:"ready"});
 
 const SCENE_BASE_STYLE = `*,*::before,*::after{box-sizing:border-box}
 html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent}
-canvas{display:block}`;
+canvas{display:block}
+html.durango-paused *,html.durango-paused *::before,html.durango-paused *::after{animation-play-state:paused!important}`;
 
 const tagPattern = (names) => new RegExp(`<\\/?(?:${names})(?=[\\s/>])(?:[^>"']|"[^"]*"|'[^']*')*>`, 'gi');
 

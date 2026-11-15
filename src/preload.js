@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld('orion', {
     adoptLegacyAnimate: (animate) => ipcRenderer.invoke('themes:adoptLegacyAnimate', animate),
     frost: (id, asset, width, saturate) => ipcRenderer.invoke('themes:frost', id, asset, width, saturate),
     reportSceneError: (id, message) => ipcRenderer.send('themes:sceneError', id, message),
+    videoForPoster: (id, asset) => ipcRenderer.invoke('themes:videoForPoster', id, asset),
+    savePoster: (id, asset, data) => ipcRenderer.invoke('themes:savePoster', id, asset, data),
     onChanged: (callback) => {
       const listener = (_event, snapshot) => callback(snapshot);
       ipcRenderer.on('themes:changed', listener);
@@ -333,6 +335,12 @@ contextBridge.exposeInMainWorld('orion', {
   openChromeDebugSetup: () => ipcRenderer.invoke('computerUse:openChromeDebugSetup'),
   relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
   focusWindow: () => ipcRenderer.invoke('app:focusWindow'),
+  isWindowFocused: () => ipcRenderer.invoke('app:isWindowFocused'),
+  onWindowFocusChange: (callback) => {
+    const listener = (_event, focused) => callback(focused === true);
+    ipcRenderer.on('app:windowFocus', listener);
+    return () => ipcRenderer.removeListener('app:windowFocus', listener);
+  },
 
   // App updates
   getAppUpdateState: () => ipcRenderer.invoke('appUpdate:getState'),

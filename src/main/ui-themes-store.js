@@ -468,6 +468,46 @@ export const importThemeAsset = async (id, sourcePath, prefix = 'backdrop') => {
   return writeThemeAsset(id, await fs.readFile(sourcePath), path.extname(sourcePath), prefix);
 };
 
+const POSTER_SOURCE_MAX_BYTES = 60 * 1024 * 1024;
+
+/**
+ * The bytes of a video backdrop that still needs a poster, for the renderer to
+ * take its first frame from (as a same-origin blob: theme files come over a
+ * protocol a canvas cannot export from). Null when there is nothing to do.
+ */
+export const videoForPoster = async (id, asset) => {
+  await ensureLoaded();
+  const theme = themes.get(id);
+  const backdrop = theme?.backdrop;
+  if (!theme || theme.builtIn || backdrop?.type !== 'video' || backdrop.asset !== asset || backdrop.poster) return null;
+  const filePath = themeAssetPath(id, asset);
+  const stats = filePath ? await fs.stat(filePath).catch(() => null) : null;
+  if (!stats?.isFile() || stats.size > POSTER_SOURCE_MAX_BYTES) return null;
+  return fs.readFile(filePath);
+};
+
+/**
+ * Keep the still frame the renderer took from a video backdrop that has no
+ * poster, so "still" (animation off, reduced motion) shows an image instead of
+ * holding a paused video decoder. Only while that video is still the backdrop
+ * and nothing set a poster meanwhile. Not an undo step.
+ */
+export const setVideoPoster = (id, asset, data) => exclusive(async () => {
+  await ensureLoaded();
+  const theme = themes.get(id);
+  const backdrop = theme?.backdrop;
+  if (!theme || theme.builtIn || backdrop?.type !== 'video' || backdrop.asset !== asset || backdrop.poster) return null;
+  const bytes = Buffer.from(data);
+  if (bytes.length < 64 || bytes.length > 8 * 1024 * 1024 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    throw new Error('A poster must be a JPEG under 8 MB.');
+  }
+  const poster = await writeThemeAsset(id, bytes, 'jpg', 'poster');
+  const next = sanitizeTheme({ ...theme, backdrop: { ...backdrop, poster } });
+  await storeTheme(next);
+  notify();
+  return poster;
+});
+
 /** Script errors a theme's scenes reported in the renderer (for the agent). */
 export const recordSceneError = (id, message) => {
   if (!isThemeId(id) || typeof message !== 'string') return;

@@ -21,6 +21,8 @@ import {
   useThemeState,
   useThemeValues,
 } from './themeState';
+import { useThemeMotion } from './motionPolicy';
+import { useVideoPoster } from './videoPoster';
 
 /**
  * Applies the active theme (Settings → Themes) to the whole window:
@@ -115,14 +117,28 @@ const useSceneEvents = (enabled: boolean) => {
   }, [enabled]);
 };
 
+/** A playing backdrop video, frozen on its current frame while `paused`. */
+const BackdropVideo: React.FC<React.VideoHTMLAttributes<HTMLVideoElement> & { paused: boolean }> = ({ paused, ...props }) => {
+  const ref = useRef<HTMLVideoElement | null>(null);
+  useEffect(() => {
+    const video = ref.current;
+    if (!video) return;
+    if (paused) video.pause();
+    else void video.play().catch(() => {});
+  }, [paused, props.src]);
+  return <video ref={ref} {...props} autoPlay={!paused} />;
+};
+
 /** One look of the backdrop (the base or a variant), with its veil. */
-const BackdropLook: React.FC<{ theme: UiTheme; backdrop: ThemeBackdrop; snapshot: ThemeSnapshot | null; animate: boolean; entering: boolean }> = ({
-  theme,
-  backdrop,
-  snapshot,
-  animate,
-  entering,
-}) => {
+const BackdropLook: React.FC<{
+  theme: UiTheme;
+  backdrop: ThemeBackdrop;
+  snapshot: ThemeSnapshot | null;
+  animate: boolean;
+  /** Freeze moving looks where they are (motionPolicy.ts). */
+  paused: boolean;
+  entering: boolean;
+}> = ({ theme, backdrop, snapshot, animate, paused, entering }) => {
   const filters = [
     backdrop.blur ? `blur(${backdrop.blur}px)` : '',
     backdrop.saturate !== undefined && backdrop.saturate !== 1 ? `saturate(${backdrop.saturate})` : '',
@@ -151,12 +167,12 @@ const BackdropLook: React.FC<{ theme: UiTheme; backdrop: ThemeBackdrop; snapshot
     content = <img className="theme-backdrop-fill" src={themeAssetUrl(snapshot, theme, backdrop.asset)} alt="" draggable={false} style={mediaStyle} />;
   } else if (backdrop.type === 'video' && backdrop.asset) {
     content = animate ? (
-      <video
+      <BackdropVideo
         key={backdrop.asset}
+        paused={paused}
         className="theme-backdrop-fill"
         src={themeAssetUrl(snapshot, theme, backdrop.asset)}
         poster={poster || undefined}
-        autoPlay
         muted
         loop
         playsInline
@@ -179,7 +195,7 @@ const BackdropLook: React.FC<{ theme: UiTheme; backdrop: ThemeBackdrop; snapshot
   } else if (backdrop.type === 'html' && backdrop.html) {
     content = (
       <div className="theme-backdrop-fill" style={fillStyle}>
-        <ThemeSceneFrame theme={theme} html={backdrop.html} role="backdrop" />
+        <ThemeSceneFrame theme={theme} html={backdrop.html} role="backdrop" animate={animate} paused={paused} />
       </div>
     );
   }
@@ -195,8 +211,9 @@ const BackdropLook: React.FC<{ theme: UiTheme; backdrop: ThemeBackdrop; snapshot
 const lookKey = (backdrop: ThemeBackdrop) =>
   `${backdrop.type}:${backdrop.asset ?? ''}:${backdrop.type === 'css' ? backdrop.css : ''}:${backdrop.type === 'html' ? backdrop.html?.length : ''}`;
 
-const Backdrop: React.FC<{ theme: UiTheme; animate: boolean }> = ({ theme, animate }) => {
+const Backdrop: React.FC<{ theme: UiTheme; animate: boolean; paused: boolean }> = ({ theme, animate, paused }) => {
   const snapshot = useThemeState((state) => state.snapshot);
+  useVideoPoster(theme);
   const values = useThemeValues(theme.id);
   const backdrop = useMemo(() => effectiveBackdrop(theme.backdrop, values), [theme.backdrop, values]);
   const key = backdrop ? lookKey(backdrop) : '';
@@ -222,9 +239,9 @@ const Backdrop: React.FC<{ theme: UiTheme; animate: boolean }> = ({ theme, anima
   return (
     <div className="theme-backdrop" aria-hidden="true">
       {leaving ? (
-        <BackdropLook key={`leaving:${leaving.key}`} theme={theme} backdrop={leaving.backdrop} snapshot={snapshot} animate={animate} entering={false} />
+        <BackdropLook key={`leaving:${leaving.key}`} theme={theme} backdrop={leaving.backdrop} snapshot={snapshot} animate={animate} paused={paused} entering={false} />
       ) : null}
-      <BackdropLook key={key} theme={theme} backdrop={backdrop} snapshot={snapshot} animate={animate} entering={Boolean(leaving)} />
+      <BackdropLook key={key} theme={theme} backdrop={backdrop} snapshot={snapshot} animate={animate} paused={paused} entering={Boolean(leaving)} />
     </div>
   );
 };
@@ -372,7 +389,15 @@ const frostCss = (url: string, backdrop: ThemeBackdrop | null) => {
 const ThemeLayer: React.FC = () => {
   const theme = useActiveTheme();
   const snapshot = useThemeState((state) => state.snapshot);
-  const animate = useThemeState((state) => state.animate);
+  const animateSetting = useThemeState((state) => state.animate);
+  // The switch, reduced motion, and whether anyone is looking (motionPolicy.ts).
+  const moving = Boolean(
+    theme &&
+      (theme.overlay ||
+        [theme.backdrop, ...(theme.backdrop?.variants ?? [])].some((look) => look?.type === 'video' || look?.type === 'html'))
+  );
+  const motion = useThemeMotion(animateSetting, moving);
+  const animate = motion.animate;
 
   useEffect(() => {
     startThemeSync();
@@ -430,10 +455,17 @@ const ThemeLayer: React.FC = () => {
     <>
       {createPortal(
         <>
-          {theme.backdrop ? <Backdrop key={`${theme.id}-backdrop`} theme={theme} animate={animate} /> : null}
+          {theme.backdrop ? <Backdrop key={`${theme.id}-backdrop`} theme={theme} animate={animate} paused={motion.paused} /> : null}
           {theme.overlay?.html && animate ? (
             <div className="theme-overlay" aria-hidden="true">
-              <ThemeSceneFrame key={`${theme.id}-overlay`} theme={theme} html={theme.overlay.html} role="overlay" />
+              <ThemeSceneFrame
+                key={`${theme.id}-overlay`}
+                theme={theme}
+                html={theme.overlay.html}
+                role="overlay"
+                animate={animate}
+                paused={motion.paused}
+              />
             </div>
           ) : null}
         </>,

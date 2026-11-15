@@ -1043,6 +1043,10 @@ type OrionCodexBrowserIntegrationStatus = {
         /** A small, softened copy of an image backdrop for static frosted panels; null if it cannot be made. */
         frost: (id: string, asset: string, width: number, saturate: number) => Promise<ThemeIpcResult<string | null>>;
         reportSceneError: (id: string, message: string) => void;
+        /** A posterless video backdrop's bytes, to take a still frame from (null: nothing to do). */
+        videoForPoster?: (id: string, asset: string) => Promise<ThemeIpcResult<Uint8Array | null>>;
+        /** Saves a still frame (JPEG bytes) as the poster of a video backdrop that has none. */
+        savePoster?: (id: string, asset: string, data: Uint8Array) => Promise<ThemeIpcResult<string | null>>;
         onChanged: (callback: (snapshot: import('./ui-themes.js').ThemeSnapshot) => void) => () => void;
         onCelebrate: (callback: () => void) => () => void;
       };
@@ -1522,6 +1526,9 @@ type OrionCodexBrowserIntegrationStatus = {
       openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>;
       relaunchApp: () => Promise<boolean>;
       focusWindow: () => Promise<boolean>;
+      /** Whether the app window itself is focused (a built-in browser tab with focus counts). */
+      isWindowFocused?: () => Promise<boolean>;
+      onWindowFocusChange?: (callback: (focused: boolean) => void) => () => void;
       getAppUpdateState: () => Promise<AppUpdateState>;
       checkForAppUpdate: (input?: { force?: boolean; background?: boolean }) => Promise<AppUpdateState>;
       downloadAppUpdate: () => Promise<AppUpdateState>;

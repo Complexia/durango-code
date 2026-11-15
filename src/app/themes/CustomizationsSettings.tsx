@@ -6,6 +6,7 @@ import { ThemeControlsSettings } from './ThemeControlsSettings';
 import { ThemePreview } from './ThemePreview';
 import { previewThemeCelebration } from './ThemeLayer';
 import { runThemeAction, startThemeSync, useThemeState } from './themeState';
+import { useMotionSettings } from './motionPolicy';
 
 /**
  * Settings → Themes: switch between themes (Stock, the built-ins and
@@ -208,6 +209,8 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
   const snapshot = useThemeState((state) => state.snapshot);
   const animate = useThemeState((state) => state.animate);
   const setAnimate = useThemeState((state) => state.setAnimate);
+  const animateInBackground = useMotionSettings((state) => state.animateInBackground);
+  const setAnimateInBackground = useMotionSettings((state) => state.setAnimateInBackground);
   const [idea, setIdea] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
 
@@ -381,6 +384,24 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
           </div>
           <label className="provider-toggle" title="Animated backdrops and effects">
             <input type="checkbox" checked={animate} onChange={(event) => setAnimate(event.target.checked)} />
+            <span />
+          </label>
+        </div>
+        <div className="setting-row">
+          <div className="setting-label">
+            <div className="setting-label-title">Keep animating in the background</div>
+            <div className="setting-label-desc">
+              Off pauses animated backdrops and video a few seconds after you switch to another app, and they pick up
+              where they left off when you come back. On keeps them moving.
+            </div>
+          </div>
+          <label className="provider-toggle" title="Keep animating in the background">
+            <input
+              type="checkbox"
+              checked={animateInBackground}
+              disabled={!animate}
+              onChange={(event) => setAnimateInBackground(event.target.checked)}
+            />
             <span />
           </label>
         </div>

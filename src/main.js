@@ -125,6 +125,8 @@ import {
   duplicateTheme,
   listThemes,
   recordSceneError,
+  setVideoPoster,
+  videoForPoster,
   renameTheme,
   resetThemeValues,
   setActiveTheme,
@@ -1198,6 +1200,14 @@ const createWindow = () => {
 
   // DevTools can still be opened manually from the Electron menu when needed.
   browserMainWindow = mainWindow;
+  // The window's own focus, for theme motion (themes/motionPolicy.ts): the
+  // page's focus also drops when a built-in browser tab takes it, which is
+  // still using the app.
+  const sendWindowFocus = () => {
+    if (!mainWindow.isDestroyed()) mainWindow.webContents.send('app:windowFocus', mainWindow.isFocused());
+  };
+  mainWindow.on('focus', sendWindowFocus);
+  mainWindow.on('blur', sendWindowFocus);
   mainWindow.on('closed', () => {
     if (browserMainWindow === mainWindow) browserMainWindow = null;
   });
@@ -1867,6 +1877,8 @@ setThemeToolsMetrics(() =>
     memoryKb: metric.memory?.workingSetSize ?? 0,
   }))
 );
+themeIpc('themes:videoForPoster', (id, asset) => videoForPoster(String(id), String(asset)));
+themeIpc('themes:savePoster', (id, asset, data) => setVideoPoster(String(id), String(asset), data));
 ipcMain.on('themes:sceneError', (_event, id, message) => recordSceneError(id, message));
 
 ipcMain.handle('storage:load', async () => {
@@ -4568,6 +4580,7 @@ ipcMain.handle('app:openExternalUrl', async (_event, url) => {
 
 // Clicking a thread-finished notification lands here: surface the window
 // even if it's minimized or behind another app.
+ipcMain.handle('app:isWindowFocused', (event) => BrowserWindow.fromWebContents(event.sender)?.isFocused() ?? true);
 ipcMain.handle('app:focusWindow', () => {
   const win = BrowserWindow.getAllWindows()[0];
   if (!win) return false;

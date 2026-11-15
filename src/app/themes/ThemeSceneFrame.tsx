@@ -44,12 +44,29 @@ type Props = {
   className?: string;
   style?: React.CSSProperties;
   title?: string;
+  /** Backdrop and overlay: whether they may move (motionPolicy.ts); widgets follow the switch. */
+  animate?: boolean;
+  /** Freeze the scene: its bootstrap holds animation frames, CSS animations and media. */
+  paused?: boolean;
 };
 
-export const ThemeSceneFrame: React.FC<Props> = ({ theme, html, role, name, interactive = false, onResize, className, style, title }) => {
+export const ThemeSceneFrame: React.FC<Props> = ({
+  theme,
+  html,
+  role,
+  name,
+  interactive = false,
+  onResize,
+  className,
+  style,
+  title,
+  animate: animateProp,
+  paused = false,
+}) => {
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   const srcDoc = useMemo(() => buildSceneDocument(html), [html]);
-  const animate = useThemeState((state) => state.animate);
+  const animateSetting = useThemeState((state) => state.animate);
+  const animate = animateProp ?? animateSetting;
   const values = useThemeValues(theme.id);
   const valuesRef = useRef(values);
   valuesRef.current = values;
@@ -78,6 +95,7 @@ export const ThemeSceneFrame: React.FC<Props> = ({ theme, html, role, name, inte
           count: running.length,
           focused: document.hasFocus(),
           reducedMotion: !animate || prefersReducedMotion(),
+          paused,
           appearance,
           values: valuesRef.current,
           colors: themeColors(),
@@ -107,7 +125,7 @@ export const ThemeSceneFrame: React.FC<Props> = ({ theme, html, role, name, inte
       window.removeEventListener('message', onMessage);
       remove();
     };
-  }, [themeId, label, animate, appearance, srcDoc]);
+  }, [themeId, label, animate, paused, appearance, srcDoc]);
 
   // Values changed (a control, another scene, the agent): tell this frame.
   const previous = useRef(values);

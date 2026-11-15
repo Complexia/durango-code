@@ -14,6 +14,7 @@ import {
   themeSummary,
 } from '../ui-themes.js';
 import { DurangoError } from './durango-client.js';
+import { backdropVideoNote } from './video-probe.js';
 import {
   canUndoTheme,
   deleteTheme,
@@ -109,7 +110,7 @@ export const THEME_TOOL_DESCRIPTIONS = Object.freeze({
 Tokens (CSS custom properties; plain colors, gradients, lengths, font lists; no url()): ${tokenTable()}.
 Over a backdrop, bg-base/bg-raised/bg-surface/settings-sidebar-bg turn translucent by surface_opacity (default 0.72) so it shows through (base_opacity sets the main transcript area separately); panel_blur frosts panels. Keep text readable: text-primary at least 7:1 against your panels.
 Backdrops: {type:"css", css:"<background value>"} | {type:"image", image_path:"/abs/file.png"} | {type:"video", video_path:"/abs/file.mp4"} (muted loop) | {type:"html", html:"<canvas>…<script>…"} (animated scene), each with optional dim (0-0.9 black veil), blur (px), saturate (0-2). To make a backdrop with AI, call generate_theme_media instead.
-HTML scenes (backdrop.html, overlay.html) run full-window in a sandbox with no network (inline <style>/<script>, canvas, SVG, data: URIs only), transparent page background; overlay scenes sit above the app with pointer events off, so keep them sparse (particles, confetti, scanlines). In a scene, window.durango.on(event, fn) and durango.state ({working, count, pointer, focused, reducedMotion, appearance}) tell you what the app is doing: ${sceneEvents()}. Make scenes react (calm when idle, livelier while an agent works, a celebration on turn-end "done"), cap devicePixelRatio at 1.5, throttle when !focused, stop when document.hidden, and draw a still frame when reducedMotion.
+HTML scenes (backdrop.html, overlay.html) run full-window in a sandbox with no network (inline <style>/<script>, canvas, SVG, data: URIs only), transparent page background; overlay scenes sit above the app with pointer events off, so keep them sparse (particles, confetti, scanlines). In a scene, window.durango.on(event, fn) and durango.state ({working, count, pointer, focused, reducedMotion, paused, appearance}) tell you what the app is doing: ${sceneEvents()}. Make scenes react (calm when idle, livelier while an agent works, a celebration on turn-end "done"), cap devicePixelRatio at 1.5, throttle when !focused, stop when document.hidden, and draw a still frame when reducedMotion (the app freezes a paused scene a second later either way).
 css: extra CSS for the app (no @import or remote url(); theme-asset("file") refers to this theme's files). Hooks: ${SELECTOR_GUIDE}. Prefer tokens over CSS; use CSS for shapes, shadows, gradients on specific parts, letter-spacing and the like.
 Values and controls (the theme's own UI, anywhere the user wants it): declare values, e.g. values: { snow: {type:"boolean", default:true, label:"Snow"}, time: {type:"choice", options:[{value:"day", icon:"sun", label:"Day"}, {value:"night", icon:"moon", label:"Night"}], default:"day"}, glow: {type:"number", min:0, max:1, step:0.05, default:0.6} }, and controls that change them: controls: [{id, kind, value (the value it changes; defaults to id), placement, icon | svg | label, tooltip, show_label}]. Kinds: ${THEME_CONTROL_KINDS.join(', ')}. toggle: a boolean (on/off: {icon, svg, label} per state). choice: a choice value, style "cycle" (one button stepping through the options, showing the current one) or "segmented" (a button per option). menu: a choice value as a dropdown. slider: a number value (width in px). button: action: "<name>" (scenes and widgets hear the action event) and/or set: {value: x}. html: your own widget (any UI: knob, clock, mini player…): html page, width, height, in a sandboxed frame that takes clicks and keys; in it durango.values, durango.set(name, value), durango.action(name, detail), durango.resize(width, height), and durango.state.colors (the theme's resolved colors) to match the app. Icons: any Lucide name (lucide.dev: "snowflake", "sun", "moon", "cloud-snow", "sparkles"…) or svg: "<svg viewBox='0 0 24 24'>…</svg>" (shapes only, stroke currentColor).
 Placement: {slot: "<name>"} for spots the app keeps for theme controls: ${slotList()}. Or {selector: "<css selector>", position: "before" | "after" | "start" | "end"} to sit next to or inside any element (get_app_theme with ui_map: true shows what is on screen with selectors and boxes). Or position: "float" to hover over the window (no slot/selector) or over an element, at corner top-left | top-right | bottom-left | bottom-right | center, moved by x/y px. all: true repeats a control for every match (each split pane); order sorts controls sharing a spot. Controls merge by id (a control with an existing id replaces it; {id, remove: true} drops it; controls: null removes all); values: {name: null} removes a value.
@@ -491,7 +492,7 @@ const resolveTarget = async (threadId, startFrom, themeRef) => {
   return { base: source };
 };
 
-const withFile = async (input, themeIdForAssets) => {
+const withFile = async (input, themeIdForAssets, notes = null) => {
   const { image_path: imagePath, video_path: videoPath, ...rest } = input;
   const patch = { ...rest };
   if (imagePath || videoPath) {
@@ -504,6 +505,10 @@ const withFile = async (input, themeIdForAssets) => {
     const asset = await importThemeAsset(themeIdForAssets, String(imagePath || videoPath));
     patch.type = isVideoAsset(asset) ? 'video' : 'image';
     patch.asset = asset;
+    if (patch.type === 'video' && notes) {
+      const note = backdropVideoNote(await fs.readFile(String(imagePath || videoPath)).catch(() => null));
+      if (note) notes.push(note);
+    }
   }
   return patch;
 };
@@ -516,14 +521,15 @@ const needsFile = (input) =>
         (Array.isArray(input.variants) && input.variants.some((variant) => variant?.image_path || variant?.video_path)))
   );
 
-const backdropPatch = async (input, themeIdForAssets) => {
+/** `notes`: collects performance notes about the video files it imports. */
+const backdropPatch = async (input, themeIdForAssets, notes = null) => {
   if (input === null) return { backdrop: null };
   if (!input || typeof input !== 'object') return {};
-  const patch = await withFile(input, themeIdForAssets);
+  const patch = await withFile(input, themeIdForAssets, notes);
   if (Array.isArray(input.variants)) {
     patch.variants = [];
     for (const variant of input.variants) {
-      if (variant && typeof variant === 'object') patch.variants.push(await withFile(variant, themeIdForAssets));
+      if (variant && typeof variant === 'object') patch.variants.push(await withFile(variant, themeIdForAssets, notes));
     }
   }
   return { backdrop: patch };
@@ -651,9 +657,10 @@ const setAppTheme = async (args, context) => {
   let themeId = target.id;
   if (args.values !== undefined) patch.values = args.values;
   if (args.controls !== undefined) patch.controls = args.controls;
+  const videoNotes = [];
   if (args.backdrop !== undefined) {
     if (needsFile(args.backdrop)) themeId = await ensureThemeId({ threadId, target });
-    Object.assign(patch, await backdropPatch(args.backdrop, themeId));
+    Object.assign(patch, await backdropPatch(args.backdrop, themeId, videoNotes));
   }
   if (patch.name === undefined && defaultNameFor(target)) patch.name = defaultNameFor(target);
   const { theme, ignored } = await updateTheme({
@@ -678,6 +685,7 @@ const setAppTheme = async (args, context) => {
     `Applied "${theme.name}" (${theme.id}, revision ${theme.revision}); Durango Code shows it now.`,
     savedNote(theme),
     ignored.length ? `Ignored: ${ignored.join('; ')}.` : null,
+    ...[...new Set(videoNotes)],
     errors.length ? `Scene script errors (fix them): ${errors.join(' | ')}` : hasScene ? 'Scenes loaded without script errors.' : null,
     valueNote,
     ...(await controlLines(theme, context.getSender)),
@@ -737,6 +745,7 @@ const generateThemeMedia = async (args, context) => {
       creditsUsed = image.creditsUsed;
     } else {
       const duration = Number.isInteger(args.duration) ? args.duration : 6;
+      // No resolution: the API's default (720p) is what a backdrop needs.
       const { runId } = await durangoClient.startVideoGeneration({ model, prompt, aspectRatio, duration, signal });
       const deadline = Date.now() + VIDEO_WAIT_MS;
       let run = null;
@@ -800,6 +809,7 @@ const generateThemeMedia = async (args, context) => {
       : apply
       ? `It is the backdrop now (${asset}). Tune the palette to match it with set_app_theme (accent, surfaces, surface_opacity) and check with screenshot: true. To adjust the picture itself, pass backdrop { dim, blur, saturate } without image_path: the file stays.`
       : `Use it with set_app_theme css as theme-asset("${asset}").`,
+    kind === 'video' ? backdropVideoNote(Buffer.from(media.data)) : null,
     theme ? savedNote(theme) : null,
     args.screenshot === true ? 'The picture below is a screenshot of the app window, not the backdrop file: never pass it as image_path.' : null,
     apply ? performanceNotes(theme) : null,

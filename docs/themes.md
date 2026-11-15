@@ -69,6 +69,38 @@ panels ~68; the same snow drawn from one sprite at 30 fps ~62; with static frost
 - **Screenshots** are only for the agent to check its work: they show the user's threads, so the
   guidance says never to use one as a backdrop or theme file.
 
+## Motion
+
+`src/app/themes/motionPolicy.ts` decides when a theme's moving parts (video backdrops, HTML
+scenes) play:
+
+- **Still:** the "Animated backdrops and effects" switch is off, or the OS asks for reduced motion
+  (followed live). A video shows its poster, the overlay is removed, and an HTML backdrop is told
+  `reducedMotion` and then frozen.
+- **Paused:** the window is hidden (minimized, `hide()`, another Space), or Durango Code has not been
+  the focused app for 12 s, unless "Keep animating in the background" is on (off by default). A
+  video freezes on its current frame; scenes freeze. Focus is the window's own (`app:windowFocus`
+  from main), so a built-in browser tab taking focus still counts as using the app.
+  - Measured in Electron 42.5: Chromium already stops a backdrop video when the window is
+    minimized, hidden or on another Space. It kept playing when the window was fully covered by
+    another window, which macOS did not reliably report as hidden, and when the app was simply
+    unfocused. The other app has focus in both cases, so the 12 s rule covers them.
+- **Freezing a scene** is enforced by the frame's bootstrap, not left to the scene's code
+  (`THEME_SCENE_BOOTSTRAP` in `ui-themes.js`). One second after `state.paused`, so a
+  reduced-motion still frame can draw first:
+  - animation frame callbacks are held (one runs per resize, so a resized canvas redraws);
+  - CSS animations pause (`html.durango-paused`);
+  - playing `<video>`s pause.
+- **Posters:** a video backdrop without a poster gets one. About 1.5 s after it shows, the renderer
+  takes the frame at 0.1 s and saves it as `poster-*.jpg` (`videoPoster.ts`, `themes:videoForPoster`
+  / `themes:savePoster`; videos up to 60 MB; not an undo step). The bytes come over IPC as a
+  same-origin blob, because a canvas cannot export frames from `orion-attachment:` media. "Still"
+  then shows an image instead of a paused video holding a decoder.
+- **Video size:** `set_app_theme` (`video_path`) and `generate_theme_media` (video) tell the agent
+  when a video is larger than 1920×1080 or faster than 30 fps (`src/main/video-probe.js` reads
+  MP4/MOV boxes; no decoder). A backdrop decodes every frame for as long as it plays. Generated
+  videos use the API's default resolution, 720p.
+
 ## Safety
 
 - Tokens accept colors, gradients, lengths and font lists only (no `url()`, no `;{}<>`, no escapes).
