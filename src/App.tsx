@@ -38,7 +38,6 @@ import {
   Menu,
   SlidersHorizontal,
   Plug,
-  Globe,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import {
@@ -2421,19 +2420,8 @@ const App: React.FC = () => {
     },
     [threads]
   );
-  const browserAgentTabCount = browserPanelTabs.filter((tab) => tab.ownerKey !== 'user').length;
   // With no tab there is nothing to preview: only the expanded view shows.
   const browserVisible = browserPanelOpen && (browserExpanded || browserPanelTabs.length > 0);
-  const toggleBrowser = useCallback(() => {
-    if (browserVisible) {
-      setBrowserPanelOpen(false);
-      setBrowserExpanded(false);
-      return;
-    }
-    setBrowserPanelOpen(true);
-    // Nothing to preview yet: open straight to the address bar.
-    setBrowserExpanded(browserPanelTabs.length === 0);
-  }, [browserVisible, browserPanelTabs.length, setBrowserPanelOpen]);
   const collapseBrowser = useCallback(() => {
     setBrowserExpanded(false);
     if (browserPanelTabs.length === 0) setBrowserPanelOpen(false);
@@ -10998,20 +10986,6 @@ const App: React.FC = () => {
           </div>
 
           <div className="shell-right-group">
-            {activeTab === 'agents' && !settingsOpen && (
-              <button
-                type="button"
-                className="shell-openwith-trigger"
-                aria-pressed={browserVisible}
-                aria-expanded={browserVisible}
-                title={browserVisible ? 'Hide browser' : 'Show browser'}
-                aria-label={browserVisible ? 'Hide browser' : 'Show browser'}
-                onClick={toggleBrowser}
-              >
-                <Globe size={14} />
-                {browserAgentTabCount > 0 && <span className="text-[11px] tabular-nums">{browserAgentTabCount}</span>}
-              </button>
-            )}
             {openWithApps.length > 0 && activeWorkingDir && (
               <div className="shell-openwith-control" ref={openWithRef}>
                 <button
