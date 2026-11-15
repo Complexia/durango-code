@@ -2,9 +2,10 @@
 // src/ui-themes.js (sanitizeTheme passes every field through unchanged).
 //
 // Each animated backdrop is a self-contained canvas scene: no network, no
-// external files, devicePixelRatio capped at 1.5, ~15 fps when the window is
-// not focused, nothing drawn while the document is hidden, one still frame
-// when reduced motion is on. Scenes listen to the app through
+// external files, devicePixelRatio capped at 1.5, the same frame rate focused
+// or not (the app freezes scenes a while after it loses focus), nothing drawn
+// while the document is hidden, one still frame when reduced motion is on.
+// Scenes listen to the app through
 // `window.durango` (THEME_SCENE_EVENTS): `working` eases them into a busier
 // state over about a second, a finished turn (or Preview celebration) plays a
 // short celebration.
@@ -23,7 +24,7 @@ function fit(){R=Math.min(1.5,window.devicePixelRatio||1);W=Math.max(1,innerWidt
 function kick(){if(!raf&&!tmo)raf=requestAnimationFrame(tick);}
 function tick(now){raf=0;if(document.hidden){last=0;return;}var s=D.state;if(Math.max(1,innerWidth)!==W||Math.max(1,innerHeight)!==H)fit();
 if(s.reducedMotion){if(!rm){rm=1;dirty=1;}if(dirty){dirty=0;wl=wk=s.working?1:0;X.setTransform(R,0,0,R,0,0);draw(0,1);}last=0;tmo=setTimeout(function(){tmo=0;kick();},500);return;}rm=0;
-var gap=s.focused===false?62:MF;if(gap&&last&&now-last<gap){raf=requestAnimationFrame(tick);return;}
+var gap=MF;if(gap&&last&&now-last<gap){raf=requestAnimationFrame(tick);return;}
 var dt=last?Math.min(0.1,(now-last)/1000):0.016;last=now;T+=dt;
 wl=Math.max(0,Math.min(1,wl+(s.working?dt:-dt)*0.9));wk=wl*wl*(3-2*wl);
 X.setTransform(R,0,0,R,0,0);draw(dt,0);raf=requestAnimationFrame(tick);}
