@@ -138,6 +138,7 @@ import {
   sidebarRootThread,
   sidebarV2ThreadLists,
   subagentQuestionSources,
+  subagentReportText,
   threadsAwaitingUserAction,
   useStableIdList,
   useThreadsNeedingInput,
@@ -5961,6 +5962,8 @@ const App: React.FC = () => {
         ...(mentionedChats.length > 0 ? { hasChatMentions: true } : {}),
         ...(mcpServerIds.length > 0 ? { mcpServerIds } : {}),
         ...(orchestration ? { orchestration } : {}),
+        // A spawn_subagent child's turn reports to the agent that spawned it.
+        ...(thread.spawnId ? { spawnedSubagent: true } : {}),
       });
       void startup.then((result) => {
         if (result.ok && result.runId) {
@@ -6426,7 +6429,7 @@ const App: React.FC = () => {
         const lastAgentMessage = [...messages]
           .reverse()
           .find((message) => message.role === 'agent' && (message.content.trim() || message.error));
-        const output = lastAgentMessage?.content.trim();
+        const output = subagentReportText(messages);
         void window.orion?.reportSubagentResult?.({
           spawnId,
           ok: status === 'done',

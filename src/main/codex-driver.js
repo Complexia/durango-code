@@ -826,7 +826,11 @@ export const createCodexAppServerDriver = ({
               ...(Array.isArray(question.options) ? question.options.filter((option) => typeof option === 'string').map((option) => `- ${option}`) : []),
             ].join('\n')).join('\n\n')}`);
           }
-          if (questions.length && !ended && callbacks.onUserInput) {
+          // A spawn_subagent child asks whoever spawned it: the questions are
+          // already in its reply, which is the report the parent agent gets.
+          // A card would flag the user for a question that isn't theirs, and
+          // stay after the run ends, when no one waits on an answer.
+          if (questions.length && !ended && callbacks.onUserInput && !input.spawnedSubagent) {
             pendingUserInputs.set(`async:${item.id}`, {
               id: `async:${item.id}`,
               async: true,

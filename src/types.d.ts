@@ -1544,6 +1544,8 @@ type OrionCodexBrowserIntegrationStatus = {
         forkSession?: boolean;
         /** One-shot side question (/btw): never touches the thread's persistent claude session. */
         aside?: boolean;
+        /** A spawn_subagent child's turn: its non-blocking questions go to the parent agent in its report, not to the user. */
+        spawnedSubagent?: boolean;
         /** Codex goal run (/goal): drive the turn over `codex app-server` and pursue the goal across turns. */
         codexGoal?: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number };
         /** Preserved branch context used only when starting a fresh Codex goal thread. */

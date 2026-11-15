@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { type Thread, type UserAction } from '../store';
+import { type Message, type Thread, type UserAction } from '../store';
 import type { SubagentQuestionSource } from './CodexQuestions';
 import { workStartedAt } from '../thread-shell.js';
 import { getThreadActivityTime } from './time';
@@ -284,6 +284,26 @@ export const subagentQuestionSources = (threads: Thread[], threadId: string): Su
         },
       ];
     });
+};
+
+/**
+ * The result a spawn_subagent child reports to its parent: everything it
+ * replied after the spawn prompt. Steering the child splits its reply into
+ * one message per steer; reporting only the last part would drop what it said
+ * earlier, such as a question meant for the parent (Codex async questions from
+ * spawned children are not shown to the user, codex-driver.js). Steers are
+ * included as notes so the parent can follow the change of direction. Empty
+ * when the child wrote nothing.
+ */
+export const subagentReportText = (messages: Pick<Message, 'role' | 'content'>[]): string => {
+  const firstPrompt = messages.findIndex((message) => message.role === 'user');
+  const parts = messages.slice(firstPrompt + 1).flatMap((message) => {
+    const text = message.content.trim();
+    if (!text || (message.role !== 'agent' && message.role !== 'user')) return [];
+    return [{ agent: message.role === 'agent', text }];
+  });
+  if (!parts.some((part) => part.agent)) return '';
+  return parts.map((part) => (part.agent ? part.text : `[The user steered the subagent: ${part.text}]`)).join('\n\n');
 };
 
 /** Stable Set identity for an id list, so memoized consumers don't churn. */

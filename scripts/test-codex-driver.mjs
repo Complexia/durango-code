@@ -849,6 +849,25 @@ assert.equal(astraWire.length, wireBeforeLateAnswer, 'late answers must not writ
 assert.equal(completedQuestions.answer('astra-run', 'async:late-question', { 0: ['B'] }), null, 'late answers cannot replay');
 assert.equal(completedQuestions.list('orion-astra').length, 0);
 
+// A spawn_subagent child's async questions go to its parent in its reply:
+// no card for the user while it runs, nothing retained after it ends.
+// Blocking questions still reach the user (the run waits on them).
+astraDriver = createCodexAppServerDriver({
+  child: astraChild, cwd: '/tmp', model: astra, input: { ...astraInput, spawnedSubagent: true },
+  resumeSessionId: 'astra-native', accessMode: 'full-access', callbacks: astraCallbacks,
+});
+await astraDriver.start();
+const textBeforeSubagentAsync = astraText.join('').length;
+astraDriver.handleMessage({ method: 'item/completed', params: { threadId: 'astra-native', item: { ...asyncItem, id: 'subagent-question' } } });
+assert.match(astraText.join('').slice(textBeforeSubagentAsync), /Which design\?\n- A\n- B/, 'the question stays in the reply the parent reads');
+assert.equal(astraDriver.getUserInputs().length, 0, 'a spawned subagent async question is not shown to the user');
+ask('subagent-blocking');
+assert.equal(astraDriver.getUserInputs().length, 1, 'blocking questions from a spawned subagent still reach the user');
+astraDriver.handleMessage({ method: 'turn/completed', params: { threadId: 'astra-native', turn: { id: 'astra-turn', status: 'completed' } } });
+await astraDriver.dispose();
+astraDriver = null;
+assert.equal(completedQuestions.list('orion-astra').length, 0, 'a finished spawned subagent leaves no question behind');
+
 // Exercise the actual IPC routing with only a goal driver registered. The
 // ordinary-steer map intentionally has no entry for this run.
 let answerGoalQuestion;
