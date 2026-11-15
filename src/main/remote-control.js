@@ -2441,6 +2441,10 @@ const handleHostRequest = async (session, message) => {
             codexServiceTier: sanitizeCodexServiceTier(message?.codexServiceTier),
             claudeContextWindow: sanitizeClaudeContextWindow(message?.claudeContextWindow),
             source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
+            // An agent of the controller sent this turn (machine_run_agent).
+            // In a thread that agent created, its non-blocking questions go
+            // back to that agent in the reply, not to a card here (App.tsx).
+            ...(message?.fromAgent === true ? { fromAgent: true } : {}),
             // A new thread an agent of the controller started (machine_run_agent):
             // its subagent, listed back to that controller under the thread there.
             ...(typeof message?.spawnedBy?.threadId === 'string' &&
@@ -3660,6 +3664,7 @@ export const runRemoteTurn = async ({
   codexServiceTier,
   claudeContextWindow,
   spawnedBy,
+  fromAgent,
   turnKey,
 } = {}) => {
   try {
@@ -3707,6 +3712,8 @@ export const runRemoteTurn = async ({
         ...(!threadId && typeof spawnedBy?.threadId === 'string' && spawnedBy.threadId
           ? { spawnedBy: { threadId: spawnedBy.threadId } }
           : {}),
+        // An agent here sent the turn (machine_run_agent), not the user.
+        ...(fromAgent === true ? { fromAgent: true } : {}),
       },
       (Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS) +
         (Number.isFinite(deps?.clientResponseGraceMs)

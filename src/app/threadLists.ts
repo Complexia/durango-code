@@ -306,6 +306,17 @@ export const subagentReportText = (messages: Pick<Message, 'role' | 'content'>[]
   return parts.map((part) => (part.agent ? part.text : `[The user steered the subagent: ${part.text}]`)).join('\n\n');
 };
 
+/**
+ * Whether a turn reports to an agent rather than the user, so the agent's
+ * non-blocking questions go to that agent in its reply instead of a card
+ * (codex-driver.js): a spawn_subagent child's turn, or a turn an agent on
+ * another machine sent (machine_run_agent) in a thread it created there. An
+ * agent's follow-up in a thread the user started keeps its cards: the user
+ * may be following that thread.
+ */
+export const turnReportsToAgent = (thread: Pick<Thread, 'spawnId' | 'spawnedBy'>, fromAgent?: boolean): boolean =>
+  Boolean(thread.spawnId) || (fromAgent === true && Boolean(thread.spawnedBy));
+
 /** Stable Set identity for an id list, so memoized consumers don't churn. */
 export const useStableIdList = (ids: string[]) => {
   const key = ids.join('\u0000');

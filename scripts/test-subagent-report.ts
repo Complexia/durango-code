@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { subagentReportText } from '../src/app/threadLists';
+import { subagentReportText, turnReportsToAgent } from '../src/app/threadLists';
 
 // What a spawn_subagent child reports back to the agent that spawned it.
 const user = (content: string) => ({ role: 'user' as const, content });
@@ -29,5 +29,14 @@ assert.equal(
   subagentReportText([{ role: 'system', content: 'Run started' }, user('Do it'), { role: 'system', content: 'Compacted' }, agent('Done')]),
   'Done'
 );
+
+// Whose a turn's non-blocking questions are: the agent that sent it, only in
+// a thread an agent created.
+const spawnedBy = { machineId: 'm-mac', machineName: 'Mac', threadId: 'mac-thread' };
+assert.equal(turnReportsToAgent({ spawnId: 'spawn-1' }), true, 'a spawn_subagent child');
+assert.equal(turnReportsToAgent({ spawnedBy }, true), true, 'machine_run_agent in the thread it created');
+assert.equal(turnReportsToAgent({ spawnedBy }, false), false, 'the user typing in that thread on the host');
+assert.equal(turnReportsToAgent({}, true), false, 'an agent follow-up in a thread the user started');
+assert.equal(turnReportsToAgent({}), false, 'an ordinary user turn');
 
 console.log('Subagent report tests passed.');

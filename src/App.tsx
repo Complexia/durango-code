@@ -139,6 +139,7 @@ import {
   sidebarV2ThreadLists,
   subagentQuestionSources,
   subagentReportText,
+  turnReportsToAgent,
   threadsAwaitingUserAction,
   useStableIdList,
   useThreadsNeedingInput,
@@ -1127,7 +1128,8 @@ const App: React.FC = () => {
         attachments: FileAttachment[],
         claimStart?: (threadId?: string) => Promise<boolean>,
         applyClaimedSettings?: () => void,
-        extraContext?: string
+        extraContext?: string,
+        fromAgent?: boolean
       ) => Promise<ThreadTurnStartResult>)
     | null
   >(null);
@@ -5586,7 +5588,10 @@ const App: React.FC = () => {
       applyClaimedSettings?: () => void,
       // Agent context the transcript doesn't show (a controller's copies of
       // threads its prompt mentions that this machine can't read).
-      extraContext?: string
+      extraContext?: string,
+      // An agent sent this turn (machine_run_agent from another machine);
+      // it counts as the agent's only in a thread that agent created.
+      fromAgent?: boolean
     ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
       if (claimStart && !(await claimRemoteThreadStart(() => claimStart(threadId), applyClaimedSettings))) {
@@ -5962,8 +5967,8 @@ const App: React.FC = () => {
         ...(mentionedChats.length > 0 ? { hasChatMentions: true } : {}),
         ...(mcpServerIds.length > 0 ? { mcpServerIds } : {}),
         ...(orchestration ? { orchestration } : {}),
-        // A spawn_subagent child's turn reports to the agent that spawned it.
-        ...(thread.spawnId ? { spawnedSubagent: true } : {}),
+        // A turn an agent sent in a thread it created reports to that agent.
+        ...(turnReportsToAgent(thread, fromAgent) ? { spawnedSubagent: true } : {}),
       });
       void startup.then((result) => {
         if (result.ok && result.runId) {
@@ -6020,7 +6025,10 @@ const App: React.FC = () => {
       applyClaimedSettings?: () => void,
       // Agent context the transcript doesn't show (a controller's copies of
       // threads its prompt mentions that this machine can't read).
-      extraContext?: string
+      extraContext?: string,
+      // An agent sent this turn (machine_run_agent from another machine);
+      // it counts as the agent's only in a thread that agent created.
+      fromAgent?: boolean
     ): Promise<ThreadTurnStartResult> => {
       // A thread on another machine starts its turns there, whichever path
       // (retry, follow-up, composer) asked for one.
@@ -6048,7 +6056,8 @@ const App: React.FC = () => {
               attachments,
               claimStart,
               applyClaimedSettings,
-              extraContext
+              extraContext,
+              fromAgent
             );
           } finally {
             release();
@@ -8879,7 +8888,8 @@ const App: React.FC = () => {
               Array.isArray(command.attachments) ? command.attachments : [],
               claimStart,
               applyClaimedSettings,
-              typeof command.context === 'string' ? command.context : undefined
+              typeof command.context === 'string' ? command.context : undefined,
+              command.fromAgent === true
             )
           : undefined;
         if (!start) {

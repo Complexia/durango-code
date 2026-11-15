@@ -618,18 +618,36 @@ const replyAfterPrompt = (thread, prompt, fromIndex = 0) => {
   }
   if (start === -1) return null;
   const replies = [];
+  // The reply in order, with steers: a steer (a user message sent into the
+  // running turn) continues this turn in a new agent message, so it isn't a
+  // later turn.
+  const parts = [];
   let laterTurn = false;
+  let awaitingContinuation = false;
   for (const message of messages.slice(start + 1)) {
     if (message?.role === 'user') {
-      laterTurn = true;
-      break;
+      if (message.steer !== true) {
+        laterTurn = true;
+        break;
+      }
+      parts.push({ steer: String(message.content ?? '').trim() });
+      awaitingContinuation = true;
+      continue;
     }
-    if (message?.role === 'agent') replies.push(message);
+    if (message?.role === 'agent') {
+      replies.push(message);
+      parts.push({ reply: message });
+      awaitingContinuation = false;
+    }
   }
   return {
     replies,
+    parts,
     laterTurn,
-    finished: replies.length > 0 && replies.every((message) => message.status !== 'running'),
+    finished:
+      replies.length > 0 &&
+      !awaitingContinuation &&
+      replies.every((message) => message.status !== 'running'),
   };
 };
 
@@ -712,7 +730,20 @@ const turnWasStopped = (thread, prompt, fromIndex) => lastTurnReply(thread, prom
 const formatTurnResult = (machine, thread, prompt, fromIndex) => {
   const last = lastTurnReply(thread, prompt, fromIndex);
   const status = last?.status === 'error' ? 'failed' : last?.status === 'stopped' ? 'was stopped' : 'finished';
-  const content = String(last?.content ?? '').trim();
+  // Every part of the turn's reply, not only the last: a question the agent
+  // there asked this agent (not shown to the user there) may be in an
+  // earlier part, and a steer from the user there splits the reply.
+  const parts = replyAfterPrompt(thread, prompt, fromIndex)?.parts ?? [];
+  const content = (parts.some((part) => part.reply) ? parts : [{ reply: last }])
+    .map((part) =>
+      part.reply
+        ? String(part.reply?.content ?? '').trim()
+        : part.steer
+          ? `[Steered by the user there: ${part.steer}]`
+          : ''
+    )
+    .filter(Boolean)
+    .join('\n\n');
   return [
     `The turn on ${machine.name} ${status} — thread "${thread.title}" (id: ${thread.id}).`,
     '',
@@ -819,6 +850,10 @@ const machineRunAgent = async (args, context) => {
       ...(!threadId && typeof context?.threadId === 'string' && context.threadId
         ? { spawnedBy: { threadId: context.threadId } }
         : {}),
+      // This agent sent the turn. In a thread it created there, the agent
+      // there asks it, not the user, and its reply comes back here (the host
+      // decides; a thread the user started keeps its question cards).
+      fromAgent: true,
     });
     if (!started.ok || !started.threadId) {
       return fail(`Could not start the turn on ${machine.name}: ${started.error ?? 'no thread was started.'}`);

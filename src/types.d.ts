@@ -507,6 +507,8 @@ export type RemoteCommandRequest = {
      * (machine_run_agent) from its thread `threadId` there.
      */
     spawnedBy?: import('./store').ThreadSpawnedBy;
+    /** runTurn: an agent on the controller sent this turn (machine_run_agent), not the user. */
+    fromAgent?: boolean;
     /**
      * Set when Durango started this run (dispatch worker in main): the
      * renderer creates the thread exactly like a remote runTurn (or, for a
@@ -1544,7 +1546,11 @@ type OrionCodexBrowserIntegrationStatus = {
         forkSession?: boolean;
         /** One-shot side question (/btw): never touches the thread's persistent claude session. */
         aside?: boolean;
-        /** A spawn_subagent child's turn: its non-blocking questions go to the parent agent in its report, not to the user. */
+        /**
+         * A turn an agent sent (a spawn_subagent child, or machine_run_agent
+         * from another machine): its non-blocking questions go to that agent
+         * in the reply, not to the user.
+         */
         spawnedSubagent?: boolean;
         /** Codex goal run (/goal): drive the turn over `codex app-server` and pursue the goal across turns. */
         codexGoal?: { action: 'set' | 'resume'; objective?: string; tokenBudget?: number };

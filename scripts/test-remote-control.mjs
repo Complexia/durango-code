@@ -1012,6 +1012,7 @@ if (
       turnKey: 'turn-key-1',
       prompt: 'build the thing',
       context: '[Thread mentions from another machine]\nnewest page',
+      fromAgent: true,
     });
     results.runTurnEvents = remoteEventsSeen.splice(0);
     results.continueTurn = await engine.runRemoteTurn({
@@ -2076,6 +2077,7 @@ if (
     assert.equal(seen.command.kind, 'runTurn');
     assert.equal(seen.command.prompt, 'build the thing');
     assert.equal(seen.command.context, '[Thread mentions from another machine]\nnewest page', 'hidden context reaches the host renderer');
+    assert.equal(seen.command.fromAgent, true, 'a turn an agent sent (machine_run_agent) is marked on the host');
     console.log('ok  live large-thread transfer uses one stable snapshot across chunks');
 
     for (const [mode, errorPattern] of [

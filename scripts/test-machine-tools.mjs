@@ -80,6 +80,46 @@ const remote = {
       messages: [{ role: 'user', content: input.prompt }, { role: 'agent', content: '', status: 'running' }],
     });
     if (threadId === 't-slow') return { ok: true, threadId };
+    if (threadId === 't-steer') {
+      // The user there steers the turn: the first part closes, the steer is
+      // added, and the reply goes on (and here fails) in a new message.
+      const at = (ms, status, messages) =>
+        setTimeout(() => {
+          hostThreads.set('t-steer', { ...hostThreads.get('t-steer'), status, messages });
+          if (status !== 'running') {
+            for (const listener of listeners) {
+              listener({ machineId: 'm-omarchy', kind: 'turnEvent', payload: { type: 'error', threadId } });
+            }
+          }
+        }, ms);
+      const first = [
+        { role: 'user', content: input.prompt },
+        { role: 'agent', content: 'Started the review.', status: 'done' },
+        { role: 'user', content: 'Check the build too', steer: true },
+      ];
+      at(30, 'running', first);
+      at(120, 'running', [...first, { role: 'agent', content: 'Building', status: 'running' }]);
+      at(250, 'error', [...first, { role: 'agent', content: 'The build failed.', status: 'error' }]);
+      return { ok: true, threadId };
+    }
+    if (threadId === 't-split') {
+      // The reply comes in two parts; the first asks the caller something.
+      setTimeout(() => {
+        hostThreads.set('t-split', {
+          ...hostThreads.get('t-split'),
+          status: 'done',
+          messages: [
+            { role: 'user', content: input.prompt },
+            { role: 'agent', content: 'Which findings? They are not in my prompt.', status: 'done' },
+            { role: 'agent', content: 'Checked what I could: build passes.', status: 'done' },
+          ],
+        });
+        for (const listener of listeners) {
+          listener({ machineId: 'm-omarchy', kind: 'turnEvent', payload: { type: 'done', threadId } });
+        }
+      }, 50);
+      return { ok: true, threadId };
+    }
     if (threadId === 't-busy') {
       // A follow-up with the same text as an earlier turn; another follow-up
       // starts there before this waiter reads the saved transcript.
@@ -279,6 +319,7 @@ process.on('unhandledRejection', (error) => {
   const run = calls.find((call) => call.kind === 'runTurn').input;
   assert.equal(run.modelId, 'codex:gpt', "the caller's provider there");
   assert.deepEqual(run.spawnedBy, { threadId: 'local-driver' });
+  assert.equal(run.fromAgent, true, 'the host knows an agent sent the turn');
   assert.equal(remoteThreadSpawner('m-omarchy', 't-new'), 'local-driver');
   assert.equal(remoteThreadSpawner('m-studio', 't-new'), null);
 
@@ -303,6 +344,30 @@ process.on('unhandledRejection', (error) => {
   const followUp = calls.find((call) => call.kind === 'runTurn').input;
   assert.equal(followUp.modelId, undefined, 'a follow-up keeps its thread\'s model');
   assert.equal(followUp.spawnedBy, undefined);
+  assert.equal(followUp.fromAgent, true, 'a follow-up in an existing thread is the agent\'s turn too');
+
+  // The caller gets every part of the reply, including a question the agent
+  // there asked it before going on.
+  hostThreads.set('t-split', { id: 't-split', title: 'Verify', status: 'done', modelId: 'codex:gpt', messages: [] });
+  const split = await runMachineTool('machine_run_agent', { machine: 'omarchy', thread_id: 't-split', prompt: 'Verify the findings' }, {
+    ...full,
+    threadId: 'local-driver',
+  });
+  assert.equal(split.ok, true, split.text);
+  // A steer from the user there continues the turn: the caller waits for the
+  // continuation and gets the whole reply, with its outcome.
+  hostThreads.set('t-steer', { id: 't-steer', title: 'Review', status: 'done', modelId: 'codex:gpt', messages: [] });
+  const steered = await runMachineTool('machine_run_agent', { machine: 'omarchy', thread_id: 't-steer', prompt: 'Review it' }, {
+    ...full,
+    threadId: 'local-driver',
+  });
+  assert.equal(steered.ok, true, steered.text);
+  assert.match(steered.text, /failed/, 'the outcome is the continuation\'s, not the closed first part\'s');
+  assert.match(
+    steered.text,
+    /Started the review\.\n\n\[Steered by the user there: Check the build too\]\n\nThe build failed\./
+  );
+  assert.match(split.text, /Which findings\? They are not in my prompt\.\n\nChecked what I could: build passes\./);
 
   const models = [
     { id: 'claude:opus', providerId: 'claude', available: true },
