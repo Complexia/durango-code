@@ -7,4 +7,9 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['monaco-editor'],
   },
+  // Module workers, so a worker can load chunks on demand (the code
+  // highlighter's grammars); the default (iife) can't be code-split.
+  worker: {
+    format: 'es',
+  },
 });

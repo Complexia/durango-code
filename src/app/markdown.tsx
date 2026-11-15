@@ -8,6 +8,9 @@ import { imageFileNamePattern, isLocalFilePath, localMediaSrc, videoFileNamePatt
 import { handleLightboxImageClick } from './imageLightbox';
 import { sourceAttachmentSrc, useSourceAttachmentAccount } from './sourceAttachments';
 import { resolveThreadReference, threadReferencePattern } from './promptContext';
+import { CodeBlock } from './CodeBlock';
+import { fenceLanguage } from './codeHighlight';
+import { MermaidBlock } from './MermaidBlock';
 import { chatIdFromReference, chatReferencePattern, knownDurangoChat, knownDurangoChats, knownDurangoChatUrl } from './durangoChats';
 
 // Candidate base directories (in priority order) used to resolve relative
@@ -384,19 +387,167 @@ export const remarkMediaPathPreviews = () => (tree: MarkdownNode) => {
   previewMediaPaths(tree, shown);
 };
 
-export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink };
+/** Raw markdown of the document being rendered, to tell an open code fence from a closed one. */
+const MarkdownSourceContext = React.createContext('');
+
+/** Line endings in `text` between `from` and `to`: LF, CR and CRLF (one each), as the parser counts them. */
+const countLineEndings = (text: string, from = 0, to = text.length) => {
+  let count = 0;
+  for (let index = from; index < to; index += 1) {
+    const char = text.charCodeAt(index);
+    if (char === 10) count += 1;
+    else if (char === 13) {
+      count += 1;
+      if (text.charCodeAt(index + 1) === 10) index += 1;
+    }
+  }
+  return count;
+};
+
+/**
+ * Whether a fenced code block has its closing fence yet, from the parser's
+ * own output: `source.slice(start, end)` is the block's raw markdown and
+ * `contentText` its code text as rendered (the parser's value plus a newline).
+ * A closed block spans one more line ending than its content (opener,
+ * content, closer), and its last line is a fence. Indented code has no fence
+ * and is always complete. Runs on every streamed chunk, so it only counts
+ * line endings and never builds per-line strings.
+ */
+export const isFencedCodeClosed = (source: string, start: number, end: number, contentText: string): boolean => {
+  let first = start;
+  while (first < end && (source[first] === ' ' || source[first] === '\t' || source[first] === '>')) first += 1;
+  const fenceChar = source[first];
+  if ((fenceChar !== '`' && fenceChar !== '~') || source[first + 1] !== fenceChar || source[first + 2] !== fenceChar) {
+    return true;
+  }
+  if (countLineEndings(source, start, end) <= countLineEndings(contentText)) return false;
+  const lastLineStart = Math.max(source.lastIndexOf('\n', end - 1), source.lastIndexOf('\r', end - 1)) + 1;
+  const lastLine = source.slice(lastLineStart, end).replace(/[ \t>]/g, '');
+  return lastLine.length >= 3 && [...lastLine].every((char) => char === fenceChar);
+};
+
+type HastNode = {
+  type: string;
+  tagName?: string;
+  value?: string;
+  properties?: { className?: unknown; [key: string]: unknown };
+  children?: HastNode[];
+  position?: { start: { offset?: number }; end: { offset?: number } };
+};
+
+const hastText = (node: HastNode): string =>
+  node.type === 'text' ? (node.value ?? '') : (node.children ?? []).map(hastText).join('');
+
+// Fenced and indented code: highlighted blocks, and Mermaid fences as diagrams.
+// Inline code never reaches here (react-markdown only wraps blocks in <pre>).
+export const MarkdownPre: React.FC<React.ComponentPropsWithoutRef<'pre'> & ExtraProps> = ({ node, children }) => {
+  const source = useContext(MarkdownSourceContext);
+  const hast = node as HastNode | undefined;
+  const codeNode = hast?.children?.find((child) => child.type === 'element' && child.tagName === 'code');
+  if (!hast || !codeNode) return <pre>{children}</pre>;
+  const className = codeNode.properties?.className;
+  const language = fenceLanguage(Array.isArray(className) ? className.join(' ') : String(className ?? ''));
+  let code = hastText(codeNode);
+  const start = hast.position?.start.offset;
+  const end = hast.position?.end.offset;
+  const closed = start === undefined || end === undefined || !source ? true : isFencedCodeClosed(source, start, end, code);
+  // An open fence runs to the end of the text, and the code text always ends
+  // in a newline, even when the last line is still being written. Drop that
+  // newline so the unfinished line reads as unfinished.
+  const lastChar = source.charCodeAt(source.length - 1);
+  if (!closed && lastChar !== 10 && lastChar !== 13) code = code.replace(/\n$/, '');
+  if (language === 'mermaid') return <MermaidBlock code={code} closed={closed} />;
+  return <CodeBlock code={code} language={language} final={closed} />;
+};
+
+/** Columns whose longest cell is at least this many characters read as prose. */
+const PROSE_COLUMN_CHARS = 40;
+
+/**
+ * Cells of the prose columns of a table: they keep a readable width (index.css)
+ * instead of being squeezed to one word per line by a neighbour that can't
+ * wrap (a long path in a code span); the table scrolls sideways instead.
+ */
+export const proseTableCells = (table: HastNode): Set<HastNode> => {
+  const rows: HastNode[][] = [];
+  const collect = (node: HastNode) => {
+    for (const child of node.children ?? []) {
+      if (child.type !== 'element') continue;
+      if (child.tagName === 'tr') {
+        rows.push((child.children ?? []).filter((cell) => cell.tagName === 'td' || cell.tagName === 'th'));
+      } else collect(child);
+    }
+  };
+  collect(table);
+  const longest: number[] = [];
+  for (const row of rows) {
+    row.forEach((cell, column) => {
+      longest[column] = Math.max(longest[column] ?? 0, hastTextLength(cell));
+    });
+  }
+  const cells = new Set<HastNode>();
+  for (const row of rows) {
+    row.forEach((cell, column) => {
+      if ((longest[column] ?? 0) >= PROSE_COLUMN_CHARS) cells.add(cell);
+    });
+  }
+  return cells;
+};
+
+/** Text length of a hast subtree, without building the string. */
+const hastTextLength = (node: HastNode): number =>
+  node.type === 'text' ? (node.value ?? '').length : (node.children ?? []).reduce((sum, child) => sum + hastTextLength(child), 0);
+
+/**
+ * Rehype plugin for tables, done once while parsing instead of by a React
+ * component per table and per cell: each table goes in a scrolling wrapper
+ * (`.markdown-table`, so a wide table scrolls inside the message instead of
+ * squeezing its columns), and the cells of its prose columns get
+ * `data-prose` (a readable minimum width in index.css).
+ */
+export const rehypeMarkdownTables = () => (tree: HastNode) => {
+  const visit = (node: HastNode) => {
+    const children = node.children;
+    if (!children) return;
+    for (let index = 0; index < children.length; index += 1) {
+      const child = children[index];
+      if (child.type !== 'element') continue;
+      if (child.tagName !== 'table') {
+        visit(child);
+        continue;
+      }
+      for (const cell of proseTableCells(child)) {
+        cell.properties = { ...cell.properties, dataProse: '' };
+      }
+      children[index] = {
+        type: 'element',
+        tagName: 'div',
+        properties: { className: ['markdown-table'] },
+        children: [child],
+        position: child.position,
+      };
+    }
+  };
+  visit(tree);
+};
+
+export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink, pre: MarkdownPre };
 const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences, remarkMediaPathPreviews];
+const markdownRehypePlugins = [rehypeMarkdownTables];
 
 // The rendered blocks of one markdown document, without a container, so the
 // segments of a streaming message can share one `.markdown-content`.
 const MarkdownBlocks: React.FC<{ content: string }> = React.memo(({ content }) => (
-  <ReactMarkdown
-    remarkPlugins={markdownRemarkPlugins}
-    urlTransform={markdownUrlTransform}
-    components={markdownComponents}
-  >
-    {content}
-  </ReactMarkdown>
+  <MarkdownSourceContext.Provider value={content}>
+    <ReactMarkdown
+      remarkPlugins={markdownRemarkPlugins}
+      rehypePlugins={markdownRehypePlugins}
+      urlTransform={markdownUrlTransform}
+      components={markdownComponents}
+    >
+      {content}
+    </ReactMarkdown>
+  </MarkdownSourceContext.Provider>
 ));
 
 export const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (

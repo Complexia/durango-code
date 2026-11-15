@@ -4823,45 +4823,418 @@ body {
   font-size: 0.9em;
 }
 
-.markdown-content pre {
-  overflow-x: auto;
-  border: 1px solid #303034;
-  border-radius: 8px;
-  background: #151516;
-  padding: 12px;
+/* Fenced code, diagrams: one frame with a small header (label, actions). */
+.markdown-content .code-block {
+  margin: 0.85em 0;
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--code-background);
 }
 
-.markdown-content pre code {
+.code-block {
+  --code-background: #141416;
+  --code-foreground: #d4d4d8;
+  --code-token-comment: #6b6f7a;
+  --code-token-keyword: #c792ea;
+  --code-token-string: #a5d6a7;
+  --code-token-string-expression: #a5d6a7;
+  --code-token-constant: #f2b880;
+  --code-token-function: #82aaff;
+  --code-token-parameter: #e4c58a;
+  --code-token-punctuation: #8e8e98;
+  --code-token-link: #7cc4fa;
+  --code-token-inserted: #7dd3a0;
+  --code-token-deleted: #f38b8b;
+  --code-token-changed: #e4c58a;
+  --code-ansi-black: #3a3a40;
+  --code-ansi-red: #f38b8b;
+  --code-ansi-green: #a5d6a7;
+  --code-ansi-yellow: #e4c58a;
+  --code-ansi-blue: #82aaff;
+  --code-ansi-magenta: #c792ea;
+  --code-ansi-cyan: #7cc4fa;
+  --code-ansi-white: #d4d4d8;
+  --code-ansi-bright-black: #6b6f7a;
+  --code-ansi-bright-red: #ff9e9e;
+  --code-ansi-bright-green: #b9e5bb;
+  --code-ansi-bright-yellow: #f0d6a2;
+  --code-ansi-bright-blue: #a3c1ff;
+  --code-ansi-bright-magenta: #dab3f2;
+  --code-ansi-bright-cyan: #a1d6fc;
+  --code-ansi-bright-white: #f4f4f5;
+}
+
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.code-block-label {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Code blocks draw their language label from the header's data-label, with the
+   buttons directly in the header. */
+.code-block-header[data-label] {
+  justify-content: flex-start;
+  gap: 2px;
+}
+
+.code-block-header[data-label]::before {
+  content: attr(data-label);
+  min-width: 0;
+  margin-right: auto;
+  padding-right: 8px;
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.code-block-note {
+  color: var(--text-muted);
+  font-family: 'Inter Variable', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.code-block-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 2px;
+}
+
+.code-block-action,
+.code-block-toggle button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 24px;
+  min-width: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.code-block-action:hover,
+.code-block-toggle button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.code-block-action:focus-visible,
+.code-block-toggle button:focus-visible {
+  outline: 2px solid var(--accent-glow);
+  outline-offset: 1px;
+}
+
+.code-block-action[aria-pressed='true'],
+.code-block-toggle button[aria-pressed='true'] {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+
+/* Code block header icons (Lucide shapes, ISC) as masks on the buttons themselves:
+   no SVG elements per block. */
+.code-block-action[data-icon]::before {
+  content: '';
+  display: block;
+  width: 13px;
+  height: 13px;
+  background: currentColor;
+  -webkit-mask: var(--code-icon) center / contain no-repeat;
+  mask: var(--code-icon) center / contain no-repeat;
+}
+
+.code-block-action[data-icon='copy'] {
+  --code-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='14' height='14' x='8' y='8' rx='2' ry='2'/%3E%3Cpath d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2'/%3E%3C/svg%3E");
+}
+
+.code-block-action[data-icon='check'] {
+  --code-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 6 9 17l-5-5'/%3E%3C/svg%3E");
+}
+
+.code-block-action[data-icon='wrap'] {
+  --code-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m16 16-3 3 3 3'/%3E%3Cpath d='M3 12h14.5a1 1 0 0 1 0 7H13'/%3E%3Cpath d='M3 19h6'/%3E%3Cpath d='M3 5h18'/%3E%3C/svg%3E");
+}
+
+/* Forced colors (high contrast) replace backgrounds, which would erase the
+   masked icons: keep them, in the system's button text color. */
+@media (forced-colors: active) {
+  .code-block-action[data-icon]::before {
+    forced-color-adjust: none;
+    background: ButtonText;
+  }
+}
+
+.code-block-action[data-copied] {
+  color: var(--success);
+}
+
+.code-block-toggle {
+  display: inline-flex;
+  margin-right: 4px;
+  padding: 2px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  gap: 2px;
+}
+
+.code-block-toggle button {
+  height: 20px;
+  padding: 0 7px;
+}
+
+.markdown-content .code-block-pre,
+.code-block-pre {
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: auto;
   border: 0;
   border-radius: 0;
   background: transparent;
+  color: var(--code-foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 2;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+.code-block-pre[data-wrap] {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* One block per group of lines: coloring or adding lines lays out that group only. */
+.code-block-pre code {
+  display: block;
+}
+
+.code-block-pre .code-lines {
+  display: block;
+}
+
+.markdown-content .code-block-pre code {
   padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font-size: inherit;
+}
+
+/* Tables: column widths follow whole words (the prose's `overflow-wrap: anywhere`
+   would let a column shrink to one letter per line); a table wider than the
+   message scrolls sideways inside it. */
+.markdown-content .markdown-table {
+  width: fit-content;
+  margin: 0.85em 0;
+  max-width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
 }
 
 .markdown-content table {
-  width: 100%;
+  margin: 0;
   border-collapse: collapse;
-  overflow: hidden;
-  border: 1px solid #333338;
-  border-radius: 8px;
-  display: block;
-  max-width: 100%;
-  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: normal;
+  word-break: normal;
+  font-variant-numeric: tabular-nums;
 }
 
 .markdown-content th,
 .markdown-content td {
-  border: 1px solid #333338;
-  padding: 8px 10px;
+  min-width: 4.5em;
+  max-width: 28rem;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border-subtle);
   text-align: left;
   vertical-align: top;
+  overflow-wrap: break-word;
+  text-wrap: pretty;
+}
+
+.markdown-content :is(th, td)[data-prose] {
+  min-width: 13em;
 }
 
 .markdown-content th {
-  color: #f1f1f1;
-  background: rgb(255 255 255 / 4%);
-  font-weight: 700;
+  background: rgb(255 255 255 / 3%);
+  border-bottom-color: var(--border-default);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
 }
+
+.markdown-content tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.markdown-content tbody tr:hover td {
+  background: rgb(255 255 255 / 1.5%);
+}
+
+/* Mermaid diagrams (Pele). --pele-bg must match what's behind the diagram:
+   edge labels are painted with it. */
+.markdown-diagram {
+  --pele-bg: var(--code-background, #141416);
+  --pele-fg: var(--text-primary);
+  --pele-muted: var(--text-secondary);
+  --pele-line: #8a8a94;
+  --pele-surface: var(--bg-surface);
+  --pele-surface-alt: var(--bg-elevated);
+  --pele-border: rgb(255 255 255 / 22%);
+  --pele-accent: var(--accent);
+  --pele-critical: var(--danger);
+  --pele-error: var(--danger);
+  --pele-radius: 6px;
+  --pele-font: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --pele-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --pele-series-1: #7fa0e0;
+  --pele-series-2: #8fc79a;
+  --pele-series-3: #e0b46f;
+  --pele-series-4: #d98a8a;
+  --pele-series-5: #b39ddb;
+  --pele-series-6: #6fc3c3;
+  --pele-series-7: #d6a0c4;
+  --pele-series-8: #a8a8b0;
+}
+
+.markdown-diagram-canvas {
+  padding: 16px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+}
+
+.markdown-diagram-svg {
+  width: 100%;
+  margin: 0 auto;
+}
+
+.markdown-diagram-svg > svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.markdown-diagram-loading {
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+}
+
+.markdown-diagram-loading > div {
+  height: 14px;
+  width: 35%;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  animation: markdown-skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes markdown-skeleton-pulse {
+  0%, 100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.markdown-diagram-loading > div + div {
+  height: 96px;
+  width: 100%;
+  border-radius: 8px;
+}
+
+.markdown-diagram-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  background: rgb(0 0 0 / 62%);
+  backdrop-filter: blur(4px);
+}
+
+.markdown-diagram-dialog {
+  --code-background: #141416;
+  display: flex;
+  flex-direction: column;
+  width: min(1200px, 100%);
+  height: min(860px, 100%);
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--code-background);
+  box-shadow: var(--shadow-lg);
+}
+
+.markdown-diagram-dialog-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 8px 8px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.markdown-diagram-hint {
+  flex: 1;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.markdown-diagram-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.markdown-diagram-zoom {
+  position: absolute;
+  inset: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
 
 .chat-input-area {
   padding: 12px 32px 18px;
