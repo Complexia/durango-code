@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { type Message, type Thread, type UserAction } from '../store';
 import type { SubagentQuestionSource } from './CodexQuestions';
-import { workStartedAt } from '../thread-shell.js';
+import { isSteer, workStartedAt } from '../thread-shell.js';
 import { getThreadActivityTime } from './time';
 
 export type SidebarV2View = 'pinned' | 'working' | 'recent' | 'snoozed' | 'settled';
@@ -83,8 +83,9 @@ export const compareSidebarV2Recent =
   (attentionSince: ReadonlyMap<string, number>) => (a: Thread, b: Thread) =>
     sidebarV2RecentRank(b, attentionSince.get(b.id)) - sidebarV2RecentRank(a, attentionSince.get(a.id));
 
-// When the work leading up to an agent run began (see thread-shell.js).
-export { workStartedAt };
+// When the work leading up to an agent run began, and which user messages
+// were steered into a running turn (see thread-shell.js).
+export { isSteer, workStartedAt };
 
 /**
  * How long a thread's agents have worked: the sum of its runs, from start to

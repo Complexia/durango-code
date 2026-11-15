@@ -1423,6 +1423,14 @@ export const finalizeClaudeTurn = async (session, resultMessage) => {
     session.activeTurns.push(continuation);
     updateClaudeBackgroundSettle(session);
     flushPendingClaudeTaskNotifications(session, continuation);
+    // The model reads it as its next turn's prompt: mark it read, as a steer
+    // read at a tool call is (the transcript's sent/seen receipt).
+    emitAgentEvent(session.sender, {
+      runId: turn.runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity: claudeSteerActivity(steers),
+    });
     session.pushUserMessage(steers.map((steer) => steer.text).join('\n\n'), {
       content: steers.flatMap((steer, index) => [
         ...(index > 0 ? [{ type: 'text', text: '\n\n' }] : []),
@@ -2949,6 +2957,13 @@ export const steerClaudeSdkRun = async (runId, text, attachments) => {
       return true;
     }
     openClaudeBackgroundTurn(session, runId, 'claude — steered background work');
+    // Its next turn's prompt: read now, like a steer at a turn's end.
+    emitAgentEvent(session.sender, {
+      runId,
+      threadId: session.threadId,
+      type: 'activity',
+      activity: claudeSteerActivity([{ text }]),
+    });
     session.pushUserMessage(text, { content });
     return true;
   }

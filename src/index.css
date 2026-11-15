@@ -3421,6 +3421,78 @@ body {
   box-shadow: none;
 }
 
+/* A message steered into a live run (AgentRunGroup in chat.tsx): it rises
+   from the composer into the run, which keeps going under the same header. */
+.message.user.steered {
+  animation: steer-in 420ms var(--ease-out) both;
+}
+
+@keyframes steer-in {
+  from {
+    opacity: 0;
+    transform: translateY(28px) scale(0.97);
+    transform-origin: bottom right;
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* A folded run's earlier part with nothing left to show but the header. */
+.message.agent-run.agent-run-part-empty {
+  padding-bottom: 0;
+}
+
+/* Under a steered message while the run is live: sent, then seen. */
+.steer-receipt {
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: -10px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  animation: steer-receipt-in 260ms var(--ease-out) both;
+}
+
+.steer-receipt.seen {
+  color: var(--success);
+}
+
+.steer-receipt-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  animation: steer-receipt-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes steer-receipt-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes steer-receipt-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message.user.steered,
+  .steer-receipt,
+  .steer-receipt-dot {
+    animation: none;
+  }
+}
+
 .queued-message-bar {
   display: flex;
   align-items: center;

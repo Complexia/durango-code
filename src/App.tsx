@@ -8032,7 +8032,9 @@ const App: React.FC = () => {
     // "Starting agent..." placeholder showing for a run already in flight).
     // Close out the current bubble first; after the user message lands below,
     // retarget the run's output to a fresh bubble so the rest of the turn
-    // renders in reading order. A bubble with no output yet moves below the
+    // renders in reading order. The transcript still draws the parts and the
+    // message as one run (AgentRunGroup in chat.tsx): one header, nothing
+    // folded until the run ends. A bubble with no output yet moves below the
     // steered message instead — closing it would leave an empty zero-second
     // "Response" above the steer point. (Steering a retained background run
     // hits this: the driver opens a fresh turn and its `started {background}`

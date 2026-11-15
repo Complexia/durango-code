@@ -609,7 +609,11 @@ turnEnd.session.activeTurns[0].toolWrittenPaths.add('/tmp/steer-written.txt');
 assert.equal(await steerClaudeSdkRun('run-steer-turn-end', 'one more thing'), true);
 turnEnd.session.resultsOwed -= 1;
 await finalizeClaudeTurn(turnEnd.session, { usage: { input_tokens: 1, output_tokens: 1 } });
-assert.equal(turnEnd.events.length, 0, 'The boundary must not settle the visible run');
+assert.deepEqual(
+  turnEnd.events.map((event) => [event.type, event.runId, event.activity?.title]),
+  [['activity', 'run-steer-turn-end', 'Read your message']],
+  'The boundary must not settle the visible run; it only marks the message read'
+);
 assert.deepEqual(turnEnd.pushed, ['one more thing'], 'The steer becomes the next turn');
 assert.equal(turnEnd.session.activeTurns.length, 1);
 assert.equal(turnEnd.session.activeTurns[0].runId, 'run-steer-turn-end', 'under the same run id');

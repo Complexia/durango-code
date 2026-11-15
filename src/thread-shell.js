@@ -41,7 +41,7 @@ const workContinuesAfter = (earlier, nextStart) => {
 
 // A user message steered into a running turn. Older builds didn't flag it;
 // the bubble the steer split shows it.
-const isSteer = (messages, index) =>
+export const isSteer = (messages, index) =>
   messages[index].steer === true || messages[index - 1]?.statusText === STEERED_RUN_CAPTION;
 
 /**

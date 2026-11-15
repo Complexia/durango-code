@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
-import { findThread, isNoProjectId, threadRecordOf, type BtwExchange, type LinkedBoardTask, type Message, type Thread, useOrionStore } from '../store';
+import { findThread, isNoProjectId, STEERED_RUN_CAPTION, threadRecordOf, type AgentActivity, type BtwExchange, type LinkedBoardTask, type Message, type Thread, useOrionStore } from '../store';
 import type { AgentModel } from '../agentCatalog';
 import { SessionImportCard } from './SessionImport';
 import { agentProviders } from '../agentCatalog';
@@ -16,7 +16,7 @@ import {
   ThreadReferenceText,
 } from './markdown';
 import { linkedTaskStatusLabel } from './promptContext';
-import { workStartedAt } from './threadLists';
+import { isSteer, workStartedAt } from './threadLists';
 
 export const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ text, className }) => {
   const [copied, setCopied] = useState(false);
@@ -315,36 +315,129 @@ const RunElapsed: React.FC<{ startedAt?: string; completedAt?: string; running: 
   return <>{duration || '0s'}</>;
 };
 
+const STEER_READ_TITLE = /^Read your (?:message|(\d+) messages)$/;
+
+/** The driver's note that the model read steered messages (claudeSteerActivity in main/claude-driver.js). */
+const isSteerReadActivity = (activity: AgentActivity) =>
+  activity.type === 'result' && Boolean(activity.key?.startsWith('steer-')) && STEER_READ_TITLE.test(activity.title);
+
+/** How many steered messages a run part reports read ("Read your 2 messages"). */
+const steerReadCount = (message: Message) => {
+  let count = 0;
+  for (const activity of message.activities ?? []) {
+    if (isSteerReadActivity(activity)) count += Number(STEER_READ_TITLE.exec(activity.title)?.[1] ?? 1);
+  }
+  return count;
+};
+
 /**
- * One agent turn, as in T3 Code: no cards. A plain "Working for 5s" line
- * heads the live turn with its steps listed flat underneath; once it ends the
- * line reads "Worked for 8s ›" and the steps fold away behind it, leaving the
- * final answer. Stops, failures and background waits keep their status line.
- * The time counts from the user's message (`workSince`), so a turn the agent
- * was re-invoked for after a background wait includes the wait.
+ * Whether the run's driver reports when the model read a steered message.
+ * Claude does (at its next tool call, or as its next turn); Codex and fx fold
+ * a steer in at their next step without saying so.
  */
-const AgentRunMessage: React.FC<{
+const reportsSteerReads = (message: Message | undefined) => Boolean(message?.modelId?.startsWith('claude:'));
+
+/** Whether a run part lists any steps (what folding hides). */
+const runPartHasSteps = (message: Message) =>
+  (message.activities ?? []).some((activity) => !activity.visual && !activity.theme && !isSteerReadActivity(activity));
+
+/**
+ * What a run part shows: everything ('open'), what came after its last step
+ * plus its visuals ('tail', a folded run's answer), or only its visuals
+ * ('visuals', a folded run's earlier parts).
+ */
+type RunPartFold = 'open' | 'tail' | 'visuals';
+
+const AgentRunHeader: React.FC<{
+  running: boolean;
+  startedAt?: string;
+  completedAt?: string;
+  foldable: boolean;
+  open: boolean;
+  onToggle: () => void;
+}> = ({ running, startedAt, completedAt, foldable, open, onToggle }) => (
+  <div className="agent-run-header">
+    {foldable ? (
+      <button
+        type="button"
+        className="agent-run-header-toggle"
+        onClick={onToggle}
+        aria-expanded={open}
+        title={open ? 'Hide the steps' : 'Show the steps'}
+      >
+        Worked for <RunElapsed startedAt={startedAt} completedAt={completedAt} running={false} />
+        <ChevronRight size={14} className={`agent-run-header-chevron${open ? ' open' : ''}`} />
+      </button>
+    ) : (
+      <span>
+        {running ? 'Working for ' : 'Worked for '}
+        <RunElapsed startedAt={startedAt} completedAt={completedAt} running={running} />
+      </span>
+    )}
+  </div>
+);
+
+/**
+ * One stretch of an agent turn's output: its text, steps, visuals and /btw
+ * asides in the order they happened.
+ */
+type AgentRunPartProps = {
   message: Message;
-  workSince?: string;
+  fold: RunPartFold;
   runRunning?: boolean;
+  /** Copy the part's text: only once the whole run is over. */
+  copyable: boolean;
   btwExchanges: BtwExchange[];
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
-}> = ({ message, workSince, runRunning, btwExchanges, renderBtwAside, onAuthenticateProvider, authenticatingProviderId }) => {
+  /**
+   * The run's header, on its first part. Plain values rather than an element,
+   * so a part re-renders only when what it shows changed (the run streams
+   * into its last part many times a second).
+   */
+  header?: boolean;
+  headerRunning?: boolean;
+  headerStartedAt?: string;
+  headerCompletedAt?: string;
+  foldable?: boolean;
+  stepsOpen?: boolean;
+  onToggleSteps?: () => void;
+  /** The run's outcome line under the header (stopped, failed, waiting on background work). */
+  statusLine?: string;
+};
+
+const AgentRunPart = React.memo(function AgentRunPart({
+  message,
+  fold,
+  runRunning,
+  copyable,
+  btwExchanges,
+  renderBtwAside,
+  onAuthenticateProvider,
+  authenticatingProviderId,
+  header,
+  headerRunning = false,
+  headerStartedAt,
+  headerCompletedAt,
+  foldable = false,
+  stepsOpen = false,
+  onToggleSteps,
+  statusLine,
+}: AgentRunPartProps) {
   const isRunning = message.status === 'running';
-  const startedAt = workSince ?? message.startedAt;
-  const [stepsOpen, setStepsOpen] = useState(false);
   const hasContent = message.content.trim().length > 0;
-  const showStatusText = !!message.statusText && !isRunning && message.statusText !== 'Finished.';
   // A long run carries hundreds of activities; sorting them into segments is
-  // only redone when the run itself (or its /btw asides) changed.
-  const segments = useMemo(
-    () => buildAgentRunSegments(message.content, message.activities ?? [], btwExchanges),
-    [message.content, message.activities, btwExchanges]
-  );
-  // Folded: only what came after the last step (the answer). With no steps
-  // there is nothing to fold.
+  // only redone when the run itself (or its /btw asides) changed. A steered
+  // message's "Read" note shows on the message itself (SteeredMessageReceipt).
+  const segments = useMemo(() => {
+    const activities = message.activities ?? [];
+    return buildAgentRunSegments(
+      message.content,
+      activities.some(isSteerReadActivity) ? activities.filter((activity) => !isSteerReadActivity(activity)) : activities,
+      btwExchanges
+    );
+  }, [message.content, message.activities, btwExchanges]);
   // A run that changes one theme several times shows its full card (with Save)
   // once, on the last change; earlier ones shrink to a line.
   const latestThemeCards = useMemo(() => {
@@ -355,15 +448,14 @@ const AgentRunMessage: React.FC<{
     return new Set(latest.values());
   }, [segments]);
   const lastStepIndex = segments.reduce((last, segment, index) => (segment.kind === 'activities' ? index : last), -1);
-  const foldable = !isRunning && lastStepIndex >= 0;
-  const folded = foldable && !stepsOpen;
-  // Visuals (show_html) stay visible when the steps around them fold.
-  const visibleSegments = folded
-    ? [
-        ...segments.slice(0, lastStepIndex + 1).filter((segment) => segment.kind === 'visual' || segment.kind === 'theme'),
-        ...segments.slice(lastStepIndex + 1),
-      ]
-    : segments;
+  // Visuals (show_html) and theme cards stay visible when the steps around them fold.
+  const isPinned = (segment: (typeof segments)[number]) => segment.kind === 'visual' || segment.kind === 'theme';
+  const visibleSegments =
+    fold === 'visuals'
+      ? segments.filter(isPinned)
+      : fold === 'tail' && lastStepIndex >= 0
+        ? [...segments.slice(0, lastStepIndex + 1).filter(isPinned), ...segments.slice(lastStepIndex + 1)]
+        : segments;
   const lastSegment = segments.at(-1);
   // Between steps (or before the first), say the agent is thinking.
   const thinking =
@@ -374,32 +466,23 @@ const AgentRunMessage: React.FC<{
       (lastSegment.kind === 'activities' &&
         !lastSegment.activities.some((activity) => activity.status === 'running' || activity.status === 'waiting')));
 
+  // A folded run's earlier part with no visuals shows nothing but its header.
+  const empty = visibleSegments.length === 0 && !thinking && !message.error;
   return (
-    <div className={`message agent agent-run ${message.status ?? ''}`}>
-      {(isRunning || message.startedAt) && (
-        <div className="agent-run-header">
-          {foldable ? (
-            <button
-              type="button"
-              className="agent-run-header-toggle"
-              onClick={() => setStepsOpen((open) => !open)}
-              aria-expanded={stepsOpen}
-              title={stepsOpen ? 'Hide the steps' : 'Show the steps'}
-            >
-              Worked for <RunElapsed startedAt={startedAt} completedAt={message.completedAt} running={false} />
-              <ChevronRight size={14} className={`agent-run-header-chevron${stepsOpen ? ' open' : ''}`} />
-            </button>
-          ) : (
-            <span>
-              {isRunning ? 'Working for ' : 'Worked for '}
-              <RunElapsed startedAt={startedAt} completedAt={message.completedAt} running={isRunning} />
-            </span>
-          )}
-        </div>
+    <div className={`message agent agent-run ${message.status ?? ''}${empty ? ' agent-run-part-empty' : ''}`}>
+      {header && (
+        <AgentRunHeader
+          running={headerRunning}
+          startedAt={headerStartedAt}
+          completedAt={headerCompletedAt}
+          foldable={foldable}
+          open={stepsOpen}
+          onToggle={onToggleSteps ?? noop}
+        />
       )}
-      {showStatusText && (
+      {header && statusLine && (
         <div className="agent-status-line">
-          <span>{message.statusText}</span>
+          <span>{statusLine}</span>
         </div>
       )}
       {visibleSegments.map((segment, index) =>
@@ -444,10 +527,36 @@ const AgentRunMessage: React.FC<{
         ) : (
           <div className="agent-error">{message.error}</div>
         ))}
-      {hasContent && !isRunning && <CopyMessageButton text={message.content} />}
+      {copyable && fold !== 'visuals' && hasContent && !isRunning && <CopyMessageButton text={message.content} />}
     </div>
   );
-};
+});
+
+const noop = () => {};
+
+/**
+ * Under a message steered into a live run: sent, then seen once the agent
+ * read it, for drivers that report it (reportsSteerReads); a plain "sent"
+ * for the others. Gone once the run is over.
+ */
+const SteeredMessageReceipt: React.FC<{ state: 'pending' | 'seen' | 'sent' }> = ({ state }) => (
+  <div key={state} className={`steer-receipt ${state}`} role="status">
+    {state === 'seen' ? (
+      <>
+        <Check size={12} /> Seen
+      </>
+    ) : state === 'pending' ? (
+      <>
+        <span className="steer-receipt-dot" aria-hidden="true" />
+        Sent · the agent reads it after its current step
+      </>
+    ) : (
+      <>
+        <Check size={12} /> Sent · the agent takes it in at its next step
+      </>
+    )}
+  </div>
+);
 
 const NO_BTW_EXCHANGES: BtwExchange[] = [];
 
@@ -477,7 +586,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   taskBusy,
   onMarkTaskDone,
   onUnlinkTask,
-  btwExchanges = NO_BTW_EXCHANGES,
+  btwExchanges,
   renderBtwAside,
   onAuthenticateProvider,
   authenticatingProviderId,
@@ -485,7 +594,6 @@ export const ChatMessage = React.memo(function ChatMessage({
 }: ChatMessageProps) {
   const attachments = message.attachments ?? [];
   const messageTasks = message.linkedTasks ?? [];
-  const isAgentRun = message.role === 'agent' && message.kind === 'agent-run';
   const backgroundIntervention = message.claudeBackgroundIntervention;
 
   if (message.kind === 'claude-background-intervention' && backgroundIntervention) {
@@ -518,13 +626,14 @@ export const ChatMessage = React.memo(function ChatMessage({
     );
   }
 
-  if (isAgentRun) {
+  if (message.role === 'agent' && message.kind === 'agent-run') {
+    // A lone run (the transcript gathers runs into AgentRunGroup itself).
     return (
-      <AgentRunMessage
-        message={message}
+      <AgentRunGroup
+        parts={[message]}
+        btwAsides={[btwExchanges]}
         workSince={workSince}
-        runRunning={runRunning}
-        btwExchanges={btwExchanges}
+        liveRunId={runRunning ? message.id : undefined}
         renderBtwAside={renderBtwAside}
         onAuthenticateProvider={onAuthenticateProvider}
         authenticatingProviderId={authenticatingProviderId}
@@ -533,7 +642,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   }
 
   return (
-    <div className={`message ${message.role}`}>
+    <div className={`message ${message.role}${message.role === 'user' && message.steer ? ' steered' : ''}`}>
       {message.role === 'agent' ? (
         <StreamingMarkdownContent content={message.content} />
       ) : (
@@ -599,6 +708,141 @@ export const ChatMessage = React.memo(function ChatMessage({
     </div>
   );
 });
+
+export type AgentRunGroupProps = {
+  /**
+   * The run: its agent-run messages, with any messages steered into it in
+   * between (steering splits the stored run at each steered message, see
+   * recordSteeredMessage in App.tsx). Usually one agent-run.
+   */
+  parts: Message[];
+  /** Each part's /btw asides (same order as `parts`). */
+  btwAsides: (BtwExchange[] | undefined)[];
+  /** The run's work start (ISO): the user's message it answers, see workStartedAt. */
+  workSince?: string;
+  /** Set on the thread's live run (background work keeps it live after its turn). */
+  liveRunId?: string;
+  /** How many of the steered messages in `parts` the agent reported read (the first ones: it reads them in order). */
+  steersRead?: number;
+  /** Whether the run's driver reports reads at all (reportsSteerReads). */
+  reportsReads?: boolean;
+  renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
+  /** For steered messages' task chips: set only when one carries tasks. */
+  liveTasks?: LinkedBoardTask[];
+  taskBusy?: boolean;
+  onMarkTaskDone?: (taskId: string) => void;
+  onUnlinkTask?: (taskId: string) => void;
+  onAuthenticateProvider?: (providerId: string) => void;
+  authenticatingProviderId?: string | null;
+};
+
+const sameItems = <T,>(a: readonly T[], b: readonly T[]) =>
+  a.length === b.length && a.every((item, index) => item === b[index]);
+
+/**
+ * One agent run, as in T3 Code: no cards. A plain "Working for 5s" line heads
+ * the live run with its steps listed flat underneath; once it ends the line
+ * reads "Worked for 8s ›" and the steps fold away behind it, leaving the final
+ * answer. Stops, failures and background waits keep their status line. The
+ * time counts from the user's message (`workSince`), so a turn the agent was
+ * re-invoked for after a background wait includes the wait.
+ *
+ * Steering never interrupts the run, and neither does its transcript: a
+ * message steered in sits between the run's parts with a sent/seen receipt,
+ * under one header that keeps counting, and nothing folds until the whole run
+ * is over.
+ */
+export const AgentRunGroup = React.memo(
+  function AgentRunGroup({
+    parts,
+    btwAsides,
+    workSince,
+    liveRunId,
+    steersRead = 0,
+    reportsReads = false,
+    renderBtwAside,
+    liveTasks,
+    taskBusy,
+    onMarkTaskDone,
+    onUnlinkTask,
+    onAuthenticateProvider,
+    authenticatingProviderId,
+  }: AgentRunGroupProps) {
+    const [stepsOpen, setStepsOpen] = useState(false);
+    const toggleSteps = useCallback(() => setStepsOpen((open) => !open), []);
+    const runParts = parts.filter((part) => part.kind === 'agent-run');
+    const firstRun = runParts[0];
+    const lastRun = runParts.at(-1);
+    const running = lastRun?.status === 'running';
+    const foldable = !running && runParts.some(runPartHasSteps);
+    const folded = foldable && !stepsOpen;
+    // The split parts carry the steer caption; the run's own outcome
+    // (stopped, failed, waiting on background tasks) is its last part's.
+    const statusText = lastRun?.statusText;
+    const statusLine =
+      statusText && !running && statusText !== 'Finished.' && statusText !== STEERED_RUN_CAPTION ? statusText : undefined;
+    const header = !!firstRun && (running || !!firstRun.startedAt);
+    let steerNumber = 0;
+
+    return (
+      <>
+        {parts.map((part, index) => {
+          if (part.kind === 'agent-run') {
+            const first = part === firstRun;
+            return (
+              <AgentRunPart
+                key={part.id}
+                message={part}
+                fold={folded ? (part === lastRun ? 'tail' : 'visuals') : 'open'}
+                runRunning={part.status === 'running' || part.id === liveRunId}
+                copyable={!running}
+                btwExchanges={btwAsides[index] ?? NO_BTW_EXCHANGES}
+                renderBtwAside={renderBtwAside}
+                onAuthenticateProvider={onAuthenticateProvider}
+                authenticatingProviderId={part.authProviderId ? authenticatingProviderId : undefined}
+                {...(first && header
+                  ? {
+                      header: true,
+                      headerRunning: running,
+                      headerStartedAt: workSince ?? part.startedAt,
+                      headerCompletedAt: lastRun?.completedAt,
+                      foldable,
+                      stepsOpen,
+                      onToggleSteps: toggleSteps,
+                      statusLine,
+                    }
+                  : {})}
+              />
+            );
+          }
+          steerNumber += 1;
+          const receipt = !reportsReads ? 'sent' : steerNumber <= steersRead ? 'seen' : 'pending';
+          return (
+            <React.Fragment key={part.id}>
+              <ChatMessage
+                message={part}
+                liveTasks={part.linkedTasks?.length ? liveTasks : undefined}
+                taskBusy={part.linkedTasks?.length ? taskBusy : undefined}
+                onMarkTaskDone={onMarkTaskDone}
+                onUnlinkTask={onUnlinkTask}
+              />
+              {running && <SteeredMessageReceipt state={receipt} />}
+              {renderBtwAside && btwAsides[index]?.map(renderBtwAside)}
+            </React.Fragment>
+          );
+        })}
+      </>
+    );
+  },
+  // The transcript rebuilds its runs on every streamed chunk; a run
+  // re-renders only when one of its own messages (or a prop) changed.
+  (previous, next) =>
+    (Object.keys(next) as (keyof AgentRunGroupProps)[]).every((key) =>
+      key === 'parts' || key === 'btwAsides'
+        ? sameItems<unknown>(previous[key], next[key])
+        : Object.is(previous[key], next[key])
+    ) && Object.keys(previous).length === Object.keys(next).length
+);
 
 export const AgentsWelcome: React.FC<{
   projectName?: string | null;
@@ -727,6 +971,82 @@ export type ChatTranscriptProps = {
  * re-render this boundary only; memoized historical messages retain their
  * object identity and are skipped by React.
  */
+export type TranscriptItem =
+  | { kind: 'message'; message: Message }
+  | {
+      kind: 'run';
+      /** The run's first message, in the whole transcript: stable while earlier pages load. */
+      key: string;
+      /** Its messages inside the window. */
+      parts: Message[];
+      /** How many of the steered messages in `parts` the agent reported read. */
+      steersRead: number;
+      reportsReads: boolean;
+    };
+
+/**
+ * The window's messages (from `start`), with each agent run gathered into one
+ * item: its agent-run messages and the messages steered into it, which split
+ * the stored run (recordSteeredMessage in App.tsx). A run can start with
+ * steered messages when they were sent before it showed any output (its empty
+ * bubble moves below each one). Runs are found in the whole transcript, so a
+ * run the window cuts keeps its key (and its mounted parts) when an earlier
+ * page loads.
+ */
+export const groupTranscriptRuns = (messages: Message[], start: number): TranscriptItem[] => {
+  const items: TranscriptItem[] = [];
+  const steeredAt = (index: number) => messages[index]?.role === 'user' && isSteer(messages, index);
+  const steersLeadIntoRun = (index: number) => {
+    let next = index;
+    while (steeredAt(next)) next += 1;
+    return next > index && messages[next]?.kind === 'agent-run';
+  };
+  let index = 0;
+  while (index < messages.length) {
+    const first = index;
+    const message = messages[index];
+    if (message.kind !== 'agent-run' && !steersLeadIntoRun(index)) {
+      if (index >= start) items.push({ kind: 'message', message });
+      index += 1;
+      continue;
+    }
+    index += 1;
+    while (index < messages.length) {
+      const next = messages[index];
+      const previous = messages[index - 1];
+      const continues =
+        steeredAt(index) ||
+        (next.kind === 'agent-run' &&
+          (steeredAt(index - 1) || (previous.kind === 'agent-run' && previous.statusText === STEERED_RUN_CAPTION)));
+      if (!continues) break;
+      index += 1;
+    }
+    if (index <= start) continue;
+    const parts = messages.slice(Math.max(first, start), index);
+    let steersRead = 0;
+    let reportsReads = false;
+    if (index - first > 1) {
+      // Reads count against the run's steered messages in order, wherever
+      // the driver's note landed (it can reach the transcript before the
+      // steer splits it); the ones above the window come first.
+      let reads = 0;
+      let hiddenSteers = 0;
+      for (let at = first; at < index; at += 1) {
+        const part = messages[at];
+        if (part.kind === 'agent-run') {
+          reads += steerReadCount(part);
+          if (reportsSteerReads(part)) reportsReads = true;
+        } else if (at < start) {
+          hiddenSteers += 1;
+        }
+      }
+      steersRead = Math.max(0, reads - hiddenSteers);
+    }
+    items.push({ kind: 'run', key: messages[first].id, parts, steersRead, reportsReads });
+  }
+  return items;
+};
+
 export const ChatTranscript = React.memo(function ChatTranscript({
   threadId,
   projectName,
@@ -879,8 +1199,8 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     }
     return { windowStart: Math.max(0, messages.length - TRANSCRIPT_WINDOW_INITIAL), windowStartId: null };
   }, [messages, requestedWindowStartId]);
-  const visibleMessages = useMemo(
-    () => (windowStart === 0 ? messages : messages.slice(windowStart)),
+  const transcriptItems = useMemo(
+    () => groupTranscriptRuns(messages, windowStart),
     [messages, windowStart]
   );
   // Marks the top of the window; the element after it is the scroll anchor
@@ -1177,33 +1497,50 @@ export const ChatTranscript = React.memo(function ChatTranscript({
             )}
             <div ref={windowTopRef} className="chat-window-top" aria-hidden="true" />
 
-            {visibleMessages.map((message) => {
-              const isAgentRun = message.kind === 'agent-run';
-              const btwAsides = btwAsidesByAnchor.get(message.id);
-              // Props a message doesn't use stay undefined, so a change to
-              // them (sending flips taskBusy, a login flips the provider) only
-              // re-renders the messages that show it.
+            {transcriptItems.map((item) => {
+              // Props an item doesn't use stay undefined, so a change to them
+              // (sending flips taskBusy, a login flips the provider) only
+              // re-renders the items that show it.
+              if (item.kind === 'run') {
+                const { parts } = item;
+                const firstRun = parts.find((part) => part.kind === 'agent-run');
+                const hasTasks = parts.some((part) => (part.linkedTasks?.length ?? 0) > 0);
+                const live =
+                  thread.status === 'running' && !!latestAgentRun && parts.includes(latestAgentRun);
+                return (
+                  <AgentRunGroup
+                    key={item.key}
+                    parts={parts}
+                    steersRead={item.steersRead}
+                    reportsReads={item.reportsReads}
+                    btwAsides={parts.map((part) => btwAsidesByAnchor.get(part.id))}
+                    workSince={firstRun ? workSinceIso(messages, firstRun) : undefined}
+                    liveRunId={live ? latestAgentRun.id : undefined}
+                    renderBtwAside={renderBtwAside}
+                    liveTasks={hasTasks ? thread.linkedTasks : undefined}
+                    taskBusy={hasTasks ? isSending : undefined}
+                    onMarkTaskDone={handleMarkTaskDone}
+                    onUnlinkTask={handleUnlinkTask}
+                    onAuthenticateProvider={onAuthenticateProvider}
+                    authenticatingProviderId={
+                      parts.some((part) => part.authProviderId) ? authenticatingProviderId : undefined
+                    }
+                  />
+                );
+              }
+              const { message } = item;
               const hasTasks = (message.linkedTasks?.length ?? 0) > 0;
               return (
                 <React.Fragment key={message.id}>
                   <ChatMessage
                     message={message}
-                    workSince={isAgentRun ? workSinceIso(messages, message) : undefined}
-                    runRunning={
-                      message.status === 'running' ||
-                      (message.id === latestAgentRun?.id && thread.status === 'running')
-                    }
                     liveTasks={hasTasks ? thread.linkedTasks : undefined}
                     taskBusy={hasTasks ? isSending : undefined}
                     onMarkTaskDone={handleMarkTaskDone}
                     onUnlinkTask={handleUnlinkTask}
-                    btwExchanges={isAgentRun ? btwAsides : undefined}
-                    renderBtwAside={isAgentRun && btwAsides ? renderBtwAside : undefined}
-                    onAuthenticateProvider={onAuthenticateProvider}
-                    authenticatingProviderId={message.authProviderId ? authenticatingProviderId : undefined}
                     onDiscardClaudeBackgroundTasks={handleDiscardClaudeBackgroundTasks}
                   />
-                  {!isAgentRun && btwAsides?.map(renderBtwAside)}
+                  {btwAsidesByAnchor.get(message.id)?.map(renderBtwAside)}
                 </React.Fragment>
               );
             })}

@@ -53,6 +53,7 @@ export const WAITING_ON_BACKGROUND_CAPTION: RegExp;
 export const STEERED_RUN_CAPTION: string;
 export const TRANSCRIPT_KEYS: readonly ['messages', 'btwExchanges'];
 
+export function isSteer<M extends ShellMessage>(messages: M[], index: number): boolean;
 export function workStartedAt<M extends ShellMessage>(messages: M[], message: M): number;
 export function summarizeThreadMessages(messages: readonly ShellMessage[] | undefined): ThreadSummary;
 export function sameThreadSummary(a: ThreadSummary | undefined, b: ThreadSummary | undefined): boolean;
