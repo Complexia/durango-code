@@ -7,14 +7,20 @@ user turns **Save** on in the theme card the tool leaves in the transcript (or t
 `save: true` when asked). Saved themes, six prebuilt ones and **Stock** (the original look, no
 theme at all) are switched in Settings → Themes.
 
+Agents can do everything that page does through `manage_app_themes`: list, apply, stock, save,
+unsave, rename, duplicate, delete, undo, turn animated effects on or off, play the celebration, and
+`measure` (CPU of each Durango Code process over a few seconds, from `app.getAppMetrics`).
+`set_app_theme` with `theme_id` changes a theme the user already has in place instead of a copy; the
+thread then shapes that theme.
+
 ## Pieces
 
 | File | Role |
 |---|---|
 | `src/ui-themes.js` | The format, shared by main and renderer: `THEME_TOKENS` (CSS custom properties a theme may set, with stock values equal to `src/index.css` `:root`), `sanitizeTheme`, `mergeTheme`, `themeToCss`, HTML scene documents (`buildSceneDocument`, CSP + `window.durango` bootstrap). |
 | `src/ui-themes-builtin.js` | The prebuilt themes (animated HTML scenes, no files). |
-| `src/main/ui-themes-store.js` | Storage under `<userData>/themes/` (`state.json` = active id and each theme's current values, `<id>/theme.json`, `<id>/history.json` for Undo, `<id>/<asset>` backdrop files). Broadcasts `themes:changed`. Unsaved themes nobody uses are pruned after 14 days. |
-| `src/main/theme-tools.js` | `get_app_theme`, `set_app_theme`, `generate_theme_media` (one schema source: Claude registers them in `claude-driver.js`, the bridge lists them through `__tools`). |
+| `src/main/ui-themes-store.js` | Storage under `<userData>/themes/` (`state.json` = active id, each theme's current values and the animated-effects setting, `<id>/theme.json`, `<id>/history.json` for Undo, `<id>/<asset>` backdrop files). Broadcasts `themes:changed`. Unsaved themes nobody uses are pruned after 14 days. |
+| `src/main/theme-tools.js` | `get_app_theme`, `set_app_theme`, `manage_app_themes`, `generate_theme_media` (one schema source: Claude registers them in `claude-driver.js`, the bridge lists them through `__tools`). |
 | `src/app/themes/ThemeLayer.tsx` | Applies the active theme: a `<style>` (textContent only), the backdrop behind the app (`z-index: -1` in `body`), an overlay scene above it (pointer events off), and agent activity → scene events. |
 | `src/app/themes/ThemeControls.tsx` | The theme's own controls (lazy-loaded): places a host for each control in a slot, next to or inside a selector's element, or floating; re-places them as the app re-renders; draws toggle / choice / slider / menu / button, or the theme's HTML widget. |
 | `src/app/themes/ThemeControlsSettings.tsx` | Settings → Themes → "<theme> controls": the active theme's values as plain settings (switch, segmented, slider), where each control sits, Run for action buttons, Reset to defaults. |
@@ -36,6 +42,32 @@ Control kinds: `toggle`, `choice` (cycle or segmented), `slider`, `menu`, `butto
 or `float` at a corner of an element or the window. `get_app_theme` reports where each control is on screen and,
 with `ui_map: true`, an outline of the UI with selectors and boxes; `generate_theme_media` with `variant_when`
 adds a generated picture as a variant.
+
+## Performance
+
+A theme runs all day, often on a laptop, while agents work, so it should cost close to Stock.
+Measured on an M-series MacBook Air with the window focused and an agent working, in % of one CPU core:
+Stock ~25; a snow overlay that built a radial gradient per flake per frame at 60 fps over 14px frosted
+panels ~68; the same snow drawn from one sprite at 30 fps ~62; with static frost too ~33.
+
+- **Static frost.** `backdrop-filter` re-runs every frame something behind or above a panel changes,
+  and an overlay damages the whole window. For an image backdrop with an overlay, `ThemeLayer`
+  (`useStaticFrost`) asks main for a small copy of the picture (`themes:frost`, made once with
+  `nativeImage`, saved as `frost-<width>-<asset>.jpg`) and the `html.theme-static-frost` rules in
+  `index.css` paint each panel as its tint over the dim veil over that copy, `fixed` to the window
+  so it lines up with the backdrop. The browser's smooth upscale does the blurring. Video and HTML
+  backdrops change every frame, so they keep the live blur, and the tools tell the agent to keep
+  `panel_blur` at 0 with them.
+- **Guidance.** The rules (`PERFORMANCE_GUIDE` in `theme-tools.js`) come back in `get_app_theme`'s result and in a
+  thread's first `set_app_theme` result, not in the tool descriptions, so only theme work loads them (tool
+  descriptions are listed to some providers on every request). They say: draw particles from a pre-rendered sprite
+  (no per-particle gradients, `shadowBlur` or `ctx.filter`), at most 30 fps (15 unfocused), a capped
+  devicePixelRatio, nothing while `document.hidden`, one still frame on `reducedMotion`, and CSS
+  animations of transform and opacity only.
+- **Notes.** `performanceNotes(theme)` reads the theme after every change (`set_app_theme`, `apply`,
+  `generate_theme_media`) and tells the agent what will cost CPU or GPU every frame.
+- **Screenshots** are only for the agent to check its work: they show the user's threads, so the
+  guidance says never to use one as a backdrop or theme file.
 
 ## Safety
 

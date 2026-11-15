@@ -22,11 +22,20 @@ contextBridge.exposeInMainWorld('orion', {
     canUndo: (id) => ipcRenderer.invoke('themes:canUndo', id),
     setValues: (id, values) => ipcRenderer.invoke('themes:setValues', id, values),
     resetValues: (id) => ipcRenderer.invoke('themes:resetValues', id),
+    setAnimate: (animate) => ipcRenderer.invoke('themes:setAnimate', animate),
+    adoptLegacyAnimate: (animate) => ipcRenderer.invoke('themes:adoptLegacyAnimate', animate),
+    frost: (id, asset, width, saturate) => ipcRenderer.invoke('themes:frost', id, asset, width, saturate),
     reportSceneError: (id, message) => ipcRenderer.send('themes:sceneError', id, message),
     onChanged: (callback) => {
       const listener = (_event, snapshot) => callback(snapshot);
       ipcRenderer.on('themes:changed', listener);
       return () => ipcRenderer.removeListener('themes:changed', listener);
+    },
+    // An agent pressed "Preview celebration" (manage_app_themes celebrate).
+    onCelebrate: (callback) => {
+      const listener = () => callback();
+      ipcRenderer.on('themes:celebrate', listener);
+      return () => ipcRenderer.removeListener('themes:celebrate', listener);
     },
   },
   // App persistence

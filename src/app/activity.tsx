@@ -408,6 +408,8 @@ export const activityLabel = (activity: AgentActivity): { text: string; code?: b
       return { text: 'Restyled Durango Code' };
     case 'mcp__orion__get_app_theme':
       return { text: 'Looked at the app theme' };
+    case 'mcp__orion__manage_app_themes':
+      return { text: 'Managed app themes' };
     case 'mcp__orion__generate_theme_media':
       return { text: 'Generated a theme backdrop' };
     case 'mcp__orion__request_secret':

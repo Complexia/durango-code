@@ -16,14 +16,20 @@ import {
 import { DurangoError } from './durango-client.js';
 import {
   canUndoTheme,
+  deleteTheme,
+  duplicateTheme,
   getActiveTheme,
   getTheme,
   importThemeAsset,
   listThemes,
+  renameTheme,
   sceneErrorsFor,
+  setActiveTheme,
   setThemeSaved,
   setThemeValues,
   themeValuesFor,
+  setThemesAnimate,
+  undoTheme,
   updateTheme,
   workingThemeFor,
   writeThemeAsset,
@@ -45,10 +51,10 @@ import {
 // (claude-driver.js) and the bridge shim lists them through `__tools`
 // (mcp-bridge.js), so there is one source.
 
-export const THEME_TOOL_NAMES = Object.freeze(['get_app_theme', 'set_app_theme', 'generate_theme_media']);
+export const THEME_TOOL_NAMES = Object.freeze(['get_app_theme', 'set_app_theme', 'manage_app_themes', 'generate_theme_media']);
 export const THEME_READ_TOOL_NAMES = Object.freeze(['get_app_theme']);
 /** Only change how Durango Code looks on this computer: approved in every mode. */
-export const THEME_LOCAL_TOOL_NAMES = Object.freeze(['get_app_theme', 'set_app_theme']);
+export const THEME_LOCAL_TOOL_NAMES = Object.freeze(['get_app_theme', 'set_app_theme', 'manage_app_themes']);
 
 export const DEFAULT_THEME_IMAGE_MODEL = 'google/gemini-3.1-flash-image-preview';
 export const DEFAULT_THEME_VIDEO_MODEL = 'google/veo-3.1-fast';
@@ -85,9 +91,20 @@ const SELECTOR_GUIDE = [
   '.theme-backdrop (your backdrop layer)',
 ].join(', ');
 
+// What we measured (2026-11): Stock ~25% of a CPU core with the window focused
+// and an agent working; a snow theme drawing a radial gradient per flake per
+// frame at 60 fps over 14px frosted panels ~68%; the same snow from one sprite
+// at 30 fps with static frost ~33%. Most of the gap was the panels' live
+// backdrop-filter re-running every frame under the animated overlay.
+const PERFORMANCE_GUIDE = `Performance: the theme runs all day, on laptops, while agents work, so keep its cost close to Stock (check with manage_app_themes measure; compare with Stock by applying stock, measuring and applying the theme again). Anything that animates repaints the window every frame:
+- Overlay and HTML scenes: draw each particle from one pre-rendered sprite (an offscreen canvas, drawImage with globalAlpha); never create gradients, shadowBlur or ctx.filter per particle per frame. Keep particles to a couple of hundred. Run at most 30 fps (15 when !focused) by skipping requestAnimationFrame frames, use devicePixelRatio 1 for soft particles (at most 1.5 for crisp lines), do nothing while document.hidden, and on reducedMotion draw one still frame once, not on every frame.
+- panel_blur is a live blur of whatever is behind each panel: with a video or HTML backdrop it re-runs every frame, so keep it at 0 (use surface_opacity for legibility). An image backdrop (fit cover) with an overlay is fine: Durango Code paints its frosted panels from a static, pre-blurred copy by itself, unless your css sets a panel's background (then it keeps the live blur, so use panel_blur 0). backdrop.blur on a video or HTML backdrop is also re-run every frame; soften the content itself instead.
+- CSS: animate only transform and opacity; no infinite animations of filter, backdrop-filter, box-shadow or large gradients.
+Screenshots (screenshot: true) are pictures of the app window with the user's threads in it, only for checking your work: never use one as a backdrop, image_path or theme file.`;
+
 export const THEME_TOOL_DESCRIPTIONS = Object.freeze({
-  get_app_theme: `Read Durango Code's current look before restyling it: the active theme (or stock), the theme this thread is shaping, every theme token with its stock value, CSS hooks, the scene event API, and script errors your scenes reported. Pass screenshot: true to also get a picture of the app window as it looks now, to check your work, and ui_map: true for an outline of what is on screen (elements as CSS selectors with their boxes, the theme slots, your placed controls) to find where to put a control or what to style. It also lists the theme's values (current choice) and where each of its controls is on screen. Use it with set_app_theme when the user asks to customize, theme, restyle or decorate Durango Code itself (this app), not their project.`,
-  set_app_theme: `Restyle Durango Code itself (the app the user is talking to you in), live: colors, fonts, corner radius, an animated or image backdrop behind the app, an effects overlay above it, and extra CSS. Use it whenever the user asks to customize how Durango Code looks ("make it pink", "synthwave theme", "add snow"); never edit Durango Code's source or files for that. Each call changes this thread's working theme and applies it at once; values you leave out stay as they are (tokens: { name: null } removes one; backdrop/overlay: null removes them; css: "" clears it). The first call starts from the theme in use (pass start_from: "stock" for a clean slate, or "new" for a second theme in this thread). The theme stays unsaved until the user turns Save on in the theme card in this thread (or Settings → Themes), or asks you to: then pass save: true. The user can always return to the original look in Settings → Themes → Stock, or with Cmd/Ctrl+Alt+Shift+0.
+  get_app_theme: `Read Durango Code's current look before restyling it, and the performance rules every theme must follow: the active theme (or stock), the theme this thread is shaping, every theme token with its stock value, CSS hooks, the scene event API, and script errors your scenes reported. Pass screenshot: true to also get a picture of the app window as it looks now, to check your work, and ui_map: true for an outline of what is on screen (elements as CSS selectors with their boxes, the theme slots, your placed controls) to find where to put a control or what to style. It also lists the theme's values (current choice) and where each of its controls is on screen. Use it with set_app_theme when the user asks to customize, theme, restyle or decorate Durango Code itself (this app), not their project.`,
+  set_app_theme: `Restyle Durango Code itself (the app the user is talking to you in), live: colors, fonts, corner radius, an animated or image backdrop behind the app, an effects overlay above it, and extra CSS. Use it whenever the user asks to customize how Durango Code looks ("make it pink", "synthwave theme", "add snow"); never edit Durango Code's source or files for that. Each call changes this thread's working theme and applies it at once; values you leave out stay as they are (tokens: { name: null } removes one; backdrop/overlay: null removes them; css: "" clears it). The first call starts from the theme in use (pass start_from: "stock" for a clean slate, or "new" for a second theme in this thread); to change a theme the user already has in place (no copy), pass its theme_id (from manage_app_themes list): this thread then shapes that theme. Switching, saving, renaming, duplicating and deleting themes is manage_app_themes. The theme stays unsaved until the user turns Save on in the theme card in this thread (or Settings → Themes), or asks you to: then pass save: true. The user can always return to the original look in Settings → Themes → Stock, or with Cmd/Ctrl+Alt+Shift+0.
 
 Tokens (CSS custom properties; plain colors, gradients, lengths, font lists; no url()): ${tokenTable()}.
 Over a backdrop, bg-base/bg-raised/bg-surface/settings-sidebar-bg turn translucent by surface_opacity (default 0.72) so it shows through (base_opacity sets the main transcript area separately); panel_blur frosts panels. Keep text readable: text-primary at least 7:1 against your panels.
@@ -98,7 +115,18 @@ Values and controls (the theme's own UI, anywhere the user wants it): declare va
 Placement: {slot: "<name>"} for spots the app keeps for theme controls: ${slotList()}. Or {selector: "<css selector>", position: "before" | "after" | "start" | "end"} to sit next to or inside any element (get_app_theme with ui_map: true shows what is on screen with selectors and boxes). Or position: "float" to hover over the window (no slot/selector) or over an element, at corner top-left | top-right | bottom-left | bottom-right | center, moved by x/y px. all: true repeats a control for every match (each split pane); order sorts controls sharing a spot. Controls merge by id (a control with an existing id replaces it; {id, remove: true} drops it; controls: null removes all); values: {name: null} removes a value.
 What values change: CSS sees each as data-tv-<name> on <html> (:root[data-tv-snow="false"] .theme-overlay { display: none }) and --tv-<name> (booleans 1/0, numbers as they are, choices as a quoted string; opacity: var(--tv-glow)). Scenes and widgets get durango.values and the value event. backdrop.variants switch the backdrop: variants: [{when: {time: "night"}, image_path: "/abs/night.png" (or asset: "<file already in the theme>"), dim, blur, saturate, position…}] (first match wins; it crossfades). generate_theme_media with variant_when makes such a picture for you. Style controls with CSS on [data-theme-control="<id>"] (.theme-control-button, .is-on for a pressed toggle or chosen option). set_values: {name: value} changes the current choice (what the user would click) without redefining anything; values reset with null.
 When the user asks for a control, build all of it in one go: the value, the control where they asked, and everything it should change (CSS, scene code that listens, a generated second picture for a variant). Then check with screenshot: true (and get_app_theme for where the controls landed).
-Pass screenshot: true to see the result. Keep each html page under ${Math.round(THEME_LIMITS.html / 1000)} KB.`,
+Pass screenshot: true to see the result. Keep each html page under ${Math.round(THEME_LIMITS.html / 1000)} KB. Follow the performance rules get_app_theme returns (it is the first call of any theme work; this tool repeats them on a thread's first change).`,
+  manage_app_themes: `Do anything the user can do in Settings → Themes, for any theme (not only the one this thread shapes). Actions:
+- list: every theme with its id, built-in/saved/unsaved, which one is in use, and whether animated effects are on.
+- apply (theme_id): use a theme, built-in or the user's. stock: back to the original look.
+- save / unsave (theme_id): Save keeps a theme in the gallery; unsaved drafts that are not in use are deleted after 14 days.
+- rename (theme_id, name). duplicate (theme_id, optional name): a saved copy the user (and you) can change, the way to edit a built-in.
+- delete (theme_id): user themes only; deleting the theme in use returns to Stock. It cannot be undone.
+- undo (theme_id): step a theme back one revision and use it.
+- animate (animate: true/false): Settings' "Animated backdrops and effects" for the whole app (false shows still frames and hides overlays).
+- celebrate: play what the theme in use does when an agent finishes a turn ("Preview celebration").
+- measure (seconds, default 5): CPU of each Durango Code process (main, GPU, window, scene frames) over that time, to check what a theme costs. Includes the work of agents running at the time, including you.
+theme_id also takes a theme's exact name when only one theme has it. To restyle a theme, use set_app_theme (with theme_id to change one the user already has).`,
   generate_theme_media: `Generate a backdrop for Durango Code's theme with Durango inference (image or looping video models, billed to the user's Durango credits) and apply it to this thread's working theme. Use it when the user wants an AI-made wallpaper, scene, or animated backdrop for the app ("a misty forest at dawn behind everything"). Image takes a few seconds to a minute; video takes one to several minutes (you wait here). Write a vivid prompt for a backdrop: wide, atmospheric, low-detail center with interest at the edges, no text; say "seamless loop, slow subtle motion" for video. With variant_when: {value: x} (a value the theme declares, e.g. {time: "night"}) the media becomes a backdrop variant shown while the values match, instead of replacing the backdrop: keep the same composition as the main picture so the switch reads as the same place. Afterwards tune tokens (accent, surfaces) with set_app_theme so the palette matches the picture, and check with screenshot: true.`,
 });
 
@@ -129,18 +157,18 @@ export const THEME_TOOL_INPUT_SCHEMAS = Object.freeze({
       appearance: { type: 'string', enum: ['dark', 'light'], description: 'Light or dark (form controls and scrollbars follow).' },
       tokens: THEME_TOKENS_SCHEMA,
       surface_opacity: {
-        type: 'number',
+        type: ['number', 'null'],
         minimum: 0.1,
         maximum: 1,
         description: 'How opaque panels are over a backdrop (0.1-1, default 0.72). null resets it.',
       },
       base_opacity: {
-        type: 'number',
+        type: ['number', 'null'],
         minimum: 0.05,
         maximum: 1,
-        description: 'Opacity of the main transcript area over a backdrop (defaults to surface_opacity); lower lets the scene show more behind the conversation.',
+        description: 'Opacity of the main transcript area over a backdrop (defaults to surface_opacity); lower lets the scene show more behind the conversation. null resets it.',
       },
-      panel_blur: { type: 'number', minimum: 0, maximum: 40, description: 'Frosted-glass blur of panels over the backdrop, in px.' },
+      panel_blur: { type: ['number', 'null'], minimum: 0, maximum: 40, description: 'Frosted-glass blur of panels over the backdrop, in px. null resets it.' },
       backdrop: {
         type: ['object', 'null'],
         description: 'What paints behind the app; null removes it. See the description for the types.',
@@ -227,6 +255,11 @@ export const THEME_TOOL_INPUT_SCHEMAS = Object.freeze({
         additionalProperties: false,
       },
       css: { type: 'string', description: 'Extra CSS for the app; replaces the theme\'s previous css. "" clears it.' },
+      theme_id: {
+        type: 'string',
+        description:
+          'Change this existing theme in place (id or exact name from manage_app_themes list) instead of this thread\'s working theme; this thread then shapes it. Built-ins cannot change: duplicate them first.',
+      },
       start_from: {
         type: 'string',
         description:
@@ -235,6 +268,22 @@ export const THEME_TOOL_INPUT_SCHEMAS = Object.freeze({
       save: { type: 'boolean', description: 'true when the user asks to keep the theme (lists it in Settings); false unsaves it.' },
       screenshot: { type: 'boolean', description: 'Return a picture of the app after the change.' },
     },
+    additionalProperties: false,
+  },
+  manage_app_themes: {
+    type: 'object',
+    properties: {
+      action: {
+        type: 'string',
+        enum: ['list', 'apply', 'stock', 'save', 'unsave', 'rename', 'duplicate', 'delete', 'undo', 'animate', 'celebrate', 'measure'],
+        description: 'What to do (see the description).',
+      },
+      theme_id: { type: 'string', description: 'The theme: its id, or its exact name if only one theme has it.' },
+      name: { type: 'string', description: 'rename: the new name; duplicate: the copy\'s name (default "<name> copy").' },
+      animate: { type: 'boolean', description: 'animate: true plays animated backdrops and effects, false shows still frames.' },
+      seconds: { type: 'integer', minimum: 2, maximum: 15, description: 'measure: how long to sample (default 5).' },
+    },
+    required: ['action'],
     additionalProperties: false,
   },
   generate_theme_media: {
@@ -274,7 +323,7 @@ export const themeMcpToolDefinitions = (accessMode) =>
 /** System-prompt hint for Claude runs (claude-driver.js). */
 export const THEME_TOOLS_PROMPT_HINT = [
   '# Customizing Durango Code (Durango Code)',
-  'When the user asks to change how Durango Code itself looks (a theme, colors, fonts, a backdrop or wallpaper, animated effects, "make the app look like…"), use mcp__orion__set_app_theme (and get_app_theme first to see the current look): it restyles the app live from this thread, with no code changes. For AI-made wallpapers or looping video backdrops, use mcp__orion__generate_theme_media (Durango inference). Themes can also add their own controls anywhere in the app (toggles, choices, sliders, menus, buttons or custom HTML widgets in the title bar, sidebar, prompt box or next to any element) whose values drive the theme CSS, scenes and backdrop variants: build the whole feature when asked. Make it delightful: a coherent palette with readable text, and HTML scenes that react to agent activity. Check your work with screenshot: true, then tell the user they can keep it with Save on the theme card and switch themes or go back to Stock in Settings → Themes.',
+  'When the user asks to change how Durango Code itself looks (a theme, colors, fonts, a backdrop or wallpaper, animated effects, "make the app look like…"), use mcp__orion__set_app_theme (and get_app_theme first to see the current look): it restyles the app live from this thread, with no code changes. For AI-made wallpapers or looping video backdrops, use mcp__orion__generate_theme_media (Durango inference). To switch, save, rename or delete themes, or anything else Settings → Themes does, use mcp__orion__manage_app_themes. Themes can also add their own controls anywhere in the app (toggles, choices, sliders, menus, buttons or custom HTML widgets in the title bar, sidebar, prompt box or next to any element) whose values drive the theme CSS, scenes and backdrop variants: build the whole feature when asked. Make it delightful and light: a coherent palette with readable text, and HTML scenes that react to agent activity. Check your work with screenshot: true, then tell the user they can keep it with Save on the theme card.',
 ].join('\n');
 
 // --- helpers ----------------------------------------------------------------------
@@ -283,6 +332,12 @@ let durangoClient = null;
 /** main.js wires the Durango client (generate_theme_media). */
 export const setThemeToolsClient = (client) => {
   durangoClient = client;
+};
+
+let metricsSource = null;
+/** main.js wires app.getAppMetrics (manage_app_themes measure). */
+export const setThemeToolsMetrics = (source) => {
+  metricsSource = typeof source === 'function' ? source : null;
 };
 
 const fail = (text) => ({ ok: false, text });
@@ -398,8 +453,30 @@ const savedNote = (theme) =>
     ? 'It is saved: it is in Settings → Themes.'
     : 'It is not saved yet: the user keeps it with Save on the theme card in this thread (or in Settings → Themes); if they ask you to keep it, call set_app_theme with save: true.';
 
+/** A theme by id, or by exact name (case-insensitive) when only one theme has it. */
+const findTheme = async (ref) => {
+  const wanted = typeof ref === 'string' ? ref.trim() : '';
+  if (!wanted) throw new Error('Pass theme_id (an id or exact name from manage_app_themes list).');
+  const byId = await getTheme(wanted);
+  if (byId) return byId;
+  const { themes } = await listThemes();
+  const named = themes.filter((theme) => theme.name.toLowerCase() === wanted.toLowerCase());
+  if (named.length === 1) return named[0];
+  if (named.length > 1) {
+    throw new Error(`${named.length} themes are named "${wanted}": pass one of their ids (${named.map((theme) => theme.id).join(', ')}).`);
+  }
+  throw new Error(`No theme "${wanted}". Use manage_app_themes list to see the themes.`);
+};
+
 /** The theme to change for this call, or the base a new one starts from. */
-const resolveTarget = async (threadId, startFrom) => {
+const resolveTarget = async (threadId, startFrom, themeRef) => {
+  if (typeof themeRef === 'string' && themeRef.trim()) {
+    const theme = await findTheme(themeRef);
+    if (theme.builtIn) {
+      throw new Error(`"${theme.name}" is built in and cannot change. Duplicate it (manage_app_themes duplicate) and change the copy, or pass start_from: "${theme.id}".`);
+    }
+    return { id: theme.id, claim: true };
+  }
   const working = await workingThemeFor(threadId);
   const from = typeof startFrom === 'string' ? startFrom.trim() : 'current';
   if (!from || from === 'current') {
@@ -547,6 +624,7 @@ const getAppTheme = async (args, context) => {
     `Themes available: ${themes.map((theme) => `${theme.name} (${theme.id}${theme.builtIn ? ', built-in' : theme.saved ? '' : ', unsaved'})`).filter((_, index, list) => list.length < 40 || index < 40).join(', ')}.`,
     `Active theme JSON: ${active ? JSON.stringify(describeTheme(active)) : 'null'}`,
     `Theme slots for controls: ${slotList()}.`,
+    PERFORMANCE_GUIDE,
   ].filter(Boolean);
   if (args.ui_map === true) {
     const map = await runInWindow(context.getSender, THEME_UI_MAP_SCRIPT);
@@ -557,7 +635,9 @@ const getAppTheme = async (args, context) => {
 
 const setAppTheme = async (args, context) => {
   const { threadId } = context;
-  const target = await resolveTarget(threadId, args.start_from);
+  const target = await resolveTarget(threadId, args.start_from, args.theme_id);
+  // An agent that skipped get_app_theme still gets the rules once per thread.
+  const firstChange = !(await workingThemeFor(threadId));
   const patch = {};
   if (args.name !== undefined) patch.name = args.name;
   if (args.description !== undefined) patch.description = args.description;
@@ -581,6 +661,7 @@ const setAppTheme = async (args, context) => {
     patch,
     threadId,
     base: themeId ? undefined : target.base,
+    claim: target.claim === true,
     ...(typeof args.save === 'boolean' ? { saved: args.save } : {}),
   });
   let valueNote = null;
@@ -600,6 +681,8 @@ const setAppTheme = async (args, context) => {
     errors.length ? `Scene script errors (fix them): ${errors.join(' | ')}` : hasScene ? 'Scenes loaded without script errors.' : null,
     valueNote,
     ...(await controlLines(theme, context.getSender)),
+    performanceNotes(theme),
+    firstChange ? PERFORMANCE_GUIDE : null,
     'The user can return to the original look any time (Settings → Themes → Stock).',
   ]
     .filter(Boolean)
@@ -719,10 +802,175 @@ const generateThemeMedia = async (args, context) => {
       : `Use it with set_app_theme css as theme-asset("${asset}").`,
     theme ? savedNote(theme) : null,
     args.screenshot === true ? 'The picture below is a screenshot of the app window, not the backdrop file: never pass it as image_path.' : null,
+    apply ? performanceNotes(theme) : null,
   ]
     .filter(Boolean)
     .join('\n');
   return resultWithShot(text, { screenshot: args.screenshot === true, getSender: context.getSender });
+};
+
+// --- performance -----------------------------------------------------------------
+
+// Same test as ThemeLayer's: static frost steps aside for theme CSS that paints a panel's background.
+const FROST_PANELS = /\.(sidebar|app-shellbar|composer-shell|settings-panel|settings-sidebar|thread-pane-header)\b/;
+const themeStylesPanels = (css) => {
+  if (!css) return false;
+  for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (FROST_PANELS.test(match[1]) && /(^|[;\s])background(-color|-image)?\s*:/i.test(match[2])) return true;
+  }
+  return false;
+};
+
+/** What in this theme is likely to cost CPU/GPU every frame, as advice for the agent; null when nothing stands out. */
+export const performanceNotes = (theme) => {
+  if (!theme) return null;
+  const notes = [];
+  const backdrop = theme.backdrop;
+  const movingBackdrop = backdrop?.type === 'video' || backdrop?.type === 'html';
+  if ((theme.panelBlur ?? 0) > 0 && movingBackdrop) {
+    notes.push(`panel_blur ${theme.panelBlur} over a ${backdrop.type} backdrop re-blurs every panel on every frame; set panel_blur 0 and use surface_opacity`);
+  }
+  if ((theme.panelBlur ?? 0) > 0 && theme.overlay?.html && backdrop?.type === 'image') {
+    const why = backdrop.fit === 'contain' ? 'fit is contain' : themeStylesPanels(theme.css) ? 'your css sets a panel background' : null;
+    if (why) notes.push(`panel_blur ${theme.panelBlur} under the animated overlay stays a live blur because ${why}, so it re-runs every frame; set panel_blur 0 or drop the panel background css`);
+  }
+  if ((backdrop?.blur ?? 0) > 0 && movingBackdrop) {
+    notes.push(`backdrop.blur on a ${backdrop.type} backdrop is re-applied every frame; soften the content itself`);
+  }
+  const scenes = [
+    ['overlay', theme.overlay?.html],
+    ['backdrop', backdrop?.type === 'html' ? backdrop.html : null],
+  ];
+  for (const [role, html] of scenes) {
+    if (!html || !/requestAnimationFrame/.test(html)) continue;
+    const issues = [];
+    if (/create(Radial|Linear|Conic)Gradient/.test(html)) issues.push('it creates canvas gradients (pre-render a sprite once if that happens per particle per frame)');
+    if (/shadowBlur/.test(html)) issues.push('it uses shadowBlur (bake the glow into a sprite)');
+    if (/\.filter\s*=/.test(html)) issues.push('it sets ctx.filter (expensive per draw)');
+    if (!/document\.hidden|visibilityState/.test(html)) issues.push('it keeps drawing while the window is hidden (check document.hidden)');
+    if (!/focused/.test(html)) issues.push('it does not slow down when the window is not focused');
+    if (!/reducedMotion/.test(html)) issues.push('it ignores reducedMotion');
+    if (/devicePixelRatio/.test(html) && !/Math\.min\([^)]*devicePixelRatio/.test(html)) issues.push('devicePixelRatio is not capped');
+    if (issues.length) notes.push(`${role} scene: ${issues.join('; ')}`);
+  }
+  if (theme.css && /@keyframes[^{]*\{[^@]*?(filter|box-shadow|blur\()/i.test(theme.css)) {
+    notes.push('css animates filter, blur or box-shadow; animate transform and opacity instead');
+  }
+  return notes.length ? `Performance notes (fix before handing over, then check with manage_app_themes measure): ${notes.join(' | ')}.` : null;
+};
+
+const PROCESS_LABELS = { Browser: 'main process', GPU: 'GPU', Tab: 'window or scene frame', Utility: 'utility' };
+
+const measureCost = async (seconds, context) => {
+  if (!metricsSource) return fail('Measuring is not available in this build.');
+  const sampleMs = Math.round((Number.isInteger(seconds) ? Math.min(15, Math.max(2, seconds)) : 5) * 1000);
+  metricsSource();
+  await wait(sampleMs, context.signal);
+  if (context.signal?.aborted) return fail('Stopped before the measurement finished.');
+  const rows = metricsSource().filter((row) => row.cpu > 0.05 || row.type === 'GPU' || row.type === 'Browser');
+  rows.sort((a, b) => b.cpu - a.cpu);
+  const total = rows.reduce((sum, row) => sum + row.cpu, 0);
+  const active = await getActiveTheme();
+  const { animate } = await listThemes();
+  const sender = context.getSender?.();
+  const focused = sender && !sender.isDestroyed?.() && typeof sender.isFocused === 'function' ? sender.isFocused() : null;
+  const lines = [
+    `Durango Code used ${total.toFixed(1)}% of one CPU core over ${sampleMs / 1000}s (100% = one core fully busy).`,
+    ...rows.map((row) => `- ${PROCESS_LABELS[row.type] ?? row.type}${row.name ? ` (${row.name})` : ''} pid ${row.pid}: ${row.cpu.toFixed(1)}%, ${Math.round(row.memoryKb / 1024)} MB`),
+    `Theme in use: ${active ? `"${active.name}" (${active.id})` : 'Stock'}; animated effects ${animate === false ? 'off' : 'on'}${focused === null ? '' : `; window ${focused ? 'focused (scenes at full rate)' : 'not focused (scenes throttle)'}`}.`,
+    'Agents working at the time, you included, add to these numbers: compare with Stock measured the same way. A good animated theme stays within about 10 points of Stock.',
+  ];
+  return { ok: true, text: lines.join('\n') };
+};
+
+// --- manage_app_themes -------------------------------------------------------------
+
+const themeLine = (theme, { activeId, threadId }) =>
+  [
+    `- "${theme.name}" (${theme.id})`,
+    theme.builtIn ? 'built-in' : theme.saved ? 'saved' : 'unsaved draft',
+    theme.id === activeId ? 'IN USE' : null,
+    theme.threadId && theme.threadId === threadId ? "this thread's working theme" : null,
+    theme.builtIn ? null : `revision ${theme.revision ?? 1}`,
+    theme.description ? theme.description : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+const manageAppThemes = async (args, context) => {
+  const action = typeof args.action === 'string' ? args.action : '';
+  const card = (theme, note) => emitThemeCard({ ...context, theme, note });
+  switch (action) {
+    case 'list': {
+      const { activeId, animate, themes } = await listThemes();
+      const lines = [
+        `In use: ${activeId ? (themes.find((theme) => theme.id === activeId)?.name ?? activeId) : 'Stock (the original look)'}. Animated backdrops and effects: ${animate === false ? 'off' : 'on'}.`,
+        ...themes.map((theme) => themeLine(theme, { activeId, threadId: context.threadId })),
+      ];
+      return { ok: true, text: lines.join('\n') };
+    }
+    case 'apply': {
+      const theme = await findTheme(args.theme_id);
+      await setActiveTheme(theme.id);
+      await card(theme, 'Applied');
+      return { ok: true, text: [`"${theme.name}" (${theme.id}) is in use now.`, performanceNotes(theme)].filter(Boolean).join('\n') };
+    }
+    case 'stock':
+      await setActiveTheme(null);
+      return { ok: true, text: 'Durango Code is back to Stock, the original look.' };
+    case 'save':
+    case 'unsave': {
+      const found = await findTheme(args.theme_id);
+      if (found.builtIn) return fail('Built-in themes are always in the gallery.');
+      const theme = await setThemeSaved(found.id, action === 'save');
+      await card(theme);
+      return { ok: true, text: `"${theme.name}" is ${theme.saved ? 'saved: it stays in Settings → Themes' : 'unsaved: it is deleted after 14 days unless it is in use'}.` };
+    }
+    case 'rename': {
+      const found = await findTheme(args.theme_id);
+      if (found.builtIn) return fail('Built-in themes cannot be renamed: duplicate it and rename the copy.');
+      const name = typeof args.name === 'string' ? args.name.trim() : '';
+      if (!name) return fail('rename needs name.');
+      const theme = await renameTheme(found.id, name);
+      return { ok: true, text: `Renamed "${found.name}" to "${theme.name}".` };
+    }
+    case 'duplicate': {
+      const found = await findTheme(args.theme_id);
+      const name = typeof args.name === 'string' && args.name.trim() ? args.name.trim() : undefined;
+      const theme = await duplicateTheme(found.id, { name });
+      return { ok: true, text: `Made "${theme.name}" (${theme.id}), a saved copy of "${found.name}". It is not in use; apply it, or change it with set_app_theme theme_id: "${theme.id}".` };
+    }
+    case 'delete': {
+      const found = await findTheme(args.theme_id);
+      if (found.builtIn) return fail('Built-in themes cannot be deleted.');
+      const { activeId } = await deleteTheme(found.id);
+      return { ok: true, text: `Deleted "${found.name}" (${found.id}).${activeId ? '' : ' Durango Code shows Stock now.'}` };
+    }
+    case 'undo': {
+      const found = await findTheme(args.theme_id);
+      if (found.builtIn) return fail('Built-in themes have no history.');
+      const theme = await undoTheme(found.id);
+      await card(theme, 'Undid the last change');
+      return { ok: true, text: `"${theme.name}" is back to its previous revision and in use.` };
+    }
+    case 'animate': {
+      if (typeof args.animate !== 'boolean') return fail('animate needs animate: true or false.');
+      await setThemesAnimate(args.animate);
+      return { ok: true, text: args.animate ? 'Animated backdrops and effects are on.' : 'Animated backdrops and effects are off: still frames, no overlays.' };
+    }
+    case 'celebrate': {
+      const active = await getActiveTheme();
+      if (!active) return fail('Stock has no celebration; apply a theme first.');
+      const sender = context.getSender?.();
+      if (!sender || sender.isDestroyed?.()) return fail('The Durango Code window is not available.');
+      sender.send('themes:celebrate');
+      return { ok: true, text: `Played "${active.name}"'s celebration (themes without a turn-end effect show nothing).` };
+    }
+    case 'measure':
+      return measureCost(args.seconds, context);
+    default:
+      return fail('manage_app_themes needs action: list, apply, stock, save, unsave, rename, duplicate, delete, undo, animate, celebrate or measure.');
+  }
 };
 
 /**
@@ -737,6 +985,7 @@ export const runThemeTool = async (name, rawArgs, context = {}) => {
   try {
     if (name === 'get_app_theme') return await getAppTheme(args, context);
     if (name === 'set_app_theme') return await setAppTheme(args, context);
+    if (name === 'manage_app_themes') return await manageAppThemes(args, context);
     return await generateThemeMedia(args, context);
   } catch (error) {
     return fail(`${name} failed: ${error?.message ?? error}`);

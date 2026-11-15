@@ -33,8 +33,10 @@ import * as store from '../src/main/ui-themes-store.js';
 import {
   THEME_TOOL_INPUT_SCHEMAS,
   THEME_TOOL_NAMES,
+  performanceNotes,
   runThemeTool,
   setThemeToolsClient,
+  setThemeToolsMetrics,
   themeMcpToolDefinitions,
 } from '../src/main/theme-tools.js';
 import { ORION_THEME_TOOL_NAMES, isPreapprovedOrionTool, orionThemeToolNamesForAccessMode } from '../src/main/thread-reader-routing.js';
@@ -177,8 +179,11 @@ const broadcasts = [];
 store.configureThemeStore({ dir, send: (snapshot) => broadcasts.push(snapshot) });
 
 const events = [];
+const sent = [];
 const sender = {
   isDestroyed: () => false,
+  isFocused: () => true,
+  send: (channel) => sent.push(channel),
   capturePage: async () => ({
     getSize: () => ({ width: 2000, height: 1200 }),
     resize: function () {
@@ -351,6 +356,182 @@ await test('state survives a restart; unsaved drafts are kept while recent', asy
   assert.ok(snapshot.themes.some((theme) => theme.threadId === 'thread-b'));
 });
 
+await test('manage_app_themes: everything Settings → Customizations does', async () => {
+  store.configureThemeStore({ dir, send: (snapshot) => broadcasts.push(snapshot) });
+  const manage = (args, thread = 'thread-m') => runThemeTool('manage_app_themes', args, context(thread));
+  const list = await manage({ action: 'list' });
+  assert.equal(list.ok, true, list.text);
+  assert.match(list.text, /"Neon Sunset" \(t[a-z0-9]+\) · saved · IN USE/);
+  assert.match(list.text, /Animated backdrops and effects: on/);
+
+  // Apply by id or unique name; stock; a built-in by name.
+  assert.equal((await manage({ action: 'stock' })).ok, true);
+  assert.equal((await store.listThemes()).activeId, null);
+  assert.equal((await manage({ action: 'apply', theme_id: 'neon sunset' })).ok, true);
+  assert.equal((await store.listThemes()).activeId, firstId);
+  assert.equal((await manage({ action: 'apply', theme_id: BUILTIN_THEMES[0].name })).ok, true);
+  assert.equal((await store.listThemes()).activeId, BUILTIN_THEMES[0].id);
+  assert.equal((await manage({ action: 'apply', theme_id: 'nope' })).ok, false);
+
+  // Duplicate a built-in, rename, unsave/save, undo after an in-place edit, delete.
+  const dup = await manage({ action: 'duplicate', theme_id: BUILTIN_THEMES[0].id, name: 'Mine' });
+  assert.equal(dup.ok, true, dup.text);
+  const mine = (await store.listThemes()).themes.find((theme) => theme.name === 'Mine');
+  assert.ok(mine && mine.saved);
+  assert.equal((await manage({ action: 'rename', theme_id: mine.id, name: 'Mine too' })).ok, true);
+  assert.equal((await store.getTheme(mine.id)).name, 'Mine too');
+  assert.equal((await manage({ action: 'rename', theme_id: BUILTIN_THEMES[0].id, name: 'x' })).ok, false);
+  assert.equal((await manage({ action: 'unsave', theme_id: mine.id })).ok, true);
+  assert.equal((await store.getTheme(mine.id)).saved, false);
+  assert.equal((await manage({ action: 'save', theme_id: mine.id })).ok, true);
+  assert.equal((await store.getTheme(mine.id)).saved, true);
+
+  // set_app_theme theme_id changes that theme in place (no copy) and this thread then shapes it.
+  const count = (await store.listThemes()).themes.length;
+  const dangerBefore = (await store.getTheme(mine.id)).tokens.danger;
+  const edit = await runThemeTool('set_app_theme', { theme_id: mine.id, tokens: { accent: '#00ff88' } }, context('thread-m'));
+  assert.equal(edit.ok, true, edit.text);
+  assert.equal((await store.listThemes()).themes.length, count, 'no copy');
+  assert.equal((await store.getTheme(mine.id)).tokens.accent, '#00ff88');
+  assert.equal((await store.workingThemeFor('thread-m')).id, mine.id);
+  await runThemeTool('set_app_theme', { tokens: { danger: '#ff3355' } }, context('thread-m'));
+  assert.equal((await store.getTheme(mine.id)).tokens.danger, '#ff3355', 'later calls keep shaping it');
+  const builtInEdit = await runThemeTool('set_app_theme', { theme_id: BUILTIN_THEMES[0].id, tokens: { accent: '#000' } }, context('thread-m'));
+  assert.equal(builtInEdit.ok, false);
+  assert.match(builtInEdit.text, /duplicate/i);
+
+  assert.equal((await manage({ action: 'undo', theme_id: mine.id })).ok, true);
+  assert.equal((await store.getTheme(mine.id)).tokens.danger, dangerBefore);
+  assert.equal((await store.getTheme(mine.id)).tokens.accent, '#00ff88');
+  assert.equal((await store.listThemes()).activeId, mine.id);
+
+  assert.equal((await manage({ action: 'delete', theme_id: BUILTIN_THEMES[0].id })).ok, false);
+  const deleted = await manage({ action: 'delete', theme_id: mine.id });
+  assert.equal(deleted.ok, true);
+  assert.match(deleted.text, /Stock now/);
+  assert.equal(await store.getTheme(mine.id), null);
+
+  // Animated effects persist with the rest of the state.
+  assert.equal((await manage({ action: 'animate', animate: false })).ok, true);
+  assert.equal((await store.listThemes()).animate, false);
+  assert.equal(broadcasts.at(-1).animate, false);
+  store.configureThemeStore({ dir, send: (snapshot) => broadcasts.push(snapshot) });
+  assert.equal((await store.listThemes()).animate, false, 'kept across a restart');
+  assert.equal((await manage({ action: 'animate', animate: true })).ok, true);
+
+  // Celebrate needs a theme in use and tells the window.
+  assert.equal((await manage({ action: 'celebrate' })).ok, false);
+  await manage({ action: 'apply', theme_id: firstId });
+  assert.equal((await manage({ action: 'celebrate' })).ok, true);
+  assert.equal(sent.at(-1), 'themes:celebrate');
+
+  assert.equal((await manage({ action: 'fly' })).ok, false);
+});
+
+await test('manage_app_themes measure reports CPU per process', async () => {
+  let calls = 0;
+  setThemeToolsMetrics(() => {
+    calls += 1;
+    return [
+      { pid: 1, type: 'Browser', name: '', cpu: 1.5, memoryKb: 200_000 },
+      { pid: 2, type: 'GPU', name: '', cpu: 12.25, memoryKb: 300_000 },
+      { pid: 3, type: 'Tab', name: '', cpu: 9, memoryKb: 100_000 },
+    ];
+  });
+  const result = await runThemeTool('manage_app_themes', { action: 'measure', seconds: 2 }, context('thread-m'));
+  assert.equal(result.ok, true, result.text);
+  assert.equal(calls, 2, 'one call resets the counters, one reads them');
+  assert.match(result.text, /22\.8% of one CPU core over 2s/);
+  assert.match(result.text, /GPU pid 2: 12\.3%/);
+  assert.match(result.text, /window focused/);
+  setThemeToolsMetrics(null);
+  assert.equal((await runThemeTool('manage_app_themes', { action: 'measure', seconds: 2 }, context('thread-m'))).ok, false);
+});
+
+await test('performance notes flag per-frame costs and stay quiet for a light theme', async () => {
+  const heavy = sanitizeTheme({
+    id: 'theavy1',
+    name: 'Heavy',
+    panelBlur: 14,
+    backdrop: { type: 'html', html: '<canvas></canvas><script>function f(){requestAnimationFrame(f);const g=x.createRadialGradient(0,0,0,0,0,4);x.shadowBlur=8;}f();const d=devicePixelRatio;</script>' },
+    css: '@keyframes glow { from { box-shadow: 0 0 4px red } to { box-shadow: 0 0 20px red } }',
+  });
+  const notes = performanceNotes(heavy);
+  assert.match(notes, /panel_blur 14 over a html backdrop/);
+  assert.match(notes, /canvas gradients/);
+  assert.match(notes, /shadowBlur/);
+  assert.match(notes, /document\.hidden/);
+  assert.match(notes, /not focused/);
+  assert.match(notes, /reducedMotion/);
+  assert.match(notes, /devicePixelRatio is not capped/);
+  assert.match(notes, /css animates/);
+  const light = sanitizeTheme({
+    id: 'tlight1',
+    name: 'Light',
+    panelBlur: 14,
+    backdrop: { type: 'image', asset: 'backdrop-a.jpg' },
+    overlay: { html: '<script>function f(){requestAnimationFrame(f);if(document.hidden)return;if(D.state.reducedMotion)return;const s=focused?33:66;}const dpr=Math.min(devicePixelRatio,1.5);</script>' },
+  });
+  assert.equal(performanceNotes(light), null, 'image backdrop + overlay gets static frost; a careful scene is fine');
+  const setResult = await runThemeTool('set_app_theme', { start_from: 'stock', name: 'Busy', panel_blur: 10, backdrop: { type: 'html', html: '<script>requestAnimationFrame(()=>{})</script>' } }, context('thread-p'));
+  assert.match(setResult.text, /Performance notes/);
+});
+
+await test('review fixes: ownership, undo, animate migration, resets, frost notes', async () => {
+  store.configureThemeStore({ dir, send: (snapshot) => broadcasts.push(snapshot) });
+  // A thread's stale edit after another thread took the theme over is refused.
+  await runThemeTool('set_app_theme', { start_from: 'stock', name: 'Owned' }, context('thread-r1'));
+  const owned = await store.workingThemeFor('thread-r1');
+  const taken = await runThemeTool('set_app_theme', { theme_id: owned.id, tokens: { accent: '#abcdef' } }, context('thread-r2'));
+  assert.equal(taken.ok, true, taken.text);
+  await assert.rejects(store.updateTheme({ id: owned.id, patch: { tokens: { accent: '#000000' } }, threadId: 'thread-r1' }), /took this theme over/);
+  assert.equal((await store.getTheme(owned.id)).tokens.accent, '#abcdef');
+  // Undo keeps the new owner.
+  await store.undoTheme(owned.id);
+  assert.equal((await store.getTheme(owned.id)).threadId, 'thread-r2');
+  assert.equal((await store.workingThemeFor('thread-r2')).id, owned.id);
+  // The legacy animate value only fills a gap.
+  const fresh = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-themes-animate-'));
+  store.configureThemeStore({ dir: fresh, send: () => {} });
+  assert.equal((await store.adoptLegacyThemesAnimate(false)).animate, false, 'no stored setting: adopted');
+  assert.equal((await store.adoptLegacyThemesAnimate(true)).animate, false, 'stored: ignored');
+  store.configureThemeStore({ dir: fresh, send: () => {} });
+  assert.equal((await store.adoptLegacyThemesAnimate(true)).animate, false, 'stored across restart: ignored');
+  await store.setThemesAnimate(true);
+  await fs.rm(fresh, { recursive: true, force: true });
+  store.configureThemeStore({ dir, send: (snapshot) => broadcasts.push(snapshot) });
+  // null resets the numeric settings, and the schemas allow it.
+  await runThemeTool('set_app_theme', { surface_opacity: 0.5, base_opacity: 0.3, panel_blur: 8 }, context('thread-r2'));
+  const reset = await runThemeTool('set_app_theme', { surface_opacity: null, base_opacity: null, panel_blur: null }, context('thread-r2'));
+  assert.equal(reset.ok, true, reset.text);
+  const after = await store.getTheme(owned.id);
+  assert.equal(after.surfaceOpacity, undefined);
+  assert.equal(after.baseOpacity, undefined);
+  assert.equal(after.panelBlur, undefined);
+  for (const key of ['surface_opacity', 'base_opacity', 'panel_blur']) {
+    assert.ok(THEME_TOOL_INPUT_SCHEMAS.set_app_theme.properties[key].type.includes('null'), `${key} is nullable`);
+  }
+  // Frost steps aside for panel background css or contain, and the notes say so.
+  const scene = '<script>function f(){requestAnimationFrame(f);if(document.hidden)return;if(D.state.reducedMotion)return;const s=focused?33:66;}</script>';
+  const styled = sanitizeTheme({ id: 'tstyled1', name: 'Styled', panelBlur: 12, backdrop: { type: 'image', asset: 'backdrop-a.jpg' }, overlay: { html: scene }, css: '.sidebar { background: #123; }' });
+  assert.match(performanceNotes(styled), /panel background/);
+  const contain = sanitizeTheme({ id: 'tcontain1', name: 'Contain', panelBlur: 12, backdrop: { type: 'image', asset: 'backdrop-a.jpg', fit: 'contain' }, overlay: { html: scene } });
+  assert.match(performanceNotes(contain), /fit is contain/);
+});
+
+await test('performance rules load with theme work, not with the tool list', async () => {
+  const [getDef, setDef] = ['get_app_theme', 'set_app_theme'].map((name) => themeMcpToolDefinitions('full-access').find((tool) => tool.name === name));
+  assert.ok(!setDef.description.includes('pre-rendered sprite'), 'the rules are not in the always-listed description');
+  assert.match(setDef.description, /performance rules get_app_theme returns/);
+  assert.match(getDef.description, /performance rules/);
+  const read = await runThemeTool('get_app_theme', {}, context('thread-q'));
+  assert.match(read.text, /pre-rendered sprite/);
+  const first = await runThemeTool('set_app_theme', { start_from: 'stock', name: 'Quiet' }, context('thread-q'));
+  assert.match(first.text, /pre-rendered sprite/, "a thread's first change repeats them");
+  const second = await runThemeTool('set_app_theme', { tokens: { accent: '#123456' } }, context('thread-q'));
+  assert.ok(!second.text.includes('pre-rendered sprite'), 'later changes do not');
+});
+
 await test('tool schemas: one source for Claude and the bridge; read-only drops generation', async () => {
   assert.deepEqual([...ORION_THEME_TOOL_NAMES], [...THEME_TOOL_NAMES]);
   assert.deepEqual(themeMcpToolDefinitions('full-access').map((tool) => tool.name), [...THEME_TOOL_NAMES]);
@@ -359,6 +540,7 @@ await test('tool schemas: one source for Claude and the bridge; read-only drops 
   for (const mode of ['read-only', 'workspace-write', 'full-access']) {
     assert.equal(isPreapprovedOrionTool('set_app_theme', mode), true, `set_app_theme in ${mode}`);
     assert.equal(isPreapprovedOrionTool('get_app_theme', mode), true);
+    assert.equal(isPreapprovedOrionTool('manage_app_themes', mode), true);
   }
   assert.equal(isPreapprovedOrionTool('generate_theme_media', 'read-only'), false);
   assert.equal(isPreapprovedOrionTool('generate_theme_media', 'workspace-write'), true);

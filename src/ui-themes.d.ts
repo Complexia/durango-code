@@ -89,6 +89,8 @@ export type UiTheme = {
 
 export type ThemeSnapshot = {
   activeId: string | null;
+  /** Animated backdrops and effects on (false = still frames, no overlays). */
+  animate?: boolean;
   /** Folder that holds each theme's files: `<dir>/<id>/<asset>`. */
   dir: string;
   themes: UiTheme[];

@@ -29,12 +29,12 @@ export const orionBuiltinToolNamesForAccessMode = (accessMode) =>
     ? ORION_BUILTIN_TOOL_NAMES.filter((name) => name !== 'remember')
     : ORION_BUILTIN_TOOL_NAMES;
 
-// Theme tools (theme-tools.js): get/set only change how Durango Code looks on
+// Theme tools (theme-tools.js): get/set/manage only change how Durango Code looks on
 // this computer, so every mode approves them; generate_theme_media spends
 // Durango credits, an external mutation, so Read only leaves it unapproved
 // (and the tool refuses in that mode). Served through `__tools` for the
 // bridge, so the shim's static list does not include them.
-export const ORION_THEME_TOOL_NAMES = Object.freeze(['get_app_theme', 'set_app_theme', 'generate_theme_media']);
+export const ORION_THEME_TOOL_NAMES = Object.freeze(['get_app_theme', 'set_app_theme', 'manage_app_themes', 'generate_theme_media']);
 export const orionThemeToolNamesForAccessMode = (accessMode) =>
   accessMode === 'read-only'
     ? ORION_THEME_TOOL_NAMES.filter((name) => name !== 'generate_theme_media')

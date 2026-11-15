@@ -1037,8 +1037,14 @@ type OrionCodexBrowserIntegrationStatus = {
           values: Record<string, import('./ui-themes.js').ThemeValue | null>
         ) => Promise<ThemeIpcResult<{ values: Record<string, import('./ui-themes.js').ThemeValue>; ignored: string[] }>>;
         resetValues: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
+        setAnimate: (animate: boolean) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
+        /** The pre-1.0.206 localStorage setting; main keeps it only if state.json has none yet. */
+        adoptLegacyAnimate: (animate: boolean) => Promise<ThemeIpcResult<import('./ui-themes.js').ThemeSnapshot>>;
+        /** A small, softened copy of an image backdrop for static frosted panels; null if it cannot be made. */
+        frost: (id: string, asset: string, width: number, saturate: number) => Promise<ThemeIpcResult<string | null>>;
         reportSceneError: (id: string, message: string) => void;
         onChanged: (callback: (snapshot: import('./ui-themes.js').ThemeSnapshot) => void) => () => void;
+        onCelebrate: (callback: () => void) => () => void;
       };
       openDirectory: () => Promise<string | null>;
       /** Lists the directories in a typed path (project picker's Add project view). */

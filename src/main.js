@@ -130,9 +130,13 @@ import {
   setActiveTheme,
   setThemeSaved,
   setThemeValues,
+  adoptLegacyThemesAnimate,
+  setThemesAnimate,
+  themeAssetPath,
   undoTheme,
 } from './main/ui-themes-store.js';
-import { setThemeToolsClient } from './main/theme-tools.js';
+import { isThemeAssetName, isVideoAsset } from './ui-themes.js';
+import { setThemeToolsClient, setThemeToolsMetrics } from './main/theme-tools.js';
 import { createBrowserManager } from './main/browser/manager.js';
 import { browserScreenshotsDirectory } from './main/browser/security.js';
 import { browserModeFor, setBrowserManager } from './main/browser-tools.js';
@@ -1807,6 +1811,62 @@ themeIpc('themes:undo', (id) => undoTheme(String(id)));
 themeIpc('themes:canUndo', (id) => canUndoTheme(String(id)));
 themeIpc('themes:setValues', (id, values) => setThemeValues(String(id), values && typeof values === 'object' ? values : {}));
 themeIpc('themes:resetValues', (id) => resetThemeValues(String(id)));
+themeIpc('themes:setAnimate', (animate) => setThemesAnimate(animate !== false));
+themeIpc('themes:adoptLegacyAnimate', (animate) => adoptLegacyThemesAnimate(animate !== false));
+themeIpc('themes:frost', (id, asset, width, saturate) => makeThemeFrost(String(id), String(asset), Number(width), Number(saturate)));
+
+// Static frost for an image backdrop (ThemeLayer useStaticFrost): a small copy
+// of the picture that the renderer stretches behind each panel, so frosted
+// panels need no live backdrop-filter. Made once per size and kept with the
+// theme's files.
+const makeThemeFrost = async (id, asset, width, saturate) => {
+  if (!isThemeAssetName(asset) || isVideoAsset(asset)) return null;
+  const source = themeAssetPath(id, asset);
+  const size = Math.max(16, Math.min(320, Math.round(Number.isFinite(width) ? width : 96)));
+  const amount = Math.max(0, Math.min(3, Number.isFinite(saturate) ? saturate : 1));
+  const name = `frost-${size}-s${Math.round(amount * 100)}-${asset.replace(/\.[a-z0-9]+$/i, '')}.jpg`;
+  const target = isThemeAssetName(name) ? themeAssetPath(id, name) : null;
+  if (!source || !target) return null;
+  try {
+    await fs.access(target);
+    return name;
+  } catch {}
+  const image = nativeImage.createFromPath(source);
+  if (image.isEmpty()) return null;
+  // Two steps down stays smooth where one big step would alias.
+  let small = image.resize({ width: size * 4, quality: 'best' }).resize({ width: size, quality: 'best' });
+  if (Math.abs(amount - 1) > 0.005) small = saturateImage(small, amount);
+  await fs.writeFile(target, small.toJPEG(85));
+  return name;
+};
+
+// CSS saturate() (Filter Effects matrix) on a small BGRA bitmap, the way the
+// backdrop's own filter and the live panel blur's saturate(1.15) tint it.
+const saturateImage = (image, s) => {
+  const size = image.getSize();
+  const pixels = Buffer.from(image.toBitmap());
+  for (let index = 0; index + 3 < pixels.length; index += 4) {
+    const b = pixels[index];
+    const g = pixels[index + 1];
+    const r = pixels[index + 2];
+    const clamp = (value) => Math.max(0, Math.min(255, Math.round(value)));
+    pixels[index + 2] = clamp((0.213 + 0.787 * s) * r + (0.715 - 0.715 * s) * g + (0.072 - 0.072 * s) * b);
+    pixels[index + 1] = clamp((0.213 - 0.213 * s) * r + (0.715 + 0.285 * s) * g + (0.072 - 0.072 * s) * b);
+    pixels[index] = clamp((0.213 - 0.213 * s) * r + (0.715 - 0.715 * s) * g + (0.072 + 0.928 * s) * b);
+  }
+  return nativeImage.createFromBitmap(pixels, size);
+};
+
+// manage_app_themes measure: CPU of each Durango Code process over a window.
+setThemeToolsMetrics(() =>
+  app.getAppMetrics().map((metric) => ({
+    pid: metric.pid,
+    type: metric.type,
+    name: metric.name ?? metric.serviceName ?? '',
+    cpu: metric.cpu?.percentCPUUsage ?? 0,
+    memoryKb: metric.memory?.workingSetSize ?? 0,
+  }))
+);
 ipcMain.on('themes:sceneError', (_event, id, message) => recordSceneError(id, message));
 
 ipcMain.handle('storage:load', async () => {

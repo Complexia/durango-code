@@ -10,16 +10,18 @@ type ThemeState = {
   snapshot: ThemeSnapshot | null;
   /** Values changed here and not yet confirmed by the store, by theme id. */
   pendingValues: Record<string, Record<string, ThemeValue>>;
-  /** Whether scenes animate (Settings → Themes; local to this window). */
+  /** Whether scenes animate (Settings → Themes; kept by the main process so agents can change it too). */
   animate: boolean;
   setAnimate: (animate: boolean) => void;
 };
 
-const ANIMATE_KEY = 'durango.themes.animate';
+// Before 1.0.206 the setting lived in this window's localStorage; it now lives
+// in themes/state.json (ui-themes-store.js), so agents can change it too.
+const LEGACY_ANIMATE_KEY = 'durango.themes.animate';
 
-const readAnimate = () => {
+const readLegacyAnimate = () => {
   try {
-    return window.localStorage.getItem(ANIMATE_KEY) !== 'off';
+    return window.localStorage.getItem(LEGACY_ANIMATE_KEY) !== 'off';
   } catch {
     return true;
   }
@@ -28,14 +30,15 @@ const readAnimate = () => {
 export const useThemeState = create<ThemeState>((set) => ({
   snapshot: null,
   pendingValues: {},
-  animate: typeof window === 'undefined' ? true : readAnimate(),
+  animate: typeof window === 'undefined' ? true : readLegacyAnimate(),
   setAnimate: (animate) => {
-    try {
-      window.localStorage.setItem(ANIMATE_KEY, animate ? 'on' : 'off');
-    } catch {}
     set({ animate });
+    void window.orion?.themes?.setAnimate(animate).catch(() => {});
   },
 }));
+
+const applySnapshot = (snapshot: ThemeSnapshot) =>
+  useThemeState.setState({ snapshot, animate: snapshot.animate !== false });
 
 let started = false;
 
@@ -43,9 +46,22 @@ let started = false;
 export const startThemeSync = () => {
   if (started || typeof window === 'undefined' || !window.orion?.themes) return;
   started = true;
-  window.orion.themes.onChanged((snapshot) => useThemeState.setState({ snapshot }));
-  void window.orion.themes.list().then((result) => {
-    if (result.ok) useThemeState.setState({ snapshot: result.value });
+  const api = window.orion.themes;
+  api.onChanged(applySnapshot);
+  void api.list().then(async (result) => {
+    if (!result.ok) return;
+    let snapshot = result.value;
+    try {
+      if (window.localStorage.getItem(LEGACY_ANIMATE_KEY) !== null) {
+        // Main keeps it only if state.json has no setting yet, so it never overrides a newer one.
+        const moved = await api.adoptLegacyAnimate(readLegacyAnimate());
+        if (moved.ok) {
+          snapshot = moved.value;
+          window.localStorage.removeItem(LEGACY_ANIMATE_KEY);
+        }
+      }
+    } catch {}
+    applySnapshot(snapshot);
   });
 };
 

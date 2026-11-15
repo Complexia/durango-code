@@ -38,7 +38,7 @@ const IDEAS: ReadonlyArray<{ label: string; prompt: string }> = [
 ];
 
 const customizePrompt = (idea: string) =>
-  `Customize how Durango Code looks: ${idea.trim()}\n\nRestyle the app live with the theme tools (get_app_theme, set_app_theme; generate_theme_media for AI-made backdrops), check it with a screenshot, and keep text readable.`;
+  `Customize how Durango Code looks: ${idea.trim()}\n\nRestyle the app live with the theme tools (get_app_theme, set_app_theme; generate_theme_media for AI-made backdrops; manage_app_themes to switch, save or measure), check it with a screenshot, keep text readable, and keep it light: if it animates, measure it against Stock.`;
 
 type Props = {
   /** Opens a new thread with the prompt in its composer (App.tsx). */

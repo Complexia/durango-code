@@ -17,7 +17,7 @@ import { BUILTIN_THEMES } from '../ui-themes-builtin.js';
 // renderer (IPC in main.js) and the "Use Stock Theme" shortcut all see one
 // state:
 //
-//   <userData>/themes/state.json          { activeId (null = stock), values: { <themeId>: { name: value } } }
+//   <userData>/themes/state.json          { activeId (null = stock), animate, values: { <themeId>: { name: value } } }
 //   <userData>/themes/<id>/theme.json      one theme (built-ins are code)
 //   <userData>/themes/<id>/history.json    earlier revisions, for Undo
 //   <userData>/themes/<id>/<asset>         backdrop images and videos
@@ -43,6 +43,10 @@ const sceneErrors = new Map();
 let activeId = null;
 /** The user's current choice for each theme's values (controls), by theme id. */
 let storedValues = {};
+// Settings → Themes → Animated backdrops and effects (false = still frames).
+let animate = true;
+// Whether state.json holds the setting (the pre-1.0.206 localStorage value only fills a gap).
+let animateStored = false;
 let writeChain = Promise.resolve();
 
 /** Wire the store (main.js): where themes live and how to tell the renderer. */
@@ -53,6 +57,8 @@ export const configureThemeStore = ({ dir, send }) => {
   themes.clear();
   activeId = null;
   storedValues = {};
+  animate = true;
+  animateStored = false;
 };
 
 const builtInById = new Map(
@@ -111,6 +117,8 @@ const ensureLoaded = () => {
         if (isThemeId(id) && values && typeof values === 'object' && !Array.isArray(values)) storedValues[id] = values;
       }
     }
+    animate = state?.animate !== false;
+    animateStored = typeof state?.animate === 'boolean';
     // Unsaved drafts nobody kept.
     const cutoff = Date.now() - UNSAVED_TTL_MS;
     for (const theme of [...themes.values()]) {
@@ -135,6 +143,7 @@ const resolvedValues = () => {
 
 const snapshot = () => ({
   activeId,
+  animate,
   dir: themesDir,
   values: resolvedValues(),
   themes: [...builtInById.values(), ...[...themes.values()].sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''))],
@@ -175,7 +184,7 @@ const persistState = () => {
   for (const [id, entry] of Object.entries(storedValues)) {
     if ((themes.has(id) || builtInById.has(id)) && Object.keys(entry).length) values[id] = entry;
   }
-  return queueWrite(() => writeJson(path.join(themesDir, STATE_FILE), { activeId, ...(Object.keys(values).length ? { values } : {}) }));
+  return queueWrite(() => writeJson(path.join(themesDir, STATE_FILE), { activeId, animate, ...(Object.keys(values).length ? { values } : {}) }));
 };
 
 /**
@@ -231,6 +240,29 @@ export const setActiveTheme = (id) => exclusive(async () => {
   return snapshot();
 });
 
+/** Play animated scenes and video (true) or show still frames and hide overlays (false). */
+export const setThemesAnimate = (value) => exclusive(async () => {
+  await ensureLoaded();
+  const next = value !== false;
+  if (next === animate && animateStored) return snapshot();
+  animate = next;
+  animateStored = true;
+  await persistState();
+  notify();
+  return snapshot();
+});
+
+/** The old per-window setting, kept only when state.json has none yet (it never overrides a newer choice). */
+export const adoptLegacyThemesAnimate = (value) => exclusive(async () => {
+  await ensureLoaded();
+  if (animateStored) return snapshot();
+  animate = value !== false;
+  animateStored = true;
+  await persistState();
+  notify();
+  return snapshot();
+});
+
 const appendHistory = async (previous) => {
   const file = path.join(themeDir(previous.id), HISTORY_FILE);
   const history = (await readJson(file)) ?? [];
@@ -265,13 +297,18 @@ export const workingThemeFor = async (threadId) => {
  * Change a theme (or create one from `base`, a theme to start from) and apply
  * it. `patch` uses mergeTheme's fields. Returns `{ theme, ignored }`.
  */
-export const updateTheme = ({ id, patch, threadId, base, activate = true, saved }) => exclusive(async () => {
+export const updateTheme = ({ id, patch, threadId, base, activate = true, saved, claim = false }) => exclusive(async () => {
   await ensureLoaded();
   const current = id ? themes.get(id) ?? null : null;
   if (id && !current) throw new Error('That theme no longer exists.');
+  // A thread's edit to its working theme, decided before an await (a file
+  // import), must not land after another thread took the theme over.
+  if (current && !claim && threadId && current.threadId && current.threadId !== threadId) {
+    throw new Error('Another thread took this theme over while this change was in progress; nothing changed. Run the call again to start a new working theme, or pass theme_id to take it back.');
+  }
   const start = current ?? (base ? { ...base, id: undefined, builtIn: false, saved: false, revision: 0, createdAt: undefined } : null);
   const themeId = current?.id ?? newThemeId();
-  const { theme, ignored } = mergeTheme(start, patch ?? {}, { id: themeId, threadId: current?.threadId ?? threadId });
+  const { theme, ignored } = mergeTheme(start, patch ?? {}, { id: themeId, threadId: (claim ? threadId : current?.threadId) ?? threadId });
   if (!theme) throw new Error('The theme could not be built from those values.');
   if (typeof saved === 'boolean') theme.saved = saved;
   else theme.saved = current?.saved ?? false;
@@ -370,6 +407,8 @@ export const undoTheme = (id) => exclusive(async () => {
   const restored = {
     ...previous,
     saved: current.saved,
+    // Ownership follows the theme now, not the revision (a thread that took it over keeps it).
+    threadId: current.threadId,
     name: previous.name,
     revision: (current.revision ?? 1) + 1,
     updatedAt: new Date().toISOString(),

@@ -9255,6 +9255,30 @@ html.theme-panel-blur :is(.sidebar, .app-shellbar, .composer-shell, .settings-pa
   backdrop-filter: blur(var(--theme-panel-blur)) saturate(1.15);
 }
 
+/* Static frost (ThemeLayer useStaticFrost): image backdrop + animated overlay.
+   Each panel paints its own tint over the dim veil over a small, softened copy
+   of the picture, fixed to the window so it lines up with the backdrop. */
+html.theme-static-frost :is(.sidebar, .app-shellbar, .composer-shell, .settings-panel, .settings-sidebar, .thread-pane-header) {
+  --theme-frost-tint: var(--theme-frost-raised);
+  background-image: var(--theme-frost-tint), linear-gradient(var(--theme-frost-dim), var(--theme-frost-dim)), var(--theme-frost);
+  background-position: 0 0, 0 0, var(--theme-frost-position);
+  background-size: auto, auto, cover;
+  background-repeat: no-repeat;
+  background-attachment: scroll, scroll, fixed;
+}
+
+html.theme-static-frost .app-shellbar {
+  --theme-frost-tint: var(--theme-frost-shell);
+}
+
+html.theme-static-frost .settings-sidebar {
+  --theme-frost-tint: var(--theme-frost-settings);
+}
+
+html.theme-static-frost .thread-pane-header {
+  --theme-frost-tint: linear-gradient(rgb(26 26 30 / 60%), rgb(26 26 30 / 60%));
+}
+
 .theme-card-button {
   display: inline-flex;
   align-items: center;
