@@ -88,7 +88,7 @@ export type DurangoWorkspaceStatus = {
   /** The change this workspace holds, if any (`.durango/change.json`). */
   change?: {
     changeId: string;
-    status: 'open' | 'queued' | 'landed' | 'abandoned' | null;
+    status: 'open' | 'queued' | 'landed' | 'archived' | 'abandoned' | null;
     url: string | null;
     title: string | null;
     rejection: string | null;

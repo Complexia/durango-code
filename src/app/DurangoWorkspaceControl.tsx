@@ -25,6 +25,7 @@ const changeStatusLabel: Record<string, string> = {
   open: 'Open',
   queued: 'On the train',
   landed: 'Merged',
+  archived: 'Archived',
   abandoned: 'Abandoned',
 };
 
