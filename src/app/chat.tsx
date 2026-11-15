@@ -155,7 +155,8 @@ export const AgentFamilySwitcher: React.FC<{
 
   const anyRunning =
     root.status === 'running' || subagents.some(({ thread }) => thread.status === 'running');
-  useRunTicker(anyRunning);
+  // Elapsed times only tick while rows are on screen.
+  useRunTicker(anyRunning && sectionOpen && subagents.length > 0);
 
   if (subagents.length === 0) return null;
 

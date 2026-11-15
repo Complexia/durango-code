@@ -2963,6 +2963,13 @@ body {
   50% { opacity: 0.65; transform: scale(0.88); }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .status-dot.running,
+  .thread-working-dot {
+    animation: none;
+  }
+}
+
 /* Main panel area */
 .panel {
   flex: 1;
@@ -4342,6 +4349,7 @@ body {
 }
 
 .agent-switcher-row {
+  isolation: isolate;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -4410,9 +4418,27 @@ body {
 }
 
 .agent-switcher-dot.status-running {
+  position: relative;
   border-color: var(--accent);
   background: var(--accent);
+}
+
+/* The pulsing glow is its own ring animated with transform + opacity, which
+   the compositor runs off the main thread. Animating box-shadow instead
+   repainted the dot on the main thread every frame (60 style recalcs and
+   paints a second while any subagent family was running). */
+.agent-switcher-dot.status-running::after {
+  content: '';
+  position: absolute;
+  inset: -1.5px;
+  border-radius: 50%;
+  background: var(--accent-glow);
+  opacity: 0;
   animation: agent-switcher-pulse 1.4s ease-in-out infinite;
+  pointer-events: none;
+  /* Behind the dot (the row isolates it), so only the part outside the dot
+     shows, as the shadow did. */
+  z-index: -1;
 }
 
 .agent-switcher-dot.status-done {
@@ -4425,13 +4451,24 @@ body {
 }
 
 @keyframes agent-switcher-pulse {
+  /* Starts a little inside the dot: the ring is its own layer and can land
+     half a pixel off the dot, which showed as a sliver at rest. */
   0%,
   100% {
-    box-shadow: 0 0 0 0 var(--accent-glow);
+    opacity: 1;
+    transform: scale(0.8);
   }
 
+  /* 7px dot + 4px of ring each side: the old 4px box-shadow spread. */
   50% {
-    box-shadow: 0 0 0 4px transparent;
+    opacity: 0;
+    transform: scale(2.15);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-switcher-dot.status-running::after {
+    animation: none;
   }
 }
 

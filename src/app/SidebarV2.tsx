@@ -698,11 +698,28 @@ const ProviderMark: React.FC<{ modelId: string }> = ({ modelId }) => {
 const WorkingDuration: React.FC<{ thread: Thread }> = ({ thread }) => {
   const startedAt = thread.summary.workingSince;
   const [now, setNow] = useState(() => Date.now());
+  const valid = startedAt !== null && Number.isFinite(startedAt);
+  // Wake only when the label can change: every second under a minute, then
+  // at the next minute ("7m" → "8m"). A running thread can sit in several
+  // sections at once, each with its own label, so idle ticks add up.
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
-  if (startedAt === null || !Number.isFinite(startedAt)) return null;
+    if (!valid) return undefined;
+    // `now` is from the last tick; when `startedAt` moved meanwhile it can be
+    // up to a minute old, so take a fresh one first.
+    const current = Date.now();
+    if (current - now > 250) {
+      setNow(current);
+      return undefined;
+    }
+    const elapsed = Math.max(0, now - (startedAt as number));
+    // formatWorkedDuration rounds to whole seconds, so a minute turns over
+    // 500ms before its exact boundary.
+    const delay =
+      elapsed < 59_500 ? 1000 - (elapsed % 1000) : (Math.floor((elapsed + 500) / 60_000) + 1) * 60_000 - 500 - elapsed;
+    const timer = window.setTimeout(() => setNow(Date.now()), Math.max(250, delay));
+    return () => window.clearTimeout(timer);
+  }, [now, startedAt, valid]);
+  if (!valid) return null;
   return <span className="tabular-nums">{formatWorkedDuration(Math.max(0, now - startedAt))}</span>;
 };
 
@@ -724,7 +741,7 @@ const ThreadStatusLabel: React.FC<{ thread: Thread; tone: ReturnType<typeof thre
   if (thread.status === 'running') {
     return (
       <span className="inline-flex items-center gap-1 text-[11.5px] font-medium text-sky-400">
-        <CircleDashed size={13} className="shrink-0 animate-spin [animation-duration:3s]" />
+        <CircleDashed size={13} className="shrink-0 animate-spin [animation-duration:3s] motion-reduce:animate-none" />
         Working
         <WorkingDuration thread={thread} />
       </span>
