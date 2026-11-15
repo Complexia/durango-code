@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
 import {
   BACKDROP_TYPES,
   STOCK_THEME_ID,
@@ -128,8 +129,12 @@ export const THEME_TOOL_INPUT_SCHEMAS = Object.freeze({
           type: { type: 'string', enum: [...BACKDROP_TYPES] },
           css: { type: 'string', description: 'type css: a CSS background value (gradients, colors).' },
           html: { type: 'string', description: 'type html: a self-contained animated scene page.' },
-          image_path: { type: 'string', description: 'type image: absolute path of an image file to copy into the theme.' },
-          video_path: { type: 'string', description: 'type video: absolute path of a video file to copy into the theme.' },
+          image_path: {
+            type: 'string',
+            description:
+              'type image: absolute path of a new image file to copy into the theme (one the user gave you or you made). Leave it out to keep the current picture; dim, blur, saturate, position and fit then change in place. Never a screenshot from screenshot: true.',
+          },
+          video_path: { type: 'string', description: 'type video: absolute path of a new video file to copy into the theme. Leave it out to keep the current video.' },
           dim: { type: 'number', minimum: 0, maximum: 0.9, description: 'Black veil over the backdrop (0-0.9).' },
           blur: { type: 'number', minimum: 0, maximum: 40, description: 'Blur of the backdrop, in px.' },
           saturate: { type: 'number', minimum: 0, maximum: 2, description: 'Saturation of the backdrop (1 = as is).' },
@@ -215,6 +220,30 @@ const wait = (ms, signal) =>
 
 const SCREENSHOT_MAX_WIDTH = 1280;
 
+// Agents get the window screenshots below back as files (Claude saves tool
+// images under tool-results/), and have mistaken one for the backdrop they
+// generated: the theme then painted a frozen copy of the thread behind the
+// app. Remember what each screenshot hashes to and refuse it as a backdrop.
+const SHOT_HASH_LIMIT = 200;
+const shotHashes = new Set();
+const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
+const rememberShot = (data) => {
+  shotHashes.add(sha256(data));
+  if (shotHashes.size > SHOT_HASH_LIMIT) shotHashes.delete(shotHashes.values().next().value);
+};
+
+/** True when the file at `filePath` is a window screenshot a theme tool returned. */
+const isAppScreenshotFile = async (filePath) => {
+  if (!shotHashes.size) return false;
+  try {
+    const stats = await fs.stat(filePath);
+    if (!stats.isFile() || stats.size > 20 * 1024 * 1024) return false;
+    return shotHashes.has(sha256(await fs.readFile(filePath)));
+  } catch {
+    return false;
+  }
+};
+
 /** A JPEG of the app window, scaled down; null if the window is gone. */
 const captureWindow = async (getSender) => {
   const sender = getSender?.();
@@ -223,7 +252,9 @@ const captureWindow = async (getSender) => {
     let image = await sender.capturePage();
     const size = image.getSize();
     if (size.width > SCREENSHOT_MAX_WIDTH) image = image.resize({ width: SCREENSHOT_MAX_WIDTH, quality: 'good' });
-    return { data: image.toJPEG(82).toString('base64'), mimeType: 'image/jpeg' };
+    const jpeg = image.toJPEG(82);
+    rememberShot(jpeg);
+    return { data: jpeg.toString('base64'), mimeType: 'image/jpeg' };
   } catch {
     return null;
   }
@@ -307,6 +338,12 @@ const backdropPatch = async (input, themeIdForAssets) => {
   const { image_path: imagePath, video_path: videoPath, ...rest } = input;
   const patch = { ...rest };
   if (imagePath || videoPath) {
+    if (await isAppScreenshotFile(String(imagePath || videoPath))) {
+      throw new Error(
+        `${imagePath || videoPath} is a screenshot of Durango Code that a theme tool returned, not a backdrop picture. ` +
+          'To change how the current backdrop looks (dim, blur, saturate, position, fit), pass backdrop without image_path: the picture stays. Nothing was changed.'
+      );
+    }
     const asset = await importThemeAsset(themeIdForAssets, String(imagePath || videoPath));
     patch.type = isVideoAsset(asset) ? 'video' : 'image';
     patch.asset = asset;
@@ -466,9 +503,10 @@ const generateThemeMedia = async (args, context) => {
   const text = [
     `Generated a ${kind} with ${model}${creditsUsed ? ` (${creditsUsed} credits)` : ''} and saved it in theme "${theme?.name}" as ${asset}.`,
     apply
-      ? 'It is the backdrop now. Tune the palette to match it with set_app_theme (accent, surfaces, surface_opacity, dim) and check with screenshot: true.'
+      ? `It is the backdrop now (${asset}). Tune the palette to match it with set_app_theme (accent, surfaces, surface_opacity) and check with screenshot: true. To adjust the picture itself, pass backdrop { dim, blur, saturate } without image_path: the file stays.`
       : `Use it with set_app_theme css as theme-asset("${asset}").`,
     theme ? savedNote(theme) : null,
+    args.screenshot === true ? 'The picture below is a screenshot of the app window, not the backdrop file: never pass it as image_path.' : null,
   ]
     .filter(Boolean)
     .join('\n');

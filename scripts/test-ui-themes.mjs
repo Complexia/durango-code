@@ -285,6 +285,26 @@ await test('generate_theme_media: Durango inference image becomes the backdrop',
   assert.equal(readOnly.ok, false);
 });
 
+await test('a returned screenshot is refused as a backdrop; dim without image_path keeps the picture', async () => {
+  // What happened: generate_theme_media with screenshot: true, Claude saved the
+  // screenshot under tool-results/, and the agent passed it as image_path.
+  const generated = await runThemeTool('generate_theme_media', { prompt: 'misty forest', screenshot: true }, context('thread-d'));
+  assert.equal(generated.ok, true, generated.text);
+  const before = await store.workingThemeFor('thread-d');
+  const shot = generated.content.find((block) => block.type === 'image');
+  const saved = path.join(dir, 'mcp-orion-blob-1.jpg');
+  await fs.writeFile(saved, Buffer.from(shot.data, 'base64'));
+  const refused = await runThemeTool('set_app_theme', { backdrop: { type: 'image', image_path: saved, dim: 0.05 } }, context('thread-d'));
+  assert.equal(refused.ok, false);
+  assert.match(refused.text, /screenshot of Durango Code/);
+  assert.equal((await store.workingThemeFor('thread-d')).revision, before.revision, 'nothing changed');
+  const tuned = await runThemeTool('set_app_theme', { backdrop: { dim: 0.05, saturate: 1.1 } }, context('thread-d'));
+  assert.equal(tuned.ok, true, tuned.text);
+  const after = await store.workingThemeFor('thread-d');
+  assert.equal(after.backdrop.asset, before.backdrop.asset);
+  assert.equal(after.backdrop.dim, 0.05);
+});
+
 await test('generate_theme_media: video polls until done', async () => {
   let polls = 0;
   setThemeToolsClient({
