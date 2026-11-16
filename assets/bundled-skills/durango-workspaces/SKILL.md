@@ -81,6 +81,12 @@ durango-code change amend --description-file /tmp/fix-sidebar-dots.md   # rewrit
   `--public-description "…"` and must not depend on private paths.
 - `durango-code change create --snapshot` backs up work in progress; snapshots
   never land.
+- Every amend is kept as a revision: `durango-code change log` lists them,
+  `change diff --from N --to M` shows what changed between two, and
+  `change restore --rev N` undoes a bad amend.
+- Large tasks can land as a stack of small changes: `durango-code commit -m "…"`
+  makes a local commit backed up on the server as a draft, `durango-code sl`
+  shows the stack, and `change create --stack` opens one change per commit.
 - Report the change URL exactly as the CLI prints it. Opening the change ends
   the task: don't land, deploy, or touch production unless the user asks.
 
@@ -109,8 +115,12 @@ for what they asked.
   `durango-code land <id> <id>…` lands specific ones; `land --cancel <id>` takes
   one off the train. Never deploy any other way.
 - Land is refused when an added line contains a secret.
-- Reverting a merged change: `durango-code change revert <id>` opens a revert
-  change; land it like any other.
+- A stacked workspace lands with `durango-code land <id> <id>…` (bare `land`
+  refuses and lists the ids).
+- Reverting a merged change: `durango-code change revert <id>` (or
+  `durango-code revert r<seq>`) opens a revert change; land it like any other.
+  `durango-code log` lists landed commits with their `r<seq>` numbers, and
+  `durango-code show r<seq>` shows one.
 
 ## Clean up
 
