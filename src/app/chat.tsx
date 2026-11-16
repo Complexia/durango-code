@@ -9,6 +9,7 @@ import { HtmlVisual } from './HtmlVisual';
 import { ThemeCard } from './themes/ThemeCard';
 import { AgentActivityCard, buildAgentRunSegments, FloatingTasksCard, formatRunDuration, formatTokenCount, ThinkingRow, useRunTicker } from './activity';
 import { AttachmentThumb } from './attachments';
+import { RemoteUploadStatus } from './remoteUploads';
 import {
   MarkdownBaseDirContext,
   MarkdownContent,
@@ -695,6 +696,10 @@ export const ChatMessage = React.memo(function ChatMessage({
               {attachments.map((attachment) => (
                 <div key={attachment.id} className="message-attachment" title={attachment.path}>
                   <AttachmentThumb attachment={attachment} />
+                  {/* Still on its way to the machine the thread runs on. */}
+                  {message.role === 'user' && attachment.path && (
+                    <RemoteUploadStatus path={attachment.path} variant="message" />
+                  )}
                   <span>{attachment.name}</span>
                 </div>
               ))}

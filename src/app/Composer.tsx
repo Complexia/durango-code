@@ -31,6 +31,7 @@ import type { OrionMcpEntry, SlashCommandInfo } from '../types';
 import { agentProviders, claudeCodeCliModelId, isClaudeCodeCliModelId, type AgentModel, type AgentProviderId } from '../agentCatalog';
 import { THREAD_DRAG_MIME } from './AgentsSidebar';
 import { AttachmentThumb, attachmentKindLabel, formatAttachmentSize } from './attachments';
+import { RemoteUploadStatus, cancelRemoteUpload, prepareRemoteUpload } from './remoteUploads';
 import { SnapShotAttachmentBadge, openSnapShotOutline } from './SnapShotSettings';
 import { ComposerPopover } from './ComposerPopover';
 import { modelMentionToken, threadMentionToken } from './promptContext';
@@ -224,6 +225,33 @@ export const Composer = ({
   const chatInput = draft.text;
   const chatAttachments = draft.attachments;
   const starting = draft.starting.has(threadId);
+  // A thread on another machine: its files start on their way there as soon
+  // as they are attached, so sending doesn't wait for a large one.
+  const remoteMachineId = threads.find((thread) => thread.id === threadId)?.remote?.machineId ?? null;
+  const preparedUploadsRef = React.useRef(new Map<string, string>()); // `${threadId}\n${path}` -> machine id
+  React.useEffect(() => {
+    const prepared = preparedUploadsRef.current;
+    const present = new Set<string>();
+    for (const attachment of chatAttachments) {
+      if (!attachment.path) continue;
+      const key = `${threadId}\n${attachment.path}`;
+      present.add(key);
+      const previous = prepared.get(key);
+      if (previous === remoteMachineId) continue;
+      // The thread moved to another machine (or back here).
+      if (previous) cancelRemoteUpload(previous, attachment.path);
+      if (remoteMachineId) {
+        prepareRemoteUpload(remoteMachineId, attachment);
+        prepared.set(key, remoteMachineId);
+      } else {
+        prepared.delete(key);
+      }
+    }
+    // Sent (or removed): attaching the file again starts a new upload.
+    for (const key of [...prepared.keys()]) {
+      if (key.startsWith(`${threadId}\n`) && !present.has(key)) prepared.delete(key);
+    }
+  }, [chatAttachments, remoteMachineId, threadId]);
   const hasPendingLinkedTasks = pendingLinkedTaskCount > 0;
   const hasDraftContent = !!chatInput.trim() || chatAttachments.length > 0;
   // Offered only where the default placeholder would show, so it never hides
@@ -940,6 +968,8 @@ export const Composer = ({
   };
 
   const removeChatAttachment = (id: string) => {
+    const removed = chatAttachments.find((attachment) => attachment.id === id);
+    if (removed?.path && remoteMachineId) cancelRemoteUpload(remoteMachineId, removed.path);
     controller.setAttachments((current) => current.filter((attachment) => attachment.id !== id));
   };
 
@@ -979,6 +1009,14 @@ export const Composer = ({
                 <span className="composer-attachment-size">
                   {formatAttachmentSize(attachment.size)}
                 </span>
+                {remoteMachineId && attachment.path && (
+                  <RemoteUploadStatus
+                    machineId={remoteMachineId}
+                    path={attachment.path}
+                    variant="chip"
+                    onRetry={() => prepareRemoteUpload(remoteMachineId, attachment)}
+                  />
+                )}
               </span>
               <button
                 type="button"

@@ -5478,6 +5478,92 @@ body {
   font-size: 10px;
 }
 
+/* A file on its way to the machine the thread runs on (remoteUploads.tsx). */
+.composer-attachment {
+  position: relative;
+  overflow: hidden;
+}
+
+.remote-upload-status {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.remote-upload-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.remote-upload-done .remote-upload-text {
+  color: var(--text-secondary);
+}
+
+.remote-upload-failed .remote-upload-text {
+  color: var(--danger, #f87171);
+}
+
+.remote-upload-retry {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  color: var(--text-secondary);
+}
+
+.remote-upload-retry:hover {
+  background: rgb(255 255 255 / 8%);
+  color: var(--text-primary);
+}
+
+.remote-upload-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: rgb(255 255 255 / 8%);
+}
+
+.remote-upload-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 200ms ease-out;
+}
+
+.message-attachment {
+  position: relative;
+}
+
+.remote-upload-message {
+  padding: 5px 7px 0;
+}
+
+.remote-firewall-notice {
+  margin-top: 6px;
+  color: var(--text-secondary);
+}
+
+.remote-firewall-notice code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgb(255 255 255 / 8%);
+  color: var(--text-primary);
+  font-size: 11px;
+  user-select: all;
+}
+
 .composer-attachment-remove {
   width: 22px;
   height: 22px;

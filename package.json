@@ -66,6 +66,7 @@
     "test:machine-tools": "node scripts/run-electron-test.mjs scripts/test-machine-tools.mjs",
     "test:remote-control-identity": "node --no-warnings scripts/test-remote-control-identity.mjs",
     "test:remote-relay": "node scripts/test-remote-relay.mjs",
+    "test:remote-firewall": "node --no-warnings scripts/test-remote-firewall.mjs",
     "test:remote-view-races": "node --no-warnings --experimental-strip-types scripts/test-remote-view-races.mjs",
     "test:remote-threads": "bun scripts/test-remote-threads.ts && bun scripts/test-remote-thread-listing.ts && bun scripts/test-remote-thread-mentions.ts",
     "test:steering": "node scripts/run-electron-test.mjs scripts/test-steering.mjs",

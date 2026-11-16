@@ -129,7 +129,23 @@ if (role) {
     );
   }
 
+  // The host announces a local route only once a test turns it on ('lan-on').
+  let hostLanAddresses = [];
+  const uploadProgress = [];
+  const heldChunks = new Set();
   await engine.initRemoteControl({
+    lanAddresses: () => hostLanAddresses,
+    allowLoopbackLan: true,
+    // A file a refused command named waits for a retry this long.
+    unclaimedUploadTtlMs: 1500,
+    freeDiskBytes: async () => 700 * 1024 * 1024,
+    // Chunks past 8 MiB are held 3 s the first time they arrive, so an upload
+    // can be interrupted halfway (its resend waits for that first write).
+    beforeUploadChunk: (offset) => {
+      if (offset < 8 * 1024 * 1024 || heldChunks.has(offset)) return undefined;
+      heldChunks.add(offset);
+      return new Promise((resolve) => setTimeout(resolve, 3000));
+    },
     readSession: async () => activeSession(),
     readStoreState: async () => ({
       projects: [{ id: 'p1', name: 'orion', path: '/tmp/orion' }],
@@ -139,7 +155,10 @@ if (role) {
     readThreadsIndex: async () => ({
       entries: fixtureThreads.map((thread) => ({ id: thread.id, hash: `v-${thread.id}`, shell: thread, summary: null })),
     }),
-    broadcast: () => 1,
+    broadcast: (channel, payload) => {
+      if (channel === 'remote:uploadProgress') uploadProgress.push(payload);
+      return 1;
+    },
     dispatchRendererCommand: (payload) => {
       const { commandId, command } = payload;
       if (command.kind === 'runTurn') {
@@ -277,6 +296,10 @@ if (role) {
             (state) => send({ kind: 'online', state }),
             (error) => send({ kind: 'online', error: error.message })
           );
+        }
+        if (command === 'lan-on' || command === 'lan-off') {
+          hostLanAddresses = command === 'lan-on' ? ['127.0.0.1'] : [];
+          send({ kind: 'hostLan', addresses: hostLanAddresses });
         }
         if (command === 'pair-again') {
           const next = engine.startRemotePairing();
@@ -430,6 +453,120 @@ if (role) {
           });
         }
         if (command === 'state') send({ kind: 'controllerState', state: engine.getRemoteControlState() });
+        if (command === 'lan-uploads') {
+          void (async () => {
+            const lanResults = {};
+            const machineState = () => engine.getRemoteControlState().machines.find((machine) => machine.id === hostMachineId);
+            const reconnect = async () => {
+              engine.disconnectRemoteMachine({ machineId: hostMachineId });
+              const connected = await engine.connectRemoteMachine({ machineId: hostMachineId });
+              return { ...connected, route: machineState()?.route ?? null };
+            };
+            const persistedLan = () =>
+              JSON.parse(fs.readFileSync(path.join(process.env.ORION_TEST_USERDATA, 'orion-remote-control.json'), 'utf-8'))
+                .remoteMachines[0].lan ?? null;
+            // Over the relay, the host's welcome says where it listens locally…
+            lanResults.learning = await reconnect();
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            lanResults.learnedLan = persistedLan();
+            // …so the next session goes there directly.
+            lanResults.direct = await reconnect();
+
+            // A file attached in the prompt box starts uploading at once; a
+            // dropped connection resumes it where the host's copy stops.
+            const bigBytes = crypto.randomBytes(24 * 1024 * 1024 + 4321);
+            const bigPath = path.join(process.env.ORION_TEST_USERDATA, 'screen-recording.mov');
+            fs.writeFileSync(bigPath, bigBytes);
+            const attachment = { id: 'big', name: 'screen-recording.mov', path: bigPath, mimeType: 'video/quicktime', size: bigBytes.length };
+            uploadProgress.length = 0;
+            lanResults.prepared = await engine.prepareRemoteAttachmentUpload({ machineId: hostMachineId, attachment });
+            const halfway = Date.now() + 20_000;
+            const interrupted = () =>
+              uploadProgress.find(
+                (event) => event.path === bigPath && event.state === 'uploading' && event.sent >= 8 * 1024 * 1024
+              );
+            while (!interrupted() && Date.now() < halfway) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            lanResults.interruptedAt = interrupted()?.sent ?? null;
+            lanResults.bigSize = bigBytes.length;
+            const beforeDrop = uploadProgress.length;
+            engine.disconnectRemoteMachine({ machineId: hostMachineId });
+            lanResults.bigTurn = await engine.runRemoteTurn({
+              machineId: hostMachineId,
+              projectId: 'p1',
+              prompt: 'make a video from this',
+              attachments: [attachment],
+            });
+            const afterDrop = uploadProgress.slice(beforeDrop).filter((event) => event.path === bigPath);
+            lanResults.resumedFrom = afterDrop.length > 0 ? Math.min(...afterDrop.map((event) => event.sent)) : null;
+            lanResults.finalState = afterDrop.at(-1)?.state ?? null;
+            lanResults.bigRoute = afterDrop.find((event) => event.route)?.route ?? null;
+            const bigHostPath = lanResults.bigTurn.attachments?.[0]?.hostPath;
+            lanResults.bigHash = crypto.createHash('sha256').update(bigBytes).digest('hex');
+            lanResults.bigHostHash = bigHostPath
+              ? crypto.createHash('sha256').update(fs.readFileSync(bigHostPath)).digest('hex')
+              : null;
+
+            // Uploaded from the prompt box, then left long enough for the host
+            // to drop it: sending re-uploads instead of failing.
+            const notePath = path.join(process.env.ORION_TEST_USERDATA, 'notes.txt');
+            fs.writeFileSync(notePath, 'remember the intro shot');
+            const note = { id: 'note', name: 'notes.txt', path: notePath, mimeType: 'text/plain', size: 23 };
+            await engine.prepareRemoteAttachmentUpload({ machineId: hostMachineId, attachment: note });
+            const noteDeadline = Date.now() + 10_000;
+            while (!uploadProgress.some((event) => event.path === notePath && event.state === 'done') && Date.now() < noteDeadline) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            await new Promise((resolve) => setTimeout(resolve, 2500));
+            lanResults.expiredTurn = await engine.runRemoteTurn({
+              machineId: hostMachineId,
+              projectId: 'p1',
+              prompt: 'use the notes',
+              attachments: [note],
+            });
+            const noteHostPath = lanResults.expiredTurn.attachments?.[0]?.hostPath;
+            lanResults.expiredCopy = noteHostPath ? fs.readFileSync(noteHostPath, 'utf8') : null;
+
+            // Two turns sending the same file at once each get their own copy
+            // there (a host lets one command use an upload).
+            const sharedPath = path.join(process.env.ORION_TEST_USERDATA, 'shared.txt');
+            fs.writeFileSync(sharedPath, 'both turns want this');
+            const shared = { id: 'shared', name: 'shared.txt', path: sharedPath, mimeType: 'text/plain', size: 20 };
+            lanResults.sharedTurns = await Promise.all(
+              ['first', 'second'].map((prompt) =>
+                engine.runRemoteTurn({ machineId: hostMachineId, projectId: 'p1', prompt, attachments: [shared] })
+              )
+            );
+
+            // Bigger than the old 100 MB cap is fine; bigger than the host's
+            // free disk space is refused up front, saying so.
+            const hugePath = path.join(process.env.ORION_TEST_USERDATA, 'huge.mov');
+            fs.writeFileSync(hugePath, '');
+            fs.truncateSync(hugePath, 250 * 1024 * 1024);
+            lanResults.hugeTurn = await engine.runRemoteTurn({
+              machineId: hostMachineId,
+              projectId: 'p1',
+              prompt: 'too big for that disk',
+              attachments: [{ id: 'huge', name: 'huge.mov', path: hugePath, mimeType: 'video/quicktime', size: 250 * 1024 * 1024 }],
+            });
+            send({ kind: 'lanUploads', results: lanResults });
+          })().catch((error) => send({ kind: 'lanUploads', error: error.stack ?? String(error) }));
+        }
+        if (command === 'lan-forget') {
+          void (async () => {
+            const machineState = () => engine.getRemoteControlState().machines.find((machine) => machine.id === hostMachineId);
+            engine.disconnectRemoteMachine({ machineId: hostMachineId });
+            // Reached locally; its welcome says it no longer listens there…
+            await engine.connectRemoteMachine({ machineId: hostMachineId });
+            const viaLan = machineState()?.route ?? null;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            engine.disconnectRemoteMachine({ machineId: hostMachineId });
+            // …so the next session goes through the relay again.
+            await engine.connectRemoteMachine({ machineId: hostMachineId });
+            send({ kind: 'lanForgotten', viaLan, route: machineState()?.route ?? null });
+          })();
+        }
         if (command === 'await-offline') {
           void (async () => {
             const deadline = Date.now() + 5000;
@@ -1120,15 +1257,69 @@ if (role) {
     assert.equal(acted.command.attachments?.[0]?.name, 'where-i-am-stuck.txt');
     assert.equal(fs.readFileSync(acted.command.attachments[0].path, 'utf8'), 'the login page says "expired"');
     assert.equal(results.refusedAction.ok, false);
-    const hostAttachments = fs.readdirSync(path.join(tmpRoot, 'host', 'attachments'));
-    assert.equal(
-      hostAttachments.some((name) => name.endsWith('refused.txt')),
-      false,
-      'a refused reply\'s file is deleted on the host'
+    // Kept a while for a retry (the controller still has it), then deleted.
+    await waitUntil(
+      () => !fs.readdirSync(path.join(tmpRoot, 'host', 'attachments')).some((name) => name.endsWith('refused.txt')),
+      'a refused reply\'s file to be deleted on the host',
+      10_000
     );
     assert.deepEqual(results.offerChecks, [true, false, true, false], 'codes go only to hosts new enough for them');
     console.log('ok  the host thread\'s questions and user actions are answered from the controller');
     console.log('ok  pair + snapshot + thread + runTurn/stopTurn round trip over the relay');
+  }
+
+  // 2b. Two machines paired over the internet that share a network talk
+  // directly once the host has said where it listens; large files upload
+  // several chunks at a time, resume after a dropped connection, and are
+  // limited by the host's free disk space rather than a fixed size.
+  {
+    host.send('lan-on');
+    await host.waitFor('hostLan');
+    controller.send('lan-uploads');
+    const lan = await controller.waitFor('lanUploads', 60_000);
+    assert.equal(lan.error, undefined, lan.error);
+    const { results: lanResults } = lan;
+    assert.equal(lanResults.learning.ok, true, `reconnect failed: ${lanResults.learning.error}`);
+    assert.equal(lanResults.learning.route, 'relay', 'the first session after pairing goes through the relay');
+    assert.deepEqual(lanResults.learnedLan, { addresses: ['127.0.0.1'], port: basePort }, 'the host\'s local route is remembered');
+    assert.equal(lanResults.direct.ok, true, `local reconnect failed: ${lanResults.direct.error}`);
+    assert.equal(lanResults.direct.route, 'lan', 'the next session goes over the local network');
+    assert.equal(lanResults.prepared.ok, true, `prepare failed: ${lanResults.prepared.error}`);
+    assert.equal(lanResults.bigTurn.ok, true, `big turn failed: ${lanResults.bigTurn.error}`);
+    assert.ok(
+      lanResults.interruptedAt >= 8 * 1024 * 1024 && lanResults.interruptedAt < lanResults.bigSize,
+      `the upload was interrupted halfway (at ${lanResults.interruptedAt} of ${lanResults.bigSize})`
+    );
+    assert.ok(
+      lanResults.resumedFrom >= 8 * 1024 * 1024 && lanResults.resumedFrom < lanResults.bigSize,
+      `the upload resumed from the host's copy instead of starting over (from ${lanResults.resumedFrom})`
+    );
+    assert.equal(
+      fs.readdirSync(path.join(tmpRoot, 'host', 'attachments')).filter((name) => name.endsWith('screen-recording.mov')).length,
+      1,
+      'the resumed upload is one file on the host, not a second copy'
+    );
+    assert.deepEqual(
+      lanResults.sharedTurns.map((turn) => turn.ok),
+      [true, true],
+      `two turns can send the same file at once: ${lanResults.sharedTurns.map((turn) => turn.error).join(' / ')}`
+    );
+    assert.equal(lanResults.bigRoute, 'lan', 'the upload went over the local network');
+    assert.equal(lanResults.finalState, 'sent');
+    assert.equal(lanResults.bigHostHash, lanResults.bigHash, 'the host has an exact copy of the big file');
+    assert.equal(lanResults.expiredTurn.ok, true, `a file the host dropped is sent again: ${lanResults.expiredTurn.error}`);
+    assert.equal(lanResults.expiredCopy, 'remember the intro shot');
+    assert.equal(lanResults.hugeTurn.ok, false, 'a file larger than the host\'s free space is refused');
+    assert.match(lanResults.hugeTurn.error, /disk space free/);
+    console.log('ok  machines paired over the internet connect locally; big uploads resume and check disk space');
+
+    host.send('lan-off');
+    await host.waitFor('hostLan');
+    controller.send('lan-forget');
+    const forgotten = await controller.waitFor('lanForgotten', 30_000);
+    assert.equal(forgotten.viaLan, 'lan');
+    assert.equal(forgotten.route, 'relay', 'a host that stops listening locally is reached through the relay again');
+    console.log('ok  a host that stops announcing a local route is reached through the relay again');
   }
 
   // 3. The relay carried the bytes and understood none of them.

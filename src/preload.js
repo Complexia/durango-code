@@ -407,6 +407,14 @@ contextBridge.exposeInMainWorld('orion', {
   remoteResolveProject: (input) => ipcRenderer.invoke('remote:resolveProject', input),
   remoteListThreads: (input) => ipcRenderer.invoke('remote:listThreads', input),
   remoteFetchAttachment: (input) => ipcRenderer.invoke('remote:fetchAttachment', input),
+  remotePrepareUpload: (input) => ipcRenderer.invoke('remote:prepareUpload', input),
+  remoteCancelUpload: (input) => ipcRenderer.invoke('remote:cancelUpload', input),
+  remoteListUploads: () => ipcRenderer.invoke('remote:listUploads'),
+  onRemoteUploadProgress: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('remote:uploadProgress', listener);
+    return () => ipcRenderer.removeListener('remote:uploadProgress', listener);
+  },
   remoteThreadGit: (input) => ipcRenderer.invoke('remote:threadGit', input),
   remoteListQuestions: (input) => ipcRenderer.invoke('remote:listQuestions', input),
   remoteAnswerQuestion: (input) => ipcRenderer.invoke('remote:answerQuestion', input),

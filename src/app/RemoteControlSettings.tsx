@@ -348,6 +348,13 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                   ? `Not listening: ${host.error}`
                   : 'TCP port other machines connect to while incoming control is on.'}
               {overInternet && ' Machines on your own network keep using this port; the internet route needs no port at all.'}
+              {host?.firewall && (
+                <div className="remote-firewall-notice">
+                  This machine’s firewall ({host.firewall.tool}) blocks port {host.firewall.port}, so your other
+                  machines on this network reach it through the internet instead, which is much slower for large
+                  files. To let them connect directly, run <code>{host.firewall.command}</code> in a terminal here.
+                </div>
+              )}
             </div>
           </div>
           <input
@@ -487,7 +494,13 @@ const RemoteControlSettings = React.memo(function RemoteControlSettings({
                     </span>
                   </div>
                   <div className="setting-label-desc">
-                    {machine.host ? `${machine.host}:${machine.port}` : 'Reached over the internet'}
+                    {machine.status === 'connected' && machine.route === 'lan'
+                      ? 'Connected over your local network'
+                      : machine.status === 'connected' && machine.route === 'relay'
+                        ? 'Connected over the internet'
+                        : machine.host
+                          ? `${machine.host}:${machine.port}`
+                          : 'Reached over the internet, or directly when on the same network'}
                     {machine.error ? ` — ${machine.error}` : ''}
                   </div>
                 </div>

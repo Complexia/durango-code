@@ -364,7 +364,23 @@ export type RemoteMachineEntry = {
   relay: boolean;
   pairedAt: string | null;
   status: 'connected' | 'connecting' | 'offline' | 'error';
+  /** How the live session reaches it: the typed address, its local network, or the relay. */
+  route?: 'direct' | 'lan' | 'relay' | null;
   error: string | null;
+};
+
+/** A file on its way to another machine (remote:uploadProgress). */
+export type RemoteUploadProgress = {
+  machineId: string;
+  machineName: string;
+  /** The file's path on this machine. */
+  path: string;
+  size: number;
+  sent: number;
+  /** deferred: that machine takes files only with the turn (older version). */
+  state: 'uploading' | 'done' | 'sent' | 'error' | 'cancelled' | 'deferred';
+  route: 'direct' | 'lan' | 'relay' | null;
+  error?: string;
 };
 
 /** Engine state pushed from main over remote:state. */
@@ -384,6 +400,8 @@ export type RemoteControlState = {
     port: number;
     addresses: string[];
     error: string | null;
+    /** Linux: the firewall drops the port, so machines nearby fall back to the relay. */
+    firewall?: { tool: 'ufw'; port: number; command: string } | null;
     /** Internet mode only; `enabled` is false whenever the relay is not held. */
     relay: { enabled: boolean; online: boolean; error: string | null };
     pairing: { code: string; expiresAt: string } | null;
@@ -1991,6 +2009,15 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => Promise<{ ok: boolean; threads?: RemoteListedThread[]; error?: string }>;
       /** A local copy of one of a paired machine's attachments. */
       remoteFetchAttachment?: (input: { machineId: string; path: string }) => Promise<{ ok: boolean; path?: string; error?: string }>;
+      /** Start sending a prompt-box file to the machine its thread runs on. */
+      remotePrepareUpload?: (input: {
+        machineId: string;
+        attachment: { id: string; name: string; path: string; mimeType?: string; size?: number };
+      }) => Promise<{ ok: boolean; error?: string }>;
+      /** Stop sending it (taken out of the prompt box, or the thread moved). */
+      remoteCancelUpload?: (input: { machineId: string; path: string }) => Promise<{ ok: boolean }>;
+      remoteListUploads?: () => Promise<RemoteUploadProgress[]>;
+      onRemoteUploadProgress?: (cb: (progress: RemoteUploadProgress) => void) => () => void;
       /** The branch (and workspace) a paired machine's thread works in. */
       remoteThreadGit?: (input: { machineId: string; threadId: string }) => Promise<{
         ok: boolean;

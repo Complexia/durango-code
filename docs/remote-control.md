@@ -189,10 +189,55 @@ deletes the registration; re-enabling internet mode re-registers it (the
 listener forgets its cached registration on every stop, so a fresh start
 always re-POSTs and revives a soft-deleted row).
 
-**Route choice on the controller** is deliberately boring: direct first when
-the machine has a known address, relay second when internet mode is on. No
-probing, no racing. A machine paired over the internet has no address stored at
-all, so it goes straight to the relay.
+**Route choice on the controller**: the typed address first (machines paired
+by address), then the machine's **local network route**, then the relay when
+internet mode is on. A machine paired over the internet has no typed address,
+but every session's `welcome` carries where the host listens on its own
+networks (`lan: { port, addresses }`: private and CGNAT/Tailscale IPv4 only,
+container and VM bridges left out). The controller stores it with the pairing
+(`remoteMachines[].lan`) and next time dials those addresses all at once for
+1.5 seconds before falling back to the relay; a local route that failed is
+skipped for two minutes. Two machines that paired over the internet but share
+a network therefore talk directly, which matters most for large files. The
+handshake is the same on every route, so a wrong machine answering on a
+learned address fails authentication and the relay is used. Settings shows
+which route a connected machine uses.
+
+**Linux firewalls.** A host whose `ufw` drops the remote-control port (Omarchy
+ships that way) is only reachable through the relay. Settings detects it from
+ufw's rule files and shows the command that opens the port
+(`sudo ufw allow 47615/tcp`).
+
+## Attachments to another machine
+
+A turn's files are uploaded before the turn starts and named in it by upload
+id. Hosts announce `features: ['uploads2', 'lan']` in `welcome`; for those:
+
+- **Uploads start in the prompt box.** Attaching a file to a thread that runs
+  on another machine starts sending it at once (`remote:prepareUpload`); the
+  chip shows progress (`remote:uploadProgress`), the sent message shows it
+  while the turn waits, and removing the file cancels it and drops the host's
+  copy. The command that sends the file reuses the same transfer, checking the
+  host still has it.
+- **A separate session carries them.** Uploads go over a second session to the
+  machine (`transferSessionKey`), so a large file never delays the thread's
+  streamed events. It closes after a minute unused.
+- **Several chunks at a time, resumable.** 2 MiB chunks at aligned offsets,
+  four in flight per machine (under the transports' 16 MiB pending-write
+  ceiling), written where they belong on the host. Uploads belong to the
+  controller device, not the session: after a dropped connection the
+  controller asks `uploadStatus` and continues from where the host's copy
+  stops.
+- **No fixed size limit.** `uploadOpen` checks the host's free disk space (with
+  512 MB to spare, counting other uploads still arriving) and says how much is
+  free when it refuses. Unfinished uploads go after 30 minutes without a chunk;
+  finished ones no turn used after an hour (a failed turn's files stay for a
+  retry); unfinished files are deleted at quit.
+
+Older hosts get the original one-chunk-at-a-time upload with the turn, up to
+100 MB, and the error says to update Durango Code there. Copies of a host's own
+attachments for the controller's mirror stay limited to 100 MB (larger ones
+show by name) and are written to disk as they arrive.
 
 ## Security model
 
@@ -335,7 +380,9 @@ npm run test:machine-tools    # machine_* tools against a fake fleet, and the
 npm run test:remote-relay     # two real processes over a local fake relay:
                               # direct mode makes zero relay calls, pairing and
                               # runTurn by machine ID, relay sees ciphertext
-                              # only, control-socket reconnect
+                              # only, control-socket reconnect, learned local
+                              # route, resumable uploads, disk-space refusal
+npm run test:remote-firewall  # the ufw check behind the Settings notice
 ```
 
 None needs the app running or a network backend — the relay test brings up its

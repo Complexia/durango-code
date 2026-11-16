@@ -169,6 +169,9 @@ import {
   runRemoteTurn,
   checkoutRemoteSource,
   fetchRemoteAttachment,
+  prepareRemoteAttachmentUpload,
+  cancelRemoteAttachmentUpload,
+  listRemoteAttachmentUploads,
   fetchRemoteThreadGit,
   listRemoteQuestions,
   answerRemoteQuestion,
@@ -2225,6 +2228,9 @@ ipcMain.handle('remote:steerTurn', afterRemoteControlInit((_event, input) => ste
 ipcMain.handle('remote:resolveProject', afterRemoteControlInit((_event, input) => resolveRemoteProject(input)));
 ipcMain.handle('remote:listThreads', afterRemoteControlInit((_event, input) => listRemoteThreads(input)));
 ipcMain.handle('remote:fetchAttachment', afterRemoteControlInit((_event, input) => fetchRemoteAttachment(input)));
+ipcMain.handle('remote:prepareUpload', afterRemoteControlInit((_event, input) => prepareRemoteAttachmentUpload(input)));
+ipcMain.handle('remote:cancelUpload', afterRemoteControlInit((_event, input) => cancelRemoteAttachmentUpload(input)));
+ipcMain.handle('remote:listUploads', afterRemoteControlInit(() => listRemoteAttachmentUploads()));
 ipcMain.handle('remote:threadGit', afterRemoteControlInit((_event, input) => fetchRemoteThreadGit(input)));
 ipcMain.handle('remote:listQuestions', afterRemoteControlInit((_event, input) => listRemoteQuestions(input)));
 ipcMain.handle('remote:answerQuestion', afterRemoteControlInit((_event, input) => answerRemoteQuestion(input)));

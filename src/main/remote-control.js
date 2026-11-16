@@ -3,6 +3,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import { app, safeStorage } from 'electron';
 import {
   MAX_FRAME_BYTES,
@@ -84,7 +85,39 @@ const ENCRYPTED_FRAME_OVERHEAD_BYTES = 8 + 16;
 // → controller to show the host's attachments in the controller's mirror).
 // 3 MiB of raw bytes is 4 MiB of base64, well under MAX_FRAME_BYTES.
 const ATTACHMENT_CHUNK_BYTES = 3 * 1024 * 1024;
-export const MAX_REMOTE_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+// What a host without resumable uploads (`uploads2`) accepts, and the largest
+// host attachment this machine copies for its mirror of a thread there.
+const LEGACY_MAX_REMOTE_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const MAX_MIRRORED_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+// Resumable uploads (uploadOpen / uploadChunk / uploadStatus): fixed-size
+// chunks at chunk-aligned offsets, several in flight at once and written where
+// they belong, so they may land in any order and a dropped connection resumes
+// where the host's copy stops. The size bound is a sanity check; the real
+// limit is the host's free disk space.
+const UPLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
+export const MAX_REMOTE_ATTACHMENT_BYTES = 64 * 1024 * 1024 * 1024;
+const UPLOAD_DISK_HEADROOM_BYTES = 512 * 1024 * 1024;
+// Chunks in flight per host. Each is ~2.7 MiB of base64 on the wire; four stay
+// well under the transports' pending-write ceiling (MAX_PENDING_WRITE_BYTES).
+const UPLOAD_WINDOW_CHUNKS = 4;
+// A chunk queued behind the others on a slow uplink waits for them too.
+const UPLOAD_CHUNK_TIMEOUT_MS = 120_000;
+const UPLOAD_RESUME_ATTEMPTS = 6;
+// A resumable upload outlives the session it started on: a controller that
+// reconnects picks it up. Unfinished ones go after this long without a chunk,
+// finished ones no turn has used (yet) after the second.
+const UNFINISHED_UPLOAD_TTL_MS = 30 * 60 * 1000;
+const UNCLAIMED_UPLOAD_TTL_MS = 60 * 60 * 1000;
+// What this host supports beyond the base protocol, announced in `welcome`.
+const HOST_FEATURES = ['uploads2', 'lan'];
+// The controller's connection that carries uploads, separate from the one
+// that carries the thread, closes after this long unused.
+const TRANSFER_SESSION_IDLE_MS = 60_000;
+// Learned local-network route to a machine paired over the internet: tried
+// before the relay, briefly, and not again for a while once it failed.
+const LAN_CONNECT_TIMEOUT_MS = 1500;
+const LAN_RETRY_AFTER_MS = 2 * 60 * 1000;
+const MAX_LAN_ADDRESSES = 6;
 // Uploads one session may hold open (unfinished) at once.
 const MAX_OPEN_UPLOADS = 16;
 // Relay streams have no meaningful source address — the relay is the only peer
@@ -144,7 +177,17 @@ const hostSessions = new Set(); // inbound controller sessions (post-handshake)
 // device, signing out, or stopping the listener must reach these too — a
 // connection parked between hello and confirm is not in hostSessions yet.
 const inboundConnections = new Set();
-const clientSessions = new Map(); // machineId -> outbound session
+// Outbound sessions by key: the machine id for the session that carries a
+// machine's threads, transferSessionKey(machineId) for the one that carries
+// its uploads.
+const clientSessions = new Map();
+const transferSessionKey = (machineId) => `${machineId}\u0000transfer`;
+// Resumable uploads this host holds, by the controller device that sent them
+// (deviceId -> uploadId -> upload): any session of that device may continue
+// or use one.
+const deviceUploads = new Map();
+// Learned local-network routes that just failed: machineId -> when.
+const lanFailures = new Map();
 // Pairing connections are intentionally separate from reusable client
 // sessions, but must still be lifecycle-owned so disabling Remote Control can
 // abort a handshake or an in-flight account-proof request.
@@ -267,6 +310,9 @@ const loadPersistedState = async () => {
         host,
         port,
         relay,
+        // Where the host said it listens on its local network (sanitized
+        // again: the file is ours, but its contents decide where we dial).
+        lan: sanitizeLanRoute(entry?.lan),
         userId: typeof entry.userId === 'string' ? entry.userId : null,
         secret,
         pairedAt: typeof entry.pairedAt === 'string' ? entry.pairedAt : null,
@@ -340,6 +386,7 @@ const writePersistedState = async () => {
       host: machine.host,
       port: machine.port,
       relay: machine.relay === true,
+      ...(machine.lan ? { lan: machine.lan } : {}),
       userId: machine.userId,
       secret: encryptSecret(machine.secret),
       pairedAt: machine.pairedAt,
@@ -438,10 +485,117 @@ const localAddresses = () => {
   return addresses;
 };
 
+// Private (RFC 1918) and carrier-grade NAT (Tailscale and similar VPNs)
+// IPv4 addresses: the only kind a host announces for its local route, and the
+// only kind a controller dials from one.
+const isPrivateIPv4 = (value) => {
+  if (!net.isIPv4(value)) return false;
+  const [a, b] = value.split('.').map(Number);
+  return (
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127)
+  );
+};
+
+// Tests run both machines on one: they may announce loopback.
+const isLanAddress = (value) =>
+  isPrivateIPv4(value) || (deps?.allowLoopbackLan === true && net.isIPv4(value) && value.startsWith('127.'));
+
+// Container and VM bridges: addresses that exist on many machines at once
+// (docker0 is 172.17.0.1 everywhere), so dialing one could reach the wrong
+// machine — or this one.
+const VIRTUAL_INTERFACE_PATTERN = /^(docker|br-|veth|virbr|vmnet|vboxnet|lxc|lxd|cni|flannel|podman|bridge\d)/i;
+
+/** Where this host can be reached on its own networks, for `welcome`. */
+const lanAddresses = () => {
+  if (typeof deps?.lanAddresses === 'function') {
+    return (deps.lanAddresses() ?? []).filter(isLanAddress).slice(0, MAX_LAN_ADDRESSES);
+  }
+  const addresses = [];
+  for (const [name, entries] of Object.entries(os.networkInterfaces())) {
+    if (VIRTUAL_INTERFACE_PATTERN.test(name)) continue;
+    for (const entry of entries ?? []) {
+      if (entry.family === 'IPv4' && !entry.internal && isPrivateIPv4(entry.address)) addresses.push(entry.address);
+    }
+  }
+  return [...new Set(addresses)].slice(0, MAX_LAN_ADDRESSES);
+};
+
+const sanitizeLanRoute = (value) => {
+  if (!value || typeof value !== 'object') return null;
+  const port = Number(value.port);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) return null;
+  const addresses = [
+    ...new Set((Array.isArray(value.addresses) ? value.addresses : []).map(String).filter(isLanAddress)),
+  ].slice(0, MAX_LAN_ADDRESSES);
+  return addresses.length > 0 ? { addresses, port } : null;
+};
+
+// ---------------------------------------------------------------------------
+// Host firewall (Linux, ufw): a host whose firewall drops its port is only
+// reachable through the relay, which is far slower for large files. Settings
+// says so and gives the command that opens it. Read from ufw's own rule files
+// (world-readable on the distributions that ship it); anything unreadable or
+// unusual reports nothing rather than a guess.
+
+let firewallNotice = null; // { tool, port, command } | null
+let firewallCheckedPort = null;
+
+const portInUfwSpec = (spec, port) => {
+  if (spec === 'any') return true;
+  return spec.split(',').some((part) => {
+    const [from, to] = part.split(':').map(Number);
+    if (!Number.isInteger(from)) return false;
+    return Number.isInteger(to) ? port >= from && port <= to : port === from;
+  });
+};
+
+export const ufwBlocksPort = ({ conf, rules, defaults }, port) => {
+  if (!/^\s*ENABLED\s*=\s*yes\s*$/im.test(String(conf ?? ''))) return false;
+  const policy = /^\s*DEFAULT_INPUT_POLICY\s*=\s*"?(\w+)"?/im.exec(String(defaults ?? ''))?.[1]?.toUpperCase();
+  if (policy === 'ACCEPT') return false;
+  // `### tuple ### allow tcp 47615 0.0.0.0/0 any 192.168.1.0/24 in`:
+  // action, protocol, destination port, destination, source port, source, direction.
+  for (const line of String(rules ?? '').split('\n')) {
+    const match = /^###\s+tuple\s+###\s+(\S+)\s+(\S+)\s+(\S+)\s+\S+\s+\S+\s+\S+(?:\s+(\S+))?/.exec(line.trim());
+    if (!match) continue;
+    const [, action, protocol, destinationPort, direction = 'in'] = match;
+    if (!action.startsWith('allow') || direction !== 'in') continue;
+    if (protocol !== 'tcp' && protocol !== 'any') continue;
+    if (portInUfwSpec(destinationPort, port)) return false;
+  }
+  return true;
+};
+
+const checkHostFirewall = async (port) => {
+  if ((deps?.platform ?? process.platform) !== 'linux') return;
+  firewallCheckedPort = port;
+  const read = (file) =>
+    (typeof deps?.readFirewallFile === 'function' ? deps.readFirewallFile(file) : fs.readFile(file, 'utf8')).catch(
+      () => null
+    );
+  try {
+    const [conf, rules, defaults] = await Promise.all([
+      read('/etc/ufw/ufw.conf'),
+      read('/etc/ufw/user.rules'),
+      read('/etc/default/ufw'),
+    ]);
+    if (firewallCheckedPort !== port) return;
+    const blocked = conf !== null && rules !== null && ufwBlocksPort({ conf, rules, defaults }, port);
+    const next = blocked ? { tool: 'ufw', port, command: `sudo ufw allow ${port}/tcp` } : null;
+    if (JSON.stringify(next) !== JSON.stringify(firewallNotice)) {
+      firewallNotice = next;
+      publishState();
+    }
+  } catch {}
+};
+
 const clientStatus = (machineId) => {
   const session = clientSessions.get(machineId);
   if (!session) return { status: 'offline', error: null };
-  if (session.ready) return { status: 'connected', error: null };
+  if (session.ready) return { status: 'connected', route: session.route, error: null };
   if (session.connecting) return { status: 'connecting', error: null };
   return { status: session.lastError ? 'error' : 'offline', error: session.lastError };
 };
@@ -477,6 +631,7 @@ export const getRemoteControlState = () => {
       port: listeningPort ?? settings.port,
       addresses: listening ? localAddresses() : [],
       error: listenError,
+      firewall: listening ? firewallNotice : null,
       relay: {
         enabled: Boolean(relayListener),
         online: relayOnline,
@@ -817,6 +972,8 @@ export const notifyRemoteControlAccountChanged = (session, { reconcile: shouldRe
 export const shutdownRemoteControl = () => {
   shuttingDown = true;
   clearAccountExpiryTimer();
+  removeUnusedUploadFilesSync();
+  cancelHostUploadTransfers('Shutting down.');
   stopServer();
   stopRelayListener();
   cancelOutboundPairingAttempts('Shutting down.');
@@ -964,6 +1121,7 @@ const startServer = (port) =>
       listeningPort = port;
       listenError = null;
       publishState();
+      void checkHostFirewall(port);
       resolve();
     });
   });
@@ -994,6 +1152,7 @@ const stopServer = () => {
 const teardownForAccountChange = () => {
   relayRegisteredFor = null;
   stopServer();
+  discardResumableUploads();
   stopRelayListener();
   cancelOutboundPairingAttempts('The Durango account changed.');
   for (const [machineId] of clientSessions) {
@@ -1081,6 +1240,7 @@ export const revokeRemoteDevice = async ({ deviceId } = {}) => {
   }
   if (!outcome.value?.found) return { ok: false, error: 'Device not found.' };
   retireHostDeviceAuthorization(id, 'This controlling device was revoked.');
+  discardResumableUploads(id);
   publishState();
   return { ok: true };
 };
@@ -1323,6 +1483,10 @@ const handleInboundConnection = (transport, { ip = null } = {}) => {
           machine: { id: identity.machineId, name: identity.machineName },
           userId: currentUserId,
           appVersion: deps.getAppVersion?.() ?? null,
+          features: HOST_FEATURES,
+          // Where this machine listens on its own networks: a controller that
+          // reached it through the relay tries these first next time.
+          lan: listening && listeningPort ? { port: listeningPort, addresses: lanAddresses() } : null,
         });
         publishState();
       }
@@ -1788,7 +1952,10 @@ const discardUpload = (session, upload) => {
 const settleUploadedAttachments = (session, attachments, succeeded) => {
   for (const attachment of attachments) {
     const upload = session.uploads.get(attachment.id);
-    if (!upload) continue;
+    if (!upload) {
+      settleResumableUpload(session, attachment.id, succeeded);
+      continue;
+    }
     if (succeeded) {
       upload.used = true;
       session.uploads.delete(upload.id);
@@ -1796,6 +1963,293 @@ const settleUploadedAttachments = (session, attachments, succeeded) => {
       discardUpload(session, upload);
     }
   }
+};
+
+// --- Resumable uploads (host side) ------------------------------------------
+//
+// Held per controller device rather than per session, so an upload survives a
+// dropped connection and can be sent on a connection of its own while the
+// thread's connection stays free. A command that names one claims it; when the
+// command fails the upload goes back to waiting, because the controller keeps
+// it for a retry (the file was often uploaded while the user was typing).
+// Unused ones expire (scheduleResumableUploadExpiry).
+
+const resumableUploadsOf = (deviceId) => {
+  let uploads = deviceUploads.get(deviceId);
+  if (!uploads) {
+    uploads = new Map();
+    deviceUploads.set(deviceId, uploads);
+  }
+  return uploads;
+};
+
+const findResumableUpload = (session, uploadId) =>
+  deviceUploads.get(session.deviceId)?.get(String(uploadId ?? '')) ?? null;
+
+const uploadTtl = (upload) => {
+  const override = upload.done ? deps?.unclaimedUploadTtlMs : deps?.unfinishedUploadTtlMs;
+  if (Number.isFinite(override)) return Math.max(1, override);
+  return upload.done ? UNCLAIMED_UPLOAD_TTL_MS : UNFINISHED_UPLOAD_TTL_MS;
+};
+
+const scheduleResumableUploadExpiry = (upload) => {
+  clearTimeout(upload.timer);
+  upload.timer = null;
+  if (upload.claimed || upload.discarded) return;
+  upload.timer = setTimeout(() => discardResumableUpload(upload), uploadTtl(upload));
+  upload.timer.unref?.();
+};
+
+const discardResumableUpload = (upload) => {
+  if (upload.discarded) return;
+  upload.discarded = true;
+  clearTimeout(upload.timer);
+  const uploads = deviceUploads.get(upload.deviceId);
+  uploads?.delete(upload.id);
+  if (uploads?.size === 0) deviceUploads.delete(upload.deviceId);
+  const handle = upload.handle;
+  upload.handle = null;
+  void (async () => {
+    await handle?.close().catch(() => {});
+    if (!upload.used) await fs.rm(upload.path, { force: true }).catch(() => {});
+  })();
+};
+
+/** Every resumable upload not claimed by a running command (of one device, or all). */
+const discardResumableUploads = (deviceId = null) => {
+  for (const [owner, uploads] of [...deviceUploads]) {
+    if (deviceId && owner !== deviceId) continue;
+    for (const upload of [...uploads.values()]) if (!upload.claimed) discardResumableUpload(upload);
+  }
+};
+
+/**
+ * At quit: files no command has used would be orphans (nothing would expire
+ * them after a restart). A controller that still wants one finds it gone
+ * (uploadStatus) and sends it again.
+ */
+const removeUnusedUploadFilesSync = () => {
+  for (const uploads of deviceUploads.values()) {
+    for (const upload of uploads.values()) {
+      if (upload.used || upload.claimed) continue;
+      try {
+        fsSync.rmSync(upload.path, { force: true });
+      } catch {}
+    }
+  }
+};
+
+const settleResumableUpload = (session, uploadId, succeeded) => {
+  const upload = findResumableUpload(session, uploadId);
+  if (!upload) return;
+  upload.claimed = false;
+  if (succeeded) {
+    // The transcript that references the file keeps it.
+    upload.used = true;
+    discardResumableUpload(upload);
+  } else {
+    scheduleResumableUploadExpiry(upload);
+  }
+};
+
+// upload.chunks[i]: CHUNK_MISSING, CHUNK_WRITING (a write is under way, in
+// upload.writes), or CHUNK_WRITTEN. Only written chunks count as received.
+const CHUNK_MISSING = 0;
+const CHUNK_WRITING = 1;
+const CHUNK_WRITTEN = 2;
+
+/** Where a resumed upload continues: the end of the written chunks from the start. */
+const contiguousUploadBytes = (upload) => {
+  if (upload.done) return upload.size;
+  const index = upload.chunks.findIndex((state) => state !== CHUNK_WRITTEN);
+  return index === -1 ? upload.size : Math.min(upload.size, index * UPLOAD_CHUNK_BYTES);
+};
+
+/** FileHandle.write may write less than asked: write all of it. */
+const writeFully = async (handle, buffer, position) => {
+  let written = 0;
+  while (written < buffer.length) {
+    const { bytesWritten } = await handle.write(buffer, written, buffer.length - written, position + written);
+    if (!(bytesWritten > 0)) throw new Error('Could not write the attachment.');
+    written += bytesWritten;
+  }
+};
+
+const formatBytes = (bytes) => {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  return `${Math.max(1, Math.round(bytes / 1024 ** 2))} MB`;
+};
+
+const freeDiskBytes = async (directory) => {
+  if (typeof deps?.freeDiskBytes === 'function') return deps.freeDiskBytes(directory);
+  try {
+    const stats = await fs.statfs(directory);
+    return Number(stats.bavail) * Number(stats.bsize);
+  } catch {
+    return null;
+  }
+};
+
+const resumableUploadReply = (upload) => ({
+  ok: true,
+  uploadId: upload.id,
+  chunkBytes: UPLOAD_CHUNK_BYTES,
+  received: contiguousUploadBytes(upload),
+  done: upload.done,
+  ...(upload.done ? { path: upload.path } : {}),
+});
+
+/** Open a resumable upload: room for it is checked and the file made up front. */
+const handleUploadOpen = async (session, message) => {
+  if (typeof deps?.getAttachmentDirectoryPath !== 'function') {
+    return { ok: false, error: 'This machine cannot receive attachments. Update Durango Code on it.' };
+  }
+  const size = Number(message?.size);
+  if (!Number.isSafeInteger(size) || size < 0 || size > MAX_REMOTE_ATTACHMENT_BYTES) {
+    return { ok: false, error: 'This attachment is too large to send to another machine.' };
+  }
+  const uploads = resumableUploadsOf(session.deviceId);
+  const waiting = [...uploads.values()].filter((upload) => !upload.claimed).length;
+  if (waiting >= MAX_OPEN_UPLOADS) return { ok: false, error: 'Too many attachments at once.' };
+  const id = crypto.randomUUID();
+  const directory = deps.getAttachmentDirectoryPath();
+  const name = sanitizeAttachmentName(message?.name);
+  const upload = {
+    id,
+    deviceId: session.deviceId,
+    name: safeAttachmentName(message?.name),
+    mimeType: String(message?.mimeType ?? '').slice(0, 200) || 'application/octet-stream',
+    size,
+    // One byte per chunk (CHUNK_MISSING / CHUNK_WRITING / CHUNK_WRITTEN), and
+    // the writes under way by chunk index.
+    chunks: new Uint8Array(Math.ceil(size / UPLOAD_CHUNK_BYTES)),
+    writes: new Map(),
+    received: 0,
+    done: size === 0,
+    claimed: false,
+    used: false,
+    discarded: false,
+    handle: null,
+    timer: null,
+    path: path.join(directory, `${id}-${name}`),
+  };
+  // Counted (and the slot taken) before any await, so concurrent opens cannot
+  // get past the cap together.
+  uploads.set(id, upload);
+  try {
+    await fs.mkdir(directory, { recursive: true });
+    const free = await freeDiskBytes(directory);
+    // Other uploads still arriving (from any controller) need their room too.
+    let reserved = 0;
+    for (const deviceUploadList of deviceUploads.values()) {
+      for (const other of deviceUploadList.values()) {
+        if (other !== upload && !other.done) reserved += other.size - other.received;
+      }
+    }
+    if (Number.isFinite(free) && free - reserved < size + UPLOAD_DISK_HEADROOM_BYTES) {
+      discardResumableUpload(upload);
+      return {
+        ok: false,
+        error: `${identity?.machineName ?? 'That machine'} has ${formatBytes(Math.max(0, free - reserved))} of disk space free; ${upload.name} needs ${formatBytes(size)}.`,
+      };
+    }
+    if (upload.done) {
+      await fs.writeFile(upload.path, Buffer.alloc(0));
+    } else {
+      const handle = await fs.open(upload.path, 'w');
+      // Discarded (device revoked, signed out) while it was being made: the
+      // discard could not reach this handle or file.
+      if (upload.discarded) {
+        await handle.close().catch(() => {});
+        await fs.rm(upload.path, { force: true }).catch(() => {});
+        return { ok: false, error: 'The upload was cancelled.' };
+      }
+      upload.handle = handle;
+    }
+  } catch (error) {
+    discardResumableUpload(upload);
+    throw error;
+  }
+  if (upload.discarded) {
+    await fs.rm(upload.path, { force: true }).catch(() => {});
+    return { ok: false, error: 'The upload was cancelled.' };
+  }
+  scheduleResumableUploadExpiry(upload);
+  return resumableUploadReply(upload);
+};
+
+/** One chunk, written where it belongs; repeats are acknowledged, not rewritten. */
+const handleUploadChunk = async (session, message) => {
+  const upload = findResumableUpload(session, message?.uploadId);
+  if (!upload) return { ok: false, unknownUpload: true, error: 'Unknown attachment upload.' };
+  if (upload.done) return resumableUploadReply(upload);
+  const offset = Number(message?.offset);
+  const chunk = typeof message?.data === 'string' ? Buffer.from(message.data, 'base64') : null;
+  const index = offset / UPLOAD_CHUNK_BYTES;
+  if (
+    !chunk ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset >= upload.size ||
+    !Number.isInteger(index) ||
+    chunk.length !== Math.min(UPLOAD_CHUNK_BYTES, upload.size - offset)
+  ) {
+    return { ok: false, error: 'Invalid attachment chunk.' };
+  }
+  if (upload.chunks[index] === CHUNK_WRITING) {
+    // Sent again (a resume) while the first copy is still being written:
+    // answer once that write has settled, with what it left.
+    await upload.writes.get(index)?.catch(() => {});
+    if (upload.discarded) return { ok: false, unknownUpload: true, error: 'Unknown attachment upload.' };
+    if (upload.chunks[index] !== CHUNK_WRITTEN) return { ok: false, error: 'Could not write the attachment.' };
+    return resumableUploadReply(upload);
+  }
+  if (upload.chunks[index] === CHUNK_MISSING) {
+    upload.chunks[index] = CHUNK_WRITING;
+    scheduleResumableUploadExpiry(upload);
+    const write = (async () => {
+      // Tests slow uploads down enough to interrupt one.
+      if (typeof deps?.beforeUploadChunk === 'function') await deps.beforeUploadChunk(offset);
+      if (!upload.handle) throw new Error('The upload was cancelled.');
+      await writeFully(upload.handle, chunk, offset);
+    })();
+    upload.writes.set(index, write);
+    try {
+      await write;
+    } catch (error) {
+      upload.chunks[index] = CHUNK_MISSING;
+      if (upload.discarded) return { ok: false, unknownUpload: true, error: 'Unknown attachment upload.' };
+      throw error;
+    } finally {
+      upload.writes.delete(index);
+    }
+    if (upload.discarded) return { ok: false, unknownUpload: true, error: 'Unknown attachment upload.' };
+    upload.chunks[index] = CHUNK_WRITTEN;
+    upload.received += chunk.length;
+    if (upload.received === upload.size && !upload.done) {
+      const handle = upload.handle;
+      upload.handle = null;
+      await handle?.close();
+      upload.done = true;
+      scheduleResumableUploadExpiry(upload);
+    }
+  }
+  return resumableUploadReply(upload);
+};
+
+const handleUploadStatus = (session, message) => {
+  const upload = findResumableUpload(session, message?.uploadId);
+  if (!upload) return { ok: false, unknownUpload: true, error: 'Unknown attachment upload.' };
+  return resumableUploadReply(upload);
+};
+
+/** The controller no longer wants these (removed from its prompt box). */
+const handleUploadDiscard = (session, message) => {
+  for (const uploadId of (Array.isArray(message?.uploadIds) ? message.uploadIds : []).slice(0, 64)) {
+    const upload = findResumableUpload(session, uploadId);
+    if (upload && !upload.claimed) discardResumableUpload(upload);
+  }
+  return { ok: true };
 };
 
 /**
@@ -1817,7 +2271,7 @@ const handleAttachmentUpload = async (session, message) => {
   let upload;
   if (offset === 0 && !message?.uploadId) {
     const size = Number(message?.size);
-    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_REMOTE_ATTACHMENT_BYTES) {
+    if (!Number.isSafeInteger(size) || size < 0 || size > LEGACY_MAX_REMOTE_ATTACHMENT_BYTES) {
       return { ok: false, error: 'This attachment is too large to send to another machine.' };
     }
     // Counted (and the slot taken) before any await, so concurrent first
@@ -1880,10 +2334,15 @@ const handleAttachmentUpload = async (session, message) => {
 const resolveUploadedAttachments = (session, list) => {
   if (!Array.isArray(list) || list.length === 0) return [];
   const uploads = list.slice(0, 32).map((item) => {
-    const upload = session.uploads.get(String(item?.uploadId ?? ''));
+    const uploadId = String(item?.uploadId ?? '');
+    const upload = session.uploads.get(uploadId) ?? findResumableUpload(session, uploadId);
     if (!upload?.done || upload.claimed) throw new Error('An attachment did not finish uploading.');
     return { item, upload };
   });
+  // Claimed together, after all were found: a missing one claims none.
+  for (const { upload } of uploads) {
+    if (upload.chunks) clearTimeout(upload.timer);
+  }
   return uploads.map(({ item, upload }) => {
     // One command per upload: a second naming it is refused.
     upload.claimed = true;
@@ -1917,7 +2376,7 @@ const handleAttachmentRead = async (message) => {
     if (!real.startsWith((await fs.realpath(directory)) + path.sep)) return { ok: false, error: 'Not an attachment.' };
     handle = await fs.open(real, 'r');
     const { size } = await handle.stat();
-    if (size > MAX_REMOTE_ATTACHMENT_BYTES) return { ok: false, error: 'This attachment is too large to fetch.' };
+    if (size > MAX_MIRRORED_ATTACHMENT_BYTES) return { ok: false, error: 'This attachment is too large to fetch.' };
     if (offset > size) return { ok: false, error: 'Invalid offset.' };
     const length = Math.min(ATTACHMENT_CHUNK_BYTES, size - offset);
     const buffer = Buffer.alloc(length);
@@ -2189,6 +2648,18 @@ const handleHostRequest = async (session, message) => {
         return;
       case 'attachmentRead':
         respond(await handleAttachmentRead(message));
+        return;
+      case 'uploadOpen':
+        respond(await handleUploadOpen(session, message));
+        return;
+      case 'uploadChunk':
+        respond(await handleUploadChunk(session, message));
+        return;
+      case 'uploadStatus':
+        respond(handleUploadStatus(session, message));
+        return;
+      case 'uploadDiscard':
+        respond(handleUploadDiscard(session, message));
         return;
       case 'follow': {
         // The threads this controller shows: their streams come through.
@@ -2670,10 +3141,10 @@ export const notifyRemoteWorkspaceChanged = () => {
 // ---------------------------------------------------------------------------
 // Controller side: pair with hosts, maintain outbound sessions, proxy requests.
 
-const closeClientSession = (machineId, reason) => {
-  const session = clientSessions.get(machineId);
+const closeClientSession = (key, reason) => {
+  const session = clientSessions.get(key);
   if (!session) return;
-  clientSessions.delete(machineId);
+  clientSessions.delete(key);
   if (reason) session.lastError = reason;
   session.abortController?.abort(new Error(reason ?? 'Disconnected.'));
   session.channel?.destroy();
@@ -2685,12 +3156,18 @@ const closeClientSession = (machineId, reason) => {
   publishState();
 };
 
+/** Both of a machine's sessions: its threads' and its uploads'. */
+const closeMachineSessions = (machineId, reason) => {
+  closeClientSession(machineId, reason);
+  closeClientSession(transferSessionKey(machineId), reason);
+};
+
 const clientSessionCanContinue = (machineId, session, machine) =>
   !shuttingDown &&
   settings.enabled &&
   Boolean(currentUserId) &&
   (session.route !== 'relay' || relayEnabled()) &&
-  clientSessions.get(machineId) === session &&
+  clientSessions.get(session.key ?? machineId) === session &&
   remoteMachines.includes(machine) &&
   (!machine.userId || machine.userId === currentUserId);
 
@@ -2700,20 +3177,75 @@ const cancelledClientSessionError = () =>
 // ---------------------------------------------------------------------------
 // Route selection (controller side).
 //
-// Direct first, relay second — always, and only those two. Direct is the
-// fastest path and keeps the bytes inside your own network; the relay is a
-// fallback for when there is no route to the host's address. A machine paired
-// over the relay has no address at all, so it goes straight to the relay.
-// There is no probing, no racing, and no per-machine preference to get wrong.
+// Direct first, then the local network, then the relay. Direct is the address
+// the user typed. A machine paired over the relay has no such address, but
+// each session's `welcome` says where the host listens on its own networks
+// (machine.lan): those are dialed next, all at once and briefly, so two
+// machines on the same network talk directly even though they paired over
+// the internet. The relay is the fallback when neither answers. A local route
+// that failed is skipped for a while (lanFailures), so a laptop away from home
+// doesn't pay the timeout on every connection.
+
+/** The learned local addresses worth dialing for a machine. */
+const lanCandidates = (machine) => {
+  const lan = machine.lan;
+  if (!lan || !Number.isInteger(lan.port)) return [];
+  const own = new Set(localAddresses());
+  return lan.addresses.filter(
+    (address) => !own.has(address) && !(machine.host === address && machine.port === lan.port)
+  );
+};
 
 const clientRoutes = (machine) => {
   const routes = [];
   if (machine.host && Number.isInteger(machine.port)) routes.push('direct');
+  const failedAt = lanFailures.get(machine.id);
+  if (lanCandidates(machine).length > 0 && !(failedAt && Date.now() - failedAt < LAN_RETRY_AFTER_MS)) {
+    routes.push('lan');
+  }
   if (relayEnabled()) routes.push('relay');
   return routes;
 };
 
-const createControllerTransport = async (route, { host, port, machineId }, signal) => {
+/** A TCP connection to whichever of `addresses` answers first. */
+const connectFirstAddress = (addresses, port, timeoutMs, signal) =>
+  new Promise((resolve, reject) => {
+    const sockets = [];
+    let settled = false;
+    let failures = 0;
+    const settle = (error, winner = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
+      for (const socket of sockets) if (socket !== winner) socket.destroy();
+      if (winner) resolve(winner);
+      else reject(error);
+    };
+    const unreachable = () => new Error('Not reachable on its local network.');
+    const onAbort = () => settle(cancelledClientSessionError());
+    const timer = setTimeout(() => settle(unreachable()), timeoutMs);
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    for (const address of addresses) {
+      const socket = net.connect({ host: address, port });
+      sockets.push(socket);
+      // Stays attached: a later error on a socket that lost the race (or on
+      // the winner before its transport takes over) must not go unhandled.
+      socket.on('error', () => {
+        failures += 1;
+        if (failures === addresses.length) settle(unreachable());
+      });
+      socket.once('connect', () => settle(null, socket));
+    }
+  });
+
+const createControllerTransport = async (route, { host, port, machineId, machine }, signal) => {
+  if (route === 'lan') {
+    const candidates = lanCandidates(machine);
+    const timeoutMs = Number.isFinite(deps?.lanConnectTimeoutMs) ? deps.lanConnectTimeoutMs : LAN_CONNECT_TIMEOUT_MS;
+    const socket = await connectFirstAddress(candidates, machine.lan.port, timeoutMs, signal);
+    return { ...wrapTcpSocket(socket), kind: 'tcp' };
+  }
   if (route !== 'relay') return createTcpTransport({ host, port });
   // A controller ticket authorizes exactly one socket to exactly one machine.
   // It is not an account credential and is never shown to the peer.
@@ -3208,12 +3740,19 @@ export const removeRemoteMachine = async ({ machineId } = {}) => {
     return { ok: false, error: error?.message ?? String(error) };
   }
   if (!outcome.value?.found) return { ok: false, error: 'Machine not found.' };
-  closeClientSession(id, null);
+  cancelHostUploadTransfers('This machine was removed.', id);
+  closeMachineSessions(id, null);
   publishState();
   return { ok: true };
 };
 
-const ensureClientSession = async (machineId) => {
+/**
+ * The machine's session: the one that carries its threads, or with `transfer`
+ * a second one that carries uploads, so a large file doesn't hold up the
+ * thread's streamed events behind it. The transfer session closes itself when
+ * unused (TRANSFER_SESSION_IDLE_MS).
+ */
+const ensureClientSession = async (machineId, { transfer = false } = {}) => {
   if (!identity) throw new Error(stateError ?? 'Remote control is unavailable on this machine.');
   if (!settings.enabled) throw new Error('Remote control is disabled in Settings.');
   await refreshAccount();
@@ -3224,12 +3763,16 @@ const ensureClientSession = async (machineId) => {
     throw new Error('This machine was paired under a different Durango account.');
   }
 
-  const existing = clientSessions.get(machineId);
+  const key = transfer ? transferSessionKey(machineId) : machineId;
+  const existing = clientSessions.get(key);
   if (existing?.ready) return existing;
   if (existing?.connectPromise) return existing.connectPromise;
 
   const session = {
+    key,
+    transfer,
     machineId,
+    hostFeatures: new Set(),
     channel: null,
     ready: false,
     connecting: true,
@@ -3239,7 +3782,7 @@ const ensureClientSession = async (machineId) => {
     route: null,
     abortController: new AbortController(),
   };
-  clientSessions.set(machineId, session);
+  clientSessions.set(key, session);
   publishState();
 
   session.connectPromise = (async () => {
@@ -3259,6 +3802,7 @@ const ensureClientSession = async (machineId) => {
               host: machine.host,
               port: machine.port,
               machineId: machine.id,
+              machine,
             }, session.abortController.signal),
           psk: Buffer.from(machine.secret, 'base64'),
           mode: 'session',
@@ -3270,12 +3814,14 @@ const ensureClientSession = async (machineId) => {
             session.channel = channel;
           },
         });
+        if (route === 'lan') lanFailures.delete(machine.id);
         break;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
         // A cancelled session is not a routing failure — do not try the next
         // route after remote control has been switched off underneath us.
         if (!clientSessionCanContinue(machineId, session, machine)) break;
+        if (route === 'lan') lanFailures.set(machine.id, Date.now());
       }
     }
     if (!connection) {
@@ -3378,7 +3924,9 @@ const ensureClientSession = async (machineId) => {
         }
         return;
       }
-      if (message?.t === 'event') {
+      // The transfer session gets the host's lifecycle events too; the
+      // thread's session already delivered them.
+      if (message?.t === 'event' && !session.transfer) {
         const event = { machineId, kind: message.kind, payload: message.payload ?? null };
         deps.broadcast('remote:event', event);
         notifyRemoteEventListeners(event);
@@ -3386,9 +3934,9 @@ const ensureClientSession = async (machineId) => {
     };
     while (beforeRouter.length > 0) routeMessage(beforeRouter.shift());
     channel.onClose(() => {
-      if (clientSessions.get(machineId) === session) {
-        clientSessions.delete(machineId);
-        session.ready = false;
+      if (clientSessions.get(key) === session) {
+        clientSessions.delete(key);
+              session.ready = false;
         session.connecting = false;
         session.connectPromise = null;
         session.lastError = 'Disconnected from the host.';
@@ -3402,16 +3950,32 @@ const ensureClientSession = async (machineId) => {
     });
     // `onClose` replays a close that landed during the handler handoff above.
     // Do not promote the now-unowned local object after that synchronous replay.
-    if (channel.closed || clientSessions.get(machineId) !== session) {
+    if (channel.closed || clientSessions.get(key) !== session) {
       throw new Error(session.lastError ?? 'Disconnected from the host.');
     }
 
-    // Refresh the display name we hold for the host.
+    session.hostFeatures = new Set(
+      (Array.isArray(welcome.features) ? welcome.features : []).slice(0, 32).map(String)
+    );
+    // Refresh the display name and the local route we hold for the host.
+    const previous = { name: machine.name, lan: machine.lan };
+    let changed = false;
     if (typeof welcome.machine?.name === 'string' && welcome.machine.name && welcome.machine.name !== machine.name) {
-      const previousName = machine.name;
       machine.name = welcome.machine.name.slice(0, 120);
+      changed = true;
+    }
+    if (session.hostFeatures.has('lan')) {
+      const lan = sanitizeLanRoute(welcome.lan);
+      if (JSON.stringify(lan) !== JSON.stringify(machine.lan ?? null)) {
+        machine.lan = lan;
+        lanFailures.delete(machine.id);
+        changed = true;
+      }
+    }
+    if (changed) {
       void savePersistedState().catch(() => {
-        machine.name = previousName;
+        machine.name = previous.name;
+        machine.lan = previous.lan;
         publishState();
       });
     }
@@ -3430,9 +3994,9 @@ const clientRequest = async (
   machineId,
   message,
   timeoutMs = REQUEST_TIMEOUT_MS,
-  { extendOnClaim = false, signal, onDispatch, onClaimed } = {}
+  { extendOnClaim = false, signal, onDispatch, onClaimed, transfer = false } = {}
 ) => {
-  const session = await ensureClientSession(machineId);
+  const session = await ensureClientSession(machineId, { transfer });
   // Stopped while connecting: never sent.
   if (signal?.aborted) throw new Error('Cancelled before it started.');
   // `await ensureClientSession` yields even for an already-ready session. The
@@ -3441,7 +4005,7 @@ const clientRequest = async (
   if (
     !settings.enabled ||
     (session.route === 'relay' && !relayEnabled()) ||
-    clientSessions.get(machineId) !== session ||
+    clientSessions.get(session.key) !== session ||
     !session.ready ||
     !session.channel
   ) {
@@ -3499,7 +4063,7 @@ export const connectRemoteMachine = async ({ machineId } = {}) => {
 };
 
 export const disconnectRemoteMachine = ({ machineId } = {}) => {
-  closeClientSession(String(machineId ?? ''), null);
+  closeMachineSessions(String(machineId ?? ''), null);
   return { ok: true };
 };
 
@@ -3607,35 +4171,204 @@ export const fetchRemoteThread = async ({ machineId, threadId, knownVersion } = 
   }
 };
 
-/**
- * Send one local file to a paired host for a turn (handleAttachmentUpload on
- * the host) → { uploadId, hostPath }.
- */
-const uploadAttachmentToHost = async (machineId, attachment) => {
-  const localPath = String(attachment?.path ?? '');
-  const handle = await fs.open(localPath, 'r');
-  try {
-    const { size } = await handle.stat();
-    if (size > MAX_REMOTE_ATTACHMENT_BYTES) {
-      throw new Error(`${attachment?.name ?? 'An attachment'} is too large to send to another machine (100 MB at most).`);
+// --- Uploads (controller side) ------------------------------------------------
+//
+// One transfer per machine and file (as the file is now: path, size, mtime).
+// The prompt box starts it as soon as a file is attached to a thread on
+// another machine (prepareRemoteAttachmentUpload), so a large file is often
+// there by the time the turn is sent; the command that sends the file waits
+// for the same transfer (uploadAttachmentToHost). Hosts with resumable uploads
+// (`uploads2`) get chunks several at a time over a session of their own, and a
+// dropped connection resumes where the host's copy stops; older hosts get the
+// original one-chunk-at-a-time upload on the thread's session, up to the size
+// they accept. Progress goes to the renderer as `remote:uploadProgress`.
+
+const hostUploadTransfers = new Map(); // key -> transfer
+const UPLOAD_PROGRESS_INTERVAL_MS = 250;
+
+/** A refusal from the host (or a problem with the file): retrying won't help. */
+class UploadRefusal extends Error {}
+/** A prompt-box upload to a host without resumable uploads: sent with the turn instead. */
+class DeferredUpload extends Error {}
+
+const TRANSIENT_UPLOAD_ERROR =
+  /Disconnected|did not respond in time|Could not reach|closed the connection|timed out|was lost on the host|not reading data/i;
+
+const hostUploadKey = (machineId, localPath, size, mtimeMs) =>
+  [machineId, localPath, size, mtimeMs].join('\u0000');
+
+const publishUploadProgress = (transfer, force = false) => {
+  const now = Date.now();
+  if (!force && now - transfer.publishedAt < UPLOAD_PROGRESS_INTERVAL_MS) {
+    // Throttled, not dropped: the latest value goes out at the end of the window.
+    if (!transfer.publishTimer) {
+      transfer.publishTimer = setTimeout(() => {
+        transfer.publishTimer = null;
+        if (transfer.state === 'uploading') publishUploadProgress(transfer, true);
+      }, UPLOAD_PROGRESS_INTERVAL_MS - (now - transfer.publishedAt));
+      transfer.publishTimer.unref?.();
     }
+    return;
+  }
+  clearTimeout(transfer.publishTimer);
+  transfer.publishTimer = null;
+  transfer.publishedAt = now;
+  deps?.broadcast?.('remote:uploadProgress', {
+    machineId: transfer.machineId,
+    machineName: machineDisplayName(transfer.machineId),
+    path: transfer.localPath,
+    size: transfer.size,
+    sent: transfer.sent,
+    state: transfer.state,
+    route: transfer.route ?? null,
+    ...(transfer.error ? { error: transfer.error } : {}),
+  });
+};
+
+// Chunks in flight per machine, shared by every upload to it: the transports
+// close a connection whose unsent data passes MAX_PENDING_WRITE_BYTES.
+const uploadSlots = new Map(); // machineId -> { free, waiters }
+
+const acquireUploadSlot = (machineId, signal) => {
+  let slots = uploadSlots.get(machineId);
+  if (!slots) {
+    slots = { free: UPLOAD_WINDOW_CHUNKS, waiters: [] };
+    uploadSlots.set(machineId, slots);
+  }
+  return acquireFrom(slots, signal);
+};
+
+const acquireFrom = (slots, signal) => {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error('The upload was cancelled.'));
+  if (slots.free > 0) {
+    slots.free -= 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = {
+      resolve: () => {
+        signal?.removeEventListener?.('abort', onAbort);
+        resolve();
+      },
+    };
+    const onAbort = () => {
+      const index = slots.waiters.indexOf(waiter);
+      if (index === -1) return;
+      slots.waiters.splice(index, 1);
+      reject(signal.reason ?? new Error('The upload was cancelled.'));
+    };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    slots.waiters.push(waiter);
+  });
+};
+
+const releaseUploadSlot = (machineId) => releaseTo(uploadSlots.get(machineId), UPLOAD_WINDOW_CHUNKS);
+
+const releaseTo = (slots, capacity) => {
+  if (!slots) return;
+  const next = slots.waiters.shift();
+  if (next) next.resolve();
+  else slots.free = Math.min(capacity, slots.free + 1);
+};
+
+// Uploads to hosts without resumable uploads use 3 MiB chunks (4 MiB of
+// base64) on the thread's own session: at most two of those in flight per
+// machine, whatever the number of files.
+const LEGACY_UPLOAD_WINDOW_CHUNKS = 2;
+const legacyUploadSlots = new Map(); // machineId -> { free, waiters }
+
+const acquireLegacyUploadSlot = (machineId, signal) => {
+  let slots = legacyUploadSlots.get(machineId);
+  if (!slots) {
+    slots = { free: LEGACY_UPLOAD_WINDOW_CHUNKS, waiters: [] };
+    legacyUploadSlots.set(machineId, slots);
+  }
+  return acquireFrom(slots, signal);
+};
+
+const releaseLegacyUploadSlot = (machineId) => releaseTo(legacyUploadSlots.get(machineId), LEGACY_UPLOAD_WINDOW_CHUNKS);
+
+// The transfer session closes once no upload to the machine has needed it for
+// a while.
+const activeUploadCounts = new Map(); // machineId -> uploads running
+const transferIdleTimers = new Map(); // machineId -> timer
+
+const noteUploadActivity = (machineId, delta) => {
+  const count = (activeUploadCounts.get(machineId) ?? 0) + delta;
+  clearTimeout(transferIdleTimers.get(machineId));
+  transferIdleTimers.delete(machineId);
+  if (count > 0) {
+    activeUploadCounts.set(machineId, count);
+    return;
+  }
+  activeUploadCounts.delete(machineId);
+  const idleMs = Number.isFinite(deps?.transferSessionIdleMs) ? deps.transferSessionIdleMs : TRANSFER_SESSION_IDLE_MS;
+  const timer = setTimeout(() => {
+    transferIdleTimers.delete(machineId);
+    if (!activeUploadCounts.get(machineId)) closeClientSession(transferSessionKey(machineId), null);
+  }, idleMs);
+  timer.unref?.();
+  transferIdleTimers.set(machineId, timer);
+};
+
+const waitFor = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new Error('The upload was cancelled.'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error('The upload was cancelled.'));
+    };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
+
+const machineDisplayName = (machineId) =>
+  remoteMachines.find((machine) => machine.id === machineId)?.name ?? 'That machine';
+
+/** Read one chunk of the file being sent; a file that shrank under us is refused. */
+const readUploadChunk = async (transfer, handle, offset, length) => {
+  const buffer = Buffer.alloc(length);
+  if (length === 0) return buffer;
+  const { bytesRead } = await handle.read(buffer, 0, length, offset);
+  if (bytesRead !== length) throw new UploadRefusal(`${transfer.name} changed while it was being sent.`);
+  return buffer;
+};
+
+/** Hosts without resumable uploads: one chunk at a time on the thread's session. */
+const sendLegacyUpload = async (transfer) => {
+  if (transfer.size > LEGACY_MAX_REMOTE_ATTACHMENT_BYTES) {
+    throw new UploadRefusal(
+      `${transfer.name} is too large for ${machineDisplayName(transfer.machineId)} (100 MB at most). Update Durango Code there to send larger files.`
+    );
+  }
+  transfer.route = clientSessions.get(transfer.machineId)?.route ?? null;
+  const handle = await fs.open(transfer.localPath, 'r');
+  try {
     let uploadId;
     let offset = 0;
     for (;;) {
-      const length = Math.min(ATTACHMENT_CHUNK_BYTES, size - offset);
-      const buffer = Buffer.alloc(length);
-      if (length > 0) {
-        const { bytesRead } = await handle.read(buffer, 0, length, offset);
-        if (bytesRead !== length) throw new Error(`${attachment?.name ?? 'An attachment'} changed while it was being sent.`);
+      const length = Math.min(ATTACHMENT_CHUNK_BYTES, transfer.size - offset);
+      const buffer = await readUploadChunk(transfer, handle, offset, length);
+      await acquireLegacyUploadSlot(transfer.machineId, transfer.signal);
+      let response;
+      try {
+        response = await clientRequest(transfer.machineId, {
+          t: 'attachmentUpload',
+          ...(uploadId ? { uploadId } : { name: transfer.name, mimeType: transfer.mimeType, size: transfer.size }),
+          offset,
+          data: buffer.toString('base64'),
+        });
+      } finally {
+        releaseLegacyUploadSlot(transfer.machineId);
       }
-      const response = await clientRequest(machineId, {
-        t: 'attachmentUpload',
-        ...(uploadId ? { uploadId } : { name: String(attachment?.name ?? path.basename(localPath)), mimeType: attachment?.mimeType, size }),
-        offset,
-        data: buffer.toString('base64'),
-      });
       if (!response.ok) {
-        throw new Error(
+        throw new UploadRefusal(
           response.error === 'Unsupported request.'
             ? 'That machine cannot receive attachments yet. Update Durango Code on it.'
             : (response.error ?? 'The attachment could not be sent.')
@@ -3643,13 +4376,342 @@ const uploadAttachmentToHost = async (machineId, attachment) => {
       }
       uploadId = response.uploadId;
       offset += length;
+      transfer.sent = offset;
+      publishUploadProgress(transfer);
       if (response.done) return { uploadId, hostPath: typeof response.path === 'string' ? response.path : null };
-      if (length === 0 || response.received !== offset) throw new Error('The host did not accept the attachment.');
+      if (length === 0 || response.received !== offset) throw new UploadRefusal('The host did not accept the attachment.');
+      if (transfer.signal.aborted) throw transfer.signal.reason ?? new Error('The upload was cancelled.');
     }
   } finally {
     await handle.close().catch(() => {});
   }
 };
+
+/** One pass of a resumable upload: open it (or find where the host's copy stops), then send the rest. */
+const sendResumableUpload = async (transfer) => {
+  const request = (message, timeoutMs = REQUEST_TIMEOUT_MS) =>
+    clientRequest(transfer.machineId, message, timeoutMs, { transfer: true, signal: transfer.signal });
+  const finished = (response) => ({
+    uploadId: transfer.uploadId,
+    hostPath: typeof response.path === 'string' ? response.path : null,
+  });
+  const stats = await fs.stat(transfer.localPath);
+  if (stats.size !== transfer.size || stats.mtimeMs !== transfer.mtimeMs) {
+    throw new UploadRefusal(`${transfer.name} changed while it was being sent. Attach it again.`);
+  }
+  let start = 0;
+  if (transfer.uploadId) {
+    const status = await request({ t: 'uploadStatus', uploadId: transfer.uploadId });
+    if (status.ok) {
+      if (status.done) return finished(status);
+      start = Number.isSafeInteger(status.received) ? status.received : 0;
+    } else if (status.unknownUpload) {
+      transfer.uploadId = null;
+    } else {
+      throw new UploadRefusal(status.error ?? 'The attachment could not be sent.');
+    }
+  }
+  if (!transfer.uploadId) {
+    const opened = await request({
+      t: 'uploadOpen',
+      name: transfer.name,
+      mimeType: transfer.mimeType,
+      size: transfer.size,
+    });
+    if (!opened.ok) throw new UploadRefusal(opened.error ?? 'The attachment could not be sent.');
+    // Cancelled while the host was opening it: the cancel could not name it.
+    if (transfer.signal.aborted) {
+      void clientRequest(transfer.machineId, { t: 'uploadDiscard', uploadIds: [String(opened.uploadId)] }, REQUEST_TIMEOUT_MS, {
+        transfer: true,
+      }).catch(() => {});
+      throw transfer.signal.reason ?? new Error('The upload was cancelled.');
+    }
+    if (opened.chunkBytes !== UPLOAD_CHUNK_BYTES) throw new UploadRefusal('That machine expects a different upload format. Update Durango Code on both machines.');
+    transfer.uploadId = String(opened.uploadId);
+    if (opened.done) return finished(opened);
+    start = 0;
+  }
+  if (start % UPLOAD_CHUNK_BYTES !== 0 || start > transfer.size) throw new Error('The upload was lost on the host.');
+  transfer.route = clientSessions.get(transferSessionKey(transfer.machineId))?.route ?? null;
+  transfer.sent = start;
+  publishUploadProgress(transfer, true);
+
+  const uploadId = transfer.uploadId;
+  const handle = await fs.open(transfer.localPath, 'r');
+  const inFlight = new Set();
+  let failure = null;
+  let last = null;
+  try {
+    for (let offset = start; offset < transfer.size && !failure; offset += UPLOAD_CHUNK_BYTES) {
+      await acquireUploadSlot(transfer.machineId, transfer.signal);
+      if (failure) {
+        releaseUploadSlot(transfer.machineId);
+        break;
+      }
+      const chunkOffset = offset;
+      const length = Math.min(UPLOAD_CHUNK_BYTES, transfer.size - chunkOffset);
+      const task = (async () => {
+        try {
+          const buffer = await readUploadChunk(transfer, handle, chunkOffset, length);
+          const response = await request(
+            { t: 'uploadChunk', uploadId, offset: chunkOffset, data: buffer.toString('base64') },
+            Number.isFinite(deps?.uploadChunkTimeoutMs) ? deps.uploadChunkTimeoutMs : UPLOAD_CHUNK_TIMEOUT_MS
+          );
+          if (!response.ok) {
+            if (response.unknownUpload) {
+              transfer.uploadId = null;
+              throw new Error('The upload was lost on the host.');
+            }
+            throw new UploadRefusal(response.error ?? 'The attachment could not be sent.');
+          }
+          transfer.sent = Math.min(transfer.size, transfer.sent + length);
+          publishUploadProgress(transfer);
+          if (response.done) last = response;
+        } finally {
+          releaseUploadSlot(transfer.machineId);
+        }
+      })().catch((error) => {
+        failure ??= error;
+      });
+      inFlight.add(task);
+      void task.then(() => inFlight.delete(task));
+    }
+  } catch (error) {
+    failure ??= error;
+  } finally {
+    await Promise.all([...inFlight]);
+    await handle.close().catch(() => {});
+  }
+  if (failure) throw failure;
+  if (!last) {
+    const status = await request({ t: 'uploadStatus', uploadId });
+    if (!status.ok || !status.done) throw new Error('The upload was lost on the host.');
+    last = status;
+  }
+  return finished(last);
+};
+
+const runHostUpload = async (transfer) => {
+  noteUploadActivity(transfer.machineId, 1);
+  try {
+    const session = await ensureClientSession(transfer.machineId);
+    if (!session.hostFeatures.has('uploads2')) {
+      if (transfer.prepared) throw new DeferredUpload('Sent with the turn.');
+      return await sendLegacyUpload(transfer);
+    }
+    transfer.resumable = true;
+    let lastError = null;
+    for (let attempt = 0; attempt < UPLOAD_RESUME_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await waitFor(Math.min(8000, 500 * 2 ** attempt), transfer.signal);
+      try {
+        return await sendResumableUpload(transfer);
+      } catch (error) {
+        if (transfer.signal.aborted || error instanceof UploadRefusal) throw error;
+        if (!TRANSIENT_UPLOAD_ERROR.test(error?.message ?? '')) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  } finally {
+    noteUploadActivity(transfer.machineId, -1);
+  }
+};
+
+/**
+ * The transfer of this file to this machine: the one under way (or done), or a
+ * new one. `claim` takes it for a command (counted before this returns): a
+ * host lets one command use an upload, so a second command sending the same
+ * file at the same time gets a transfer of its own.
+ */
+const startHostUpload = async (machineId, attachment, { prepared = false, claim = false } = {}) => {
+  const localPath = String(attachment?.path ?? '');
+  const name = String(attachment?.name ?? path.basename(localPath));
+  const stats = await fs.stat(localPath);
+  if (!stats.isFile()) throw new Error(`${name} is not a file.`);
+  const baseKey = hostUploadKey(machineId, localPath, stats.size, stats.mtimeMs);
+  const existing = hostUploadTransfers.get(baseKey);
+  if (existing && (existing.state === 'uploading' || existing.state === 'done') && !(claim && existing.users > 0)) {
+    if (claim) existing.users += 1;
+    return existing;
+  }
+  const key = existing && claim && existing.users > 0 ? `${baseKey}\u0000${crypto.randomUUID()}` : baseKey;
+  const abortController = new AbortController();
+  const transfer = {
+    key,
+    machineId,
+    localPath,
+    name,
+    mimeType: typeof attachment?.mimeType === 'string' ? attachment.mimeType : undefined,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    sent: 0,
+    state: 'uploading',
+    error: null,
+    uploadId: null,
+    resumable: false,
+    prepared,
+    users: claim ? 1 : 0,
+    publishedAt: 0,
+    publishTimer: null,
+    route: null,
+    abortController,
+    signal: abortController.signal,
+  };
+  hostUploadTransfers.set(key, transfer);
+  publishUploadProgress(transfer, true);
+  transfer.promise = runHostUpload(transfer).then(
+    (result) => {
+      transfer.state = 'done';
+      transfer.sent = transfer.size;
+      publishUploadProgress(transfer, true);
+      return result;
+    },
+    (error) => {
+      if (error instanceof DeferredUpload) {
+        if (hostUploadTransfers.get(key) === transfer) hostUploadTransfers.delete(key);
+        transfer.state = 'deferred';
+      } else {
+        transfer.state = transfer.signal.aborted ? 'cancelled' : 'error';
+        transfer.error = error?.message ?? String(error);
+      }
+      publishUploadProgress(transfer, true);
+      throw error;
+    }
+  );
+  // A prompt-box upload may never be awaited.
+  transfer.promise.catch(() => {});
+  return transfer;
+};
+
+/**
+ * Send one local file to a paired host for a command → { uploadId, hostPath,
+ * transfer }. Settle the transfer with settleHostUploads once the command
+ * that names it has an answer.
+ */
+const uploadAttachmentToHost = async (machineId, attachment) => {
+  for (let attempt = 0; ; attempt += 1) {
+    const transfer = await startHostUpload(machineId, attachment, { claim: true });
+    const reused = transfer.state === 'done';
+    try {
+      const result = await transfer.promise;
+      // Uploaded a while ago (from the prompt box): make sure the host still
+      // has it (it drops unused files after a while, and on restart).
+      if (reused && transfer.resumable && attempt === 0) {
+        const status = await clientRequest(machineId, { t: 'uploadStatus', uploadId: result.uploadId }, REQUEST_TIMEOUT_MS, {
+          transfer: true,
+        }).catch(() => null);
+        if (status && !(status.ok && status.done)) {
+          transfer.users -= 1;
+          if (hostUploadTransfers.get(transfer.key) === transfer) hostUploadTransfers.delete(transfer.key);
+          continue;
+        }
+      }
+      return { ...result, transfer };
+    } catch (error) {
+      transfer.users -= 1;
+      // Started from the prompt box for a host that takes files only with the
+      // turn: send it now, the original way.
+      if (error instanceof DeferredUpload && attempt === 0) continue;
+      throw error;
+    }
+  }
+};
+
+/** Every file of a command, at once (they share the machine's chunk slots). */
+const uploadAttachmentsToHost = async (machineId, attachments) => {
+  const list = Array.isArray(attachments) ? attachments.slice(0, 32) : [];
+  const settled = await Promise.allSettled(list.map((attachment) => uploadAttachmentToHost(machineId, attachment)));
+  const failed = settled.find((result) => result.status === 'rejected');
+  if (failed) {
+    settleHostUploads(
+      settled.filter((result) => result.status === 'fulfilled').map((result) => result.value),
+      { ok: false }
+    );
+    throw failed.reason;
+  }
+  return settled.map((result, index) => ({ ...result.value, attachment: list[index] }));
+};
+
+/**
+ * The command that named these uploads has answered. The host keeps a file it
+ * used; one a failed command named stays there for a retry (resumable hosts),
+ * so it stays known here too, unless the host no longer has it.
+ */
+const settleHostUploads = (uploads, { ok, error } = {}) => {
+  const lostOnHost = !ok && /did not finish uploading/i.test(String(error ?? ''));
+  for (const upload of uploads) {
+    const transfer = upload?.transfer;
+    if (!transfer) continue;
+    transfer.users = Math.max(0, transfer.users - 1);
+    if (hostUploadTransfers.get(transfer.key) !== transfer) continue;
+    if (ok || lostOnHost || !transfer.resumable) {
+      hostUploadTransfers.delete(transfer.key);
+      transfer.state = ok ? 'sent' : transfer.state;
+      if (ok) publishUploadProgress(transfer, true);
+    }
+  }
+};
+
+/** Abort transfers (all, or one machine's), e.g. when a machine is removed. */
+const cancelHostUploadTransfers = (reason, machineId = null) => {
+  for (const transfer of [...hostUploadTransfers.values()]) {
+    if (machineId && transfer.machineId !== machineId) continue;
+    hostUploadTransfers.delete(transfer.key);
+    transfer.abortController.abort(new Error(reason));
+  }
+};
+
+/**
+ * The prompt box got a file for a thread on `machineId`: start sending it now
+ * so the turn doesn't wait for it. Progress arrives as remote:uploadProgress.
+ */
+export const prepareRemoteAttachmentUpload = async ({ machineId, attachment } = {}) => {
+  try {
+    await startHostUpload(String(machineId ?? ''), attachment, { prepared: true });
+    return { ok: true };
+  } catch (error) {
+    return clientErrorResult(error);
+  }
+};
+
+/**
+ * The file was taken out of the prompt box (or the thread moved to another
+ * machine): stop sending it and let the host drop its copy. A file a command
+ * is sending right now is left alone.
+ */
+export const cancelRemoteAttachmentUpload = ({ machineId, path: localPath } = {}) => {
+  const targetMachineId = String(machineId ?? '');
+  for (const transfer of [...hostUploadTransfers.values()]) {
+    if (transfer.machineId !== targetMachineId || transfer.localPath !== String(localPath ?? '')) continue;
+    if (transfer.users > 0) continue;
+    hostUploadTransfers.delete(transfer.key);
+    const wasUploading = transfer.state === 'uploading';
+    transfer.abortController.abort(new Error('The upload was cancelled.'));
+    if (transfer.resumable && transfer.uploadId) {
+      void clientRequest(targetMachineId, { t: 'uploadDiscard', uploadIds: [transfer.uploadId] }, REQUEST_TIMEOUT_MS, {
+        transfer: true,
+      }).catch(() => {});
+    }
+    if (!wasUploading) {
+      transfer.state = 'cancelled';
+      publishUploadProgress(transfer, true);
+    }
+  }
+  return { ok: true };
+};
+
+/** Uploads under way or waiting to be used, for a renderer that just loaded. */
+export const listRemoteAttachmentUploads = () =>
+  [...hostUploadTransfers.values()].map((transfer) => ({
+    machineId: transfer.machineId,
+    machineName: machineDisplayName(transfer.machineId),
+    path: transfer.localPath,
+    size: transfer.size,
+    sent: transfer.sent,
+    state: transfer.state,
+    route: transfer.route ?? null,
+    ...(transfer.error ? { error: transfer.error } : {}),
+  }));
 
 export const runRemoteTurn = async ({
   machineId,
@@ -3673,67 +4735,74 @@ export const runRemoteTurn = async ({
     const requestedReasoningEffort = sanitizeReasoningEffort(reasoningEffort);
     const requestedCodexServiceTier = sanitizeCodexServiceTier(codexServiceTier);
     const requestedClaudeContextWindow = sanitizeClaudeContextWindow(claudeContextWindow);
-    // The turn's files go first; the turn names them by upload id.
-    const uploaded = [];
-    for (const attachment of Array.isArray(attachments) ? attachments.slice(0, 32) : []) {
-      const { uploadId, hostPath } = await uploadAttachmentToHost(targetMachineId, attachment);
-      uploaded.push({
+    // The turn's files go first (often already there: the prompt box started
+    // them); the turn names them by upload id.
+    const uploaded = (await uploadAttachmentsToHost(targetMachineId, attachments)).map(
+      ({ uploadId, hostPath, transfer, attachment }) => ({
         uploadId,
         hostPath,
+        transfer,
         localPath: String(attachment.path),
         name: String(attachment?.name ?? ''),
         ...(attachment?.snapshot ? { snapshot: attachment.snapshot } : {}),
-      });
-    }
-    const response = await clientRequest(
-      targetMachineId,
-      {
-        t: 'runTurn',
-        ...(threadId ? { threadId: String(threadId) } : {}),
-        ...(projectId ? { projectId: String(projectId) } : {}),
-        ...(modelId ? { modelId: String(modelId) } : {}),
-        ...(requestedAccessMode ? { accessMode: requestedAccessMode } : {}),
-        ...(requestedReasoningEffort ? { reasoningEffort: requestedReasoningEffort } : {}),
-        ...(requestedCodexServiceTier ? { codexServiceTier: requestedCodexServiceTier } : {}),
-        ...(requestedClaudeContextWindow
-          ? { claudeContextWindow: requestedClaudeContextWindow }
-          : {}),
-        ...(uploaded.length > 0
-          ? {
-              attachments: uploaded.map(({ uploadId, name, snapshot }) => ({
-                uploadId,
-                name,
-                ...(snapshot ? { snapshot } : {}),
-              })),
-            }
-          : {}),
-        prompt: String(prompt ?? ''),
-        ...(typeof context === 'string' && context.trim() ? { context: context.slice(0, MAX_TURN_CONTEXT_CHARS) } : {}),
-        ...(!threadId && typeof spawnedBy?.threadId === 'string' && spawnedBy.threadId
-          ? { spawnedBy: { threadId: spawnedBy.threadId } }
-          : {}),
-        // An agent here sent the turn (machine_run_agent), not the user.
-        ...(fromAgent === true ? { fromAgent: true } : {}),
-      },
-      (Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS) +
-        (Number.isFinite(deps?.clientResponseGraceMs)
-          ? Math.max(0, deps.clientResponseGraceMs)
-          : CLIENT_RESPONSE_GRACE_MS),
-      {
-        extendOnClaim: true,
-        // The host made (or found) the turn's thread and is starting it: tell
-        // the renderer its id now, so the turn streams here while it starts.
-        onClaimed:
-          typeof turnKey === 'string' && turnKey
-            ? (hostThreadId) =>
-                deps.broadcast('remote:event', {
-                  machineId: targetMachineId,
-                  kind: 'turnClaimed',
-                  payload: { turnKey, threadId: hostThreadId },
-                })
-            : undefined,
-      }
+      })
     );
+    let response;
+    try {
+      response = await clientRequest(
+        targetMachineId,
+        {
+          t: 'runTurn',
+          ...(threadId ? { threadId: String(threadId) } : {}),
+          ...(projectId ? { projectId: String(projectId) } : {}),
+          ...(modelId ? { modelId: String(modelId) } : {}),
+          ...(requestedAccessMode ? { accessMode: requestedAccessMode } : {}),
+          ...(requestedReasoningEffort ? { reasoningEffort: requestedReasoningEffort } : {}),
+          ...(requestedCodexServiceTier ? { codexServiceTier: requestedCodexServiceTier } : {}),
+          ...(requestedClaudeContextWindow
+            ? { claudeContextWindow: requestedClaudeContextWindow }
+            : {}),
+          ...(uploaded.length > 0
+            ? {
+                attachments: uploaded.map(({ uploadId, name, snapshot }) => ({
+                  uploadId,
+                  name,
+                  ...(snapshot ? { snapshot } : {}),
+                })),
+              }
+            : {}),
+          prompt: String(prompt ?? ''),
+          ...(typeof context === 'string' && context.trim() ? { context: context.slice(0, MAX_TURN_CONTEXT_CHARS) } : {}),
+          ...(!threadId && typeof spawnedBy?.threadId === 'string' && spawnedBy.threadId
+            ? { spawnedBy: { threadId: spawnedBy.threadId } }
+            : {}),
+          // An agent here sent the turn (machine_run_agent), not the user.
+          ...(fromAgent === true ? { fromAgent: true } : {}),
+        },
+        (Number.isFinite(deps?.runTurnTimeoutMs) ? Math.max(1, deps.runTurnTimeoutMs) : RUN_TURN_TIMEOUT_MS) +
+          (Number.isFinite(deps?.clientResponseGraceMs)
+            ? Math.max(0, deps.clientResponseGraceMs)
+            : CLIENT_RESPONSE_GRACE_MS),
+        {
+          extendOnClaim: true,
+          // The host made (or found) the turn's thread and is starting it: tell
+          // the renderer its id now, so the turn streams here while it starts.
+          onClaimed:
+            typeof turnKey === 'string' && turnKey
+              ? (hostThreadId) =>
+                  deps.broadcast('remote:event', {
+                    machineId: targetMachineId,
+                    kind: 'turnClaimed',
+                    payload: { turnKey, threadId: hostThreadId },
+                  })
+              : undefined,
+        }
+      );
+    } catch (error) {
+      settleHostUploads(uploaded, { ok: false, error: error?.message });
+      throw error;
+    }
+    settleHostUploads(uploaded, { ok: response.ok === true, error: response.error });
     return {
       ok: response.ok === true,
       threadId: typeof response.threadId === 'string' ? response.threadId : undefined,
@@ -3777,35 +4846,50 @@ export const fetchRemoteAttachment = async ({ machineId, path: hostPath } = {}) 
       await fs.access(localPath);
       return { ok: true, path: localPath };
     } catch {}
-    const chunks = [];
-    let offset = 0;
-    let size = null;
-    for (;;) {
-      const response = await clientRequest(targetMachineId, { t: 'attachmentRead', path: requestedPath, offset });
-      if (!response.ok) return { ok: false, error: response.error ?? 'Could not fetch the attachment.' };
-      if (!Number.isSafeInteger(response.size) || response.size > MAX_REMOTE_ATTACHMENT_BYTES) {
-        throw new Error('The host sent an invalid attachment.');
-      }
-      if (size === null) size = response.size;
-      if (response.size !== size || response.offset !== offset) throw new Error('The host sent an invalid attachment.');
-      const chunk = Buffer.from(String(response.data ?? ''), 'base64');
-      if (chunk.length > ATTACHMENT_CHUNK_BYTES || offset + chunk.length > size) {
-        throw new Error('The host sent an invalid attachment.');
-      }
-      chunks.push(chunk);
-      offset += chunk.length;
-      if (response.nextOffset === null) break;
-      // Bounded by the size the host announced: a host cannot keep a fetch
-      // going (and this machine buffering) past it.
-      if (response.nextOffset !== offset || chunk.length === 0 || offset >= size) {
-        throw new Error('The host sent an invalid attachment.');
-      }
-    }
-    if (offset !== size) throw new Error('The host sent an incomplete attachment.');
+    // Written to disk as it arrives (never held whole in memory), under a
+    // temporary name until complete.
     await fs.mkdir(directory, { recursive: true });
     const temporary = `${localPath}.${crypto.randomUUID()}.part`;
-    await fs.writeFile(temporary, Buffer.concat(chunks, size));
-    await fs.rename(temporary, localPath);
+    const handle = await fs.open(temporary, 'w');
+    let complete = false;
+    try {
+      let offset = 0;
+      let size = null;
+      for (;;) {
+        const response = await clientRequest(targetMachineId, { t: 'attachmentRead', path: requestedPath, offset });
+        if (!response.ok) return { ok: false, error: response.error ?? 'Could not fetch the attachment.' };
+        if (!Number.isSafeInteger(response.size) || response.size < 0) {
+          throw new Error('The host sent an invalid attachment.');
+        }
+        // The mirror shows a large file of that machine by name only.
+        if (response.size > MAX_MIRRORED_ATTACHMENT_BYTES) {
+          return { ok: false, tooLarge: true, error: 'This attachment is too large to copy here.' };
+        }
+        if (size === null) size = response.size;
+        if (response.size !== size || response.offset !== offset) throw new Error('The host sent an invalid attachment.');
+        const chunk = Buffer.from(String(response.data ?? ''), 'base64');
+        if (chunk.length > ATTACHMENT_CHUNK_BYTES || offset + chunk.length > size) {
+          throw new Error('The host sent an invalid attachment.');
+        }
+        if (chunk.length > 0) await writeFully(handle, chunk, offset);
+        offset += chunk.length;
+        if (response.nextOffset === null) break;
+        // Bounded by the size the host announced: a host cannot keep a fetch
+        // going past it.
+        if (response.nextOffset !== offset || chunk.length === 0 || offset >= size) {
+          throw new Error('The host sent an invalid attachment.');
+        }
+      }
+      if (offset !== size) throw new Error('The host sent an incomplete attachment.');
+      await handle.close();
+      await fs.rename(temporary, localPath);
+      complete = true;
+    } finally {
+      if (!complete) {
+        await handle.close().catch(() => {});
+        await fs.rm(temporary, { force: true }).catch(() => {});
+      }
+    }
     return { ok: true, path: localPath };
   } catch (error) {
     return clientErrorResult(error);
@@ -3867,28 +4951,38 @@ export const answerRemoteQuestion = async ({ machineId, threadId, runId, request
 export const remoteUserAction = async ({ machineId, threadId, actionId, op, reply, attachments, watching, secretAnswer } = {}) => {
   try {
     const targetMachineId = String(machineId ?? '');
-    const uploaded = [];
-    if (op === 'reply') {
-      for (const attachment of Array.isArray(attachments) ? attachments.slice(0, 32) : []) {
-        const { uploadId } = await uploadAttachmentToHost(targetMachineId, attachment);
-        uploaded.push({ uploadId, name: String(attachment?.name ?? '') });
-      }
+    const uploaded =
+      op === 'reply'
+        ? (await uploadAttachmentsToHost(targetMachineId, attachments)).map(({ uploadId, transfer, attachment }) => ({
+            uploadId,
+            transfer,
+            name: String(attachment?.name ?? ''),
+          }))
+        : [];
+    let response;
+    try {
+      response = await clientRequest(
+        targetMachineId,
+        {
+          t: 'userAction',
+          threadId: String(threadId ?? ''),
+          actionId: String(actionId ?? ''),
+          op,
+          ...(op === 'reply'
+            ? { reply: String(reply ?? ''), attachments: uploaded.map(({ uploadId, name }) => ({ uploadId, name })) }
+            : {}),
+          ...(op === 'watch' ? { watching: watching === true } : {}),
+          ...(op === 'secret' ? { secretAnswer } : {}),
+        },
+        (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
+          (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),
+        { extendOnClaim: true }
+      );
+    } catch (error) {
+      settleHostUploads(uploaded, { ok: false, error: error?.message });
+      throw error;
     }
-    const response = await clientRequest(
-      targetMachineId,
-      {
-        t: 'userAction',
-        threadId: String(threadId ?? ''),
-        actionId: String(actionId ?? ''),
-        op,
-        ...(op === 'reply' ? { reply: String(reply ?? ''), attachments: uploaded } : {}),
-        ...(op === 'watch' ? { watching: watching === true } : {}),
-        ...(op === 'secret' ? { secretAnswer } : {}),
-      },
-      (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
-        (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),
-      { extendOnClaim: true }
-    );
+    settleHostUploads(uploaded, { ok: response.ok === true, error: response.error });
     if (!response.ok) {
       return { ok: false, error: unsupportedMessage(response, 'take user action answers') ?? response.error ?? 'That machine did not take it.' };
     }
@@ -3951,27 +5045,35 @@ export const checkoutRemoteSource = async ({ machineId, repoId, name } = {}) => 
 export const steerRemoteTurn = async ({ machineId, threadId, prompt, attachments } = {}) => {
   try {
     const targetMachineId = String(machineId ?? '');
-    const uploaded = [];
-    for (const attachment of Array.isArray(attachments) ? attachments.slice(0, 32) : []) {
-      const { uploadId } = await uploadAttachmentToHost(targetMachineId, attachment);
-      uploaded.push({
+    const uploaded = (await uploadAttachmentsToHost(targetMachineId, attachments)).map(
+      ({ uploadId, transfer, attachment }) => ({
         uploadId,
+        transfer,
         name: String(attachment?.name ?? ''),
         ...(attachment?.snapshot ? { snapshot: attachment.snapshot } : {}),
-      });
-    }
-    const response = await clientRequest(
-      targetMachineId,
-      {
-        t: 'steerTurn',
-        threadId: String(threadId ?? ''),
-        prompt: String(prompt ?? ''),
-        ...(uploaded.length > 0 ? { attachments: uploaded } : {}),
-      },
-      (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
-        (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),
-      { extendOnClaim: true }
+      })
     );
+    let response;
+    try {
+      response = await clientRequest(
+        targetMachineId,
+        {
+          t: 'steerTurn',
+          threadId: String(threadId ?? ''),
+          prompt: String(prompt ?? ''),
+          ...(uploaded.length > 0
+            ? { attachments: uploaded.map(({ transfer: _transfer, ...attachment }) => attachment) }
+            : {}),
+        },
+        (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
+          (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),
+        { extendOnClaim: true }
+      );
+    } catch (error) {
+      settleHostUploads(uploaded, { ok: false, error: error?.message });
+      throw error;
+    }
+    settleHostUploads(uploaded, { ok: response.ok === true, error: response.error });
     if (!response.ok) {
       return { ok: false, error: unsupportedMessage(response, 'take steering messages') ?? response.error ?? 'Steer failed.' };
     }
