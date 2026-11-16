@@ -35,7 +35,9 @@ import {
   ORION_BUILTIN_TOOL_NAMES,
   isPreapprovedOrionTool,
   isRequiredThreadReaderBridgeMissing,
+  orionAppToolNamesForAccessMode,
 } from '../src/main/thread-reader-routing.js';
+import { APP_TOOL_DESCRIPTIONS, APP_TOOL_INPUT_SCHEMAS } from '../src/main/app-tools.js';
 import { claudeSecretRefHooks, createOrionMcpServer } from '../src/main/claude-driver.js';
 import {
   USER_ACTION_TOOL_DESCRIPTIONS,
@@ -414,7 +416,36 @@ try {
     assert.equal(parsed.tokens.accent, '#ff4fd8');
     assert.equal(parsed.backdrop.type, 'html');
     assert.throws(() => z.object(setTheme.schema).parse({ backdrop: { type: 'bogus' } }));
+    // Value declarations, controls, current values and variant conditions are
+    // objects and mixed scalars, not strings (they were rejected as "expected
+    // string" before json-schema-zod.js).
+    const withValues = z.object(setTheme.schema).parse({
+      values: { snow: { type: 'boolean', default: true, label: 'Snow' }, time: null },
+      controls: [{ id: 'snow-toggle', kind: 'toggle', value: 'snow', icon: 'snowflake', placement: { slot: 'titlebar-right', position: 'start' }, on: { icon: 'snowflake' }, showLabel: true }],
+      set_values: { snow: false, glow: 0.4, time: 'night', old: null },
+    });
+    assert.deepEqual(withValues.values.snow, { type: 'boolean', default: true, label: 'Snow' });
+    assert.equal(withValues.values.time, null);
+    assert.equal(withValues.controls[0].showLabel, true, 'keys a schema does not list are kept for the tool to clean');
+    assert.deepEqual(withValues.set_values, { snow: false, glow: 0.4, time: 'night', old: null });
+    assert.throws(() => z.object(setTheme.schema).parse({ set_values: { snow: { on: true } } }));
+    assert.throws(() => z.object(setTheme.schema).parse({ controls: [{ kind: 'toggle' }] }), 'control ids are required');
+    const media = registered.find((entry) => entry.name === 'generate_theme_media') ?? null;
+    if (media) assert.deepEqual(z.object(media.schema).parse({ prompt: 'x', variant_when: { time: 'night', snow: true } }).variant_when, { time: 'night', snow: true });
   }
+
+  // --- App tools: Claude registers them; Read only only the snapshot -------------------------
+  for (const name of orionAppToolNamesForAccessMode('read-only')) {
+    const entry = registered.find((candidate) => candidate.name === name);
+    assert.ok(entry, `Claude registers ${name}`);
+    assert.equal(entry.description, APP_TOOL_DESCRIPTIONS[name]);
+    assert.deepEqual(Object.keys(entry.schema).sort(), Object.keys(APP_TOOL_INPUT_SCHEMAS[name].properties).sort());
+  }
+  assert.equal(registered.some((entry) => entry.name === 'app_click'), false, 'Read only lists no app actions');
+  assert.equal(isPreapprovedOrionTool('app_snapshot', 'read-only'), true);
+  assert.equal(isPreapprovedOrionTool('app_snapshot', 'workspace-write'), true);
+  assert.equal(isPreapprovedOrionTool('app_click', 'workspace-write'), false, 'Workspace write asks before acting in the app');
+  assert.equal(isPreapprovedOrionTool('app_type', 'full-access'), true);
 
   // --- Device tools: Claude registers them only with agent access, mirroring device-tools.js ---
   setDeviceDataRootForTests(path.join(testRoot, 'device-data'));
@@ -889,7 +920,8 @@ try {
     }
     // Theme tools come from the app (`__tools`), after the shim's own.
     const themeNames = orionThemeToolNamesForAccessMode('read-only');
-    assert.deepEqual(shimTools.map((tool) => tool.name), [...ORION_BUILTIN_TOOL_NAMES, ...themeNames]);
+    const appNames = orionAppToolNamesForAccessMode('read-only');
+    assert.deepEqual(shimTools.map((tool) => tool.name), [...ORION_BUILTIN_TOOL_NAMES, ...themeNames, ...appNames]);
     for (const name of themeNames) {
       const tool = shimTools.find((candidate) => candidate.name === name);
       assert.equal(tool.description, THEME_TOOL_DESCRIPTIONS[name], `${name} description matches theme-tools.js`);

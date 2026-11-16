@@ -789,6 +789,7 @@ const TOOL_AREAS = [
   [/^device_/, 'simulators'],
   [/^machine_/, 'other machines'],
   [/_app_theme$|^generate_theme_media$/, 'app theme'],
+  [/^app_(snapshot|click|type|press|scroll)$/, 'app window'],
   [/^load_tools$/, 'connected apps'],
 ];
 const serverInstructions = (all) => {

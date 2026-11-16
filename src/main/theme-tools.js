@@ -324,7 +324,7 @@ export const themeMcpToolDefinitions = (accessMode) =>
 /** System-prompt hint for Claude runs (claude-driver.js). */
 export const THEME_TOOLS_PROMPT_HINT = [
   '# Customizing Durango Code (Durango Code)',
-  'When the user asks to change how Durango Code itself looks (a theme, colors, fonts, a backdrop or wallpaper, animated effects, "make the app look like…"), use mcp__orion__set_app_theme (and get_app_theme first to see the current look): it restyles the app live from this thread, with no code changes. For AI-made wallpapers or looping video backdrops, use mcp__orion__generate_theme_media (Durango inference). To switch, save, rename or delete themes, or anything else Settings → Themes does, use mcp__orion__manage_app_themes. Themes can also add their own controls anywhere in the app (toggles, choices, sliders, menus, buttons or custom HTML widgets in the title bar, sidebar, prompt box or next to any element) whose values drive the theme CSS, scenes and backdrop variants: build the whole feature when asked. Make it delightful and light: a coherent palette with readable text, and HTML scenes that react to agent activity. Check your work with screenshot: true, then tell the user they can keep it with Save on the theme card.',
+  'When the user asks to change how Durango Code itself looks (a theme, colors, fonts, a backdrop or wallpaper, animated effects, "make the app look like…"), use mcp__orion__set_app_theme (and get_app_theme first to see the current look): it restyles the app live from this thread, with no code changes. For AI-made wallpapers or looping video backdrops, use mcp__orion__generate_theme_media (Durango inference). To switch, save, rename or delete themes, or anything else Settings → Themes does, use mcp__orion__manage_app_themes. Themes can also add their own controls anywhere in the app (toggles, choices, sliders, menus, buttons or custom HTML widgets in the title bar, sidebar, prompt box or next to any element) whose values drive the theme CSS, scenes and backdrop variants: build the whole feature when asked. Make it delightful and light: a coherent palette with readable text, and HTML scenes that react to agent activity. Check your work with screenshot: true, then tell the user they can keep it with Save on the theme card. To change a value yourself use set_app_theme set_values; to press a control the way the user does, use mcp__orion__app_snapshot and app_click.',
 ].join('\n');
 
 // --- helpers ----------------------------------------------------------------------
@@ -382,8 +382,8 @@ const isAppScreenshotFile = async (filePath) => {
   }
 };
 
-/** A JPEG of the app window, scaled down; null if the window is gone. */
-const captureWindow = async (getSender) => {
+/** A JPEG of the app window, scaled down; null if the window is gone (app-tools.js uses it too). */
+export const captureWindow = async (getSender) => {
   const sender = getSender?.();
   if (!sender || sender.isDestroyed?.() || typeof sender.capturePage !== 'function') return null;
   try {

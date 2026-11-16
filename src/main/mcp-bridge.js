@@ -13,6 +13,7 @@ import { USER_ACTION_TOOL_NAMES, runUserActionTool } from './user-actions.js';
 import { SECRET_TOOL_NAMES, cancelSecretRequests, redactSecrets, resolveSecretRefs, runSecretTool } from './secret-requests.js';
 import { VISUAL_TOOL_NAMES, runVisualTool } from './visual-tools.js';
 import { THEME_TOOL_NAMES, runThemeTool, themeMcpToolDefinitions } from './theme-tools.js';
+import { APP_TOOL_NAMES, appBridgeToolDefinitions, runAppTool } from './app-tools.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
 import { MACHINE_TOOL_NAMES, machineMcpToolDefinitions, machineToolsAvailable, runMachineTool } from './machine-tools.js';
@@ -178,6 +179,8 @@ export const handleMcpBridgeConnection = (socket) => {
             ...onDemandMcpToolDefinitions(session.onDemandMcps?.names() ?? []),
             // Restyling Durango Code itself (theme-tools.js).
             ...themeMcpToolDefinitions(session.accessMode),
+            // Using Durango Code's own window (app-tools.js).
+            ...appBridgeToolDefinitions(session.accessMode),
           ],
         });
         continue;
@@ -301,6 +304,20 @@ export const handleMcpBridgeConnection = (socket) => {
           runId: session.runId,
           accessMode: session.accessMode,
           signal: session.abortController?.signal,
+        }).then(({ ok, text, content }) =>
+          reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
+        );
+        continue;
+      }
+      if (APP_TOOL_NAMES.includes(message.tool)) {
+        // Re-checks the run's access mode; resolves, never rejects. These
+        // providers can't be relied on to ask before an action (Codex approves
+        // every orion tool), so actions need Full access here.
+        void runAppTool(message.tool, args, {
+          getSender: session.getSender,
+          threadId: session.threadId,
+          accessMode: session.accessMode,
+          requireFullAccess: true,
         }).then(({ ok, text, content }) =>
           reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
         );

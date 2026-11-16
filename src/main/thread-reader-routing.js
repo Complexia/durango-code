@@ -51,6 +51,16 @@ export const orionThemeToolNamesForAccessMode = (accessMode) =>
     ? ORION_THEME_TOOL_NAMES.filter((name) => name !== 'generate_theme_media')
     : ORION_THEME_TOOL_NAMES;
 
+// Using Durango Code's own window (app-tools.js): app_snapshot only reads, so
+// every mode approves it; clicking, typing, keys and scrolling act as the user
+// (they can change settings or answer prompts), so only Full access approves
+// them, Workspace write asks for each, and Read only refuses them in the tool.
+// Served through `__tools` for the bridge, like the theme tools.
+export const ORION_APP_READ_TOOL_NAMES = Object.freeze(['app_snapshot']);
+export const ORION_APP_TOOL_NAMES = Object.freeze(['app_snapshot', 'app_click', 'app_type', 'app_press', 'app_scroll']);
+export const orionAppToolNamesForAccessMode = (accessMode) =>
+  accessMode === 'full-access' ? ORION_APP_TOOL_NAMES : ORION_APP_READ_TOOL_NAMES;
+
 // The built-in browser's tools (browser-tools.js) are only listed for runs
 // that use it. Like Claude in Chrome under Workspace write they are
 // pre-approved; Read only lists just these two, which read existing tabs.
@@ -97,7 +107,8 @@ export const isPreapprovedOrionTool = (name, accessMode) =>
     (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))) ||
     orionDeviceToolNamesForAccessMode(accessMode).includes(name) ||
     orionMachineToolNamesForAccessMode(accessMode).includes(name) ||
-    orionThemeToolNamesForAccessMode(accessMode).includes(name));
+    orionThemeToolNamesForAccessMode(accessMode).includes(name) ||
+    orionAppToolNamesForAccessMode(accessMode).includes(name));
 
 const runPluginHelpCommand = (providerId) =>
   providerId === 'cursor'

@@ -33,6 +33,7 @@
     "test:durango-tools": "node scripts/run-electron-test.mjs scripts/test-durango-tools.mjs",
     "test:mcp-bridge-compact": "node scripts/run-electron-test.mjs scripts/test-mcp-bridge-compact.mjs",
     "test:builtin-browser": "node scripts/run-electron-test.mjs scripts/test-builtin-browser.mjs",
+    "test:app-tools": "node scripts/run-electron-test.mjs scripts/test-app-tools.mjs",
     "test:devices": "node scripts/run-electron-test.mjs scripts/test-devices.mjs",
     "test:durango-dispatch": "node --no-warnings --experimental-strip-types scripts/test-durango-dispatch.mjs",
     "test:durango-deploy-watcher": "node --no-warnings scripts/test-durango-deploy-watcher.mjs",

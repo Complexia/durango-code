@@ -20,6 +20,7 @@ import {
 import {
   orionBuiltinToolNamesForAccessMode,
   orionThemeToolNamesForAccessMode,
+  orionAppToolNamesForAccessMode,
   orionDeviceToolNamesForAccessMode,
   orionMachineToolNamesForAccessMode,
 } from './thread-reader-routing.js';
@@ -28,6 +29,8 @@ import { browserModeFor, browserToolsForAccessMode, builtinBrowserTips, hasBuilt
 import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOLS_PROMPT_HINT, runDeviceTool } from './device-tools.js';
 import { agentDeviceAccessAllowed, getCachedDeviceSettings } from './devices/device-settings.js';
 import { THEME_TOOLS_PROMPT_HINT, themeMcpToolDefinitions, runThemeTool } from './theme-tools.js';
+import { APP_TOOLS_PROMPT_HINT, appMcpToolDefinitions, runAppTool } from './app-tools.js';
+import { zodForJsonSchema, zodShapeForInputSchema } from './json-schema-zod.js';
 import { VISUAL_MAX_HEIGHT, VISUAL_MIN_HEIGHT, VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, runVisualTool } from './visual-tools.js';
 import {
   USER_ACTION_CHECK_MAX_CHARS,
@@ -575,23 +578,18 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       ...(claudeDeviceToolsEnabled(session) ? createClaudeDeviceTools(tool, z, session) : []),
       ...(session.machinesEnabled ? claudeMachineTools(tool, z, session) : []),
       ...claudeThemeTools(tool, z, session),
+      ...claudeAppTools(tool, z, session),
     ],
   });
 
 // Theme tools (theme-tools.js holds the schemas; the bridge lists the same
 // ones through `__tools`): an agent restyles Durango Code live.
 const claudeThemeTools = (tool, z, session) =>
-  themeMcpToolDefinitions(session.accessMode).map((definition) => {
-    const required = new Set(definition.inputSchema.required ?? []);
-    const shape = {};
-    for (const [key, property] of Object.entries(definition.inputSchema.properties ?? {})) {
-      const type = zodForThemeSchema(z, property);
-      shape[key] = required.has(key) ? type : type.optional();
-    }
-    return tool(
+  themeMcpToolDefinitions(session.accessMode).map((definition) =>
+    tool(
       definition.name,
       definition.description,
-      shape,
+      zodShapeForInputSchema(z, definition.inputSchema),
       async (args, extra) =>
         durangoToolResultWithImages(
           await runThemeTool(definition.name, args, {
@@ -603,30 +601,28 @@ const claudeThemeTools = (tool, z, session) =>
           })
         ),
       definition.annotations ? { annotations: definition.annotations } : undefined
-    );
-  });
+    )
+  );
 
-// zodForJsonSchema plus the object shapes the theme tools use (nested
-// objects, string maps, nullable unions).
-const zodForThemeSchema = (z, schema) => {
-  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
-  const nullable = types.includes('null');
-  const main = types.find((type) => type !== 'null');
-  let type;
-  if (main === 'object' && schema.properties) {
-    const shape = {};
-    for (const [key, property] of Object.entries(schema.properties)) {
-      shape[key] = zodForThemeSchema(z, property).optional();
-    }
-    type = z.object(shape);
-  } else if (main === 'object') {
-    type = z.record(z.string(), z.string().nullable());
-  } else {
-    type = zodForJsonSchema(z, { ...schema, type: main, description: undefined });
-  }
-  if (nullable) type = type.nullable();
-  return schema.description ? type.describe(schema.description) : type;
-};
+// Using Durango Code's own window (app-tools.js holds the schemas; the bridge
+// lists the same ones through `__tools`).
+const claudeAppTools = (tool, z, session) =>
+  appMcpToolDefinitions(session.accessMode).map((definition) =>
+    tool(
+      definition.name,
+      definition.description,
+      zodShapeForInputSchema(z, definition.inputSchema),
+      async (args) =>
+        durangoToolResultWithImages(
+          await runAppTool(definition.name, args, {
+            getSender: () => session.sender,
+            threadId: session.threadId,
+            accessMode: session.accessMode,
+          })
+        ),
+      definition.annotations ? { annotations: definition.annotations } : undefined
+    )
+  );
 
 // The user's other machines (machine-tools.js holds the schemas; the bridge
 // lists the same ones), registered while remote control can reach one.
@@ -747,19 +743,6 @@ const durangoToolResultWithImages = ({ ok, text, images }) => ({
   ...(ok ? {} : { isError: true }),
 });
 
-// JSON schema property (the subset browser-tools.js uses) -> zod.
-const zodForJsonSchema = (z, schema) => {
-  let type;
-  if (schema.type === 'string') type = Array.isArray(schema.enum) ? z.enum(schema.enum) : z.string();
-  else if (schema.type === 'integer' || schema.type === 'number') {
-    type = schema.type === 'integer' ? z.number().int() : z.number();
-    if (typeof schema.minimum === 'number') type = type.min(schema.minimum);
-    if (typeof schema.maximum === 'number') type = type.max(schema.maximum);
-  } else if (schema.type === 'boolean') type = z.boolean();
-  else if (schema.type === 'array') type = z.array(zodForJsonSchema(z, schema.items ?? { type: 'string' }));
-  else type = z.any();
-  return schema.description ? type.describe(schema.description) : type;
-};
 
 // Claude Task subagents share their parent's session; the PreToolUse hook
 // below stamps their agent id into `_agent` so each gets its own tabs.
@@ -2343,6 +2326,7 @@ export const createClaudeSdkSession = ({
               ...[
                 ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode),
                 ...orionThemeToolNamesForAccessMode(sdkOptions.accessMode),
+                ...orionAppToolNamesForAccessMode(sdkOptions.accessMode),
                 ...(devicesEnabled ? orionDeviceToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 ...(machinesEnabled ? orionMachineToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 'wait_for_background_tasks',
@@ -2390,6 +2374,7 @@ export const createClaudeSdkSession = ({
             CLAUDE_SECRET_TIP,
             CLAUDE_VISUALS_TIP,
             THEME_TOOLS_PROMPT_HINT,
+            APP_TOOLS_PROMPT_HINT,
             ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
             ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
             ...(devicesEnabled ? [DEVICE_TOOLS_PROMPT_HINT] : []),

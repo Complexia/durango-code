@@ -127,7 +127,7 @@ try {
 
   // --- Server instructions (Codex): one line on what orion is for ---------------------------
   const fullInit = await full.call('initialize', { protocolVersion: '2025-06-18' });
-  assert.match(fullInit.result.instructions, /^Durango Code, the app running you: subagents on other models, other threads, Durango Chat, user memory, user actions, secrets, HTML visuals, built-in browser, simulators, other machines, app theme, connected apps\.$/);
+  assert.match(fullInit.result.instructions, /^Durango Code, the app running you: subagents on other models, other threads, Durango Chat, user memory, user actions, secrets, HTML visuals, built-in browser, simulators, other machines, app theme, app window, connected apps\.$/);
   assert.ok(fullInit.result.instructions.length <= 246, 'fits the namespace line Codex shows (250 characters)');
   const compactInit = await compact.call('initialize', { protocolVersion: '2025-06-18' });
   assert.equal(compactInit.result.instructions, undefined, 'only with --instructions (fx repeats it on every tool)');
@@ -135,7 +135,7 @@ try {
   // --- Full list: unchanged for providers that defer natively --------------------------------
   const fullTools = (await full.call('tools/list')).result.tools;
   const fullNames = fullTools.map((tool) => tool.name);
-  for (const name of ['spawn_subagent', 'request_secret', 'show_html', 'device_screenshot', 'browser_open', 'machine_exec', 'set_app_theme', 'load_tools', 'call_app_tool']) {
+  for (const name of ['spawn_subagent', 'request_secret', 'show_html', 'device_screenshot', 'browser_open', 'machine_exec', 'set_app_theme', 'app_snapshot', 'app_click', 'load_tools', 'call_app_tool']) {
     assert.ok(fullNames.includes(name), `the run lists ${name}`);
   }
   assert.equal(fullNames.filter((name) => name === 'load_tools').length, 1);
