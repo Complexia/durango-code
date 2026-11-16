@@ -27,13 +27,16 @@
 // "Stock" is no theme at all: the app's own stylesheet, untouched. It is
 // always available and is what every reset returns to.
 
+import { T3_THEME_ROLES, t3CompatCss } from './t3-theme-format.js';
+
 export const STOCK_THEME_ID = 'stock';
 export const THEME_FORMAT_VERSION = 1;
 
 export const THEME_LIMITS = Object.freeze({
   name: 60,
   description: 240,
-  css: 60_000,
+  // Room for a theme imported from T3 Code (50,000 characters there) after its hooks are rewritten.
+  css: 160_000,
   html: 200_000,
   tokenValue: 400,
   values: 24,
@@ -596,7 +599,94 @@ export const sanitizeTheme = (input) => {
   if (controls.length) theme.controls = controls;
   const css = sanitizeThemeCss(input.css);
   if (css.trim()) theme.css = css;
+  const published = sanitizeCommunityRef(input.published);
+  if (published && !theme.builtIn) {
+    theme.published = { slug: published.slug, version: published.version, listed: input.published.listed === true };
+    if (Number.isInteger(input.published.revision) && input.published.revision > 0) theme.published.revision = input.published.revision;
+    if (typeof input.published.fingerprint === 'string' && /^[a-z0-9]{1,16}$/.test(input.published.fingerprint)) {
+      theme.published.fingerprint = input.published.fingerprint;
+    }
+  }
+  // Imported from T3 Code: its colors for every T3 role (t3-theme-format.js),
+  // so its CSS finds the variables it expects.
+  if (input.compat?.t3?.colors && typeof input.compat.t3.colors === 'object') {
+    const colors = {};
+    for (const role of T3_THEME_ROLES) {
+      const value = sanitizeTokenValue(input.compat.t3.colors[role]);
+      if (value) colors[role] = value;
+    }
+    if (Object.keys(colors).length) {
+      theme.compat = { t3: { colors } };
+      // The file's other appearance (T3 Code's variants), kept for export.
+      const variants = {};
+      for (const look of THEME_APPEARANCES) {
+        const raw = input.compat.t3.variants?.[look];
+        if (look === theme.appearance || !raw || typeof raw !== 'object') continue;
+        const roles = {};
+        for (const role of T3_THEME_ROLES) {
+          const value = sanitizeTokenValue(raw[role]);
+          if (value) roles[role] = value;
+        }
+        if (Object.keys(roles).length) variants[look] = roles;
+      }
+      if (Object.keys(variants).length) theme.compat.t3.variants = variants;
+    }
+  }
+  const origin = sanitizeCommunityRef(input.origin);
+  if (origin && !theme.builtIn) {
+    theme.origin = origin;
+    const author = cleanText(input.origin.author, 40);
+    if (author) theme.origin.author = author;
+    const originName = cleanText(input.origin.name, THEME_LIMITS.name);
+    if (originName) theme.origin.name = originName;
+  }
   return theme;
+};
+
+// Community themes (durango.sh/code/themes): `published` = this theme is the
+// user's own shared one ({ slug, version, listed, revision: the local revision
+// that was shared }); `origin` = it was installed from (or remixes) a shared
+// theme ({ slug, version, author?, name? }).
+const COMMUNITY_SLUG_PATTERN = /^[a-z0-9]{10}$/;
+
+// What sharing sends: the theme without fields that describe this computer's copy.
+export const THEME_LOCAL_FIELDS = Object.freeze(['id', 'threadId', 'saved', 'builtIn', 'revision', 'createdAt', 'updatedAt', 'published', 'origin']);
+export const shareableTheme = (theme) => {
+  const out = { ...(theme ?? {}) };
+  for (const field of THEME_LOCAL_FIELDS) delete out[field];
+  return out;
+};
+
+const stableJson = (value) => {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().filter((key) => value[key] !== undefined).map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+};
+
+/**
+ * A short hash of what sharing would send (name and description included), to
+ * tell whether a shared theme changed since (a rename is not a new revision).
+ * Same in main and renderer; not cryptographic.
+ */
+export const themeShareFingerprint = (theme) => {
+  const text = stableJson(shareableTheme(theme));
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+};
+export const isCommunityThemeSlug = (value) => typeof value === 'string' && COMMUNITY_SLUG_PATTERN.test(value);
+const sanitizeCommunityRef = (input) => {
+  if (!input || typeof input !== 'object' || !isCommunityThemeSlug(input.slug)) return null;
+  return { slug: input.slug, version: Number.isInteger(input.version) && input.version > 0 ? input.version : 1 };
 };
 
 // --- CSS ------------------------------------------------------------------------
@@ -663,6 +753,7 @@ export const themeToCss = (input, { assetUrl = () => '' } = {}) => {
   declarations.push(`--theme-panel-blur: ${theme.panelBlur ?? 0}px;`);
   if (theme.appearance === 'light') declarations.push('color-scheme: light;');
   const parts = [`:root {\n  ${declarations.join('\n  ')}\n}`];
+  if (theme.compat?.t3) parts.push(t3CompatCss(theme.compat.t3.colors, theme.appearance));
   if (theme.backdrop?.type === 'css') {
     parts.push(`.theme-backdrop-css { background: ${theme.backdrop.css}; }`);
   }

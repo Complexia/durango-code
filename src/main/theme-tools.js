@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
   BACKDROP_TYPES,
   STOCK_THEME_ID,
@@ -14,6 +16,8 @@ import {
   themeSummary,
 } from '../ui-themes.js';
 import { DurangoError } from './durango-client.js';
+import { browseCommunityThemes, installCommunityTheme, shareTheme, unshareTheme } from './theme-community.js';
+import { exportThemeToT3, importT3Theme, t3FileName } from './theme-t3.js';
 import { backdropVideoNote } from './video-probe.js';
 import {
   canUndoTheme,
@@ -127,6 +131,8 @@ Pass screenshot: true to see the result. Keep each html page under ${Math.round(
 - animate (animate: true/false): Settings' "Animated backdrops and effects" for the whole app (false shows still frames and hides overlays).
 - celebrate: play what the theme in use does when an agent finishes a turn ("Preview celebration").
 - measure (seconds, default 5): CPU of each Durango Code process (main, GPU, window, scene frames) over that time, to check what a theme costs. Includes the work of agents running at the time, including you.
+- Community themes (durango.sh/code/themes): browse (query, optional) lists shared themes; install (link: a theme's link or slug) downloads one, saves it and uses it. share (theme_id, listed) publishes a user theme when the user asks to share it and returns its link (listed: true puts it in the public gallery; otherwise only people with the link see it); sharing it again updates the shared copy. unshare (theme_id) removes it from durango.sh.
+- T3 Code themes: import_t3 (link: a T3 Code theme file's path, URL or JSON; appearance: light or dark to take a file's other variant) adds and applies it (its colors and CSS; T3 Code's selectors are mapped to ours). export_t3 (theme_id, path: where to save, default ~/Downloads) writes a file T3 Code imports (Settings → Appearance → Import, or "t3 theme set <file>"): colors, CSS and the backdrop picture when it fits; scenes, video and controls stay here.
 theme_id also takes a theme's exact name when only one theme has it. To restyle a theme, use set_app_theme (with theme_id to change one the user already has).`,
   generate_theme_media: `Generate a backdrop for Durango Code's theme with Durango inference (image or looping video models, billed to the user's Durango credits) and apply it to this thread's working theme. Use it when the user wants an AI-made wallpaper, scene, or animated backdrop for the app ("a misty forest at dawn behind everything"). Image takes a few seconds to a minute; video takes one to several minutes (you wait here). Write a vivid prompt for a backdrop: wide, atmospheric, low-detail center with interest at the edges, no text; say "seamless loop, slow subtle motion" for video. With variant_when: {value: x} (a value the theme declares, e.g. {time: "night"}) the media becomes a backdrop variant shown while the values match, instead of replacing the backdrop: keep the same composition as the main picture so the switch reads as the same place. Afterwards tune tokens (accent, surfaces) with set_app_theme so the palette matches the picture, and check with screenshot: true.`,
 });
@@ -276,13 +282,18 @@ export const THEME_TOOL_INPUT_SCHEMAS = Object.freeze({
     properties: {
       action: {
         type: 'string',
-        enum: ['list', 'apply', 'stock', 'save', 'unsave', 'rename', 'duplicate', 'delete', 'undo', 'animate', 'celebrate', 'measure'],
+        enum: ['list', 'apply', 'stock', 'save', 'unsave', 'rename', 'duplicate', 'delete', 'undo', 'animate', 'celebrate', 'measure', 'browse', 'install', 'share', 'unshare', 'import_t3', 'export_t3'],
         description: 'What to do (see the description).',
       },
       theme_id: { type: 'string', description: 'The theme: its id, or its exact name if only one theme has it.' },
       name: { type: 'string', description: 'rename: the new name; duplicate: the copy\'s name (default "<name> copy").' },
       animate: { type: 'boolean', description: 'animate: true plays animated backdrops and effects, false shows still frames.' },
       seconds: { type: 'integer', minimum: 2, maximum: 15, description: 'measure: how long to sample (default 5).' },
+      listed: { type: 'boolean', description: 'share: true lists it in the public gallery; false keeps it link-only (default: as it was, else link-only).' },
+      link: { type: 'string', description: 'install: a community theme link (durango.sh/code/themes/…) or its slug. import_t3: a T3 Code theme file (absolute path, URL or JSON text).' },
+      path: { type: 'string', description: 'export_t3: absolute path of the .json file to write (default ~/Downloads/<theme id>.json; T3 Code takes the theme id from the file name).' },
+      query: { type: 'string', description: 'browse: words to search names and descriptions for.' },
+      appearance: { type: 'string', enum: ['dark', 'light'], description: 'import_t3: which of the file\'s appearances to import (default: its own).' },
     },
     required: ['action'],
     additionalProperties: false,
@@ -901,6 +912,8 @@ const themeLine = (theme, { activeId, threadId }) =>
     theme.id === activeId ? 'IN USE' : null,
     theme.threadId && theme.threadId === threadId ? "this thread's working theme" : null,
     theme.builtIn ? null : `revision ${theme.revision ?? 1}`,
+    theme.published ? `shared${theme.published.listed ? ' in the gallery' : ' by link'}: durango.sh/code/themes/${theme.published.slug}` : null,
+    theme.origin ? `from community theme ${theme.origin.slug}${theme.origin.author ? ` by ${theme.origin.author}` : ''}` : null,
     theme.description ? theme.description : null,
   ]
     .filter(Boolean)
@@ -977,8 +990,67 @@ const manageAppThemes = async (args, context) => {
     }
     case 'measure':
       return measureCost(args.seconds, context);
+    case 'browse': {
+      const found = await browseCommunityThemes({ q: typeof args.query === 'string' ? args.query : undefined, limit: 20 });
+      if (!found.length) return { ok: true, text: args.query ? `No community themes match "${args.query}".` : 'No community themes yet.' };
+      return {
+        ok: true,
+        text: [
+          `Community themes (install with action: "install", link: <slug>):`,
+          ...found.map((entry) => `- "${entry.name}" (${entry.slug})${entry.author ? ` by ${entry.author}` : ''} · ${entry.installs} installs${entry.description ? ` · ${entry.description}` : ''}`),
+        ].join('\n'),
+      };
+    }
+    case 'install': {
+      if (typeof args.link !== 'string' || !args.link.trim()) return fail('install needs link: a community theme link or slug (see browse).');
+      const { theme, alreadyInstalled } = await installCommunityTheme(args.link);
+      await card(theme, alreadyInstalled ? 'Applied' : 'Installed');
+      return {
+        ok: true,
+        text: [
+          alreadyInstalled
+            ? `This computer already had "${theme.name}" (${theme.id}); it is in use now.`
+            : `Installed "${theme.name}" (${theme.id}) and applied it. It is saved in Settings → Themes; change it with set_app_theme theme_id: "${theme.id}".`,
+          performanceNotes(theme),
+        ].filter(Boolean).join('\n'),
+      };
+    }
+    case 'share': {
+      if (context.accessMode === 'read-only') return fail('Sharing publishes the theme on durango.sh, so it is unavailable in Read only access mode.');
+      const found = await findTheme(args.theme_id);
+      const { theme, shared } = await shareTheme(found.id, { listed: typeof args.listed === 'boolean' ? args.listed : undefined });
+      return {
+        ok: true,
+        text: `Shared "${theme.name}": ${shared.url} (${shared.listed ? 'listed in the public gallery' : 'link only: not in the gallery'}, version ${shared.version}). Anyone with the link can install it in Durango Code.`,
+      };
+    }
+    case 'unshare': {
+      if (context.accessMode === 'read-only') return fail('Unsharing changes durango.sh, so it is unavailable in Read only access mode.');
+      const found = await findTheme(args.theme_id);
+      await unshareTheme(found.id);
+      return { ok: true, text: `"${found.name}" is no longer shared; its link stops working. Copies people installed stay theirs.` };
+    }
+    case 'import_t3': {
+      if (typeof args.link !== 'string' || !args.link.trim()) return fail('import_t3 needs link: a T3 Code theme file\'s absolute path, URL or JSON.');
+      const { theme } = await importT3Theme(args.link, { appearance: args.appearance });
+      await card(theme, 'Imported from T3 Code');
+      return {
+        ok: true,
+        text: [`Imported "${theme.name}" (${theme.id}) from T3 Code and applied it. It is saved in Settings → Themes; change it with set_app_theme theme_id: "${theme.id}".`, performanceNotes(theme)].filter(Boolean).join('\n'),
+      };
+    }
+    case 'export_t3': {
+      if (context.accessMode === 'read-only') return fail('Exporting writes a file, so it is unavailable in Read only access mode.');
+      const found = await findTheme(args.theme_id);
+      const target = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : path.join(os.homedir(), 'Downloads', t3FileName(found.name));
+      const { filePath, notes } = await exportThemeToT3(found.id, target);
+      return {
+        ok: true,
+        text: [`Wrote "${found.name}" for T3 Code to ${filePath}. In T3 Code: Settings → Appearance → Import (drop the file), or run \`t3 theme set ${filePath}\`.`, ...notes].join('\n'),
+      };
+    }
     default:
-      return fail('manage_app_themes needs action: list, apply, stock, save, unsave, rename, duplicate, delete, undo, animate, celebrate or measure.');
+      return fail('manage_app_themes needs action: list, apply, stock, save, unsave, rename, duplicate, delete, undo, animate, celebrate, measure, browse, install, share, unshare, import_t3 or export_t3.');
   }
 };
 

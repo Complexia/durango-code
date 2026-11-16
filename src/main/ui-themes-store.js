@@ -306,7 +306,8 @@ export const updateTheme = ({ id, patch, threadId, base, activate = true, saved,
   if (current && !claim && threadId && current.threadId && current.threadId !== threadId) {
     throw new Error('Another thread took this theme over while this change was in progress; nothing changed. Run the call again to start a new working theme, or pass theme_id to take it back.');
   }
-  const start = current ?? (base ? { ...base, id: undefined, builtIn: false, saved: false, revision: 0, createdAt: undefined } : null);
+  // A theme started from another is a new theme: not the shared one (`published`).
+  const start = current ?? (base ? { ...base, id: undefined, builtIn: false, saved: false, revision: 0, createdAt: undefined, published: undefined } : null);
   const themeId = current?.id ?? newThemeId();
   const { theme, ignored } = mergeTheme(start, patch ?? {}, { id: themeId, threadId: (claim ? threadId : current?.threadId) ?? threadId });
   if (!theme) throw new Error('The theme could not be built from those values.');
@@ -368,6 +369,8 @@ export const duplicateTheme = (id, { name } = {}) => exclusive(async () => {
     builtIn: false,
     saved: true,
     threadId: undefined,
+    // The copy is not the theme the user shared; where it came from (origin) stays.
+    published: undefined,
     name: name ?? `${source.name} copy`,
     createdAt: now,
     updatedAt: now,
@@ -409,6 +412,9 @@ export const undoTheme = (id) => exclusive(async () => {
     saved: current.saved,
     // Ownership follows the theme now, not the revision (a thread that took it over keeps it).
     threadId: current.threadId,
+    // So do the community links (sharing is not an edit).
+    published: current.published,
+    origin: current.origin,
     name: previous.name,
     revision: (current.revision ?? 1) + 1,
     updatedAt: new Date().toISOString(),
@@ -432,6 +438,59 @@ export const canUndoTheme = async (id) => {
   const history = await readJson(path.join(themeDir(id), HISTORY_FILE));
   return Array.isArray(history) && history.length > 0;
 };
+
+/** Remember (or forget, null) that the user shared this theme on durango.sh. Not an undo step. */
+export const setThemePublished = (id, published) => exclusive(async () => {
+  await ensureLoaded();
+  const theme = themes.get(id);
+  if (!theme) throw new Error('That theme no longer exists.');
+  const next = sanitizeTheme({ ...theme, published: published ?? undefined });
+  await storeTheme(next);
+  notify();
+  return next;
+});
+
+/**
+ * Add a community theme: `theme` is the shared manifest, `files` its assets
+ * ({ name → bytes }, names already checked), `origin` where it came from. It is
+ * saved (in the gallery) under a new id, and applied unless `activate` is false.
+ */
+export const installTheme = ({ theme: manifest, files, origin, activate = true }) => exclusive(async () => {
+  await ensureLoaded();
+  const id = newThemeId();
+  const now = new Date().toISOString();
+  const theme = sanitizeTheme({
+    ...manifest,
+    id,
+    builtIn: false,
+    saved: true,
+    threadId: undefined,
+    published: undefined,
+    origin,
+    revision: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+  if (!theme) throw new Error('That is not a Durango Code theme.');
+  await fs.mkdir(themeDir(id), { recursive: true });
+  try {
+    for (const [name, bytes] of Object.entries(files ?? {})) {
+      if (!isThemeAssetName(name)) continue;
+      await fs.writeFile(path.join(themeDir(id), name), bytes);
+    }
+    await storeTheme(theme);
+  } catch (error) {
+    themes.delete(id);
+    await fs.rm(themeDir(id), { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
+  if (activate) {
+    activeId = id;
+    await persistState();
+  }
+  notify();
+  return theme;
+});
 
 const extensionFor = (mimeOrExt) => {
   const value = String(mimeOrExt ?? '').toLowerCase().replace(/^\./, '');

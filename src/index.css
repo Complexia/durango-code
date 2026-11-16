@@ -9506,3 +9506,30 @@ html.theme-static-frost .thread-pane-header {
   background: var(--accent-strong);
   color: var(--on-accent);
 }
+
+/* Light themes (html.theme-light, ThemeLayer): parts the stock look paints
+   with fixed dark values follow the theme's tokens instead. A light theme
+   imported from T3 Code (t3-themes.js) showed these first: grey reply text
+   and a sidebar fading in from near-black. */
+html.theme-light .markdown-content {
+  color: color-mix(in srgb, var(--text-primary) 92%, var(--bg-base));
+}
+html.theme-light .agents-sidebar {
+  background: var(--bg-raised);
+}
+html.theme-light .sidebar-primary-actions {
+  background: linear-gradient(180deg, var(--bg-raised) 72%, transparent);
+}
+/* The thread sidebar colors its text with Tailwind's fixed neutrals (made for
+   the dark stock look) over the theme's own background, so in a light theme
+   that text takes the theme's text tokens. Only there, and not in its menus,
+   which keep a fixed dark fill (as do menus and badges elsewhere). */
+html.theme-light .agents-sidebar :is(.text-neutral-50, .text-neutral-100, .text-neutral-200, .text-zinc-100, .text-zinc-200):not([role="menu"] *) {
+  color: var(--text-primary);
+}
+html.theme-light .agents-sidebar :is(.text-neutral-300, .text-neutral-400, .text-zinc-300, .text-zinc-400):not([role="menu"] *) {
+  color: var(--text-secondary);
+}
+html.theme-light .agents-sidebar :is(.text-neutral-500, .text-neutral-600, .text-zinc-500, .text-zinc-600):not([role="menu"] *) {
+  color: var(--text-muted);
+}

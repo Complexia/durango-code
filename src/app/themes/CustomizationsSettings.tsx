@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Check, Copy, MessageSquare, MoreHorizontal, Pencil, PartyPopper, RotateCcw, Sparkles, Trash2, Wand2 } from 'lucide-react';
+import { Check, Copy, FileDown, MessageSquare, MoreHorizontal, Pencil, PartyPopper, RotateCcw, Share2, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import { toast } from 'sonner';
 import type { UiTheme } from '../../ui-themes.js';
+import { CommunityThemesSection, ShareThemeDialog } from './CommunityThemes';
 import { ThemeControlsSettings } from './ThemeControlsSettings';
 import { ThemePreview } from './ThemePreview';
 import { previewThemeCelebration } from './ThemeLayer';
@@ -50,11 +51,30 @@ type Props = {
   hasThread?: (threadId: string) => boolean;
 };
 
+/** Saves a theme as a T3 Code theme file (theme-t3.js) and says how to use it there. */
+const exportForT3 = async (theme: UiTheme) => {
+  const result = await window.orion?.themes?.exportT3?.(theme.id);
+  if (!result) return;
+  if (!result.ok) {
+    toast.error(result.error);
+    return;
+  }
+  if (!result.value) return;
+  toast.success(`Saved “${theme.name}” for T3 Code`, {
+    description: [
+      'In T3 Code: Settings → Appearance → Import, and drop the file in.',
+      ...result.value.notes,
+    ].join(' '),
+    duration: 9000,
+  });
+};
+
 const ThemeMenu: React.FC<{
   theme: UiTheme;
   onRename: () => void;
   onOpenThread?: () => void;
-}> = ({ theme, onRename, onOpenThread }) => {
+  onShare?: () => void;
+}> = ({ theme, onRename, onOpenThread, onShare }) => {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -102,6 +122,16 @@ const ThemeMenu: React.FC<{
           {!theme.builtIn && (
             <button type="button" role="menuitem" className={item} onClick={() => { setOpen(false); onRename(); }}>
               <Pencil size={13} /> Rename
+            </button>
+          )}
+          {!theme.builtIn && onShare && (
+            <button type="button" role="menuitem" className={item} onClick={() => { setOpen(false); onShare(); }}>
+              <Share2 size={13} /> {theme.published ? 'Shared…' : 'Share…'}
+            </button>
+          )}
+          {window.orion?.themes?.exportT3 && (
+            <button type="button" role="menuitem" className={item} onClick={() => { setOpen(false); void exportForT3(theme); }}>
+              <FileDown size={13} /> Export for T3 Code…
             </button>
           )}
           <button type="button" role="menuitem" className={item} onClick={() => void act((api) => api.duplicate(theme.id), `Made a copy of “${theme.name}”`)}>
@@ -213,6 +243,7 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
   const setAnimateInBackground = useMotionSettings((state) => state.setAnimateInBackground);
   const [idea, setIdea] = useState('');
   const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [sharingId, setSharingId] = useState<string | null>(null);
 
   useEffect(() => startThemeSync(), []);
 
@@ -221,6 +252,7 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
   const builtIns = themes.filter((theme) => theme.builtIn);
   const saved = themes.filter((theme) => !theme.builtIn && theme.saved).reverse();
   const activeTheme = themes.find((theme) => theme.id === activeId) ?? null;
+  const sharingTheme = sharingId ? themes.find((theme) => theme.id === sharingId && !theme.builtIn) ?? null : null;
   const activeDraft = themes.find((theme) => theme.id === activeId && !theme.builtIn && !theme.saved) ?? null;
   const isMac = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform);
 
@@ -254,6 +286,7 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
         <ThemeMenu
           theme={theme}
           onRename={() => setRenamingId(theme.id)}
+          onShare={window.orion?.themes?.share ? () => setSharingId(theme.id) : undefined}
           onOpenThread={
             theme.threadId && onOpenThread && (hasThread?.(theme.threadId) ?? true)
               ? () => onOpenThread(theme.threadId as string)
@@ -360,6 +393,8 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
 
       {activeTheme ? <ThemeControlsSettings key={activeTheme.id} theme={activeTheme} /> : null}
 
+      {window.orion?.themes?.openGallery ? <CommunityThemesSection /> : null}
+
       <div className="settings-group-label">Prebuilt</div>
       <div className="grid grid-cols-[repeat(auto-fill,minmax(210px,1fr))] gap-3">
         {builtIns.map((theme) => (
@@ -372,6 +407,8 @@ export const CustomizationsSettings: React.FC<Props> = ({ onCustomizeWithAgent, 
           />
         ))}
       </div>
+
+      {sharingTheme && <ShareThemeDialog key={sharingTheme.id} theme={sharingTheme} onClose={() => setSharingId(null)} />}
 
       <div className="settings-group-label">Effects</div>
       <div className="settings-group">

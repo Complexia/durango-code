@@ -28,6 +28,99 @@ thread then shapes that theme.
 | `src/app/themes/ThemeSceneFrame.tsx` | One sandboxed scene frame (backdrop, overlay or widget): app events in; `durango.set` / `action` / `resize` out. |
 | `src/app/themes/ThemeCard.tsx` | The transcript card: preview, Save toggle, Use, Undo, Back to stock. |
 | `src/app/themes/CustomizationsSettings.tsx` | Settings tab: "Customize with an agent", gallery, effects toggle, celebration preview. |
+| `src/main/theme-community.js` | Community themes: share a theme to durango.sh, install one (see "Sharing"). |
+| `src/t3-theme-format.js`, `src/t3-themes.js`, `src/main/theme-t3.js` | T3 Code themes in and out (see "T3 Code themes"). |
+| `src/app/themes/CommunityThemes.tsx` | The Share dialog (theme ⋯ menu), the install dialog, and Settings → Themes → Community. |
+
+## Sharing (community themes)
+
+People share themes on **durango.sh/code/themes**. The gallery, the theme pages and the shared files
+live on durango.sh, so the app only gains an upload and a download path.
+
+- **Share** (a theme's ⋯ menu → Share…, or `manage_app_themes` `share`). `theme-community.js`:
+  - hashes every file the theme uses (backdrop, poster, variants, `theme-asset()` in its CSS);
+  - asks durango.sh which files it lacks (`POST /api/v1/themes/uploads`);
+  - PUTs those straight to storage with presigned URLs that sign the exact size and type;
+  - publishes the theme without its local fields (`POST /api/v1/themes`). The fields left out are
+    `id`, `threadId`, `saved`, `revision`, the dates, `published` and `origin`.
+
+  It also uploads a ~960px JPEG of the backdrop (`community-thumbnail.jpg`, made with `nativeImage`)
+  for the gallery. The theme remembers `published: { slug, version, listed, revision }`. Sharing it
+  again updates the same link and bumps the version. The dialog offers Update when the theme's
+  revision moved past the shared one. Themes are link-only unless "List in the community gallery"
+  is on. Stop sharing deletes the shared copy; installed copies stay with the people who have them.
+  Sharing needs a signed-in Durango account (the desktop's `code`-scoped key) and is refused in Read
+  only mode.
+- **Install.** A theme page's Install button opens `orion://theme/install?slug=<slug>`. `main.js`
+  keeps the link until the renderer takes it, and the install dialog asks first. Pasting a link in
+  Settings → Themes → Community, or `manage_app_themes` `install`, works too. The app:
+  - reads `GET /api/v1/themes/<slug>` (public, so no sign-in is needed);
+  - downloads each file the theme uses and checks its size and sha256;
+  - adds the theme through the store as a saved theme with `origin: { slug, version, author, name }`,
+    sanitized like any theme, and applies it.
+
+  A copy of the same version already on this computer is applied instead of installed twice.
+  Installs are counted once per signed-in account.
+- **Remix.** An installed theme is a normal saved theme, and agents change it like any other.
+  Sharing it sends `remixedFrom` with the original's slug, and the new theme page links back to it.
+- **Limits:** 25 MB per file, 60 MB per theme, 24 files, and a 512 KB theme object.
+- **Web previews.** durango.sh never applies a shared theme's CSS. Its pages draw a sketch of the
+  app with the theme's colors (only plain color and gradient values pass) over its thumbnail, video
+  or HTML scene. Scenes run in `sandbox="allow-scripts"` frames with the same no-network CSP as the
+  app: always on a theme page, and on hover in the gallery.
+- **Moderation.** Signed-in viewers can report a theme. Admins can hide a theme from its page, which
+  removes it from the gallery and its link.
+
+## T3 Code themes
+
+[T3 Code](https://github.com/pingdotgg/t3code) themes work in Durango Code, and ours work in T3 Code. A T3
+Code theme is JSON: a name, an appearance, colors for its 61 roles (or only a `canvas` and an `accent`),
+optional light/dark `variants`, and up to 50,000 characters of CSS. That CSS is written against T3 Code's
+stable hooks (`[data-slot="sidebar"]`, `[data-user-message-bubble]`, …, `THEME_CSS_HOOKS` in its
+`packages/shared/src/themeCss.ts`) and its variables (`--app-theme-<role>`, and shadcn ones such as
+`--background` and `--accent`). It can use `:has()`, `@keyframes` and `data:` pictures, but no scripts.
+`src/t3-theme-format.js` holds T3 Code's roles, variable names, stock palettes and aliases (copied from
+its source, MIT).
+
+- **Import** (Settings → Themes → Community → Import file…, a `.json` link in "Install from a link",
+  or `manage_app_themes import_t3`). `t3ThemeToDurango`:
+  - maps the roles onto our tokens and keeps all of them as `compat.t3.colors`;
+  - while the theme is on, `themeToCss` defines every `--app-theme-*` (for roles we have, our token
+    with the theme's color as fallback, so later edits follow) and T3 Code's aliases as `--t3-*`;
+  - rewrites the CSS:
+    - each T3 hook becomes `:is(<our element>, [data-t3-hook="…"])`; the marker never matches and
+      lets export restore the exact hook, and hooks with no counterpart only keep the marker;
+    - `.dark` follows the theme's appearance;
+    - T3's shadcn variable names get the `--t3-` prefix, because ours share names (`--accent`,
+      `--warning`).
+  - Selectors that only exist in T3 Code stay and never match.
+  - Strings, `url()` and comments are never rewritten.
+  - CSS that would exceed a theme's 160,000 characters once mapped is refused, not cut off.
+  - A file's light/dark `variants` are kept in `compat.t3.variants`. The install dialog (or
+    `import_t3 appearance`) can import the other appearance; export writes the other one back as a
+    variant.
+- **Export** (a theme's ⋯ menu → Export for T3 Code…, `manage_app_themes export_t3`, and every share,
+  which durango.sh offers as "Download for T3 Code"). `durangoThemeToT3`:
+  - fills every role from our tokens. An imported theme keeps its own colors unless the token they
+    follow changed, so import → export gives back the same file.
+  - rewrites the CSS:
+    - our classes become T3's hooks;
+    - our variables become `--dc-*`, defined at the top from the theme's values or the matching T3
+      role;
+    - the theme's controls take their defaults (`[data-tv-x="default"]` always matches, other values
+      never);
+    - `theme-asset()` becomes `none`.
+  - embeds the backdrop picture as a JPEG `data:` URL (`nativeImage`, the largest that fits; it's
+    left out if it can't fit).
+  - Scenes, video and controls stay in Durango Code; the export says so.
+  - Never overwrites a file that isn't a T3 theme unless the user chose it in the save dialog.
+  - Not available in Read only mode.
+  - The file is named after its id (`dc-<name>.json`) because `t3 theme set <file>` takes the id
+    from the file name. It passes T3 Code's checks: version 1, id pattern, name ≤ 48, literal colors,
+    CSS ≤ 50,000 and T3's no-remote-files check.
+- **Checked against T3 Code itself** (nightly 0.1.10-nightly.20261116):
+  - `t3 theme set` accepted an exported Snowfall Pines and showed its colors and wallpaper;
+  - a T3 theme file round-trips with identical colors and CSS (`bun run test:t3-themes`).
 
 ## Values and controls
 
@@ -128,5 +221,5 @@ scenes) play:
 
 ## Tests
 
-`bun run test:ui-themes` (format, built-ins, store, tools) and `bun run test:durango-tools` (Claude and
+`bun run test:ui-themes` (format, built-ins, store, tools), `bun run test:theme-community` (share and install against a fake durango.sh) and `bun run test:durango-tools` (Claude and
 bridge schemas stay in step).

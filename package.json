@@ -55,6 +55,8 @@
     "test:html-visuals": "bun scripts/test-html-visuals.tsx",
     "test:steered-runs": "bun scripts/test-steered-runs.tsx",
     "test:ui-themes": "node --no-warnings scripts/test-ui-themes.mjs",
+    "test:theme-community": "node --no-warnings scripts/test-theme-community.mjs",
+    "test:t3-themes": "node --no-warnings scripts/test-t3-themes.mjs",
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
     "test:text-context-menu": "node --no-warnings scripts/test-text-context-menu.mjs",
     "test:renderer-recovery": "node --no-warnings scripts/test-renderer-recovery.mjs",

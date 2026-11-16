@@ -452,6 +452,34 @@ export const createDurangoClient = ({
     }
   };
 
+  // Public /api/v1 reads (community themes): no key, so installing works signed out.
+  const publicGet = async (apiPath, { query, signal } = {}) => {
+    const credential = await credentials.peek().catch(() => null);
+    const url = new URL(`/api/v1${apiPath}`, credential?.baseUrl ?? resolveDurangoBaseUrl(webOrigin()));
+    for (const [key, value] of Object.entries(query ?? {})) {
+      if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value));
+    }
+    let response;
+    try {
+      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      response = await fetchImpl(url, {
+        headers: { accept: 'application/json' },
+        signal: signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal,
+        redirect: 'error',
+      });
+    } catch (error) {
+      throw networkError('Durango', error);
+    }
+    const data = await readJson(response);
+    if (!response.ok) {
+      throw new DurangoError('api', errorMessageFrom(data) || `Durango request failed (${response.status}).`, {
+        status: response.status,
+        apiCode: errorCodeFrom(data),
+      });
+    }
+    return data ?? {};
+  };
+
   const taskPath = (taskId) => {
     const id = str(taskId).trim();
     if (!id) throw new DurangoError('api', 'A task id is required.');
@@ -705,6 +733,38 @@ export const createDurangoClient = ({
         data: Buffer.from(await response.arrayBuffer()),
         mimeType: response.headers.get('content-type') || 'application/octet-stream',
       };
+    },
+    // --- Community themes (durango.sh/code/themes, theme-community.js) --------
+    /** `assets: [{ name, sha256, size }]` → `[{ name, sha256, contentType, uploadUrl | null }]`. */
+    async prepareThemeUploads(assets, { signal } = {}) {
+      const data = await request('POST', '/themes/uploads', { body: { assets }, signal });
+      return Array.isArray(data.uploads) ? data.uploads : [];
+    },
+    /** Shares a theme (or updates the shared one: `slug`); resolves its summary. */
+    async publishTheme(body, { signal } = {}) {
+      return request('POST', '/themes', { body, timeout: 60_000, signal });
+    },
+    async setSharedThemeListed(slug, listed) {
+      return request('PATCH', `/themes/${encodeURIComponent(str(slug))}`, { body: { listed: listed === true } });
+    },
+    async deleteSharedTheme(slug) {
+      return request('DELETE', `/themes/${encodeURIComponent(str(slug))}`);
+    },
+    async listOwnSharedThemes() {
+      const data = await request('GET', '/themes/mine');
+      return Array.isArray(data.themes) ? data.themes : [];
+    },
+    /** Counts an install for the signed-in account (once per account). */
+    async recordThemeInstall(slug) {
+      return request('POST', `/themes/${encodeURIComponent(str(slug))}/installs`);
+    },
+    /** A shared theme with its files' download URLs; public, no account needed. */
+    async communityTheme(slug, { signal } = {}) {
+      return publicGet(`/themes/${encodeURIComponent(str(slug))}`, { signal });
+    },
+    /** The public gallery: `{ themes, nextOffset }`. */
+    async communityThemes({ q, sort, limit } = {}, { signal } = {}) {
+      return publicGet('/themes', { query: { q, sort, limit }, signal });
     },
   };
 };

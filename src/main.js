@@ -123,6 +123,7 @@ import {
   configureThemeStore,
   deleteTheme,
   duplicateTheme,
+  getTheme,
   listThemes,
   recordSceneError,
   setVideoPoster,
@@ -139,6 +140,17 @@ import {
 } from './main/ui-themes-store.js';
 import { isThemeAssetName, isVideoAsset } from './ui-themes.js';
 import { setThemeToolsClient, setThemeToolsMetrics } from './main/theme-tools.js';
+import {
+  communityGalleryUrl,
+  configureCommunityThemes,
+  installCommunityTheme,
+  previewCommunityTheme,
+  setSharedThemeListed,
+  shareTheme,
+  themeInstallLinkSlug,
+  unshareTheme,
+} from './main/theme-community.js';
+import { configureT3Themes, exportThemeToT3, importT3Theme, t3FileName } from './main/theme-t3.js';
 import { createBrowserManager } from './main/browser/manager.js';
 import { browserScreenshotsDirectory } from './main/browser/security.js';
 import { browserModeFor, setBrowserManager } from './main/browser-tools.js';
@@ -748,6 +760,34 @@ const durangoClient = durangoMock
 setDurangoToolsClient(durangoClient);
 // generate_theme_media makes theme backdrops with Durango inference.
 setThemeToolsClient(durangoClient);
+// Community themes: share to and install from durango.sh/code/themes.
+// T3 Code exports embed the backdrop as a JPEG data: URL that fits in its
+// 50,000 characters of CSS: the largest size and quality that fits `maxChars`.
+configureT3Themes({
+  picture: (bytes, maxChars) => {
+    const image = nativeImage.createFromBuffer(Buffer.from(bytes));
+    if (image.isEmpty()) return null;
+    const { width } = image.getSize();
+    for (const target of [960, 800, 640, 520, 420, 340]) {
+      const sized = width > target ? image.resize({ width: target, quality: 'good' }) : image;
+      for (const quality of [72, 60, 48, 38]) {
+        const url = `data:image/jpeg;base64,${sized.toJPEG(quality).toString('base64')}`;
+        if (url.length <= maxChars) return url;
+      }
+    }
+    return null;
+  },
+});
+configureCommunityThemes({
+  durangoClient,
+  // A ~960px JPEG of the backdrop for the gallery (the original can be many MB).
+  thumbnail: (bytes) => {
+    const image = nativeImage.createFromBuffer(Buffer.from(bytes));
+    if (image.isEmpty()) return null;
+    const { width } = image.getSize();
+    return (width > 960 ? image.resize({ width: 960, quality: 'good' }) : image).toJPEG(78);
+  },
+});
 // fx's own Vercel AI Gateway key, saved from Settings → Providers → fx. Stored
 // like the Durango key (safeStorage-encrypted in packaged builds) and only
 // handed to fx processes whose route is AI Gateway.
@@ -1089,11 +1129,31 @@ if (process.defaultApp && process.argv.length >= 2) {
   app.setAsDefaultProtocolClient(appProtocol);
 }
 
+// orion://theme/install?slug=<slug> (the Install button on a community theme
+// page): kept until the renderer asks (it may not be loaded yet), then it
+// shows the install dialog; nothing installs without the user's click.
+let pendingThemeInstall = null;
+const handleThemeInstallLink = (rawUrl) => {
+  const slug = themeInstallLinkSlug(rawUrl, appProtocol);
+  if (!slug) return false;
+  pendingThemeInstall = slug;
+  const [window] = BrowserWindow.getAllWindows();
+  if (window && !window.isDestroyed()) {
+    window.webContents.send('themes:installRequest', slug);
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+  }
+  return true;
+};
+
 app.on('second-instance', (_event, argv) => {
   const callbackUrl = argv.find((arg) => isDesktopAuthCallbackUrl(arg));
   if (callbackUrl) {
     void handleDesktopAuthCallback(callbackUrl);
   }
+  const themeLink = argv.find((arg) => themeInstallLinkSlug(arg, appProtocol));
+  if (themeLink) handleThemeInstallLink(themeLink);
 
   const [window] = BrowserWindow.getAllWindows();
   if (window) {
@@ -1104,6 +1164,7 @@ app.on('second-instance', (_event, argv) => {
 
 app.on('open-url', (event, url) => {
   event.preventDefault();
+  if (handleThemeInstallLink(url)) return;
   void handleDesktopAuthCallback(url);
 });
 
@@ -1557,6 +1618,8 @@ app.whenReady().then(async () => {
   getBrowserManagerInstance();
   await remoteControlReady;
 
+  const startupThemeLink = process.argv.find((arg) => themeInstallLinkSlug(arg, appProtocol));
+  if (startupThemeLink) pendingThemeInstall = themeInstallLinkSlug(startupThemeLink, appProtocol);
   const startupAuthUrl = process.argv.find((arg) => isDesktopAuthCallbackUrl(arg));
   if (startupAuthUrl) {
     void handleDesktopAuthCallback(startupAuthUrl);
@@ -1884,6 +1947,48 @@ setThemeToolsMetrics(() =>
 themeIpc('themes:videoForPoster', (id, asset) => videoForPoster(String(id), String(asset)));
 themeIpc('themes:savePoster', (id, asset, data) => setVideoPoster(String(id), String(asset), data));
 ipcMain.on('themes:sceneError', (_event, id, message) => recordSceneError(id, message));
+// Community themes (theme-community.js).
+themeIpc('themes:share', (id, options) => shareTheme(String(id), { listed: typeof options?.listed === 'boolean' ? options.listed : undefined }));
+themeIpc('themes:setShareListed', (id, listed) => setSharedThemeListed(String(id), listed === true));
+themeIpc('themes:unshare', (id) => unshareTheme(String(id)));
+themeIpc('themes:previewCommunity', (slugOrUrl) => previewCommunityTheme(String(slugOrUrl ?? '')));
+themeIpc('themes:installCommunity', (slugOrUrl, options) =>
+  installCommunityTheme(String(slugOrUrl ?? ''), { appearance: options?.appearance === 'light' || options?.appearance === 'dark' ? options.appearance : undefined })
+);
+// T3 Code themes (theme-t3.js): import a file, export one.
+themeIpc('themes:importT3File', async () => {
+  const [window] = BrowserWindow.getAllWindows();
+  const result = await dialog.showOpenDialog(window, {
+    title: 'Import a T3 Code theme',
+    properties: ['openFile'],
+    filters: [{ name: 'T3 Code theme', extensions: ['json'] }],
+  });
+  if (result.canceled || !result.filePaths[0]) return null;
+  return importT3Theme(result.filePaths[0]);
+});
+themeIpc('themes:exportT3', async (id) => {
+  const theme = await getTheme(String(id));
+  if (!theme) throw new Error('That theme no longer exists.');
+  const [window] = BrowserWindow.getAllWindows();
+  const result = await dialog.showSaveDialog(window, {
+    title: 'Export for T3 Code',
+    defaultPath: path.join(app.getPath('downloads'), t3FileName(theme.name)),
+    filters: [{ name: 'T3 Code theme', extensions: ['json'] }],
+  });
+  if (result.canceled || !result.filePath) return null;
+  // The user picked the file (and agreed to replace it) in the save dialog.
+  return exportThemeToT3(theme.id, result.filePath, { allowOverwrite: true });
+});
+themeIpc('themes:takeInstallRequest', () => {
+  const slug = pendingThemeInstall;
+  pendingThemeInstall = null;
+  return slug;
+});
+themeIpc('themes:openGallery', async (slug) => {
+  const url = await communityGalleryUrl();
+  await shell.openExternal(typeof slug === 'string' && /^[a-z0-9]{10}$/.test(slug) ? `${url}/${slug}` : url);
+  return url;
+});
 
 ipcMain.handle('storage:load', async () => {
   try {

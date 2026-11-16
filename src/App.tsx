@@ -253,6 +253,7 @@ import type {
 const TerminalView = React.lazy(() => import('./TerminalView'));
 const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
 import ThemeLayer from './app/themes/ThemeLayer';
+import { CommunityInstallDialog } from './app/themes/CommunityThemes';
 // Remote control is opt-in and rarely on screen; keep its view out of the
 // startup chunk like the settings page.
 
@@ -10861,6 +10862,7 @@ const App: React.FC = () => {
     >
       <Toaster position="top-center" richColors closeButton />
       <ThemeLayer />
+      <CommunityInstallDialog />
       <ProjectPickerModal
         open={projectPickerOpen && !repositoryOperationBusy}
         initialView={projectPickerView}

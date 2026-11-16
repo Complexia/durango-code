@@ -85,6 +85,12 @@ export type UiTheme = {
   values?: Record<string, ThemeValueSpec>;
   controls?: ThemeControl[];
   css?: string;
+  /** The user shared this theme (durango.sh/code/themes/<slug>); `revision` is the local revision that was shared. */
+  published?: { slug: string; version: number; listed: boolean; revision?: number; fingerprint?: string };
+  /** Installed from (or a remix of) a community theme. */
+  origin?: { slug: string; version: number; author?: string; name?: string };
+  /** Imported from T3 Code: its color roles (src/t3-theme-format.js). */
+  compat?: { t3?: { colors: Record<string, string>; variants?: Partial<Record<'dark' | 'light', Record<string, string>>> } };
 };
 
 export type ThemeSnapshot = {
@@ -155,6 +161,8 @@ export declare function isVideoAsset(name: string | undefined | null): boolean;
 export declare function sanitizeBackdrop(input: unknown): ThemeBackdrop | null;
 export declare function isThemeId(id: unknown): boolean;
 export declare function sanitizeTheme(input: unknown): UiTheme | null;
+export declare function isCommunityThemeSlug(value: unknown): value is string;
+export declare function themeShareFingerprint(theme: UiTheme): string;
 export declare function themeToCss(theme: UiTheme | null, options?: { assetUrl?: (name: string) => string }): string;
 export declare function mergeTheme(
   base: Partial<UiTheme> | null,

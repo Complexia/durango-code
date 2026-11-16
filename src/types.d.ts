@@ -1,4 +1,25 @@
 type ThemeIpcResult<T> = { ok: true; value: T } | { ok: false; error: string };
+/** A shared theme on durango.sh (src/main/theme-community.js). */
+type CommunityThemeSummary = { slug: string; name: string; version: number; listed: boolean; url: string; installs?: number; author?: string | null };
+type CommunityThemePreview = {
+  /** community: a durango.sh theme; t3: a T3 Code theme file from a link. */
+  kind?: 'community' | 't3';
+  slug: string | null;
+  name: string;
+  description: string;
+  author: string | null;
+  appearance: 'dark' | 'light';
+  installs: number;
+  version: number;
+  url: string | null;
+  previewUrl: string | null;
+  bytes: number;
+  animated: boolean;
+  /** This computer already has it (some version). */
+  installedId: string | null;
+  /** A T3 Code theme's appearances (its own first). */
+  appearances?: Array<'dark' | 'light'>;
+};
 export {};
 
 type AppUpdateState = {
@@ -1079,6 +1100,20 @@ type OrionCodexBrowserIntegrationStatus = {
         videoForPoster?: (id: string, asset: string) => Promise<ThemeIpcResult<Uint8Array | null>>;
         /** Saves a still frame (JPEG bytes) as the poster of a video backdrop that has none. */
         savePoster?: (id: string, asset: string, data: Uint8Array) => Promise<ThemeIpcResult<string | null>>;
+        /** Share a theme to durango.sh/code/themes (or update the shared copy). */
+        share?: (id: string, options?: { listed?: boolean }) => Promise<ThemeIpcResult<{ theme: import('./ui-themes.js').UiTheme; shared: CommunityThemeSummary }>>;
+        setShareListed?: (id: string, listed: boolean) => Promise<ThemeIpcResult<{ theme: import('./ui-themes.js').UiTheme; shared: CommunityThemeSummary }>>;
+        unshare?: (id: string) => Promise<ThemeIpcResult<import('./ui-themes.js').UiTheme>>;
+        previewCommunity?: (slugOrUrl: string) => Promise<ThemeIpcResult<CommunityThemePreview>>;
+        installCommunity?: (slugOrUrl: string, options?: { appearance?: 'dark' | 'light' }) => Promise<ThemeIpcResult<{ theme: import('./ui-themes.js').UiTheme; alreadyInstalled: boolean }>>;
+        /** A theme install link that arrived before the renderer listened (taken once). */
+        takeInstallRequest?: () => Promise<ThemeIpcResult<string | null>>;
+        openGallery?: (slug?: string) => Promise<ThemeIpcResult<string>>;
+        /** Pick a T3 Code theme file and add it (null: cancelled). */
+        importT3File?: () => Promise<ThemeIpcResult<{ theme: import('./ui-themes.js').UiTheme; alreadyInstalled: boolean } | null>>;
+        /** Save a theme as a T3 Code theme file (null: cancelled). */
+        exportT3?: (id: string) => Promise<ThemeIpcResult<{ filePath: string; notes: string[]; name: string } | null>>;
+        onInstallRequest?: (callback: (slug: string) => void) => () => void;
         onChanged: (callback: (snapshot: import('./ui-themes.js').ThemeSnapshot) => void) => () => void;
         onCelebrate: (callback: () => void) => () => void;
       };

@@ -28,6 +28,22 @@ contextBridge.exposeInMainWorld('orion', {
     reportSceneError: (id, message) => ipcRenderer.send('themes:sceneError', id, message),
     videoForPoster: (id, asset) => ipcRenderer.invoke('themes:videoForPoster', id, asset),
     savePoster: (id, asset, data) => ipcRenderer.invoke('themes:savePoster', id, asset, data),
+    // Community themes (durango.sh/code/themes).
+    share: (id, options) => ipcRenderer.invoke('themes:share', id, options),
+    setShareListed: (id, listed) => ipcRenderer.invoke('themes:setShareListed', id, listed),
+    unshare: (id) => ipcRenderer.invoke('themes:unshare', id),
+    previewCommunity: (slugOrUrl) => ipcRenderer.invoke('themes:previewCommunity', slugOrUrl),
+    installCommunity: (slugOrUrl, options) => ipcRenderer.invoke('themes:installCommunity', slugOrUrl, options),
+    takeInstallRequest: () => ipcRenderer.invoke('themes:takeInstallRequest'),
+    openGallery: (slug) => ipcRenderer.invoke('themes:openGallery', slug),
+    // T3 Code themes (theme-t3.js).
+    importT3File: () => ipcRenderer.invoke('themes:importT3File'),
+    exportT3: (id) => ipcRenderer.invoke('themes:exportT3', id),
+    onInstallRequest: (callback) => {
+      const listener = (_event, slug) => callback(slug);
+      ipcRenderer.on('themes:installRequest', listener);
+      return () => ipcRenderer.removeListener('themes:installRequest', listener);
+    },
     onChanged: (callback) => {
       const listener = (_event, snapshot) => callback(snapshot);
       ipcRenderer.on('themes:changed', listener);
