@@ -86,7 +86,7 @@ export type UiTheme = {
   controls?: ThemeControl[];
   css?: string;
   /** The user shared this theme (durango.sh/code/themes/<slug>); `revision` is the local revision that was shared. */
-  published?: { slug: string; version: number; listed: boolean; revision?: number; fingerprint?: string };
+  published?: { slug: string; version: number; listed: boolean; revision?: number; fingerprint?: string; anonymous?: boolean };
   /** Installed from (or a remix of) a community theme. */
   origin?: { slug: string; version: number; author?: string; name?: string };
   /** Imported from T3 Code: its color roles (src/t3-theme-format.js). */

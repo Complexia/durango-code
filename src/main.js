@@ -778,8 +778,27 @@ configureT3Themes({
     return null;
   },
 });
+// This device's owner key for community themes shared without an account
+// (theme-community.js): made on first use, kept in userData. Whoever holds it
+// can update or stop sharing those themes; nothing else.
+let themeOwnerKeyPromise = null;
+const themeOwnerKey = () => {
+  themeOwnerKeyPromise ??= (async () => {
+    const file = path.join(app.getPath('userData'), 'community-theme-owner.key');
+    const existing = (await fs.readFile(file, 'utf8').catch(() => '')).trim();
+    if (/^[A-Za-z0-9_-]{32,128}$/.test(existing)) return existing;
+    const key = crypto.randomBytes(32).toString('base64url');
+    await fs.writeFile(file, `${key}\n`, { mode: 0o600 });
+    return key;
+  })().catch((error) => {
+    themeOwnerKeyPromise = null;
+    throw error;
+  });
+  return themeOwnerKeyPromise;
+};
 configureCommunityThemes({
   durangoClient,
+  anonymousKey: themeOwnerKey,
   // A ~960px JPEG of the backdrop for the gallery (the original can be many MB).
   thumbnail: (bytes) => {
     const image = nativeImage.createFromBuffer(Buffer.from(bytes));

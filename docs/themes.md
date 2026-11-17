@@ -49,8 +49,12 @@ live on durango.sh, so the app only gains an upload and a download path.
   again updates the same link and bumps the version. The dialog offers Update when the theme's
   revision moved past the shared one. Themes are link-only unless "List in the community gallery"
   is on. Stop sharing deletes the shared copy; installed copies stay with the people who have them.
-  Sharing needs a signed-in Durango account (the desktop's `code`-scoped key) and is refused in Read
-  only mode.
+  Sharing needs no account. Signed in, the theme belongs to the Durango account (the desktop's
+  `code`-scoped key); signed out, to this device: a random owner key made on first use
+  (`<userData>/community-theme-owner.key`) and sent as `X-Durango-Theme-Owner`, which durango.sh stores
+  only as a hash. `published.anonymous` remembers which, so updates and Stop sharing keep using the
+  owner the theme was shared as, even after signing in. Anonymous sharing is rate limited per network
+  address. Sharing is refused in Read only mode.
 - **Install.** A theme page's Install button opens `orion://theme/install?slug=<slug>`. `main.js`
   keeps the link until the renderer takes it, and the install dialog asks first. Pasting a link in
   Settings → Themes → Community, or `manage_app_themes` `install`, works too. The app:

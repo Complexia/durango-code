@@ -606,6 +606,8 @@ export const sanitizeTheme = (input) => {
     if (typeof input.published.fingerprint === 'string' && /^[a-z0-9]{1,16}$/.test(input.published.fingerprint)) {
       theme.published.fingerprint = input.published.fingerprint;
     }
+    // Shared without an account (this device's owner key, theme-community.js).
+    if (input.published.anonymous === true) theme.published.anonymous = true;
   }
   // Imported from T3 Code: its colors for every T3 role (t3-theme-format.js),
   // so its CSS finds the variables it expects.
@@ -645,7 +647,7 @@ export const sanitizeTheme = (input) => {
 
 // Community themes (durango.sh/code/themes): `published` = this theme is the
 // user's own shared one ({ slug, version, listed, revision: the local revision
-// that was shared }); `origin` = it was installed from (or remixes) a shared
+// that was shared, anonymous: shared without an account }); `origin` = it was installed from (or remixes) a shared
 // theme ({ slug, version, author?, name? }).
 const COMMUNITY_SLUG_PATTERN = /^[a-z0-9]{10}$/;
 

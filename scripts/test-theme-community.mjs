@@ -16,6 +16,7 @@ import {
   configureCommunityThemes,
   installCommunityTheme,
   previewCommunityTheme,
+  setSharedThemeListed,
   shareTheme,
   themeFileNames,
   themeInstallLinkSlug,
@@ -32,11 +33,16 @@ const shared = new Map(); // slug → { ownerId, theme, assets, version, listed 
 let slugCounter = 0;
 const calls = [];
 
-const fakeClient = (ownerId) => ({
+// `signedIn: false` = no account on this device; `{ anonymousKey }` acts as that key's owner.
+const fakeClient = (account, { signedIn = true } = {}) => ({
   async baseUrl() {
     return 'https://durango.test';
   },
-  async prepareThemeUploads(assets) {
+  async signedIn() {
+    return signedIn;
+  },
+  async prepareThemeUploads(assets, as) {
+    const ownerId = ownerOf(account, as, signedIn);
     calls.push(['uploads', assets.length]);
     return assets.map((asset) => ({
       ...asset,
@@ -44,8 +50,9 @@ const fakeClient = (ownerId) => ({
       uploadUrl: objects.has(`${ownerId}/${asset.sha256}`) ? null : `https://storage.test/put/${ownerId}/${asset.sha256}`,
     }));
   },
-  async publishTheme(body) {
-    calls.push(['publish', body.slug ?? null]);
+  async publishTheme(body, as) {
+    const ownerId = ownerOf(account, as, signedIn);
+    calls.push(['publish', body.slug ?? null, ownerId]);
     for (const field of ['id', 'threadId', 'saved', 'revision', 'published', 'origin']) {
       assert.ok(!(field in body.theme), `${field} is not shared`);
     }
@@ -60,11 +67,13 @@ const fakeClient = (ownerId) => ({
     shared.set(slug, { ownerId, theme: body.theme, assets: body.assets, version: 1, listed: body.listed === true, thumbnail: body.thumbnail });
     return { slug, version: 1, listed: body.listed === true, url: `https://durango.test/code/themes/${slug}` };
   },
-  async setSharedThemeListed(slug, listed) {
+  async setSharedThemeListed(slug, listed, as) {
+    assert.equal(shared.get(slug).ownerId, ownerOf(account, as, signedIn), 'changed by its owner');
     shared.get(slug).listed = listed;
     return { slug, listed };
   },
-  async deleteSharedTheme(slug) {
+  async deleteSharedTheme(slug, as) {
+    assert.equal(shared.get(slug)?.ownerId, ownerOf(account, as, signedIn), 'removed by its owner');
     shared.delete(slug);
     return { deleted: true };
   },
@@ -90,6 +99,12 @@ const fakeClient = (ownerId) => ({
     return { themes: [] };
   },
 });
+
+const ownerOf = (account, as, signedIn) => {
+  if (as?.anonymousKey) return `anon-${as.anonymousKey}`;
+  if (!signedIn) throw new DurangoError('not_signed_in', 'Sign in.');
+  return account;
+};
 
 let tamper = false;
 let encode = false;
@@ -176,7 +191,7 @@ const second = await shareTheme(mine.id);
 assert.equal(second.shared.slug, 'slug000001');
 assert.equal(second.theme.published.version, 2);
 assert.equal(second.theme.published.listed, true, 'keeps listed when not given');
-assert.deepEqual(calls, [['uploads', 3], ['publish', 'slug000001']]);
+assert.deepEqual(calls, [['uploads', 3], ['publish', 'slug000001', 'owner']]);
 
 // A duplicate is a new theme, not the shared one.
 const copy = await store.duplicateTheme(mine.id);
@@ -252,6 +267,27 @@ const fresh = await shareTheme(mine.id);
 shared.delete(fresh.shared.slug);
 const reshared = await shareTheme(mine.id);
 assert.notEqual(reshared.shared.slug, fresh.shared.slug);
+
+// Signed out: shared as this device's anonymous owner, and it stays that owner's after signing in.
+const deviceKey = 'device-key-0123456789abcdefghijklmnop';
+configureCommunityThemes({ durangoClient: fakeClient('owner', { signedIn: false }), fetch: fakeFetch, anonymousKey: async () => deviceKey });
+const lone = (await store.duplicateTheme(mine.id, { name: 'No account' })).id;
+const anonShare = await shareTheme(lone, { listed: true });
+assert.equal(anonShare.theme.published.anonymous, true);
+assert.equal(shared.get(anonShare.shared.slug).ownerId, `anon-${deviceKey}`);
+configureCommunityThemes({ durangoClient: fakeClient('owner'), fetch: fakeFetch });
+await store.updateTheme({ id: lone, threadId: 'thread-3', claim: true, patch: { tokens: { accent: '#123456' } } });
+const anonUpdate = await shareTheme(lone);
+assert.equal(anonUpdate.shared.slug, anonShare.shared.slug, 'same link after signing in');
+assert.equal(anonUpdate.theme.published.anonymous, true);
+assert.equal((await setSharedThemeListed(lone, false)).theme.published.anonymous, true);
+await unshareTheme(lone);
+assert.ok(!shared.has(anonShare.shared.slug));
+// Signed in: a new share belongs to the account.
+const withAccount = await shareTheme(lone);
+assert.equal(withAccount.theme.published.anonymous, undefined);
+assert.equal(shared.get(withAccount.shared.slug).ownerId, 'owner');
+configureCommunityThemes({ anonymousKey: null });
 
 await fs.rm(tmp, { recursive: true, force: true });
 console.log('theme community: ok');

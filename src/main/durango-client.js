@@ -452,8 +452,10 @@ export const createDurangoClient = ({
     }
   };
 
-  // Public /api/v1 reads (community themes): no key, so installing works signed out.
-  const publicGet = async (apiPath, { query, signal } = {}) => {
+  // /api/v1 calls without a key (community themes): public reads, so installing
+  // works signed out, and sharing without an account (`headers` carries the
+  // device's anonymous theme owner key).
+  const keylessRequest = async (method, apiPath, { query, body, timeout = timeoutMs, signal, headers: extraHeaders } = {}) => {
     const credential = await credentials.peek().catch(() => null);
     const url = new URL(`/api/v1${apiPath}`, credential?.baseUrl ?? resolveDurangoBaseUrl(webOrigin()));
     for (const [key, value] of Object.entries(query ?? {})) {
@@ -461,9 +463,15 @@ export const createDurangoClient = ({
     }
     let response;
     try {
-      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      const timeoutSignal = AbortSignal.timeout(timeout);
       response = await fetchImpl(url, {
-        headers: { accept: 'application/json' },
+        method,
+        headers: {
+          accept: 'application/json',
+          ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+          ...(extraHeaders ?? {}),
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal,
         redirect: 'error',
       });
@@ -479,6 +487,14 @@ export const createDurangoClient = ({
     }
     return data ?? {};
   };
+  const publicGet = (apiPath, options) => keylessRequest('GET', apiPath, options);
+
+  // Community theme writes: the signed-in account, or (`anonymousKey`) the
+  // device's own owner key, for sharing without an account.
+  const themeRequest = (method, apiPath, { anonymousKey, ...options } = {}) =>
+    anonymousKey
+      ? keylessRequest(method, apiPath, { ...options, headers: { 'x-durango-theme-owner': anonymousKey } })
+      : request(method, apiPath, options);
 
   const taskPath = (taskId) => {
     const id = str(taskId).trim();
@@ -735,23 +751,29 @@ export const createDurangoClient = ({
       };
     },
     // --- Community themes (durango.sh/code/themes, theme-community.js) --------
+    // Writes take `{ anonymousKey }` to act as the device's anonymous owner
+    // instead of the signed-in account (sharing needs no account).
+    /** Whether a Durango account is signed in on this device. */
+    async signedIn() {
+      return Boolean((await readSession().catch(() => null))?.token);
+    },
     /** `assets: [{ name, sha256, size }]` → `[{ name, sha256, contentType, uploadUrl | null }]`. */
-    async prepareThemeUploads(assets, { signal } = {}) {
-      const data = await request('POST', '/themes/uploads', { body: { assets }, signal });
+    async prepareThemeUploads(assets, { signal, anonymousKey } = {}) {
+      const data = await themeRequest('POST', '/themes/uploads', { body: { assets }, signal, anonymousKey });
       return Array.isArray(data.uploads) ? data.uploads : [];
     },
     /** Shares a theme (or updates the shared one: `slug`); resolves its summary. */
-    async publishTheme(body, { signal } = {}) {
-      return request('POST', '/themes', { body, timeout: 60_000, signal });
+    async publishTheme(body, { signal, anonymousKey } = {}) {
+      return themeRequest('POST', '/themes', { body, timeout: 60_000, signal, anonymousKey });
     },
-    async setSharedThemeListed(slug, listed) {
-      return request('PATCH', `/themes/${encodeURIComponent(str(slug))}`, { body: { listed: listed === true } });
+    async setSharedThemeListed(slug, listed, { anonymousKey } = {}) {
+      return themeRequest('PATCH', `/themes/${encodeURIComponent(str(slug))}`, { body: { listed: listed === true }, anonymousKey });
     },
-    async deleteSharedTheme(slug) {
-      return request('DELETE', `/themes/${encodeURIComponent(str(slug))}`);
+    async deleteSharedTheme(slug, { anonymousKey } = {}) {
+      return themeRequest('DELETE', `/themes/${encodeURIComponent(str(slug))}`, { anonymousKey });
     },
-    async listOwnSharedThemes() {
-      const data = await request('GET', '/themes/mine');
+    async listOwnSharedThemes({ anonymousKey } = {}) {
+      const data = await themeRequest('GET', '/themes/mine', { anonymousKey });
       return Array.isArray(data.themes) ? data.themes : [];
     },
     /** Counts an install for the signed-in account (once per account). */

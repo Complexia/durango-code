@@ -8,7 +8,10 @@ import { importT3Theme, isT3ThemeSource, previewT3Theme, t3FileForTheme } from '
 // Community themes (docs/themes.md → "Sharing"): share a theme to
 // durango.sh/code/themes and install other people's. The gallery, the
 // manifests and the files live on durango.sh; the app only uploads and
-// downloads. Sharing:
+// downloads. Sharing needs no account: signed out, the theme is shared as this
+// device's anonymous owner (a random key kept in userData, sent as
+// X-Durango-Theme-Owner), and `published.anonymous` remembers that, so later
+// updates and Stop sharing use the same owner even after signing in. Sharing:
 //   1. hash every file the theme uses; durango.sh answers with a presigned
 //      PUT for each one it doesn't have (POST /api/v1/themes/uploads);
 //   2. PUT those bytes straight to storage;
@@ -27,15 +30,29 @@ const UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 let client = null;
 let fetchImpl = (...args) => fetch(...args);
 let makeThumbnail = null;
+let anonymousOwnerKey = null;
 
 /**
- * main.js wires the Durango client and `thumbnail(bytes) → JPEG bytes | null`
- * (nativeImage); tests pass fakes and a fake fetch.
+ * main.js wires the Durango client, `thumbnail(bytes) → JPEG bytes | null`
+ * (nativeImage) and `anonymousKey() → Promise<string>` (this device's owner
+ * key for sharing without an account); tests pass fakes and a fake fetch.
  */
-export const configureCommunityThemes = ({ durangoClient, fetch: fetchOverride, thumbnail } = {}) => {
+export const configureCommunityThemes = ({ durangoClient, fetch: fetchOverride, thumbnail, anonymousKey } = {}) => {
   client = durangoClient ?? null;
   if (fetchOverride) fetchImpl = fetchOverride;
   if (thumbnail !== undefined) makeThumbnail = typeof thumbnail === 'function' ? thumbnail : null;
+  if (anonymousKey !== undefined) anonymousOwnerKey = typeof anonymousKey === 'function' ? anonymousKey : null;
+};
+
+/**
+ * Who shares `theme`: the owner it was shared as, else the signed-in account,
+ * else this device without an account. `{}` = the account; `{ anonymousKey }`.
+ */
+const sharerFor = async (theme, api) => {
+  const anonymous = theme.published ? theme.published.anonymous === true : !(await api.signedIn());
+  if (!anonymous) return {};
+  if (!anonymousOwnerKey) throw new Error('Sign in to your Durango account in Durango Code to share themes.');
+  return { anonymousKey: await anonymousOwnerKey() };
 };
 
 export const THUMBNAIL_NAME = 'community-thumbnail.jpg';
@@ -198,8 +215,9 @@ const shareThemeNow = async (id, { listed } = {}) => {
     const thumbnail = await thumbnailFile(theme, files);
     if (thumbnail) files.push(thumbnail);
     const assets = files.map(({ name, sha256: hash, size }) => ({ name, sha256: hash, size }));
+    const as = await sharerFor(theme, api);
     if (assets.length) {
-      const uploads = await api.prepareThemeUploads(assets);
+      const uploads = await api.prepareThemeUploads(assets, as);
       const byName = new Map(files.map((file) => [file.name, file]));
       for (const entry of uploads) {
         const file = byName.get(entry?.name);
@@ -218,11 +236,11 @@ const shareThemeNow = async (id, { listed } = {}) => {
     };
     let shared;
     try {
-      shared = await api.publishTheme({ ...body, ...(theme.published?.slug ? { slug: theme.published.slug } : {}) });
+      shared = await api.publishTheme({ ...body, ...(theme.published?.slug ? { slug: theme.published.slug } : {}) }, as);
     } catch (error) {
       // The shared copy was removed on durango.sh: share it as a new one.
       if (!(theme.published?.slug && error instanceof DurangoError && error.status === 404)) throw error;
-      shared = await api.publishTheme(body);
+      shared = await api.publishTheme(body, as);
     }
     if (!isCommunityThemeSlug(shared?.slug)) throw new Error('durango.sh did not return a link for the theme.');
     const updated = await setThemePublished(theme.id, {
@@ -231,6 +249,7 @@ const shareThemeNow = async (id, { listed } = {}) => {
       listed: shared.listed === true,
       revision: theme.revision,
       fingerprint: themeShareFingerprint(theme),
+      ...(as.anonymousKey ? { anonymous: true } : {}),
     });
     return { theme: updated, shared };
   } catch (error) {
@@ -244,7 +263,7 @@ export const setSharedThemeListed = (id, listed) => oneAtATime(id, async () => {
   const theme = await getTheme(id);
   if (!theme?.published) throw new Error('That theme is not shared.');
   try {
-    const shared = await api.setSharedThemeListed(theme.published.slug, listed);
+    const shared = await api.setSharedThemeListed(theme.published.slug, listed, await sharerFor(theme, api));
     const updated = await setThemePublished(theme.id, { ...theme.published, listed: shared.listed === true });
     return { theme: updated, shared };
   } catch (error) {
@@ -258,7 +277,7 @@ export const unshareTheme = (id) => oneAtATime(id, async () => {
   const theme = await getTheme(id);
   if (!theme?.published) throw new Error('That theme is not shared.');
   try {
-    await api.deleteSharedTheme(theme.published.slug);
+    await api.deleteSharedTheme(theme.published.slug, await sharerFor(theme, api));
   } catch (error) {
     if (!(error instanceof DurangoError && error.status === 404)) throw friendly(error, 'stop sharing a theme');
   }
