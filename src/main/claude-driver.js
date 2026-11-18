@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from './claude-input.js';
-import { withClaudeEnv } from './claude-env.js';
+import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
 import { CLAUDE_CHROME_BROWSER_TIPS, claudeChromeLeaseHooks } from './claude-chrome.js';
 import { claudeForegroundWaitHooks } from './claude-foreground-wait.js';
 import { existsSync } from 'node:fs';
@@ -2407,9 +2407,7 @@ export const createClaudeSdkSession = ({
             : {}
         ),
         ...(sdkOptions.ultracode ? { settings: JSON.stringify({ ultracode: true }) } : {}),
-        ...(sdkOptions.accessMode === 'full-access'
-          ? { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }
-          : { permissionMode: sdkOptions.accessMode === 'read-only' ? 'plan' : 'acceptEdits' }),
+        ...claudePermissionOptionsForAccessMode(sdkOptions.accessMode),
         ...(allowedTools.length > 0 ? { allowedTools } : {}),
         ...(Object.keys(sdkOptions.extraArgs).length > 0 ? { extraArgs: sdkOptions.extraArgs } : {}),
         ...(resumeSessionId ? { resume: resumeSessionId } : {}),

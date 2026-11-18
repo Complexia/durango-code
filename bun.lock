@@ -6,6 +6,7 @@
       "name": "orion",
       "dependencies": {
         "@anthropic-ai/claude-agent-sdk": "^0.3.261",
+        "@fontsource-variable/figtree": "^5.3.0",
         "@fontsource-variable/inter": "^5.3.0",
         "@modelcontextprotocol/sdk": "^1.29.0",
         "@monaco-editor/react": "^4.7.0",
@@ -264,6 +265,8 @@
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.21.5", "", { "os": "win32", "cpu": "x64" }, "sha512-tQd/1efJuzPC6rCFwEvLtci/xNFcTZknmXs98FYDfGE4wP9ClFV98nyKrzJKVPMhdDnjzLhdUyMX4PsQAPjwIw=="],
 
     "@felixrieseberg/electron-forge-maker-nsis": ["@felixrieseberg/electron-forge-maker-nsis@7.2.0", "", { "dependencies": { "@electron-forge/maker-base": "^7.6.0", "@electron/windows-sign": "^1.2.0", "app-builder-lib": "^24.13.3", "debug": "^4.4.0", "electron-updater-yaml": "^1.1.2", "fs-extra": "^11.2.0" } }, "sha512-Dko6I4SuaEB/QLfkS8K//XJZez3Sdt1ldV0Z1VE3IqYw1YMov5W6KQZugYiUnC6jmYa9Yz0LibWdZuKRrOtqnA=="],
+
+    "@fontsource-variable/figtree": ["@fontsource-variable/figtree@5.3.0", "", {}, "sha512-VRVodD7OiG7apQwE8/2fMjaqpY/a0qRJqL5HtYj8CKIVps+9amaFcdfKmDIf7iqYQx6iPLlArVXAfKeIZmVcNQ=="],
 
     "@fontsource-variable/inter": ["@fontsource-variable/inter@5.3.0", "", {}, "sha512-OupL48va4JNofb97w6NYeF9S7W/kHNKM0Er8Dem5nqi4jeOLrVJDoE8tZEpnMJmtkvNbB1EIPPwHcdkF6b1oUA=="],
 

@@ -463,6 +463,14 @@ contextBridge.exposeInMainWorld('orion', {
 
   // Durango Chat (@chat mentions, optional profile memory in instructions)
   durangoSearchChats: (input) => ipcRenderer.invoke('durango:searchChats', input),
+  // Bots (Sidebar v3)
+  getBotsMode: () => ipcRenderer.invoke('bots:mode'),
+  listBots: () => ipcRenderer.invoke('bots:list'),
+  getBotThread: (input) => ipcRenderer.invoke('bots:thread', input),
+  sendBotMessage: (input) => ipcRenderer.invoke('bots:send', input),
+  ensureProjectBot: (input) => ipcRenderer.invoke('bots:ensureProjectBot', input),
+  getBotProject: (input) => ipcRenderer.invoke('bots:project', input),
+  botProjectAction: (input) => ipcRenderer.invoke('bots:projectAction', input),
   durangoProfileMemory: () => ipcRenderer.invoke('durango:profileMemory'),
   durangoOpenChat: (input) => ipcRenderer.invoke('durango:openChat', input),
   // Durango Tasks backend + Durango Chat dispatch (agents started from chat)

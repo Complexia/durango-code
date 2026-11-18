@@ -1,0 +1,1203 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { DurangoError } from './durango-client.js';
+import { DISPATCH_ACCESS_MODES } from './durango-dispatch.js';
+import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
+import { zodShapeForInputSchema } from './json-schema-zod.js';
+
+// Bot replies: a Durango bot's reply, run here on the person's own Claude Code.
+//
+// Durango bots are always-on assistants with a chat thread on Durango. While
+// the person is signed in, Claude Code is available here and "Answer your
+// bots on this computer" is on (Settings → Durango; on by default, separate
+// from the dispatch opt-in), this worker long-polls `POST /api/v1/code/bots/claim`
+// (polling is this machine's bot presence on Durango: its name, projects and
+// Claude models). Messages the person sends from here run here first.
+// A claimed reply ("lane") runs through the Claude Agent SDK with the bot's
+// prompt appended to Claude Code's system prompt and the bot's tools served
+// from an in-process MCP server whose handlers call Durango. Progress (the
+// reply so far, the tool running) streams back; messages that reach the bot
+// meanwhile come back as its inbox and are handed to the running session
+// without interrupting it. The final text goes to `…/finish`. When Claude Code
+// can't run the reply here (usage limit, signed out of Claude, no runtime),
+// the finish asks Durango to run it elsewhere.
+//
+// Access: a bot reply runs with the access set for bots (Settings → Durango,
+// Workspace write by default), mapped to Claude Code exactly as agent threads
+// map it. No one is at the machine to approve anything, so outside Full access
+// tools that would ask are declined (the bot's own tools are always allowed).
+
+export const BOT_REPLIES_CAPABILITY = 'bot-replies';
+export const BOT_DEFAULT_ACCESS_MODE = 'workspace-write';
+
+/** Settings → Durango for bots: `{ enabled }` (on unless turned off) and their `accessMode`. */
+export const normalizeBotSettings = (raw) => {
+  const value = raw && typeof raw === 'object' ? raw : {};
+  return {
+    enabled: value.enabled !== false,
+    accessMode: DISPATCH_ACCESS_MODES.includes(value.accessMode) ? value.accessMode : BOT_DEFAULT_ACCESS_MODE,
+  };
+};
+export const BOT_MAX_LANES = 3;
+export const BOT_MCP_SERVER = 'durango_bot';
+export const BOT_PROGRESS_THROTTLE_MS = 1_000;
+export const BOT_CLAIM_WAIT_MS = 25_000;
+export const BOT_INBOX_HEADER =
+  "(Bot inbox: arrived while you were working. Take it into what you're doing and answer it in this reply too.)";
+export const BOT_FAILURE_MAX_CHARS = 500;
+const MAX_BACKOFF_MS = 60_000;
+const OFFLINE_RECHECK_MS = 15_000;
+const UNAVAILABLE_RECHECK_MS = 60_000;
+const REPORT_RETRY_DELAYS_MS = [1_000, 4_000, 10_000];
+
+const BOT_TOOL_PREFIX = `mcp__${BOT_MCP_SERVER}__`;
+
+/** One inbox batch as the user message the running session reads. */
+export const formatBotInbox = (items) =>
+  [
+    BOT_INBOX_HEADER,
+    ...items.map((item) =>
+      item.source === 'person' ? item.content : `[${item.label || item.source}]\n${item.content}`
+    ),
+  ].join('\n\n');
+
+/** "claude-opus-5-5" (or "claude-opus-5-5[1m]", "claude-haiku-5-5-20261001") → "anthropic/claude-opus-5.5". */
+export const durangoModelIdForClaude = (model) => {
+  const match = String(model ?? '')
+    .trim()
+    .replace(/\[1m\]$/i, '')
+    .replace(/-\d{8}$/, '')
+    .match(/^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?$/);
+  if (!match) return null;
+  return `anthropic/claude-${match[1]}-${match[2]}${match[3] ? `.${match[3]}` : ''}`;
+};
+
+// Assistant-message errors that mean "this machine's Claude Code can't run it
+// now", not "this reply went wrong": another machine or the cloud can.
+const RETRY_ELSEWHERE_ASSISTANT_ERRORS = new Set([
+  'rate_limit',
+  'billing_error',
+  'authentication_failed',
+  'oauth_org_not_allowed',
+  'account_on_hold',
+  'model_not_found',
+]);
+const RETRY_ELSEWHERE_TEXT =
+  /usage limit|rate[ _-]?limit|limit reached|out of (?:extra )?usage|credit balance|not logged in|\/login|log ?in again|invalid api key|oauth|authenticat|unauthori[sz]ed|ENOENT|EACCES|spawn|native binary|executable not found|cannot find module/i;
+
+/** Error text that reads as a usage limit, a signed-out Claude Code or a missing runtime. */
+export const isRetryElsewhereError = (text) => RETRY_ELSEWHERE_TEXT.test(String(text ?? ''));
+
+const shorten = (value, max = BOT_FAILURE_MAX_CHARS) => {
+  const text = String(value ?? '').trim();
+  return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
+};
+
+/** Short label of a tool for `activeTool` ("mcp__durango_bot__web_search" → "web_search"). */
+export const botToolLabel = (toolName) => {
+  const name = String(toolName ?? '');
+  const mcp = name.match(/^mcp__[^_]+(?:_[^_]+)*?__(.+)$/);
+  return shorten(mcp ? mcp[1] : name, 80) || null;
+};
+
+const BOT_PROJECTS_MAX = 40;
+
+const ACCESS_NOTES = {
+  'read-only': 'Read only: you can read them, not change them',
+  'workspace-write': 'Workspace write: you can read and edit files in them',
+  'full-access': 'Full access',
+};
+
+/**
+ * The machine's Durango Code projects a reply may use (absolute paths, at most
+ * BOT_PROJECTS_MAX), deduplicated by path.
+ */
+export const botProjectsForLane = (projects) => {
+  const seen = new Set();
+  const out = [];
+  for (const project of Array.isArray(projects) ? projects : []) {
+    const name = typeof project?.name === 'string' ? project.name.trim() : '';
+    const dir = typeof project?.path === 'string' ? project.path : '';
+    if (!name || !dir || !path.isAbsolute(dir) || seen.has(dir)) continue;
+    seen.add(dir);
+    out.push({ name, path: dir });
+    if (out.length >= BOT_PROJECTS_MAX) break;
+  }
+  return out;
+};
+
+/**
+ * What a reply running here is told about this machine's Durango Code
+ * projects: their folders (readable, and writable as far as the machine's
+ * access allows) and how to start real Durango Code threads in them.
+ * `threads`: 'local' (signed out) or 'machine' (a Durango bot's reply), both
+ * starting threads with delegate_task `project`; null for a task (no hand-off).
+ */
+export const botProjectsNote = ({ projects, accessMode, threads }) => {
+  const list = botProjectsForLane(projects);
+  if (!list.length) {
+    return threads
+      ? "## This computer's Durango Code projects\n\nNone are open in Durango Code on this computer (or none are allowed for Durango). If the person wants work done in a project, ask them to add it in Durango Code."
+      : '';
+  }
+  const lines = [
+    "## This computer's Durango Code projects",
+    '',
+    ...list.map((project) => `- ${project.name}: ${project.path}`),
+    '',
+    `You can work in these folders directly (this computer's access for Durango: ${ACCESS_NOTES[accessMode] ?? ACCESS_NOTES['read-only']}). Quick looks (a file, git log, a grep) you do yourself.`,
+  ];
+  if (threads) {
+    lines.push(
+      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. Write complete instructions: the thread sees nothing of this conversation (the project\'s notes are added for it). See where a project stands with list_threads and read_thread (the person\'s threads too), and steer a thread with message_thread (a follow-up turn there, reported back like a task).'
+    );
+  }
+  return lines.join('\n');
+};
+
+/** A project by name (or folder name), case-insensitive. */
+export const findProject = (projects, name) => {
+  const wanted = String(name ?? '').trim().toLowerCase();
+  if (!wanted) return null;
+  const list = (Array.isArray(projects) ? projects : []).filter((project) => project && typeof project.id === 'string');
+  return (
+    list.find((project) => String(project.name ?? '').trim().toLowerCase() === wanted) ??
+    list.find((project) => path.basename(String(project.path ?? '')).toLowerCase() === wanted) ??
+    null
+  );
+};
+
+/** What the claim tells Durango about this machine (bots.botMachines). */
+export const presenceOf = (info) => ({
+  name: String(info?.name ?? '').trim().slice(0, 120) || os.hostname(),
+  projects: botProjectsForLane(info?.projects).map((project) => project.name),
+  // Ids and repo ids: Durango names a project's key from them (e.g. for the
+  // main bot creating a project's bot).
+  projectRefs: (Array.isArray(info?.projects) ? info.projects : [])
+    .filter((project) => typeof project?.id === 'string' && typeof project?.name === 'string')
+    .slice(0, 100)
+    .map((project) => ({ name: project.name, id: project.id, repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null })),
+  models: (Array.isArray(info?.models) ? info.models : []).filter((model) => typeof model === 'string' && model).slice(0, 20),
+});
+
+/** The bot's working directory: `<botsDir>/<botId>`, the id made path-safe. */
+export const botWorkDir = (botsDir, botId) => {
+  const id = String(botId ?? '');
+  const safe = /^[A-Za-z0-9_-]{1,100}$/.test(id) ? id : crypto.createHash('sha256').update(id).digest('hex').slice(0, 32);
+  return path.join(botsDir, safe);
+};
+
+const userMessage = (text) => ({
+  type: 'user',
+  message: { role: 'user', content: [{ type: 'text', text }] },
+  parent_tool_use_id: null,
+});
+
+const toolDenial = (toolName, accessMode) => {
+  if (toolName === 'AskUserQuestion') {
+    return 'No one can answer questions during a bot reply. Ask in your reply instead.';
+  }
+  if (toolName === 'ExitPlanMode') {
+    return 'This bot reply runs Read only on this machine: answer without changing anything here.';
+  }
+  return `No one is at this machine to approve ${toolName} for this bot reply (it runs with the machine's ${accessMode} access). Do without it, or say in your reply what you would need.`;
+};
+
+const defaultClaudeEnv = () => withClaudeEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' });
+
+/**
+ * One prompt, one answer, no tools (a local bot's history summary). deps:
+ * loadSdk, resolveBinary and env as createClaudeLaneRunner's; cwd (or a
+ * function returning it). → ({ model, systemPrompt, prompt, signal }) => text.
+ * Throws when Claude Code ends without an answer.
+ */
+export const createClaudeOneShot = ({
+  loadSdk,
+  resolveBinary = async () => null,
+  env = defaultClaudeEnv,
+  cwd = () => os.tmpdir(),
+}) => async ({ model, systemPrompt, prompt, signal }) => {
+  const [sdk, binary] = await Promise.all([loadSdk(), resolveBinary()]);
+  const abortController = new AbortController();
+  const onAbort = () => abortController.abort();
+  signal?.addEventListener('abort', onAbort, { once: true });
+  let query = null;
+  let text = '';
+  let failure = null;
+  try {
+    query = sdk.query({
+      prompt,
+      options: {
+        cwd: typeof cwd === 'function' ? cwd() : cwd,
+        ...(model ? { model } : {}),
+        ...(systemPrompt ? { systemPrompt } : {}),
+        tools: [],
+        maxTurns: 1,
+        persistSession: false,
+        settingSources: [],
+        ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
+        abortController,
+        env: env(),
+      },
+    });
+    for await (const message of query) {
+      if (message?.type !== 'result') continue;
+      if (message.subtype === 'success' && !message.is_error && typeof message.result === 'string') text = message.result;
+      else failure = (Array.isArray(message.errors) && message.errors.filter(Boolean).join('; ')) || `Claude Code stopped (${message.subtype}).`;
+      break;
+    }
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    try {
+      query?.close?.();
+    } catch {}
+    try {
+      abortController.abort();
+    } catch {}
+  }
+  if (!text.trim()) throw new Error(failure || 'Claude Code gave no answer.');
+  return text.trim();
+};
+
+/**
+ * Runs lanes on the Claude Agent SDK. deps:
+ * - loadSdk(): the SDK module ({ query, tool, createSdkMcpServer })
+ * - loadZod(): the zod module ({ z })
+ * - resolveBinary(): Claude Code executable path or null (the SDK's own)
+ * - createInputQueue(): streaming-input queue ({ push, close, stream })
+ * - botsDir: parent of the per-bot working directories (or a function returning it)
+ * - env(): the claude process environment
+ * - getProjects(): this machine's Durango Code projects the reply may use
+ *   ([{ name, path }], already limited to the ones allowed for Durango)
+ *
+ * lane.threads: how the reply starts Durango Code threads in a project
+ * ('machine' | 'local'; absent for tasks), see botProjectsNote.
+ *
+ * → (lane, ctx) => { text, modelId, failure?, retryElsewhere?, aborted? }
+ * ctx: { signal, accessMode, update({ text, activeTool }), takeInbox(): Promise<items>,
+ *        callTool({ name, input, toolCallId }): Promise<{ result }> }
+ */
+export const createClaudeLaneRunner = ({
+  loadSdk,
+  loadZod,
+  resolveBinary = async () => null,
+  createInputQueue,
+  botsDir,
+  env = defaultClaudeEnv,
+  getProjects = () => [],
+  mkdir = (dir) => fs.mkdir(dir, { recursive: true }),
+  randomId = () => crypto.randomUUID(),
+}) => async (lane, ctx) => {
+  const accessMode = ctx.accessMode || 'read-only';
+  let sdk;
+  let zod;
+  let binary;
+  let cwd;
+  let projects = [];
+  try {
+    projects = botProjectsForLane(await getProjects());
+  } catch {}
+  const projectsNote = botProjectsNote({
+    projects,
+    accessMode,
+    threads: lane.threads === 'machine' || lane.threads === 'local' ? lane.threads : null,
+  });
+  try {
+    [sdk, zod, binary] = await Promise.all([loadSdk(), loadZod(), resolveBinary()]);
+    cwd = botWorkDir(typeof botsDir === 'function' ? botsDir() : botsDir, lane.botId);
+    await mkdir(cwd);
+  } catch (error) {
+    return { text: '', retryElsewhere: true, failure: shorten(`Claude Code is not available here: ${error?.message ?? error}`) };
+  }
+  if (ctx.signal?.aborted) return { text: '', aborted: true };
+  const z = zod?.z ?? zod;
+
+  // --- reply text and the tool running -----------------------------------------------
+  const blocks = []; // text blocks of the main loop's assistant messages
+  let partial = ''; // the text block streaming now
+  const toolCalls = new Map(); // tool_use id -> tool name (main loop)
+  const currentText = () =>
+    [...blocks, partial]
+      .map((part) => part.trim())
+      .filter(Boolean)
+      .join('\n\n');
+  const activeTool = () => {
+    const names = [...toolCalls.values()];
+    return names.length ? botToolLabel(names[names.length - 1]) : null;
+  };
+  const update = () => ctx.update({ text: currentText(), activeTool: activeTool() });
+
+  // --- inbox: taken between steps, read at the next tool result or turn end -------
+  const pendingInbox = [];
+  let inboxRequest = null;
+  const requestInbox = () => {
+    if (inboxRequest) return inboxRequest;
+    inboxRequest = Promise.resolve()
+      .then(() => ctx.takeInbox())
+      .then(
+        (items) => {
+          if (Array.isArray(items)) pendingInbox.push(...items);
+        },
+        () => {}
+      )
+      .finally(() => {
+        inboxRequest = null;
+      });
+    return inboxRequest;
+  };
+  // Like a steer in an agent thread (claudeSteerHooks): the main loop reads
+  // what arrived at its next tool result, without interrupting the step.
+  const deliverAtToolResult = (hookEventName) => async (input) => {
+    if (input?.agent_id) return { continue: true };
+    const items = pendingInbox.splice(0);
+    void requestInbox();
+    if (!items.length) return { continue: true };
+    return { hookSpecificOutput: { hookEventName, additionalContext: formatBotInbox(items) } };
+  };
+
+  // --- the bot's tools ---------------------------------------------------------------
+  const toolUseIds = new Map(); // tool name -> tool_use ids waiting for their handler
+  const botTools = lane.tools.map((definition) =>
+    sdk.tool(
+      definition.name,
+      definition.description || definition.name,
+      zodShapeForInputSchema(z, definition.inputSchema),
+      async (args) => {
+        const toolCallId = toolUseIds.get(definition.name)?.shift() || randomId();
+        try {
+          const { result } = await ctx.callTool({ name: definition.name, input: args ?? {}, toolCallId });
+          return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result ?? null) }] };
+        } catch (error) {
+          return {
+            content: [{ type: 'text', text: `The ${definition.name} tool failed: ${error?.message ?? error}` }],
+            isError: true,
+          };
+        }
+      },
+      { alwaysLoad: true }
+    )
+  );
+  const mcpServers = botTools.length
+    ? { [BOT_MCP_SERVER]: sdk.createSdkMcpServer({ name: BOT_MCP_SERVER, version: '1.0.0', tools: botTools }) }
+    : {};
+  const recordToolUse = async (input) => {
+    const name = String(input?.tool_name ?? '');
+    if (name.startsWith(BOT_TOOL_PREFIX) && input?.tool_use_id) {
+      const short = name.slice(BOT_TOOL_PREFIX.length);
+      toolUseIds.set(short, [...(toolUseIds.get(short) ?? []), input.tool_use_id]);
+    }
+    return { continue: true };
+  };
+
+  // --- the run -------------------------------------------------------------------------
+  const inputQueue = createInputQueue();
+  const abortController = new AbortController();
+  let stderrTail = '';
+  const onAbort = () => {
+    inputQueue.close();
+    try {
+      abortController.abort();
+    } catch {}
+  };
+  ctx.signal?.addEventListener('abort', onAbort, { once: true });
+
+  let model = lane.model;
+  let sawInit = false;
+  let result = null;
+  let assistantError = null;
+  let rateLimited = false;
+  let lastAssistantId = null;
+  let thrown = null;
+  let query = null;
+  try {
+    inputQueue.push(userMessage(lane.prompt));
+    query = sdk.query({
+      prompt: inputQueue.stream(),
+      options: {
+        cwd,
+        ...(lane.model ? { model: lane.model } : {}),
+        systemPrompt: {
+          type: 'preset',
+          preset: 'claude_code',
+          append: projectsNote ? `${lane.systemPrompt}\n\n${projectsNote}` : lane.systemPrompt,
+        },
+        settingSources: ['user', 'project', 'local'],
+        includePartialMessages: true,
+        ...(projects.length ? { additionalDirectories: projects.map((project) => project.path) } : {}),
+        mcpServers,
+        ...claudePermissionOptionsForAccessMode(accessMode),
+        ...(accessMode !== 'full-access' && botTools.length
+          ? { allowedTools: lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`) }
+          : {}),
+        canUseTool: async (toolName, toolInput) =>
+          toolName.startsWith(BOT_TOOL_PREFIX)
+            ? { behavior: 'allow', updatedInput: toolInput }
+            : { behavior: 'deny', message: toolDenial(toolName, accessMode) },
+        hooks: {
+          PreToolUse: [{ hooks: [recordToolUse] }],
+          PostToolUse: [{ hooks: [deliverAtToolResult('PostToolUse')] }],
+          PostToolUseFailure: [{ hooks: [deliverAtToolResult('PostToolUseFailure')] }],
+        },
+        ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
+        abortController,
+        stderr: (data) => {
+          stderrTail = `${stderrTail}${data}`.slice(-2000);
+        },
+        env: env(),
+      },
+    });
+    for await (const message of query) {
+      if (ctx.signal?.aborted) break;
+      const mainLoop = !message?.parent_tool_use_id;
+      if (message?.type === 'system' && message.subtype === 'init') {
+        sawInit = true;
+        if (typeof message.model === 'string' && message.model) model = message.model;
+        continue;
+      }
+      if (message?.type === 'rate_limit_event') {
+        if (message.rate_limit_info?.status === 'rejected') rateLimited = true;
+        continue;
+      }
+      if (message?.type === 'stream_event' && mainLoop) {
+        const event = message.event;
+        if (event?.type === 'content_block_start' && event.content_block?.type === 'text') partial = '';
+        if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+          partial += event.delta.text ?? '';
+          update();
+        }
+        continue;
+      }
+      if (message?.type === 'assistant' && mainLoop) {
+        if (message.error) assistantError = message.error;
+        const synthetic = Boolean(message.error) || message.message?.model === '<synthetic>';
+        const id = message.message?.id ?? null;
+        if (!synthetic && id !== lastAssistantId) {
+          lastAssistantId = id;
+          // A new step: take what arrived meanwhile, read at its next tool result.
+          void requestInbox();
+        }
+        for (const block of Array.isArray(message.message?.content) ? message.message.content : []) {
+          if (block?.type === 'text' && !synthetic) {
+            blocks.push(String(block.text ?? ''));
+            partial = '';
+          } else if (block?.type === 'tool_use' && block.id) {
+            toolCalls.set(block.id, block.name);
+          }
+        }
+        if (synthetic) partial = '';
+        update();
+        continue;
+      }
+      if (message?.type === 'user' && mainLoop) {
+        const content = message.message?.content;
+        let changed = false;
+        for (const block of Array.isArray(content) ? content : []) {
+          if (block?.type === 'tool_result' && block.tool_use_id && toolCalls.delete(block.tool_use_id)) changed = true;
+        }
+        if (changed) update();
+        continue;
+      }
+      if (message?.type === 'result') {
+        result = message;
+        partial = '';
+        toolCalls.clear();
+        if (message.is_error || message.subtype !== 'success') break;
+        // Before finishing: anything that reached the bot meanwhile continues
+        // this reply (like a steer at a turn's end).
+        if (inboxRequest) await inboxRequest;
+        await requestInbox();
+        if (ctx.signal?.aborted) break;
+        const items = pendingInbox.splice(0);
+        if (!items.length) break;
+        result = null;
+        update();
+        inputQueue.push(userMessage(formatBotInbox(items)));
+      }
+    }
+  } catch (error) {
+    thrown = error;
+  } finally {
+    ctx.signal?.removeEventListener('abort', onAbort);
+    inputQueue.close();
+    try {
+      query?.close?.();
+    } catch {}
+    try {
+      abortController.abort();
+    } catch {}
+  }
+
+  const text = currentText();
+  const modelId = durangoModelIdForClaude(model);
+  const withModel = modelId ? { modelId } : {};
+  if (ctx.signal?.aborted) return { text, aborted: true, ...withModel };
+  if (result && !result.is_error && result.subtype === 'success') return { text, ...withModel };
+
+  const resultErrors = Array.isArray(result?.errors) ? result.errors.filter(Boolean).join('; ') : '';
+  const reason =
+    (thrown ? thrown?.message ?? String(thrown) : '') ||
+    resultErrors ||
+    (typeof result?.result === 'string' ? result.result : '') ||
+    (assistantError ? `Claude Code stopped (${assistantError}).` : '') ||
+    (result?.subtype && result.subtype !== 'success' ? `Claude Code stopped (${result.subtype}).` : '') ||
+    'Claude Code ended before finishing the reply.';
+  // A reply that failed before writing anything (a usage limit, no login, an
+  // older Claude Code that doesn't have the model, an API error) loses nothing
+  // by moving: the next place (another machine or the cloud) answers instead.
+  const retryElsewhere =
+    !text.trim() ||
+    rateLimited ||
+    RETRY_ELSEWHERE_ASSISTANT_ERRORS.has(assistantError) ||
+    (Boolean(thrown) && !sawInit) ||
+    isRetryElsewhereError(`${reason}\n${stderrTail}`);
+  return { text, failure: shorten(reason), retryElsewhere, ...withModel };
+};
+
+// --- the worker ------------------------------------------------------------------------
+
+const abortableSleep = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
+
+const isAbort = (error) =>
+  error?.name === 'AbortError' ||
+  error?.cause?.name === 'AbortError' ||
+  (error instanceof DurangoError && error.code === 'network' && error.cause?.name === 'AbortError');
+
+const isNetworkError = (error) => error instanceof DurangoError && error.code === 'network' && !isAbort(error);
+
+/** Durango no longer has this lane for this machine: the reply moved elsewhere. */
+const isLaneGone = (error) =>
+  error instanceof DurangoError && (error.status === 404 || error.status === 409 || error.status === 410);
+
+/**
+ * deps:
+ * - client: { claimBotLane, reportBotLaneProgress, callBotLaneTool, finishBotLane }
+ * - getMachineId(): Promise<string|null>
+ * - platform: string
+ * - isSignedIn(): Promise<boolean>
+ * - isOnline(): boolean
+ * - isAvailable(): Promise<boolean>   Claude Code can run here
+ * - runLane(lane, ctx): see createClaudeLaneRunner
+ * - getMachineInfo(): { name, projects: [{ id, name, path, repoId?, key? }], models: string[] } for the
+ *   claim (this machine's bot presence) and for starting threads here
+ * - startProjectThread({ projectId, prompt, key, botName, title, accessMode }): starts a
+ *   Durango Code thread here → { ok, threadId?, error? }; its outcome is reported by the
+ *   caller (POST …/bots/tasks/:taskId/report, key = the task id)
+ * - startThreadFollowUp({ threadId, prompt, key, botName, accessMode }): a follow-up turn
+ *   in an existing thread here, reported the same way (message_thread)
+ * - threadTools: createBotThreadTools(...) (bot-thread-tools.js): list_threads and
+ *   read_thread here; with startThreadFollowUp, message_thread
+ * - stopThread(threadId, taskId): stops that task's run in a thread here (a task cancelled on Durango; a later turn is left alone)
+ * - onStateChange(state): void
+ */
+export const createBotReplyWorker = ({
+  client,
+  getMachineId,
+  platform = process.platform,
+  isSignedIn = async () => true,
+  isOnline = () => true,
+  isAvailable = async () => true,
+  runLane,
+  getMachineInfo = async () => null,
+  startProjectThread = null,
+  startThreadFollowUp = null,
+  threadTools = null,
+  stopThread = null,
+  maxLanes = BOT_MAX_LANES,
+  claimWaitMs = BOT_CLAIM_WAIT_MS,
+  throttleMs = BOT_PROGRESS_THROTTLE_MS,
+  reportRetryDelaysMs = REPORT_RETRY_DELAYS_MS,
+  unavailableRecheckMs = UNAVAILABLE_RECHECK_MS,
+  sleep = abortableSleep,
+  random = Math.random,
+  onStateChange = () => {},
+  log = (...args) => console.warn('[durango bots]', ...args),
+}) => {
+  let settings = normalizeBotSettings({ enabled: false });
+  let signedIn = false;
+  let suspended = false;
+  let generation = 0;
+  let controller = null;
+  let loopPromise = null;
+  let status = 'off';
+  let lastError = null;
+  const running = new Map(); // laneId -> entry
+  let slotWaiters = [];
+  // Set while the loop waits out an idle period (an account with no bots).
+  let idleWait = null;
+  // Task id -> the thread here working on it (started by a reply here), so a
+  // task cancelled on Durango stops its thread (the claim's stopTasks). Each
+  // stop is acknowledged on the next claim once handled; until then Durango
+  // sends it again.
+  const taskThreads = new Map();
+  const STOP_WAIT_MS = 10 * 60_000;
+  const awaitingThread = new Map(); // task id -> until when (its thread isn't known yet)
+  const stopping = new Set();
+  const stopAcks = new Set();
+  const stopTaskThread = (taskId, threadId) => {
+    if (stopping.has(taskId)) return;
+    stopping.add(taskId);
+    void Promise.resolve()
+      .then(() => (stopThread ? stopThread(threadId, taskId) : { ok: true }))
+      .then((result) => {
+        // Already idle counts as stopped.
+        if (result && result.ok === false && !/no running turn/i.test(String(result.error ?? ''))) {
+          throw new Error(result.error || 'the thread did not stop');
+        }
+        taskThreads.delete(taskId);
+        stopAcks.add(taskId);
+      })
+      .catch((error) => log(`stopping the thread of cancelled task ${taskId} failed (will retry):`, error?.message ?? error))
+      .finally(() => stopping.delete(taskId));
+  };
+  const rememberTaskThread = (taskId, threadId) => {
+    if (!taskId || !threadId) return;
+    taskThreads.delete(taskId);
+    taskThreads.set(taskId, threadId);
+    while (taskThreads.size > 200) taskThreads.delete(taskThreads.keys().next().value);
+    // Cancelled before its thread was known here: stop it now.
+    const until = awaitingThread.get(taskId);
+    if (until !== undefined) {
+      awaitingThread.delete(taskId);
+      if (until > Date.now()) stopTaskThread(taskId, threadId);
+    }
+  };
+  const stopCancelledTasks = (taskIds) => {
+    const now = Date.now();
+    for (const [taskId, until] of awaitingThread) if (until <= now) awaitingThread.delete(taskId);
+    for (const taskId of Array.isArray(taskIds) ? taskIds : []) {
+      const threadId = taskThreads.get(taskId);
+      if (threadId) {
+        stopTaskThread(taskId, threadId);
+        continue;
+      }
+      // Not known here (yet): a thread starting now is stopped once it registers.
+      if (!awaitingThread.has(taskId)) awaitingThread.set(taskId, now + STOP_WAIT_MS);
+      stopAcks.add(taskId);
+    }
+  };
+
+  const publish = () => {
+    try {
+      onStateChange(getState());
+    } catch {}
+  };
+  const setStatus = (next, error = lastError) => {
+    if (status === next && lastError === error) return;
+    status = next;
+    lastError = error;
+    publish();
+  };
+
+  const shouldRun = () => settings.enabled && signedIn && !suspended;
+
+  const wakeSlotWaiters = () => {
+    const waiters = slotWaiters;
+    slotWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
+  const atLimit = () => running.size >= maxLanes;
+  const waitForSlot = (signal) =>
+    new Promise((resolve) => {
+      if (signal?.aborted || !atLimit()) return resolve();
+      slotWaiters.push(resolve);
+      signal?.addEventListener('abort', resolve, { once: true });
+    });
+
+  /** One POST, retried on network errors. Throws the last error. */
+  const withRetries = async (send) => {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await send();
+      } catch (error) {
+        if (!isNetworkError(error) || attempt >= reportRetryDelaysMs.length) throw error;
+        await sleep(reportRetryDelaysMs[attempt]);
+      }
+    }
+  };
+
+  // --- one lane ------------------------------------------------------------------------
+
+  const handleLane = async (lane) => {
+    const machineId = (await getMachineId().catch(() => null)) ?? undefined;
+    const abort = new AbortController();
+    const entry = {
+      lane,
+      abort,
+      stopped: false, // Durango moved the reply elsewhere: never finish
+      shutdown: false, // turned off / signed out / quit here
+      text: '',
+      activeTool: null,
+      dirty: false,
+      lastSentAt: 0,
+      throttleTimer: null,
+      heartbeatTimer: null,
+      chain: Promise.resolve(),
+      seenSeqs: new Set(),
+    };
+    running.set(lane.laneId, entry);
+    publish();
+    const heartbeatMs = lane.heartbeatMs || 10_000;
+
+    const clearTimers = () => {
+      if (entry.throttleTimer) clearTimeout(entry.throttleTimer);
+      if (entry.heartbeatTimer) clearTimeout(entry.heartbeatTimer);
+      entry.throttleTimer = null;
+      entry.heartbeatTimer = null;
+    };
+    const stopLane = () => {
+      if (entry.stopped) return;
+      entry.stopped = true;
+      clearTimers();
+      abort.abort();
+    };
+    const armHeartbeat = () => {
+      if (entry.heartbeatTimer) clearTimeout(entry.heartbeatTimer);
+      if (abort.signal.aborted) return;
+      entry.heartbeatTimer = setTimeout(() => void send(false), heartbeatMs);
+      entry.heartbeatTimer.unref?.();
+    };
+
+    // Progress posts go out one at a time, in order. → the inbox items it took.
+    const send = (takeInbox) => {
+      const next = entry.chain.then(async () => {
+        if (abort.signal.aborted) return [];
+        entry.dirty = false;
+        entry.lastSentAt = Date.now();
+        armHeartbeat();
+        // A take is named, and the name kept until it gets through: a retry
+        // after a lost response returns the same messages (not none).
+        if (takeInbox && !entry.pendingTakeId) entry.pendingTakeId = `t${(entry.takeCount = (entry.takeCount ?? 0) + 1)}`;
+        const takeId = takeInbox ? entry.pendingTakeId : null;
+        let response;
+        try {
+          response = await withRetries(() =>
+            client.reportBotLaneProgress({
+              laneId: lane.laneId,
+              botId: lane.botId,
+              machineId,
+              text: entry.text,
+              ...(entry.activeTool ? { activeTool: entry.activeTool } : {}),
+              takeInbox: Boolean(takeInbox),
+              ...(takeId ? { takeId } : {}),
+            })
+          );
+          if (takeId) entry.pendingTakeId = null;
+        } catch (error) {
+          if (isLaneGone(error) || (error instanceof DurangoError && error.code === 'not_signed_in')) {
+            stopLane();
+          } else {
+            log(`progress for ${lane.laneId} failed:`, error?.message ?? error);
+          }
+          return [];
+        }
+        if (response?.stop) {
+          stopLane();
+          return [];
+        }
+        const items = [];
+        for (const item of Array.isArray(response?.inbox) ? response.inbox : []) {
+          if (item.seq !== null && item.seq !== undefined) {
+            if (entry.seenSeqs.has(item.seq)) continue;
+            entry.seenSeqs.add(item.seq);
+          }
+          items.push(item);
+        }
+        return items;
+      });
+      entry.chain = next.catch(() => []);
+      return next;
+    };
+
+    const update = ({ text, activeTool } = {}) => {
+      if (abort.signal.aborted) return;
+      const nextText = typeof text === 'string' ? text : entry.text;
+      const nextTool = activeTool || null;
+      if (nextText === entry.text && nextTool === entry.activeTool) return;
+      entry.text = nextText;
+      entry.activeTool = nextTool;
+      entry.dirty = true;
+      if (entry.throttleTimer) return;
+      const wait = Math.max(0, entry.lastSentAt + throttleMs - Date.now());
+      entry.throttleTimer = setTimeout(() => {
+        entry.throttleTimer = null;
+        if (entry.dirty && !abort.signal.aborted) void send(false);
+      }, wait);
+      entry.throttleTimer.unref?.();
+    };
+
+    const callServerTool = ({ name, input, toolCallId }) =>
+      withRetries(() =>
+        client.callBotLaneTool({
+          laneId: lane.laneId,
+          botId: lane.botId,
+          machineId,
+          name,
+          input,
+          toolCallId,
+          signal: abort.signal,
+        })
+      );
+
+    // delegate_task in one of this machine's projects: a Durango Code thread
+    // here, started by this app (no agent dispatch needed); Durango records
+    // the task and gets the thread's outcome when it ends.
+    const startThreadHere = async (input, toolCallId) => {
+      const target = await localThreadTarget(input, machineId);
+      if (!target) return null;
+      if (target.error) return { ok: false, error: target.error };
+      const title = String(input?.title ?? '').trim();
+      const instructions = String(input?.instructions ?? '').trim();
+      if (!title || !instructions) return { ok: false, error: 'delegate_task needs a title and instructions.' };
+      const created = await withRetries(() =>
+        client.createBotLaneTask({
+          laneId: lane.laneId,
+          botId: lane.botId,
+          machineId,
+          title,
+          instructions,
+          project: target.project.name,
+          ...(typeof target.project.key === 'string' ? { projectKey: target.project.key } : {}),
+          // A retry after a lost response gets the same task back (no stray running task).
+          ...(toolCallId ? { requestId: String(toolCallId) } : {}),
+          signal: abort.signal,
+        })
+      );
+      const started = await Promise.resolve(
+        startProjectThread({
+          projectId: target.project.id,
+          // The project's notes first (Durango keeps them), then the work.
+          prompt: `${created.brief ? `${created.brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${lane.botName}" that asked for this.`,
+          key: created.taskId,
+          botName: lane.botName,
+          title: created.title || title,
+          accessMode: settings.accessMode,
+        })
+      ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+      if (!started?.ok) {
+        const error = started?.error || 'The Durango Code thread could not start.';
+        void client.reportBotTask({ taskId: created.taskId, machineId, outcome: 'failed', error }).catch(() => {});
+        return { ok: false, error };
+      }
+      rememberTaskThread(created.taskId, started.threadId);
+      return {
+        ok: true,
+        taskId: created.taskId,
+        title: created.title || title,
+        project: target.project.name,
+        status: 'running',
+        note: 'A Durango Code thread is working on it in that project on this computer; the person can watch it in the app. Its report will arrive in your inbox.',
+      };
+    };
+
+    // message_thread: a follow-up turn in a thread here, recorded as a task.
+    const messageThreadHere = async (input, toolCallId) => {
+      const { entry } = await threadTools.findThread(input?.thread_id);
+      const message = String(input?.message ?? '').trim();
+      if (!message) return { ok: false, error: 'message_thread needs a message.' };
+      const title = String(input?.title ?? '').trim() || `Follow-up: ${entry.title || 'thread'}`.slice(0, 80);
+      const created = await withRetries(() =>
+        client.createBotLaneTask({
+          laneId: lane.laneId,
+          botId: lane.botId,
+          machineId,
+          title,
+          instructions: message,
+          ...(toolCallId ? { requestId: String(toolCallId) } : {}),
+          signal: abort.signal,
+        })
+      );
+      const started = await Promise.resolve(
+        startThreadFollowUp({
+          threadId: entry.id,
+          prompt: `${message}\n\n(From the bot "${lane.botName}": end with a concise report of the outcome; it goes back to the bot.)`,
+          key: created.taskId,
+          botName: lane.botName,
+          accessMode: settings.accessMode,
+        })
+      ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+      if (!started?.ok) {
+        const error = started?.error || 'The follow-up could not start.';
+        void client.reportBotTask({ taskId: created.taskId, machineId, outcome: 'failed', error }).catch(() => {});
+        return { ok: false, error };
+      }
+      rememberTaskThread(created.taskId, entry.id);
+      return { ok: true, taskId: created.taskId, threadId: entry.id, status: 'running', note: 'The thread is working on it; the outcome will arrive in your inbox.' };
+    };
+
+    const callTool = async ({ name, input, toolCallId }) => {
+      if (threadTools && (name === 'list_threads' || name === 'read_thread' || name === 'message_thread')) {
+        try {
+          if (name === 'list_threads') return { result: await threadTools.list(input ?? {}) };
+          if (name === 'read_thread') return { result: await threadTools.read(input ?? {}) };
+          if (!startThreadFollowUp) return { result: { ok: false, error: 'Follow-ups are not available here.' } };
+          return { result: await messageThreadHere(input ?? {}, toolCallId) };
+        } catch (error) {
+          return { result: { ok: false, error: error?.message ?? String(error) } };
+        }
+      }
+      if (name === 'delegate_task' && startProjectThread) {
+        try {
+          const result = await startThreadHere(input, toolCallId);
+          if (result) return { result };
+        } catch (error) {
+          return { result: { ok: false, error: error?.message ?? String(error) } };
+        }
+      }
+      return callServerTool({ name, input, toolCallId });
+    };
+
+    let outcome;
+    try {
+      void send(false); // started: the first heartbeat
+      try {
+        // Threads in a project start here (delegate_task `project`); the
+        // thread tools read and follow up this machine's threads.
+        outcome = await runLane({ ...lane, threads: 'machine', tools: threadTools ? [...lane.tools, ...threadTools.definitions] : lane.tools }, {
+          signal: abort.signal,
+          accessMode: settings.accessMode,
+          update,
+          takeInbox: () => send(true),
+          callTool,
+        });
+      } catch (error) {
+        const reason = error?.message ?? String(error);
+        outcome = { text: entry.text, failure: shorten(reason), retryElsewhere: isRetryElsewhereError(reason) };
+      }
+      clearTimers();
+      // Progress already queued goes out before the finish.
+      await entry.chain;
+      if (entry.stopped) return;
+      let body;
+      if (entry.shutdown) {
+        // Turned off or signed out here mid-reply: Durango runs it elsewhere.
+        body = { text: '', retryElsewhere: true };
+      } else {
+        const text = String(outcome?.text ?? '').trim();
+        const failure = outcome?.failure ? shorten(outcome.failure) : null;
+        body =
+          outcome?.retryElsewhere && !text
+            ? { text: '', retryElsewhere: true, ...(failure ? { failure } : {}) }
+            : { text, ...(failure ? { failure } : {}) };
+        if (outcome?.modelId) body.modelId = outcome.modelId;
+        // A take that never got through: its messages (if it claimed any)
+        // never reached this reply, so they go back to the inbox.
+        if (entry.pendingTakeId && !body.retryElsewhere) body.lostTakes = [entry.pendingTakeId];
+      }
+      try {
+        await withRetries(() =>
+          client.finishBotLane({ laneId: lane.laneId, botId: lane.botId, machineId, ...body })
+        );
+      } catch (error) {
+        if (!isLaneGone(error)) log(`finish for ${lane.laneId} failed:`, error?.message ?? error);
+      }
+    } finally {
+      clearTimers();
+      abort.abort();
+      if (running.get(lane.laneId) === entry) running.delete(lane.laneId);
+      wakeSlotWaiters();
+      publish();
+    }
+  };
+
+  const shutdownLanes = () => {
+    for (const entry of running.values()) {
+      if (entry.abort.signal.aborted) continue;
+      entry.shutdown = true;
+      entry.abort.abort();
+    }
+  };
+
+  // --- claim loop ------------------------------------------------------------------------
+
+  const loop = async (myGeneration, signal) => {
+    let failures = 0;
+    const current = () => myGeneration === generation && !signal.aborted && shouldRun();
+    const backoff = async (error) => {
+      failures += 1;
+      const base = Math.min(MAX_BACKOFF_MS, 1_000 * 2 ** Math.min(failures - 1, 6));
+      setStatus('error', error?.message ?? String(error));
+      await sleep(Math.round(base * (0.75 + random() * 0.5)), signal);
+    };
+    while (current()) {
+      if (!isOnline()) {
+        setStatus('offline', null);
+        await sleep(OFFLINE_RECHECK_MS, signal);
+        continue;
+      }
+      if (!(await isAvailable().catch(() => false))) {
+        if (!current()) break;
+        setStatus('unavailable', null);
+        await sleep(unavailableRecheckMs, signal);
+        continue;
+      }
+      if (atLimit()) {
+        setStatus('busy', null);
+        await waitForSlot(signal);
+        continue;
+      }
+      if (!current()) break;
+      setStatus(running.size ? 'running' : 'listening', null);
+      let claimed;
+      try {
+        const machineId = await getMachineId();
+        const info = await Promise.resolve(getMachineInfo()).catch(() => null);
+        const acks = [...stopAcks];
+        claimed = await client.claimBotLane({
+          machineId,
+          platform,
+          ...(info ? { machine: presenceOf(info) } : {}),
+          ...(acks.length ? { ackStopTasks: acks } : {}),
+          waitMs: claimWaitMs,
+          signal,
+        });
+        for (const id of acks) stopAcks.delete(id);
+        failures = 0;
+      } catch (error) {
+        if (!current() || isAbort(error)) continue;
+        if (error instanceof DurangoError && error.code === 'not_signed_in') {
+          setStatus('signed_out', null);
+          break;
+        }
+        await backoff(error);
+        continue;
+      }
+      stopCancelledTasks(claimed?.stopTasks);
+      // No bots on the account: nothing to answer, so check back much later
+      // (wake() — a bot made or messaged here — or a sign-in restarts sooner).
+      if (claimed?.idleMs) {
+        idleWait = new AbortController();
+        await sleep(claimed.idleMs, AbortSignal.any([signal, idleWait.signal]));
+        idleWait = null;
+        continue;
+      }
+      const lane = claimed?.lane;
+      if (!lane || running.has(lane.laneId)) continue;
+      if (!current()) {
+        // Turned off during the claim: let Durango send it elsewhere now.
+        void client
+          .finishBotLane({ laneId: lane.laneId, botId: lane.botId, machineId: await getMachineId(), text: '', retryElsewhere: true })
+          .catch(() => {});
+        continue;
+      }
+      void handleLane(lane).catch((error) => log('lane failed', error?.message ?? error));
+    }
+  };
+
+  const restart = () => {
+    generation += 1;
+    controller?.abort();
+    controller = null;
+    wakeSlotWaiters();
+    if (!shouldRun()) {
+      shutdownLanes();
+      setStatus(!settings.enabled ? 'off' : !signedIn ? 'signed_out' : suspended ? 'paused' : 'off', null);
+      return;
+    }
+    const myController = new AbortController();
+    controller = myController;
+    const myGeneration = generation;
+    const previous = loopPromise ?? Promise.resolve();
+    loopPromise = previous
+      .catch(() => {})
+      .then(() => loop(myGeneration, myController.signal))
+      .catch((error) => log('claim loop stopped', error?.message ?? error))
+      .finally(() => {
+        if (myGeneration === generation && status !== 'signed_out' && status !== 'error') {
+          if (!shouldRun()) setStatus(!settings.enabled ? 'off' : 'paused', null);
+        }
+      });
+  };
+
+  // Whether delegate_task's `project` (and `run_on`) mean a thread on this
+  // machine: → { project } | { error } | null (not here: Durango handles it).
+  async function localThreadTarget(input, machineId) {
+    const projectName = String(input?.project ?? '').trim();
+    if (!projectName) return null;
+    const runOn = String(input?.run_on ?? '').trim().toLowerCase();
+    if (runOn === 'cloud' || runOn === 'web') return null;
+    const info = await Promise.resolve(getMachineInfo()).catch(() => null);
+    if (!info) return null;
+    const name = String(info.name ?? '').trim().toLowerCase();
+    const here =
+      !runOn ||
+      runOn === String(machineId ?? '').toLowerCase() ||
+      runOn === `machine:${String(machineId ?? '').toLowerCase()}` ||
+      (name && (runOn === name || name.includes(runOn)));
+    if (!here) return null;
+    const project = findProject(info.projects, projectName);
+    if (project) return { project };
+    // Asked for here by name, or nothing else could have it: say what exists.
+    if (runOn) {
+      const names = botProjectsForLane(info.projects).map((item) => item.name);
+      return { error: `No Durango Code project named "${projectName}" on this computer. Projects: ${names.join(', ') || 'none'}.` };
+    }
+    return null;
+  }
+
+  function getState() {
+    return {
+      enabled: settings.enabled,
+      signedIn,
+      status,
+      lastError,
+      running: [...running.values()].map((entry) => ({
+        laneId: entry.lane.laneId,
+        botId: entry.lane.botId,
+        botName: entry.lane.botName,
+      })),
+    };
+  }
+
+  return {
+    getState,
+    /** The bot settings (normalizeBotSettings): `enabled` gates the worker, `accessMode` is every reply's. */
+    configure({ settings: nextSettings } = {}) {
+      const previous = settings;
+      settings = normalizeBotSettings(nextSettings);
+      if (previous.enabled !== settings.enabled || !loopPromise) restart();
+      publish();
+    },
+    /**
+     * A bot was just made or messaged here: stop waiting out an idle period.
+     * Only that wait ends: a claim in flight (a reply being handed over) is left alone.
+     */
+    wake() {
+      idleWait?.abort();
+    },
+    accountChanged(isSignedInNow) {
+      const next = Boolean(isSignedInNow);
+      if (next === signedIn && !(next && (status === 'signed_out' || status === 'error'))) return;
+      signedIn = next;
+      restart();
+    },
+    suspend() {
+      if (suspended) return;
+      suspended = true;
+      restart();
+    },
+    resume() {
+      if (!suspended) return;
+      suspended = false;
+      restart();
+    },
+    /** Quit: stop claiming and abort running replies. */
+    stop() {
+      settings = { ...settings, enabled: false };
+      restart();
+    },
+    /** For tests: resolves when the current loop exits. */
+    idle: () => loopPromise ?? Promise.resolve(),
+  };
+};

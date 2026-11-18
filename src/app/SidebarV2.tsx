@@ -267,6 +267,9 @@ const ThreadRowMenu: React.FC<{ actions: RowMenuAction[]; label: string; onOpenC
   );
 };
 
+const HOVER_CARD_WIDTH = 300;
+const HOVER_CARD_GAP = 8;
+
 const ThreadHoverCard: React.FC<{
   anchor: DOMRect;
   thread: Thread;
@@ -274,11 +277,27 @@ const ThreadHoverCard: React.FC<{
   modelLabel: string | null;
 }> = ({ anchor, thread, project, modelLabel }) => {
   const cardRef = useRef<HTMLDivElement>(null);
-  const [top, setTop] = useState(anchor.top);
+  const [position, setPosition] = useState({ left: anchor.right + HOVER_CARD_GAP, top: anchor.top });
+  // Beside the row: to its right in the sidebar; where a row is too wide for
+  // that (Sidebar v3's project page), to its left, else below it. Always
+  // inside the window.
   useLayoutEffect(() => {
     const height = cardRef.current?.offsetHeight ?? 0;
-    setTop(Math.max(8, Math.min(anchor.top, window.innerHeight - height - 8)));
-  }, [anchor.top]);
+    const width = cardRef.current?.offsetWidth ?? HOVER_CARD_WIDTH;
+    const margin = 8;
+    const clampTop = (value: number) => Math.max(margin, Math.min(value, window.innerHeight - height - margin));
+    if (anchor.right + HOVER_CARD_GAP + width + margin <= window.innerWidth) {
+      setPosition({ left: anchor.right + HOVER_CARD_GAP, top: clampTop(anchor.top) });
+    } else if (anchor.left - HOVER_CARD_GAP - width >= margin) {
+      setPosition({ left: anchor.left - HOVER_CARD_GAP - width, top: clampTop(anchor.top) });
+    } else {
+      const below = anchor.bottom + 6 + height + margin <= window.innerHeight;
+      setPosition({
+        left: Math.max(margin, Math.min(anchor.right - width, window.innerWidth - width - margin)),
+        top: clampTop(below ? anchor.bottom + 6 : anchor.top - height - 6),
+      });
+    }
+  }, [anchor.top, anchor.left, anchor.right, anchor.bottom]);
   const status =
     thread.status === 'running'
       ? 'Working'
@@ -293,8 +312,8 @@ const ThreadHoverCard: React.FC<{
     <div
       ref={cardRef}
       role="tooltip"
-      className="pointer-events-none fixed z-[1050] w-[300px] animate-[sidebar-menu-in_140ms_cubic-bezier(0.22,1,0.36,1)] rounded-xl border border-white/10 bg-[rgb(20_20_22_/_0.98)] px-3.5 py-3 text-neutral-200 shadow-[0_16px_48px_rgb(0_0_0_/_0.55)] backdrop-blur-md"
-      style={{ left: anchor.right + 8, top }}
+      className="pointer-events-none fixed z-[1050] w-[300px] max-w-[calc(100vw-16px)] animate-[sidebar-menu-in_140ms_cubic-bezier(0.22,1,0.36,1)] rounded-xl border border-white/10 bg-[rgb(20_20_22_/_0.98)] px-3.5 py-3 text-neutral-200 shadow-[0_16px_48px_rgb(0_0_0_/_0.55)] backdrop-blur-md"
+      style={position}
     >
       <div className="text-[13px] font-semibold leading-snug text-neutral-100">{thread.title}</div>
       <div className="mt-2 flex flex-col gap-1.5 text-[12px] text-neutral-400">
@@ -354,7 +373,7 @@ const putAwayOnce = (putAway: () => void) => {
   putAway();
 };
 
-type ThreadRowProps = {
+export type ThreadRowProps = {
   thread: Thread;
   view: SidebarV2View;
   project: Project | undefined;
@@ -365,9 +384,12 @@ type ThreadRowProps = {
   actions: SidebarV2Actions;
   onStartRename: (threadId: string) => void;
   onEndRename: () => void;
+  /** The hover card at the pointer instead of beside the row (wide rows, e.g. Sidebar v3's project page). */
+  hoverAtPointer?: boolean;
 };
 
-const ThreadRow = React.memo(function ThreadRow({
+// Also Sidebar v3's project page threads (BotsWorkspace.tsx).
+export const ThreadRow = React.memo(function ThreadRow({
   thread,
   view,
   project,
@@ -378,10 +400,18 @@ const ThreadRow = React.memo(function ThreadRow({
   actions: model,
   onStartRename,
   onEndRename,
+  hoverAtPointer = false,
 }: ThreadRowProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [hoverAnchor, setHoverAnchor] = useState<DOMRect | null>(null);
   const rowRef = useRef<HTMLDivElement>(null);
+  const pointerRef = useRef<{ x: number; y: number } | null>(null);
+  // The card's anchor: the row, or a point just off the pointer.
+  const hoverAnchorNow = () => {
+    const pointer = pointerRef.current;
+    if (hoverAtPointer && pointer) return new DOMRect(pointer.x + 6, pointer.y + 10, 0, 0);
+    return rowRef.current?.getBoundingClientRect() ?? null;
+  };
   const hoverTimerRef = useRef<number | null>(null);
   const clearHoverTimer = () => {
     if (hoverTimerRef.current !== null) window.clearTimeout(hoverTimerRef.current);
@@ -495,15 +525,25 @@ const ThreadRow = React.memo(function ThreadRow({
         event.dataTransfer.setData('text/plain', thread.id);
         event.dataTransfer.effectAllowed = 'copy';
       }}
-      onMouseEnter={() => {
+      onMouseEnter={(event) => {
         clearHoverTimer();
+        pointerRef.current = { x: event.clientX, y: event.clientY };
         // Hovered on the way to a click: another machine's thread starts
         // loading now, so it opens current.
         if (thread.remote) model.readAheadRemoteThread(thread.id);
         hoverTimerRef.current = window.setTimeout(() => {
-          if (rowRef.current) setHoverAnchor(rowRef.current.getBoundingClientRect());
+          setHoverAnchor(hoverAnchorNow());
         }, HOVER_CARD_DELAY_MS);
       }}
+      onMouseMove={
+        hoverAtPointer
+          ? (event) => {
+              pointerRef.current = { x: event.clientX, y: event.clientY };
+              // Shown already: it follows the pointer.
+              if (hoverAnchor) setHoverAnchor(hoverAnchorNow());
+            }
+          : undefined
+      }
       onMouseLeave={() => {
         clearHoverTimer();
         setHoverAnchor(null);

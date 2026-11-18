@@ -118,6 +118,23 @@ export type SidebarV2Settings = {
   settledExistingAt?: string;
 };
 
+/**
+ * Sidebar v3 (Settings → Experimental): the sidebar lists the person's
+ * Durango bots instead of threads, and the main panel shows the picked bot's
+ * conversation (src/app/BotsWorkspace.tsx). Off by default.
+ */
+export type SidebarV3Settings = {
+  enabled: boolean;
+  /** The bot open in the main panel. */
+  selectedBotId?: string | null;
+  /** What the main panel shows: the picked bot, the selected thread (the usual thread view), the projects window or one project. */
+  view?: 'bot' | 'thread' | 'projects' | 'project';
+  /** The project open in the projects window: a Durango Code project id, or `bot:<botId>` for a project bot's project not open here. */
+  selectedProjectId?: string | null;
+};
+
+export const defaultSidebarV3Settings: SidebarV3Settings = { enabled: false, selectedBotId: null };
+
 /** Settings → Cosmetics. */
 export type AppearanceSettings = {
   /** Zoom factor for the whole window (text, icons and spacing alike). */
@@ -215,6 +232,23 @@ export type DurangoSettings = {
   dispatch: DurangoDispatchSettings;
   /** "Deploy changes landed elsewhere" (main: durango-deploy-watcher.js). */
   deployWatcher: DurangoDeployWatcherSettings;
+  /** Durango bots on this computer (main: bot-replies.js, local-bots.js). Absent = defaults. */
+  bots?: DurangoBotsSettings;
+};
+
+export type DurangoBotsSettings = {
+  /**
+   * Answer the person's Durango bots on this computer's Claude Code. On by
+   * default: replies run here unless a bot's own order says otherwise.
+   */
+  enabled: boolean;
+  /** What a bot reply (and a thread it starts) may do here. */
+  accessMode: 'read-only' | 'workspace-write' | 'full-access';
+};
+
+export const defaultDurangoBotsSettings: DurangoBotsSettings = {
+  enabled: true,
+  accessMode: 'workspace-write',
 };
 
 export type DurangoDeployWatcherSettings = {
@@ -1266,6 +1300,7 @@ interface OrionState {
   snapShotSettings: SnapShotSettings;
   deploymentSettings: DeploymentSettings;
   sidebarV2Settings: SidebarV2Settings;
+  sidebarV3Settings: SidebarV3Settings;
   browserSettings: BrowserSettings;
   appearanceSettings: AppearanceSettings;
 
@@ -1318,6 +1353,7 @@ interface OrionState {
   setSnapShotSettings: (updates: Partial<SnapShotSettings>) => void;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
   setSidebarV2Settings: (updates: Partial<SidebarV2Settings>) => void;
+  setSidebarV3Settings: (updates: Partial<SidebarV3Settings>) => void;
   setAppearanceSettings: (updates: Partial<AppearanceSettings>) => void;
 
   createThread: (
@@ -2259,6 +2295,7 @@ const PERSISTED_SOURCE_KEYS = [
   'selectedProjectId',
   'selectedThreadId',
   'sidebarV2Settings',
+  'sidebarV3Settings',
   'snapShotSettings',
   'splitViewSettings',
   'textGenerationSettings',
@@ -2315,6 +2352,7 @@ const buildPersistedSettings = (state: OrionState) => ({
           ...state.sidebarV2Settings,
           views: { ...defaultSidebarV2Settings.views, ...state.sidebarV2Settings?.views },
         },
+        sidebarV3Settings: { ...defaultSidebarV3Settings, ...state.sidebarV3Settings },
         appearanceSettings: { ...defaultAppearanceSettings, ...state.appearanceSettings },
         browserSettings: { ...defaultBrowserSettings, ...state.browserSettings },
         workspacePath: state.workspacePath,
@@ -2364,6 +2402,7 @@ export const useOrionStore = create<OrionState>()(
       snapShotSettings: defaultSnapShotSettings,
       deploymentSettings: defaultDeploymentSettings,
       sidebarV2Settings: defaultSidebarV2Settings,
+      sidebarV3Settings: defaultSidebarV3Settings,
       browserSettings: defaultBrowserSettings,
       appearanceSettings: defaultAppearanceSettings,
       workspacePath: null,
@@ -2857,6 +2896,11 @@ export const useOrionStore = create<OrionState>()(
       setAppearanceSettings: (updates) =>
         set((state) => ({
           appearanceSettings: { ...defaultAppearanceSettings, ...state.appearanceSettings, ...updates },
+        })),
+
+      setSidebarV3Settings: (updates) =>
+        set((state) => ({
+          sidebarV3Settings: { ...defaultSidebarV3Settings, ...state.sidebarV3Settings, ...updates },
         })),
 
       setSidebarV2Settings: (updates) =>
@@ -3553,6 +3597,7 @@ export const useOrionStore = create<OrionState>()(
         merged.snapShotSettings = mergeSnapShotSettings(merged.snapShotSettings);
         merged.appearanceSettings = { ...defaultAppearanceSettings, ...merged.appearanceSettings };
         merged.browserSettings = { ...defaultBrowserSettings, ...merged.browserSettings };
+        merged.sidebarV3Settings = { ...defaultSidebarV3Settings, ...merged.sidebarV3Settings };
         // The Pinned group starts off on every launch; turning it on lasts
         // until the app quits. Stores from when sidebar v2 was opt-in turn it
         // on once; those that never had it on get the first-switch settle

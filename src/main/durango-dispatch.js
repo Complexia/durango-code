@@ -253,7 +253,16 @@ export const dispatchEffort = (effort, model) => {
   return listed.find((entry) => entry === wanted) ?? listed.find((entry) => modelKey(entry) === modelKey(wanted)) ?? (model ? wanted : wanted.toLowerCase());
 };
 
-export const buildMachinePayload = ({ machineId, name, platform, projects, allowedProjectIds = null, sourceCheckout = false, models = [] }) => {
+export const buildMachinePayload = ({
+  machineId,
+  name,
+  platform,
+  projects,
+  allowedProjectIds = null,
+  sourceCheckout = false,
+  models = [],
+  extraCapabilities = [],
+}) => {
   const listed = registeredModels(models);
   const available = new Set(
     (Array.isArray(models) ? models : [])
@@ -272,10 +281,15 @@ export const buildMachinePayload = ({ machineId, name, platform, projects, allow
         name: String(project.name).slice(0, 200),
         repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null,
       })),
-    capabilities:
-      sourceCheckout && (allowedProjectIds === null || allowedProjectIds === undefined)
-        ? [...DISPATCH_CAPABILITIES, SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
-        : DISPATCH_CAPABILITIES,
+    capabilities: [
+      ...DISPATCH_CAPABILITIES,
+      ...(sourceCheckout && (allowedProjectIds === null || allowedProjectIds === undefined)
+        ? [SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
+        : []),
+      ...(Array.isArray(extraCapabilities)
+        ? extraCapabilities.filter((capability) => typeof capability === 'string' && capability && !DISPATCH_CAPABILITIES.includes(capability))
+        : []),
+    ],
     models: listed,
     // Models left out (cap or overlong ids): Durango lets this machine judge unlisted ones.
     ...(listed.length < available.size ? { modelsTruncated: true } : {}),
@@ -349,6 +363,8 @@ const isAbort = (error) =>
  * - isOnline(): boolean
  * - canStart(): boolean            a renderer can take commands (a window is open)
  * - onStateChange(state): void
+ * - extraCapabilities(): Promise<string[]>   what else this machine offers right now
+ *     (e.g. "bot-replies" while Claude Code can run here); re-registers when it changes
  */
 export const createDispatchWorker = ({
   client,
@@ -370,6 +386,7 @@ export const createDispatchWorker = ({
   isOnline = () => true,
   canStart = () => true,
   onStateChange = () => {},
+  extraCapabilities = async () => [],
   sleep = abortableSleep,
   random = Math.random,
   heartbeatMs = DISPATCH_HEARTBEAT_MS,
@@ -429,6 +446,7 @@ export const createDispatchWorker = ({
       allowedProjectIds: settings.allowedProjectIds,
       sourceCheckout: Boolean(checkoutProject),
       models: await listModels().catch(() => []),
+      extraCapabilities: await extraCapabilities().catch(() => []),
     });
     return { payload, signature: JSON.stringify(payload) };
   };

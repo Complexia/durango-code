@@ -53,6 +53,7 @@ import {
   defaultNotificationSettings,
   defaultDurangoSettings,
   defaultDurangoDispatchSettings,
+  defaultDurangoBotsSettings,
   defaultDurangoDeployWatcherSettings,
   defaultSidebarV2Settings,
   defaultAppearanceSettings,
@@ -252,6 +253,8 @@ import type {
 // counterpart, node-pty, is likewise only import()ed on first terminal:ensure.)
 const TerminalView = React.lazy(() => import('./TerminalView'));
 const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
+// Sidebar v3 (experimental, off by default): loaded only when it is turned on.
+const BotsWorkspace = React.lazy(() => import('./app/BotsWorkspace').then((module) => ({ default: module.BotsWorkspace })));
 import ThemeLayer from './app/themes/ThemeLayer';
 import { CommunityInstallDialog } from './app/themes/CommunityThemes';
 // Remote control is opt-in and rarely on screen; keep its view out of the
@@ -1476,8 +1479,15 @@ const App: React.FC = () => {
     selectedThread.status === 'idle' &&
     !isSending;
 
-  const shellTitle =
-    activeTab === 'agents'
+  const sidebarV3Enabled = useOrionStore((state) => state.sidebarV3Settings?.enabled === true);
+  const sidebarV3View = useOrionStore((state) => state.sidebarV3Settings?.view ?? 'bot');
+  // Sidebar v3 showing a bot or the projects window: no thread is on screen.
+  const v3AwayFromThread = activeTab === 'agents' && sidebarV3Enabled && sidebarV3View !== 'thread';
+  const shellTitle = v3AwayFromThread
+    ? sidebarV3View === 'projects' || sidebarV3View === 'project'
+      ? 'Projects'
+      : 'Bots'
+    : activeTab === 'agents'
       ? (selectedThread?.title ?? 'New thread')
       : activeFilePath
         ? (activeFilePath.split(/[\\/]/).pop() ?? 'Code')
@@ -3097,6 +3107,7 @@ const App: React.FC = () => {
         useDurangoTasks: settings.useDurangoTasks !== false,
         dispatch: { ...defaultDurangoDispatchSettings, ...settings.dispatch },
         deployWatcher: { ...defaultDurangoDeployWatcherSettings, ...settings.deployWatcher },
+        bots: { ...defaultDurangoBotsSettings, ...settings.bots },
         projects: dispatchProjectsPayload(state.projects),
       })
       .catch(() => {});
@@ -8927,11 +8938,14 @@ const App: React.FC = () => {
           });
         } else if (dispatch) {
           const project = findProjectById(useOrionStore.getState(), thread!.projectId);
+          // A bot's thread starts with the project's notes: its title is the task's.
           const firstLine =
-            promptText
+            dispatch.title?.trim() ||
+            (promptText
+              .replace(/^\[Project notes: [^\]]*\][\s\S]*?\[\/Project notes\]\s*/, '')
               .split('\n')
               .map((line) => line.trim())
-              .find((line) => line && !/^\[(Started|Sent) from /.test(line)) ?? '';
+              .find((line) => line && !/^\[(Started|Sent) from /.test(line)) ?? '');
           let title = firstLine.length > 60 ? `${firstLine.slice(0, 59).trimEnd()}…` : firstLine;
           let linkNote = '';
           if (dispatch.taskId && window.orion?.linkBoardTask) {
@@ -8963,9 +8977,11 @@ const App: React.FC = () => {
           addMessageToThread(threadId, {
             role: 'system',
             content:
-              `Started remotely from ${dispatchSource}${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
+              `${dispatch.origin === 'bot' ? 'Started by' : 'Started remotely from'} ${dispatchSource}${dispatch.sourceUrl ? ` (${dispatch.sourceUrl})` : ''}. ` +
               `Access: ${accessLabel}${askedForEdits ? ' (this Mac\'s limit for agents started from Durango)' : ''}. ` +
-              (dispatch.origin === 'tasks'
+              (dispatch.origin === 'bot'
+                ? 'The prompt came from your bot; review the changes before you ship them.'
+                : dispatch.origin === 'tasks'
                 ? 'The prompt came from the task; review the changes before you ship them.'
                 : dispatch.origin === 'api'
                   ? 'The prompt came from an app connected to your Durango account; review the changes before you ship them.'
@@ -9065,6 +9081,14 @@ const App: React.FC = () => {
         // Claiming yields to main, so resolve the thread again only after main
         // has atomically confirmed that this command is still authorized.
         const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        // A cancelled bot task stops its own run only: once that run ended (or
+        // the thread moved on to another turn) nothing here is stopped.
+        if (
+          command.stopDispatchId &&
+          (thread?.durangoDispatch?.id !== command.stopDispatchId || thread.durangoDispatch.reportedAt)
+        ) {
+          return { ok: false, error: 'No running turn on that thread.' };
+        }
         if (thread && remoteThreadRuntime(thread.modelId) === 'terminal') {
           if (thread.status !== 'running') {
             return { ok: false, error: 'No running turn on that thread.' };
@@ -9313,15 +9337,31 @@ const App: React.FC = () => {
           continue;
         }
         inFlight.add(dispatch.id);
-        updateThread(thread.id, { durangoDispatch: { ...dispatch, reportedAt: new Date().toISOString() } });
+        // A bot task's outcome counts as reported only once Durango has it:
+        // offline through every retry, it is tried again later (and on the
+        // next launch) instead of leaving the task "running" for good.
+        const botTask = dispatch.id.startsWith('bottask:');
+        if (!botTask) updateThread(thread.id, { durangoDispatch: { ...dispatch, reportedAt: new Date().toISOString() } });
         const settled = window.orion?.durangoDispatchSettled?.({
           dispatchId: dispatch.id,
           threadId: thread.id,
           ...outcome,
         });
         void Promise.resolve(settled)
-          .catch(() => {})
-          .finally(() => inFlight.delete(dispatch.id));
+          .then(
+            (result) => (result as { retry?: boolean } | undefined)?.retry !== true,
+            () => false
+          )
+          .then((delivered) => {
+            inFlight.delete(dispatch.id);
+            if (!botTask) return;
+            if (delivered) {
+              const current = useOrionStore.getState().threads.find((candidate) => candidate.id === thread.id)?.durangoDispatch;
+              if (current?.id === dispatch.id) updateThread(thread.id, { durangoDispatch: { ...current, reportedAt: new Date().toISOString() } });
+              return;
+            }
+            window.setTimeout(() => check(useOrionStore.getState().threads), 60_000);
+          });
       }
     };
     check(useOrionStore.getState().threads);
@@ -10852,6 +10892,127 @@ const App: React.FC = () => {
     </div>
   ) : null;
 
+  // The thread view: the Agents tab's main panel, and Sidebar v3's when a
+  // thread is open there.
+  const agentsThreadPanel = (
+        <div
+          className={`panel agents-panel${threadDropActive ? ' thread-drop-active' : ''}`}
+          onDragOver={handleThreadDragOver}
+          onDragLeave={handleThreadDragLeave}
+          onDrop={handleThreadDrop}
+        >
+          {threadDropActive && (
+            <div className={`thread-drop-hint${splitFull ? ' full' : ''}`}>
+              <Columns3 size={18} />
+              <span>
+                {splitFull
+                  ? `Split view is full — ${MAX_THREAD_PANES} panes is the limit`
+                  : threadPanes.length === 0
+                    ? 'Drop to open this thread'
+                    : 'Drop to open beside the current view'}
+              </span>
+            </div>
+          )}
+          {threadPanes.length === 0 ? (
+            // The effect above opens a fresh composer within a frame, so
+            // the panel stays blank meanwhile; the placeholder is only
+            // for when there is no project to start a thread in.
+            storeHydrated && !defaultNewThreadProject && (
+              <div className="empty-state">
+                <div className="empty-state-icon">
+                  <Bot size={30} />
+                </div>
+                <div className="empty-state-title">Select a thread</div>
+                <div className="text-xs text-[#6b6b74]">Pick a conversation or start a new one</div>
+              </div>
+            )
+          ) : (
+            <div className={`thread-panes count-${threadPanes.length}`}>
+              {threadPanes.map((pane) => {
+                const tasksCardState = tasksCardStates[pane.thread.id] ?? {
+                  position: null,
+                  collapsed: false,
+                  dismissedFor: null,
+                };
+                return (
+                  <ThreadPane
+                    key={pane.thread.id}
+                    thread={pane.thread}
+                    project={pane.project}
+                    focused={pane.focused}
+                    split={threadPanes.length > 1}
+                    onFocus={() => selectThread(pane.thread.id)}
+                    onClose={() => closeThreadPane(pane.thread.id)}
+                    statusDot={renderThreadStatusDot(pane.thread)}
+                  >
+                    <DeviceCard threadId={pane.thread.id} />
+                    {pane.isTerminal ? (
+                      // Mounting spawns the CLI: hold off while the thread's
+                      // workspace is being removed so it never opens in a
+                      // directory that is about to go away.
+                      pane.workspaceUnavailable ? (
+                        <div className="terminal-view" />
+                      ) : (
+                        <React.Suspense fallback={<div className="terminal-view" />}>
+                          <TerminalView
+                            key={pane.thread.id}
+                            threadId={pane.thread.id}
+                            projectPath={pane.projectPath ?? ''}
+                            accessMode={pane.thread.accessMode ?? 'full-access'}
+                            focused={pane.focused}
+                            resumeSessionId={pane.thread.agentSessionIds?.claude}
+                            forkSession={pane.thread.pendingForkProviders?.includes('claude')}
+                            generalInstructions={[
+                              normalizedOrchestrationSettings.generalInstructions.trim(),
+                              terminalDurangoMemoryBlock,
+                            ]
+                              .filter(Boolean)
+                              .join('\n\n')}
+                          />
+                        </React.Suspense>
+                      )
+                    ) : (
+                      <ChatTranscript
+                        threadId={pane.thread.id}
+                        projectName={pane.project?.name}
+                        canChangeProject={pane.canChangeProject}
+                        onOpenProjectPicker={openProjectPicker}
+                        agentModels={agentModels}
+                        mediaBaseDirs={pane.mediaBaseDirs}
+                        isSending={pane.isSending}
+                        remoteMachineUnreachable={
+                          pane.thread.remote
+                            ? remoteMachineUnreachableReason(pane.thread.remote.machineId)
+                            : undefined
+                        }
+                        steerSupported={pane.steerSupported}
+                        steerReady={pane.steerReady}
+                        authenticatingProviderId={authenticatingProviderId}
+                        {...paneChatRefs(pane.thread.id)}
+                        chatScrollPositionsRef={chatScrollPositionsRef}
+                        tasksCardPosition={tasksCardState.position}
+                        tasksCardCollapsed={tasksCardState.collapsed}
+                        tasksCardDismissedFor={tasksCardState.dismissedFor}
+                        onMoveTasksCard={moveTasksCard}
+                        onToggleTasksCard={toggleTasksCard}
+                        onDismissTasksCard={dismissTasksCard}
+                        onMarkTaskDone={markLinkedTaskDone}
+                        onUnlinkTask={unlinkTaskFromThread}
+                        onDismissBtwExchange={dismissBtwExchange}
+                        onAuthenticateProvider={handleAuthenticateProvider}
+                        onDiscardClaudeBackgroundTasks={discardClaudeBackgroundTasks}
+                        onSteerQueuedMessage={steerQueuedMessage}
+                      />
+                    )}
+                    {pane.focused ? composerNode : null}
+                  </ThreadPane>
+                );
+              })}
+            </div>
+          )}
+        </div>
+  );
+
   return (
     <div
       className={`app-container ${draggingFiles ? 'dragging-files' : ''}`}
@@ -10899,7 +11060,7 @@ const App: React.FC = () => {
 
         <div className="shell-main-chrome">
           <div className="shell-title-group">
-            {activeTab === 'agents' && activeThreadProject && (
+            {activeTab === 'agents' && !v3AwayFromThread && activeThreadProject && (
               <>
                 <div className="shell-project-control shell-breadcrumb-project" ref={projectPickerRef}>
                   <button
@@ -10950,7 +11111,7 @@ const App: React.FC = () => {
                 {selectedThread && <span className="shell-breadcrumb-separator">/</span>}
               </>
             )}
-            {activeTab === 'agents' && selectedThread ? (
+            {activeTab === 'agents' && !v3AwayFromThread && selectedThread ? (
               <div className="thread-title-menu shell-thread-title-menu" ref={threadMenuRef}>
                 {threadRenameKey === `shell:${selectedThread.id}` ? (
                   <InlineRenameInput
@@ -11020,7 +11181,7 @@ const App: React.FC = () => {
             ) : (
               <span className="shell-title truncate">{shellTitle}</span>
             )}
-            {activeTab === 'agents' && selectedThread?.goal && (
+            {activeTab === 'agents' && !v3AwayFromThread && selectedThread?.goal && (
               <div className="goal-chip-wrap" ref={goalMenuRef}>
                 <button
                   type="button"
@@ -11088,7 +11249,7 @@ const App: React.FC = () => {
               </>
             )}
 
-            {activeTab === 'agents' && selectedThread && (
+            {activeTab === 'agents' && !v3AwayFromThread && selectedThread && (
               <span className={`status-dot shell-status-dot ${selectedThread.status}`} />
             )}
             <ThemeSlot name="titlebar-center" />
@@ -11240,7 +11401,20 @@ const App: React.FC = () => {
       {!settingsOpen && (
         <div className="main-content">
           {/* ========== AGENTS TAB ========== */}
-          {activeTab === 'agents' && (
+          {/* Sidebar v3 (Settings → Experimental): bots instead of threads. */}
+          {activeTab === 'agents' && sidebarV3Enabled && (
+            <React.Suspense fallback={null}>
+              <BotsWorkspace
+                sidebarFooterProps={sidebarFooterProps}
+                threadPanel={agentsThreadPanel}
+                onNewThread={stableAgentsSidebarActions.handleCreateThread}
+                threadActions={sidebarV2Actions}
+                attentionThreadIds={attentionThreadIds}
+                paneThreadIds={paneThreadIds}
+              />
+            </React.Suspense>
+          )}
+          {activeTab === 'agents' && !sidebarV3Enabled && (
             <>
               {/* Sidebar: Projects + Threads */}
               {sidebarV2Enabled ? (
@@ -11267,123 +11441,8 @@ const App: React.FC = () => {
                 <AgentsSidebar {...agentsSidebarModel} />
               )}
 
-              {/* Main Panel: Thread view */}
-              <div
-                className={`panel agents-panel${threadDropActive ? ' thread-drop-active' : ''}`}
-                onDragOver={handleThreadDragOver}
-                onDragLeave={handleThreadDragLeave}
-                onDrop={handleThreadDrop}
-              >
-                {threadDropActive && (
-                  <div className={`thread-drop-hint${splitFull ? ' full' : ''}`}>
-                    <Columns3 size={18} />
-                    <span>
-                      {splitFull
-                        ? `Split view is full — ${MAX_THREAD_PANES} panes is the limit`
-                        : threadPanes.length === 0
-                          ? 'Drop to open this thread'
-                          : 'Drop to open beside the current view'}
-                    </span>
-                  </div>
-                )}
-                {threadPanes.length === 0 ? (
-                  // The effect above opens a fresh composer within a frame, so
-                  // the panel stays blank meanwhile; the placeholder is only
-                  // for when there is no project to start a thread in.
-                  storeHydrated && !defaultNewThreadProject && (
-                    <div className="empty-state">
-                      <div className="empty-state-icon">
-                        <Bot size={30} />
-                      </div>
-                      <div className="empty-state-title">Select a thread</div>
-                      <div className="text-xs text-[#6b6b74]">Pick a conversation or start a new one</div>
-                    </div>
-                  )
-                ) : (
-                  <div className={`thread-panes count-${threadPanes.length}`}>
-                    {threadPanes.map((pane) => {
-                      const tasksCardState = tasksCardStates[pane.thread.id] ?? {
-                        position: null,
-                        collapsed: false,
-                        dismissedFor: null,
-                      };
-                      return (
-                        <ThreadPane
-                          key={pane.thread.id}
-                          thread={pane.thread}
-                          project={pane.project}
-                          focused={pane.focused}
-                          split={threadPanes.length > 1}
-                          onFocus={() => selectThread(pane.thread.id)}
-                          onClose={() => closeThreadPane(pane.thread.id)}
-                          statusDot={renderThreadStatusDot(pane.thread)}
-                        >
-                          <DeviceCard threadId={pane.thread.id} />
-                          {pane.isTerminal ? (
-                            // Mounting spawns the CLI: hold off while the thread's
-                            // workspace is being removed so it never opens in a
-                            // directory that is about to go away.
-                            pane.workspaceUnavailable ? (
-                              <div className="terminal-view" />
-                            ) : (
-                              <React.Suspense fallback={<div className="terminal-view" />}>
-                                <TerminalView
-                                  key={pane.thread.id}
-                                  threadId={pane.thread.id}
-                                  projectPath={pane.projectPath ?? ''}
-                                  accessMode={pane.thread.accessMode ?? 'full-access'}
-                                  focused={pane.focused}
-                                  resumeSessionId={pane.thread.agentSessionIds?.claude}
-                                  forkSession={pane.thread.pendingForkProviders?.includes('claude')}
-                                  generalInstructions={[
-                                    normalizedOrchestrationSettings.generalInstructions.trim(),
-                                    terminalDurangoMemoryBlock,
-                                  ]
-                                    .filter(Boolean)
-                                    .join('\n\n')}
-                                />
-                              </React.Suspense>
-                            )
-                          ) : (
-                            <ChatTranscript
-                              threadId={pane.thread.id}
-                              projectName={pane.project?.name}
-                              canChangeProject={pane.canChangeProject}
-                              onOpenProjectPicker={openProjectPicker}
-                              agentModels={agentModels}
-                              mediaBaseDirs={pane.mediaBaseDirs}
-                              isSending={pane.isSending}
-                              remoteMachineUnreachable={
-                                pane.thread.remote
-                                  ? remoteMachineUnreachableReason(pane.thread.remote.machineId)
-                                  : undefined
-                              }
-                              steerSupported={pane.steerSupported}
-                              steerReady={pane.steerReady}
-                              authenticatingProviderId={authenticatingProviderId}
-                              {...paneChatRefs(pane.thread.id)}
-                              chatScrollPositionsRef={chatScrollPositionsRef}
-                              tasksCardPosition={tasksCardState.position}
-                              tasksCardCollapsed={tasksCardState.collapsed}
-                              tasksCardDismissedFor={tasksCardState.dismissedFor}
-                              onMoveTasksCard={moveTasksCard}
-                              onToggleTasksCard={toggleTasksCard}
-                              onDismissTasksCard={dismissTasksCard}
-                              onMarkTaskDone={markLinkedTaskDone}
-                              onUnlinkTask={unlinkTaskFromThread}
-                              onDismissBtwExchange={dismissBtwExchange}
-                              onAuthenticateProvider={handleAuthenticateProvider}
-                              onDiscardClaudeBackgroundTasks={discardClaudeBackgroundTasks}
-                              onSteerQueuedMessage={steerQueuedMessage}
-                            />
-                          )}
-                          {pane.focused ? composerNode : null}
-                        </ThreadPane>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
+              {/* Main Panel: Thread view (also inside Sidebar v3 when a thread is open there) */}
+              {agentsThreadPanel}
 
               {browserVisible && (
                 <BrowserPanel

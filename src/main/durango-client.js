@@ -393,6 +393,77 @@ const normalizeDispatch = (dispatch) => {
   };
 };
 
+// --- Bot replies: a Durango bot's reply run on this machine's Claude Code ------------
+
+export const BOT_LANE_DEFAULT_HEARTBEAT_MS = 10_000;
+// Bot tools can take a while (searches, generations); the default 15 s is too short.
+const BOT_TOOL_TIMEOUT_MS = 180_000;
+const BOT_TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+
+const normalizeBotTool = (tool) => {
+  const name = str(tool?.name).trim();
+  if (!BOT_TOOL_NAME.test(name)) return null;
+  return {
+    name,
+    description: str(tool?.description),
+    inputSchema: tool?.inputSchema && typeof tool.inputSchema === 'object' ? tool.inputSchema : { type: 'object', properties: {} },
+  };
+};
+
+export const normalizeBotLane = (lane) => {
+  if (!lane || typeof lane !== 'object') return null;
+  const laneId = str(lane.laneId).trim();
+  const botId = str(lane.botId).trim();
+  if (!laneId || !botId) return null;
+  const seen = new Set();
+  const tools = [];
+  for (const tool of Array.isArray(lane.tools) ? lane.tools : []) {
+    const normalized = normalizeBotTool(tool);
+    if (!normalized || seen.has(normalized.name)) continue;
+    seen.add(normalized.name);
+    tools.push(normalized);
+  }
+  return {
+    laneId,
+    botId,
+    botName: str(lane.botName).trim() || 'Bot',
+    threadId: str(lane.threadId),
+    replyMessageId: str(lane.replyMessageId),
+    /** Claude Code model id ("claude-opus-5-5"); null = Claude Code's default. */
+    model: str(lane.model).trim() || null,
+    /** Appended to Claude Code's system prompt. */
+    systemPrompt: str(lane.systemPrompt),
+    prompt: str(lane.prompt),
+    tools,
+    heartbeatMs: clampInt(lane.heartbeatMs, 2_000, 60_000, BOT_LANE_DEFAULT_HEARTBEAT_MS),
+  };
+};
+
+const BOT_INBOX_SOURCES = new Set(['person', 'routine', 'task', 'bot']);
+export const normalizeBotInbox = (inbox) =>
+  (Array.isArray(inbox) ? inbox : [])
+    .filter((item) => item && typeof item === 'object' && typeof item.content === 'string')
+    .map((item) => ({
+      seq: Number.isFinite(Number(item.seq)) ? Number(item.seq) : null,
+      source: BOT_INBOX_SOURCES.has(item.source) ? item.source : 'person',
+      label: typeof item.label === 'string' && item.label.trim() ? item.label.trim() : null,
+      content: item.content,
+    }));
+
+const botLanePath = (laneId, action) => {
+  const id = str(laneId).trim();
+  if (!id) throw new DurangoError('api', 'A lane id is required.');
+  return `/code/bots/lanes/${encodeURIComponent(id)}/${action}`;
+};
+
+/**
+ * The account a desktop session belongs to (its user id, else its token), for
+ * requests pinned to one account (`account` below): a sync started for one
+ * account never sends to another, even across a key refresh.
+ */
+export const accountKeyOf = (session) =>
+  session?.token ? (session.user?.id ? `user:${session.user.id}` : `token:${session.token}`) : null;
+
 export const createDurangoClient = ({
   credentials,
   readSession,
@@ -402,10 +473,18 @@ export const createDurangoClient = ({
   webOrigin = () => DEFAULT_DURANGO_URL,
 }) => {
   const chatUrls = createChatUrlMemory();
-  const request = async (method, apiPath, { query, body, timeout = timeoutMs, signal, headers: extraHeaders } = {}) => {
+  const request = async (method, apiPath, { query, body, form, timeout = timeoutMs, signal, headers: extraHeaders, account } = {}) => {
     const session = await readSession();
     if (!session?.token) throw notSignedIn();
+    // Pinned to an account: checked again once the key is in hand (and after
+    // a refresh), so a switch midway never sends this to the other account.
+    const checkAccount = async () => {
+      if (account && accountKeyOf(await readSession()) !== account) {
+        throw new DurangoError('account_changed', 'The Durango account changed.');
+      }
+    };
     let credential = await credentials.get();
+    await checkAccount();
     for (let attempt = 0; ; attempt += 1) {
       const url = new URL(`/api/v1${apiPath}`, credential.baseUrl);
       for (const [key, value] of Object.entries(query ?? {})) {
@@ -422,7 +501,8 @@ export const createDurangoClient = ({
             ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
             ...(extraHeaders ?? {}),
           },
-          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+          // `form` (multipart, e.g. a file) sets its own content type.
+          ...(form !== undefined ? { body: form } : body !== undefined ? { body: JSON.stringify(body) } : {}),
           signal: signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal,
           redirect: 'error',
         });
@@ -435,6 +515,7 @@ export const createDurangoClient = ({
         // expired: re-mint once with the desktop session, then give up.
         if (attempt === 0) {
           credential = await credentials.refresh(credential.keyId);
+          await checkAccount();
           continue;
         }
         throw new DurangoError('not_connected', 'Durango rejected this device\'s key. Sign out and back in to reconnect.', {
@@ -609,6 +690,114 @@ export const createDurangoClient = ({
       if (!id) throw new DurangoError('api', 'A dispatch id is required.');
       await request('POST', `/code/dispatches/${encodeURIComponent(id)}`, { body: report });
       return { ok: true };
+    },
+    // --- Bot replies on this machine's Claude Code (bot-replies.js) -----------
+    /** Long-poll for a bot reply to run here; `{ lane: null }` when none arrived. Polling marks this machine available. */
+    /** `machine`: `{ name, projects: string[], models: string[] }`, this machine's bot presence. */
+    async claimBotLane({ machineId, platform, machine, ackStopTasks, waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
+      const wait = clampInt(waitMs, 0, DISPATCH_CLAIM_WAIT_MS, DISPATCH_CLAIM_WAIT_MS);
+      const data = await request('POST', '/code/bots/claim', {
+        body: { machineId, platform, ...(machine ? { machine } : {}), ...(ackStopTasks?.length ? { ackStopTasks } : {}), waitMs: wait },
+        timeout: wait + (DISPATCH_CLAIM_TIMEOUT_MS - DISPATCH_CLAIM_WAIT_MS),
+        signal,
+      });
+      return {
+        lane: normalizeBotLane(data.lane),
+        // Cancelled bot tasks whose threads run here: stop them.
+        stopTasks: Array.isArray(data.stopTasks) ? data.stopTasks.filter((id) => typeof id === 'string' && id).slice(0, 20) : [],
+        // The account has no bots: ask again only after this long.
+        ...(Number.isFinite(data.idleMs) && data.idleMs > 0 ? { idleMs: Math.min(data.idleMs, 60 * 60_000) } : {}),
+      };
+    },
+    /** `{ botId, machineId, text, activeTool?, takeInbox }` → `{ stop, inbox }`. */
+    async reportBotLaneProgress({ laneId, signal, ...body } = {}) {
+      const data = await request('POST', botLanePath(laneId, 'progress'), { body, signal });
+      return { stop: data.stop === true, inbox: normalizeBotInbox(data.inbox) };
+    },
+    /** `{ botId, machineId, name, input, toolCallId }` → `{ result }`. */
+    async callBotLaneTool({ laneId, signal, ...body } = {}) {
+      const data = await request('POST', botLanePath(laneId, 'tool'), { body, signal, timeout: BOT_TOOL_TIMEOUT_MS });
+      return { result: data.result ?? null };
+    },
+    /** `{ botId, machineId, text, modelId?, failure?, retryElsewhere? }` → `{ ok, stored }`. */
+    async finishBotLane({ laneId, signal, ...body } = {}) {
+      const data = await request('POST', botLanePath(laneId, 'finish'), { body, signal });
+      return { ok: data.ok !== false, stored: data.stored === true };
+    },
+    /** A task the reply runs as a Durango Code thread here: `{ botId, machineId, title, instructions }` → `{ taskId, title }`. */
+    async createBotLaneTask({ laneId, signal, ...body } = {}) {
+      const data = await request('POST', botLanePath(laneId, 'tasks'), { body, signal });
+      if (!str(data.taskId)) throw new DurangoError('api', errorMessageFrom(data) || 'Durango did not record the task.');
+      return { taskId: str(data.taskId), title: str(data.title), brief: str(data.brief) };
+    },
+    /** That thread ended: `{ machineId, outcome: 'finished' | 'failed', summary?, error? }` → `{ ok }`. */
+    async reportBotTask({ taskId, ...body } = {}) {
+      const data = await request('POST', `/code/bots/tasks/${encodeURIComponent(str(taskId))}/report`, { body });
+      return { ok: data.ok === true };
+    },
+    // --- Bots (Sidebar v3): the person's Durango bots and their threads ---------
+    /** → `{ allowed, bots }` (the primary first). */
+    async listBots() {
+      const data = await request('GET', '/bots');
+      return { allowed: data.allowed === true, bots: Array.isArray(data.bots) ? data.bots : [] };
+    },
+    /** → `{ bot, messages, live, hasMore }`; `read` marks the bot read. */
+    async botThread(botId, { limit, read } = {}) {
+      return await request('GET', `/bots/${encodeURIComponent(str(botId))}/messages`, {
+        query: { limit: clampInt(limit, 1, 200, 80), ...(read ? { read: '1' } : {}) },
+      });
+    },
+    /** `{ messageId, content, timeZone? }` → `{ seq }`. Never blocked by a reply in progress. */
+    async sendBotMessage(botId, body) {
+      return await request('POST', `/bots/${encodeURIComponent(str(botId))}/messages`, { body });
+    },
+    /** A project's bot, created the first time: `{ name, repoId?, machineId?, projectId?, timeZone? }` → the bot. */
+    async ensureProjectBot(body) {
+      const data = await request('POST', '/bots/projects', { body });
+      if (!data.bot || typeof data.bot !== 'object') throw new DurangoError('api', errorMessageFrom(data) || 'Durango did not return the project bot.');
+      return data.bot;
+    },
+    /** A project bot's notes and files → the project, or null for a bot without one. */
+    async botProject(botId) {
+      const data = await request('GET', `/bots/${encodeURIComponent(str(botId))}/project`);
+      return data.project ?? null;
+    },
+    /**
+     * A project file: Durango's server stores the bytes (no client storage
+     * ids). `{ botId | key, name, bytes, contentType }` → `{ ok, fileId, name, replaced }`.
+     */
+    async uploadProjectFile({ botId, key, name, bytes, contentType, account }) {
+      const form = new FormData();
+      form.append('file', new Blob([bytes], { type: contentType || 'application/octet-stream' }), str(name));
+      if (botId) form.append('botId', str(botId));
+      if (key) form.append('key', str(key));
+      return await request('POST', '/bots/project-files', { form, timeout: Math.max(timeoutMs, 120_000), ...(account ? { account } : {}) });
+    },
+    /** A project's notes and files by its key (a project needs no bot) → the project. */
+    async projectMemory(key) {
+      const data = await request('GET', '/bots/projects/memory', { query: { key: str(key) } });
+      return data.project ?? null;
+    },
+    /** Changes a project's notes and files by its key (actions as botProjectAction). */
+    async projectMemoryAction(key, body, { account } = {}) {
+      return await request('POST', '/bots/projects/memory', { body: { ...body, key: str(key) }, timeout: Math.max(timeoutMs, 60_000), ...(account ? { account } : {}) });
+    },
+    /** Changes a project bot's notes and files: `{ action: 'add_note' | 'delete_note' | 'delete_file', … }` (files upload with uploadProjectFile). */
+    async botProjectAction(botId, body, { account } = {}) {
+      return await request('POST', `/bots/${encodeURIComponent(str(botId))}/project`, { body, timeout: Math.max(timeoutMs, 60_000), ...(account ? { account } : {}) });
+    },
+    /** Bots made on this device while signed out (local-bots.js exportForSync) → `{ ok, bots: [{ localId, botId }] }`. */
+    async importBots(payload, { account } = {}) {
+      const data = await request('POST', '/bots/import', { body: payload, timeout: Math.max(timeoutMs, 60_000), ...(account ? { account } : {}) });
+      if (data.ok !== true) throw new DurangoError('api', errorMessageFrom(data) || 'Durango did not accept the bots.');
+      return {
+        ok: true,
+        // false: part of it was deferred (retry later; the import is idempotent).
+        complete: data.complete !== false,
+        bots: (Array.isArray(data.bots) ? data.bots : [])
+          .filter((bot) => bot && typeof bot === 'object')
+          .map((bot) => ({ localId: str(bot.localId), botId: str(bot.botId) })),
+      };
     },
     async searchChats(q, { limit, cursor } = {}) {
       const data = await request('GET', '/chats', {
@@ -974,8 +1163,60 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       console.log(`[durango mock] dispatch ${dispatchId} → ${report?.status}${report?.error ? ` (${report.error})` : ''}`);
       return { ok: true };
     },
+    // No mock bot replies: the claim just waits, like an idle Durango.
+    async claimBotLane({ waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
+      await waitFor(Math.min(clampInt(waitMs, 0, DISPATCH_CLAIM_WAIT_MS, DISPATCH_CLAIM_WAIT_MS), 25_000), signal);
+      return { lane: null };
+    },
+    async reportBotLaneProgress() {
+      return { stop: false, inbox: [] };
+    },
+    async callBotLaneTool({ name } = {}) {
+      return { result: { ok: false, error: `Mock Durango has no bot tool ${str(name)}.` } };
+    },
+    async finishBotLane({ laneId, ...body } = {}) {
+      reports.push({ laneId, ...body });
+      return { ok: true, stored: true };
+    },
+    async createBotLaneTask() {
+      throw new DurangoError('api', 'Mock Durango has no bot tasks.');
+    },
+    async reportBotTask() {
+      return { ok: false };
+    },
     async chatUrl(chatId) {
       return MOCK_CHATS.find((chat) => chat.id === chatId)?.url ?? `${DEFAULT_DURANGO_URL}/chats`;
+    },
+    async listBots() {
+      return { allowed: true, bots: [] };
+    },
+    async botThread() {
+      return { bot: null, messages: [], live: [], hasMore: false };
+    },
+    async ensureProjectBot() {
+      throw new DurangoError('api', 'Mock Durango has no project bots.');
+    },
+    async botProject() {
+      return null;
+    },
+    async botProjectAction() {
+      throw new DurangoError('api', 'Mock Durango has no project bots.');
+    },
+    async projectMemory() {
+      return null;
+    },
+    async uploadProjectFile() {
+      throw new DurangoError('api', 'Mock Durango has no project files.');
+    },
+    async projectMemoryAction() {
+      throw new DurangoError('api', 'Mock Durango has no project bots.');
+    },
+    async sendBotMessage() {
+      return { seq: 0 };
+    },
+    async importBots(payload) {
+      const bots = Array.isArray(payload?.bots) ? payload.bots : [];
+      return { ok: true, bots: bots.map((bot, index) => ({ localId: str(bot?.localId), botId: `mockbot${index}` })) };
     },
     async searchChats(q, { limit } = {}) {
       const query = str(q).trim().toLowerCase();

@@ -42,6 +42,8 @@
   --settings-sidebar-bg: #0c0c0e;
   --font-ui: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  /* Bots (Sidebar v3 and its pages): Figtree, then the UI font. */
+  --font-bots: 'Figtree Variable', var(--font-ui);
   --theme-panel-blur: 0px;
   /* Deeper accents for gradients on primary buttons (themes derive them). */
   --link: #4da3ff;
@@ -1772,6 +1774,10 @@ body {
 .sidebar-resizing * {
   cursor: col-resize !important;
   user-select: none !important;
+}
+
+.bots-font {
+  font-family: var(--font-bots);
 }
 
 .agents-sidebar {

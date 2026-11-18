@@ -57,7 +57,7 @@ import { browseDirectories, resolveProjectDirectory } from './main/project-brows
 import { approvalExplainPrompt, approvalExplainTruncated, parseApprovalExplanation } from './main/approval-explainer.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, installDownloadedLinuxUpdate, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
-import { claudeSdkSessions, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, notifyClaudeSession, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
+import { claudeSdkSessions, createClaudeInputQueue, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, loadClaudeSdk, loadZod, notifyClaudeSession, resolveClaudeBinary, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { unwatchUserActions, watchUserAction } from './main/user-actions.js';
 import { answerSecretRequest, listPendingSecretRequests, startSecretFileSweeps } from './main/secret-requests.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
@@ -77,14 +77,19 @@ import { guardVisualFrames } from './main/visual-tools.js';
 import { attachTextContextMenu } from './main/text-context-menu.js';
 import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
-import { DurangoError, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
+import { DurangoError, accountKeyOf, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
 import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
 import {
+  capThreadAccessMode,
   createDispatchWorker,
   dispatchSourceLabel,
   dispatchSourceUrl,
+  isProjectAllowed,
   normalizeDispatchSettings,
 } from './main/durango-dispatch.js';
+import { createBotReplyWorker, createClaudeLaneRunner, createClaudeOneShot, normalizeBotSettings } from './main/bot-replies.js';
+import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
+import { createBotThreadTools } from './main/bot-thread-tools.js';
 import {
   createDeployWatcher,
   createSourceConfigFetcher,
@@ -880,6 +885,8 @@ const clearAccountSession = async ({ preserveRepository = false } = {}) => {
   notifyRemoteControlAccountChanged(null, { reconcile: false });
   // Durango Chat dispatch stops polling the moment sign-out begins.
   dispatchWorker.accountChanged(durangoMock);
+  botReplyWorker.accountChanged(durangoMock);
+  localBots.setActive(!durangoMock);
   deployWatcher.accountChanged(false);
   await Promise.all([repositoryClear, durangoClear.catch(() => {})]);
   await fs.rm(getAccountSessionFilePath(), { force: true });
@@ -888,6 +895,7 @@ const clearAccountSession = async ({ preserveRepository = false } = {}) => {
 const publishAccountState = async (session) => {
   const effectiveSession = session === undefined ? await readAccountSession() : session;
   const account = desktopAccountForRenderer(effectiveSession);
+  const wasAuthenticated = lastPublishedAccountAuthenticated;
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send('account:changed', account);
   }
@@ -907,6 +915,10 @@ const publishAccountState = async (session) => {
   // Same for Durango Chat dispatch (never claims while signed out) and the
   // deploy watcher (never checks or deploys while signed out).
   dispatchWorker.accountChanged(durangoMock || account.authenticated);
+  botReplyWorker.accountChanged(durangoMock || account.authenticated);
+  // Bots on this device while signed out; signing in uploads them to Durango.
+  localBots.setActive(!(durangoMock || account.authenticated));
+  if (account.authenticated && wasAuthenticated !== true) void syncLocalBotsToDurango();
   deployWatcher.accountChanged(account.authenticated);
   return account;
 };
@@ -1468,10 +1480,12 @@ app.whenReady().then(async () => {
   // The deploy watcher (off by default) is seeded and gated the same way.
   powerMonitor.on('suspend', () => {
     dispatchWorker.suspend();
+    botReplyWorker.suspend();
     deployWatcher.suspend();
   });
   powerMonitor.on('resume', () => {
     dispatchWorker.resume();
+    botReplyWorker.resume();
     deployWatcher.resume();
   });
   void Promise.all([readPersistedStoreState(), isDispatchSignedIn()])
@@ -1485,6 +1499,10 @@ app.whenReady().then(async () => {
         });
       }
       dispatchWorker.accountChanged(signedIn);
+      botReplyWorker.accountChanged(signedIn);
+      localBots.setActive(!signedIn);
+      // A sync that failed last time is retried at start.
+      if (signedIn) void syncLocalBotsToDurango();
       deployWatcher.accountChanged(signedIn && !durangoMock);
     })
     .catch((error) => console.error('Could not start Durango Chat dispatch', error));
@@ -1845,6 +1863,8 @@ app.on('will-quit', (event) => {
   shutdownWorkspaceSync();
   shutdownRemoteControl();
   dispatchWorker.stop();
+  botReplyWorker.stop();
+  void localBots.stop();
   deployWatcher.stop();
   disposeForQuit();
   if (quitBarrierSatisfied) return;
@@ -1874,6 +1894,8 @@ const settleQuitBarrierForUpdate = async () => {
   shutdownWorkspaceSync();
   shutdownRemoteControl();
   dispatchWorker.stop();
+  botReplyWorker.stop();
+  void localBots.stop();
   deployWatcher.stop();
   disposeForQuit('update');
   // If a quit is already draining this same work, waiting on it here settles at
@@ -4564,6 +4586,7 @@ const listDispatchModels = async () => {
       id: model.id,
       label: String(model.label || model.id),
       slug: typeof model.slug === 'string' ? model.slug : undefined,
+      providerId: typeof model.providerId === 'string' ? model.providerId : undefined,
       provider: String(model.providerLabel || model.providerId || ''),
       efforts: remoteModelEfforts(model),
       available: model.available !== false,
@@ -4572,6 +4595,12 @@ const listDispatchModels = async () => {
   dispatchModelsCache = { at: Date.now(), models };
   return models;
 };
+
+// Durango bot replies on this machine's Claude Code (src/main/bot-replies.js):
+// offered while Claude models are available here (the same check the model
+// list uses), and run exactly while dispatch runs.
+const botRepliesAvailable = async () =>
+  (await listDispatchModels()).some((model) => model.providerId === 'claude' && model.available !== false);
 
 const dispatchWorker = createDispatchWorker({
   client: durangoClient,
@@ -4618,6 +4647,287 @@ const dispatchWorker = createDispatchWorker({
   notify: notifyDispatchStarted,
   onStateChange: (state) => sendToAllWindows('durango:dispatchState', state),
 });
+
+// The projects a bot reply here may see and work in: this machine's Durango
+// Code projects, limited to the ones allowed for Durango (Settings → Durango).
+let botAllowedProjectIds = normalizeDispatchSettings(null).allowedProjectIds;
+// Projects whose folder is gone (moved or deleted) are left out: a reply
+// can't work there, and Claude Code refuses a missing extra directory.
+const botProjects = () =>
+  configuredProjects.filter(
+    (project) =>
+      typeof project?.id === 'string' &&
+      typeof project?.path === 'string' &&
+      isProjectAllowed(project.id, botAllowedProjectIds) &&
+      existsSync(project.path)
+  );
+
+const claudeBotLaneRunner = createClaudeLaneRunner({
+  loadSdk: loadClaudeSdk,
+  loadZod,
+  resolveBinary: resolveClaudeBinary,
+  createInputQueue: createClaudeInputQueue,
+  botsDir: () => path.join(app.getPath('userData'), 'bots'),
+  getProjects: botProjects,
+});
+
+// A Durango Code thread a bot started in a project here (delegate_task
+// `project`), opened in the app's window like an agent from Durango Chat. The
+// renderer's dispatch settle watcher reports its outcome under the dispatch id
+// `<prefix><key>` (durango:dispatchSettled below).
+const LOCAL_BOT_DISPATCH_PREFIX = 'localbot:';
+const BOT_TASK_DISPATCH_PREFIX = 'bottask:';
+const startBotProjectThread = (prefix) => ({ projectId, prompt, key, botName, title, accessMode }) =>
+  requestDispatchRendererCommand({
+    kind: 'runTurn',
+    projectId,
+    prompt: prompt.slice(0, 200_000),
+    accessMode,
+    source: { machineId: 'durango-bot', machineName: botName },
+    durangoDispatch: {
+      id: `${prefix}${key}`,
+      origin: 'bot',
+      sourceLabel: `your bot ${botName}`,
+      ...(title ? { title: String(title).slice(0, 80) } : {}),
+      followUp: false,
+      sourceUrl: null,
+      requestedAccessMode: accessMode,
+    },
+  });
+
+// A bot's follow-up turn in an existing thread here (message_thread), reported
+// like a thread it started.
+// The turn runs with the stricter of the thread's own access and the bot's,
+// so a bot never widens what a thread may do (a Read only thread stays Read
+// only), as for follow-ups dispatched from Durango Chat.
+const startBotThreadFollowUp = (prefix) => async ({ threadId, prompt, key, botName, accessMode }) => {
+  const thread = await readThreadById(threadId).catch(() => null);
+  const turnAccessMode = capThreadAccessMode(thread?.accessMode, accessMode);
+  return requestDispatchRendererCommand({
+    kind: 'runTurn',
+    threadId,
+    prompt: prompt.slice(0, 200_000),
+    accessMode: turnAccessMode,
+    source: { machineId: 'durango-bot', machineName: botName },
+    durangoDispatch: {
+      id: `${prefix}${key}`,
+      origin: 'bot',
+      sourceLabel: `your bot ${botName}`,
+      followUp: true,
+      sourceUrl: null,
+      requestedAccessMode: turnAccessMode,
+    },
+  });
+};
+
+// list_threads / read_thread over this machine's threads in the projects bots may use.
+const botThreadTools = createBotThreadTools({
+  readIndex: () => readThreadsIndex(),
+  readThread: (args) => readThreadForAgent(args),
+  getProjects: () => botProjects(),
+});
+
+// This machine's bot presence (name, projects with their keys, Claude
+// models), sent with each claim poll. Building it reads every project's git
+// config, so it is kept a couple of minutes (and rebuilt when the projects change).
+const BOT_MACHINE_INFO_TTL_MS = 2 * 60_000;
+let botMachineInfoCache = null;
+const botMachineInfo = async () => {
+  if (botMachineInfoCache && Date.now() - botMachineInfoCache.at < BOT_MACHINE_INFO_TTL_MS) return botMachineInfoCache.info;
+  const info = {
+    name: await getDispatchMachineName(),
+    projects: await botProjectsWithKeys({ local: false }),
+    models: (await listDispatchModels().catch(() => []))
+      .filter((model) => model.providerId === 'claude' && model.available !== false)
+      .map((model) => model.slug || model.id),
+  };
+  botMachineInfoCache = { at: Date.now(), info };
+  return info;
+};
+
+// Signed in, this machine answers the person's Durango bots on its Claude
+// Code (on by default; Settings → Durango "Answer your bots on this
+// computer"). Its claim poll is its bot presence on Durango, with its name,
+// projects and Claude models.
+const botReplyWorker = createBotReplyWorker({
+  client: durangoClient,
+  getMachineId: () => getDurangoDeviceId(),
+  platform: process.platform,
+  isSignedIn: isDispatchSignedIn,
+  isOnline: () => net.isOnline(),
+  isAvailable: botRepliesAvailable,
+  runLane: claudeBotLaneRunner,
+  getMachineInfo: () => botMachineInfo(),
+  startProjectThread: startBotProjectThread(BOT_TASK_DISPATCH_PREFIX),
+  startThreadFollowUp: startBotThreadFollowUp(BOT_TASK_DISPATCH_PREFIX),
+  threadTools: botThreadTools,
+  // A task cancelled on Durango: its thread here stops, like a dispatch stopped from Chat.
+  stopThread: (threadId, taskId) =>
+    requestDispatchRendererCommand(
+      {
+        kind: 'stopTurn',
+        threadId,
+        // Only that task's run: a turn started there since is left alone.
+        stopDispatchId: `${BOT_TASK_DISPATCH_PREFIX}${taskId}`,
+        source: { machineId: 'durango-bot', machineName: 'Durango' },
+      },
+      30_000
+    ),
+});
+
+// Reports a bot task's thread outcome to Durango, retrying a few times.
+// `retry: true` = it never got through (offline, signed out): the renderer
+// keeps the outcome unreported and tries again later.
+const reportBotTaskThread = async ({ taskId, outcome, summary, error }) => {
+  const machineId = await getDurangoDeviceId().catch(() => null);
+  if (!machineId || !taskId) return { ok: false, retry: true };
+  for (const delay of [0, 2_000, 10_000, 30_000]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      return await durangoClient.reportBotTask({ taskId, machineId, outcome, ...(summary ? { summary } : {}), ...(error ? { error } : {}) });
+    } catch (failure) {
+      console.warn('[durango bots] reporting a bot task failed:', failure?.message ?? failure);
+      // Durango answered (not a network or sign-in problem): retrying won't help.
+      if (failure instanceof DurangoError && failure.code === 'api' && failure.status && failure.status < 500) return { ok: false };
+    }
+  }
+  return { ok: false, retry: true };
+};
+
+// Local bots (src/main/local-bots.js): while signed out of Durango, Sidebar v3's
+// bots live on this device and every reply runs on this machine's Claude Code,
+// with the machine's dispatch access mode (Settings → Durango). Signing in
+// uploads them to the Durango account (syncLocalBotsToDurango).
+let localBotsAccessMode = normalizeBotSettings(null).accessMode;
+const localBotNotifications = new Set();
+const notifyLocalBot = ({ title, body }) => {
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({ title, body: body ?? '' });
+  localBotNotifications.add(notification);
+  const forget = () => localBotNotifications.delete(notification);
+  notification.on('click', () => {
+    forget();
+    const win = BrowserWindow.getAllWindows()[0];
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+  });
+  notification.on('close', forget);
+  notification.show();
+};
+const localBots = createLocalBotEngine({
+  dir: () => path.join(app.getPath('userData'), 'bots', 'local'),
+  runLane: claudeBotLaneRunner,
+  summarize: createClaudeOneShot({ loadSdk: loadClaudeSdk, resolveBinary: resolveClaudeBinary }),
+  getAccessMode: () => localBotsAccessMode,
+  notify: notifyLocalBot,
+  listProjects: async () => botProjectsWithKeys({ local: true }),
+  startProjectThread: startBotProjectThread(LOCAL_BOT_DISPATCH_PREFIX),
+  startThreadFollowUp: startBotThreadFollowUp(LOCAL_BOT_DISPATCH_PREFIX),
+  threadTools: botThreadTools,
+});
+
+// A file's bytes to a project's files on Durango, by its bot (a bot id) or by
+// the project's key (`{ key }`). Durango's server stores the bytes itself.
+const uploadBotProjectFile = (target, { name, bytes, contentType }, { account } = {}) =>
+  durangoClient.uploadProjectFile({
+    ...(typeof target === 'string' ? { botId: target } : { key: target.key }),
+    name,
+    bytes,
+    contentType,
+    ...(account ? { account } : {}),
+  });
+
+// After an import: local project bots' files go to their Durango project bots.
+const LOCAL_BOTS_MACHINE = 'this-device';
+// Signed out, a project without a Source repo is keyed on 'this-device';
+// on Durango it is this machine's id (as projects opened signed in).
+const syncedProjectKey = (key, deviceId) =>
+  key.startsWith(`local:${LOCAL_BOTS_MACHINE}:`) ? `local:${deviceId}:${key.slice(`local:${LOCAL_BOTS_MACHINE}:`.length)}` : key;
+
+// The account signed in now (its user id, or the token when the session has
+// no user id), so a sync started for one account never writes to another.
+const durangoAccountKey = async () => accountKeyOf(await readAccountSession().catch(() => null));
+
+class LocalBotsAccountChanged extends Error {
+  constructor() {
+    super('the Durango account changed during the upload');
+  }
+}
+
+// Every local project library's files go to that project on Durango (by
+// key, with or without a bot). → the names that didn't upload. `stillSameAccount`
+// is checked before each file (signing out or switching accounts stops it).
+const uploadLocalProjectFiles = async (deviceId, account, stillSameAccount) => {
+  const failed = [];
+  for (const { key, files } of await localBots.projectFilesForSync()) {
+    for (const file of files) {
+      if (!(await stillSameAccount())) throw new LocalBotsAccountChanged();
+      try {
+        const bytes = await fs.readFile(file.path);
+        await uploadBotProjectFile({ key: syncedProjectKey(key, deviceId) }, { name: file.name, bytes, contentType: file.contentType }, { account });
+      } catch (error) {
+        if (error instanceof DurangoError && error.code === 'account_changed') throw new LocalBotsAccountChanged();
+        failed.push(`${file.name}: ${error?.message ?? error}`);
+      }
+    }
+  }
+  return failed;
+};
+
+// Uploads the bots made on this device while signed out to the Durango account,
+// then moves the local files aside. On failure they stay and the next sign-in
+// or app start tries again.
+let localBotsSync = null;
+const syncLocalBotsToDurango = () => {
+  if (durangoMock) return Promise.resolve();
+  let rerun = false;
+  localBotsSync ??= (async () => {
+    try {
+      if (!(await isDispatchSignedIn()) || !(await localBots.hasDataToSync())) return;
+      // Bound to the account it started for: signing out or into another
+      // account midway stops it (and keeps the local data for the next try).
+      const account = await durangoAccountKey();
+      if (!account) return;
+      const stillSameAccount = async () => (await durangoAccountKey()) === account;
+      const deviceId = await getDurangoDeviceId();
+      if (!deviceId) throw new Error('no device id yet');
+      const payload = await localBots.exportForSync();
+      // Local project keys become this machine's keys on Durango.
+      for (const bot of payload.bots) {
+        if (bot.project?.machineId === LOCAL_BOTS_MACHINE) bot.project.machineId = deviceId;
+      }
+      payload.projects = (payload.projects ?? []).map((project) => ({ ...project, key: syncedProjectKey(project.key, deviceId) }));
+      if (!(await stillSameAccount())) throw new LocalBotsAccountChanged();
+      const result = await durangoClient.importBots(payload, { account }).catch((error) => {
+        throw error instanceof DurangoError && error.code === 'account_changed' ? new LocalBotsAccountChanged() : error;
+      });
+      if (result.complete === false) {
+        // Durango kept part of it for later (a bot with a big unanswered backlog).
+        console.warn('[local bots] Durango deferred part of the import; will retry.');
+        return;
+      }
+      const failed = await uploadLocalProjectFiles(deviceId, account, stillSameAccount);
+      if (failed.length) {
+        // Kept here: the next sign-in or start retries (the import is idempotent).
+        console.warn(`[local bots] ${failed.length} project file(s) did not upload; will retry:`, failed.join('; '));
+        return;
+      }
+      if (!(await stillSameAccount())) throw new LocalBotsAccountChanged();
+      await localBots.markSynced();
+      console.log(`[local bots] uploaded ${result.bots.length} bot(s) to Durango`);
+    } catch (error) {
+      if (error instanceof LocalBotsAccountChanged) rerun = true;
+      console.warn('[local bots] could not upload this device\'s bots (will retry on the next sign-in or start):', error?.message ?? error);
+    }
+  })().finally(() => {
+    localBotsSync = null;
+    // Switched accounts midway: the account signed in now gets them.
+    if (rerun) setTimeout(() => void syncLocalBotsToDurango(), 1_000).unref?.();
+  });
+  return localBotsSync;
+};
 
 // --- Deploy watcher: deploy changes landed elsewhere ----------------------------------
 // src/main/durango-deploy-watcher.js checks Durango Source for pending deploy
@@ -4681,6 +4991,7 @@ const configureDurango = async (input) => {
   if (typeof input?.useDurangoTasks === 'boolean') useDurangoTasksSetting = input.useDurangoTasks;
   const settings = normalizeDispatchSettings(input?.dispatch);
   configuredProjects = Array.isArray(input?.projects) ? input.projects : [];
+  botMachineInfoCache = null;
   // The deploy watcher reads each project's link and durango.toml itself,
   // and only while it is on.
   const deploySettings = normalizeDeployWatcherSettings(input?.deployWatcher);
@@ -4689,6 +5000,12 @@ const configureDurango = async (input) => {
   const projects = settings.enabled ? await dispatchProjectsWithRepoIds(input?.projects) : [];
   if (seq !== dispatchConfigureSeq) return { ok: true, superseded: true };
   dispatchWorker.configure({ settings, projects });
+  // Bots have their own switch and access level (not the dispatch opt-in);
+  // the projects they see are the ones allowed for Durango.
+  const botSettings = normalizeBotSettings(input?.bots);
+  botReplyWorker.configure({ settings: botSettings });
+  localBotsAccessMode = botSettings.accessMode;
+  botAllowedProjectIds = settings.allowedProjectIds;
   return { ok: true, state: dispatchWorker.getState(), deployWatcherState: deployWatcher.getState() };
 };
 
@@ -4704,7 +5021,22 @@ ipcMain.handle('durango:openDeployLog', async (_event, input) => {
 });
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
 ipcMain.handle('durango:dispatchSettled', (_event, input) =>
-  dispatchWorker.settle({
+  typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(BOT_TASK_DISPATCH_PREFIX)
+    ? reportBotTaskThread({
+        taskId: input.dispatchId.slice(BOT_TASK_DISPATCH_PREFIX.length),
+        outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
+        summary: typeof input?.summary === 'string' ? input.summary : undefined,
+        error: typeof input?.error === 'string' ? input.error : undefined,
+      })
+    : typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(LOCAL_BOT_DISPATCH_PREFIX)
+    ? localBots.threadSettled({
+        key: input.dispatchId.slice(LOCAL_BOT_DISPATCH_PREFIX.length),
+        threadId: typeof input?.threadId === 'string' ? input.threadId : undefined,
+        outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
+        summary: typeof input?.summary === 'string' ? input.summary : undefined,
+        error: typeof input?.error === 'string' ? input.error : undefined,
+      })
+    : dispatchWorker.settle({
     dispatchId: typeof input?.dispatchId === 'string' ? input.dispatchId : '',
     threadId: typeof input?.threadId === 'string' ? input.threadId : undefined,
     outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
@@ -5415,6 +5747,284 @@ ipcMain.handle('durango:searchChats', async (_event, input) => {
       cursor: typeof input?.cursor === 'string' ? input.cursor : undefined,
     });
     return { ok: true, ...result };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+// Bots (Sidebar v3): the person's Durango bots, read and messaged with this
+// app's Durango sign-in. Replies may run on this machine (src/main/bot-replies.js).
+// Signed out, the bots are this device's own (local-bots.js), answered by this
+// machine's Claude Code.
+const LOCAL_BOTS_CLAUDE_UNAVAILABLE =
+  'Local bots run on Claude Code: install it and sign in to Claude to use bots without a Durango account.';
+const localBotsMode = async () => {
+  if (await isDispatchSignedIn()) return false;
+  localBots.setActive(true);
+  return true;
+};
+const localBotsIpcError = (error) => ({
+  ok: false,
+  ...(typeof error?.code === 'string' ? { code: error.code } : {}),
+  error: error?.message ?? String(error),
+});
+
+ipcMain.handle('bots:mode', async () => ({
+  mode: (await isDispatchSignedIn()) ? 'durango' : 'local',
+  claudeAvailable: await botRepliesAvailable().catch(() => false),
+  // Signed in: whether this machine takes bot replies (the dispatch opt-in).
+  machineReplies: botReplyWorker.getState().enabled,
+}));
+
+ipcMain.handle('bots:list', async () => {
+  if (await localBotsMode()) {
+    if (!(await botRepliesAvailable().catch(() => false))) {
+      return { ok: false, code: 'claude_unavailable', error: LOCAL_BOTS_CLAUDE_UNAVAILABLE };
+    }
+    try {
+      return { ok: true, ...(await localBots.list()), projectKeys: await botProjectKeys({ local: true }), account: 'local' };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    // Which account this list is for (no secret: a hash), so the Bots view
+    // drops what it kept for another account.
+    const before = await durangoAccountKey();
+    const list = await durangoClient.listBots();
+    const after = await durangoAccountKey();
+    if (!before || before !== after) return { ok: false, code: 'account_changed', error: 'The Durango account changed. Try again.' };
+    const account = crypto.createHash('sha256').update(before).digest('hex').slice(0, 16);
+    return { ok: true, ...list, projectKeys: await botProjectKeys({ local: false }), account };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+// Each Durango Code project's key (convex/botPolicy.ts projectKeyFor): its
+// Source repository when it has one, else this machine's project. Sidebar v3
+// finds a project's bot by it.
+// Repo links read from git config, kept a minute (bot claims ask every poll).
+const botRepoIds = new Map(); // path -> { repoId, at }
+const botRepoIdOf = async (projectPath) => {
+  if (!projectPath) return null;
+  const cached = botRepoIds.get(projectPath);
+  if (cached && Date.now() - cached.at < 60_000) return cached.repoId;
+  const repoId = (await getCloudRepoLink(projectPath).catch(() => null))?.repoId ?? null;
+  botRepoIds.set(projectPath, { repoId, at: Date.now() });
+  return repoId;
+};
+const botProjectIdentity = async (project, { local }) => {
+  const repoId = await botRepoIdOf(project.path);
+  const machineId = local ? LOCAL_BOTS_MACHINE : await getDurangoDeviceId().catch(() => null);
+  return { repoId, machineId, key: localProjectKey({ repoId, machineId, projectId: project.id }) };
+};
+// The projects bots may use, each with its repo id and Durango key.
+const botProjectsWithKeys = async ({ local }) =>
+  Promise.all(botProjects().map(async (project) => ({ ...project, ...(await botProjectIdentity(project, { local })) })));
+const botProjectKeys = async ({ local }) => {
+  const out = {};
+  for (const project of configuredProjects) {
+    if (typeof project?.id !== 'string') continue;
+    const identity = await botProjectIdentity(project, { local });
+    if (identity.key) out[project.id] = identity.key;
+  }
+  return out;
+};
+
+// A project's bot, created the first time the project is opened in Sidebar v3.
+ipcMain.handle('bots:ensureProjectBot', async (_event, input) => {
+  const projectId = typeof input?.projectId === 'string' ? input.projectId : '';
+  const project = configuredProjects.find((candidate) => candidate?.id === projectId);
+  if (!project) return { ok: false, error: 'That project is not open in Durango Code.' };
+  const local = await localBotsMode();
+  try {
+    const identity = await botProjectIdentity(project, { local });
+    if (local) {
+      return { ok: true, bot: await localBots.ensureProjectBot({ name: project.name, projectId: project.id, repoId: identity.repoId, machineId: LOCAL_BOTS_MACHINE }) };
+    }
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const bot = await durangoClient.ensureProjectBot({
+      name: project.name,
+      ...(identity.repoId ? { repoId: identity.repoId } : { machineId: identity.machineId, projectId: project.id }),
+      ...(timeZone ? { timeZone } : {}),
+    });
+    // The account has a bot now: a machine waiting out an idle period answers it.
+    botReplyWorker.wake();
+    return { ok: true, bot };
+  } catch (error) {
+    return local ? localBotsIpcError(error) : durangoIpcError(error);
+  }
+});
+
+// A project's notes and files: by its bot (`botId`), or by the project open
+// here (`projectId`), which needs no bot.
+const botProjectTarget = async (input, local) => {
+  const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : '';
+  if (botId) return { botId };
+  const projectId = typeof input?.projectId === 'string' ? input.projectId : '';
+  const project = configuredProjects.find((candidate) => candidate?.id === projectId);
+  if (!project) return null;
+  const identity = await botProjectIdentity(project, { local });
+  return identity.key ? { project: { key: identity.key, name: project.name } } : null;
+};
+
+ipcMain.handle('bots:project', async (_event, input) => {
+  const local = await localBotsMode();
+  const target = await botProjectTarget(input, local);
+  if (!target) return { ok: false, error: 'Missing bot or project.' };
+  try {
+    if (local) {
+      return { ok: true, project: target.botId ? await localBots.project(target.botId) : await localBots.projectByKey(target.project) };
+    }
+    return { ok: true, project: target.botId ? await durangoClient.botProject(target.botId) : await durangoClient.projectMemory(target.project.key) };
+  } catch (error) {
+    return local ? localBotsIpcError(error) : durangoIpcError(error);
+  }
+});
+
+const PROJECT_FILE_MAX_BYTES = 10 * 1024 * 1024;
+const PROJECT_FILE_TYPES = {
+  md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain', json: 'application/json', csv: 'text/csv',
+  html: 'text/html', yaml: 'text/yaml', yml: 'text/yaml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf', zip: 'application/zip',
+  mp4: 'video/mp4', mov: 'video/quicktime', mp3: 'audio/mpeg', wav: 'audio/wav',
+};
+const mimeTypeForPath = (filePath) => PROJECT_FILE_TYPES[path.extname(filePath).slice(1).toLowerCase()] ?? 'application/octet-stream';
+
+// Changes a project's notes and files (by `botId` or `projectId`, as bots:project):
+// { action: 'add_note', content } | { action: 'delete_note', noteId } |
+// { action: 'add_files' } (pick files) | { action: 'add_file_paths', paths } (dropped files) |
+// { action: 'delete_file', fileId, name } | { action: 'open_file', name, url? }
+ipcMain.handle('bots:projectAction', async (event, input) => {
+  const action = typeof input?.action === 'string' ? input.action : '';
+  const local = await localBotsMode();
+  const target = await botProjectTarget(input, local);
+  if (!target || !action) return { ok: false, error: 'Missing bot, project or action.' };
+  const { botId, project } = target;
+  // Pinned to the account signed in now: if another account signs in while
+  // the file picker is open (or during a batch), nothing goes to it.
+  const account = local ? null : await durangoAccountKey();
+  if (!local && !account) return { ok: false, error: 'Sign in to Durango first.' };
+  const pinned = account ? { account } : {};
+  // Signed in: the bot's route, or the project's (by key).
+  const remote = (body) => (botId ? durangoClient.botProjectAction(botId, body, pinned) : durangoClient.projectMemoryAction(project.key, body, pinned));
+  try {
+    if (action === 'add_note') {
+      const content = typeof input?.content === 'string' ? input.content : '';
+      if (local) return { ok: true, ...(botId ? await localBots.addProjectNote(botId, content) : await localBots.addProjectNoteByKey(project, content)) };
+      return { ok: true, ...(await remote({ action, content })) };
+    }
+    if (action === 'delete_note') {
+      const noteId = typeof input?.noteId === 'string' ? input.noteId : '';
+      return { ok: true, ...(local ? await localBots.deleteProjectNote(noteId) : await remote({ action, noteId })) };
+    }
+    if (action === 'delete_file') {
+      const name = String(input?.name ?? '');
+      if (local) return { ok: true, ...(botId ? await localBots.deleteProjectFile(botId, name) : await localBots.deleteProjectFileByKey(project, name)) };
+      return { ok: true, ...(await remote({ action, fileId: String(input?.fileId ?? '') })) };
+    }
+    if (action === 'open_file') {
+      if (local) {
+        const name = String(input?.name ?? '');
+        const filePath = botId ? await localBots.projectFilePath(botId, name) : await localBots.projectFilePathByKey(project, name);
+        if (!filePath) return { ok: false, error: 'That file is gone.' };
+        const error = await shell.openPath(filePath);
+        return error ? { ok: false, error } : { ok: true };
+      }
+      const url = externalWebUrl(typeof input?.url === 'string' ? input.url : '');
+      if (!url) return { ok: false, error: 'That file has no link.' };
+      await shell.openExternal(url);
+      return { ok: true };
+    }
+    // Uploads files from this machine: picked in the OS dialog (`add_files`), or
+    // dropped on the Library (`add_file_paths`, absolute paths of regular files).
+    const addPaths = async (filePaths) => {
+      const added = [];
+      const errors = [];
+      for (const filePath of filePaths.slice(0, 20)) {
+        const name = path.basename(filePath);
+        try {
+          const stat = await fs.stat(filePath);
+          if (!stat.isFile()) throw new Error('not a file');
+          if (stat.size > PROJECT_FILE_MAX_BYTES) throw new Error('over 10 MB');
+          const bytes = await fs.readFile(filePath);
+          const contentType = mimeTypeForPath(filePath);
+          if (local) {
+            if (botId) await localBots.saveProjectFile(botId, { name, bytes, contentType });
+            else await localBots.saveProjectFileByKey(project, { name, bytes, contentType });
+          } else {
+            await uploadBotProjectFile(botId ?? { key: project.key }, { name, bytes, contentType }, pinned);
+          }
+          added.push(name);
+        } catch (error) {
+          errors.push(`${name}: ${error?.message ?? error}`);
+        }
+      }
+      return { ok: errors.length === 0, added, ...(errors.length ? { error: errors.join('; ') } : {}) };
+    };
+    if (action === 'add_files') {
+      const window = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+      const picked = await dialog.showOpenDialog(window, { title: 'Add files to the project', properties: ['openFile', 'multiSelections'] });
+      if (picked.canceled || !picked.filePaths.length) return { ok: true, added: [] };
+      return await addPaths(picked.filePaths);
+    }
+    if (action === 'add_file_paths') {
+      const filePaths = (Array.isArray(input?.paths) ? input.paths : [])
+        .filter((filePath) => typeof filePath === 'string' && filePath && path.isAbsolute(filePath));
+      if (!filePaths.length) return { ok: false, error: 'No files to add.' };
+      return await addPaths(filePaths);
+    }
+    return { ok: false, error: 'Unknown action.' };
+  } catch (error) {
+    return local ? localBotsIpcError(error) : durangoIpcError(error);
+  }
+});
+
+ipcMain.handle('bots:thread', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : '';
+  if (!botId) return { ok: false, error: 'Missing bot id.' };
+  if (await localBotsMode()) {
+    try {
+      return { ok: true, ...(await localBots.thread(botId, { limit: input?.limit, read: input?.read === true })) };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    return { ok: true, ...(await durangoClient.botThread(botId, { limit: input?.limit, read: input?.read === true })) };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+ipcMain.handle('bots:send', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : '';
+  const messageId = typeof input?.messageId === 'string' ? input.messageId.slice(0, 128) : '';
+  const content = typeof input?.content === 'string' ? input.content.slice(0, 32_000) : '';
+  if (!botId || !messageId || !content.trim()) return { ok: false, error: 'Write a message first.' };
+  if (await localBotsMode()) {
+    try {
+      return { ok: true, ...(await localBots.send(botId, { messageId, content })) };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  // A bot is in use here: a machine waiting out an idle period (no bots then) answers now.
+  botReplyWorker.wake();
+  try {
+    const timeZone = typeof input?.timeZone === 'string' ? input.timeZone.slice(0, 64) : undefined;
+    // Sent from this machine: its replies run here first (unless the bot has its own order).
+    const machineId = await getDurangoDeviceId().catch(() => null);
+    return {
+      ok: true,
+      ...(await durangoClient.sendBotMessage(botId, {
+        messageId,
+        content,
+        ...(timeZone ? { timeZone } : {}),
+        ...(machineId ? { machineId } : {}),
+      })),
+    };
   } catch (error) {
     return durangoIpcError(error);
   }

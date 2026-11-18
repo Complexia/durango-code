@@ -533,6 +533,8 @@ export type RemoteCommandRequest = {
     /** Files a controller sent with the turn, already saved on this machine. */
     attachments?: import('./store').FileAttachment[];
     threadId?: string;
+    /** stopTurn: stop only the run of this Durango dispatch (a cancelled bot task), not a later turn. */
+    stopDispatchId?: string;
     projectId?: string;
     modelId?: string;
     accessMode?: 'read-only' | 'workspace-write' | 'full-access';
@@ -571,11 +573,13 @@ export type RemoteCommandRequest = {
     durangoDispatch?: {
       id: string;
       /** Started from a chat, with Run in Durango Code on a task, or through the API (Durango MCP). */
-      origin?: 'chat' | 'tasks' | 'api';
+      origin?: 'chat' | 'tasks' | 'api' | 'bot';
       /** Who sent it, for the thread's note ("Durango Chat", "Grok (MCP) via Durango"). */
       sourceLabel?: string;
       /** Continue `threadId` instead of starting a thread. */
       followUp?: boolean;
+      /** The new thread's title (a bot's task title). */
+      title?: string;
       taskId: string | null;
       sourceUrl: string | null;
       requestedAccessMode: 'ask' | 'auto-edit' | null;
@@ -1933,6 +1937,28 @@ type OrionCodexBrowserIntegrationStatus = {
         cursor?: string;
       }) => Promise<DurangoSearchChatsResult>;
       durangoOpenChat?: (input: { chatId: string; url?: string | null }) => Promise<{ ok: boolean; error?: string }>;
+      getBotsMode?: () => Promise<import('./app/bots').BotsModeResult>;
+      listBots?: () => Promise<import('./app/bots').BotsListResult>;
+      getBotThread?: (input: { botId: string; limit?: number; read?: boolean }) => Promise<import('./app/bots').BotThreadResult>;
+      ensureProjectBot?: (input: { projectId: string }) => Promise<import('./app/bots').EnsureProjectBotResult>;
+      getBotProject?: (input: import('./app/bots').BotProjectTarget) => Promise<import('./app/bots').BotProjectResult>;
+      botProjectAction?: (
+        input: import('./app/bots').BotProjectTarget &
+          (
+            | { action: 'add_note'; content: string }
+            | { action: 'delete_note'; noteId: string }
+            | { action: 'add_files' }
+            | { action: 'add_file_paths'; paths: string[] }
+            | { action: 'delete_file'; fileId: string; name: string }
+            | { action: 'open_file'; name: string; url?: string | null }
+          )
+      ) => Promise<{ ok: boolean; error?: string; duplicate?: boolean; added?: string[] }>;
+      sendBotMessage?: (input: {
+        botId: string;
+        messageId: string;
+        content: string;
+        timeZone?: string;
+      }) => Promise<{ ok: boolean; seq?: number; error?: string; code?: string }>;
       durangoProfileMemory?: () => Promise<{
         ok: boolean;
         code?: DurangoErrorCode;
@@ -1943,6 +1969,8 @@ type OrionCodexBrowserIntegrationStatus = {
         useDurangoTasks: boolean;
         dispatch: DurangoDispatchSettingsInput;
         deployWatcher: DurangoDeployWatcherSettingsInput;
+        /** Durango bots on this computer (Settings → Durango; main: bot-replies.js). */
+        bots?: { enabled: boolean; accessMode: 'read-only' | 'workspace-write' | 'full-access' };
         projects: Array<{ id: string; name: string; path: string }>;
       }) => Promise<{ ok: boolean; state?: DurangoDispatchState; deployWatcherState?: DurangoDeployWatcherState }>;
       durangoDispatchState?: () => Promise<DurangoDispatchState>;
@@ -1955,7 +1983,7 @@ type OrionCodexBrowserIntegrationStatus = {
         outcome: 'finished' | 'failed';
         summary?: string;
         error?: string;
-      }) => Promise<{ ok: boolean; skipped?: boolean }>;
+      }) => Promise<{ ok: boolean; skipped?: boolean; retry?: boolean }>;
       onDurangoDispatchState?: (cb: (state: DurangoDispatchState) => void) => () => void;
       onDurangoFocusThread?: (cb: (payload: { threadId: string }) => void) => () => void;
       workspaceSyncConfigure?: (

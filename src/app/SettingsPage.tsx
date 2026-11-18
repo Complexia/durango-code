@@ -26,6 +26,7 @@ import {
 import {
   defaultDurangoSettings,
   defaultSidebarV2Settings,
+  defaultSidebarV3Settings,
   defaultAppearanceSettings,
   UI_SCALE_OPTIONS,
   useOrionStore,
@@ -58,6 +59,7 @@ import { BuiltinBrowserSettings } from './BrowserSettings';
 import { FxConnectionsPanel } from './FxConnectionsPanel';
 import { DurangoDispatchSettings } from './DurangoDispatchSettings';
 import { DurangoDeployWatcherSetting } from './DurangoDeployWatcherSetting';
+import { DurangoBotsSetting } from './DurangoBotsSetting';
 import SkillsSettings from './SkillsSettings';
 import McpsSettings from './McpsSettings';
 import DeploymentsSettings from './DeploymentsSettings';
@@ -635,6 +637,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 authenticated={accountState.authenticated}
                 modelGroups={orchestrationModelGroups}
               />
+              <DurangoBotsSetting />
               <DurangoDeployWatcherSetting authenticated={accountState.authenticated} />
             </>
           )}
@@ -1795,6 +1798,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
               <div className="settings-group-label">Sidebar</div>
               <div className="settings-group">
                 <SidebarV2Setting />
+                <SidebarV3Setting />
               </div>
             </>
           )}
@@ -1855,6 +1859,32 @@ const SidebarV2Setting: React.FC = () => {
           type="checkbox"
           checked={enabled}
           onChange={(e) => setSidebarV2Settings({ enabled: e.target.checked })}
+        />
+        <span />
+      </label>
+    </div>
+  );
+};
+
+// Sidebar v3: the sidebar lists your Durango bots instead of threads.
+const SidebarV3Setting: React.FC = () => {
+  const enabled = useOrionStore((state) => state.sidebarV3Settings?.enabled ?? defaultSidebarV3Settings.enabled);
+  const setSidebarV3Settings = useOrionStore((state) => state.setSidebarV3Settings);
+  return (
+    <div className="setting-row">
+      <div className="setting-label">
+        <div className="setting-label-title">Sidebar v3</div>
+        <div className="setting-label-desc">
+          Your Durango bots instead of threads: the sidebar lists your bots, and picking one opens its conversation
+          here. Message a bot as often as you like; nothing waits for it to finish. With &ldquo;Allow Durango Chat
+          and Tasks to start agents on this machine&rdquo; on, its replies can run on this machine&apos;s Claude Code.
+        </div>
+      </div>
+      <label className="provider-toggle" title="Sidebar v3">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setSidebarV3Settings({ enabled: e.target.checked })}
         />
         <span />
       </label>

@@ -36,6 +36,8 @@
     "test:app-tools": "node scripts/run-electron-test.mjs scripts/test-app-tools.mjs",
     "test:devices": "node scripts/run-electron-test.mjs scripts/test-devices.mjs",
     "test:durango-dispatch": "node --no-warnings --experimental-strip-types scripts/test-durango-dispatch.mjs",
+    "test:bot-replies": "node --no-warnings scripts/test-bot-replies.mjs",
+    "test:local-bots": "node --no-warnings scripts/test-local-bots.mjs",
     "test:durango-deploy-watcher": "node --no-warnings scripts/test-durango-deploy-watcher.mjs",
     "test:thread-search": "bun scripts/test-thread-search.tsx",
     "test:subagent-report": "bun scripts/test-subagent-report.ts",
@@ -128,6 +130,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.261",
+    "@fontsource-variable/figtree": "^5.3.0",
     "@fontsource-variable/inter": "^5.3.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@monaco-editor/react": "^4.7.0",

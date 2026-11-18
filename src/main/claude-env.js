@@ -15,3 +15,11 @@ export const withClaudeEnv = (env = process.env) => ({
   [CLAUDE_CHROME_CLASSIFIER_FLOOR_ENV]: 'false',
   ...env,
 });
+
+// How a Durango Code access mode runs Claude Code (agent threads and bot
+// replies alike): Full access skips permission prompts, Workspace write
+// accepts edits and asks for the rest, Read only plans without changing files.
+export const claudePermissionOptionsForAccessMode = (accessMode) =>
+  accessMode === 'full-access'
+    ? { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }
+    : { permissionMode: accessMode === 'read-only' ? 'plan' : 'acceptEdits' };
