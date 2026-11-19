@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Archive,
   ArrowUp,
@@ -47,6 +48,7 @@ import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { useSidebarResize } from './useSidebarResize';
+import { useBotsShellSlot } from './botsShellSlot';
 import {
   botInboxSource,
   botIsWorking,
@@ -1065,6 +1067,7 @@ const BotRow: React.FC<{
 /** One bot's conversation: messages, live replies at the bottom, and a composer that never blocks. */
 const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (bot: DesktopBot) => void }> = ({ botId, onChanged, onOpenProject }) => {
   const [thread, setThread] = useState<DesktopBotThread | null>(() => botThreadCache.get(botId) ?? null);
+  const shellSlot = useBotsShellSlot();
   const [error, setError] = useState<string | null>(null);
   const [outgoing, setOutgoing] = useState<Outgoing[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1170,31 +1173,40 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
       </div>
     </AssistantRow>
   );
+  // The bot's name and status: in the shell bar's title spot (where "Bots" was),
+  // or as a row atop the pane when that spot isn't on screen.
+  const header = (
+    <>
+      <BotAvatar bot={bot} size="md" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-[14px] font-semibold text-[var(--text-primary)]">{bot.name}</span>
+          {bot.role === 'primary' && <span className="shrink-0 text-[11px] text-[var(--text-muted)]">all projects</span>}
+        </div>
+        <div className="flex items-center gap-1.5 text-[11.5px] text-[var(--text-muted)]">
+          {bot.paused ? <Pause size={11} /> : working ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" /> : null}
+          {bot.paused ? 'Paused' : working ? (live.length > 1 ? `Working on ${live.length} replies…` : 'Working…') : bot.needsYou ? 'Waiting on you' : bot.model.split('/').pop()}
+        </div>
+      </div>
+      {bot.project && (
+        <button
+          type="button"
+          onClick={() => onOpenProject(bot)}
+          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] text-[var(--text-secondary)] transition-colors duration-75 [-webkit-app-region:no-drag] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
+          title="The project: its threads, notes and files"
+        >
+          <FolderOpen size={13} /> {bot.project.name}
+        </button>
+      )}
+    </>
+  );
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
-      <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-white/[0.06] px-4">
-        <BotAvatar bot={bot} size="md" />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="truncate text-[14px] font-semibold text-neutral-100">{bot.name}</span>
-            {bot.role === 'primary' && <span className="shrink-0 text-[11px] text-neutral-500">all projects</span>}
-          </div>
-          <div className="flex items-center gap-1.5 text-[11.5px] text-neutral-500">
-            {bot.paused ? <Pause size={11} /> : working ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" /> : null}
-            {bot.paused ? 'Paused' : working ? (live.length > 1 ? `Working on ${live.length} replies…` : 'Working…') : bot.needsYou ? 'Waiting on you' : bot.model.split('/').pop()}
-          </div>
-        </div>
-        {bot.project && (
-          <button
-            type="button"
-            onClick={() => onOpenProject(bot)}
-            className="flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] text-neutral-400 transition-colors duration-75 hover:bg-white/[0.06] hover:text-neutral-200"
-            title="The project: its threads, notes and files"
-          >
-            <FolderOpen size={13} /> {bot.project.name}
-          </button>
-        )}
-      </div>
+      {shellSlot ? (
+        createPortal(header, shellSlot)
+      ) : (
+        <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-white/[0.06] px-4">{header}</div>
+      )}
       <div
         ref={scrollRef}
         className="min-h-0 flex-1 overflow-y-auto"

@@ -257,6 +257,7 @@ const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
 const BotsWorkspace = React.lazy(() => import('./app/BotsWorkspace').then((module) => ({ default: module.BotsWorkspace })));
 import ThemeLayer from './app/themes/ThemeLayer';
 import { CommunityInstallDialog } from './app/themes/CommunityThemes';
+import { setBotsShellSlot } from './app/botsShellSlot';
 // Remote control is opt-in and rarely on screen; keep its view out of the
 // startup chunk like the settings page.
 
@@ -1483,6 +1484,8 @@ const App: React.FC = () => {
   const sidebarV3View = useOrionStore((state) => state.sidebarV3Settings?.view ?? 'bot');
   // Sidebar v3 showing a bot or the projects window: no thread is on screen.
   const v3AwayFromThread = activeTab === 'agents' && sidebarV3Enabled && sidebarV3View !== 'thread';
+  // ...and on a bot (not the projects window): the bot's header takes the title spot.
+  const v3BotOnScreen = v3AwayFromThread && sidebarV3View !== 'projects' && sidebarV3View !== 'project';
   const shellTitle = v3AwayFromThread
     ? sidebarV3View === 'projects' || sidebarV3View === 'project'
       ? 'Projects'
@@ -11178,6 +11181,9 @@ const App: React.FC = () => {
                   </div>
                 )}
               </div>
+            ) : v3BotOnScreen ? (
+              // Sidebar v3 showing a bot: its pane fills this spot with its own header.
+              <div ref={setBotsShellSlot} className="shell-bot-slot bots-font" />
             ) : (
               <span className="shell-title truncate">{shellTitle}</span>
             )}
