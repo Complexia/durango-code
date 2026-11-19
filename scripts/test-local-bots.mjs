@@ -241,6 +241,46 @@ test('a message not taken in within 5 s gets a parallel reply (at most 2)', asyn
   );
 });
 
+test('a placed reply that takes in a later message moves below it, live and once stored', async () => {
+  const dir = path.join(testRoot, 'reply-moves');
+  const { engine, runner, sleeper } = makeEngine({ dir });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'land the durango change' });
+  await waitFor(() => runner.lanes.length === 1);
+  const run = runner.lanes[0];
+  // It shows text: its place is 2.
+  run.ctx.update({ text: 'Landing the project-sort change now.' });
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 2);
+  // The person writes mid-reply: 3, below the reply so far.
+  assert.equal((await engine.send(primary.id, { messageId: 'b', content: "wait no, don't" })).seq, 3);
+  // The reply takes it in and answers it: it moves below it.
+  assert.deepEqual((await run.ctx.takeInbox()).map((item) => item.seq), [3]);
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 4);
+  // Nothing new taken: it keeps its place.
+  assert.deepEqual(await run.ctx.takeInbox(), []);
+  run.ctx.update({ text: 'Landing the project-sort change now.\n\nStopped.' });
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 4);
+  sleeper.release();
+  run.finish({ text: 'Landing the project-sort change now.\n\nStopped.' });
+  await engine.idle();
+  const thread = await engine.thread(primary.id);
+  assert.deepEqual(
+    thread.messages.map((message) => `${message.seq}:${message.role}`),
+    ['1:user', '3:user', '4:assistant'],
+    'stored below the message it answered'
+  );
+  await engine.stop();
+  // After a reload: the same order.
+  const reloaded = makeEngine({ dir });
+  const again = await reloaded.engine.thread(primary.id);
+  assert.deepEqual(again.messages.map((message) => `${message.seq}:${message.content}`), [
+    '1:land the durango change',
+    "3:wait no, don't",
+    '4:Landing the project-sort change now.\n\nStopped.',
+  ]);
+  await reloaded.engine.stop();
+});
+
 test('a reply is placed after the messages that arrived while it ran', async () => {
   const { engine, runner } = makeEngine();
   const [primary] = (await engine.list()).bots;

@@ -875,6 +875,12 @@ export const createLocalBotEngine = ({
     entry.bot.requeue = (entry.bot.requeue ?? []).filter((seq) => !seqs.includes(seq));
     entry.bot.inFlight = [...new Set([...(entry.bot.inFlight ?? []), ...seqs])];
     for (const message of items) reply.claimSeqs.push(message.seq);
+    // A reply already placed (it showed text) that takes in a message sent
+    // after its place answers it from here on: it moves below it.
+    if (reply.seq !== undefined && seqs.some((seq) => seq > reply.seq)) {
+      reply.seq = entry.bot.nextSeq;
+      entry.bot.nextSeq += 1;
+    }
     persistBot(entry, { messages: false });
     changed();
     return items;
