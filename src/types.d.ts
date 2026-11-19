@@ -1629,6 +1629,8 @@ type OrionCodexBrowserIntegrationStatus = {
         /** The transcript message the run writes to (forwarded to remote controllers). */
         outputMessageId?: string;
         projectPath: string;
+        /** The thread's Durango Code project (its working directory may be a workspace outside it). */
+        projectId?: string;
         prompt: string;
         modelId: string;
         /** Image metadata used to build native ACP image blocks for Kimi turns. */

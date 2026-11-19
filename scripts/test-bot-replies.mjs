@@ -255,7 +255,7 @@ try {
     assert.ok(!buildMachinePayload({ machineId: 'm', name: 'Mac', platform: 'darwin', projects: [] }).capabilities.includes(BOT_REPLIES_CAPABILITY));
     assert.deepEqual(
       buildMachinePayload({ machineId: 'm', name: 'Mac', platform: 'darwin', projects: [], sourceCheckout: true, extraCapabilities: [BOT_REPLIES_CAPABILITY] }).capabilities,
-      ['thread-follow-up', 'model-choice', 'source-checkout', 'api-source-checkout', BOT_REPLIES_CAPABILITY]
+      ['thread-follow-up', 'model-choice', 'project-notes', 'source-checkout', 'api-source-checkout', BOT_REPLIES_CAPABILITY]
     );
     let offered = true;
     const registrations = [];
@@ -718,7 +718,8 @@ try {
     const reports = [];
     client.createBotLaneTask = async (input) => {
       tasks.push(input);
-      return { taskId: `task_${tasks.length}`, title: input.title };
+      // An older Durango still sends the project's notes: this version ignores them.
+      return { taskId: `task_${tasks.length}`, title: input.title, brief: '[Project notes: Durango]\n- Use bun.\n[/Project notes]' };
     };
     client.reportBotTask = async (input) => {
       reports.push(input);
@@ -756,12 +757,13 @@ try {
     assert.equal(results.here.project, 'Durango');
     assert.deepEqual(tasks[0], {
       laneId: 'lane_1', botId: 'bot_1', machineId: 'machine-1', title: 'Fix spinner', instructions: 'Fix the OpenCode updater spinner.',
-      project: 'Durango', requestId: 't', signal: tasks[0].signal,
-    }, 'the tool call id makes a retried create return the same task');
+      project: 'Durango', requestId: 't', readsProjectNotes: true, signal: tasks[0].signal,
+    }, 'the tool call id makes a retried create return the same task; its threads read the notes themselves (no brief)');
     assert.equal(started[0].projectId, 'p1');
     assert.equal(started[0].key, 'task_1', 'the renderer reports it as bottask:<taskId>');
     assert.equal(started[0].accessMode, 'full-access', 'threads a bot starts run with Full access');
     assert.match(started[0].prompt, /^Fix the OpenCode updater spinner\.\n\nWhen you're done, end with a concise report/);
+    assert.doesNotMatch(started[0].prompt, /Project notes|Use bun/, 'no pasted notes, even when Durango sends them');
     assert.equal(results.named.ok, true, 'run_on naming this machine');
     assert.equal(results.missingHere.ok, false);
     assert.match(results.missingHere.error, /No Durango Code project named "website" on this computer\. Projects: Durango\./);

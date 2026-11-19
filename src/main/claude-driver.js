@@ -23,6 +23,7 @@ import {
   orionAppToolNamesForAccessMode,
   orionDeviceToolNamesForAccessMode,
   orionMachineToolNamesForAccessMode,
+  ORION_PROJECT_NOTES_TOOL_NAMES,
 } from './thread-reader-routing.js';
 import { machineToolsAvailable, machineToolsForAccessMode, machineToolsPromptHint, runMachineTool } from './machine-tools.js';
 import { browserModeFor, browserToolsForAccessMode, builtinBrowserTips, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
@@ -30,6 +31,7 @@ import { DEVICE_TOOL_DESCRIPTIONS, DEVICE_TOOL_INPUT_SCHEMAS, DEVICE_TOOLS_PROMP
 import { agentDeviceAccessAllowed, getCachedDeviceSettings } from './devices/device-settings.js';
 import { THEME_TOOLS_PROMPT_HINT, themeMcpToolDefinitions, runThemeTool } from './theme-tools.js';
 import { APP_TOOLS_PROMPT_HINT, appMcpToolDefinitions, runAppTool } from './app-tools.js';
+import { PROJECT_NOTES_PROMPT_HINT, projectNotesToolDefinitions, runProjectNotesTool } from './project-notes-tool.js';
 import { zodForJsonSchema, zodShapeForInputSchema } from './json-schema-zod.js';
 import { VISUAL_MAX_HEIGHT, VISUAL_MIN_HEIGHT, VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, runVisualTool } from './visual-tools.js';
 import {
@@ -579,6 +581,7 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       ...(session.machinesEnabled ? claudeMachineTools(tool, z, session) : []),
       ...claudeThemeTools(tool, z, session),
       ...claudeAppTools(tool, z, session),
+      ...claudeProjectNotesTools(tool, z, session),
     ],
   });
 
@@ -621,6 +624,22 @@ const claudeAppTools = (tool, z, session) =>
           })
         ),
       definition.annotations ? { annotations: definition.annotations } : undefined
+    )
+  );
+
+// The thread's project notes (project-notes-tool.js holds the schema; the
+// bridge lists the same one through `__tools`).
+const claudeProjectNotesTools = (tool, z, session) =>
+  projectNotesToolDefinitions().map((definition) =>
+    tool(
+      definition.name,
+      definition.description,
+      zodShapeForInputSchema(z, definition.inputSchema),
+      async (args) =>
+        durangoToolResult(
+          await runProjectNotesTool(definition.name, args, { projectId: session.projectId, projectPath: session.projectPath })
+        ),
+      { annotations: definition.annotations }
     )
   );
 
@@ -2219,6 +2238,8 @@ export const createClaudeSdkSession = ({
   const session = {
     threadId,
     projectPath,
+    // The thread's Durango Code project (project_notes); projectPath may be a workspace outside it.
+    projectId: typeof input?.projectId === 'string' && input.projectId ? input.projectId : null,
     accessMode: sdkOptions.accessMode,
     browserMode: sdkOptions.browser,
     sender,
@@ -2327,6 +2348,7 @@ export const createClaudeSdkSession = ({
                 ...orionBuiltinToolNamesForAccessMode(sdkOptions.accessMode),
                 ...orionThemeToolNamesForAccessMode(sdkOptions.accessMode),
                 ...orionAppToolNamesForAccessMode(sdkOptions.accessMode),
+                ...ORION_PROJECT_NOTES_TOOL_NAMES,
                 ...(devicesEnabled ? orionDeviceToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 ...(machinesEnabled ? orionMachineToolNamesForAccessMode(sdkOptions.accessMode) : []),
                 'wait_for_background_tasks',
@@ -2375,6 +2397,7 @@ export const createClaudeSdkSession = ({
             CLAUDE_VISUALS_TIP,
             THEME_TOOLS_PROMPT_HINT,
             APP_TOOLS_PROMPT_HINT,
+            PROJECT_NOTES_PROMPT_HINT,
             ...(chromeEnabled ? [CLAUDE_CHROME_BROWSER_TIPS] : []),
             ...(builtinBrowser ? [builtinBrowserTips(signedInBrowserFor(sdkOptions.browser))] : []),
             ...(devicesEnabled ? [DEVICE_TOOLS_PROMPT_HINT] : []),

@@ -34,7 +34,9 @@ export const DISPATCH_ACCESS_MODES = ['read-only', 'workspace-write', 'full-acce
  * registers, applies a dispatch's `reasoningEffort`, and fails a run whose
  * model or effort it doesn't have instead of quietly using its default.
  */
-export const DISPATCH_CAPABILITIES = ['thread-follow-up', 'model-choice'];
+// 'project-notes': threads read their project's notes with the project_notes
+// tool (project-notes-tool.js), so Durango pastes none into bot-started threads.
+export const DISPATCH_CAPABILITIES = ['thread-follow-up', 'model-choice', 'project-notes'];
 /** Most models a machine lists to Durango (OpenCode alone can have hundreds). */
 export const MAX_REGISTERED_MODELS = 1000;
 /**

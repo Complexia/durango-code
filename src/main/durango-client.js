@@ -742,7 +742,7 @@ export const createDurangoClient = ({
     async createBotLaneTask({ laneId, signal, ...body } = {}) {
       const data = await request('POST', botLanePath(laneId, 'tasks'), { body, signal });
       if (!str(data.taskId)) throw new DurangoError('api', errorMessageFrom(data) || 'Durango did not record the task.');
-      return { taskId: str(data.taskId), title: str(data.title), brief: str(data.brief) };
+      return { taskId: str(data.taskId), title: str(data.title) };
     },
     /** That thread ended: `{ machineId, outcome: 'finished' | 'failed', summary?, error? }` → `{ ok }`. */
     async reportBotTask({ taskId, ...body } = {}) {

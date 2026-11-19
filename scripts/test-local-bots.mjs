@@ -548,7 +548,9 @@ test('project bots: one per project, notes and files in their instructions and i
 
   const task = await call('delegate_task', { title: 'Upgrade Next', instructions: 'Upgrade Next.js.', project: 'Site' });
   assert.equal(task.ok, true);
-  assert.match(started[0].prompt, /^\[Project notes: Site\]\n- Deploys go through durango-code land\.\n- The site runs on Next\.js\.\nProject files \(kept with the project\): plan\.md, notes\.txt\n\[\/Project notes\]\n\nUpgrade Next\.js\./);
+  // The brief alone: the thread reads the project's notes itself (project_notes).
+  assert.match(started[0].prompt, /^Upgrade Next\.js\.\n\nWhen you're done/);
+  assert.doesNotMatch(started[0].prompt, /Project notes|Deploys go through/);
   lane.finish({ text: 'Upgrading.' });
   await engine.idle();
 

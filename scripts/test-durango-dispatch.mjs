@@ -313,7 +313,7 @@ try {
         { id: 'p1', name: 'futuremail', repoId: 'repo_fm' },
         { id: 'p2', name: 'Billing', repoId: null },
       ],
-      capabilities: ['thread-follow-up', 'model-choice'],
+      capabilities: ['thread-follow-up', 'model-choice', 'project-notes'],
       models: [],
     });
     assert.equal(buildMachinePayload({ machineId: 'd', name: '', platform: 'darwin', projects }).projects.length, 3, 'null allowlist = all projects');
@@ -562,11 +562,12 @@ try {
     assert.ok(canCheckoutDispatch({ origin: 'tasks', project: { repoId: 'repo_new' } }, null, true));
     assert.deepEqual(
       buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], sourceCheckout: true }).capabilities,
-      ['thread-follow-up', 'model-choice', SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
+      ['thread-follow-up', 'model-choice', 'project-notes', SOURCE_CHECKOUT_CAPABILITY, API_SOURCE_CHECKOUT_CAPABILITY]
     );
     assert.deepEqual(
       buildMachinePayload({ machineId: 'm', name: 'omarchy', platform: 'linux', projects: [], allowedProjectIds: ['p1'], sourceCheckout: true }).capabilities,
-      ['thread-follow-up', 'model-choice']
+      ['thread-follow-up', 'model-choice', 'project-notes'],
+      "'project-notes': Durango pastes no notes into threads started here"
     );
 
     let claims = 0;

@@ -103,6 +103,7 @@ import {
   startBundledDeployRunner,
 } from './main/durango-deploy-watcher.js';
 import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } from './main/durango-tools.js';
+import { createProjectNotesReader, setProjectNotesReader } from './main/project-notes-tool.js';
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsForSync, readThreadsBatch, readThreadRawSync, readThreadShells, readThreadsIndex, searchThreadBodies, searchThreadExcerpts, warmThreadSearch, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
@@ -5940,6 +5941,21 @@ const botProjectTarget = async (input, local) => {
   return identity.key ? { project: { key: identity.key, name: project.name } } : null;
 };
 
+// project_notes (project-notes-tool.js): a thread's project notes, read when
+// the thread asks (not pasted into its prompt). By the thread's project id,
+// looked up as the project panel does (bots:project): its folder may be a
+// Durango workspace outside the project. Signed in, Durango's notes for the
+// project's key, else this device's own, without waking the local bots.
+setProjectNotesReader(
+  createProjectNotesReader({
+    projects: () => configuredProjects,
+    isLocal: async () => !(await isDispatchSignedIn()),
+    projectTarget: botProjectTarget,
+    localProject: (project) => localBots.projectByKey(project),
+    remoteProject: (key) => durangoClient.projectMemory(key),
+  })
+);
+
 ipcMain.handle('bots:project', async (_event, input) => {
   const local = await localBotsMode();
   const target = await botProjectTarget(input, local);
@@ -6658,6 +6674,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             threadId: input.threadId,
             runId,
             projectPath: input.projectPath,
+            projectId: typeof input.projectId === 'string' ? input.projectId : null,
             providerId: model.providerId,
             modelId: model.id,
             accessMode: input.accessMode || 'full-access',

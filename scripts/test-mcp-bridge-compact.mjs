@@ -127,7 +127,7 @@ try {
 
   // --- Server instructions (Codex): one line on what orion is for ---------------------------
   const fullInit = await full.call('initialize', { protocolVersion: '2025-06-18' });
-  assert.match(fullInit.result.instructions, /^Durango Code, the app running you: subagents on other models, other threads, Durango Chat, user memory, user actions, secrets, HTML visuals, built-in browser, simulators, other machines, app theme, app window, connected apps\.$/);
+  assert.match(fullInit.result.instructions, /^Durango Code, the app running you: subagents on other models, other threads, Durango Chat, user memory, user actions, secrets, HTML visuals, built-in browser, simulators, other machines, app theme, app window, project notes, connected apps\.$/);
   assert.ok(fullInit.result.instructions.length <= 246, 'fits the namespace line Codex shows (250 characters)');
   const compactInit = await compact.call('initialize', { protocolVersion: '2025-06-18' });
   assert.equal(compactInit.result.instructions, undefined, 'only with --instructions (fx repeats it on every tool)');

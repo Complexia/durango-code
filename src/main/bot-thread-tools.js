@@ -20,7 +20,14 @@ export const SHIP_VIA_THREAD_MESSAGE =
 
 // The bots' rule for shipping, in every bot's instructions (local-bots.js;
 // Durango's own copy is in chat/andromedus/lib/bots/prompt.ts).
-export const BOT_SHIPPING_RULE = `Shipping (land, ship, deploy, merge, release, publish): the Durango Code thread that made a change ships it, not you. How a project ships is its own (its code may live on GitHub rather than Durango Source, it may deploy through a website, it may need an order such as Convex before the web app, migrations or seeding), and that thread has the context; you usually don't. So when the person asks to ship something, find the thread that did the work (the thread id in its task report, or list_threads and read_thread in that project) and send it the request with message_thread, e.g. "${SHIP_VIA_THREAD_MESSAGE}" Then tell the person what it reports (what landed, what deployed, how it was checked). Only when there is no such thread (deleted, or the work wasn't done in one) start a new thread in that project with delegate_task to ship it, with the change id and everything you know about it. Don't land or deploy it yourself (the durango-code CLI, git, provider CLIs) unless the person explicitly tells you to do it yourself. Shipping is public and hard to undo: confirm with the person first unless they already asked you to ship it.`;
+/**
+ * How a bot briefs a Durango Code thread (local bots' prompt, and a Durango
+ * bot's reply on this machine, bot-replies.js). Durango's copy: BOT_PROMPT
+ * "Briefing threads", chat/andromedus/lib/bots/prompt.ts.
+ */
+export const BOT_BRIEF_RULE = `Briefing a Durango Code thread (delegate_task with \`project\`, or a follow-up with message_thread): the thread is a capable engineer that reads the project itself (its code, AGENTS.md, the project's notes through its project_notes tool) and plans its own work. Keep the brief short and goal-level: what to solve and why, plus only what it can't find on its own (what the person asked for and decided, constraints, ids, links, error text, where earlier work stands). Leave the how to it: no numbered requirement lists, step-by-step plans or file-by-file edits, and don't repeat the project's own rules or process. A few sentences is usually enough; add detail only where the person was specific.`;
+
+export const BOT_SHIPPING_RULE = `Shipping (land, ship, deploy, merge, release, publish): the Durango Code thread that made a change ships it, not you. How a project ships is its own (its code may live on GitHub rather than Durango Source, it may deploy through a website, it may need an order such as Convex before the web app, migrations or seeding), and that thread has the context; you usually don't. So when the person asks to ship something, find the thread that did the work (the thread id in its task report, or list_threads and read_thread in that project) and send it the request with message_thread, e.g. "${SHIP_VIA_THREAD_MESSAGE}" Then tell the person what it reports (what landed, what deployed, how it was checked). Only when there is no such thread (deleted, or the work wasn't done in one) start a new thread in that project with delegate_task to ship it, with the change id and what it can't find on its own. Don't land or deploy it yourself (the durango-code CLI, git, provider CLIs) unless the person explicitly tells you to do it yourself. Shipping is public and hard to undo: confirm with the person first unless they already asked you to ship it.`;
 
 /**
  * The line a thread's report to a bot ends with: which thread it was, so the
@@ -81,7 +88,7 @@ export const BOT_THREAD_TOOLS = [
       type: 'object',
       properties: {
         thread_id: { type: 'string', minLength: 1, maxLength: 200 },
-        message: { type: 'string', minLength: 1, maxLength: 16_000, description: 'The message, complete and self-contained.' },
+        message: { type: 'string', minLength: 1, maxLength: 16_000, description: 'What you need and why, plus anything the thread can\'t see (what the person said). It has its own context: don\'t repeat it or spell out steps.' },
         title: { type: 'string', maxLength: 80, description: 'Short title for the follow-up as a task, e.g. "Fix the failing test".' },
       },
       required: ['thread_id', 'message'],

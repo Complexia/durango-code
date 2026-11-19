@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoModelIdForClaude } from './bot-replies.js';
-import { BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, withThreadReportFooter } from './bot-thread-tools.js';
+import { BOT_BRIEF_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, withThreadReportFooter } from './bot-thread-tools.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -83,6 +83,8 @@ Schedules (manage_routine): when the person wants something done regularly or at
 Other bots:
 - The person can have many bots, each with its own job (e.g. a job hunter, a news digest). When they want a standing helper for an ongoing job, create one with create_bot: a clear name, a precise job, and usually a routine. Tell them it exists and what it will do.
 - Talk to another bot with message_bot (asynchronous: its answer comes back to your inbox later) and check on it with read_bot. Don't micromanage: bots run on their own.
+
+${BOT_BRIEF_RULE}
 
 ${BOT_SHIPPING_RULE}
 
@@ -309,17 +311,17 @@ export const LOCAL_BOT_TOOLS = [
   {
     name: 'delegate_task',
     description:
-      "Hand off a piece of work to run in the background as its own task, on this computer through Claude Code (with its own tools: web, shell, files…). Returns at once; the task's report arrives in your inbox when it's done, and you tell the person. Use it for anything that takes more than a couple of quick tool calls, so you stay responsive. Write complete, self-contained instructions: the task sees nothing else.",
+      "Hand off a piece of work to run in the background as its own task, on this computer through Claude Code (with its own tools: web, shell, files…). Returns at once; the task's report arrives in your inbox when it's done, and you tell the person. Use it for anything that takes more than a couple of quick tool calls, so you stay responsive. Brief it like a capable colleague: the goal and why, plus what it can't find on its own (it sees nothing of this conversation); leave the how to it.",
     inputSchema: {
       type: 'object',
       properties: {
         title: { type: 'string', minLength: 1, maxLength: 80, description: "Short title the person will see, e.g. 'Find 5 remote senior frontend roles'." },
-        instructions: { type: 'string', minLength: 1, maxLength: 16_000, description: 'Everything the task needs: goal, context, constraints, what to report back.' },
+        instructions: { type: 'string', minLength: 1, maxLength: 16_000, description: 'The brief: what to solve and why, the context and constraints it can\'t find on its own, and anything specific to report back. Goal-level, usually a few sentences: no step-by-step plans.' },
         project: {
           type: 'string',
           maxLength: 200,
           description:
-            "A Durango Code project on this computer (by name, as listed in your instructions): the task runs as a Durango Code thread in it, with every tool a thread has, and the person can watch and continue it in the app. The project's notes are added for it. Omit for work that isn't about a project.",
+            "A Durango Code project on this computer (by name, as listed in your instructions): the task runs as a Durango Code thread in it, with every tool a thread has, and the person can watch and continue it in the app. It can read the project's notes itself (project_notes). Omit for work that isn't about a project.",
         },
       },
       required: ['title', 'instructions'],
@@ -1439,12 +1441,11 @@ export const createLocalBotEngine = ({
     const task = { id: newId('lt'), title: clip(oneLine(title), 80) || 'Task', project: project.name, startedAt: now() };
     const key = `${entry.bot.id}:${task.id}`;
     runtime.threads.set(key, task);
-    await loadProjects();
-    const brief = projectBriefFor(projectKeyOf(project), project.name);
+    // The project's notes aren't pasted in: the thread reads them with project_notes.
     const started = await Promise.resolve(
       startProjectThread({
         projectId: project.id,
-        prompt: `${brief ? `${brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this. ${BOT_REPORT_GUIDE}`,
+        prompt: `${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this. ${BOT_REPORT_GUIDE}`,
         key,
         botName: entry.bot.name,
         title: task.title,
@@ -1519,26 +1520,12 @@ export const createLocalBotEngine = ({
     const files = (record.files ?? []).map((file) => file.name);
     return [
       `## Your project: ${project.name}`,
-      `You are this project's bot: its Durango Code project on this computer. Work in it by starting Durango Code threads there (delegate_task with \`project: "${project.name}"\`), several at once when the work splits; see where it stands with list_threads and read_thread, steer threads with message_thread, and report what matters. Keep what should be remembered about the project in its notes (remember_project) and its documents in its files (save_project_file): every bot and every thread you start there sees them. You aren't limited to this project.`,
+      `You are this project's bot: its Durango Code project on this computer. Work in it by starting Durango Code threads there (delegate_task with \`project: "${project.name}"\`), several at once when the work splits; see where it stands with list_threads and read_thread, steer threads with message_thread, and report what matters. Keep what should be remembered about the project in its notes (remember_project) and its documents in its files (save_project_file): every bot sees them, and threads there read them with their project_notes tool. You aren't limited to this project.`,
       notes ? `Project notes (oldest first):\n${notes}` : 'No project notes yet.',
       files.length ? `Project files (read_project_file): ${files.join(', ')}` : null,
     ]
       .filter(Boolean)
       .join('\n\n');
-  };
-
-  /** A project's notes for a thread started in it (or ''), by its key: a project needs no bot. */
-  const projectBriefFor = (key, name) => {
-    const record = projectStore?.[key];
-    if (!record || (!record.notes?.length && !record.files?.length)) return '';
-    return [
-      `[Project notes: ${name}]`,
-      notesBlock(record.notes ?? []) || null,
-      record.files?.length ? `Project files (kept with the project): ${record.files.map((file) => file.name).join(', ')}` : null,
-      '[/Project notes]',
-    ]
-      .filter(Boolean)
-      .join('\n');
   };
 
   const addNote = async (project, content, author) => {

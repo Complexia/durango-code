@@ -5942,6 +5942,8 @@ const App: React.FC = () => {
         threadId,
         outputMessageId: messageId,
         projectPath: workingDir,
+        // The thread's project (project_notes reads its notes by it, wherever the run's folder is).
+        projectId: project.id,
         prompt: agentPrompt,
         modelId: model.id,
         accessMode: thread.accessMode ?? 'full-access',
@@ -6554,6 +6556,8 @@ const App: React.FC = () => {
           runId,
           threadId,
           projectPath: workingDir,
+          // The thread's project (project_notes reads its notes by it, wherever the run's folder is).
+          projectId: project.id,
           prompt,
           modelId: model.id,
           // Plan mode: the aside can read the repo but never mutate it.
@@ -6677,6 +6681,8 @@ const App: React.FC = () => {
           runId,
           threadId,
           projectPath: workingDir,
+          // The thread's project (project_notes reads its notes by it, wherever the run's folder is).
+          projectId: project.id,
           prompt: goalAction.objective || 'Resume the goal.',
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -6833,6 +6839,8 @@ const App: React.FC = () => {
           runId,
           threadId,
           projectPath: workingDir,
+          // The thread's project (project_notes reads its notes by it, wherever the run's folder is).
+          projectId: project.id,
           prompt: review.instructions || reviewLabel,
           modelId: model.id,
           accessMode: thread.accessMode ?? 'full-access',
@@ -8858,7 +8866,7 @@ const App: React.FC = () => {
           });
         } else if (dispatch) {
           const project = findProjectById(useOrionStore.getState(), thread!.projectId);
-          // A bot's thread starts with the project's notes: its title is the task's.
+          // A bot's thread is titled after its task (threads from older versions start with a project-notes block).
           const firstLine =
             dispatch.title?.trim() ||
             (promptText

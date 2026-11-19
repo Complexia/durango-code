@@ -69,6 +69,7 @@ import { ORION_DEVICE_TOOL_NAMES } from '../src/main/thread-reader-routing.js';
 import { VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, VISUAL_TOOL_NAMES } from '../src/main/visual-tools.js';
 import { THEME_TOOL_DESCRIPTIONS, THEME_TOOL_INPUT_SCHEMAS } from '../src/main/theme-tools.js';
 import { orionThemeToolNamesForAccessMode } from '../src/main/thread-reader-routing.js';
+import { PROJECT_NOTES_TOOL_DESCRIPTION, createProjectNotesReader, formatProjectNotes, runProjectNotesTool, setProjectNotesReader } from '../src/main/project-notes-tool.js';
 import { setDeviceDataRootForTests } from '../src/main/devices/device-settings.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
 
@@ -443,9 +444,83 @@ try {
   }
   assert.equal(registered.some((entry) => entry.name === 'app_click'), false, 'Read only lists no app actions');
   assert.equal(isPreapprovedOrionTool('app_snapshot', 'read-only'), true);
+  assert.equal(isPreapprovedOrionTool('project_notes', 'read-only'), true, 'project_notes only reads');
   assert.equal(isPreapprovedOrionTool('app_snapshot', 'workspace-write'), true);
   assert.equal(isPreapprovedOrionTool('app_click', 'workspace-write'), false, 'Workspace write asks before acting in the app');
   assert.equal(isPreapprovedOrionTool('app_type', 'full-access'), true);
+
+  // --- project_notes: every thread reads its project's notes (not pasted into prompts) ---
+  assert.ok(registered.some((entry) => entry.name === 'project_notes'), 'Claude registers project_notes');
+  assert.match(formatProjectNotes(null), /does not run in one of the Durango Code projects/);
+  assert.equal(formatProjectNotes({ name: 'Site', notes: [], files: [] }), 'Site has no project notes or files yet.');
+  const notesText = formatProjectNotes({
+    name: 'Site',
+    notes: [
+      { content: 'The site runs on Next.js.', createdAt: 2 },
+      { content: 'Deploys go\nthrough land.', createdAt: 1 },
+    ],
+    files: [{ name: 'plan.md', path: '/tmp/plan.md' }, { name: 'logo.png', url: 'https://example.com/logo.png' }],
+  });
+  assert.match(notesText, /Notes \(oldest first\):\n- Deploys go through land\.\n- The site runs on Next\.js\./);
+  assert.match(notesText, /Files:\n- plan\.md: \/tmp\/plan\.md\n- logo\.png: https:\/\/example\.com\/logo\.png/);
+  // File names and paths exactly as stored: repeated spaces stay.
+  const spaced = formatProjectNotes({ name: 'Site', notes: [], files: [{ name: 'Q4  plan.md', path: '/files/ab12/Q4  plan.md' }] });
+  assert.match(spaced, /\n- Q4  plan\.md: \/files\/ab12\/Q4  plan\.md$/);
+  assert.match(formatProjectNotes({ name: 'Site', notes: [], files: [{ name: 'a\nb.md', path: '/f/a\nb.md' }] }), /- "a\\nb\.md": "\/f\/a\\nb\.md"/, 'a line break is quoted, not lost');
+
+  // The reader: the thread's project by id, then the project panel's lookup,
+  // whatever folder the run is in (a Durango workspace outside the project).
+  const lookups = [];
+  const readNotes = (signedIn) =>
+    createProjectNotesReader({
+      projects: () => [{ id: 'p1', name: 'Site', path: '/Users/me/site' }],
+      isLocal: async () => !signedIn,
+      projectTarget: async (input, local) => {
+        lookups.push({ input, local });
+        return { project: { key: 'repo:r1', name: 'Site' } };
+      },
+      localProject: async (project) => ({ notes: [{ content: `local ${project.key}`, createdAt: 1 }], files: [] }),
+      remoteProject: async (key) => ({ notes: [{ content: `remote ${key}`, createdAt: 1 }], files: [{ name: 'Q4  plan.md', url: 'https://x.test/f' }] }),
+    });
+  const inWorkspace = await readNotes(true)({ projectId: 'p1', projectPath: path.join(os.homedir(), '.durango/ws/site/fix-x') });
+  assert.deepEqual(inWorkspace.notes.map((note) => note.content), ['remote repo:r1'], 'a run in a workspace finds its project\'s notes');
+  assert.deepEqual(lookups.at(-1), { input: { projectId: 'p1' }, local: false }, 'as the project panel looks them up');
+  assert.deepEqual((await readNotes(false)({ projectId: 'p1' })).notes.map((note) => note.content), ['local repo:r1'], 'signed out: this device\'s own');
+  assert.equal(await readNotes(true)({ projectId: 'gone', projectPath: '/Users/me/site' }), null, 'by id only, never by folder');
+  assert.equal(await readNotes(true)({ projectPath: '/Users/me/site' }), null);
+
+  let readFor = null;
+  setProjectNotesReader(async (run) => {
+    readFor = run;
+    return { name: 'Site', notes: [{ content: 'Use bun.', createdAt: 1 }], files: [] };
+  });
+  const notesRun = await runProjectNotesTool('project_notes', {}, { projectId: 'p1', projectPath: '/work/site' });
+  assert.deepEqual(readFor, { projectId: 'p1', projectPath: '/work/site' }, 'reads the run\'s project');
+  assert.equal(notesRun.ok, true);
+  assert.match(notesRun.text, /- Use bun\./);
+  // Claude runs pass their thread's project id (input.projectId), not only their folder.
+  const claudeNotes = [];
+  createOrionMcpServer(
+    {
+      createSdkMcpServer: (config) => config,
+      tool: (name, description, schema, handler) => {
+        claudeNotes.push({ name, handler });
+        return { name };
+      },
+    },
+    { z },
+    { threadId: 't', projectPath: '/ws/site-fix', projectId: 'p1', accessMode: 'read-only', sender: null }
+  );
+  await claudeNotes.find((entry) => entry.name === 'project_notes').handler({});
+  assert.deepEqual(readFor, { projectId: 'p1', projectPath: '/ws/site-fix' }, 'Claude: by the session\'s project id');
+  setProjectNotesReader(async () => {
+    throw new Error('offline');
+  });
+  assert.deepEqual(await runProjectNotesTool('project_notes', {}, { projectPath: '/work/site' }), {
+    ok: false,
+    text: 'Durango Code could not read the project notes: offline',
+  });
+  setProjectNotesReader(null);
 
   // --- Device tools: Claude registers them only with agent access, mirroring device-tools.js ---
   setDeviceDataRootForTests(path.join(testRoot, 'device-data'));
@@ -866,7 +941,7 @@ try {
   const socketPath = path.join(testRoot, 'bridge.sock');
   const bridgeServer = net.createServer(handleMcpBridgeConnection);
   await new Promise((resolve) => bridgeServer.listen(socketPath, resolve));
-  mcpBridgeSessions.set('tok', { getSender: () => null, threadId: 't', projectPath: testRoot, providerId: 'grok', accessMode: 'read-only' });
+  mcpBridgeSessions.set('tok', { getSender: () => null, threadId: 't', projectPath: testRoot, projectId: 'p1', providerId: 'grok', accessMode: 'read-only' });
   const child = spawn(process.execPath, [shimPath, '--socket', socketPath, '--token', 'tok'], {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
     stdio: ['pipe', 'pipe', 'inherit'],
@@ -921,7 +996,22 @@ try {
     // Theme tools come from the app (`__tools`), after the shim's own.
     const themeNames = orionThemeToolNamesForAccessMode('read-only');
     const appNames = orionAppToolNamesForAccessMode('read-only');
-    assert.deepEqual(shimTools.map((tool) => tool.name), [...ORION_BUILTIN_TOOL_NAMES, ...themeNames, ...appNames]);
+    assert.deepEqual(shimTools.map((tool) => tool.name), [...ORION_BUILTIN_TOOL_NAMES, ...themeNames, ...appNames, 'project_notes']);
+    const notesTool = shimTools.find((candidate) => candidate.name === 'project_notes');
+    assert.equal(notesTool.description, PROJECT_NOTES_TOOL_DESCRIPTION, 'project_notes description matches project-notes-tool.js');
+    const shimNotes = await call('tools/call', { name: 'project_notes', arguments: {} });
+    assert.equal(shimNotes.result.isError, true, 'the bridge routes project_notes (no reader here)');
+    assert.match(shimNotes.result.content[0].text, /not available/);
+    let bridgeRead = null;
+    setProjectNotesReader(async (run) => {
+      bridgeRead = run;
+      return { name: 'Site', notes: [{ content: 'Use bun.', createdAt: 1 }], files: [] };
+    });
+    const bridgeNotes = await call('tools/call', { name: 'project_notes', arguments: {} });
+    setProjectNotesReader(null);
+    assert.notEqual(bridgeNotes.result.isError, true);
+    assert.match(bridgeNotes.result.content[0].text, /- Use bun\./);
+    assert.deepEqual(bridgeRead, { projectId: 'p1', projectPath: testRoot }, 'the bridge passes the run\'s project id');
     for (const name of themeNames) {
       const tool = shimTools.find((candidate) => candidate.name === name);
       assert.equal(tool.description, THEME_TOOL_DESCRIPTIONS[name], `${name} description matches theme-tools.js`);

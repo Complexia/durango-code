@@ -94,6 +94,11 @@ export const ORION_MACHINE_TOOL_NAMES = Object.freeze([
 export const orionMachineToolNamesForAccessMode = (accessMode) =>
   accessMode === 'full-access' ? ORION_MACHINE_TOOL_NAMES : ORION_MACHINE_READ_TOOL_NAMES;
 
+// The thread's project notes (project-notes-tool.js) only read the person's
+// own notes, so every mode approves them. Served through `__tools` for the
+// bridge, like the theme tools.
+export const ORION_PROJECT_NOTES_TOOL_NAMES = Object.freeze(['project_notes']);
+
 // load_tools (mcp-on-demand.js, mcp-bridge-shim.cjs) only returns tool
 // definitions and connects servers the user set up; their tools keep their
 // own approval. Claude pre-approves it in every mode too.
@@ -108,7 +113,8 @@ export const isPreapprovedOrionTool = (name, accessMode) =>
     orionDeviceToolNamesForAccessMode(accessMode).includes(name) ||
     orionMachineToolNamesForAccessMode(accessMode).includes(name) ||
     orionThemeToolNamesForAccessMode(accessMode).includes(name) ||
-    orionAppToolNamesForAccessMode(accessMode).includes(name));
+    orionAppToolNamesForAccessMode(accessMode).includes(name) ||
+    ORION_PROJECT_NOTES_TOOL_NAMES.includes(name));
 
 const runPluginHelpCommand = (providerId) =>
   providerId === 'cursor'

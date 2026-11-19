@@ -174,7 +174,7 @@ export const botProjectsNote = ({ projects, accessMode, threads }) => {
   ];
   if (threads) {
     lines.push(
-      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. Write complete instructions: the thread sees nothing of this conversation (the project\'s notes are added for it). See where a project stands with list_threads and read_thread (the person\'s threads too), and steer a thread with message_thread (a follow-up turn there, reported back like a task).',
+      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), and steer a thread with message_thread (a follow-up turn there, reported back like a task).',
       `To ship a change (land, deploy, merge, release), message the thread that made it (message_thread; its id is in the task report) with something like "${SHIP_VIA_THREAD_MESSAGE}": it knows how its project ships. A thread on another of the person's machines: delegate_task with \`thread_id\` (and no \`project\`). Land or deploy yourself only when the person explicitly tells you to.`
     );
   }
@@ -1153,14 +1153,16 @@ export const createBotReplyWorker = ({
           ...(typeof target.project.key === 'string' ? { projectKey: target.project.key } : {}),
           // A retry after a lost response gets the same task back (no stray running task).
           ...(toolCallId ? { requestId: String(toolCallId) } : {}),
+          // Its threads read the project's notes with project_notes: Durango sends no brief.
+          readsProjectNotes: true,
           signal: abort.signal,
         })
       );
       const started = await Promise.resolve(
         startProjectThread({
           projectId: target.project.id,
-          // The project's notes first (Durango keeps them), then the work.
-          prompt: `${created.brief ? `${created.brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${lane.botName}" that asked for this. ${BOT_REPORT_GUIDE}`,
+          // The project's notes aren't pasted in: the thread reads them with project_notes.
+          prompt: `${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${lane.botName}" that asked for this. ${BOT_REPORT_GUIDE}`,
           key: created.taskId,
           botName: lane.botName,
           title: created.title || title,

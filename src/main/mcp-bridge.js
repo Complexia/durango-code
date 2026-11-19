@@ -14,6 +14,7 @@ import { SECRET_TOOL_NAMES, cancelSecretRequests, redactSecrets, resolveSecretRe
 import { VISUAL_TOOL_NAMES, runVisualTool } from './visual-tools.js';
 import { THEME_TOOL_NAMES, runThemeTool, themeMcpToolDefinitions } from './theme-tools.js';
 import { APP_TOOL_NAMES, appBridgeToolDefinitions, runAppTool } from './app-tools.js';
+import { PROJECT_NOTES_TOOL_NAMES, projectNotesToolDefinitions, runProjectNotesTool } from './project-notes-tool.js';
 import { BROWSER_TOOL_NAMES, browserMcpToolDefinitions, hasBuiltinBrowser, runBrowserTool, signedInBrowserFor } from './browser-tools.js';
 import { DEVICE_TOOL_NAMES, runDeviceTool } from './device-tools.js';
 import { MACHINE_TOOL_NAMES, machineMcpToolDefinitions, machineToolsAvailable, runMachineTool } from './machine-tools.js';
@@ -181,6 +182,8 @@ export const handleMcpBridgeConnection = (socket) => {
             ...themeMcpToolDefinitions(session.accessMode),
             // Using Durango Code's own window (app-tools.js).
             ...appBridgeToolDefinitions(session.accessMode),
+            // The thread's project notes (project-notes-tool.js).
+            ...projectNotesToolDefinitions(),
           ],
         });
         continue;
@@ -320,6 +323,12 @@ export const handleMcpBridgeConnection = (socket) => {
           requireFullAccess: true,
         }).then(({ ok, text, content }) =>
           reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
+        );
+        continue;
+      }
+      if (PROJECT_NOTES_TOOL_NAMES.includes(message.tool)) {
+        void runProjectNotesTool(message.tool, args, { projectId: session.projectId, projectPath: session.projectPath }).then(({ ok, text }) =>
+          reply(ok, text)
         );
         continue;
       }
@@ -476,6 +485,7 @@ export const registerMcpBridgeForRun = async ({
   threadId,
   runId,
   projectPath,
+  projectId = null,
   providerId,
   modelId,
   accessMode,
@@ -521,6 +531,8 @@ export const registerMcpBridgeForRun = async ({
       threadId,
       runId,
       projectPath,
+      // The thread's Durango Code project (project_notes); projectPath may be a workspace outside it.
+      projectId: typeof projectId === 'string' && projectId ? projectId : null,
       providerId,
       modelId,
       accessMode,
