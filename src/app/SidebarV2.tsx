@@ -29,18 +29,19 @@ import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { SidebarSearchPanel, warmSearchIndex } from './threadSearch';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { useSidebarResize } from './useSidebarResize';
-import { THREAD_DRAG_MIME } from './AgentsSidebar';
+import { THREAD_DRAG_MIME } from './SavedViewsSection';
 import { formatWorkedDuration, threadSidebarTone, threadWorkedMs, type SidebarV2Lists, type SidebarV2View, type SidebarV2ViewsSettings } from './threadLists';
 import ThemeSlot from './themes/ThemeSlot';
+import { AGENTS_SIDEBAR_STORAGE_KEY, SidebarModeHeader } from './SidebarModeHeader';
 
-// Sidebar v2 (Settings → Experimental), after T3 Code's: one flat list of
-// threads instead of project groups. The header holds search, New agent, Add
-// project and a views menu that toggles Pinned, Working, Snoozed and Settled.
+// The Threads tab's sidebar ("sidebar v2"), after T3 Code's: one flat list of
+// threads. Under the shared Projects | Threads | Bots header
+// (SidebarModeHeader.tsx), its own row holds search, New agent, Add project
+// and a views menu that toggles Pinned, Working, Snoozed and Settled.
 // A row can be snoozed (it leaves the list until its run finishes or it needs
 // you) or settled (archived until you restore it or send it a new message).
 
 const PAGE_SIZE = 40;
-const AGENTS_SIDEBAR_STORAGE_KEY = 'orion.agentsSidebarWidth';
 const HOVER_CARD_DELAY_MS = 550;
 
 const VIEW_LABELS: Record<SidebarV2View, string> = {
@@ -877,8 +878,9 @@ export const SidebarV2 = React.memo(function SidebarV2(model: SidebarV2Model) {
 
   return (
     <div className="sidebar agents-sidebar" ref={sidebarRef}>
+      <SidebarModeHeader />
       {/* The header row anchors the search results. */}
-      <div className="sidebar-top-row relative flex items-center gap-1 px-2.5 pb-2 pt-2.5" ref={threadSearchRef}>
+      <div className="sidebar-top-row relative flex items-center gap-1 px-2.5 pb-2 pt-1" ref={threadSearchRef}>
         <button
           type="button"
           className={`flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-left text-[13px] transition-colors duration-100 ${

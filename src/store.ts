@@ -98,33 +98,46 @@ export const defaultDeploymentSettings: DeploymentSettings = {
 };
 
 /**
- * Sidebar v2 (Settings → Experimental): one flat thread list with snooze and
- * settle instead of project groups, on by default. `views` are the lists
- * toggled from its header menu.
+ * The sidebar's Threads | Bots switch (src/app/SidebarModeHeader.tsx).
+ * Threads: the flat thread list (SidebarV2) next to the thread view. Bots:
+ * the person's Durango bots (src/app/BotsWorkspace.tsx) next to the picked
+ * bot's conversation. Remembered across launches; Threads on a fresh profile.
+ */
+export type SidebarTab = 'threads' | 'bots';
+
+export const SIDEBAR_TABS: readonly SidebarTab[] = ['threads', 'bots'];
+
+/**
+ * The tab a stored profile opens on: the one it saved, else Bots for a store
+ * from when Bots was the "Sidebar v3" switch in Settings → Experimental and
+ * it was on, else Threads.
+ */
+export const sidebarTabFromPersisted = (persisted: unknown): SidebarTab => {
+  const state = (persisted ?? {}) as { sidebarTab?: unknown; sidebarV3Settings?: { enabled?: unknown } };
+  if (SIDEBAR_TABS.includes(state.sidebarTab as SidebarTab)) return state.sidebarTab as SidebarTab;
+  return state.sidebarV3Settings?.enabled === true ? 'bots' : 'threads';
+};
+
+/**
+ * The Threads tab: one flat thread list with snooze and settle. `views` are
+ * the lists toggled from its header menu.
  */
 export type SidebarV2Settings = {
-  enabled: boolean;
-  /**
-   * 2 since sidebar v2 is the default: stores from before then (where it was
-   * opt-in) are switched on once, and a later "off" sticks.
-   */
-  version?: number;
   views: { pinned: boolean; working: boolean; recent: boolean; snoozed: boolean; settled: boolean };
   /**
-   * Set once the threads from before sidebar v2 were settled. The first time
-   * it is turned on, every listed thread except pinned ones is settled so the
+   * Set once the threads from before sidebar v2 were settled. On the first
+   * launch with it, every listed thread except pinned ones is settled so the
    * sidebar starts empty instead of holding the whole history.
    */
   settledExistingAt?: string;
 };
 
 /**
- * Sidebar v3 (Settings → Experimental): the sidebar lists the person's
- * Durango bots instead of threads, and the main panel shows the picked bot's
- * conversation (src/app/BotsWorkspace.tsx). Off by default.
+ * The Bots tab's state: the sidebar lists the person's Durango bots, and the
+ * main panel shows the picked bot's conversation (src/app/BotsWorkspace.tsx).
+ * Stored under its old "Sidebar v3" name so existing picks carry over.
  */
 export type SidebarV3Settings = {
-  enabled: boolean;
   /** The bot open in the main panel. */
   selectedBotId?: string | null;
   /** What the main panel shows: the picked bot, the selected thread (the usual thread view), the projects window or one project. */
@@ -135,7 +148,13 @@ export type SidebarV3Settings = {
   threadFromProjectId?: string | null;
 };
 
-export const defaultSidebarV3Settings: SidebarV3Settings = { enabled: false, selectedBotId: null };
+export const defaultSidebarV3Settings: SidebarV3Settings = { selectedBotId: null };
+
+/** Drops the switches Settings → Experimental used to hold from a stored value. */
+const withoutSidebarSwitch = <T extends object>(value: T | undefined): Omit<T, 'enabled' | 'version'> => {
+  const { enabled: _enabled, version: _version, ...rest } = (value ?? {}) as T & { enabled?: unknown; version?: unknown };
+  return rest;
+};
 
 /** Settings → Cosmetics. */
 export type AppearanceSettings = {
@@ -150,8 +169,6 @@ export const defaultAppearanceSettings: AppearanceSettings = {
 };
 
 export const defaultSidebarV2Settings: SidebarV2Settings = {
-  enabled: true,
-  version: 2,
   views: { pinned: false, working: false, recent: true, snoozed: false, settled: false },
 };
 
@@ -1317,6 +1334,7 @@ interface OrionState {
   remoteControlSettings: RemoteControlSettings;
   snapShotSettings: SnapShotSettings;
   deploymentSettings: DeploymentSettings;
+  sidebarTab: SidebarTab;
   sidebarV2Settings: SidebarV2Settings;
   sidebarV3Settings: SidebarV3Settings;
   browserSettings: BrowserSettings;
@@ -1370,6 +1388,7 @@ interface OrionState {
   setRemoteControlSettings: (updates: Partial<RemoteControlSettings>) => void;
   setSnapShotSettings: (updates: Partial<SnapShotSettings>) => void;
   setDeploymentSettings: (updates: Partial<DeploymentSettings>) => void;
+  setSidebarTab: (tab: SidebarTab) => void;
   setSidebarV2Settings: (updates: Partial<SidebarV2Settings>) => void;
   setSidebarV3Settings: (updates: Partial<SidebarV3Settings>) => void;
   setAppearanceSettings: (updates: Partial<AppearanceSettings>) => void;
@@ -2315,6 +2334,7 @@ const PERSISTED_SOURCE_KEYS = [
   'savedViews',
   'selectedProjectId',
   'selectedThreadId',
+  'sidebarTab',
   'sidebarV2Settings',
   'sidebarV3Settings',
   'snapShotSettings',
@@ -2369,6 +2389,7 @@ const buildPersistedSettings = (state: OrionState) => ({
           ...defaultDeploymentSettings,
           ...state.deploymentSettings,
         },
+        sidebarTab: state.sidebarTab,
         sidebarV2Settings: {
           ...defaultSidebarV2Settings,
           ...state.sidebarV2Settings,
@@ -2424,6 +2445,7 @@ export const useOrionStore = create<OrionState>()(
       remoteControlSettings: defaultRemoteControlSettings,
       snapShotSettings: defaultSnapShotSettings,
       deploymentSettings: defaultDeploymentSettings,
+      sidebarTab: 'threads',
       sidebarV2Settings: defaultSidebarV2Settings,
       sidebarV3Settings: defaultSidebarV3Settings,
       browserSettings: defaultBrowserSettings,
@@ -2926,6 +2948,8 @@ export const useOrionStore = create<OrionState>()(
           sidebarV3Settings: { ...defaultSidebarV3Settings, ...state.sidebarV3Settings, ...updates },
         })),
 
+      setSidebarTab: (tab) => set({ sidebarTab: tab }),
+
       setSidebarV2Settings: (updates) =>
         set((state) => {
           const sidebarV2Settings: SidebarV2Settings = {
@@ -2938,7 +2962,9 @@ export const useOrionStore = create<OrionState>()(
               ...updates.views,
             },
           };
-          if (!sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return { sidebarV2Settings };
+          // The first-switch settle needs every stored thread: after a failed
+          // thread load it waits for a launch that reads them all.
+          if (sidebarV2Settings.settledExistingAt || threadsPersistenceBlocked) return { sidebarV2Settings };
           const at = new Date().toISOString();
           return {
             sidebarV2Settings: { ...sidebarV2Settings, settledExistingAt: at },
@@ -3632,16 +3658,18 @@ export const useOrionStore = create<OrionState>()(
         merged.snapShotSettings = mergeSnapShotSettings(merged.snapShotSettings);
         merged.appearanceSettings = { ...defaultAppearanceSettings, ...merged.appearanceSettings };
         merged.browserSettings = { ...defaultBrowserSettings, ...merged.browserSettings };
-        merged.sidebarV3Settings = { ...defaultSidebarV3Settings, ...merged.sidebarV3Settings };
+        // Threads | Bots replaced the Sidebar v2 / v3 switches in Settings →
+        // Experimental: a store with v3 on opens on Bots, and the switches'
+        // stored values are dropped.
+        merged.sidebarTab = sidebarTabFromPersisted(persisted);
+        merged.sidebarV3Settings = { ...defaultSidebarV3Settings, ...withoutSidebarSwitch(merged.sidebarV3Settings) };
         // The Pinned group starts off on every launch; turning it on lasts
-        // until the app quits. Stores from when sidebar v2 was opt-in turn it
-        // on once; those that never had it on get the first-switch settle
-        // once all threads have loaded (settleThreadsFromBeforeSidebarV2).
-        const persistedSidebarV2 = (persisted as Partial<OrionState> | undefined)?.sidebarV2Settings;
+        // until the app quits. Stores whose threads were never settled (sidebar
+        // v2 never on) get the first-switch settle once all threads have
+        // loaded (settleThreadsFromBeforeSidebarV2).
         merged.sidebarV2Settings = {
           ...defaultSidebarV2Settings,
-          ...merged.sidebarV2Settings,
-          ...(persistedSidebarV2 && (persistedSidebarV2.version ?? 1) < 2 ? { enabled: true, version: 2 } : {}),
+          ...withoutSidebarSwitch(merged.sidebarV2Settings),
           views: { ...defaultSidebarV2Settings.views, ...merged.sidebarV2Settings?.views, pinned: false },
         };
         // Durango merge: work sharing defaults to Full. Pre-Durango stores
@@ -4244,8 +4272,8 @@ const threadsWithPendingOpsSync = (): ThreadRecord[] => {
 // post-hydration save, so until this flush runs the transcripts exist only in
 // memory and a crash would lose them.
 //
-// Stores with sidebar v2 on but never settled (a fresh install, an update
-// from when it was opt-in, or one that turned it on before the first-switch
+// Stores never settled (a fresh install, an update from when sidebar v2 was
+// opt-in or switched off, or one that turned it on before the first-switch
 // settle existed) get it once here rather than in `merge`: thread edits made
 // during hydration are never saved, while this one goes through the saver
 // like a user's.
@@ -4253,7 +4281,7 @@ const settleThreadsFromBeforeSidebarV2 = () => {
   const { sidebarV2Settings, setSidebarV2Settings } = useOrionStore.getState();
   // Only over every stored thread.
   if (threadsPersistenceBlocked) return;
-  if (!sidebarV2Settings.enabled || sidebarV2Settings.settledExistingAt) return;
+  if (sidebarV2Settings.settledExistingAt) return;
   setSidebarV2Settings({});
 };
 const pruneOrphanComposerDrafts = () => {

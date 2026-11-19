@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-// Sidebar v2: snoozed threads wake when their run ends, settled threads come
+// Sidebar v2 (the Threads tab): snoozed threads wake when their run ends, settled threads come
 // back when they run again, and the four lists partition the threads. All
 // storage is in memory; nothing touches the user's profile.
 const bridge = {
@@ -13,7 +13,7 @@ const bridge = {
 Object.assign(globalThis, {
   window: { addEventListener() {}, localStorage: { getItem: () => null }, orion: bridge },
 });
-const { useOrionStore, defaultSidebarV2Settings } = await import('../src/store');
+const { useOrionStore, defaultSidebarV2Settings, sidebarTabFromPersisted } = await import('../src/store');
 const {
   compareSidebarV2Recent,
   formatWorkedDuration,
@@ -27,21 +27,23 @@ const {
   workStartedAt,
 } = await import('../src/app/threadLists');
 const { projectMonogram } = await import('../src/app/ProjectBadge');
+const { summarizeThreadMessages } = await import('../src/thread-shell.js');
 
 const store = useOrionStore.getState;
-assert.equal(store().sidebarV2Settings.enabled, true, 'sidebar v2 is on by default');
+assert.equal(store().sidebarTab, 'threads', 'a fresh profile opens on the Threads tab');
 assert.equal(store().sidebarV2Settings.settledExistingAt, undefined, 'a fresh store has not settled yet');
 
-// Stores from when sidebar v2 was opt-in turn it on once, keeping whether
-// they already settled; a later "off" sticks.
+// The Threads | Bots tab replaced the Sidebar v2 / v3 switches in Settings →
+// Experimental. A store with v3 on opens on Bots once; the saved tab wins
+// after that; the old switches' values are dropped, and whether a store
+// already settled is kept.
 const merge = useOrionStore.persist.getOptions().merge!;
-const mergedSidebar = (persisted: Record<string, unknown>) =>
-  (merge(persisted, store()) as ReturnType<typeof store>).sidebarV2Settings;
+const mergedState = (persisted: Record<string, unknown>) => merge(persisted, store()) as ReturnType<typeof store>;
+const mergedSidebar = (persisted: Record<string, unknown>) => mergedState(persisted).sidebarV2Settings;
 const views = { ...defaultSidebarV2Settings.views, settled: true };
-assert.equal(mergedSidebar({}).enabled, true, 'a store from before sidebar v2 gets it');
-assert.deepEqual(mergedSidebar({ sidebarV2Settings: { enabled: false, views } }), {
-  enabled: true,
-  version: 2,
+assert.deepEqual(mergedSidebar({}), defaultSidebarV2Settings, 'a store from before sidebar v2 gets its defaults');
+assert.deepEqual(mergedSidebar({ sidebarV2Settings: { enabled: false, views } }), { views: { ...views, pinned: false } });
+assert.deepEqual(mergedSidebar({ sidebarV2Settings: { enabled: false, version: 2, views } }), {
   views: { ...views, pinned: false },
 });
 assert.equal(
@@ -49,11 +51,30 @@ assert.equal(
   'then',
   'a store that settled before does not settle again'
 );
-assert.equal(mergedSidebar({ sidebarV2Settings: { enabled: false, version: 2, views } }).enabled, false);
-assert.equal(mergedSidebar({ sidebarV2Settings: { enabled: true, version: 2, views } }).enabled, true);
+assert.equal(mergedState({}).sidebarTab, 'threads');
+assert.equal(mergedState({ sidebarV3Settings: { enabled: false, selectedBotId: 'b1' } }).sidebarTab, 'threads');
+assert.equal(mergedState({ sidebarV3Settings: { enabled: true } }).sidebarTab, 'bots', 'Sidebar v3 on: the Bots tab');
+assert.equal(
+  mergedState({ sidebarTab: 'threads', sidebarV3Settings: { enabled: true } }).sidebarTab,
+  'threads',
+  'a saved tab wins over the old switch'
+);
+assert.equal(mergedState({ sidebarTab: 'bots' }).sidebarTab, 'bots', 'the last tab is kept across launches');
+assert.equal(mergedState({ sidebarTab: 'nonsense' }).sidebarTab, 'threads', 'an unknown saved tab falls back to Threads');
+assert.equal(sidebarTabFromPersisted(null), 'threads');
+assert.equal(sidebarTabFromPersisted({ sidebarV3Settings: null }), 'threads');
+assert.deepEqual(
+  mergedState({ sidebarV3Settings: { enabled: true, selectedBotId: 'b1', view: 'projects' } }).sidebarV3Settings,
+  { selectedBotId: 'b1', view: 'projects' },
+  'the Bots tab keeps its picks and drops the old switch'
+);
+assert.ok(!('enabled' in mergedState({ sidebarV2Settings: { enabled: true, views } }).sidebarV2Settings));
+store().setSidebarTab('bots');
+assert.equal(store().sidebarTab, 'bots');
+store().setSidebarTab('threads');
 
-// The rest runs as a store that had it off and never settled.
-useOrionStore.setState({ sidebarV2Settings: { ...defaultSidebarV2Settings, enabled: false } });
+// The rest runs as a store that never settled.
+useOrionStore.setState({ sidebarV2Settings: { ...defaultSidebarV2Settings } });
 assert.deepEqual(store().sidebarV2Settings.views, defaultSidebarV2Settings.views);
 assert.equal(store().sidebarV2Settings.views.pinned, false, 'the Pinned list starts off');
 store().setSidebarV2Settings({ views: { ...defaultSidebarV2Settings.views, settled: true } });
@@ -104,29 +125,37 @@ assert.equal(thread(onScreen).settledAt, undefined, 'running again unsettles');
 assert.ok(thread(onScreen).pinnedAt, 'unsettling keeps the pin');
 store().updateThread(onScreen, { pinnedAt: undefined });
 
-// Turning sidebar v2 on the first time settles the threads from before it,
-// except pinned ones (and running or snoozed ones); later toggles don't.
+// The first-switch settle (it runs once, on the first launch with sidebar
+// v2) settles the threads from before it, except pinned ones (and running or
+// snoozed ones); later setting changes don't.
 const old = store().createThread(projectId, 'Old', { select: false });
 const pinned = store().createThread(projectId, 'Pinned', { select: false });
 store().updateThread(pinned, { pinnedAt: new Date().toISOString() });
-store().setSidebarV2Settings({ enabled: true });
+useOrionStore.setState({ sidebarV2Settings: { ...store().sidebarV2Settings, settledExistingAt: undefined } });
+store().setSidebarV2Settings({});
 assert.ok(store().sidebarV2Settings.settledExistingAt);
 assert.ok(thread(old).settledAt, 'an existing thread is settled');
 assert.equal(thread(pinned).settledAt, undefined, 'a pinned thread stays');
 assert.equal(thread(onScreen).settledAt, undefined, 'a running thread stays');
 assert.equal(thread(background).settledAt, undefined, 'a snoozed thread stays snoozed');
-store().setSidebarV2Settings({ enabled: false });
 const later = store().createThread(projectId, 'Later', { select: false });
-store().setSidebarV2Settings({ enabled: true });
+store().setSidebarV2Settings({ views: { ...store().sidebarV2Settings.views, snoozed: true } });
 assert.equal(thread(later).settledAt, undefined, 'only the first switch settles');
-store().setSidebarV2Settings({ enabled: false });
 
 // Lists: settled beats snoozed; children never appear. Recent has every
 // thread not snoozed or settled, pinned or not; Pinned keeps settled pinned
 // threads but not snoozed ones. Snoozing or settling keeps the pin.
 const now = Date.now();
 const base = thread(onScreen);
-const make = (id: string, extra: Record<string, unknown>) => ({ ...base, id, status: 'idle' as const, ...extra });
+// Shells carry a summary of their messages (thread-shell.js), which is what
+// the lists read; a test thread's messages are summarized the same way.
+const make = (id: string, extra: Record<string, unknown>) => ({
+  ...base,
+  id,
+  status: 'idle' as const,
+  ...extra,
+  ...(Array.isArray(extra.messages) ? { summary: summarizeThreadMessages(extra.messages as never) } : {}),
+});
 const at = new Date(now).toISOString();
 const threads = [
   make('recent', {}),
@@ -141,6 +170,7 @@ assert.deepEqual(
   Object.fromEntries(Object.entries(lists).map(([view, list]) => [view, list.map((entry) => entry.id)])),
   {
     pinned: ['pinned', 'settled-pinned'],
+    working: [],
     recent: ['recent', 'pinned'],
     snoozed: ['snoozed'],
     settled: ['settled', 'settled-pinned'],
@@ -163,11 +193,11 @@ const runningFrom = (id: string, minute: number) =>
   });
 const finishedAt = (id: string, started: number, completed: number) => {
   const run = runningFrom(id, started);
-  return {
-    ...run,
+  return make(id, {
     status: 'done' as const,
+    createdAt: run.createdAt,
     messages: [run.messages[0], { ...run.messages[1], status: 'done', completedAt: iso(completed) }],
-  };
+  });
 };
 const order = (list: typeof threads, attention = new Map<string, number>()) =>
   [...list].sort(compareSidebarV2Recent(attention)).map((entry) => entry.id);
@@ -189,8 +219,7 @@ assert.deepEqual(
 );
 
 // The row's number is how long the thread's agents worked, summed over runs.
-const runThread = {
-  ...base,
+const runThread = make('runs', {
   messages: [
     { id: 'u1', role: 'user', content: 'hi', ts: '2026-10-28T00:00:00.000Z' },
     { id: 'r1', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-28T00:00:00.000Z', status: 'done',
@@ -198,7 +227,7 @@ const runThread = {
     { id: 'r2', role: 'agent', kind: 'agent-run', content: '', ts: '2026-10-28T00:10:00.000Z', status: 'running',
       startedAt: '2026-10-28T00:10:00.000Z' },
   ],
-} as typeof base;
+}) as typeof base;
 assert.equal(threadWorkedMs(runThread, Date.parse('2026-10-28T00:10:05.000Z')), 12_000);
 // Working time counts from the user's message, through turns the agent was
 // re-invoked for after a background wait, but not past a turn that finished.

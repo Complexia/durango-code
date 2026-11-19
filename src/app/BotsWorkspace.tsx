@@ -54,6 +54,8 @@ import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { sortProjectsByLatestThreadStart } from './projectOrder';
 import { useSidebarResize } from './useSidebarResize';
 import { useBotsShellSlot } from './botsShellSlot';
+import { AGENTS_SIDEBAR_STORAGE_KEY, SidebarModeHeader } from './SidebarModeHeader';
+import { noteBotList } from './botsTabBadge';
 import {
   BOT_THREAD_FIRST_PAGE,
   BOT_THREAD_OLDER_PAGE,
@@ -84,8 +86,9 @@ import {
   type BotAttachmentFile,
 } from './bots';
 
-// Sidebar v3 (Settings → Experimental): the sidebar lists the person's Durango
-// bots instead of threads, and the main panel is the picked bot's
+// The sidebar's Bots tab (once "Sidebar v3" in Settings → Experimental): the
+// sidebar lists the person's Durango bots under the shared header
+// (SidebarModeHeader.tsx), and the main panel is the picked bot's
 // conversation. Messages are never blocked: they queue in the bot's thread and
 // a reply in progress takes them in. Data comes from Durango with this app's
 // sign-in (window.orion.listBots / getBotThread / sendBotMessage), polled
@@ -96,7 +99,6 @@ import {
 const LIST_POLL_MS = 5_000;
 const THREAD_POLL_ACTIVE_MS = 1_200;
 const THREAD_POLL_IDLE_MS = 4_000;
-const SIDEBAR_STORAGE_KEY = 'orion.botsSidebarWidth';
 
 type Outgoing = { id: string; content: string; files?: BotAttachmentFile[]; failed?: string; sent?: boolean };
 
@@ -226,7 +228,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const setSidebarV3Settings = useOrionStore((state) => state.setSidebarV3Settings);
   const projects = useOrionStore((state) => state.projects);
   const threads = useOrionStore((state) => state.threads);
-  const { sidebarRef, resizeHandle } = useSidebarResize({ storageKey: SIDEBAR_STORAGE_KEY, label: 'Bots sidebar' });
+  const { sidebarRef, resizeHandle } = useSidebarResize({ storageKey: AGENTS_SIDEBAR_STORAGE_KEY, label: 'Agents sidebar' });
   const [bots, setBots] = useState<DesktopBot[] | null>(() => botListCache?.bots ?? null);
   const [projectKeys, setProjectKeys] = useState<Record<string, string>>(() => botListCache?.projectKeys ?? {});
   const [listError, setListError] = useState<string | null>(null);
@@ -258,6 +260,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     if (!result) return;
     if (!result.ok) {
       if (result.code === 'account_changed') return;
+      noteBotList(null);
       // Signed out: nothing cached may show.
       if (result.code === 'not_signed_in') {
         clearBotCaches();
@@ -275,6 +278,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     setListError(null);
     setAllowed(result.allowed !== false);
     setBots(result.bots ?? []);
+    noteBotList(result.allowed === false ? null : (result.bots ?? []));
     setProjectKeys(result.projectKeys ?? {});
     botListCache = {
       account: nextAccount,
@@ -389,31 +393,15 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   );
 
   const ready = !listError && allowed && bots !== null;
-  const projectsActive = view === 'projects' || view === 'project';
   const selectedEntry = view === 'project' ? projectEntries.find((entry) => entry.id === selectedProjectId) ?? null : null;
   return (
     <>
       <div className="sidebar agents-sidebar bots-font" ref={sidebarRef}>
-        <div className="px-1.5 pb-1 pt-3">
-          <button
-            type="button"
-            onClick={openProjects}
-            className={`flex h-9 w-full items-center gap-2.5 rounded-lg px-2 text-left text-[14.5px] transition-colors duration-75 ${
-              projectsActive ? 'bg-white/[0.08] text-neutral-100' : 'text-neutral-300 hover:bg-white/[0.045]'
-            }`}
-          >
-            <span className="flex h-5 w-5 shrink-0 items-center justify-center text-neutral-400">
-              <Folder size={16} />
-            </span>
-            <span className="flex-1">Projects</span>
-            {projects.length > 0 && <span className="text-[12px] text-neutral-500">{projects.length}</span>}
-          </button>
-        </div>
-        <div className="sidebar-top-row flex items-center gap-2 px-3.5 pb-1.5 pt-2">
-          <span className="text-[11.5px] font-semibold uppercase tracking-[0.12em] text-neutral-500">Bots</span>
-        </div>
+        {/* Projects and the Threads | Bots switch: the same header as the Threads tab's. */}
+        <SidebarModeHeader />
+        <div className="h-2 shrink-0" aria-hidden />
         {mode === 'local' && (
-          <div className="-mt-1 px-3.5 pb-2 text-[11px] leading-snug text-neutral-500">
+          <div className="px-3.5 pb-2 text-[11px] leading-snug text-neutral-500">
             On {THIS_DEVICE} · sign in to Durango to sync
           </div>
         )}
@@ -457,19 +445,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
         <SidebarFooter {...sidebarFooterProps} />
         {resizeHandle}
       </div>
-      {view === 'thread' && ready ? (
+      {/* Threads and the projects window are this machine's own: they show
+          whether or not bots are available (signed out, another plan, offline). */}
+      {view === 'thread' ? (
         threadPanel
       ) : (
         <div className="panel agents-panel bots-font">
-          {!ready ? (
-            <div className="empty-state">
-              <div className="empty-state-icon">
-                <Bot size={30} />
-              </div>
-              <div className="empty-state-title">Your bots</div>
-              <div className="text-xs text-[#6b6b74]">{listError ?? (allowed ? 'Loading…' : 'Bots are part of the Ultra plan on Durango.')}</div>
-            </div>
-          ) : view === 'projects' || (view === 'project' && !selectedEntry) ? (
+          {view === 'projects' || (view === 'project' && !selectedEntry) ? (
             <ProjectsView entries={projectEntries} onOpen={openProject} />
           ) : view === 'project' && selectedEntry ? (
             <ProjectPage
@@ -484,6 +466,14 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               attentionThreadIds={attentionThreadIds}
               account={account}
             />
+          ) : !ready ? (
+            <div className="empty-state">
+              <div className="empty-state-icon">
+                <Bot size={30} />
+              </div>
+              <div className="empty-state-title">Your bots</div>
+              <div className="text-xs text-[#6b6b74]">{listError ?? (allowed ? 'Loading…' : 'Bots are part of the Ultra plan on Durango.')}</div>
+            </div>
           ) : selectedBotId ? (
             <BotPane
               key={`${account ?? ''}:${selectedBotId}`}
@@ -522,7 +512,7 @@ const ProjectsView: React.FC<{ entries: ProjectEntry[]; onOpen: (projectId: stri
           Each project has a bot that leads it, its threads, and notes and files its bots and threads keep in mind.
         </p>
         {entries.length === 0 ? (
-          <div className="text-[13px] text-neutral-500">No projects yet. Add one from the usual sidebar (Sidebar v3 off) or the Code tab.</div>
+          <div className="text-[13px] text-neutral-500">No projects yet. Add one from the Threads tab (Add project) or the Code tab.</div>
         ) : (
           <ul className="grid grid-cols-1 gap-2 md:grid-cols-2">
             {entries.map((entry) => {

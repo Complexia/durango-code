@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 
-// Updating to the release where sidebar v2 is the default: a store from when it
-// was opt-in (off, never settled) turns it on and, once every stored thread has
-// loaded, settles them all except pinned ones, saved like a user's settle.
+// Updating to the release where sidebar v2 is the default (and later the
+// Threads tab, with no switch): a store from when it was off and never settled
+// gets it and, once every stored thread has loaded, settles them all except
+// pinned ones, saved like a user's settle. Its old Sidebar v3 switch was on,
+// so it opens on the Bots tab.
 // Only the open thread's transcript loads: the settle is a shell change, saved
 // without the others' transcripts. `--failed-backfill` checks that a failed
 // thread load settles nothing. All storage is in memory.
@@ -44,6 +46,7 @@ const bridge = {
         projects: [project],
         selectedThreadId: 'head',
         sidebarV2Settings: { enabled: false, views: { pinned: false, recent: true, snoozed: false, settled: false } },
+        sidebarV3Settings: { enabled: true, selectedBotId: 'bot-1' },
       },
     }),
   saveStore: async (value: string) => {
@@ -91,11 +94,15 @@ await new Promise<void>((resolve) => onAllThreadsLoaded(resolve));
 const state = useOrionStore.getState();
 const settledAt = (id: string) => state.threads.find((entry) => entry.id === id)?.settledAt;
 
-assert.equal(state.sidebarV2Settings.enabled, true, 'the update turns sidebar v2 on');
-assert.equal(state.sidebarV2Settings.version, 2);
+assert.ok(!('enabled' in state.sidebarV2Settings), 'the old switch is gone');
+assert.equal(state.sidebarTab, 'bots', 'Sidebar v3 on: the update opens on the Bots tab');
+assert.deepEqual(state.sidebarV3Settings, { selectedBotId: 'bot-1' });
 
 if (failedBackfill) {
   assert.equal(state.sidebarV2Settings.settledExistingAt, undefined, 'a failed load waits for a full one');
+  // Toggling a list before then doesn't mark the settle done either.
+  state.setSidebarV2Settings({ views: { ...state.sidebarV2Settings.views, snoozed: true } });
+  assert.equal(useOrionStore.getState().sidebarV2Settings.settledExistingAt, undefined, 'a view toggle waits too');
   assert.equal(state.threads.length, 0);
   console.log('Sidebar v2 update checks passed (failed backfill).');
   process.exit(0);
@@ -119,9 +126,12 @@ assert.ok(
 );
 assert.deepEqual(Object.keys(useOrionStore.getState().transcripts), ['head'], 'only the open thread loaded');
 await flushOrionStoreSave();
-const savedSidebar = JSON.parse(storeSaves.at(-1)!).state.sidebarV2Settings;
-assert.equal(savedSidebar.enabled, true);
-assert.equal(savedSidebar.version, 2);
+const savedState = JSON.parse(storeSaves.at(-1)!).state;
+const savedSidebar = savedState.sidebarV2Settings;
+assert.equal(savedSidebar.enabled, undefined);
+assert.equal(savedSidebar.version, undefined);
 assert.ok(savedSidebar.settledExistingAt);
+assert.equal(savedState.sidebarTab, 'bots', 'the tab is saved, so later launches keep it');
+assert.equal(savedState.sidebarV3Settings.enabled, undefined);
 
 console.log('Sidebar v2 update checks passed.');

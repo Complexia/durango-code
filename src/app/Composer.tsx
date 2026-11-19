@@ -29,7 +29,7 @@ import {
 import type { Project, Thread } from '../store';
 import type { OrionMcpEntry, SlashCommandInfo } from '../types';
 import { agentProviders, claudeCodeCliModelId, isClaudeCodeCliModelId, type AgentModel, type AgentProviderId } from '../agentCatalog';
-import { THREAD_DRAG_MIME } from './AgentsSidebar';
+import { THREAD_DRAG_MIME } from './SavedViewsSection';
 import { AttachmentThumb, attachmentKindLabel, formatAttachmentSize } from './attachments';
 import { RemoteUploadStatus, cancelRemoteUpload, prepareRemoteUpload } from './remoteUploads';
 import { SnapShotAttachmentBadge, openSnapShotOutline } from './SnapShotSettings';

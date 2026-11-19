@@ -127,7 +127,6 @@ const fetchPendingInput = async (threadId: string) => {
  * thread can wake up.
  */
 export const useThreadsNeedingInput = (
-  enabled: boolean,
   runningThreadIds: string[],
   onAttention: (threadId: string) => void
 ): ReadonlyMap<string, number> => {
@@ -138,10 +137,6 @@ export const useThreadsNeedingInput = (
   const initialRunningRef = useRef(runningThreadIds);
 
   useEffect(() => {
-    if (!enabled) {
-      setPending((current) => (current.size ? new Map() : current));
-      return undefined;
-    }
     let disposed = false;
     const refresh = async (threadId: string) => {
       const generation = (generationRef.current.get(threadId) ?? 0) + 1;
@@ -173,7 +168,7 @@ export const useThreadsNeedingInput = (
       disposed = true;
       unsubscribe?.();
     };
-  }, [enabled]);
+  }, []);
 
   return pending;
 };

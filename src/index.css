@@ -603,6 +603,143 @@ body {
   box-shadow: inset 0 0 0 1px rgb(255 255 255 / 4%);
 }
 
+/* The Agents sidebar's header on both tabs (SidebarModeHeader.tsx): the
+   Projects entry, then the Threads | Bots switch, styled like the shell bar's
+   Agents | Code switch. Theme tokens (not fixed whites) so light themes work,
+   and the same font and sizes on both tabs so nothing moves on a switch. */
+.sidebar-mode-header {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 10px 4px;
+  font-family: var(--font-ui);
+}
+
+.sidebar-projects-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 34px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.sidebar-projects-row:hover {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+}
+
+.sidebar-projects-row.active {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+}
+
+.sidebar-projects-row-icon {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.sidebar-projects-row-label {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-projects-row-count {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sidebar-mode-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
+}
+
+.sidebar-mode-tab {
+  position: relative;
+  height: 28px;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: calc(var(--radius-md) - 3px);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.sidebar-mode-tab:hover {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--text-primary) 4%, transparent);
+}
+
+.sidebar-mode-tab.active {
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--text-primary) 9%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-primary) 5%, transparent);
+}
+
+.sidebar-mode-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The Bots tab's badge while Threads is open (botsTabBadge.ts): unread
+   replies as a count, else a dot for working (pulsing) or needs you. */
+.sidebar-mode-tab-badge-slot {
+  display: inline-flex;
+  align-items: center;
+}
+
+.sidebar-mode-tab-count {
+  min-width: 16px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #0ea5e9;
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 650;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.sidebar-mode-tab-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+}
+
+.sidebar-mode-tab-dot.working {
+  background: #38bdf8;
+}
+
+.sidebar-mode-tab-dot.needs-you {
+  background: #fbbf24;
+}
+
 .provider-update-banner {
   position: absolute;
   top: calc(var(--shell-height) + 8px);

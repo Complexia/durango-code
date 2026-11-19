@@ -11,7 +11,7 @@ const [appSource, chatSource, mainSource, preloadSource, sidebarSource] = await 
   readFile(new URL('../src/app/chat.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/main.js', import.meta.url), 'utf8'),
   readFile(new URL('../src/preload.js', import.meta.url), 'utf8'),
-  readFile(new URL('../src/app/AgentsSidebar.tsx', import.meta.url), 'utf8'),
+  readFile(new URL('../src/app/SidebarV2.tsx', import.meta.url), 'utf8'),
 ]);
 
 const section = (source, start, end) => {
@@ -62,7 +62,7 @@ assert.match(
 
 assert.match(
   sidebarSource,
-  /useSidebarResize\(\{[\s\S]*storageKey: AGENTS_SIDEBAR_STORAGE_KEY[\s\S]*className="sidebar agents-sidebar" ref=\{sidebarRef\}[\s\S]*<SidebarFooter \{\.\.\.sidebarFooterProps\} \/>\s*\{sidebarResizeHandle\}/,
+  /useSidebarResize\(\{[\s\S]*storageKey: AGENTS_SIDEBAR_STORAGE_KEY[\s\S]*className="sidebar agents-sidebar" ref=\{sidebarRef\}[\s\S]*<SidebarFooter \{\.\.\.sidebarFooterProps\} \/>\s*\{resizeHandle\}/,
   'the Agents sidebar must be drag-resizable through the shared sidebar resize hook'
 );
 

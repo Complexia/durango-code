@@ -129,7 +129,7 @@ import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
 import orionIconUrl from '../assets/icon.png';
 import { removeBootSkeleton } from './app/bootSkeleton';
 import { CodeWorkspace } from './app/CodeWorkspace';
-import { AgentsSidebar, type AgentsSidebarModel, SavedViewsSection, THREAD_DRAG_MIME } from './app/AgentsSidebar';
+import { SavedViewsSection, THREAD_DRAG_MIME } from './app/SavedViewsSection';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
 import ThemeSlot from './app/themes/ThemeSlot';
 import { ProjectPickerModal, type ProjectPickerView } from './app/ProjectPickerModal';
@@ -157,7 +157,6 @@ import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import {
   Composer,
-  compareRecentThreadOrder,
   useLatestCallback,
   type ComposerReviewRequest,
 } from './app/Composer';
@@ -254,11 +253,13 @@ import type {
 // counterpart, node-pty, is likewise only import()ed on first terminal:ensure.)
 const TerminalView = React.lazy(() => import('./TerminalView'));
 const SettingsPage = React.lazy(() => import('./app/SettingsPage'));
-// Sidebar v3 (experimental, off by default): loaded only when it is turned on.
-const BotsWorkspace = React.lazy(() => import('./app/BotsWorkspace').then((module) => ({ default: module.BotsWorkspace })));
+// The sidebar's Bots tab: loaded the first time it opens (or when the pointer
+// reaches its tab), so the Threads tab costs nothing extra.
+const BotsWorkspace = React.lazy(() => loadBotsWorkspace().then((module) => ({ default: module.BotsWorkspace })));
 import ThemeLayer from './app/themes/ThemeLayer';
 import { CommunityInstallDialog } from './app/themes/CommunityThemes';
 import { setBotsShellSlot } from './app/botsShellSlot';
+import { BotsTabLoading, loadBotsWorkspace } from './app/SidebarModeHeader';
 // Remote control is opt-in and rarely on screen; keep its view out of the
 // startup chunk like the settings page.
 
@@ -825,7 +826,6 @@ const App: React.FC = () => {
     setSidebarV2Settings,
     addProject,
     removeProject,
-    renameProject,
     createThread,
     branchThread,
     selectProject,
@@ -890,7 +890,6 @@ const App: React.FC = () => {
       setSidebarV2Settings: state.setSidebarV2Settings,
       addProject: state.addProject,
       removeProject: state.removeProject,
-      renameProject: state.renameProject,
       createThread: state.createThread,
       branchThread: state.branchThread,
       selectProject: state.selectProject,
@@ -1037,20 +1036,8 @@ const App: React.FC = () => {
   const cloudDeployPollStartRef = useRef<Record<string, number>>({});
   const [threadMenuOpen, setThreadMenuOpen] = useState(false);
   const [goalMenuOpen, setGoalMenuOpen] = useState(false);
-  const [projectMenuOpenId, setProjectMenuOpenId] = useState<string | null>(null);
-  // Keys are namespaced ("shell:<id>", "recent:<id>", "project:<id>") because the
-  // same thread can appear in both the Recent agents list and its project list.
-  const [threadItemMenuKey, setThreadItemMenuKey] = useState<string | null>(null);
+  // The shell bar's thread title rename ("shell:<id>").
   const [threadRenameKey, setThreadRenameKey] = useState<string | null>(null);
-  const [projectRenameId, setProjectRenameId] = useState<string | null>(null);
-  const [threadListLimits, setThreadListLimits] = useState<Record<string, number>>({});
-  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>({});
-  // Nested subthread lists (keyed by parent thread id), shared between the
-  // Recent agents list and the project lists.
-  const [recentAgentsOpen, setRecentAgentsOpen] = useState(true);
-  const [recentAgentsShowAll, setRecentAgentsShowAll] = useState(false);
-  const [pinnedAgentsOpen, setPinnedAgentsOpen] = useState(true);
-  const [pinnedAgentsShowAll, setPinnedAgentsShowAll] = useState(false);
   const [savedViewsSectionOpen, setSavedViewsSectionOpen] = useState(true);
   // Threads whose Durango workspace is being created (before their first
   // turn) or removed. Mirrored in refs so turn dispatch, which reads state at
@@ -1119,8 +1106,6 @@ const App: React.FC = () => {
   const threadSearchRef = useRef<HTMLDivElement>(null);
   const threadMenuRef = useRef<HTMLDivElement>(null);
   const goalMenuRef = useRef<HTMLDivElement>(null);
-  const projectMenuRef = useRef<HTMLDivElement>(null);
-  const threadItemMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
   // `/btw` side-question runs, routed to a thread's btwExchanges instead of
   // its transcript. Kept separate from runOutputMessages so aside runs never
@@ -1481,10 +1466,10 @@ const App: React.FC = () => {
     selectedThread.status === 'idle' &&
     !isSending;
 
-  const sidebarV3Enabled = useOrionStore((state) => state.sidebarV3Settings?.enabled === true);
+  const botsTabOpen = useOrionStore((state) => state.sidebarTab === 'bots');
   const sidebarV3View = useOrionStore((state) => state.sidebarV3Settings?.view ?? 'bot');
-  // Sidebar v3 showing a bot or the projects window: no thread is on screen.
-  const v3AwayFromThread = activeTab === 'agents' && sidebarV3Enabled && sidebarV3View !== 'thread';
+  // The Bots tab showing a bot or the projects window: no thread is on screen.
+  const v3AwayFromThread = activeTab === 'agents' && botsTabOpen && sidebarV3View !== 'thread';
   // ...and on a bot (not the projects window): the bot's header takes the title spot.
   const v3BotOnScreen = v3AwayFromThread && sidebarV3View !== 'projects' && sidebarV3View !== 'project';
   const shellTitle = v3AwayFromThread
@@ -1764,11 +1749,6 @@ const App: React.FC = () => {
   // sortProjectsByLatestThreadStart); selecting a project doesn't reorder it.
   const sortedProjects = useMemo(() => sortProjectsByLatestThreadStart(projects, threads), [projects, threads]);
 
-  // The Recent agents section spans every project, so its "new thread" button
-  // has no project of its own: it targets the topmost project in the sidebar,
-  // the one where a thread was most recently started.
-  const recentAgentsTargetProject = sortedProjects[0] ?? null;
-
   // Subagent threads live in the in-thread subagents bar, not the sidebar.
   // A thread counts as a child only while its parent still exists — orphans
   // render as top-level.
@@ -1780,24 +1760,6 @@ const App: React.FC = () => {
     }
     return ids;
   }, [threads]);
-
-  const pinnedThreads = useMemo(
-    () =>
-      threads
-        .filter((t) => t.pinnedAt && !childThreadIds.has(t.id))
-        .sort((a, b) => new Date(b.pinnedAt ?? 0).getTime() - new Date(a.pinnedAt ?? 0).getTime()),
-    [childThreadIds, threads]
-  );
-
-  const recentThreads = useMemo(
-    () =>
-      threads
-        // Children never appear top-level; they nest under their parent's row.
-        // Pinned threads live in the Pinned section instead.
-        .filter((t) => !t.hiddenFromRecent && !t.pinnedAt && !childThreadIds.has(t.id))
-        .sort(compareRecentThreadOrder),
-    [childThreadIds, threads]
-  );
 
   // Settle, snooze or pin (or undo it) on a thread that runs on a paired
   // machine: that machine files it the same way, and its listing then shows
@@ -1828,8 +1790,8 @@ const App: React.FC = () => {
     },
     [sendSidebarStateToHost, updateThread]
   );
-  // Unpinning surfaces the thread at the top of Recent agents (see the
-  // recentThreads sort) so an accidental unpin of an old thread is easy to
+  // Unpinning surfaces the thread at the top of Recent (see
+  // compareSidebarV2Recent) so an accidental unpin of an old thread is easy to
   // recover instead of sinking back to its chronological spot.
   const unpinThread = useCallback(
     (threadId: string) => {
@@ -1845,14 +1807,13 @@ const App: React.FC = () => {
 
   const runningAgentCount = useMemo(() => threads.filter((t) => t.status === 'running').length, [threads]);
 
-  // Sidebar v2 (Settings → Experimental): flat Pinned / Recent / Snoozed /
-  // Settled lists, and the threads waiting on a question or approval.
   // Settings → Cosmetics → Text size zooms the whole window.
   const uiScale = useOrionStore((state) => state.appearanceSettings?.uiScale ?? defaultAppearanceSettings.uiScale);
   useEffect(() => {
     window.orion?.setZoomFactor?.(uiScale);
   }, [uiScale]);
-  const sidebarV2Enabled = sidebarV2Settings?.enabled ?? defaultSidebarV2Settings.enabled;
+  // The Threads tab (sidebar v2): flat Pinned / Recent / Snoozed / Settled
+  // lists, and the threads waiting on a question or approval.
   const sidebarV2Settled = !!sidebarV2Settings?.settledExistingAt;
   const sidebarV2Views = sidebarV2Settings?.views ?? defaultSidebarV2Settings.views;
   const runningThreadIds = useStableIdList(
@@ -1873,7 +1834,7 @@ const App: React.FC = () => {
     },
     [updateThread]
   );
-  const threadsNeedingInput = useThreadsNeedingInput(sidebarV2Enabled, runningThreadIds, wakeThreadForAttention);
+  const threadsNeedingInput = useThreadsNeedingInput(runningThreadIds, wakeThreadForAttention);
   // Threads with an action pending on the user (request_user_action) need
   // them too, running or not, until the action is resolved. Keyed by content
   // so streaming output doesn't hand the sidebar a new map every token.
@@ -2250,29 +2211,27 @@ const App: React.FC = () => {
   const sidebarV2Lists = useMemo(
     () =>
       sidebarV2ThreadLists(
-        sidebarV2Enabled
-          ? (sidebarV2Settled
-              ? threads
-              : threads.map((thread) =>
-                  Date.parse(thread.createdAt) < APP_LAUNCHED_AT
-                    ? settleThreadsForSidebarV2([thread], new Date(APP_LAUNCHED_AT).toISOString())[0]
-                    : thread
-                )
-            ).filter(
-              (thread) =>
-                thread.summary.messageCount > 0 ||
-                thread.status === 'running' ||
-                thread.modelId === claudeCodeCliModelId ||
-                !!thread.pinnedAt ||
-                !!thread.snoozedAt ||
-                !!thread.settledAt ||
-                typedDraftThreadIds.has(thread.id)
+        (sidebarV2Settled
+          ? threads
+          : threads.map((thread) =>
+              Date.parse(thread.createdAt) < APP_LAUNCHED_AT
+                ? settleThreadsForSidebarV2([thread], new Date(APP_LAUNCHED_AT).toISOString())[0]
+                : thread
             )
-          : [],
+        ).filter(
+          (thread) =>
+            thread.summary.messageCount > 0 ||
+            thread.status === 'running' ||
+            thread.modelId === claudeCodeCliModelId ||
+            !!thread.pinnedAt ||
+            !!thread.snoozedAt ||
+            !!thread.settledAt ||
+            typedDraftThreadIds.has(thread.id)
+        ),
         (thread) => childThreadIds.has(thread.id),
         compareSidebarV2Recent(attentionThreadIds)
       ),
-    [attentionThreadIds, childThreadIds, sidebarV2Enabled, sidebarV2Settled, threads, typedDraftThreadIds]
+    [attentionThreadIds, childThreadIds, sidebarV2Settled, threads, typedDraftThreadIds]
   );
   const setSidebarV2ViewVisible = useCallback(
     (view: keyof SidebarV2Settings['views'], visible: boolean) =>
@@ -2318,20 +2277,6 @@ const App: React.FC = () => {
     [sendSidebarStateToHost, updateThread]
   );
 
-  const projectThreadsByProject = useMemo(() => {
-    const grouped = new Map<string, Thread[]>();
-    for (const thread of threads) {
-      // Top-level rows only; children render nested under their parent.
-      if (childThreadIds.has(thread.id)) continue;
-      const projectThreads = grouped.get(thread.projectId);
-      if (projectThreads) projectThreads.push(thread);
-      else grouped.set(thread.projectId, [thread]);
-    }
-    for (const projectThreads of grouped.values()) {
-      projectThreads.sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime());
-    }
-    return grouped;
-  }, [childThreadIds, threads]);
 
   const runningThreadCount = useMemo(
     () =>
@@ -3716,9 +3661,7 @@ const App: React.FC = () => {
       !threadSearchOpen &&
       !threadMenuOpen &&
       !goalMenuOpen &&
-      !openWithOpen &&
-      projectMenuOpenId === null &&
-      threadItemMenuKey === null
+      !openWithOpen
     )
       return undefined;
 
@@ -3744,12 +3687,6 @@ const App: React.FC = () => {
       if (goalMenuOpen && !goalMenuRef.current?.contains(target)) {
         setGoalMenuOpen(false);
       }
-      if (projectMenuOpenId !== null && !projectMenuRef.current?.contains(target)) {
-        setProjectMenuOpenId(null);
-      }
-      if (threadItemMenuKey !== null && !threadItemMenuRef.current?.contains(target)) {
-        setThreadItemMenuKey(null);
-      }
     };
 
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -3759,8 +3696,6 @@ const App: React.FC = () => {
         setThreadMenuOpen(false);
         setGoalMenuOpen(false);
         setOpenWithOpen(false);
-        setProjectMenuOpenId(null);
-        setThreadItemMenuKey(null);
       }
     };
 
@@ -3776,8 +3711,6 @@ const App: React.FC = () => {
     goalMenuOpen,
     threadSearchOpen,
     openWithOpen,
-    projectMenuOpenId,
-    threadItemMenuKey,
   ]);
 
   useEffect(() => {
@@ -4998,11 +4931,10 @@ const App: React.FC = () => {
   };
 
   const handleNewAgent = () => {
-    // Sidebar v2 starts the new agent where the most recent thread ran; the
-    // project picker in the new thread changes it.
-    const projectId = sidebarV2Enabled
-      ? (findProjectById({ projects, noProject }, latestThreadProjectId)?.id ?? defaultNewThreadProject?.id)
-      : defaultNewThreadProject?.id;
+    // The new agent starts where the most recent thread ran; the project
+    // picker in the new thread changes it.
+    const projectId =
+      findProjectById({ projects, noProject }, latestThreadProjectId)?.id ?? defaultNewThreadProject?.id;
     if (!projectId) {
       void handleAddProject();
       return;
@@ -5010,41 +4942,39 @@ const App: React.FC = () => {
     openNewAgentIn(projectId);
   };
 
-  // A fresh composer in a project. Sidebar v2 reuses an untouched draft there
+  // A fresh composer in a project. It reuses an untouched draft there
   // (nothing sent, nothing typed) rather than stacking empty threads at the
   // top of the flat list.
   const openNewAgentIn = (projectId: string) => {
-    if (sidebarV2Enabled) {
-      const draft = useOrionStore
-        .getState()
-        .threads.find(
-          (thread) =>
-            thread.projectId === projectId &&
-            thread.summary.messageCount === 0 &&
-            thread.status !== 'running' &&
-            // Another machine's thread is never a draft here.
-            !thread.remote?.threadId &&
-            thread.modelId !== claudeCodeCliModelId &&
-            !thread.parentThreadId &&
-            !thread.subagent &&
-            !thread.settledAt &&
-            !thread.snoozedAt &&
-            !hasComposerDraft(thread.id)
-        );
-      if (draft) {
-        // Restamp it as new: Recent ranks an empty thread by createdAt, so a
-        // draft left from hours ago would otherwise open below newer threads.
-        const now = new Date();
-        updateThread(draft.id, {
-          createdAt: now.toISOString(),
-          ...(isDefaultTitle(draft.title)
-            ? { title: `Thread ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` }
-            : {}),
-        });
-        selectThread(draft.id);
-        setActiveTab('agents');
-        return;
-      }
+    const draft = useOrionStore
+      .getState()
+      .threads.find(
+        (thread) =>
+          thread.projectId === projectId &&
+          thread.summary.messageCount === 0 &&
+          thread.status !== 'running' &&
+          // Another machine's thread is never a draft here.
+          !thread.remote?.threadId &&
+          thread.modelId !== claudeCodeCliModelId &&
+          !thread.parentThreadId &&
+          !thread.subagent &&
+          !thread.settledAt &&
+          !thread.snoozedAt &&
+          !hasComposerDraft(thread.id)
+      );
+    if (draft) {
+      // Restamp it as new: Recent ranks an empty thread by createdAt, so a
+      // draft left from hours ago would otherwise open below newer threads.
+      const now = new Date();
+      updateThread(draft.id, {
+        createdAt: now.toISOString(),
+        ...(isDefaultTitle(draft.title)
+          ? { title: `Thread ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` }
+          : {}),
+      });
+      selectThread(draft.id);
+      setActiveTab('agents');
+      return;
     }
 
     handleCreateThread(projectId);
@@ -5448,7 +5378,6 @@ const App: React.FC = () => {
 
   // Create new thread for a project
   const handleCreateThread = (projectId: string) => {
-    setCollapsedProjects((prev) => (prev[projectId] ? { ...prev, [projectId]: false } : prev));
     // Prevent spamming empty threads: if selected thread for this project is empty and nothing typed, do nothing.
     // CLI threads are exempt — their conversation lives in the terminal PTY, so
     // messages.length is always 0 even when the thread is heavily used.
@@ -9589,65 +9518,6 @@ const App: React.FC = () => {
     [threads]
   );
 
-  const agentsSidebarModel: AgentsSidebarModel = {
-    projects,
-    selectThread,
-    setActiveTab,
-    selectedThreadId,
-    paneThreadIds,
-    savedViews,
-    activeSavedViewId,
-    threadTitlesById,
-    openSavedView,
-    deleteSavedView,
-    savedViewsSectionOpen,
-    setSavedViewsSectionOpen,
-    updateThread,
-    branchThread: branchThreadWithFeedback,
-    renameProject,
-    selectProject,
-    threadSearchOpen,
-    setThreadSearchOpen,
-    projectMenuOpenId,
-    setProjectMenuOpenId,
-    threadItemMenuKey,
-    setThreadItemMenuKey,
-    threadRenameKey,
-    setThreadRenameKey,
-    projectRenameId,
-    setProjectRenameId,
-    threadListLimits,
-    setThreadListLimits,
-    collapsedProjects,
-    setCollapsedProjects,
-    setRecentAgentsOpen,
-    recentAgentsOpen,
-    setRecentAgentsShowAll,
-    recentAgentsShowAll,
-    setPinnedAgentsOpen,
-    pinnedAgentsOpen,
-    setPinnedAgentsShowAll,
-    pinnedAgentsShowAll,
-    threadSearchRef,
-    projectMenuRef,
-    threadItemMenuRef,
-    selectedProject,
-    sortedProjects,
-    recentAgentsTargetProject,
-    pinnedThreads,
-    recentThreads,
-    pinThread,
-    unpinThread,
-    runningAgentCount,
-    projectThreadsByProject,
-    deleteThreadWithRuntime,
-    removeProjectWithRuntimes,
-    handleAddProject,
-    ...stableAgentsSidebarActions,
-    renderThreadCliBadge,
-    renderThreadStatusDot,
-    sidebarFooterProps,
-  };
 
   const sidebarV2ModelLabel = useCallback(
     (thread: Thread) => findAgentModel(agentModelsRef.current, thread.modelId)?.label ?? null,
@@ -9712,7 +9582,7 @@ const App: React.FC = () => {
   );
   const sidebarV2ExtraSections = useMemo(
     () =>
-      sidebarV2Enabled && savedViews.length > 0 ? (
+      savedViews.length > 0 ? (
         <SavedViewsSection
           setActiveTab={setActiveTab}
           savedViews={savedViews}
@@ -9731,7 +9601,6 @@ const App: React.FC = () => {
       savedViews,
       savedViewsSectionOpen,
       setActiveTab,
-      sidebarV2Enabled,
       threadTitlesById,
     ]
   );
@@ -11396,9 +11265,9 @@ const App: React.FC = () => {
       {!settingsOpen && (
         <div className="main-content">
           {/* ========== AGENTS TAB ========== */}
-          {/* Sidebar v3 (Settings → Experimental): bots instead of threads. */}
-          {activeTab === 'agents' && sidebarV3Enabled && (
-            <React.Suspense fallback={null}>
+          {/* The sidebar's Bots tab: bots, the projects window, and a bot's conversation. */}
+          {activeTab === 'agents' && botsTabOpen && (
+            <React.Suspense fallback={<BotsTabLoading sidebarFooterProps={sidebarFooterProps} />}>
               <BotsWorkspace
                 sidebarFooterProps={sidebarFooterProps}
                 threadPanel={agentsThreadPanel}
@@ -11409,34 +11278,30 @@ const App: React.FC = () => {
               />
             </React.Suspense>
           )}
-          {activeTab === 'agents' && !sidebarV3Enabled && (
+          {/* The Threads tab: the flat thread list and the thread view. */}
+          {activeTab === 'agents' && !botsTabOpen && (
             <>
-              {/* Sidebar: Projects + Threads */}
-              {sidebarV2Enabled ? (
-                <SidebarV2
-                  actions={sidebarV2Actions}
-                  projects={projects}
-                  noProject={noProject}
-                  selectedThreadId={selectedThreadId}
-                  paneThreadIds={paneThreadIds}
-                  threadsByView={sidebarV2Lists}
-                  views={sidebarV2Views}
-                  setViewVisible={setSidebarV2ViewVisible}
-                  attentionThreadIds={attentionThreadIds}
-                  selectProject={stableAgentsSidebarActions.handleCreateThread}
-                  handleNewAgent={stableAgentsSidebarActions.handleNewAgent}
-                  handleAddProject={handleSidebarV2AddProject}
-                  threadSearchOpen={threadSearchOpen}
-                  setThreadSearchOpen={setThreadSearchOpen}
-                  threadSearchRef={threadSearchRef}
-                  extraSections={sidebarV2ExtraSections}
-                  sidebarFooterProps={sidebarFooterProps}
-                />
-              ) : (
-                <AgentsSidebar {...agentsSidebarModel} />
-              )}
+              <SidebarV2
+                actions={sidebarV2Actions}
+                projects={projects}
+                noProject={noProject}
+                selectedThreadId={selectedThreadId}
+                paneThreadIds={paneThreadIds}
+                threadsByView={sidebarV2Lists}
+                views={sidebarV2Views}
+                setViewVisible={setSidebarV2ViewVisible}
+                attentionThreadIds={attentionThreadIds}
+                selectProject={stableAgentsSidebarActions.handleCreateThread}
+                handleNewAgent={stableAgentsSidebarActions.handleNewAgent}
+                handleAddProject={handleSidebarV2AddProject}
+                threadSearchOpen={threadSearchOpen}
+                setThreadSearchOpen={setThreadSearchOpen}
+                threadSearchRef={threadSearchRef}
+                extraSections={sidebarV2ExtraSections}
+                sidebarFooterProps={sidebarFooterProps}
+              />
 
-              {/* Main Panel: Thread view (also inside Sidebar v3 when a thread is open there) */}
+              {/* Main Panel: Thread view (also the Bots tab's when a thread is open there) */}
               {agentsThreadPanel}
 
               {browserVisible && (

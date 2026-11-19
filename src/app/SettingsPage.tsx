@@ -25,8 +25,6 @@ import {
 } from 'lucide-react';
 import {
   defaultDurangoSettings,
-  defaultSidebarV2Settings,
-  defaultSidebarV3Settings,
   defaultAppearanceSettings,
   UI_SCALE_OPTIONS,
   useOrionStore,
@@ -1794,13 +1792,13 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             </>
           )}
           {settingsTab === 'experimental' && (
-            <>
-              <div className="settings-group-label">Sidebar</div>
-              <div className="settings-group">
-                <SidebarV2Setting />
-                <SidebarV3Setting />
+            <div className="settings-empty-panel">
+              <FlaskConical size={22} aria-hidden />
+              <div className="settings-panel-title">Nothing experimental right now</div>
+              <div className="settings-muted">
+                Threads and Bots are both in the sidebar now: switch between them with the tabs under Projects.
               </div>
-            </>
+            </div>
           )}
         </div>
       </div>
@@ -1836,58 +1834,6 @@ const TextSizeSetting: React.FC = () => {
           </button>
         ))}
       </div>
-    </div>
-  );
-};
-
-// Sidebar v2: a flat thread list (after T3 Code) with snooze and settle.
-const SidebarV2Setting: React.FC = () => {
-  const enabled = useOrionStore((state) => state.sidebarV2Settings?.enabled ?? defaultSidebarV2Settings.enabled);
-  const setSidebarV2Settings = useOrionStore((state) => state.setSidebarV2Settings);
-  return (
-    <div className="setting-row">
-      <div className="setting-label">
-        <div className="setting-label-title">Sidebar v2</div>
-        <div className="setting-label-desc">
-          One list of threads instead of project groups, with search, New agent and Add project. Every thread stays
-          in the list until you snooze it (it comes back when it finishes or needs you) or settle it (archived); a
-          menu shows pinned threads at the top and the Snoozed and Settled lists.
-        </div>
-      </div>
-      <label className="provider-toggle" title="Sidebar v2">
-        <input
-          type="checkbox"
-          checked={enabled}
-          onChange={(e) => setSidebarV2Settings({ enabled: e.target.checked })}
-        />
-        <span />
-      </label>
-    </div>
-  );
-};
-
-// Sidebar v3: the sidebar lists your Durango bots instead of threads.
-const SidebarV3Setting: React.FC = () => {
-  const enabled = useOrionStore((state) => state.sidebarV3Settings?.enabled ?? defaultSidebarV3Settings.enabled);
-  const setSidebarV3Settings = useOrionStore((state) => state.setSidebarV3Settings);
-  return (
-    <div className="setting-row">
-      <div className="setting-label">
-        <div className="setting-label-title">Sidebar v3</div>
-        <div className="setting-label-desc">
-          Your Durango bots instead of threads: the sidebar lists your bots, and picking one opens its conversation
-          here. Message a bot as often as you like; nothing waits for it to finish. With &ldquo;Allow Durango Chat
-          and Tasks to start agents on this machine&rdquo; on, its replies can run on this machine&apos;s Claude Code.
-        </div>
-      </div>
-      <label className="provider-toggle" title="Sidebar v3">
-        <input
-          type="checkbox"
-          checked={enabled}
-          onChange={(e) => setSidebarV3Settings({ enabled: e.target.checked })}
-        />
-        <span />
-      </label>
     </div>
   );
 };
