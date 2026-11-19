@@ -9345,6 +9345,7 @@ const App: React.FC = () => {
         const settled = window.orion?.durangoDispatchSettled?.({
           dispatchId: dispatch.id,
           threadId: thread.id,
+          ...(/^(bottask|localbot):/.test(dispatch.id) && thread.durangoWorkspace?.path ? { workspacePath: thread.durangoWorkspace.path } : {}),
           ...outcome,
         });
         void Promise.resolve(settled)

@@ -45,6 +45,8 @@ import { compareSidebarV2Recent, sidebarV2ThreadLists, threadSidebarTone } from 
 import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
+import { localMediaSrc } from './attachments';
+import { BotActionsRow, BotCards, BotFileGallery, threadIsHere, useMessageFiles, type BotActionHandlers } from './BotReplyCards';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { useSidebarResize } from './useSidebarResize';
 import {
@@ -55,6 +57,8 @@ import {
   newBotMessageId,
   projectBotFor,
   relativeBotTime,
+  taskReportActions,
+  taskReportBody,
   type BotProject,
   type BotProjectFile,
   type BotProjectNote,
@@ -333,6 +337,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     threadActions.selectThread(threadId);
     setSidebarV3Settings({ view: 'thread', threadFromProjectId: selectedProjectId });
   };
+  // A bot reply's Open thread button: the thread in the usual thread view.
+  const openBotThread = (threadId: string) => {
+    if (!threadIsHere(threadId)) return false;
+    threadActions.selectThread(threadId);
+    setSidebarV3Settings({ view: 'thread', threadFromProjectId: null });
+    return true;
+  };
   const newProjectThread = (projectId: string) => {
     onNewThread(projectId);
     setSidebarV3Settings({ view: 'thread', threadFromProjectId: projectId });
@@ -458,7 +469,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               attentionThreadIds={attentionThreadIds}
             />
           ) : selectedBotId ? (
-            <BotPane key={`${account ?? ''}:${selectedBotId}`} botId={selectedBotId} onChanged={loadBots} onOpenProject={openProjectOfBot} />
+            <BotPane
+              key={`${account ?? ''}:${selectedBotId}`}
+              botId={selectedBotId}
+              onChanged={loadBots}
+              onOpenProject={openProjectOfBot}
+              onOpenThread={openBotThread}
+            />
           ) : (
             <div className="empty-state">
               <div className="empty-state-icon">
@@ -1063,7 +1080,13 @@ const BotRow: React.FC<{
 };
 
 /** One bot's conversation: messages, live replies at the bottom, and a composer that never blocks. */
-const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (bot: DesktopBot) => void }> = ({ botId, onChanged, onOpenProject }) => {
+const BotPane: React.FC<{
+  botId: string;
+  onChanged: () => void;
+  onOpenProject: (bot: DesktopBot) => void;
+  /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
+  onOpenThread: (threadId: string) => boolean;
+}> = ({ botId, onChanged, onOpenProject, onOpenThread }) => {
   const [thread, setThread] = useState<DesktopBotThread | null>(() => botThreadCache.get(botId) ?? null);
   const [error, setError] = useState<string | null>(null);
   const [outgoing, setOutgoing] = useState<Outgoing[]>([]);
@@ -1132,6 +1155,25 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
     },
     [botId, load, onChanged]
   );
+
+  // What reply cards do: a button or an answer sends text as the person's message; Open thread opens it here.
+  const sendRef = useRef(send);
+  sendRef.current = send;
+  const openThreadRef = useRef(onOpenThread);
+  openThreadRef.current = onOpenThread;
+  const handlers = useMemo<BotActionHandlers>(
+    () => ({ onReply: (text) => void sendRef.current(text), onOpenThread: (threadId) => openThreadRef.current(threadId) }),
+    []
+  );
+  // Questions (ask_user cards) the person answered in this thread: question → answer.
+  const answeredQuestions = useMemo(() => {
+    const answered = new Map<string, string>();
+    for (const message of thread?.messages ?? []) {
+      const match = message.role === 'user' ? /^> \*\*Answering:\*\* (.+)\n\n([\s\S]+)$/.exec(message.content) : null;
+      if (match) answered.set(match[1].trim(), match[2].trim());
+    }
+    return answered;
+  }, [thread?.messages]);
 
   const liveKey = thread?.live.map((reply) => `${reply.messageId}:${reply.content.length}`).join() ?? '';
   useLayoutEffect(() => {
@@ -1209,7 +1251,13 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
               Text {bot.name} like a person: send as many messages as you like.
             </div>
           )}
-          {timeline.map((row) => (row.kind === 'message' ? <BotMessage key={row.message.id} bot={bot} message={row.message} /> : liveRow(row.reply)))}
+          {timeline.map((row) =>
+            row.kind === 'message' ? (
+              <BotMessage key={row.message.id} bot={bot} message={row.message} handlers={handlers} answeredQuestions={answeredQuestions} />
+            ) : (
+              liveRow(row.reply)
+            )
+          )}
           {pending.map((message) => (
             <PersonBubble
               key={message.id}
@@ -2050,19 +2098,31 @@ const AssistantRow: React.FC<{ bot: DesktopBot; children: React.ReactNode; copy?
 
 const INBOX_ICON = { routine: CalendarClock, task: ListChecks, bot: Bot } as const;
 
-const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = React.memo(({ bot, message }) => {
+const BotMessage: React.FC<{
+  bot: DesktopBot;
+  message: DesktopBotMessage;
+  handlers: BotActionHandlers;
+  answeredQuestions: ReadonlyMap<string, string>;
+}> = React.memo(({ bot, message, handlers, answeredQuestions }) => {
+  const files = useMessageFiles(message.files);
   if (message.role === 'assistant') {
     const via = message.authorLabel?.startsWith('via ') ? message.authorLabel : null;
+    // Files it attached show under the text (a path it names would show twice).
+    const showsFiles = files.length > 0 || Boolean(message.cards?.some((card) => card.component === 'asset-gallery'));
     return (
-      <AssistantRow bot={bot} copy={message.content}>
-        <MarkdownContent content={message.content} />
+      <AssistantRow bot={bot} copy={copyText(message.content, message.files)}>
+        <MarkdownContent content={message.content} pathPreviews={!showsFiles} />
+        <BotFileGallery files={files} />
+        {message.cards?.length ? <BotCards cards={message.cards} handlers={handlers} answeredQuestions={answeredQuestions} /> : null}
         {via && <div className="mt-1 text-[11px] text-neutral-600">{via}</div>}
       </AssistantRow>
     );
   }
   const source = botInboxSource(message.authorLabel);
-  if (source === 'person') return <PersonBubble content={message.content} files={withSentPreviews(message.id, message.files)} />;
+  if (source === 'person') return <PersonBubble content={message.content} files={withSentPreviews(message.id, personFiles(message.files, files))} />;
   const Icon = INBOX_ICON[source];
+  // A task report carries its thread and change: open or ship them from here.
+  const actions = source === 'task' ? taskReportActions(message.content) : [];
   return (
     <div className="mx-auto w-full max-w-[92%] rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-[12.5px]">
       <div className="flex items-center gap-1.5 text-neutral-400">
@@ -2070,10 +2130,20 @@ const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = Re
         <span className="truncate font-medium text-neutral-300">{message.authorLabel}</span>
         <span className="ml-auto text-[10.5px] text-neutral-600">{relativeBotTime(message.createdAt)}</span>
       </div>
-      <div className="mt-1 line-clamp-4 whitespace-pre-wrap text-neutral-400">{message.content}</div>
+      <div className="mt-1 line-clamp-4 whitespace-pre-wrap text-neutral-400">{source === 'task' ? taskReportBody(message.content) : message.content}</div>
+      {actions.length > 0 && <BotActionsRow actions={actions} handlers={handlers} />}
     </div>
   );
 });
+
+/** The person's files with a thumbnail: the one sent from here, else the image loaded from the library. */
+const personFiles = (stored: DesktopBotMessage['files'], shown: ReturnType<typeof useMessageFiles>): BubbleFile[] | undefined =>
+  stored?.map((file, index) => {
+    const loaded = shown[index];
+    const image = loaded && /^image\/(png|jpe?g|gif|webp)$/i.test(loaded.contentType ?? '');
+    const preview = image ? loaded.url ?? (loaded.path ? localMediaSrc(loaded.path, []) : undefined) : undefined;
+    return { name: file.name, ...(file.size ? { size: file.size } : {}), ...(preview ? { preview } : {}) };
+  });
 
 /** Always open: messages queue while the bot works, like texting a person. */
 const BOT_ATTACHMENTS_MAX = 10;

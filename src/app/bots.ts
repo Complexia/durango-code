@@ -47,8 +47,83 @@ export type DesktopBotMessage = {
   /** Inbox source labels ("Routine: …", "Task: …", "Bot: …") or "via <machine>" on replies. */
   authorLabel: string | null;
   createdAt: number;
-  /** Files sent with it. */
-  files?: { name: string; size?: number }[];
+  /** Files sent with it (signed in: their library ids; signed out: their paths here). */
+  files?: BotMessageFile[];
+  /** A reply's cards: files it attached, HTML pages, buttons, questions (Durango Chat's ui parts). */
+  cards?: BotCard[];
+};
+
+export type BotMessageFile = { name: string; size?: number; assetId?: string; contentType?: string; path?: string };
+
+/** A card under a bot reply, in Durango Chat's ui part shape (chat/andromedus/lib/chat-ui-parts.ts). */
+export type BotCard = { id: string; component: string; props: unknown };
+
+/** A read link (an hour) for a library file in a bot thread (GET /api/v1/bots/files). */
+export type BotFileLink = { id: string; name: string; contentType: string; byteSize: number; url: string };
+
+/** A button under a reply (show_actions; Durango's lib/bots/ui.ts botActionSchema). */
+export type BotAction = {
+  kind: 'ship_change' | 'open_change' | 'open_thread' | 'open_url' | 'reply';
+  label?: string;
+  change_id?: string;
+  thread_id?: string;
+  url?: string;
+  text?: string;
+};
+
+const CHANGE_ID = /^chg_[a-z0-9]{8,40}$/;
+const THREAD_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const WEB_URL = /^https?:\/\/[^\s]+$/i;
+const cut = (value: unknown, max: number) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
+
+/** One button from a stored card, checked again per kind (the card is data from the network), or null. */
+export const parseBotAction = (raw: unknown): BotAction | null => {
+  const value = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const kind = value.kind;
+  const label = cut(value.label, 40) || undefined;
+  const url = cut(value.url, 2000) || undefined;
+  if (url && !WEB_URL.test(url)) return null;
+  switch (kind) {
+    case 'ship_change':
+    case 'open_change': {
+      const changeId = cut(value.change_id, 64);
+      return CHANGE_ID.test(changeId) ? { kind, label, change_id: changeId, url } : null;
+    }
+    case 'open_thread': {
+      const threadId = cut(value.thread_id, 128);
+      return THREAD_ID.test(threadId) ? { kind, label, thread_id: threadId } : null;
+    }
+    case 'open_url':
+      return url && label ? { kind, label, url } : null;
+    case 'reply':
+      return label ? { kind, label, text: cut(value.text, 500) || undefined } : null;
+    default:
+      return null;
+  }
+};
+
+export const botActionLabel = (action: BotAction) =>
+  action.label ??
+  (action.kind === 'ship_change' ? 'Ship' : action.kind === 'open_change' ? 'View change' : action.kind === 'open_thread' ? 'Open thread' : 'Open');
+
+/**
+ * The buttons a task report carries on its own: the thread it ran in and the
+ * change its workspace holds (the "Thread: @thread:…" / "Change: chg_… (open) <url>"
+ * lines Durango Code adds to the report), so the person can open or ship it
+ * from the report itself.
+ */
+export const taskReportActions = (content: string): BotAction[] => {
+  const actions: BotAction[] = [];
+  const change = /^Change: (chg_[a-z0-9]{8,40})(?: \((\w+)\))?(?: (https?:\/\/\S+))?\s*$/m.exec(content);
+  if (change) {
+    const status = change[2];
+    const url = change[3];
+    if (!status || status === 'open') actions.push({ kind: 'ship_change', change_id: change[1], ...(url ? { url } : {}) });
+    actions.push({ kind: 'open_change', change_id: change[1], ...(url ? { url } : {}) });
+  }
+  const thread = /^Thread: @thread:([A-Za-z0-9_-]{1,128})\s*$/m.exec(content);
+  if (thread) actions.push({ kind: 'open_thread', thread_id: thread[1] });
+  return actions;
 };
 
 /** A file attached to a message being written: a path on this computer. */
@@ -131,3 +206,6 @@ export const relativeBotTime = (ms: number, now = Date.now()) => {
   const days = Math.round(hours / 24);
   return days < 7 ? `${days}d` : new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 };
+
+/** A task report's own words, without the refs block Durango Code adds (shown as buttons instead). */
+export const taskReportBody = (content: string) => content.replace(/\n+---\n(?:(?:Thread|Change|Workspace): [^\n]*(?:\n|$))+\s*$/, '').trimEnd();

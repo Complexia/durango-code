@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoModelIdForClaude } from './bot-replies.js';
 import { BOT_THREAD_TOOLS } from './bot-thread-tools.js';
+import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 
 // Local bots: Durango bots that live on this device, for people who aren't
 // signed in to Durango. Same semantics as Durango's bots (always-on
@@ -23,6 +24,8 @@ export const LOCAL_BOT_PARALLEL_AFTER_MS = 5_000;
 export const LOCAL_BOT_MAX_REPLIES = 2;
 export const LOCAL_BOT_MAX_TASKS = 3;
 export const LOCAL_BOT_MESSAGE_CAP = 2_000;
+/** Cards (pages, buttons) one reply may show. */
+const LOCAL_REPLY_CARDS_MAX = 6;
 export const LOCAL_BOT_ROUTINE_TICK_MS = 60_000;
 export const LOCAL_BOT_MIN_INTERVAL_MINUTES = 15;
 export const COMPACT_TRIGGER_TOKENS = 40_000;
@@ -59,6 +62,12 @@ Routines and reports:
 - A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
+
+Show, don't point: your thread renders rich replies, so use them.
+- Screenshots, images and files the person should see go in the thread itself, never only as a path or a folder with file names. Attach them with attach_files (full paths; images show as thumbnails that open full size). When a task report names screenshots or files, attach them.
+- Diagrams: a \`\`\`mermaid code block in your text renders as a diagram.
+- Visuals: show_html renders a small self-contained, sandboxed HTML page in your reply (a chart, a comparison, a mockup, an explainer).
+- Buttons: show_actions puts buttons under your reply: open a thread a task ran in (open_thread with its id from the report), open a link, or 2-4 likely quick replies. Never invent ids or links.
 
 Where you run: on this computer, through the person's Claude Code, with the tools it allows here and the person's own logins on this computer. You see the person's Durango Code projects on this computer (listed below with their folders); real work in one goes to a Durango Code thread there (delegate_task with \`project\`), which the person can watch in the app. There are no connected apps (Gmail and others) and nothing runs anywhere else: if something needs an account or service you can't reach from here, say so.
 
@@ -514,6 +523,14 @@ const normalizeMessage = (raw) =>
                 .map((item) => ({ name: item.name, path: item.path, size: finite(item.size, 0), contentType: str(item.contentType) })),
             }
           : {}),
+        // A reply's cards (show_html pages, show_actions buttons), as Durango Chat's ui parts.
+        ...(Array.isArray(raw.cards) && raw.cards.length
+          ? {
+              cards: raw.cards
+                .filter((card) => card && typeof card.id === 'string' && typeof card.component === 'string' && card.props && typeof card.props === 'object')
+                .map((card) => ({ id: card.id, component: card.component, props: card.props })),
+            }
+          : {}),
       }
     : null;
 
@@ -885,7 +902,10 @@ export const createLocalBotEngine = ({
     return message.authorLabel ? `[${message.authorLabel}]` : 'Person';
   };
   const renderLine = (message, botName) => {
-    const files = (message.attachments ?? []).map((item) => `[attached file: ${item.name}]`).join('\n');
+    const files = [
+      ...(message.attachments ?? []).map((item) => `[attached file: ${item.name}]`),
+      ...(message.cards ?? []).map((card) => `[showed ${card.component === 'html' ? `a page "${card.props?.title ?? ''}"` : 'buttons'}]`),
+    ].join('\n');
     const text = message.content.trim();
     return `${speaker(message, botName)}:\n${[text, files].filter(Boolean).join('\n') || '(no text)'}`;
   };
@@ -1010,7 +1030,7 @@ export const createLocalBotEngine = ({
       model: bot.model,
       systemPrompt: botSystemPrompt(bot),
       prompt,
-      tools: threadTools ? [...LOCAL_BOT_TOOLS, ...BOT_THREAD_TOOLS] : LOCAL_BOT_TOOLS,
+      tools: [...LOCAL_BOT_TOOLS, ...LOCAL_CARD_TOOLS, ...(threadTools ? BOT_THREAD_TOOLS : [])],
       threads: 'local',
       heartbeatMs: HEARTBEAT_MS,
       // Files attached in the conversation (the newest): the runner copies them for Claude Code.
@@ -1039,6 +1059,28 @@ export const createLocalBotEngine = ({
     track(runReply(entry, reply, lane));
   };
 
+  /** A reply's files (attach_files, screenshots it named) → copies in attachments/<reply id>/. */
+  const copyReplyFiles = async (replyId, files) => {
+    const picked = (Array.isArray(files) ? files : []).filter((file) => file && typeof file.path === 'string').slice(0, 10);
+    if (!picked.length) return [];
+    const dir = path.join(storageDir(), 'attachments', replyId.replace(/[^A-Za-z0-9_-]/g, '_'));
+    const copied = [];
+    try {
+      await fs.mkdir(dir, { recursive: true });
+    } catch {
+      return [];
+    }
+    for (const file of picked) {
+      const name = (str(file.name) || path.basename(file.path)).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').slice(0, 120) || 'file';
+      const target = path.join(dir, `${copied.length}-${name}`);
+      try {
+        await fs.copyFile(file.path, target);
+        copied.push({ name, path: target, size: finite(file.size, 0), contentType: guessContentType(name) });
+      } catch {}
+    }
+    return copied;
+  };
+
   const runReply = async (entry, reply, lane) => {
     const myGeneration = generation;
     const runtime = runtimeFor(entry.bot.id);
@@ -1061,7 +1103,15 @@ export const createLocalBotEngine = ({
           changed();
         },
         takeInbox: async () => (reply.abort.signal.aborted ? [] : claim(entry, reply).map(inboxItem)),
-        callTool: async ({ name, input }) => ({ result: await callTool(entry, name, input) }),
+        callTool: async ({ name, input }) => {
+          // Cards stay with this reply (shown under its text once it is stored).
+          const shown = localCard(name, input, `ui-${reply.id}-${(reply.cards ??= []).length}`);
+          if (!shown) return { result: await callTool(entry, name, input) };
+          if (shown.error) return { result: { ok: false, error: shown.error } };
+          if (reply.cards.length >= LOCAL_REPLY_CARDS_MAX) return { result: { ok: false, error: 'This reply already shows as much as it can.' } };
+          reply.cards.push(shown.card);
+          return { result: { ok: true, shown: shown.card.component } };
+        },
       });
     } catch (error) {
       outcome = { text: reply.text, failure: error?.message ?? String(error) };
@@ -1084,9 +1134,20 @@ export const createLocalBotEngine = ({
     const text = str(outcome?.text).trim();
     const failure = outcome?.failure ? clip(oneLine(outcome.failure), 300) : null;
     const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : '');
+    // Files it attached, copied into the bots folder like the person's.
+    const attachments = text ? await copyReplyFiles(reply.id, outcome?.files) : [];
     if (content) {
       const { bot } = entry;
-      const message = { id: reply.id, seq: reply.seq ?? bot.nextSeq, role: 'assistant', content, authorLabel: null, createdAt: now() };
+      const message = {
+        id: reply.id,
+        seq: reply.seq ?? bot.nextSeq,
+        role: 'assistant',
+        content,
+        authorLabel: null,
+        createdAt: now(),
+        ...(attachments.length ? { attachments } : {}),
+        ...(text && reply.cards?.length ? { cards: reply.cards } : {}),
+      };
       if (reply.seq === undefined) bot.nextSeq += 1;
       // In thread order: a reply placed early stays above what came after it.
       const at = entry.messages.findIndex((existing) => existing.seq > message.seq);
@@ -1161,6 +1222,8 @@ export const createLocalBotEngine = ({
       systemPrompt: `${LOCAL_TASK_PROMPT}\n\nThe bot "${entry.bot.name}" handed you the task "${task.title}". The task follows as the message.`,
       prompt: instructions,
       tools: [],
+      // Its report names files by full path; the bot attaches them in its reply.
+      replyFiles: false,
       heartbeatMs: HEARTBEAT_MS,
     };
     track(
@@ -1227,7 +1290,7 @@ export const createLocalBotEngine = ({
     const started = await Promise.resolve(
       startProjectThread({
         projectId: project.id,
-        prompt: `${brief ? `${brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this.`,
+        prompt: `${brief ? `${brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this. ${BOT_REPORT_GUIDE}`,
         key,
         botName: entry.bot.name,
         title: task.title,
@@ -1655,7 +1718,7 @@ export const createLocalBotEngine = ({
           const started = await Promise.resolve(
             startThreadFollowUp({
               threadId: thread.id,
-              prompt: `${message}\n\n(From the bot "${self.bot.name}": end with a concise report of the outcome; it goes back to the bot.)`,
+              prompt: `${message}\n\n(From the bot "${self.bot.name}": end with a concise report of the outcome; it goes back to the bot. ${BOT_REPORT_GUIDE})`,
               key,
               botName: self.bot.name,
               accessMode: getAccessMode() || 'read-only',
@@ -1793,7 +1856,10 @@ export const createLocalBotEngine = ({
         bot: toDesktopBot(entry),
         messages: entry.messages.slice(-count).map(({ attachments, ...message }) => ({
           ...message,
-          ...(attachments?.length ? { files: attachments.map((item) => ({ name: item.name, size: item.size })) } : {}),
+          // On this device: the files themselves (Durango Code shows images from their path).
+          ...(attachments?.length
+            ? { files: attachments.map((item) => ({ name: item.name, size: item.size, path: item.path, ...(item.contentType ? { contentType: item.contentType } : {}) })) }
+            : {}),
         })),
         live: runtime
           ? [...runtime.replies.values()].map((reply) => ({

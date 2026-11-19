@@ -156,7 +156,8 @@ test('a message while idle starts a reply; live progress and the stored reply', 
     run.lane.tools.map((tool) => tool.name).sort(),
     [
       'ask_user', 'create_bot', 'delegate_task', 'forget_project_note', 'manage_routine', 'message_bot', 'notify_user',
-      'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'update_bot',
+      'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'show_actions', 'show_html',
+      'update_bot',
     ]
   );
 
@@ -622,8 +623,49 @@ test('files sent to a signed-out bot are kept with the message and reach its rep
   assert.equal(lane.attachments.length, 1);
   assert.equal(await fs.readFile(lane.attachments[0].path, 'utf8'), 'hello file', 'a copy in the bots folder');
   const thread = await engine.thread(primary.id);
-  assert.deepEqual(thread.messages[0].files, [{ name: 'brief.txt', size: 10 }]);
+  assert.deepEqual(thread.messages[0].files, [{ name: 'brief.txt', size: 10, path: lane.attachments[0].path }], 'with its path here');
   runner.lanes[0].finish({ text: 'Got it.' });
+  await engine.idle();
+  await engine.stop();
+});
+
+test('a signed-out reply keeps its files and cards (show_html, show_actions)', async () => {
+  const { engine, runner, dir } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  const shot = path.join(dir, '..', `shot-${Date.now()}.png`);
+  await fs.writeFile(shot, 'png bytes');
+  await engine.send(primary.id, { messageId: 'r1', content: 'Show me the screenshot' });
+  await waitFor(() => runner.lanes.length === 1);
+  const { ctx } = runner.lanes[0];
+  const page = await ctx.callTool({ name: 'show_html', input: { title: 'Flow', html: '<p>hi</p>', height: 'sm' } });
+  assert.deepEqual(page.result, { ok: true, shown: 'html' });
+  const bad = await ctx.callTool({ name: 'show_actions', input: { actions: [{ kind: 'open_url', url: 'javascript:alert(1)', label: 'x' }] } });
+  assert.equal(bad.result.ok, false, 'an unsafe link is refused');
+  await ctx.callTool({
+    name: 'show_actions',
+    input: { actions: [{ kind: 'reply', label: 'Looks good' }, { kind: 'open_thread', thread_id: 'thr-1' }, { kind: 'open_change', change_id: 'nope' }] },
+  });
+  runner.lanes[0].finish({ text: 'Here it is.', files: [{ path: shot, name: 'shot.png', size: 9 }] });
+  await engine.idle();
+  const thread = await engine.thread(primary.id);
+  const reply = thread.messages.find((message) => message.role === 'assistant');
+  assert.equal(reply.content, 'Here it is.');
+  assert.equal(reply.files.length, 1);
+  assert.equal(reply.files[0].name, 'shot.png');
+  assert.equal(reply.files[0].contentType, 'image/png');
+  assert.equal(await fs.readFile(reply.files[0].path, 'utf8'), 'png bytes', 'a copy in the bots folder');
+  assert.deepEqual(
+    reply.cards.map((card) => [card.component, card.props]),
+    [
+      ['html', { title: 'Flow', html: '<p>hi</p>', height: 'sm' }],
+      ['bot-actions', { actions: [{ kind: 'reply', label: 'Looks good' }, { kind: 'open_thread', thread_id: 'thr-1' }] }],
+    ]
+  );
+  // The next reply knows what this one showed.
+  await engine.send(primary.id, { messageId: 'r2', content: 'Thanks' });
+  await waitFor(() => runner.lanes.length === 2);
+  assert.match(runner.lanes[1].lane.prompt, /\[attached file: shot\.png\]\n\[showed a page "Flow"\]\n\[showed buttons\]/);
+  runner.lanes[1].finish({ text: 'Anytime.' });
   await engine.idle();
   await engine.stop();
 });

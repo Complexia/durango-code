@@ -473,6 +473,9 @@ contextBridge.exposeInMainWorld('orion', {
   ensureProjectBot: (input) => ipcRenderer.invoke('bots:ensureProjectBot', input),
   getBotProject: (input) => ipcRenderer.invoke('bots:project', input),
   botProjectAction: (input) => ipcRenderer.invoke('bots:projectAction', input),
+  botFileLinks: (input) => ipcRenderer.invoke('bots:fileLinks', input),
+  shipBotChange: (input) => ipcRenderer.invoke('bots:shipChange', input),
+  openBotChange: (input) => ipcRenderer.invoke('bots:openChange', input),
   durangoProfileMemory: () => ipcRenderer.invoke('durango:profileMemory'),
   durangoOpenChat: (input) => ipcRenderer.invoke('durango:openChat', input),
   // Durango Tasks backend + Durango Chat dispatch (agents started from chat)

@@ -657,7 +657,11 @@ try {
     assert.equal(options.permissionMode, 'bypassPermissions', 'bot replies always run with Full access');
     assert.equal(options.pathToClaudeCodeExecutable, '/opt/claude');
     assert.deepEqual(options.env, { TEST_ENV: '1' });
-    assert.deepEqual(options.mcpServers, {}, 'no tools → no bot server');
+    assert.deepEqual(
+      options.mcpServers.durango_bot.tools.map((tool) => tool.name),
+      ['attach_files'],
+      'no bot tools: only attach_files (a reply shows files from here)'
+    );
     assert.equal((await options.canUseTool('Bash', { command: 'ls' })).behavior, 'deny', 'no one here to approve');
     assert.ok(sdk.runs[0].closed, 'query closed when done');
   });
@@ -1004,6 +1008,68 @@ try {
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
     assert.deepEqual(client.calls.finish[0], { laneId: 'lane_1', botId: 'bot_1', machineId: 'machine-1', text: '', retryElsewhere: true });
     assert.equal(worker.getState().status, 'off');
+  });
+
+  await test('reply files: attach_files, screenshots the text names, uploaded at finish', async () => {
+    const shots = path.join(testRoot, 'shots');
+    await fs.mkdir(shots, { recursive: true });
+    for (const name of ['a-inbox.png', 'b-email.png', 'c-mobile.png', 'notes.txt']) await fs.writeFile(path.join(shots, name), name);
+    let attachOutput;
+    const sdk = createFakeSdk(async function* ({ next, tools }) {
+      await next();
+      yield init();
+      attachOutput = await tools.attach_files.handler({ paths: [path.join(shots, 'notes.txt'), path.join(shots, 'missing.png'), 'relative.png'] });
+      yield assistant('a1', [
+        {
+          type: 'text',
+          text: `Done. The screenshots are in \`${shots}/\`:\n\n- \`a-inbox.png\`: inbox\n- \`b-email.png\`: email\n\n![mobile](${path.join(shots, 'c-mobile.png')})`,
+        },
+      ]);
+      yield success();
+    });
+    const uploads = [];
+    const client = createFakeClient({ claim: laneClaims([makeLane()]) });
+    startWorker({
+      client,
+      runLane: sdkRunner(sdk),
+      uploadReplyFile: async (file) => {
+        uploads.push(file.name);
+        if (file.name === 'b-email.png') throw new Error('Storage refused it.');
+        return { id: `asset_${file.name.replace(/\W/g, '')}`, name: file.name, kind: file.name.endsWith('.png') ? 'image' : 'document' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.match(attachOutput.content[0].text, /notes\.txt: attached\./);
+    assert.match(attachOutput.content[0].text, /missing\.png: no such file\./);
+    assert.match(attachOutput.content[0].text, /relative\.png: not a full path/);
+    assert.deepEqual(uploads.sort(), ['a-inbox.png', 'b-email.png', 'c-mobile.png', 'notes.txt']);
+    const finish = client.calls.finish[0];
+    assert.deepEqual(
+      finish.files.map((file) => file.name).sort(),
+      ['a-inbox.png', 'c-mobile.png', 'notes.txt'],
+      'uploaded files go with the finish'
+    );
+    assert.ok(!finish.text.includes('![mobile]'), 'an embed of an attached file leaves the text');
+    assert.ok(finish.text.includes('`a-inbox.png`: inbox'), 'the rest of the text stays');
+    assert.match(finish.text, /_Couldn't attach b-email\.png\._$/, 'a file that failed to upload is named');
+  });
+
+  await test('reply files: a task lane (replyFiles: false) gets no attach_files', async () => {
+    const sdk = createFakeSdk(async function* ({ next }) {
+      await next();
+      yield init();
+      yield assistant('a1', [{ type: 'text', text: `Report: /tmp/nothing-here.png` }]);
+      yield success();
+    });
+    const outcome = await sdkRunner(sdk)(makeLane({ replyFiles: false }), {
+      accessMode: 'full-access',
+      update: () => {},
+      takeInbox: async () => [],
+      callTool: async () => ({ result: null }),
+    });
+    assert.deepEqual(sdk.runs[0].options.mcpServers, {});
+    assert.equal(outcome.files, undefined);
+    assert.equal(outcome.text, 'Report: /tmp/nothing-here.png');
   });
 
   await test('network errors on finish are retried', async () => {

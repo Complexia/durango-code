@@ -222,7 +222,9 @@ import {
   durangoWorkspaceStatus,
   findDurangoWorkspace,
   inspectDurangoWorkspaceProject,
+  landDurangoChange,
   landDurangoWorkspace,
+  locateDurangoChange,
   missingDurangoWorkspaces,
   pruneDurangoWorkspaces,
   removeDurangoWorkspace,
@@ -4769,6 +4771,20 @@ const botReplyWorker = createBotReplyWorker({
   startProjectThread: startBotProjectThread(BOT_TASK_DISPATCH_PREFIX),
   startThreadFollowUp: startBotThreadFollowUp(BOT_TASK_DISPATCH_PREFIX),
   threadTools: botThreadTools,
+  // Files a reply attached (attach_files, screenshots it names): to the person's library.
+  uploadReplyFile: async (file) => {
+    const account = await durangoAccountKey();
+    if (!account) throw new Error('Not signed in to Durango.');
+    const uploaded = await durangoClient.uploadBotAttachment({
+      name: file.name,
+      bytes: await fs.readFile(file.path),
+      contentType: mimeTypeForPath(file.path),
+      account,
+    });
+    const asset = uploaded?.part?.asset;
+    if (!asset?.id) throw new Error('Durango did not store the file.');
+    return { id: asset.id, name: asset.name ?? file.name, kind: asset.kind ?? 'file' };
+  },
   // A task cancelled on Durango: its thread here stops, like a dispatch stopped from Chat.
   stopThread: (threadId, taskId) =>
     requestDispatchRendererCommand(
@@ -5027,13 +5043,37 @@ ipcMain.handle('durango:openDeployLog', async (_event, input) => {
   const error = await shell.openPath(log);
   return error ? { ok: false, error } : { ok: true };
 });
+// What a bot task's report carries besides the thread's own words: the thread
+// and the change its workspace holds, so the bot (and its thread view) can put
+// Open thread / View change / Ship buttons on it without guessing ids.
+const botTaskReportRefs = async ({ threadId, workspacePath }) => {
+  const lines = [];
+  if (typeof threadId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(threadId)) lines.push(`Thread: @thread:${threadId}`);
+  if (isPathInput(workspacePath)) {
+    const status = await durangoWorkspaceStatus({ path: workspacePath, remote: true }).catch(() => null);
+    const change = status?.ok ? status.change : null;
+    if (change?.changeId) {
+      lines.push(`Change: ${change.changeId}${change.status ? ` (${change.status})` : ''}${change.url ? ` ${change.url}` : ''}`);
+    }
+    lines.push(`Workspace: ${workspacePath}`);
+  }
+  return lines.length ? `\n\n---\n${lines.join('\n')}` : '';
+};
+
+const withReportRefs = async (input) => {
+  const summary = typeof input?.summary === 'string' ? input.summary : undefined;
+  if (input?.outcome !== 'finished') return summary;
+  const refs = await botTaskReportRefs({ threadId: input?.threadId, workspacePath: input?.workspacePath }).catch(() => '');
+  return refs ? `${summary?.trim() || 'The thread finished without a written summary.'}${refs}` : summary;
+};
+
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
-ipcMain.handle('durango:dispatchSettled', (_event, input) =>
+ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
   typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(BOT_TASK_DISPATCH_PREFIX)
     ? reportBotTaskThread({
         taskId: input.dispatchId.slice(BOT_TASK_DISPATCH_PREFIX.length),
         outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
-        summary: typeof input?.summary === 'string' ? input.summary : undefined,
+        summary: await withReportRefs(input),
         error: typeof input?.error === 'string' ? input.error : undefined,
       })
     : typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(LOCAL_BOT_DISPATCH_PREFIX)
@@ -5041,7 +5081,7 @@ ipcMain.handle('durango:dispatchSettled', (_event, input) =>
         key: input.dispatchId.slice(LOCAL_BOT_DISPATCH_PREFIX.length),
         threadId: typeof input?.threadId === 'string' ? input.threadId : undefined,
         outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
-        summary: typeof input?.summary === 'string' ? input.summary : undefined,
+        summary: await withReportRefs(input),
         error: typeof input?.error === 'string' ? input.error : undefined,
       })
     : dispatchWorker.settle({
@@ -6110,6 +6150,50 @@ ipcMain.handle('bots:send', async (_event, input) => {
     };
   } catch (error) {
     return durangoIpcError(error);
+  }
+});
+
+// Files in bot threads (what the person attached, and files a reply attached):
+// read links (an hour) from Durango, by library id. Signed out, files are on
+// this device and the renderer shows them from their paths.
+ipcMain.handle('bots:fileLinks', async (_event, input) => {
+  const ids = (Array.isArray(input?.ids) ? input.ids : []).filter((id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id)).slice(0, 40);
+  if (!ids.length) return { ok: true, files: [] };
+  if (await localBotsMode()) return { ok: true, files: [] };
+  try {
+    return { ok: true, files: await durangoClient.botFileLinks(ids) };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+// A bot reply's Ship button: lands the change the way the thread header's
+// Land does (the renderer asked the person to confirm first).
+ipcMain.handle('bots:shipChange', async (_event, input) => {
+  const changeId = typeof input?.changeId === 'string' ? input.changeId.trim() : '';
+  if (!/^chg_[a-z0-9]{8,40}$/.test(changeId)) return { ok: false, error: 'Not a change id.' };
+  const cliSignIn = await signInBundledCli();
+  if (!cliSignIn.signedIn) return { ok: false, error: cliSignIn.error ?? 'Sign in to Durango Code first.' };
+  return landDurangoChange({ changeId });
+});
+
+// A bot reply's View change button: the change's page on durango.sh (its URL
+// when the bot gave one, else Durango Source's, found from a checkout here).
+ipcMain.handle('bots:openChange', async (_event, input) => {
+  const changeId = typeof input?.changeId === 'string' ? input.changeId.trim() : '';
+  const given = typeof input?.url === 'string' ? externalWebUrl(input.url) : null;
+  try {
+    let target = given;
+    if (!target) {
+      if (!/^chg_[a-z0-9]{8,40}$/.test(changeId)) return { ok: false, error: 'Not a change id.' };
+      await signInBundledCli();
+      target = externalWebUrl((await locateDurangoChange(changeId))?.url ?? '');
+    }
+    if (!target) return { ok: false, error: `Couldn't find ${changeId} in a Durango Source checkout on this computer.` };
+    await shell.openExternal(target);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? 'Could not open the change.' };
   }
 });
 

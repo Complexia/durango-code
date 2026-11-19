@@ -762,6 +762,13 @@ export const createDurangoClient = ({
       form.append('file', new Blob([bytes], { type: contentType || 'application/octet-stream' }), str(name) || 'file');
       return await request('POST', '/bots/attachments', { form, timeout: Math.max(timeoutMs, 180_000), ...(account ? { account } : {}) });
     },
+    /** Read links (an hour) for files in the person's bot threads, by library id → `[{ id, name, contentType, byteSize, url }]`. */
+    async botFileLinks(ids) {
+      const data = await request('GET', '/bots/files', { query: { ids: (Array.isArray(ids) ? ids : []).map(str).filter(Boolean).join(',') } });
+      return (Array.isArray(data.files) ? data.files : [])
+        .filter((file) => str(file?.id) && /^https?:\/\//.test(str(file?.url)))
+        .map((file) => ({ id: str(file.id), name: str(file.name), contentType: str(file.contentType), byteSize: Number(file.byteSize) || 0, url: str(file.url) }));
+    },
     /** A project's bot, created the first time: `{ name, repoId?, machineId?, projectId?, timeZone? }` → the bot. */
     async ensureProjectBot(body) {
       const data = await request('POST', '/bots/projects', { body });
@@ -1200,6 +1207,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async listBots() {
       return { allowed: true, bots: [] };
+    },
+    async botFileLinks() {
+      return [];
     },
     async botThread() {
       return { bot: null, messages: [], live: [], hasMore: false };

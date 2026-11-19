@@ -533,14 +533,16 @@ export const rehypeMarkdownTables = () => (tree: HastNode) => {
 
 export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink, pre: MarkdownPre };
 const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences, remarkMediaPathPreviews];
+// For a message that shows its files itself (a bot reply's attachments): paths it names stay text.
+const markdownRemarkPluginsNoPathPreviews = [remarkGfm, remarkThreadReferences];
 const markdownRehypePlugins = [rehypeMarkdownTables];
 
 // The rendered blocks of one markdown document, without a container, so the
 // segments of a streaming message can share one `.markdown-content`.
-const MarkdownBlocks: React.FC<{ content: string }> = React.memo(({ content }) => (
+const MarkdownBlocks: React.FC<{ content: string; pathPreviews?: boolean }> = React.memo(({ content, pathPreviews = true }) => (
   <MarkdownSourceContext.Provider value={content}>
     <ReactMarkdown
-      remarkPlugins={markdownRemarkPlugins}
+      remarkPlugins={pathPreviews ? markdownRemarkPlugins : markdownRemarkPluginsNoPathPreviews}
       rehypePlugins={markdownRehypePlugins}
       urlTransform={markdownUrlTransform}
       components={markdownComponents}
@@ -550,9 +552,9 @@ const MarkdownBlocks: React.FC<{ content: string }> = React.memo(({ content }) =
   </MarkdownSourceContext.Provider>
 ));
 
-export const MarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => (
+export const MarkdownContent: React.FC<{ content: string; pathPreviews?: boolean }> = React.memo(({ content, pathPreviews }) => (
   <div className="markdown-content">
-    <MarkdownBlocks content={content} />
+    <MarkdownBlocks content={content} pathPreviews={pathPreviews} />
   </div>
 ));
 

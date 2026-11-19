@@ -5,6 +5,7 @@ import path from 'node:path';
 import { DurangoError } from './durango-client.js';
 import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
+import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles } from './bot-reply-extras.js';
 
 // Bot replies: a Durango bot's reply, run here on the person's own Claude Code.
 //
@@ -437,6 +438,25 @@ export const createClaudeLaneRunner = ({
       { alwaysLoad: true }
     )
   );
+  // Files from this computer the reply shows (attach_files, and what its text
+  // points at): the caller uploads or copies them when the reply finishes.
+  // A background task's lane (`replyFiles: false`) writes a report, not a reply: it names paths instead.
+  const replyFiles = createReplyFiles();
+  const attaches = lane.replyFiles !== false;
+  if (attaches && !lane.tools.some((definition) => definition.name === ATTACH_FILES_TOOL.name)) {
+    botTools.push(
+      sdk.tool(
+        ATTACH_FILES_TOOL.name,
+        ATTACH_FILES_TOOL.description,
+        zodShapeForInputSchema(z, ATTACH_FILES_TOOL.inputSchema),
+        async (args) => {
+          const lines = await replyFiles.add(Array.isArray(args?.paths) ? args.paths : []);
+          return { content: [{ type: 'text', text: lines.join('\n') || 'Nothing to attach.' }] };
+        },
+        { alwaysLoad: true }
+      )
+    );
+  }
   const mcpServers = botTools.length
     ? { [BOT_MCP_SERVER]: sdk.createSdkMcpServer({ name: BOT_MCP_SERVER, version: '1.0.0', tools: botTools }) }
     : {};
@@ -487,7 +507,7 @@ export const createClaudeLaneRunner = ({
         mcpServers,
         ...claudePermissionOptionsForAccessMode(accessMode),
         ...(accessMode !== 'full-access' && botTools.length
-          ? { allowedTools: lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`) }
+          ? { allowedTools: [...lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`), ...(attaches ? [`${BOT_TOOL_PREFIX}${ATTACH_FILES_TOOL.name}`] : [])] }
           : {}),
         canUseTool: async (toolName, toolInput) =>
           toolName.startsWith(BOT_TOOL_PREFIX)
@@ -587,11 +607,16 @@ export const createClaudeLaneRunner = ({
     } catch {}
   }
 
-  const text = currentText();
+  const written = currentText();
   const modelId = durangoModelIdForClaude(model);
   const withModel = modelId ? { modelId } : {};
-  if (ctx.signal?.aborted) return { text, aborted: true, ...withModel };
-  if (result && !result.is_error && result.subtype === 'success') return { text, ...withModel };
+  if (ctx.signal?.aborted) return { text: written, aborted: true, ...withModel };
+  // Screenshots the text names are attached too; their /tmp embeds leave the text.
+  const { text, files } = attaches
+    ? await finishReplyFiles(written, replyFiles).catch(() => ({ text: written, files: replyFiles.list() }))
+    : { text: written, files: [] };
+  const withFiles = files.length ? { files } : {};
+  if (result && !result.is_error && result.subtype === 'success') return { text, ...withFiles, ...withModel };
 
   const resultErrors = Array.isArray(result?.errors) ? result.errors.filter(Boolean).join('; ') : '';
   const reason =
@@ -610,7 +635,7 @@ export const createClaudeLaneRunner = ({
     RETRY_ELSEWHERE_ASSISTANT_ERRORS.has(assistantError) ||
     (Boolean(thrown) && !sawInit) ||
     isRetryElsewhereError(`${reason}\n${stderrTail}`);
-  return { text, failure: shorten(reason), retryElsewhere, ...withModel };
+  return { text, failure: shorten(reason), retryElsewhere, ...withFiles, ...withModel };
 };
 
 // --- the worker ------------------------------------------------------------------------
@@ -657,6 +682,8 @@ const isLaneGone = (error) =>
  * - threadTools: createBotThreadTools(...) (bot-thread-tools.js): list_threads and
  *   read_thread here; with startThreadFollowUp, message_thread
  * - stopThread(threadId, taskId): stops that task's run in a thread here (a task cancelled on Durango; a later turn is left alone)
+ * - uploadReplyFile({ path, name, size }): uploads a file the reply attached to the
+ *   person's library → its asset `{ id, name, kind }` (POST /api/v1/bots/attachments)
  * - onStateChange(state): void
  */
 export const createBotReplyWorker = ({
@@ -672,6 +699,7 @@ export const createBotReplyWorker = ({
   startThreadFollowUp = null,
   threadTools = null,
   stopThread = null,
+  uploadReplyFile = null,
   maxLanes = BOT_MAX_LANES,
   claimWaitMs = BOT_CLAIM_WAIT_MS,
   throttleMs = BOT_PROGRESS_THROTTLE_MS,
@@ -936,7 +964,7 @@ export const createBotReplyWorker = ({
         startProjectThread({
           projectId: target.project.id,
           // The project's notes first (Durango keeps them), then the work.
-          prompt: `${created.brief ? `${created.brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${lane.botName}" that asked for this.`,
+          prompt: `${created.brief ? `${created.brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${lane.botName}" that asked for this. ${BOT_REPORT_GUIDE}`,
           key: created.taskId,
           botName: lane.botName,
           title: created.title || title,
@@ -979,7 +1007,7 @@ export const createBotReplyWorker = ({
       const started = await Promise.resolve(
         startThreadFollowUp({
           threadId: entry.id,
-          prompt: `${message}\n\n(From the bot "${lane.botName}": end with a concise report of the outcome; it goes back to the bot.)`,
+          prompt: `${message}\n\n(From the bot "${lane.botName}": end with a concise report of the outcome; it goes back to the bot. ${BOT_REPORT_GUIDE})`,
           key: created.taskId,
           botName: lane.botName,
           accessMode: settings.accessMode,
@@ -1049,6 +1077,26 @@ export const createBotReplyWorker = ({
             ? { text: '', retryElsewhere: true, ...(failure ? { failure } : {}) }
             : { text, ...(failure ? { failure } : {}) };
         if (outcome?.modelId) body.modelId = outcome.modelId;
+        // Its files go up now, in parallel; one that doesn't is named under the text.
+        if (!body.retryElsewhere && body.text && outcome?.files?.length && uploadReplyFile) {
+          const uploads = await Promise.all(
+            outcome.files.map((file) =>
+              Promise.resolve()
+                .then(() => uploadReplyFile(file))
+                .then(
+                  (asset) => ({ file, asset }),
+                  (error) => ({ file, error: error?.message ?? String(error) })
+                )
+            )
+          );
+          const assets = uploads.filter((item) => item.asset?.id).map((item) => item.asset);
+          const failed = uploads.filter((item) => !item.asset?.id);
+          if (assets.length) body.files = assets;
+          if (failed.length) {
+            log(`attaching ${failed.length} file(s) to ${lane.laneId} failed:`, failed.map((item) => item.error).join('; '));
+            body.text = `${body.text}\n\n_Couldn't attach ${failed.map((item) => item.file.name).join(', ')}._`;
+          }
+        }
         // A take that never got through: its messages (if it claimed any)
         // never reached this reply, so they go back to the inbox.
         if (entry.pendingTakeId && !body.retryElsewhere) body.lostTakes = [entry.pendingTakeId];

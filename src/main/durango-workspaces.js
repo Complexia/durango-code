@@ -268,6 +268,66 @@ export const landDurangoWorkspace = ({ path: workspacePath, env }) => {
   return promise;
 };
 
+const CHANGE_ID = /^chg_[a-z0-9]{8,40}$/;
+
+/**
+ * Where a Durango Source change can be acted on from this computer (a bot's
+ * Ship / View change buttons): the workspace holding it, else a checkout of
+ * its repository that knows it (`change show`). → `{ workspace?, repo, url, status }` or null.
+ */
+export const locateDurangoChange = async (changeId) => {
+  if (!CHANGE_ID.test(String(changeId ?? ''))) return null;
+  const list = await runBundledCli(['ws', 'list', '--json'], { cwd: os.homedir(), timeout: 30_000 }).catch(() => null);
+  const workspaces = (Array.isArray(list?.json?.workspaces) ? list.json.workspaces : []).filter(
+    (entry) => typeof entry?.path === 'string' && existsSync(entry.path)
+  );
+  const holder = workspaces.find((entry) => entry.changeId === changeId || readLocalChange(entry.path).changeId === changeId);
+  const show = async (cwd) => {
+    const shown = await runBundledCli(['change', 'show', changeId, '--json'], { cwd, timeout: 30_000 }).catch(() => null);
+    return shown?.json?.ok ? { url: shown.json.url ?? null, status: shown.json.change?.status ?? null } : null;
+  };
+  if (holder) return { workspace: holder.path, repo: holder.repo ?? null, ...((await show(holder.path)) ?? { url: null, status: null }) };
+  const repos = [...new Set(workspaces.map((entry) => entry.repo).filter((repo) => typeof repo === 'string' && existsSync(repo)))];
+  for (const repo of repos) {
+    const shown = await show(repo);
+    if (shown) return { repo, ...shown };
+  }
+  return null;
+};
+
+/**
+ * Lands a change by id, the way the thread header's Land button does: from
+ * the workspace holding it (`land` there, which checks and amends the tree
+ * first), else `land <id>` in a checkout of its repository. Waits like the CLI.
+ */
+export const landDurangoChange = async ({ changeId, env }) => {
+  const found = await locateDurangoChange(changeId);
+  if (!found) return { ok: false, error: `Couldn't find ${changeId} in a Durango Source checkout on this computer.` };
+  if (found.status && found.status !== 'open' && found.status !== 'queued') {
+    return { ok: false, error: `${changeId} is ${found.status}, so there is nothing to land.`, url: found.url };
+  }
+  if (found.workspace) return landDurangoWorkspace({ path: found.workspace, env });
+  const key = `change:${changeId}`;
+  const existing = landRuns.get(key);
+  if (existing) return existing.promise;
+  const promise = runBundledCli(['land', changeId, '--json'], { cwd: found.repo, env, timeout: LAND_TIMEOUT_MS })
+    .then((result) =>
+      result.json?.ok
+        ? { ok: true, changeId: result.json.changeId ?? changeId, url: result.json.url ?? found.url ?? null }
+        : {
+            ok: false,
+            error: bundledCliError(result, 'durango-code land failed.'),
+            code: result.json?.code ?? null,
+            url: result.json?.url ?? found.url ?? null,
+            exitCode: result.code,
+          }
+    )
+    .catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
+    .finally(() => landRuns.delete(key));
+  landRuns.set(key, { promise, startedAt: Date.now() });
+  return promise;
+};
+
 /** `ws serve` in the background: the CLI waits for a server slot and runs `[workspace] serve`. */
 export const serveDurangoWorkspace = ({ path: workspacePath, name, repo, onExit }) => {
   if (serveRuns.has(workspacePath)) return { ok: true };
