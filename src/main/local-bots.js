@@ -11,7 +11,8 @@ import { BOT_THREAD_TOOLS } from './bot-thread-tools.js';
 // message waits more than a few seconds), but every reply runs here through
 // the person's own Claude Code (createClaudeLaneRunner in bot-replies.js), the
 // bots' tools run in this process, and everything is stored as JSON under
-// `<dir>` (bots.json + one `<botId>.json` per bot). When the person signs in,
+// `<dir>` (bots.json, and per bot a `<botId>.json` snapshot plus the
+// append-only log it names; see "storage" below). When the person signs in,
 // exportForSync() is uploaded to their Durango account and markSynced() moves
 // the files aside, so nothing is uploaded twice or deleted.
 
@@ -35,6 +36,10 @@ const INBOX_LABEL = { routine: 'Routine: ', task: 'Task: ', bot: 'Bot: ' };
 const INDEX_FILE = 'bots.json';
 const PROJECTS_FILE = 'projects.json';
 const PROJECT_FILES_DIR = 'project-files';
+/** A bot's transcript log is folded into its snapshot past this many saves or bytes. */
+export const TRANSCRIPT_LOG_MAX_LINES = 500;
+export const TRANSCRIPT_LOG_MAX_BYTES = 4 * 1024 * 1024;
+const TRANSCRIPT_LOG_NAME = /^[A-Za-z0-9_-]{1,64}\.[0-9a-f]{12}\.log$/;
 export const LOCAL_PROJECT_LIMITS = { noteChars: 2_000, notesPerProject: 200, fileBytes: 10 * 1024 * 1024, filesPerProject: 200, readChars: 60_000, promptNotesChars: 6_000 };
 
 // --- prompts ------------------------------------------------------------------------------
@@ -614,7 +619,13 @@ export const createLocalBotEngine = ({
    * Queues a write of `snapshot()` (read when the write starts; null skips it).
    * → whether it landed (never rejects; a failure is logged).
    */
-  const persistFile = (name, snapshot) => {
+  const persistFile = (name, snapshot) =>
+    persistWith(name, async (file) => {
+      const data = snapshot();
+      if (data != null) await atomicWrite(file, JSON.stringify(data));
+    });
+  /** Queues `write(file)` behind the file's earlier writes (one queued at a time). → whether it landed. */
+  const persistWith = (name, write) => {
     const file = path.join(storageDir(), name);
     if (queued.has(file)) return writes.get(file);
     queued.add(file);
@@ -624,9 +635,7 @@ export const createLocalBotEngine = ({
       .then(async () => {
         queued.delete(file);
         if (myGeneration !== generation) return true;
-        const data = snapshot();
-        if (data == null) return true;
-        await atomicWrite(file, JSON.stringify(data));
+        await write(file);
         return true;
       })
       .catch((error) => {
@@ -646,19 +655,85 @@ export const createLocalBotEngine = ({
     requeue: bot.requeue ?? [],
     inFlight: bot.inFlight ?? [],
   });
+  // A bot's transcript (its messages and claim state) is a snapshot,
+  // `<id>.json` `{ version: 3, messages, claims, log }`, plus the append-only
+  // log it names, `<id>.<12 hex>.log`. Each save appends one JSON line: the
+  // messages added (or replaced) and dropped since the last save, and the
+  // claim state. So a save costs what changed, not the whole history (up to
+  // LOCAL_BOT_MESSAGE_CAP messages). One line is one save: a crash mid-write
+  // leaves a torn last line, dropped whole on load, so a claim never lands
+  // without the message it names, nor a message marked answered without its
+  // reply. Past TRANSCRIPT_LOG_MAX_* (or after a failed append) the snapshot
+  // is rewritten (temp + rename) naming a fresh log, then the old log is
+  // removed: a crash in between leaves the new snapshot with an empty log,
+  // and the stray old log is removed on the next load. Version 2 files (the
+  // whole transcript, no log) load as they are and become a snapshot on their
+  // first save. Messages are never changed in place (a change replaces the
+  // object), so what changed is found by identity against `entry.disk`.
+  const newTranscriptLog = (id) => `${id}.${crypto.randomBytes(6).toString('hex')}.log`;
+  const diskStateOf = (entry, log, claims, lines = 0, bytes = 0) => ({
+    log,
+    messages: new Map(entry.messages.map((message) => [message.id, message])),
+    claims: JSON.stringify(claims),
+    lines,
+    bytes,
+  });
+  const snapshotTranscript = async (entry) => {
+    const base = storageDir();
+    const id = entry.bot.id;
+    const log = newTranscriptLog(id);
+    const claims = claimStateOf(entry.bot);
+    // What this snapshot holds, taken with its text (the entry changes during the write).
+    const text = JSON.stringify({ version: 3, botId: id, messages: entry.messages, claims, log });
+    const disk = diskStateOf(entry, log, claims);
+    await atomicWrite(path.join(base, `${id}.json`), text);
+    const previous = entry.disk?.log;
+    entry.disk = disk;
+    if (previous) await fs.rm(path.join(base, previous), { force: true }).catch(() => {});
+  };
+  const appendTranscript = async (entry) => {
+    const disk = entry.disk;
+    if (!disk?.log || disk.lines >= TRANSCRIPT_LOG_MAX_LINES || disk.bytes >= TRANSCRIPT_LOG_MAX_BYTES) {
+      await snapshotTranscript(entry);
+      return;
+    }
+    const claims = claimStateOf(entry.bot);
+    const claimsText = JSON.stringify(claims);
+    const add = [];
+    const ids = new Set();
+    for (const message of entry.messages) {
+      ids.add(message.id);
+      if (disk.messages.get(message.id) !== message) add.push(message);
+    }
+    const drop = [];
+    for (const id of disk.messages.keys()) if (!ids.has(id)) drop.push(id);
+    if (!add.length && !drop.length && claimsText === disk.claims) return;
+    const line = `${JSON.stringify({ ...(add.length ? { add } : {}), ...(drop.length ? { drop } : {}), claims })}\n`;
+    try {
+      await fs.mkdir(storageDir(), { recursive: true });
+      await fs.appendFile(path.join(storageDir(), disk.log), line, 'utf8');
+    } catch (error) {
+      // It may have written part of the line: the next save starts a fresh log.
+      disk.log = null;
+      throw error;
+    }
+    for (const id of drop) disk.messages.delete(id);
+    for (const message of add) disk.messages.set(message.id, message);
+    disk.claims = claimsText;
+    disk.lines += 1;
+    disk.bytes += Buffer.byteLength(line);
+  };
   /**
-   * Saves a bot: its transcript file holds its messages and its claim state
-   * together (one atomic write), so a crash never leaves a claim without the
-   * message it names, or a message marked answered without its reply. The
-   * index (the bot list and settings) is saved too. → whether both landed.
+   * Saves a bot: what changed in its transcript (see above) and the index
+   * (the bot list and settings). → whether both landed.
    */
   // eslint-disable-next-line no-unused-vars -- callers still say whether messages changed
   const persistBot = (entry, _options = {}) => {
     const index = persistIndex();
     const id = entry.bot.id;
-    const transcript = persistFile(`${id}.json`, () => {
+    const transcript = persistWith(`${id}.json`, async () => {
       const current = entries.get(id);
-      return current ? { version: 2, botId: id, messages: current.messages, claims: claimStateOf(current.bot) } : null;
+      if (current) await appendTranscript(current);
     });
     const saved = Promise.all([index, transcript]).then(([a, b]) => a && b);
     entry.saved = saved;
@@ -685,6 +760,69 @@ export const createLocalBotEngine = ({
     }
   };
 
+  /**
+   * A transcript log's saves, in order. A torn last line (a crash mid-append)
+   * is cut off the file, so the next append starts on a line of its own.
+   */
+  const readTranscriptLog = async (file) => {
+    let text;
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') log(`couldn't read ${path.basename(file)}:`, error?.message ?? error);
+      return { saves: [], lines: 0, bytes: 0 };
+    }
+    const end = text.lastIndexOf('\n') + 1;
+    if (end < text.length) {
+      text = text.slice(0, end);
+      await fs.truncate(file, Buffer.byteLength(text)).catch((error) => log(`couldn't trim ${path.basename(file)}:`, error?.message ?? error));
+    }
+    const saves = [];
+    let lines = 0;
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      lines += 1;
+      try {
+        const save = JSON.parse(line);
+        if (save && typeof save === 'object') saves.push(save);
+      } catch {
+        log(`skipped an unreadable line in ${path.basename(file)}`);
+      }
+    }
+    return { saves, lines, bytes: Buffer.byteLength(text) };
+  };
+  /** A bot's transcript: its snapshot with its log's saves applied (version 2 files have no log). */
+  const readTranscript = async (base, id) => {
+    const file = await readJson(path.join(base, `${id}.json`));
+    let messages = (Array.isArray(file?.messages) ? file.messages : []).map(normalizeMessage).filter(Boolean);
+    let claims = file?.claims && typeof file.claims === 'object' ? file.claims : null;
+    const logName = typeof file?.log === 'string' && TRANSCRIPT_LOG_NAME.test(file.log) && file.log.startsWith(`${id}.`) ? file.log : null;
+    let lines = 0;
+    let bytes = 0;
+    if (logName) {
+      const replay = await readTranscriptLog(path.join(base, logName));
+      const byId = new Map(messages.map((message) => [message.id, message]));
+      for (const save of replay.saves) {
+        for (const dropped of Array.isArray(save.drop) ? save.drop : []) byId.delete(dropped);
+        for (const raw of Array.isArray(save.add) ? save.add : []) {
+          const message = normalizeMessage(raw);
+          if (message) byId.set(message.id, message);
+        }
+        if (save.claims && typeof save.claims === 'object') claims = save.claims;
+      }
+      messages = [...byId.values()];
+      ({ lines, bytes } = replay);
+    }
+    // Logs a crash left behind (between a new snapshot and removing the old
+    // log). Only next to a snapshot that was read: else they're kept.
+    const strays = !file ? [] : (await fs.readdir(base).catch(() => [])).filter(
+      (name) => name !== logName && name.startsWith(`${id}.`) && TRANSCRIPT_LOG_NAME.test(name)
+    );
+    for (const name of strays) await fs.rm(path.join(base, name), { force: true }).catch(() => {});
+    messages.sort((a, b) => a.seq - b.seq);
+    return { messages, claims, log: logName, lines, bytes };
+  };
+
   const ensureLoaded = () => {
     loaded ??= (async () => {
       const base = storageDir();
@@ -693,13 +831,12 @@ export const createLocalBotEngine = ({
       for (const raw of Array.isArray(index?.bots) ? index.bots : []) {
         const bot = normalizeBot(raw, now());
         if (!/^[A-Za-z0-9_-]{1,64}$/.test(bot.id) || next.has(bot.id)) continue;
-        const file = await readJson(path.join(base, `${bot.id}.json`));
-        const messages = (Array.isArray(file?.messages) ? file.messages : []).map(normalizeMessage).filter(Boolean);
-        messages.sort((a, b) => a.seq - b.seq);
+        const transcript = await readTranscript(base, bot.id);
+        const { messages } = transcript;
         // The claim state saved with these messages wins over the index's
         // (written separately, it may be ahead of or behind the transcript).
-        if (file?.claims && typeof file.claims === 'object') {
-          const claims = file.claims;
+        if (transcript.claims) {
+          const claims = transcript.claims;
           if (Number.isInteger(claims.processedSeq)) bot.processedSeq = claims.processedSeq;
           if (Number.isInteger(claims.compactedThroughSeq)) bot.compactedThroughSeq = claims.compactedThroughSeq;
           if (Number.isInteger(claims.nextSeq) && claims.nextSeq > 0) bot.nextSeq = Math.max(1, claims.nextSeq);
@@ -708,7 +845,11 @@ export const createLocalBotEngine = ({
         }
         const lastSeq = messages.length ? messages[messages.length - 1].seq : 0;
         if (bot.nextSeq <= lastSeq) bot.nextSeq = lastSeq + 1;
-        next.set(bot.id, { bot, messages, compacting: false });
+        const entry = { bot, messages, compacting: false };
+        // What is on disk: unchanged messages are never written again. The
+        // claim state as read (the requeue just above isn't saved yet).
+        entry.disk = diskStateOf(entry, transcript.log, transcript.claims ?? {}, transcript.lines, transcript.bytes);
+        next.set(bot.id, entry);
       }
       entries = next;
     })();
@@ -1780,7 +1921,12 @@ export const createLocalBotEngine = ({
       await ensurePrimary();
       return { allowed: true, bots: sortedEntries().map(toDesktopBot) };
     },
-    async thread(botId, { limit = 120, read = false } = {}) {
+    /**
+     * A page of a bot's thread (oldest first) and its replies being written:
+     * the newest `limit`, the `limit` before `beforeSeq` (`hasMore`: older
+     * ones left), or the first `limit` after `afterSeq` (`hasNewer`: more after).
+     */
+    async thread(botId, { limit = 120, read = false, beforeSeq, afterSeq } = {}) {
       await ensureLoaded();
       const entry = entryFor(botId);
       if (read && entry.bot.unread) {
@@ -1789,9 +1935,33 @@ export const createLocalBotEngine = ({
       }
       const count = Math.min(500, Math.max(1, Number.isInteger(limit) ? limit : 120));
       const runtime = runtimes.get(entry.bot.id);
+      const all = entry.messages;
+      // Messages are kept in seq order: the first index whose seq is above `seq`.
+      const indexAfter = (seq) => {
+        let low = 0;
+        let high = all.length;
+        while (low < high) {
+          const middle = (low + high) >> 1;
+          if (all[middle].seq <= seq) low = middle + 1;
+          else high = middle;
+        }
+        return low;
+      };
+      let start;
+      let end;
+      let hasNewer;
+      if (Number.isInteger(afterSeq)) {
+        start = indexAfter(afterSeq);
+        end = Math.min(all.length, start + count);
+        hasNewer = end < all.length;
+      } else {
+        end = Number.isInteger(beforeSeq) ? indexAfter(beforeSeq - 1) : all.length;
+        start = Math.max(0, end - count);
+      }
       return {
         bot: toDesktopBot(entry),
-        messages: entry.messages.slice(-count).map(({ attachments, ...message }) => ({
+        ...(hasNewer !== undefined ? { hasNewer } : {}),
+        messages: all.slice(start, end).map(({ attachments, ...message }) => ({
           ...message,
           ...(attachments?.length ? { files: attachments.map((item) => ({ name: item.name, size: item.size })) } : {}),
         })),
@@ -1804,7 +1974,7 @@ export const createLocalBotEngine = ({
               activeTool: reply.activeTool,
             }))
           : [],
-        hasMore: entry.messages.length > count,
+        hasMore: hasNewer === undefined && start > 0,
       };
     },
     async markRead(botId) {
@@ -1970,6 +2140,7 @@ export const createLocalBotEngine = ({
       await ensureLoaded();
       await flush();
       const ids = [...entries.keys()];
+      const logs = [...entries.values()].flatMap((entry) => (entry.disk?.log ? [entry.disk.log] : []));
       generation += 1;
       abortAll();
       entries = new Map();
@@ -1980,7 +2151,7 @@ export const createLocalBotEngine = ({
       const target = path.join(base, `synced-${stamp}`);
       await fs.mkdir(target, { recursive: true });
       projectStore = null;
-      for (const name of [INDEX_FILE, PROJECTS_FILE, PROJECT_FILES_DIR, ...ids.map((id) => `${id}.json`)]) {
+      for (const name of [INDEX_FILE, PROJECTS_FILE, PROJECT_FILES_DIR, ...ids.map((id) => `${id}.json`), ...logs]) {
         await fs.rename(path.join(base, name), path.join(target, name)).catch((error) => {
           if (error?.code !== 'ENOENT') throw error;
         });

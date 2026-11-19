@@ -1939,7 +1939,7 @@ type OrionCodexBrowserIntegrationStatus = {
       durangoOpenChat?: (input: { chatId: string; url?: string | null }) => Promise<{ ok: boolean; error?: string }>;
       getBotsMode?: () => Promise<import('./app/bots').BotsModeResult>;
       listBots?: () => Promise<import('./app/bots').BotsListResult>;
-      getBotThread?: (input: { botId: string; limit?: number; read?: boolean }) => Promise<import('./app/bots').BotThreadResult>;
+      getBotThread?: (input: { botId: string; limit?: number; read?: boolean; beforeSeq?: number; afterSeq?: number }) => Promise<import('./app/bots').BotThreadResult>;
       ensureProjectBot?: (input: { projectId: string }) => Promise<import('./app/bots').EnsureProjectBotResult>;
       getBotProject?: (input: import('./app/bots').BotProjectTarget) => Promise<import('./app/bots').BotProjectResult>;
       botProjectAction?: (

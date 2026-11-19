@@ -10,6 +10,7 @@ import path from 'node:path';
 
 import {
   LOCAL_BOT_PLACE,
+  TRANSCRIPT_LOG_MAX_LINES,
   compactionBoundary,
   createLocalBotEngine,
   durangoModelForLocalBot,
@@ -803,7 +804,14 @@ test('persistence round trip', async () => {
   await first.engine.stop();
 
   const files = (await fs.readdir(dir)).sort();
-  assert.deepEqual(files, [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  // Each bot: a snapshot and the append-only log it names.
+  assert.deepEqual(files.filter((file) => !file.endsWith('.log')), [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  for (const id of [created.botId, primary.id]) {
+    const snapshot = JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8'));
+    assert.equal(snapshot.version, 3);
+    // (Created by the first save after the snapshot.)
+    for (const file of files.filter((name) => name.startsWith(`${id}.`) && name.endsWith('.log'))) assert.equal(file, snapshot.log);
+  }
   assert.equal(files.some((file) => file.endsWith('.tmp')), false);
 
   const second = makeEngine({ dir });
@@ -898,7 +906,12 @@ test('exportForSync maps models and markSynced moves the data aside', async () =
   const { movedTo } = await engine.markSynced();
   assert.equal(path.dirname(movedTo), dir);
   assert.match(path.basename(movedTo), /^synced-/);
-  assert.deepEqual((await fs.readdir(movedTo)).sort(), [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  const moved = (await fs.readdir(movedTo)).sort();
+  assert.deepEqual(moved.filter((name) => !name.endsWith('.log')), [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  // The transcript logs went with their snapshots.
+  const named = await Promise.all([created.botId, primary.id].map(async (id) => JSON.parse(await fs.readFile(path.join(movedTo, `${id}.json`), 'utf8')).log));
+  assert.ok(moved.some((name) => name.endsWith('.log')));
+  for (const name of moved.filter((item) => item.endsWith('.log'))) assert.ok(named.includes(name), name);
   assert.deepEqual((await fs.readdir(dir)).filter((name) => !name.startsWith('synced-')), []);
   assert.equal(await engine.hasDataToSync(), false);
   // Signed out again later: a fresh primary.
@@ -937,6 +950,177 @@ test('createClaudeOneShot: one turn, no tools, the result text', async () => {
     env: () => ({}),
   });
   await assert.rejects(failing({ model: 'm', systemPrompt: 's', prompt: 'p' }), /error_max_turns/);
+});
+
+// --- long threads: transcript log and paging ----------------------------------------------
+
+/** A bot whose transcript is a version 2 file (the format before the log) with `count` answered messages. */
+const seedVersion2 = async (dir, count) => {
+  const seeded = makeEngine({ dir });
+  const [primary] = (await seeded.engine.list()).bots;
+  await seeded.engine.stop();
+  for (const name of await fs.readdir(dir)) if (name.endsWith('.log')) await fs.rm(path.join(dir, name));
+  const messages = Array.from({ length: count }, (_, index) => ({
+    id: `m${index + 1}`,
+    seq: index + 1,
+    role: index % 2 ? 'assistant' : 'user',
+    content: `message ${index + 1} ${'x'.repeat(200)}`,
+    authorLabel: null,
+    createdAt: 1_700_000_000_000 + index,
+  }));
+  const claims = { nextSeq: count + 1, processedSeq: count, compactedThroughSeq: 0, requeue: [], inFlight: [] };
+  await fs.writeFile(path.join(dir, `${primary.id}.json`), JSON.stringify({ version: 2, botId: primary.id, messages, claims }));
+  return primary.id;
+};
+const logOf = async (dir, id) => JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8')).log;
+const readLines = async (file) => (await fs.readFile(file, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+
+test('a version 2 transcript (2,000 messages) migrates to a snapshot and log with nothing lost', async () => {
+  const dir = path.join(testRoot, `bots-migrate-${Date.now()}`);
+  const id = await seedVersion2(dir, 2_000);
+  const first = makeEngine({ dir });
+  first.engine.setActive(false);
+  let thread = await first.engine.thread(id, { limit: 50 });
+  assert.equal(thread.messages.length, 50);
+  assert.equal(thread.messages.at(-1).seq, 2_000);
+  assert.equal(thread.hasMore, true);
+  // Loading alone writes nothing: the version 2 file stays until a save.
+  assert.equal(JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8')).version, 2);
+  await first.engine.send(id, { messageId: 'new1', content: 'after the migration' });
+  await first.engine.flush();
+  const snapshot = JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8'));
+  assert.equal(snapshot.version, 3);
+  assert.match(snapshot.log, new RegExp(`^${id}\\.[0-9a-f]{12}\\.log$`));
+  await first.engine.stop();
+  const second = makeEngine({ dir });
+  second.engine.setActive(false);
+  thread = await second.engine.thread(id, { limit: 500 });
+  assert.equal(thread.messages.at(-1).content, 'after the migration');
+  // Every message, all the way back.
+  const seen = [];
+  let before;
+  for (;;) {
+    const page = await second.engine.thread(id, { limit: 200, ...(before !== undefined ? { beforeSeq: before } : {}) });
+    seen.unshift(...page.messages.map((message) => message.seq));
+    if (!page.hasMore) break;
+    before = page.messages[0].seq;
+  }
+  assert.equal(seen.length, 2_001);
+  assert.deepEqual(seen.slice(0, 3), [1, 2, 3]);
+  assert.deepEqual(seen, [...seen].sort((a, b) => a - b));
+  await second.engine.stop();
+});
+
+test('a save appends what changed instead of rewriting the transcript', async () => {
+  const dir = path.join(testRoot, `bots-append-${Date.now()}`);
+  const id = await seedVersion2(dir, 2_000);
+  const { engine } = makeEngine({ dir });
+  engine.setActive(false);
+  await engine.send(id, { messageId: 'first', content: 'one' });
+  await engine.flush();
+  const snapshotFile = path.join(dir, `${id}.json`);
+  const before = await fs.stat(snapshotFile);
+  const log = path.join(dir, await logOf(dir, id));
+  for (let index = 0; index < 20; index += 1) {
+    await engine.send(id, { messageId: `more${index}`, content: `more ${index}` });
+    await engine.flush();
+  }
+  const after = await fs.stat(snapshotFile);
+  assert.equal(after.mtimeMs, before.mtimeMs, 'the snapshot is not rewritten');
+  assert.equal(after.size, before.size);
+  const lines = await readLines(log);
+  assert.equal(lines.length, 20);
+  // Each line: only the new message (and the claim state), never the history.
+  for (const [index, line] of lines.entries()) {
+    assert.deepEqual(line.add.map((message) => message.id), [`more${index}`]);
+    assert.equal(line.drop, undefined);
+    assert.equal(typeof line.claims.nextSeq, 'number');
+  }
+  assert.ok((await fs.stat(log)).size < 20 * 1_000, 'twenty small lines');
+  // A save with nothing new writes nothing.
+  await engine.markRead(id);
+  await engine.flush();
+  assert.equal((await readLines(log)).length, 20);
+  await engine.stop();
+});
+
+test('a torn last log line (a crash mid-save) is dropped whole and the log keeps working', async () => {
+  const dir = path.join(testRoot, `bots-torn-${Date.now()}`);
+  const first = makeEngine({ dir });
+  first.engine.setActive(false);
+  const [primary] = (await first.engine.list()).bots;
+  await first.engine.send(primary.id, { messageId: 'a', content: 'kept' });
+  await first.engine.send(primary.id, { messageId: 'b', content: 'kept too' });
+  await first.engine.stop();
+  const log = path.join(dir, await logOf(dir, primary.id));
+  await fs.appendFile(log, '{"add":[{"id":"c","seq":3,"role":"user","content":"half writ');
+  const second = makeEngine({ dir });
+  second.engine.setActive(false);
+  let thread = await second.engine.thread(primary.id);
+  assert.deepEqual(thread.messages.map((message) => message.content), ['kept', 'kept too']);
+  assert.equal((await fs.readFile(log, 'utf8')).endsWith('\n'), true, 'the torn tail is cut off');
+  await second.engine.send(primary.id, { messageId: 'd', content: 'after the crash' });
+  await second.engine.stop();
+  const third = makeEngine({ dir });
+  third.engine.setActive(false);
+  thread = await third.engine.thread(primary.id);
+  assert.deepEqual(thread.messages.map((message) => message.content), ['kept', 'kept too', 'after the crash']);
+  await third.engine.stop();
+});
+
+test('a long log is folded into a new snapshot; a stray old log is removed on load', async () => {
+  const dir = path.join(testRoot, `bots-fold-${Date.now()}`);
+  const first = makeEngine({ dir });
+  first.engine.setActive(false);
+  const [primary] = (await first.engine.list()).bots;
+  await first.engine.flush();
+  const firstLog = await logOf(dir, primary.id);
+  for (let index = 0; index < TRANSCRIPT_LOG_MAX_LINES + 5; index += 1) {
+    await first.engine.send(primary.id, { messageId: `n${index}`, content: `note ${index}` });
+    await first.engine.flush();
+  }
+  const secondLog = await logOf(dir, primary.id);
+  assert.notEqual(secondLog, firstLog, 'a new snapshot names a new log');
+  const files = await fs.readdir(dir);
+  assert.equal(files.includes(firstLog), false, 'the old log is removed');
+  assert.ok((await readLines(path.join(dir, secondLog))).length < 10);
+  await first.engine.stop();
+  // A crash between a new snapshot and removing the old log leaves a stray.
+  const stray = `${primary.id}.0123456789ab.log`;
+  await fs.writeFile(path.join(dir, stray), `${JSON.stringify({ add: [{ id: 'ghost', seq: 1, role: 'user', content: 'ghost', createdAt: 0 }] })}\n`);
+  const second = makeEngine({ dir });
+  second.engine.setActive(false);
+  const newest = await second.engine.thread(primary.id, { limit: 500 });
+  const oldest = await second.engine.thread(primary.id, { limit: 500, beforeSeq: newest.messages[0].seq });
+  const all = [...oldest.messages, ...newest.messages];
+  assert.equal(all.length, TRANSCRIPT_LOG_MAX_LINES + 5);
+  assert.equal(oldest.hasMore, false);
+  assert.deepEqual([all[0].content, all.at(-1).content], ['note 0', `note ${TRANSCRIPT_LOG_MAX_LINES + 4}`]);
+  assert.equal(all.some((message) => message.content === 'ghost'), false);
+  assert.equal((await fs.readdir(dir)).includes(stray), false);
+  await second.engine.stop();
+});
+
+test('thread pages: newest, before a seq (all the way back) and after a seq (new ones)', async () => {
+  const dir = path.join(testRoot, `bots-pages-${Date.now()}`);
+  const id = await seedVersion2(dir, 2_000);
+  const { engine } = makeEngine({ dir });
+  engine.setActive(false);
+  const newest = await engine.thread(id, { limit: 40 });
+  assert.deepEqual([newest.messages[0].seq, newest.messages.at(-1).seq, newest.hasMore], [1_961, 2_000, true]);
+  const older = await engine.thread(id, { limit: 40, beforeSeq: 1_961 });
+  assert.deepEqual([older.messages[0].seq, older.messages.at(-1).seq, older.hasMore], [1_921, 1_960, true]);
+  const first = await engine.thread(id, { limit: 40, beforeSeq: 30 });
+  assert.deepEqual([first.messages[0].seq, first.messages.at(-1).seq, first.hasMore], [1, 29, false]);
+  // Nothing new since the newest page.
+  const none = await engine.thread(id, { limit: 40, afterSeq: 2_000 });
+  assert.deepEqual([none.messages.length, none.hasNewer], [0, false]);
+  for (let index = 0; index < 3; index += 1) await engine.send(id, { messageId: `x${index}`, content: `new ${index}` });
+  const fresh = await engine.thread(id, { limit: 2, afterSeq: 2_000 });
+  assert.deepEqual([fresh.messages.map((message) => message.content), fresh.hasNewer], [['new 0', 'new 1'], true]);
+  const rest = await engine.thread(id, { limit: 2, afterSeq: fresh.messages.at(-1).seq });
+  assert.deepEqual([rest.messages.map((message) => message.content), rest.hasNewer], [['new 2'], false]);
+  await engine.stop();
 });
 
 // --- run -------------------------------------------------------------------------------------

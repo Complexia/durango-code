@@ -5992,15 +5992,22 @@ ipcMain.handle('bots:projectAction', async (event, input) => {
 ipcMain.handle('bots:thread', async (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : '';
   if (!botId) return { ok: false, error: 'Missing bot id.' };
+  // A page: the newest, the one before `beforeSeq` (scrolling back) or what is new after `afterSeq` (polling).
+  const page = {
+    limit: input?.limit,
+    read: input?.read === true,
+    ...(Number.isSafeInteger(input?.beforeSeq) ? { beforeSeq: input.beforeSeq } : {}),
+    ...(Number.isSafeInteger(input?.afterSeq) ? { afterSeq: input.afterSeq } : {}),
+  };
   if (await localBotsMode()) {
     try {
-      return { ok: true, ...(await localBots.thread(botId, { limit: input?.limit, read: input?.read === true })) };
+      return { ok: true, ...(await localBots.thread(botId, page)) };
     } catch (error) {
       return localBotsIpcError(error);
     }
   }
   try {
-    return { ok: true, ...(await durangoClient.botThread(botId, { limit: input?.limit, read: input?.read === true })) };
+    return { ok: true, ...(await durangoClient.botThread(botId, page)) };
   } catch (error) {
     return durangoIpcError(error);
   }

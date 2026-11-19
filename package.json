@@ -39,6 +39,7 @@
     "test:durango-dispatch": "node --no-warnings --experimental-strip-types scripts/test-durango-dispatch.mjs",
     "test:bot-replies": "node --no-warnings scripts/test-bot-replies.mjs",
     "test:local-bots": "node --no-warnings scripts/test-local-bots.mjs",
+    "test:bot-thread-window": "node --no-warnings scripts/test-bot-thread-window.mjs",
     "test:durango-deploy-watcher": "node --no-warnings scripts/test-durango-deploy-watcher.mjs",
     "test:thread-search": "bun scripts/test-thread-search.tsx",
     "test:subagent-report": "bun scripts/test-subagent-report.ts",

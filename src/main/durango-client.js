@@ -746,10 +746,18 @@ export const createDurangoClient = ({
       const data = await request('GET', '/bots');
       return { allowed: data.allowed === true, bots: Array.isArray(data.bots) ? data.bots : [] };
     },
-    /** → `{ bot, messages, live, hasMore }`; `read` marks the bot read. */
-    async botThread(botId, { limit, read } = {}) {
+    /**
+     * → `{ bot, messages, live, hasMore, hasNewer? }`: the newest page, the page
+     * before `beforeSeq`, or the new messages after `afterSeq`. `read` marks the bot read.
+     */
+    async botThread(botId, { limit, read, beforeSeq, afterSeq } = {}) {
       return await request('GET', `/bots/${encodeURIComponent(str(botId))}/messages`, {
-        query: { limit: clampInt(limit, 1, 200, 80), ...(read ? { read: '1' } : {}) },
+        query: {
+          limit: clampInt(limit, 1, 200, 80),
+          ...(Number.isSafeInteger(beforeSeq) ? { beforeSeq: String(beforeSeq) } : {}),
+          ...(Number.isSafeInteger(afterSeq) ? { afterSeq: String(afterSeq) } : {}),
+          ...(read ? { read: '1' } : {}),
+        },
       });
     },
     /** `{ messageId, content, timeZone? }` → `{ seq }`. Never blocked by a reply in progress. */
