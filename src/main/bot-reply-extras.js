@@ -176,7 +176,7 @@ export const LOCAL_CARD_TOOLS = Object.freeze([
   {
     name: 'show_actions',
     description:
-      'Show buttons under your reply that the person can tap. Kinds: open_thread (a Durango Code thread on this computer, thread_id), open_url (a web page, url + label), reply (sends text, or the label, as the person\'s next message: quick replies). ship_change ships a Durango Source change (chg_…) through the thread that made it: give its thread_id from the task report too (the person confirms first; that thread ships it its project\'s way). open_change takes a change id and needs the person signed in. At most 6 buttons; never invent ids or URLs.',
+      'Show buttons under your reply that the person can tap. Kinds: open_thread (a Durango Code thread on this computer, thread_id), open_url (a web page, url + label), reply (sends text, or the label, as the person\'s next message: quick replies). ship_change ships a Durango Source change (chg_…) through the thread that made it: give its thread_id from the task report too (the person confirms first; that thread ships it its project\'s way). open_change takes a change id and needs the person signed in. At most 6 buttons; never invent ids or URLs. Call it after your reply\'s text: the buttons show under it, so don\'t write that text again after the call.',
     inputSchema: {
       type: 'object',
       properties: {

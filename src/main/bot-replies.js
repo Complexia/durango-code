@@ -30,6 +30,7 @@ const withRunOn = (definition) =>
       }
     : definition;
 import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles } from './bot-reply-extras.js';
+import { createReplyText } from './bot-reply-text.js';
 import {
   BOT_SESSION_RESET_TOKENS,
   contextTokensOf,
@@ -527,11 +528,11 @@ export const createClaudeLaneRunner = ({
   const blocks = []; // text blocks of the main loop's assistant messages
   let partial = ''; // the text block streaming now
   const toolCalls = new Map(); // tool_use id -> tool name (main loop)
-  const currentText = () =>
-    [...blocks, partial]
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .join('\n\n');
+  // Text before a tool call shows too: an update the reply writes again
+  // (e.g. after show_actions) shows once, from when that block is finished
+  // (bot-reply-text.js); the block streaming now shows as it comes.
+  const replyText = createReplyText();
+  const currentText = () => replyText.text(blocks, partial);
   const activeTool = () => {
     const names = [...toolCalls.values()];
     return names.length ? botToolLabel(names[names.length - 1]) : null;

@@ -25,6 +25,7 @@ import {
   normalizeBotSettings,
   saveLaneAttachments,
 } from '../src/main/bot-replies.js';
+import { blockRepeats, createReplyText, replyTextOf } from '../src/main/bot-reply-text.js';
 import { createBotThreadTools, threadReportFooter, withThreadReportFooter } from '../src/main/bot-thread-tools.js';
 import { cutMiddle, estimateTextTokens, maxPromptTokensFromEnv, planBotPrompt } from '../src/main/bot-sessions.js';
 
@@ -619,6 +620,56 @@ try {
     assert.ok(beats >= 2 && beats <= 4, `heartbeats every 150 ms (${beats} in 400 ms)`);
     assert.equal(client.calls.progress.at(-1).text, 'x'.repeat(30));
     assert.deepEqual(client.calls.finish[0], { laneId: 'lane_1', botId: 'bot_1', machineId: 'machine-1', text: 'x'.repeat(30) });
+  });
+
+  await test('an update written again after a tool call shows once; progress lines stay', async () => {
+    const report = 'Done: chg_abc12345xyz fixes the sidebar dots. The fast checks passed and the screenshot is /tmp/dots.png.';
+    const again = '**Done:** chg_abc12345xyz fixes the sidebar dots.\n\nThe fast checks passed and the screenshot is /tmp/dots.png. Tap Ship when it looks right.';
+    const live = [];
+    const sdk = createFakeSdk(async function* ({ next }) {
+      await next();
+      yield init('claude-opus-5-5');
+      yield assistant('a1', [{ type: 'text', text: 'Checking that now.' }]);
+      yield assistant('a1', [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }]);
+      yield toolResult('tu1');
+      yield assistant('a2', [{ type: 'text', text: report }]);
+      yield assistant('a2', [{ type: 'tool_use', id: 'tu2', name: 'mcp__durango_bot__show_actions', input: {} }]);
+      yield toolResult('tu2');
+      yield assistant('a3', [{ type: 'text', text: again }]);
+      yield success();
+    });
+    const outcome = await sdkRunner(sdk)(makeLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: ({ text }) => live.push(text),
+      takeInbox: async () => [],
+      callTool: async () => ({ result: { ok: true } }),
+    });
+    assert.equal(outcome.text, `Checking that now.\n\n${again}`);
+    assert.equal(live[0], 'Checking that now.', 'the progress line shows at once');
+    assert.ok(live.includes(`Checking that now.\n\n${report}`), 'the first update shows while the tool runs');
+    assert.equal(blockRepeats('Checking that now.', report), false);
+    assert.equal(replyTextOf(['Looking.', 'Found three.', '']), 'Looking.\n\nFound three.');
+  });
+
+  await test('reply text: only real repeats are left out; streaming text always shows', () => {
+    const billing = 'The billing deployment passed all required checks in staging and is ready for review.';
+    const search = 'The search deployment passed all required checks in staging and is ready for review.';
+    assert.equal(replyTextOf([billing, search]), `${billing}\n\n${search}`, 'reports about different things both stay');
+    assert.equal(
+      replyTextOf(['Build passed.', 'Tests failed.', 'Build passed. Tests failed.', 'Build passed. Release ready with no further issues.']),
+      'Tests failed.\n\nBuild passed. Tests failed.\n\nBuild passed. Release ready with no further issues.',
+      'a block is left out only for a shown block that repeats it (no chains)'
+    );
+    assert.equal(replyTextOf(['Checking that now.', 'As I said, checking that now was quick.']), 'Checking that now.\n\nAs I said, checking that now was quick.');
+    const replyText = createReplyText();
+    const blocks = ['Checking that now.', billing];
+    assert.equal(replyText.text(blocks, 'The billing deployment'), `Checking that now.\n\n${billing}\n\nThe billing deployment`, 'the block streaming now shows as it comes');
+    blocks.push(`${billing} Ship it when ready.`);
+    assert.equal(replyText.text(blocks, ''), `Checking that now.\n\n${billing} Ship it when ready.`, 'once finished, the earlier copy goes');
+    blocks.length = 0;
+    blocks.push('Fresh start.');
+    assert.equal(replyText.text(blocks, ''), 'Fresh start.', 'a cleared and refilled list is read again');
   });
 
   await test('normal run: SDK options, text assembly, model id', async () => {
