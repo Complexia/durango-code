@@ -165,7 +165,8 @@ test('a message while idle starts a reply; live progress and the stored reply', 
   assert.equal(thread.bot.status, 'running');
   assert.deepEqual(thread.bot.replies, [{ messageId: run.lane.laneId, place: LOCAL_BOT_PLACE }]);
   assert.deepEqual(thread.live, [
-    { messageId: run.lane.laneId, place: LOCAL_BOT_PLACE, content: 'Checking SF weather now.', activeTool: 'WebSearch' },
+    // It showed text, so it has its place (seq 2, after the message it answers).
+    { messageId: run.lane.laneId, seq: 2, place: LOCAL_BOT_PLACE, content: 'Checking SF weather now.', activeTool: 'WebSearch' },
   ]);
 
   run.finish({ text: 'Checking SF weather now.\n\n18°C and sunny.', modelId: 'anthropic/claude-opus-5.5' });
@@ -624,6 +625,20 @@ test('files sent to a signed-out bot are kept with the message and reach its rep
   assert.deepEqual(thread.messages[0].files, [{ name: 'brief.txt', size: 10 }]);
   runner.lanes[0].finish({ text: 'Got it.' });
   await engine.idle();
+  await engine.stop();
+});
+
+test('a message sent after a reply showed text comes below that reply, also once stored', async () => {
+  const { engine, runner } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'Look at this.' });
+  await waitFor(() => runner.lanes.length === 1);
+  runner.lanes[0].ctx.update({ text: 'Looking at the screenshot.' });
+  await engine.send(primary.id, { messageId: 'b', content: 'also the prompt box' });
+  runner.lanes[0].finish({ text: 'Looking at the screenshot. Done.' });
+  await waitFor(async () => (await engine.thread(primary.id)).messages.length === 3);
+  const thread = await engine.thread(primary.id);
+  assert.deepEqual(thread.messages.map((message) => message.content), ['Look at this.', 'Looking at the screenshot. Done.', 'also the prompt box']);
   await engine.stop();
 });
 

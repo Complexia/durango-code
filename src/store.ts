@@ -131,6 +131,8 @@ export type SidebarV3Settings = {
   view?: 'bot' | 'thread' | 'projects' | 'project';
   /** The project open in the projects window: a Durango Code project id, or `bot:<botId>` for a project bot's project not open here. */
   selectedProjectId?: string | null;
+  /** The thread open in the thread view came from this project's page (Esc goes back to it). */
+  threadFromProjectId?: string | null;
 };
 
 export const defaultSidebarV3Settings: SidebarV3Settings = { enabled: false, selectedBotId: null };
@@ -248,7 +250,8 @@ export type DurangoBotsSettings = {
 
 export const defaultDurangoBotsSettings: DurangoBotsSettings = {
   enabled: true,
-  accessMode: 'workspace-write',
+  // Always Full access (src/main/bot-replies.js normalizeBotSettings).
+  accessMode: 'full-access',
 };
 
 export type DurangoDeployWatcherSettings = {

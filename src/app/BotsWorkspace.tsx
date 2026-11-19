@@ -43,6 +43,8 @@ import { botFaceDataUrl, botFaceSeed } from './botFace';
 import { ThreadRow, type SidebarV2Actions } from './SidebarV2';
 import { compareSidebarV2Recent, sidebarV2ThreadLists, threadSidebarTone } from './threadLists';
 import { MarkdownContent } from './markdown';
+import { CopyMessageButton } from './chat';
+import { handleLightboxImageClick } from './imageLightbox';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { useSidebarResize } from './useSidebarResize';
 import {
@@ -58,6 +60,7 @@ import {
   type BotProjectNote,
   type BotProjectTarget,
   type DesktopBot,
+  type DesktopBotLive,
   type DesktopBotMessage,
   type DesktopBotThread,
   type BotAttachmentFile,
@@ -77,7 +80,42 @@ const THREAD_POLL_ACTIVE_MS = 1_200;
 const THREAD_POLL_IDLE_MS = 4_000;
 const SIDEBAR_STORAGE_KEY = 'orion.botsSidebarWidth';
 
-type Outgoing = { id: string; content: string; files?: BotAttachmentFile[]; failed?: string };
+type Outgoing = { id: string; content: string; files?: BotAttachmentFile[]; failed?: string; sent?: boolean };
+
+/** Thumbnails of images you sent, by message id, so the stored message keeps them (this session only). */
+const SENT_PREVIEWS_MAX = 40;
+const sentPreviews = new Map<string, { name: string; preview: string }[]>();
+const releasePreview = (preview: string | undefined) => {
+  if (preview?.startsWith('blob:')) URL.revokeObjectURL(preview);
+};
+const rememberSentPreviews = (messageId: string, files: BotAttachmentFile[]) => {
+  const previews = files.flatMap((file) => (file.preview ? [{ name: file.name, preview: file.preview }] : []));
+  if (!previews.length) return;
+  // A retry sends the same files: release only thumbnails it no longer has.
+  sentPreviews.get(messageId)?.forEach((item) => previews.some((next) => next.preview === item.preview) || releasePreview(item.preview));
+  sentPreviews.delete(messageId);
+  sentPreviews.set(messageId, previews);
+  while (sentPreviews.size > SENT_PREVIEWS_MAX) {
+    const [oldest] = sentPreviews.keys();
+    sentPreviews.get(oldest)?.forEach((item) => releasePreview(item.preview));
+    sentPreviews.delete(oldest);
+  }
+};
+/** A stored message's files with the thumbnails sent from here, matched by name in order. */
+const withSentPreviews = (messageId: string, files: { name: string; size?: number }[] | undefined) => {
+  const previews = sentPreviews.get(messageId);
+  if (!files?.length || !previews?.length) return files;
+  const left = [...previews];
+  return files.map((file) => {
+    const index = left.findIndex((item) => item.name === file.name);
+    if (index < 0) return file;
+    const [match] = left.splice(index, 1);
+    return { ...file, preview: match.preview };
+  });
+};
+/** What Copy puts on the clipboard: the text, then the names of the files sent with it. */
+const copyText = (content: string, files?: { name: string }[]) =>
+  [content.trim(), files?.length ? `Attached: ${files.map((file) => file.name).join(', ')}` : ''].filter(Boolean).join('\n\n');
 
 // The last data the Bots view showed, kept while the app runs: switching to
 // the Code tab unmounts the view, and coming back shows this at once while a
@@ -287,20 +325,28 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   }, [bots, projectKeys, projects, threadsByProject]);
 
   const openBot = (botId: string) => setSidebarV3Settings({ selectedBotId: botId, view: 'bot' });
-  // A thread opened from a project page shows in a modal over it.
-  const [threadModal, setThreadModal] = useState(false);
-  const openThreadModal = (threadId: string) => {
+  // A thread opened from a project page shows in the usual thread view (the
+  // same as Sidebar v2's: its header, theme, subagents and prompt box). Esc
+  // goes back to the project, when no menu of the thread view is open.
+  const threadFromProjectId = v3?.threadFromProjectId ?? null;
+  const openProjectThread = (threadId: string) => {
     threadActions.selectThread(threadId);
-    setThreadModal(true);
+    setSidebarV3Settings({ view: 'thread', threadFromProjectId: selectedProjectId });
   };
-  const newThreadInModal = (projectId: string) => {
+  const newProjectThread = (projectId: string) => {
     onNewThread(projectId);
-    setThreadModal(true);
+    setSidebarV3Settings({ view: 'thread', threadFromProjectId: projectId });
   };
-  const closeThreadModal = useCallback(() => setThreadModal(false), []);
   useEffect(() => {
-    if (view !== 'project') setThreadModal(false);
-  }, [view]);
+    if (view !== 'thread' || !threadFromProjectId) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      if (document.querySelector(THREAD_VIEW_OPEN_MENUS)) return;
+      setSidebarV3Settings({ view: 'project', selectedProjectId: threadFromProjectId, threadFromProjectId: null });
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [view, threadFromProjectId, setSidebarV3Settings]);
   const openProjects = () => setSidebarV3Settings({ view: 'projects' });
   const openProject = (projectId: string) => setSidebarV3Settings({ view: 'project', selectedProjectId: projectId });
   // From a project bot's header: its project's page.
@@ -405,8 +451,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               entry={selectedEntry}
               onBack={openProjects}
               onOpenBot={openBot}
-              onNewThread={newThreadInModal}
-              onOpenThread={openThreadModal}
+              onNewThread={newProjectThread}
+              onOpenThread={openProjectThread}
               onBotAdded={botAdded}
               threadActions={threadActions}
               attentionThreadIds={attentionThreadIds}
@@ -423,11 +469,6 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             </div>
           )}
         </div>
-      )}
-      {threadModal && view === 'project' && ready && (
-        <ThreadModal projectName={selectedEntry?.name ?? 'Project'} onClose={closeThreadModal}>
-          {threadPanel}
-        </ThreadModal>
       )}
     </>
   );
@@ -957,11 +998,9 @@ const ProjectThreadRow: React.FC<{
 };
 
 /**
- * A thread opened from a project page: the usual thread view (App's agents
- * panel, with its subagents, prompt box and pickers) in a large modal. Esc
- * (when no menu of the thread view is open), ✕ or a click outside closes it.
+ * Open menus and pickers of the thread view (App.tsx): Esc closes them before
+ * going back from a thread to the project it was opened from.
  */
-// Open menus and pickers of the thread view (App.tsx): Esc closes them before the modal.
 const THREAD_VIEW_OPEN_MENUS = [
   '[role="menu"]',
   '[role="listbox"]',
@@ -974,51 +1013,6 @@ const THREAD_VIEW_OPEN_MENUS = [
   '[class*="composer-menu"]',
 ].join(', ');
 
-const ThreadModal: React.FC<{ projectName: string; onClose: () => void; children: React.ReactNode }> = ({ projectName, onClose, children }) => {
-  const panelRef = useRef<HTMLDivElement | null>(null);
-  const thread = useOrionStore((state) => state.threads.find((item) => item.id === state.selectedThreadId) ?? null);
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || event.defaultPrevented) return;
-      const panel = panelRef.current;
-      // A picker or menu of the thread view is open: Esc closes that first.
-      if (panel?.querySelector(THREAD_VIEW_OPEN_MENUS)) return;
-      onClose();
-    };
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [onClose]);
-  return (
-    <div
-      className="bots-thread-modal fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-7 backdrop-blur-[3px]"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-      role="dialog"
-      aria-modal="true"
-      aria-label="Thread"
-    >
-      <div ref={panelRef} className="bots-thread-modal-panel relative flex h-full max-h-[1000px] w-full max-w-[1280px] flex-col overflow-hidden rounded-2xl bg-[#111113] shadow-[0_30px_120px_rgba(0,0,0,0.6)] ring-1 ring-white/[0.1]">
-        <div className="flex h-12 shrink-0 items-center gap-2 border-b border-white/[0.06] pl-5 pr-2.5">
-          <span className="shrink-0 text-[14px] text-neutral-500">{projectName}</span>
-          <span className="text-neutral-600">/</span>
-          <span className="min-w-0 truncate text-[15px] font-semibold text-neutral-100">{thread?.title || 'New thread'}</span>
-          {thread?.status === 'running' && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" aria-label="Working" />}
-          <button
-            type="button"
-            onClick={onClose}
-            title="Close (Esc)"
-            aria-label="Close"
-            className="ml-auto grid h-8 w-8 shrink-0 place-items-center rounded-lg text-neutral-400 hover:bg-white/[0.08] hover:text-neutral-100"
-          >
-            <X size={16} />
-          </button>
-        </div>
-        <div className="flex min-h-0 flex-1">{children}</div>
-      </div>
-    </div>
-  );
-};
 
 const ProjectGlyph: React.FC<{ size?: 'sm' | 'md' }> = ({ size = 'sm' }) => (
   <span
@@ -1111,6 +1105,7 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
       const content = text.trim();
       if (!content && !files.length) return;
       stick.current = true;
+      rememberSentPreviews(id, files);
       setOutgoing((current) => [...current.filter((message) => message.id !== id), { id, content, ...(files.length ? { files } : {}) }]);
       let timeZone: string | undefined;
       try {
@@ -1122,13 +1117,16 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
         botId,
         messageId: id,
         content,
-        ...(files.length ? { files } : {}),
+        // Paths only: thumbnails stay in this window.
+        ...(files.length ? { files: files.map(({ path, name, size }) => ({ path, name, size })) } : {}),
         ...(timeZone ? { timeZone } : {}),
       });
       if (!result?.ok) {
         setOutgoing((current) => current.map((message) => (message.id === id ? { ...message, failed: result?.error ?? 'Couldn’t send.' } : message)));
         return;
       }
+      // Stored: it stops saying "Sending…" now, before the thread reloads.
+      setOutgoing((current) => current.map((message) => (message.id === id ? { ...message, sent: true } : message)));
       void load();
       onChanged();
     },
@@ -1150,6 +1148,28 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
   }
   const { bot } = thread;
   const live = thread.live.filter((reply) => !stored.has(reply.messageId));
+  // A reply that has shown text has its place: messages sent after that go below it, here and once stored.
+  const placed = live.filter((reply): reply is DesktopBotLive & { seq: number } => typeof reply.seq === 'number');
+  const unplaced = live.filter((reply) => typeof reply.seq !== 'number');
+  const timeline: ({ kind: 'message'; seq: number; message: DesktopBotMessage } | { kind: 'live'; seq: number; reply: DesktopBotLive })[] = [
+    ...thread.messages.map((message) => ({ kind: 'message' as const, seq: message.seq, message })),
+    ...placed.map((reply) => ({ kind: 'live' as const, seq: reply.seq, reply })),
+  ].sort((a, b) => a.seq - b.seq);
+  const starting = !bot.paused && live.length === 0 && (working || pending.some((message) => message.sent));
+  const liveRow = (reply: DesktopBotLive) => (
+    <AssistantRow key={`live-${reply.messageId}`} bot={bot}>
+      {reply.content ? <MarkdownContent content={reply.content} /> : null}
+      <div className="mt-1 flex items-center gap-1.5 text-[11.5px] text-neutral-500">
+        <Loader2 size={11} className="animate-spin" />
+        {reply.activeTool ? `Using ${reply.activeTool}` : reply.content ? 'Writing…' : 'Thinking…'}
+        {reply.place === LOCAL_BOT_PLACE ? (
+          <span className="text-neutral-600">· on {THIS_DEVICE}</span>
+        ) : reply.place !== 'cloud' ? (
+          <span className="text-neutral-600">· on your machine</span>
+        ) : null}
+      </div>
+    </AssistantRow>
+  );
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-white/[0.06] px-4">
@@ -1189,9 +1209,7 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
               Text {bot.name} like a person: send as many messages as you like.
             </div>
           )}
-          {thread.messages.map((message) => (
-            <BotMessage key={message.id} bot={bot} message={message} />
-          ))}
+          {timeline.map((row) => (row.kind === 'message' ? <BotMessage key={row.message.id} bot={bot} message={row.message} /> : liveRow(row.reply)))}
           {pending.map((message) => (
             <PersonBubble
               key={message.id}
@@ -1202,27 +1220,15 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
                   <button type="button" className="text-red-400 hover:underline" onClick={() => void send(message.content, message.files ?? [], message.id)}>
                     {message.failed} Retry
                   </button>
-                ) : (
-                  'Sending…'
+                ) : message.sent ? null : (
+                  // Shown only if sending takes a moment (fades in after ~1 s).
+                  <span className="bot-sending">Sending…</span>
                 )
               }
             />
           ))}
-          {live.map((reply) => (
-            <AssistantRow key={`live-${reply.messageId}`} bot={bot}>
-              {reply.content ? <MarkdownContent content={reply.content} /> : null}
-              <div className="mt-1 flex items-center gap-1.5 text-[11.5px] text-neutral-500">
-                <Loader2 size={11} className="animate-spin" />
-                {reply.activeTool ? `Using ${reply.activeTool}` : reply.content ? 'Writing…' : 'Thinking…'}
-                {reply.place === LOCAL_BOT_PLACE ? (
-                  <span className="text-neutral-600">· on {THIS_DEVICE}</span>
-                ) : reply.place !== 'cloud' ? (
-                  <span className="text-neutral-600">· on your machine</span>
-                ) : null}
-              </div>
-            </AssistantRow>
-          ))}
-          {working && live.length === 0 && (
+          {unplaced.map(liveRow)}
+          {starting && (
             <AssistantRow bot={bot}>
               <div className="flex items-center gap-1.5 text-[11.5px] text-neutral-500">
                 <Loader2 size={11} className="animate-spin" /> Starting…
@@ -1975,13 +1981,31 @@ const ProjectLibrary: React.FC<{
   );
 };
 
-const PersonBubble: React.FC<{ content: string; files?: { name: string; size?: number }[]; meta?: React.ReactNode }> = ({ content, files, meta }) => {
+type BubbleFile = { name: string; size?: number; preview?: string };
+
+const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: React.ReactNode; copyable?: boolean }> = ({ content, files, meta, copyable = true }) => {
   const answer = /^> \*\*Answering:\*\* (.+)\n\n([\s\S]+)$/.exec(content);
+  const images = files?.filter((file) => file.preview) ?? [];
+  const others = files?.filter((file) => !file.preview) ?? [];
   return (
     <div className="flex flex-col items-end gap-1">
-      {files && files.length > 0 && (
+      {images.length > 0 && (
         <div className="flex max-w-[85%] flex-wrap justify-end gap-1.5">
-          {files.map((file, index) => (
+          {images.map((file, index) => (
+            <img
+              key={`${file.name}-${index}`}
+              src={file.preview}
+              alt={file.name}
+              title={file.name}
+              onClick={handleLightboxImageClick}
+              className="max-h-[180px] max-w-[260px] cursor-zoom-in rounded-xl object-cover ring-1 ring-white/[0.08]"
+            />
+          ))}
+        </div>
+      )}
+      {others.length > 0 && (
+        <div className="flex max-w-[85%] flex-wrap justify-end gap-1.5">
+          {others.map((file, index) => (
             <span key={`${file.name}-${index}`} className="inline-flex max-w-[260px] items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[12px] text-neutral-300 ring-1 ring-white/[0.08]">
               <Paperclip size={12} className="shrink-0 text-neutral-500" />
               <span className="truncate">{file.name}</span>
@@ -1991,26 +2015,36 @@ const PersonBubble: React.FC<{ content: string; files?: { name: string; size?: n
         </div>
       )}
       {content.trim() !== '' && (
-      <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-white/[0.08] px-3.5 py-2 text-[13.5px] leading-relaxed text-neutral-100">
-        {answer ? (
-          <>
-            <span className="mb-1 block border-l-2 border-sky-400/50 pl-2 text-[12px] text-neutral-400">{answer[1]}</span>
-            {answer[2]}
-          </>
-        ) : (
-          content
-        )}
-      </div>
+        <div className="bot-msg user relative max-w-[85%]">
+          <div className="whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-white/[0.08] px-3.5 py-2 text-[13.5px] leading-relaxed text-neutral-100">
+            {answer ? (
+              <>
+                <span className="mb-1 block border-l-2 border-sky-400/50 pl-2 text-[12px] text-neutral-400">{answer[1]}</span>
+                {answer[2]}
+              </>
+            ) : (
+              content
+            )}
+          </div>
+          {copyable && <CopyMessageButton text={copyText(content, files)} />}
+        </div>
       )}
       {meta && <span className="pr-1 text-[11px] text-neutral-500">{meta}</span>}
     </div>
   );
 };
 
-const AssistantRow: React.FC<{ bot: DesktopBot; children: React.ReactNode }> = ({ bot, children }) => (
-  <div className="flex items-start gap-2.5">
+const AssistantRow: React.FC<{ bot: DesktopBot; children: React.ReactNode; copy?: string }> = ({ bot, children, copy }) => (
+  <div className={`flex items-start gap-2.5${copy ? ' bot-msg agent' : ''}`}>
     <BotAvatar bot={bot} />
-    <div className="min-w-0 flex-1 text-[13.5px] leading-relaxed text-neutral-200">{children}</div>
+    <div className="min-w-0 flex-1 text-[13.5px] leading-relaxed text-neutral-200">
+      {children}
+      {copy && (
+        <div className="bot-msg-actions">
+          <CopyMessageButton text={copy} />
+        </div>
+      )}
+    </div>
   </div>
 );
 
@@ -2020,14 +2054,14 @@ const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = Re
   if (message.role === 'assistant') {
     const via = message.authorLabel?.startsWith('via ') ? message.authorLabel : null;
     return (
-      <AssistantRow bot={bot}>
+      <AssistantRow bot={bot} copy={message.content}>
         <MarkdownContent content={message.content} />
         {via && <div className="mt-1 text-[11px] text-neutral-600">{via}</div>}
       </AssistantRow>
     );
   }
   const source = botInboxSource(message.authorLabel);
-  if (source === 'person') return <PersonBubble content={message.content} files={message.files} />;
+  if (source === 'person') return <PersonBubble content={message.content} files={withSentPreviews(message.id, message.files)} />;
   const Icon = INBOX_ICON[source];
   return (
     <div className="mx-auto w-full max-w-[92%] rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-[12.5px]">
@@ -2045,15 +2079,20 @@ const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = Re
 const BOT_ATTACHMENTS_MAX = 10;
 
 /** A file from the clipboard or a drop with no path on disk: saved to a temp file first (bots:saveAttachment). */
+const PREVIEW_TYPES = /^image\/(png|jpeg|gif|webp)$/;
+
 const fileToAttachment = async (file: File): Promise<BotAttachmentFile | null> => {
   const filePath = window.orion?.getPathForFile?.(file) ?? '';
-  if (filePath) return { path: filePath, name: file.name || 'file', size: file.size };
+  // A blob: URL thumbnail, released when the file is removed (or its sent message is forgotten).
+  const withPreview = (attachment: BotAttachmentFile): BotAttachmentFile =>
+    PREVIEW_TYPES.test(file.type) ? { ...attachment, preview: URL.createObjectURL(file) } : attachment;
+  if (filePath) return withPreview({ path: filePath, name: file.name || 'file', size: file.size });
   const buffer = new Uint8Array(await file.arrayBuffer());
   let binary = '';
   for (let index = 0; index < buffer.length; index += 0x8000) binary += String.fromCharCode(...buffer.subarray(index, index + 0x8000));
   const extension = file.type.startsWith('image/') ? `.${file.type.slice('image/'.length).replace('jpeg', 'jpg').replace(/[^a-z0-9]/g, '')}` : '';
   const result = await window.orion?.saveBotAttachment?.({ name: file.name || `pasted${extension}`, data: btoa(binary) });
-  return result?.ok && result.file ? result.file : null;
+  return result?.ok && result.file ? withPreview(result.file) : null;
 };
 
 /** Always open: messages queue while the bot works, like texting a person. Files attach by button, paste or drop. */
@@ -2069,14 +2108,25 @@ const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: s
     element.style.height = '0px';
     element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
   }, [text]);
+  // Thumbnails still in the box when it goes away are released (sent ones belong to their message).
+  const filesRef = useRef(files);
+  filesRef.current = files;
+  useEffect(() => () => filesRef.current.forEach((file) => releasePreview(file.preview)), []);
   const add = (next: BotAttachmentFile[]) => {
     setAttachError(null);
-    setFiles((current) => {
-      const merged = [...current];
-      for (const file of next) if (!merged.some((item) => item.path === file.path)) merged.push(file);
-      if (merged.length > BOT_ATTACHMENTS_MAX) setAttachError(`Up to ${BOT_ATTACHMENTS_MAX} files per message.`);
-      return merged.slice(0, BOT_ATTACHMENTS_MAX);
-    });
+    const merged = [...filesRef.current];
+    for (const file of next) {
+      if (merged.some((item) => item.path === file.path) || merged.length >= BOT_ATTACHMENTS_MAX) releasePreview(file.preview);
+      else merged.push(file);
+    }
+    if (filesRef.current.length + next.length > BOT_ATTACHMENTS_MAX) setAttachError(`Up to ${BOT_ATTACHMENTS_MAX} files per message.`);
+    filesRef.current = merged;
+    setFiles(merged);
+  };
+  const remove = (file: BotAttachmentFile) => {
+    releasePreview(file.preview);
+    filesRef.current = filesRef.current.filter((item) => item.path !== file.path);
+    setFiles(filesRef.current);
   };
   const addFiles = async (list: FileList | File[]) => {
     const picked = await Promise.all([...list].map((file) => fileToAttachment(file).catch(() => null)));
@@ -2098,6 +2148,7 @@ const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: s
     if (!text.trim() && !files.length) return;
     onSend(text, files);
     setText('');
+    filesRef.current = [];
     setFiles([]);
     setAttachError(null);
     ref.current?.focus();
@@ -2126,8 +2177,21 @@ const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: s
           }}
         >
           {files.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1.5 pt-0.5">
-              {files.map((file) => (
+            <div className="mb-1.5 flex flex-wrap items-end gap-1.5 pt-0.5">
+              {files.map((file) =>
+                file.preview ? (
+                  <span key={file.path} className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-lg ring-1 ring-white/[0.1]" title={`${file.name} · ${formatFileSize(file.size)}`}>
+                    <img src={file.preview} alt={file.name} onClick={handleLightboxImageClick} className="h-full w-full cursor-zoom-in object-cover" />
+                    <button
+                      type="button"
+                      aria-label={`Remove ${file.name}`}
+                      onClick={() => remove(file)}
+                      className="absolute right-1 top-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-neutral-200 opacity-0 transition-opacity hover:bg-black/90 focus-visible:opacity-100 group-hover:opacity-100"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
+                ) : (
                 <span key={file.path} className="inline-flex max-w-[240px] items-center gap-1.5 rounded-lg bg-white/[0.06] py-1 pl-2.5 pr-1 text-[12px] text-neutral-200 ring-1 ring-white/[0.08]">
                   <Paperclip size={12} className="shrink-0 text-neutral-500" />
                   <span className="truncate">{file.name}</span>
@@ -2135,13 +2199,14 @@ const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: s
                   <button
                     type="button"
                     aria-label={`Remove ${file.name}`}
-                    onClick={() => setFiles((current) => current.filter((item) => item.path !== file.path))}
+                    onClick={() => remove(file)}
                     className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 hover:bg-white/[0.08] hover:text-neutral-200"
                   >
                     <X size={11} />
                   </button>
                 </span>
-              ))}
+                )
+              )}
             </div>
           )}
           <div className="flex items-end gap-2">

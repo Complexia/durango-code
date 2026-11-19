@@ -52,9 +52,22 @@ export type DesktopBotMessage = {
 };
 
 /** A file attached to a message being written: a path on this computer. */
-export type BotAttachmentFile = { path: string; name: string; size: number };
+export type BotAttachmentFile = {
+  path: string;
+  name: string;
+  size: number;
+  /** Images only: a data: or blob: URL for the thumbnail (never sent to the main process). */
+  preview?: string;
+};
 
-export type DesktopBotLive = { messageId: string; place: string; content: string; activeTool: string | null };
+export type DesktopBotLive = {
+  messageId: string;
+  place: string;
+  content: string;
+  activeTool: string | null;
+  /** Its place in the thread, taken when it first shows text (null before): later messages go below it. */
+  seq?: number | null;
+};
 
 export type DesktopBotThread = {
   bot: DesktopBot;

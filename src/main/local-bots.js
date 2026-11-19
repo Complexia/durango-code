@@ -1050,6 +1050,13 @@ export const createLocalBotEngine = ({
         update: ({ text, activeTool } = {}) => {
           if (reply.abort.signal.aborted) return;
           if (typeof text === 'string') reply.text = text;
+          // The reply takes its place in the thread when it first shows text:
+          // what the person sends after that comes below it.
+          if (reply.seq === undefined && reply.text.trim()) {
+            reply.seq = entry.bot.nextSeq;
+            entry.bot.nextSeq += 1;
+            persistBot(entry, { messages: false });
+          }
           reply.activeTool = activeTool || null;
           changed();
         },
@@ -1079,9 +1086,12 @@ export const createLocalBotEngine = ({
     const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : '');
     if (content) {
       const { bot } = entry;
-      const message = { id: reply.id, seq: bot.nextSeq, role: 'assistant', content, authorLabel: null, createdAt: now() };
-      bot.nextSeq += 1;
-      entry.messages.push(message);
+      const message = { id: reply.id, seq: reply.seq ?? bot.nextSeq, role: 'assistant', content, authorLabel: null, createdAt: now() };
+      if (reply.seq === undefined) bot.nextSeq += 1;
+      // In thread order: a reply placed early stays above what came after it.
+      const at = entry.messages.findIndex((existing) => existing.seq > message.seq);
+      if (at === -1) entry.messages.push(message);
+      else entry.messages.splice(at, 0, message);
       trimMessages(entry);
       bot.lastActivityAt = message.createdAt;
       bot.lastPreview = lastPreview(content);
@@ -1788,6 +1798,7 @@ export const createLocalBotEngine = ({
         live: runtime
           ? [...runtime.replies.values()].map((reply) => ({
               messageId: reply.id,
+              seq: reply.seq ?? null,
               place: LOCAL_BOT_PLACE,
               content: reply.text,
               activeTool: reply.activeTool,

@@ -80,7 +80,6 @@ import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThre
 import { DurangoError, accountKeyOf, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
 import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
 import {
-  capThreadAccessMode,
   createDispatchWorker,
   dispatchSourceLabel,
   dispatchSourceUrl,
@@ -4710,8 +4709,8 @@ const startBotProjectThread = (prefix) => ({ projectId, prompt, key, botName, ti
 // so a bot never widens what a thread may do (a Read only thread stays Read
 // only), as for follow-ups dispatched from Durango Chat.
 const startBotThreadFollowUp = (prefix) => async ({ threadId, prompt, key, botName, accessMode }) => {
-  const thread = await readThreadById(threadId).catch(() => null);
-  const turnAccessMode = capThreadAccessMode(thread?.accessMode, accessMode);
+  // Bots work with Full access, in their follow-ups too (bot-replies.js normalizeBotSettings).
+  const turnAccessMode = accessMode;
   return requestDispatchRendererCommand({
     kind: 'runTurn',
     threadId,
@@ -6010,6 +6009,8 @@ ipcMain.handle('bots:thread', async (_event, input) => {
 // Files the person attaches to a bot message: picked, dropped (their paths) or
 // pasted (saved to a temp file first, bots:saveAttachment). Regular files only.
 const BOT_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const BOT_ATTACHMENT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024;
+
 const botAttachmentFiles = async (files) => {
   const out = [];
   for (const file of (Array.isArray(files) ? files : []).slice(0, 10)) {
@@ -6029,7 +6030,20 @@ ipcMain.handle('bots:pickAttachments', async (event) => {
   const picked = await dialog.showOpenDialog(window, { title: 'Attach files', properties: ['openFile', 'multiSelections'] });
   if (picked.canceled) return { ok: true, files: [] };
   try {
-    return { ok: true, files: (await botAttachmentFiles(picked.filePaths.map((filePath) => ({ path: filePath })))).map(({ path: filePath, name, size }) => ({ path: filePath, name, size })) };
+    const files = await botAttachmentFiles(picked.filePaths.map((filePath) => ({ path: filePath })));
+    // Images come with a small data URL so the prompt box can show a thumbnail.
+    return {
+      ok: true,
+      files: await Promise.all(
+        files.map(async ({ path: filePath, name, size, contentType }) => {
+          const preview =
+            /^image\/(png|jpeg|gif|webp)$/.test(contentType) && size <= BOT_ATTACHMENT_PREVIEW_MAX_BYTES
+              ? `data:${contentType};base64,${(await fs.readFile(filePath)).toString('base64')}`
+              : undefined;
+          return { path: filePath, name, size, ...(preview ? { preview } : {}) };
+        })
+      ),
+    };
   } catch (error) {
     return { ok: false, error: error?.message ?? String(error) };
   }
@@ -6072,14 +6086,14 @@ ipcMain.handle('bots:send', async (_event, input) => {
     // Pinned to the account signed in now (uploads and the message alike).
     const account = await durangoAccountKey();
     if (!account) return { ok: false, error: 'Sign in to Durango first.' };
-    const assets = [];
-    for (const file of files) {
-      const uploaded = await durangoClient.uploadBotAttachment({ name: file.name, bytes: await fs.readFile(file.path), contentType: file.contentType, account });
-      if (uploaded?.part) assets.push(uploaded.part);
-    }
+    // Uploads in parallel (and the device id alongside): sending waits only for the slowest file.
+    const [uploads, machineId] = await Promise.all([
+      Promise.all(files.map(async (file) => durangoClient.uploadBotAttachment({ name: file.name, bytes: await fs.readFile(file.path), contentType: file.contentType, account }))),
+      // Sent from this machine: its replies run here first (unless the bot has its own order).
+      getDurangoDeviceId().catch(() => null),
+    ]);
+    const assets = uploads.map((uploaded) => uploaded?.part).filter(Boolean);
     const timeZone = typeof input?.timeZone === 'string' ? input.timeZone.slice(0, 64) : undefined;
-    // Sent from this machine: its replies run here first (unless the bot has its own order).
-    const machineId = await getDurangoDeviceId().catch(() => null);
     return {
       ok: true,
       ...(await durangoClient.sendBotMessage(

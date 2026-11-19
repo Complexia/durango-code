@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DurangoError } from './durango-client.js';
-import { DISPATCH_ACCESS_MODES } from './durango-dispatch.js';
 import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
 
@@ -30,14 +29,17 @@ import { zodShapeForInputSchema } from './json-schema-zod.js';
 // tools that would ask are declined (the bot's own tools are always allowed).
 
 export const BOT_REPLIES_CAPABILITY = 'bot-replies';
-export const BOT_DEFAULT_ACCESS_MODE = 'workspace-write';
+// Bots always work with Full access: nobody is there to approve their
+// commands, and their threads run on their own (the person's decision,
+// 2026-11-19). A saved older choice (Workspace write) no longer applies.
+export const BOT_DEFAULT_ACCESS_MODE = 'full-access';
 
-/** Settings → Durango for bots: `{ enabled }` (on unless turned off) and their `accessMode`. */
+/** Settings → Durango for bots: `{ enabled }` (on unless turned off); `accessMode` is always Full access. */
 export const normalizeBotSettings = (raw) => {
   const value = raw && typeof raw === 'object' ? raw : {};
   return {
     enabled: value.enabled !== false,
-    accessMode: DISPATCH_ACCESS_MODES.includes(value.accessMode) ? value.accessMode : BOT_DEFAULT_ACCESS_MODE,
+    accessMode: BOT_DEFAULT_ACCESS_MODE,
   };
 };
 export const BOT_MAX_LANES = 3;

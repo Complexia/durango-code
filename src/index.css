@@ -3400,6 +3400,41 @@ body {
   right: -34px;
 }
 
+/* Durango bots (Sidebar v3): the same Copy button as threads, on hover. */
+.bot-msg {
+  position: relative;
+}
+
+.bot-msg:hover .message-copy-btn {
+  opacity: 1;
+}
+
+.bot-msg.user .message-copy-btn {
+  left: -34px;
+}
+
+.bot-msg-actions {
+  height: 26px;
+  margin-top: 2px;
+  margin-bottom: -12px;
+}
+
+.bot-msg-actions .message-copy-btn {
+  position: static;
+}
+
+/* "Sending…" only appears if sending takes a moment. */
+.bot-sending {
+  opacity: 0;
+  animation: bot-sending-in 200ms ease-out 1s forwards;
+}
+
+@keyframes bot-sending-in {
+  to {
+    opacity: 1;
+  }
+}
+
 @keyframes message-in {
   from {
     opacity: 0;

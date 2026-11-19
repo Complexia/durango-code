@@ -654,7 +654,7 @@ try {
     assert.deepEqual(options.additionalDirectories, ['/Users/me/projects/durango'], 'the projects are reachable');
     assert.equal(options.cwd, path.join(testRoot, 'bots', 'bot_1'));
     assert.ok((await fs.stat(options.cwd)).isDirectory(), 'per-bot directory created');
-    assert.equal(options.permissionMode, 'acceptEdits', 'workspace-write → acceptEdits, as agent threads');
+    assert.equal(options.permissionMode, 'bypassPermissions', 'bot replies always run with Full access');
     assert.equal(options.pathToClaudeCodeExecutable, '/opt/claude');
     assert.deepEqual(options.env, { TEST_ENV: '1' });
     assert.deepEqual(options.mcpServers, {}, 'no tools → no bot server');
@@ -672,10 +672,10 @@ try {
     assert.ok(botProjectsNote({ projects: [], accessMode: 'read-only', threads: 'local' }).includes('None are open'));
   });
 
-  await test('bot settings: on by default with Workspace write, separate from the dispatch opt-in', async () => {
-    assert.deepEqual(normalizeBotSettings(undefined), { enabled: true, accessMode: 'workspace-write' });
+  await test('bot settings: on by default, always Full access (a saved older choice no longer applies)', async () => {
+    assert.deepEqual(normalizeBotSettings(undefined), { enabled: true, accessMode: 'full-access' });
     assert.deepEqual(normalizeBotSettings({ enabled: false, accessMode: 'full-access' }), { enabled: false, accessMode: 'full-access' });
-    assert.deepEqual(normalizeBotSettings({ accessMode: 'bogus' }), { enabled: true, accessMode: 'workspace-write' });
+    assert.deepEqual(normalizeBotSettings({ accessMode: 'workspace-write' }), { enabled: true, accessMode: 'full-access' });
   });
 
   await test('the claim carries this machine\'s presence: name, allowed projects, Claude models', async () => {
@@ -753,7 +753,7 @@ try {
     }, 'the tool call id makes a retried create return the same task');
     assert.equal(started[0].projectId, 'p1');
     assert.equal(started[0].key, 'task_1', 'the renderer reports it as bottask:<taskId>');
-    assert.equal(started[0].accessMode, 'workspace-write');
+    assert.equal(started[0].accessMode, 'full-access', 'threads a bot starts run with Full access');
     assert.match(started[0].prompt, /^Fix the OpenCode updater spinner\.\n\nWhen you're done, end with a concise report/);
     assert.equal(results.named.ok, true, 'run_on naming this machine');
     assert.equal(results.missingHere.ok, false);
@@ -794,9 +794,9 @@ try {
     assert.deepEqual(reads, [{ thread_id: 'bbb333' }]);
   });
 
-  await test('access modes map like agent threads', async () => {
+  await test('every bot reply runs with Full access, whatever was saved before', async () => {
     for (const [accessMode, expected] of [
-      ['read-only', { permissionMode: 'plan' }],
+      ['read-only', { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }],
       ['full-access', { permissionMode: 'bypassPermissions', allowDangerouslySkipPermissions: true }],
     ]) {
       const sdk = createFakeSdk(async function* ({ next }) {
@@ -851,7 +851,7 @@ try {
     assert.equal(definition.description, 'Search the web');
     assert.ok(definition.shape.q, 'JSON Schema → zod shape');
     assert.equal(definition.extras.alwaysLoad, true);
-    assert.deepEqual(options.allowedTools, ['mcp__durango_bot__web_search'], 'pre-approved outside Full access');
+    assert.equal(options.allowedTools, undefined, 'Full access: nothing to pre-approve');
     assert.equal((await options.canUseTool('mcp__durango_bot__web_search', { q: 'x' })).behavior, 'allow');
     const call = client.calls.tool[0];
     assert.equal(call.laneId, 'lane_1');
