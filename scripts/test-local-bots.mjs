@@ -625,6 +625,57 @@ test('delegate_task with a project starts a Durango Code thread; its outcome is 
   runner.lanes[2].finish({ text: 'Found it.' });
   await engine.idle();
   assert.deepEqual(await engine.threadSettled({ key: 'gone:lt_x', outcome: 'failed' }), { ok: false });
+
+  // The thread resumes by itself (say, a background check it waited on ended):
+  // that turn's report reaches the bot too, as a later one.
+  await engine.threadSettled({ key: started[0].key, threadId: 'thread_9', outcome: 'finished', summary: 'Fixed the secret; signups work.' });
+  await waitFor(() => runner.lanes.length === 4, { label: 'reply to the later report' });
+  assert.match(runner.lanes[3].lane.prompt, /\[Task: Debug signups\]:\nA later report from the thread, after its earlier one:\n\nFixed the secret; signups work\./);
+  runner.lanes[3].finish({ text: 'Fixed.' });
+  await engine.idle();
+});
+
+test('local bots: a thread whose turn ends while it still waits says so, and reports again when it finishes', async () => {
+  const started = [];
+  const { engine, runner } = makeEngine({
+    listProjects: async () => [{ id: 'proj_1', name: 'Durango', path: '/Users/me/durango' }],
+    startProjectThread: async (input) => {
+      started.push(input);
+      return { ok: true, threadId: 'thread_7' };
+    },
+  });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'Release the app.' });
+  await waitFor(() => runner.lanes.length === 1);
+  const result = await runner.lanes[0].ctx
+    .callTool({ name: 'delegate_task', input: { title: 'Release', instructions: 'Release it.', project: 'Durango' }, toolCallId: 't' })
+    .then((out) => out.result);
+  assert.equal(result.ok, true);
+  runner.lanes[0].finish({ text: 'On it.' });
+  await waitFor(() => runner.running().length === 0);
+
+  await engine.threadSettled({
+    key: started[0].key,
+    threadId: 'thread_7',
+    outcome: 'finished',
+    summary: 'Watching the notarization.',
+    waiting: ['background command: bun run deploy'],
+  });
+  await waitFor(() => runner.lanes.length === 2, { label: 'reply to the waiting report' });
+  const prompt = runner.lanes[1].lane.prompt;
+  assert.match(prompt, /\[Task: Release\]:\nNOT FINISHED YET: the thread ended its turn but still has work pending: background command: bun run deploy\. When that ends it resumes by itself and reports again/);
+  assert.match(prompt, /What it said so far:\n\nWatching the notarization\./);
+  assert.match(prompt, /Threads that reported but aren't finished \(still working in the background; each reports again when it is\): "Release" \(lt[^,]+, thread thread_7\)/);
+  assert.doesNotMatch(prompt, /Your tasks still running/, 'a waiting thread holds no task slot');
+  runner.lanes[1].finish({ text: 'Still releasing.' });
+  await waitFor(() => runner.running().length === 0);
+
+  await engine.threadSettled({ key: started[0].key, threadId: 'thread_7', outcome: 'finished', summary: 'Released 1.0.217.' });
+  await waitFor(() => runner.lanes.length === 3, { label: 'reply to the final report' });
+  assert.match(runner.lanes[2].lane.prompt, /\[Task: Release\]:\nA later report from the thread, after its earlier one:\n\nReleased 1\.0\.217\./);
+  assert.doesNotMatch(runner.lanes[2].lane.prompt, /Threads that reported but aren't finished/);
+  runner.lanes[2].finish({ text: 'Released.' });
+  await engine.idle();
 });
 
 test('project bots: one per project, notes and files in their instructions and in threads they start', async () => {

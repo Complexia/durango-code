@@ -4838,7 +4838,9 @@ const botReplyWorker = createBotReplyWorker({
 // keeps the outcome unreported and tries again later.
 // The report ends with the thread's id (and this machine), so the bot can
 // follow up there with message_thread, e.g. to ship the change it made.
-const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error }) => {
+// `waiting` / `seq`: see durango:dispatchSettled (a turn that ended with the
+// thread still waiting, and the sequence number of a later report).
+const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error, waiting, seq }) => {
   const machineId = await getDurangoDeviceId().catch(() => null);
   if (!machineId || !taskId) return { ok: false, retry: true };
   if (threadId) {
@@ -4851,7 +4853,15 @@ const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error }
   for (const delay of [0, 2_000, 10_000, 30_000]) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try {
-      return await durangoClient.reportBotTask({ taskId, machineId, outcome, ...(summary ? { summary } : {}), ...(error ? { error } : {}) });
+      return await durangoClient.reportBotTask({
+        taskId,
+        machineId,
+        outcome,
+        ...(summary ? { summary } : {}),
+        ...(error ? { error } : {}),
+        ...(waiting?.length ? { waiting } : {}),
+        ...(seq ? { seq } : {}),
+      });
     } catch (failure) {
       console.warn('[durango bots] reporting a bot task failed:', failure?.message ?? failure);
       // Durango answered (not a network or sign-in problem): retrying won't help.
@@ -5113,6 +5123,14 @@ const withReportRefs = async (input) => {
 };
 
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
+// `waiting`: the turn ended but the thread still waits on background work (or
+// on the person), so it isn't done. `seq`: the report's sequence number (two
+// per agent run, odd while waiting); each later report of the dispatch has a higher one.
+const dispatchWaiting = (input) =>
+  input?.outcome === 'finished' && Array.isArray(input?.waiting)
+    ? input.waiting.filter((item) => typeof item === 'string' && item.trim()).map((item) => item.trim().slice(0, 200)).slice(0, 6)
+    : [];
+const dispatchSeq = (input) => (Number.isSafeInteger(input?.seq) && input.seq > 0 ? input.seq : undefined);
 ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
   typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(BOT_TASK_DISPATCH_PREFIX)
     ? reportBotTaskThread({
@@ -5121,6 +5139,8 @@ ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
         outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
         summary: await withReportRefs(input),
         error: typeof input?.error === 'string' ? input.error : undefined,
+        waiting: dispatchWaiting(input),
+        seq: dispatchSeq(input),
       })
     : typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(LOCAL_BOT_DISPATCH_PREFIX)
     ? localBots.threadSettled({
@@ -5129,6 +5149,7 @@ ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
         outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
         summary: await withReportRefs(input),
         error: typeof input?.error === 'string' ? input.error : undefined,
+        waiting: dispatchWaiting(input),
       })
     : dispatchWorker.settle({
     dispatchId: typeof input?.dispatchId === 'string' ? input.dispatchId : '',
@@ -5136,6 +5157,8 @@ ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
     outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
     summary: typeof input?.summary === 'string' ? input.summary : undefined,
     error: typeof input?.error === 'string' ? input.error : undefined,
+    waiting: dispatchWaiting(input),
+    seq: dispatchSeq(input),
   })
 );
 

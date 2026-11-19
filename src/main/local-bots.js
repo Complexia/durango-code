@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoModelIdForClaude } from './bot-replies.js';
-import { BOT_BRIEF_RULE, BOT_SETTLE_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, withThreadReportFooter } from './bot-thread-tools.js';
+import { BOT_BRIEF_RULE, BOT_SETTLE_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, threadReportText, withThreadReportFooter } from './bot-thread-tools.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -84,6 +84,7 @@ Stay responsive:
 Routines and reports:
 - A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
+- A task report that starts "NOT FINISHED YET" (or says the task isn't finished yet) is an update, not the outcome: the thread is still working in the background and reports again when it finishes. Tell the person briefly where it stands if it matters, don't report it as done, and don't start the work again.
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
 
 Show, don't point: your thread renders rich replies, so use them.
@@ -666,7 +667,8 @@ export const createLocalBotEngine = ({
   const runtimeFor = (botId) => {
     let runtime = runtimes.get(botId);
     if (!runtime) {
-      runtime = { replies: new Map(), tasks: new Map(), threads: new Map(), pendingChecks: 0 };
+      // reportedThreads: threads that already reported (key → task), for the reports of turns they resume by themselves.
+      runtime = { replies: new Map(), tasks: new Map(), threads: new Map(), reportedThreads: new Map(), pendingChecks: 0 };
       runtimes.set(botId, runtime);
     }
     return runtime;
@@ -1143,6 +1145,15 @@ export const createLocalBotEngine = ({
             (task) =>
               `"${task.title}" (${task.id}${task.project ? `, a Durango Code thread in ${task.project}` : ''}, started ${ago(task.startedAt, at)})`
           )
+          .join('; ')}.`,
+      });
+    }
+    const waitingThreads = [...runtime.reportedThreads.values()].filter((task) => task.waiting);
+    if (waitingThreads.length) {
+      lines.push({
+        steady: true,
+        text: `Threads that reported but aren't finished (still working in the background; each reports again when it is): ${waitingThreads
+          .map((task) => `"${task.title}" (${task.id}${task.threadId ? `, thread ${task.threadId}` : ''})`)
           .join('; ')}.`,
       });
     }
@@ -2158,24 +2169,41 @@ export const createLocalBotEngine = ({
       return { seq: message.seq };
     },
     /**
-     * A Durango Code thread a bot started in a project (startProjectThread) ended:
-     * its report goes to the bot's inbox. `key` is the one it was started with.
+     * A Durango Code thread a bot started in a project (startProjectThread)
+     * ended its turn: its report goes to the bot's inbox. `key` is the one it
+     * was started with. `waiting`: the turn ended but the thread still waits
+     * on background work, so it isn't done; it reports again (same key) for
+     * each turn it later resumes by itself.
      */
-    async threadSettled({ key, threadId, outcome, summary, error } = {}) {
+    async threadSettled({ key, threadId, outcome, summary, error, waiting } = {}) {
       await ensureLoaded();
       const [botId] = str(key).split(':');
       const entry = entries.get(botId);
       if (!entry) return { ok: false };
       const runtime = runtimeFor(botId);
-      const task = runtime.threads.get(str(key));
+      const running = runtime.threads.get(str(key));
+      const task = running ?? runtime.reportedThreads.get(str(key));
       runtime.threads.delete(str(key));
       const title = task?.title ?? 'Durango Code thread';
       const where = task?.project ? `the Durango Code thread in ${task.project}` : 'the Durango Code thread';
       // Which thread it was, so the bot can follow up there (e.g. to ship the change).
       const thread = { threadId: str(threadId).trim() || task?.threadId || '', project: task?.project ?? null };
+      const stillWaiting = outcome === 'finished' && Array.isArray(waiting) && waiting.length > 0;
+      // Kept so a later report (a turn the thread resumes by itself) still has
+      // its title, and so the bot's status lists it while it waits.
+      runtime.reportedThreads.delete(str(key));
+      if (task) runtime.reportedThreads.set(str(key), { ...task, waiting: stillWaiting });
+      while (runtime.reportedThreads.size > 50) runtime.reportedThreads.delete(runtime.reportedThreads.keys().next().value);
       const report =
         outcome === 'finished'
-          ? withThreadReportFooter(str(summary).trim() || 'The thread finished without a written summary.', thread)
+          ? withThreadReportFooter(
+              threadReportText({
+                summary: str(summary).trim() || 'The thread finished without a written summary.',
+                waiting: stillWaiting ? waiting : [],
+                later: !running && Boolean(task),
+              }),
+              thread
+            )
           : withThreadReportFooter(`The task couldn't finish (${where}): ${clip(oneLine(error) || 'the thread stopped.', 300)}`, thread);
       appendInbox(entry, { content: report, authorLabel: inboxLabel('task', title) });
       return { ok: true };

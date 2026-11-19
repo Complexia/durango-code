@@ -32,7 +32,7 @@ import {
 } from '../src/main/durango-dispatch.js';
 import { checkoutFolderName, chooseCheckoutDir, cliSupportsClone, createSourceCheckout, sourceCheckoutRoot } from '../src/main/source-checkout.js';
 import { linuxPasswordStore } from '../src/main/linux-password-store-policy.js';
-import { durangoDispatchOutcome, dispatchSummaryText } from '../src/app/durangoDispatch.ts';
+import { durangoDispatchHasNewRuns, durangoDispatchOutcome, dispatchSummaryText, startDurangoDispatchReporter } from '../src/app/durangoDispatch.ts';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-durango-dispatch-'));
 
@@ -928,6 +928,29 @@ try {
     assert.deepEqual(reports('disp_old')[0], { status: 'failed', codeThreadId: 't9', error: 'Durango Code quit before the agent finished.', machineId: 'device-uuid-1' });
   });
 
+  await test('settle: a waiting turn and each later report of the same dispatch go out with their sequence numbers', async () => {
+    server.always('POST', '/api/v1/code/dispatches/disp_bg', () => ({ json: { ok: true } }));
+    const { worker } = makeWorker();
+    await worker.settle({ dispatchId: 'disp_bg', threadId: 't3', outcome: 'finished', summary: 'Watching.', waiting: ['background command: deploy'], seq: 1 });
+    await worker.settle({ dispatchId: 'disp_bg', threadId: 't3', outcome: 'finished', summary: 'Deployed.', seq: 4 });
+    assert.deepEqual(reports('disp_bg'), [
+      { status: 'finished', codeThreadId: 't3', summary: 'Watching.', waiting: ['background command: deploy'], reportSeq: 1, machineId: 'device-uuid-1' },
+      { status: 'finished', codeThreadId: 't3', summary: 'Deployed.', reportSeq: 4, machineId: 'device-uuid-1' },
+    ]);
+  });
+
+  await test('settle: Durango unreachable through every retry → retry later; a 4xx is final', async () => {
+    server.always('POST', '/api/v1/code/dispatches/disp_down', () => ({ status: 503, json: durangoErrorBody('Down.', 'dispatch_unavailable') }));
+    server.always('POST', '/api/v1/code/dispatches/disp_gone', () => ({ status: 404, json: durangoErrorBody('Dispatch not found.', 'dispatch_not_found') }));
+    const { worker } = makeWorker();
+    const down = await worker.settle({ dispatchId: 'disp_down', threadId: 't4', outcome: 'finished', summary: 'Done.', seq: 2 });
+    assert.equal(down.ok, false);
+    assert.equal(down.retry, true);
+    const gone = await worker.settle({ dispatchId: 'disp_gone', threadId: 't5', outcome: 'finished', summary: 'Done.', seq: 2 });
+    assert.equal(gone.ok, false);
+    assert.equal(gone.retry, undefined);
+  });
+
   await test('suspend pauses polling; resume restarts it', async () => {
     server.always('POST', '/api/v1/code/machines', () => ({ json: { ok: true } }));
     server.always('POST', '/api/v1/code/dispatches/claim', async () => {
@@ -983,8 +1006,8 @@ try {
     const run = (fields) => ({ id: 'm', role: 'agent', kind: 'agent-run', content: '', ts: 'x', ...fields });
     assert.equal(outcomeOf({ status: 'running', messages: [run({ status: 'running' })], durangoDispatch: dispatch }), null);
     assert.equal(outcomeOf({ status: 'idle', messages: [], durangoDispatch: dispatch }), null, 'not started yet');
-    assert.deepEqual(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'Fixed it.' })], durangoDispatch: dispatch }), { outcome: 'finished', summary: 'Fixed it.' });
-    assert.deepEqual(outcomeOf({ status: 'error', messages: [run({ status: 'error', error: 'claude exited with code 1.' })], durangoDispatch: dispatch }), { outcome: 'failed', error: 'claude exited with code 1.' });
+    assert.deepEqual(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'Fixed it.' })], durangoDispatch: dispatch }), { outcome: 'finished', summary: 'Fixed it.', seq: 2 });
+    assert.deepEqual(outcomeOf({ status: 'error', messages: [run({ status: 'error', error: 'claude exited with code 1.' })], durangoDispatch: dispatch }), { outcome: 'failed', error: 'claude exited with code 1.', seq: 2 });
     assert.match(outcomeOf({ status: 'idle', messages: [run({ status: 'stopped' })], durangoDispatch: dispatch }).error, /Stopped in Durango Code/);
     assert.match(outcomeOf({ status: 'idle', messages: [run({ status: 'stopped', statusText: 'Interrupted by app restart.' })], durangoDispatch: dispatch }).error, /quit before/);
     assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done' })], durangoDispatch: { ...dispatch, reportedAt: 'x' } }), null, 'reported once');
@@ -993,12 +1016,202 @@ try {
     assert.equal(outcomeOf({ status: 'idle', messages: [run({ status: 'done', content: 'Old.' })], durangoDispatch: followUp }), null, 'its run has not started');
     assert.deepEqual(
       outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'Old.' }), run({ status: 'done', content: 'Tests added.' })], durangoDispatch: followUp }),
-      { outcome: 'finished', summary: 'Tests added.' }
+      { outcome: 'finished', summary: 'Tests added.', seq: 4 }
     );
+    assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done' })], durangoDispatch: { ...dispatch, reportedAt: 'x', reportedSeq: 2 } }), null, 'reported');
     const summary = dispatchSummaryText('a'.repeat(100) + 'THE END', 20);
     assert.equal(summary.length, 20);
     assert.ok(summary.startsWith('…') && summary.endsWith('THE END'), 'keeps the conclusion at the end');
   });
+  await test('renderer outcome: the turns a thread resumes by itself report, the latest run is the report', () => {
+    const dispatch = { id: 'd1', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' };
+    const run = (fields) => ({ id: `m${Math.random()}`, role: 'agent', kind: 'agent-run', content: '', ts: 'x', ...fields });
+    const shells = (status = 'pending') => ({
+      id: 'card', role: 'system', kind: 'claude-background-intervention', content: 'Left running in the background: watch', ts: 'x',
+      claudeBackgroundIntervention: { runId: 'r', tasks: ['watch the change for a new commit'], status },
+    });
+    // The case that went silent: every turn waited on a background command (the
+    // thread stayed Working), and the report named the first turn's words.
+    const waitedThrough = [
+      run({ status: 'done', content: "I'm waiting for the amend." }),
+      run({ status: 'done', content: 'Landed; releasing.', continuation: true }),
+      run({ status: 'done', content: 'Released 1.0.217 on every platform.', continuation: true }),
+    ];
+    assert.equal(outcomeOf({ status: 'running', messages: waitedThrough, durangoDispatch: dispatch }), null, 'still Working');
+    assert.deepEqual(outcomeOf({ status: 'done', messages: waitedThrough, durangoDispatch: dispatch }), {
+      outcome: 'finished',
+      summary: 'Released 1.0.217 on every platform.',
+      seq: 6,
+    });
+    // A turn that ended with a background command it did not wait on: a waiting report (odd seq).
+    const early = [run({ status: 'done', content: 'Watching for the amend.' }), shells()];
+    assert.deepEqual(outcomeOf({ status: 'done', messages: early, durangoDispatch: dispatch }), {
+      outcome: 'finished',
+      summary: 'Watching for the amend.',
+      waiting: ['background command: watch the change for a new commit'],
+      seq: 1,
+    });
+    assert.deepEqual(outcomeOf({ status: 'done', messages: [early[0], shells('stopping')], durangoDispatch: dispatch }).waiting, ['background command: watch the change for a new commit'], 'still stopping');
+    // Waiting on the person (request_user_action) is waiting too.
+    assert.deepEqual(
+      outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'Sign in, please.' })], userActions: [{ id: 'ua_1', action: 'Finish  the npm login', requestedAt: 'x' }], durangoDispatch: dispatch }).waiting,
+      ['the person: Finish the npm login']
+    );
+    const reportedWaiting = { ...dispatch, reportedAt: 'x', reportedSeq: 1 };
+    assert.equal(outcomeOf({ status: 'done', messages: early, durangoDispatch: reportedWaiting }), null, 'that wait was reported');
+    // The wait ended (the command finished, was stopped, or the app quit) with no turn after it: reported once more.
+    for (const status of ['settled', 'stopped']) {
+      const ended = outcomeOf({ status: 'done', messages: [early[0], shells(status)], durangoDispatch: reportedWaiting });
+      assert.equal(ended.outcome, 'finished');
+      assert.equal(ended.waitEnded, true);
+      assert.equal(ended.seq, 2);
+      assert.match(ended.summary, /^The background work it was waiting on has ended .* Its last words:\n\nWatching for the amend\.$/s);
+    }
+    const longEnd = outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'x'.repeat(5_000) + 'THE END' }), shells('settled')], durangoDispatch: reportedWaiting });
+    assert.ok(longEnd.summary.startsWith('The background work') && longEnd.summary.endsWith('THE END') && longEnd.summary.length <= 2_000, 'clips the words, not the note');
+    // ...or the thread resumed by itself, and that turn reports when it settles.
+    const resumed = [early[0], shells('settled'), run({ status: 'running', continuation: true })];
+    assert.equal(outcomeOf({ status: 'running', messages: resumed, durangoDispatch: reportedWaiting }), null, 'resumed turn still running');
+    resumed[2] = { ...resumed[2], status: 'done', content: 'Landed all three.' };
+    assert.deepEqual(outcomeOf({ status: 'done', messages: resumed, durangoDispatch: reportedWaiting }), { outcome: 'finished', summary: 'Landed all three.', seq: 4 });
+    assert.equal(outcomeOf({ status: 'done', messages: resumed, durangoDispatch: { ...reportedWaiting, reportedSeq: 4 } }), null, 'that turn already reported');
+    resumed[2] = { ...resumed[2], status: 'error', error: 'claude exited with code 1.' };
+    assert.deepEqual(outcomeOf({ status: 'error', messages: resumed, durangoDispatch: reportedWaiting }), { outcome: 'failed', error: 'claude exited with code 1.', seq: 4 });
+    // A steer splits one run in two: the second half (continuation) is the outcome.
+    const steered = [run({ status: 'done', content: 'Halfway.', statusText: 'Steered' }), { id: 's', role: 'user', content: 'also do X', ts: 'x', steer: true }, run({ status: 'stopped', continuation: true })];
+    assert.match(outcomeOf({ status: 'idle', messages: steered, durangoDispatch: dispatch }).error, /Stopped in Durango Code/);
+    // A turn the person sent ends the dispatch's chain: theirs isn't reported.
+    const personTurn = [run({ status: 'done', content: 'Done.' }), run({ status: 'done', content: 'Their own question.' }), run({ status: 'done', content: 'More of theirs.', continuation: true })];
+    assert.equal(outcomeOf({ status: 'done', messages: personTurn, durangoDispatch: { ...dispatch, reportedAt: 'x', reportedSeq: 2 } }), null);
+    // Reported by an older build (no reportedSeq): never again.
+    assert.equal(outcomeOf({ status: 'done', messages: waitedThrough, durangoDispatch: { ...dispatch, reportedAt: 'x' } }), null);
+    // The cheap shell check agrees.
+    assert.equal(durangoDispatchHasNewRuns(dispatch, 0), true);
+    assert.equal(durangoDispatchHasNewRuns({ ...dispatch, reportedAt: 'x' }, 9), false);
+    assert.equal(durangoDispatchHasNewRuns({ ...dispatch, reportedAt: 'x', reportedSeq: 2 }, 1), false);
+    assert.equal(durangoDispatchHasNewRuns({ ...dispatch, reportedAt: 'x', reportedSeq: 2 }, 2), true);
+    assert.equal(durangoDispatchHasNewRuns(reportedWaiting, 1), true, 'a reported wait can end without a new run');
+  });
+  // A small store and clock for the reporter (App.tsx mounts it on the real store).
+  const reporterWorld = ({ settle }) => {
+    let state = { threads: [], transcripts: {} };
+    const listeners = new Set();
+    let clock = 0;
+    const timers = [];
+    const sent = [];
+    const set = (patch) => {
+      const previous = state;
+      state = { ...state, ...patch };
+      for (const listener of [...listeners]) listener(state, previous);
+    };
+    const thread = (id, fields) => ({ id, status: 'done', summary: { agentRunCount: 0 }, ...fields });
+    const putThread = (next) => set({ threads: [...state.threads.filter((t) => t.id !== next.id), next] });
+    const stop = startDurangoDispatchReporter({
+      getState: () => state,
+      subscribe: (listener) => (listeners.add(listener), () => listeners.delete(listener)),
+      ensureTranscript: async () => null,
+      settle: (input) => {
+        sent.push(input);
+        return settle(input);
+      },
+      markReported: (threadId, dispatchId, reported) => {
+        const current = state.threads.find((t) => t.id === threadId);
+        if (current?.durangoDispatch?.id === dispatchId) putThread({ ...current, durangoDispatch: { ...current.durangoDispatch, ...reported } });
+      },
+      setTimer: (callback, ms) => {
+        const timer = { at: clock + ms, callback };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => timers.splice(timers.indexOf(timer), 1),
+      now: () => clock,
+    });
+    const tick = async (ms) => {
+      clock += ms;
+      for (const timer of timers.filter((t) => t.at <= clock)) {
+        timers.splice(timers.indexOf(timer), 1);
+        timer.callback();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+    return { get state() { return state; }, set, thread, putThread, sent, tick, stop };
+  };
+  const agentRun = (fields) => ({ id: `m${Math.random()}`, role: 'agent', kind: 'agent-run', content: '', ts: 'x', ...fields });
+  const card = (status) => ({
+    id: 'card', role: 'system', kind: 'claude-background-intervention', content: '', ts: 'x',
+    claudeBackgroundIntervention: { runId: 'r', tasks: ['watch'], status },
+  });
+
+  await test('reporter: a turn that settles while the previous report is in flight is still reported', async () => {
+    let release;
+    const world = reporterWorld({ settle: () => new Promise((resolve) => (release = resolve)) });
+    const dispatch = { id: 'localbot:b:t', sourceUrl: null, startedAt: 'x' };
+    const first = agentRun({ status: 'done', content: 'Watching.' });
+    world.set({ transcripts: { t1: { messages: [first, card('pending')] } } });
+    world.putThread(world.thread('t1', { durangoDispatch: dispatch, summary: { agentRunCount: 1 } }));
+    assert.equal(world.sent.length, 1);
+    assert.deepEqual(world.sent[0].waiting, ['background command: watch']);
+    // The thread resumes and finishes before the first report is acknowledged.
+    world.set({ transcripts: { t1: { messages: [first, card('settled'), agentRun({ status: 'done', content: 'Released.', continuation: true })] } } });
+    world.putThread(world.thread('t1', { durangoDispatch: dispatch, summary: { agentRunCount: 2 } }));
+    assert.equal(world.sent.length, 1, 'one report at a time');
+    release({ ok: true });
+    await world.tick(0);
+    await world.tick(0);
+    assert.equal(world.sent.length, 2);
+    assert.equal(world.sent[1].summary, 'Released.');
+    assert.equal(world.sent[1].seq, 4);
+    world.stop();
+  });
+
+  await test('reporter: an undelivered report is tried again, and only marked once delivered', async () => {
+    const answers = [{ ok: false, retry: true }, { ok: true }];
+    const world = reporterWorld({ settle: async () => answers.shift() });
+    const dispatch = { id: 'disp_1', sourceUrl: null, startedAt: 'x' };
+    world.set({ transcripts: { t1: { messages: [agentRun({ status: 'done', content: 'Done.' })] } } });
+    world.putThread(world.thread('t1', { durangoDispatch: dispatch, summary: { agentRunCount: 1 } }));
+    await world.tick(0);
+    assert.equal(world.sent.length, 1);
+    assert.equal(world.state.threads[0].durangoDispatch.reportedAt, undefined, 'not marked while undelivered');
+    await world.tick(60_000);
+    await world.tick(0);
+    assert.equal(world.sent.length, 2);
+    assert.equal(world.state.threads[0].durangoDispatch.reportedSeq, 2);
+    world.stop();
+  });
+
+  await test('reporter: a wait that ends with no turn after it reports after a grace period; a resumed turn does not', async () => {
+    const world = reporterWorld({ settle: async () => ({ ok: true }) });
+    const dispatch = { id: 'bottask:x', sourceUrl: null, startedAt: 'x', reportedAt: 'x', reportedSeq: 1 };
+    const first = agentRun({ status: 'done', content: 'Watching.' });
+    world.set({ transcripts: { t1: { messages: [first, card('pending')] } } });
+    world.putThread(world.thread('t1', { durangoDispatch: dispatch, summary: { agentRunCount: 1 } }));
+    assert.equal(world.sent.length, 0, 'still waiting');
+    // The card settles (only the transcript changes): not yet.
+    world.set({ transcripts: { t1: { messages: [first, card('settled')] } } });
+    assert.equal(world.sent.length, 0, 'grace period');
+    // A resumed turn shows up within the grace period: no "wait ended" report.
+    world.set({ transcripts: { t1: { messages: [first, card('settled'), agentRun({ status: 'running', continuation: true })] } } });
+    world.putThread(world.thread('t1', { status: 'running', durangoDispatch: dispatch, summary: { agentRunCount: 2 } }));
+    await world.tick(10_000);
+    assert.equal(world.sent.length, 0);
+    world.stop();
+
+    // No turn follows: reported once the grace period is over.
+    const quiet = reporterWorld({ settle: async () => ({ ok: true }) });
+    quiet.set({ transcripts: { t1: { messages: [first, card('settled')] } } });
+    quiet.putThread(quiet.thread('t1', { durangoDispatch: dispatch, summary: { agentRunCount: 1 } }));
+    assert.equal(quiet.sent.length, 0);
+    await quiet.tick(5_100);
+    await quiet.tick(0);
+    assert.equal(quiet.sent.length, 1);
+    assert.equal(quiet.sent[0].seq, 2);
+    assert.equal(quiet.sent[0].waitEnded, undefined, 'not sent to main');
+    assert.match(quiet.sent[0].summary, /^The background work it was waiting on has ended/);
+    assert.equal(quiet.state.threads[0].durangoDispatch.reportedSeq, 2);
+    quiet.stop();
+  });
+
 } finally {
   await server.close();
   await fs.rm(testRoot, { recursive: true, force: true });

@@ -175,7 +175,7 @@ import {
   remoteThreadRuntime,
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
-import { dispatchProjectsPayload, durangoDispatchOutcome } from './app/durangoDispatch';
+import { dispatchProjectsPayload, startDurangoDispatchReporter } from './app/durangoDispatch';
 import { threadStartedByBot } from './app/botSettle';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
@@ -1108,6 +1108,9 @@ const App: React.FC = () => {
   const threadMenuRef = useRef<HTMLDivElement>(null);
   const goalMenuRef = useRef<HTMLDivElement>(null);
   const runOutputMessages = useRef(new Map<string, { threadId: string; messageId: string }>());
+  // Threads whose next turn starts from a queued answer to the agent's own
+  // request: that turn's run continues the agent's work (Message.continuation).
+  const continuationTurnsRef = useRef(new Set<string>());
   // `/btw` side-question runs, routed to a thread's btwExchanges instead of
   // its transcript. Kept separate from runOutputMessages so aside runs never
   // touch thread status, queued-message dispatch, or the active-run map.
@@ -1924,9 +1927,11 @@ const App: React.FC = () => {
         }
         if (accepted || cancelled()) return;
         pinThreadToBottom(targetId);
+        // The answer continues the agent's work: a bot that started the
+        // thread hears how the turn it starts ends.
         queueMessageToThread(
           targetId,
-          attachments.length > 0 ? { text: replyText, attachments } : { text }
+          attachments.length > 0 ? { text: replyText, attachments, continuation: true } : { text, continuation: true }
         );
       });
     },
@@ -4546,6 +4551,7 @@ const App: React.FC = () => {
             kind: 'agent-run',
             status: 'running',
             statusText: 'Continuing background work.',
+            continuation: true,
             command: event.command,
             startedAt: new Date().toISOString(),
             activities: [],
@@ -5933,6 +5939,8 @@ const App: React.FC = () => {
         startedAt: new Date().toISOString(),
         activities: [],
         modelId: model.id,
+        // A queued answer to the agent's own request (continuationTurnsRef).
+        ...(continuationTurnsRef.current.has(threadId) ? { continuation: true } : {}),
       });
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
@@ -6961,12 +6969,15 @@ const App: React.FC = () => {
         window.setTimeout(() => setQueueRetryTick((tick) => tick + 1), QUEUE_RETRY_DELAY_MS);
         toast.error(`Could not send the queued message in "${current.title}": ${error}`);
       };
-      void startTurnForThread(thread.id, next.text, next.attachments ?? []).then(
-        (result) => {
-          if (!result.ok) putBack(result.error ?? 'the agent turn could not start');
-        },
-        (error) => putBack(error instanceof Error ? error.message : String(error))
-      );
+      if (next.continuation) continuationTurnsRef.current.add(thread.id);
+      void startTurnForThread(thread.id, next.text, next.attachments ?? [])
+        .then(
+          (result) => {
+            if (!result.ok) putBack(result.error ?? 'the agent turn could not start');
+          },
+          (error) => putBack(error instanceof Error ? error.message : String(error))
+        )
+        .finally(() => continuationTurnsRef.current.delete(thread.id));
     }
   }, [threads, activeRunsByThread, removeQueuedThreadMessage, startTurnForThread, updateThread, queueRetryTick]);
 
@@ -8062,6 +8073,8 @@ const App: React.FC = () => {
         status: 'running',
         statusText: "I'm working on this now.",
         startedAt: new Date().toISOString(),
+        // The rest of the same run, after the steer.
+        continuation: true,
         activities: carriedActivities.map((activity) => ({ ...activity, contentOffset: 0 })),
         ...(splitMessage.command ? { command: splitMessage.command } : {}),
         ...(splitMessage.modelId ? { modelId: splitMessage.modelId } : {}),
@@ -9257,84 +9270,20 @@ const App: React.FC = () => {
     []
   );
 
-  // Durango Chat dispatch: report each dispatched thread's outcome back to the
-  // chat once its run settles (finished → summary, error/stop → failed). Runs
-  // off the persisted thread state, so a run interrupted by a restart is
-  // still reported (as failed) on the next launch.
+  // Durango Chat dispatch and bots: report each dispatched thread's outcome
+  // back to whoever started it (app/durangoDispatchReporter.ts).
   useEffect(() => {
-    if (!window.orion?.durangoDispatchSettled) return undefined;
-    const inFlight = new Set<string>();
-    const loading = new Set<string>();
-    // Shells already looked at with no outcome (or an unreadable
-    // transcript). An outcome can only appear when the shell changes (its
-    // status or summary), so each shell version is examined — and its
-    // transcript loaded — at most once.
-    const examined = new WeakSet<Thread>();
-    const check = (threads: Thread[]) => {
-      const { transcripts } = useOrionStore.getState();
-      for (const thread of threads) {
-        const dispatch = thread.durangoDispatch;
-        if (!dispatch || dispatch.reportedAt || inFlight.has(dispatch.id)) continue;
-        if (thread.status === 'running' || examined.has(thread)) continue;
-        // No dispatched run yet, and no start failure to report.
-        if (thread.summary.agentRunCount <= (dispatch.runOffset ?? 0) && thread.status !== 'error') {
-          examined.add(thread);
-          continue;
-        }
-        const transcript = transcripts[thread.id];
-        if (!transcript) {
-          // The outcome is in the transcript: load it, then look again.
-          if (loading.has(thread.id)) continue;
-          loading.add(thread.id);
-          void ensureThreadTranscript(thread.id)
-            .catch((error) => {
-              console.warn('Could not load a dispatched thread to report its outcome', error);
-              examined.add(thread);
-              return null;
-            })
-            .finally(() => {
-              loading.delete(thread.id);
-              check(useOrionStore.getState().threads);
-            });
-          continue;
-        }
-        const outcome = durangoDispatchOutcome(thread, transcript.messages);
-        if (!outcome) {
-          examined.add(thread);
-          continue;
-        }
-        inFlight.add(dispatch.id);
-        // A bot task's outcome counts as reported only once Durango has it:
-        // offline through every retry, it is tried again later (and on the
-        // next launch) instead of leaving the task "running" for good.
-        const botTask = dispatch.id.startsWith('bottask:');
-        if (!botTask) updateThread(thread.id, { durangoDispatch: { ...dispatch, reportedAt: new Date().toISOString() } });
-        const settled = window.orion?.durangoDispatchSettled?.({
-          dispatchId: dispatch.id,
-          threadId: thread.id,
-          ...(/^(bottask|localbot):/.test(dispatch.id) && thread.durangoWorkspace?.path ? { workspacePath: thread.durangoWorkspace.path } : {}),
-          ...outcome,
-        });
-        void Promise.resolve(settled)
-          .then(
-            (result) => (result as { retry?: boolean } | undefined)?.retry !== true,
-            () => false
-          )
-          .then((delivered) => {
-            inFlight.delete(dispatch.id);
-            if (!botTask) return;
-            if (delivered) {
-              const current = useOrionStore.getState().threads.find((candidate) => candidate.id === thread.id)?.durangoDispatch;
-              if (current?.id === dispatch.id) updateThread(thread.id, { durangoDispatch: { ...current, reportedAt: new Date().toISOString() } });
-              return;
-            }
-            window.setTimeout(() => check(useOrionStore.getState().threads), 60_000);
-          });
-      }
-    };
-    check(useOrionStore.getState().threads);
-    return useOrionStore.subscribe((state, previous) => {
-      if (state.threads !== previous.threads) check(state.threads);
+    const settle = window.orion?.durangoDispatchSettled;
+    if (!settle) return undefined;
+    return startDurangoDispatchReporter({
+      getState: () => useOrionStore.getState(),
+      subscribe: (listener) => useOrionStore.subscribe(listener),
+      ensureTranscript: (threadId) => ensureThreadTranscript(threadId),
+      settle: (input) => settle(input),
+      markReported: (threadId, dispatchId, reported) => {
+        const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.durangoDispatch;
+        if (current?.id === dispatchId) updateThread(threadId, { durangoDispatch: { ...current, ...reported } });
+      },
     });
   }, [updateThread]);
 

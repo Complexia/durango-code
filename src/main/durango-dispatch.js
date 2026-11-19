@@ -476,7 +476,7 @@ export const createDispatchWorker = ({
 
   const machineIdForReports = async () => (await getMachineId().catch(() => null)) ?? undefined;
 
-  /** One report; resolves to 'ok' | 'conflict' (cancelled/settled elsewhere) | 'failed'. */
+  /** One report; resolves to 'ok' | 'conflict' (cancelled/settled elsewhere) | 'failed' | 'retry' (Durango unreachable or 5xx through every retry). */
   const sendReport = async (dispatchId, body, { retries = [] } = {}) => {
     const machineId = await machineIdForReports();
     for (let attempt = 0; ; attempt += 1) {
@@ -491,7 +491,8 @@ export const createDispatchWorker = ({
         }
         if (attempt >= retries.length) {
           log(`report ${body.status} for ${dispatchId} failed:`, error?.message ?? error);
-          return 'failed';
+          // Durango answered (a 4xx won't change on retry), or it couldn't be reached.
+          return error instanceof DurangoError && error.status && error.status < 500 ? 'failed' : 'retry';
         }
         await sleep(retries[attempt]);
       }
@@ -883,9 +884,12 @@ export const createDispatchWorker = ({
     /**
      * The renderer saw a dispatched thread settle. `outcome`: finished |
      * failed. Also accepted for dispatches this process no longer tracks
-     * (app restarted mid-run).
+     * (app restarted mid-run), and again for each turn the thread later
+     * resumes by itself or the end of its wait (`seq`, the report's sequence
+     * number, grows). `{ retry: true }`: not delivered (offline); try again later.
+     * `waiting`: the turn ended but the thread still waits on these.
      */
-    async settle({ dispatchId, threadId, outcome, summary, error }) {
+    async settle({ dispatchId, threadId, outcome, summary, error, waiting, seq }) {
       if (!dispatchId || cancelled.has(dispatchId)) return { ok: true, skipped: true };
       const entry = running.get(dispatchId) ?? {
         dispatch: { id: dispatchId, project: {} },
@@ -903,14 +907,17 @@ export const createDispatchWorker = ({
               status: 'finished',
               ...(threadId || entry.threadId ? { codeThreadId: threadId || entry.threadId } : {}),
               summary: truncateText(summary, DISPATCH_SUMMARY_MAX_CHARS) || 'The agent finished.',
+              ...(Array.isArray(waiting) && waiting.length ? { waiting } : {}),
+              ...(seq ? { reportSeq: seq } : {}),
             }
           : {
               status: 'failed',
               ...(threadId || entry.threadId ? { codeThreadId: threadId || entry.threadId } : {}),
               error: truncateText(error, DISPATCH_ERROR_MAX_CHARS) || 'The agent stopped with an error.',
+              ...(seq ? { reportSeq: seq } : {}),
             };
       const result = await queueReport(entry, body, { retries: reportRetryDelaysMs });
-      return { ok: result !== 'failed', result };
+      return { ok: result !== 'failed' && result !== 'retry', result, ...(result === 'retry' ? { retry: true } : {}) };
     },
     /** Quit: stop polling and heartbeats (in-flight runs die with the app). */
     stop() {

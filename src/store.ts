@@ -518,6 +518,13 @@ export type Message = {
    * threads), so per-message attribution needs this frozen copy.
    */
   modelId?: string;
+  /**
+   * An agent run that continues the previous one rather than a turn the
+   * person sent: one the thread started on its own (a background command it
+   * waited on finished, a subagent reported back, the person answered a
+   * request), or the rest of a run a steer split in two.
+   */
+  continuation?: boolean;
   /** Orion-authored prompt shown when a completed Claude turn is held open only by local shell tasks. */
   claudeBackgroundIntervention?: {
     runId: string;
@@ -539,6 +546,12 @@ export type QueuedMessage = {
   id: string;
   text: string;
   attachments?: FileAttachment[];
+  /**
+   * The person's answer to a request the agent made (request_user_action),
+   * queued because no live session could take it: the turn it starts
+   * continues the agent's work (Message.continuation).
+   */
+  continuation?: boolean;
 };
 
 /**
@@ -775,6 +788,13 @@ export type Thread = {
     runOffset?: number;
     /** Set once the outcome went back to Durango Chat. */
     reportedAt?: string;
+    /**
+     * The last report's sequence number (`seq` of durangoDispatchOutcome: two
+     * per agent run, odd while it still waited). A turn the thread resumes by
+     * itself after that, or the end of that wait, reports again.
+     * Absent with `reportedAt`: reported by an older build, once.
+     */
+    reportedSeq?: number;
   };
   /** Codex goal (/goal) this thread is pursuing, if any. Null after /goal clear. */
   goal?: ThreadGoal | null;

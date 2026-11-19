@@ -2013,6 +2013,10 @@ type OrionCodexBrowserIntegrationStatus = {
         outcome: 'finished' | 'failed';
         summary?: string;
         error?: string;
+        /** The turn ended, but the thread still waits on these (it reports again when it resumes). */
+        waiting?: string[];
+        /** The report's sequence number (two per agent run, odd while waiting): later reports have higher ones. */
+        seq?: number;
       }) => Promise<{ ok: boolean; skipped?: boolean; retry?: boolean }>;
       onDurangoDispatchState?: (cb: (state: DurangoDispatchState) => void) => () => void;
       onDurangoFocusThread?: (cb: (payload: { threadId: string }) => void) => () => void;

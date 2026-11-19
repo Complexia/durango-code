@@ -60,6 +60,26 @@ export const withThreadReportFooter = (report, thread) => {
   return footer ? (text ? `${text}\n\n${footer}` : footer) : text;
 };
 
+/**
+ * A thread's report to a bot when its turn ended but its work didn't: it is
+ * still waiting on background work (or on the person), and reports again
+ * once it resumes and finishes. Durango's own copy: threadReportText in
+ * chat/convex/botPolicy.ts.
+ * `later`: a report after an earlier one (the thread resumed on its own, or
+ * the work it waited on ended).
+ */
+export const threadReportText = ({ summary, waiting, later = false } = {}) => {
+  const text = String(summary ?? '').trim();
+  const list = (Array.isArray(waiting) ? waiting : []).map((item) => String(item ?? '').trim()).filter(Boolean);
+  if (list.length) {
+    return [
+      `NOT FINISHED YET: the thread ended its turn but still has work pending: ${list.join('; ')}. When that ends it resumes by itself and reports again (a command it left running on purpose, like a dev server, may just keep running). Don't treat this as its final report.`,
+      text ? `What it said so far:\n\n${text}` : '',
+    ].filter(Boolean).join('\n\n');
+  }
+  return later ? `A later report from the thread, after its earlier one:\n\n${text}` : text;
+};
+
 const MAX_LISTED = 40;
 
 export const BOT_THREAD_TOOLS = [
