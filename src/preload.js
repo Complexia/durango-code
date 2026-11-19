@@ -468,6 +468,8 @@ contextBridge.exposeInMainWorld('orion', {
   listBots: () => ipcRenderer.invoke('bots:list'),
   getBotThread: (input) => ipcRenderer.invoke('bots:thread', input),
   sendBotMessage: (input) => ipcRenderer.invoke('bots:send', input),
+  pickBotAttachments: () => ipcRenderer.invoke('bots:pickAttachments'),
+  saveBotAttachment: (input) => ipcRenderer.invoke('bots:saveAttachment', input),
   ensureProjectBot: (input) => ipcRenderer.invoke('bots:ensureProjectBot', input),
   getBotProject: (input) => ipcRenderer.invoke('bots:project', input),
   botProjectAction: (input) => ipcRenderer.invoke('bots:projectAction', input),

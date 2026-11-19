@@ -60,6 +60,7 @@ import {
   type DesktopBot,
   type DesktopBotMessage,
   type DesktopBotThread,
+  type BotAttachmentFile,
 } from './bots';
 
 // Sidebar v3 (Settings → Experimental): the sidebar lists the person's Durango
@@ -76,7 +77,7 @@ const THREAD_POLL_ACTIVE_MS = 1_200;
 const THREAD_POLL_IDLE_MS = 4_000;
 const SIDEBAR_STORAGE_KEY = 'orion.botsSidebarWidth';
 
-type Outgoing = { id: string; content: string; failed?: string };
+type Outgoing = { id: string; content: string; files?: BotAttachmentFile[]; failed?: string };
 
 // The last data the Bots view showed, kept while the app runs: switching to
 // the Code tab unmounts the view, and coming back shows this at once while a
@@ -1106,18 +1107,24 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
   const pending = outgoing.filter((message) => !stored.has(message.id));
 
   const send = useCallback(
-    async (text: string, id = newBotMessageId()) => {
+    async (text: string, files: BotAttachmentFile[] = [], id = newBotMessageId()) => {
       const content = text.trim();
-      if (!content) return;
+      if (!content && !files.length) return;
       stick.current = true;
-      setOutgoing((current) => [...current.filter((message) => message.id !== id), { id, content }]);
+      setOutgoing((current) => [...current.filter((message) => message.id !== id), { id, content, ...(files.length ? { files } : {}) }]);
       let timeZone: string | undefined;
       try {
         timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
       } catch {
         timeZone = undefined;
       }
-      const result = await window.orion?.sendBotMessage?.({ botId, messageId: id, content, ...(timeZone ? { timeZone } : {}) });
+      const result = await window.orion?.sendBotMessage?.({
+        botId,
+        messageId: id,
+        content,
+        ...(files.length ? { files } : {}),
+        ...(timeZone ? { timeZone } : {}),
+      });
       if (!result?.ok) {
         setOutgoing((current) => current.map((message) => (message.id === id ? { ...message, failed: result?.error ?? 'Couldn’t send.' } : message)));
         return;
@@ -1189,9 +1196,10 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
             <PersonBubble
               key={message.id}
               content={message.content}
+              files={message.files}
               meta={
                 message.failed ? (
-                  <button type="button" className="text-red-400 hover:underline" onClick={() => void send(message.content, message.id)}>
+                  <button type="button" className="text-red-400 hover:underline" onClick={() => void send(message.content, message.files ?? [], message.id)}>
                     {message.failed} Retry
                   </button>
                 ) : (
@@ -1223,7 +1231,7 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
           )}
         </div>
       </div>
-      <BotComposer botName={bot.name} paused={bot.paused} onSend={(text) => void send(text)} />
+      <BotComposer botName={bot.name} paused={bot.paused} onSend={(text, files) => void send(text, files)} />
     </div>
   );
 };
@@ -1967,10 +1975,22 @@ const ProjectLibrary: React.FC<{
   );
 };
 
-const PersonBubble: React.FC<{ content: string; meta?: React.ReactNode }> = ({ content, meta }) => {
+const PersonBubble: React.FC<{ content: string; files?: { name: string; size?: number }[]; meta?: React.ReactNode }> = ({ content, files, meta }) => {
   const answer = /^> \*\*Answering:\*\* (.+)\n\n([\s\S]+)$/.exec(content);
   return (
     <div className="flex flex-col items-end gap-1">
+      {files && files.length > 0 && (
+        <div className="flex max-w-[85%] flex-wrap justify-end gap-1.5">
+          {files.map((file, index) => (
+            <span key={`${file.name}-${index}`} className="inline-flex max-w-[260px] items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[12px] text-neutral-300 ring-1 ring-white/[0.08]">
+              <Paperclip size={12} className="shrink-0 text-neutral-500" />
+              <span className="truncate">{file.name}</span>
+              {file.size ? <span className="shrink-0 text-neutral-500">{formatFileSize(file.size)}</span> : null}
+            </span>
+          ))}
+        </div>
+      )}
+      {content.trim() !== '' && (
       <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-white/[0.08] px-3.5 py-2 text-[13.5px] leading-relaxed text-neutral-100">
         {answer ? (
           <>
@@ -1981,6 +2001,7 @@ const PersonBubble: React.FC<{ content: string; meta?: React.ReactNode }> = ({ c
           content
         )}
       </div>
+      )}
       {meta && <span className="pr-1 text-[11px] text-neutral-500">{meta}</span>}
     </div>
   );
@@ -2006,7 +2027,7 @@ const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = Re
     );
   }
   const source = botInboxSource(message.authorLabel);
-  if (source === 'person') return <PersonBubble content={message.content} />;
+  if (source === 'person') return <PersonBubble content={message.content} files={message.files} />;
   const Icon = INBOX_ICON[source];
   return (
     <div className="mx-auto w-full max-w-[92%] rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-[12.5px]">
@@ -2021,8 +2042,26 @@ const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = Re
 });
 
 /** Always open: messages queue while the bot works, like texting a person. */
-const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: string) => void }> = ({ botName, paused, onSend }) => {
+const BOT_ATTACHMENTS_MAX = 10;
+
+/** A file from the clipboard or a drop with no path on disk: saved to a temp file first (bots:saveAttachment). */
+const fileToAttachment = async (file: File): Promise<BotAttachmentFile | null> => {
+  const filePath = window.orion?.getPathForFile?.(file) ?? '';
+  if (filePath) return { path: filePath, name: file.name || 'file', size: file.size };
+  const buffer = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  for (let index = 0; index < buffer.length; index += 0x8000) binary += String.fromCharCode(...buffer.subarray(index, index + 0x8000));
+  const extension = file.type.startsWith('image/') ? `.${file.type.slice('image/'.length).replace('jpeg', 'jpg').replace(/[^a-z0-9]/g, '')}` : '';
+  const result = await window.orion?.saveBotAttachment?.({ name: file.name || `pasted${extension}`, data: btoa(binary) });
+  return result?.ok && result.file ? result.file : null;
+};
+
+/** Always open: messages queue while the bot works, like texting a person. Files attach by button, paste or drop. */
+const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: string, files: BotAttachmentFile[]) => void }> = ({ botName, paused, onSend }) => {
   const [text, setText] = useState('');
+  const [files, setFiles] = useState<BotAttachmentFile[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   useLayoutEffect(() => {
     const element = ref.current;
@@ -2030,41 +2069,122 @@ const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: s
     element.style.height = '0px';
     element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
   }, [text]);
+  const add = (next: BotAttachmentFile[]) => {
+    setAttachError(null);
+    setFiles((current) => {
+      const merged = [...current];
+      for (const file of next) if (!merged.some((item) => item.path === file.path)) merged.push(file);
+      if (merged.length > BOT_ATTACHMENTS_MAX) setAttachError(`Up to ${BOT_ATTACHMENTS_MAX} files per message.`);
+      return merged.slice(0, BOT_ATTACHMENTS_MAX);
+    });
+  };
+  const addFiles = async (list: FileList | File[]) => {
+    const picked = await Promise.all([...list].map((file) => fileToAttachment(file).catch(() => null)));
+    const ok = picked.filter((file): file is BotAttachmentFile => Boolean(file));
+    if (ok.length < picked.length) setAttachError('Some files couldn’t be attached.');
+    add(ok);
+  };
+  const pick = async () => {
+    const result = await window.orion?.pickBotAttachments?.();
+    if (!result) return;
+    if (!result.ok) {
+      setAttachError(result.error ?? 'Couldn’t attach those files.');
+      return;
+    }
+    add(result.files ?? []);
+    ref.current?.focus();
+  };
   const submit = () => {
-    if (!text.trim()) return;
-    onSend(text);
+    if (!text.trim() && !files.length) return;
+    onSend(text, files);
     setText('');
+    setFiles([]);
+    setAttachError(null);
     ref.current?.focus();
   };
   return (
     <div className="shrink-0 px-4 pb-4 pt-2">
       <div className="mx-auto w-full max-w-[760px]">
         {paused && <div className="mb-1.5 text-center text-[11.5px] text-neutral-500">{botName} is paused: messages wait until you resume it.</div>}
-        <div className="flex items-end gap-2 rounded-2xl border border-white/10 bg-white/[0.035] px-3.5 py-2 focus-within:border-white/20">
-          <textarea
-            ref={ref}
-            value={text}
-            rows={1}
-            placeholder={`Message ${botName}`}
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+        <div
+          className={`rounded-2xl border bg-white/[0.035] px-3.5 py-2 transition-colors focus-within:border-white/20 ${
+            dragging ? 'border-sky-400/60 bg-sky-400/[0.06]' : 'border-white/10'
+          }`}
+          onDragOver={(event) => {
+            if (!event.dataTransfer.types.includes('Files')) return;
+            event.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
+          }}
+          onDrop={(event) => {
+            if (!event.dataTransfer.files.length) return;
+            event.preventDefault();
+            setDragging(false);
+            void addFiles(event.dataTransfer.files);
+          }}
+        >
+          {files.length > 0 && (
+            <div className="mb-1.5 flex flex-wrap gap-1.5 pt-0.5">
+              {files.map((file) => (
+                <span key={file.path} className="inline-flex max-w-[240px] items-center gap-1.5 rounded-lg bg-white/[0.06] py-1 pl-2.5 pr-1 text-[12px] text-neutral-200 ring-1 ring-white/[0.08]">
+                  <Paperclip size={12} className="shrink-0 text-neutral-500" />
+                  <span className="truncate">{file.name}</span>
+                  <span className="shrink-0 text-neutral-500">{formatFileSize(file.size)}</span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${file.name}`}
+                    onClick={() => setFiles((current) => current.filter((item) => item.path !== file.path))}
+                    className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 hover:bg-white/[0.08] hover:text-neutral-200"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex items-end gap-2">
+            <button
+              type="button"
+              aria-label="Attach files"
+              title="Attach files (or paste, or drop them here)"
+              onClick={() => void pick()}
+              className="mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/[0.08] hover:text-neutral-100"
+            >
+              <Paperclip size={15} />
+            </button>
+            <textarea
+              ref={ref}
+              value={text}
+              rows={1}
+              placeholder={`Message ${botName}`}
+              onChange={(event) => setText(event.target.value)}
+              onPaste={(event) => {
+                if (!event.clipboardData.files.length) return;
                 event.preventDefault();
-                submit();
-              }
-            }}
-            className="max-h-[200px] min-h-[22px] flex-1 resize-none bg-transparent py-1 text-[13.5px] leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-500"
-          />
-          <button
-            type="button"
-            aria-label="Send"
-            onClick={submit}
-            disabled={!text.trim()}
-            className="mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-neutral-100 text-neutral-900 transition-opacity disabled:opacity-25"
-          >
-            <ArrowUp size={14} strokeWidth={2.4} />
-          </button>
+                void addFiles(event.clipboardData.files);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  submit();
+                }
+              }}
+              className="max-h-[200px] min-h-[22px] flex-1 resize-none bg-transparent py-1 text-[13.5px] leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-500"
+            />
+            <button
+              type="button"
+              aria-label="Send"
+              onClick={submit}
+              disabled={!text.trim() && !files.length}
+              className="mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-neutral-100 text-neutral-900 transition-opacity disabled:opacity-25"
+            >
+              <ArrowUp size={14} strokeWidth={2.4} />
+            </button>
+          </div>
         </div>
+        {attachError && <div className="mt-1 px-1 text-[11.5px] text-red-300">{attachError}</div>}
       </div>
     </div>
   );

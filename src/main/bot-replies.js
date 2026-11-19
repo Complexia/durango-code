@@ -183,6 +183,57 @@ export const presenceOf = (info) => ({
 });
 
 /** The bot's working directory: `<botsDir>/<botId>`, the id made path-safe. */
+// --- attachments ---------------------------------------------------------------
+/** Files a reply saves for Claude Code: at most this many, each at most this big. */
+const LANE_ATTACHMENTS_MAX = 10;
+const LANE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+
+const safeFileName = (name) =>
+  String(name ?? 'file')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_')
+    .replace(/^\.+/, '_')
+    .slice(0, 120) || 'file';
+
+const defaultDownload = async (url) => {
+  const response = await fetch(url, { signal: AbortSignal.timeout(120_000), redirect: 'follow' });
+  if (!response.ok) throw new Error(`download failed (${response.status})`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > LANE_ATTACHMENT_MAX_BYTES) throw new Error('over 25 MB');
+  return bytes;
+};
+
+/**
+ * Saves a reply's attachments in its work folder (`attachments/`, inside its
+ * cwd, so Claude Code can read them in any access mode): from Durango's
+ * download links, or copied from this computer (signed-out bots). → a note
+ * for the prompt naming each file and where it is, or '' when there are none.
+ */
+export const saveLaneAttachments = async (attachments, dir, { download = defaultDownload, copyFile = (from, to) => fs.copyFile(from, to) } = {}) => {
+  const list = (Array.isArray(attachments) ? attachments : []).slice(-LANE_ATTACHMENTS_MAX);
+  if (!list.length) return '';
+  await fs.mkdir(dir, { recursive: true });
+  const lines = [];
+  for (const item of list) {
+    const name = safeFileName(item?.name);
+    const tag = String(item?.id ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
+    const target = path.join(dir, tag ? `${tag}-${name}` : name);
+    try {
+      const existing = await fs.stat(target).catch(() => null);
+      if (!existing?.isFile()) {
+        if (typeof item?.path === 'string' && item.path) await copyFile(item.path, target);
+        else if (typeof item?.url === 'string' && /^https:\/\//.test(item.url)) await fs.writeFile(target, await download(item.url));
+        else continue;
+      }
+      lines.push(`- ${item?.name ?? name}: ${target}`);
+    } catch (error) {
+      lines.push(`- ${item?.name ?? name}: couldn't be saved here (${error?.message ?? error})`);
+    }
+  }
+  return lines.length
+    ? `<attachments>\nFiles attached in this conversation, saved on this computer (read them with your tools):\n${lines.join('\n')}\n</attachments>`
+    : '';
+};
+
 export const botWorkDir = (botsDir, botId) => {
   const id = String(botId ?? '');
   const safe = /^[A-Za-z0-9_-]{1,100}$/.test(id) ? id : crypto.createHash('sha256').update(id).digest('hex').slice(0, 32);
@@ -289,6 +340,7 @@ export const createClaudeLaneRunner = ({
   getProjects = () => [],
   mkdir = (dir) => fs.mkdir(dir, { recursive: true }),
   randomId = () => crypto.randomUUID(),
+  downloadAttachment = defaultDownload,
 }) => async (lane, ctx) => {
   const accessMode = ctx.accessMode || 'read-only';
   let sdk;
@@ -312,6 +364,10 @@ export const createClaudeLaneRunner = ({
     return { text: '', retryElsewhere: true, failure: shorten(`Claude Code is not available here: ${error?.message ?? error}`) };
   }
   if (ctx.signal?.aborted) return { text: '', aborted: true };
+  // Files attached in the conversation: saved next to the reply for Claude Code.
+  const attachmentsNote = await saveLaneAttachments(lane.attachments, path.join(cwd, 'attachments'), {
+    download: downloadAttachment,
+  }).catch(() => '');
   const z = zod?.z ?? zod;
 
   // --- reply text and the tool running -----------------------------------------------
@@ -412,7 +468,7 @@ export const createClaudeLaneRunner = ({
   let thrown = null;
   let query = null;
   try {
-    inputQueue.push(userMessage(lane.prompt));
+    inputQueue.push(userMessage(attachmentsNote ? `${lane.prompt}\n\n${attachmentsNote}` : lane.prompt));
     query = sdk.query({
       prompt: inputQueue.stream(),
       options: {

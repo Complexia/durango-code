@@ -1958,7 +1958,11 @@ type OrionCodexBrowserIntegrationStatus = {
         messageId: string;
         content: string;
         timeZone?: string;
+        /** Files attached (paths on this computer). */
+        files?: import('./app/bots').BotAttachmentFile[];
       }) => Promise<{ ok: boolean; seq?: number; error?: string; code?: string }>;
+      pickBotAttachments?: () => Promise<{ ok: boolean; files?: import('./app/bots').BotAttachmentFile[]; error?: string }>;
+      saveBotAttachment?: (input: { name: string; data: string }) => Promise<{ ok: boolean; file?: import('./app/bots').BotAttachmentFile; error?: string }>;
       durangoProfileMemory?: () => Promise<{
         ok: boolean;
         code?: DurangoErrorCode;

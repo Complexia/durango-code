@@ -47,7 +47,12 @@ export type DesktopBotMessage = {
   /** Inbox source labels ("Routine: …", "Task: …", "Bot: …") or "via <machine>" on replies. */
   authorLabel: string | null;
   createdAt: number;
+  /** Files sent with it. */
+  files?: { name: string; size?: number }[];
 };
+
+/** A file attached to a message being written: a path on this computer. */
+export type BotAttachmentFile = { path: string; name: string; size: number };
 
 export type DesktopBotLive = { messageId: string; place: string; content: string; activeTool: string | null };
 

@@ -21,6 +21,7 @@ import {
   durangoModelIdForClaude,
   formatBotInbox,
   normalizeBotSettings,
+  saveLaneAttachments,
 } from '../src/main/bot-replies.js';
 import { createBotThreadTools } from '../src/main/bot-thread-tools.js';
 
@@ -560,6 +561,30 @@ try {
     assert.equal(client.calls.claim.length, 1, 'no polling while idle');
     worker.wake();
     await waitFor(() => client.calls.claim.length === 2, { label: 'claims again once woken' });
+  });
+
+  await test('attachments are saved next to the reply and named in the prompt', async () => {
+    const dir = await fs.mkdtemp(path.join(testRoot, 'attach-'));
+    const local = path.join(dir, 'source.txt');
+    await fs.writeFile(local, 'local file');
+    const downloads = [];
+    const note = await saveLaneAttachments(
+      [
+        { id: 'asset123456', name: 'photo.png', url: 'https://storage.example/photo.png' },
+        { id: 'lm1', name: 'notes/../x.txt', path: local },
+        { id: 'bad', name: 'nope.bin', url: 'http://insecure.example/x' },
+      ],
+      path.join(dir, 'attachments'),
+      { download: async (url) => (downloads.push(url), new Uint8Array([1, 2, 3])) }
+    );
+    assert.deepEqual(downloads, ['https://storage.example/photo.png']);
+    assert.match(note, /<attachments>/);
+    assert.match(note, /photo\.png: .*attachments\/asset123-photo\.png/);
+    const copied = note.match(/x\.txt: (\S+)/)?.[1];
+    assert.equal(path.dirname(copied), path.join(dir, 'attachments'), 'a name can\'t leave the attachments folder');
+    assert.equal(await fs.readFile(copied, 'utf8'), 'local file');
+    assert.doesNotMatch(note, /nope\.bin/, 'only https links are downloaded');
+    assert.equal(await saveLaneAttachments([], path.join(dir, 'none')), '');
   });
 
   await test('progress is throttled, heartbeats keep the lane alive', async () => {

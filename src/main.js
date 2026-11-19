@@ -376,8 +376,17 @@ const markRemoteCommandRendererReady = (webContents) => {
   if (remoteCommandRenderer === webContents) return { ok: true };
   remoteCommandRendererCleanup?.();
   remoteCommandRenderer = webContents;
+  // Only the window's own page reloading or navigating ends its readiness.
+  // `did-start-loading` also fires when a frame inside it loads (a theme's
+  // scene, an HTML visual in a thread), which used to leave Durango Code
+  // thinking no window was open ("Open a Durango Code window…").
+  const onNavigation = (details, _url, isInPlace, isMainFrame) => {
+    const mainFrame = details?.isMainFrame ?? isMainFrame;
+    const sameDocument = details?.isSameDocument ?? isInPlace;
+    if (mainFrame && !sameDocument) clear();
+  };
   const clear = () => {
-    webContents.removeListener('did-start-loading', clear);
+    webContents.removeListener('did-start-navigation', onNavigation);
     webContents.removeListener('render-process-gone', clear);
     webContents.removeListener('destroyed', clear);
     if (remoteCommandRenderer === webContents) {
@@ -387,7 +396,7 @@ const markRemoteCommandRendererReady = (webContents) => {
     if (remoteCommandRendererCleanup === clear) remoteCommandRendererCleanup = null;
   };
   remoteCommandRendererCleanup = clear;
-  webContents.once('did-start-loading', clear);
+  webContents.on('did-start-navigation', onNavigation);
   webContents.once('render-process-gone', clear);
   webContents.once('destroyed', clear);
   return { ok: true };
@@ -2384,7 +2393,7 @@ ipcMain.handle('remote:userAction', afterRemoteControlInit((_event, input) => re
 ipcMain.handle('remote:threadState', afterRemoteControlInit((_event, input) => setRemoteThreadState(input)));
 ipcMain.handle('remote:followThreads', afterRemoteControlInit((_event, input) => followRemoteThreads(input)));
 // Registered only after the renderer has installed onRemoteCommandRequest.
-// did-start-loading/destroyed clear this authority until the next mount.
+// A main-frame navigation, a crash or destruction clears this authority until the next mount.
 ipcMain.handle('remote:rendererReady', (event) => markRemoteCommandRendererReady(event.sender));
 ipcMain.handle('remote:claimCommand', (event, input) =>
   event.sender !== remoteCommandRenderer
@@ -5998,14 +6007,61 @@ ipcMain.handle('bots:thread', async (_event, input) => {
   }
 });
 
+// Files the person attaches to a bot message: picked, dropped (their paths) or
+// pasted (saved to a temp file first, bots:saveAttachment). Regular files only.
+const BOT_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+const botAttachmentFiles = async (files) => {
+  const out = [];
+  for (const file of (Array.isArray(files) ? files : []).slice(0, 10)) {
+    const filePath = typeof file?.path === 'string' ? file.path : '';
+    if (!filePath || !path.isAbsolute(filePath)) continue;
+    const stat = await fs.stat(filePath).catch(() => null);
+    if (!stat?.isFile()) throw new Error(`Can't read ${path.basename(filePath)}.`);
+    if (stat.size > BOT_ATTACHMENT_MAX_BYTES) throw new Error(`${path.basename(filePath)} is over 25 MB.`);
+    const name = (typeof file?.name === 'string' && file.name.trim() ? file.name : path.basename(filePath)).slice(0, 200);
+    out.push({ path: filePath, name, size: stat.size, contentType: mimeTypeForPath(filePath) });
+  }
+  return out;
+};
+
+ipcMain.handle('bots:pickAttachments', async (event) => {
+  const window = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+  const picked = await dialog.showOpenDialog(window, { title: 'Attach files', properties: ['openFile', 'multiSelections'] });
+  if (picked.canceled) return { ok: true, files: [] };
+  try {
+    return { ok: true, files: (await botAttachmentFiles(picked.filePaths.map((filePath) => ({ path: filePath })))).map(({ path: filePath, name, size }) => ({ path: filePath, name, size })) };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+});
+
+// A pasted image (or file) → a temp file to attach like a picked one.
+ipcMain.handle('bots:saveAttachment', async (_event, input) => {
+  const data = typeof input?.data === 'string' ? input.data : '';
+  const bytes = Buffer.from(data, 'base64');
+  if (!bytes.length || bytes.length > BOT_ATTACHMENT_MAX_BYTES) return { ok: false, error: 'That file is empty or over 25 MB.' };
+  const name = (typeof input?.name === 'string' && input.name.trim() ? input.name.trim() : 'pasted').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').slice(0, 120);
+  const dir = path.join(app.getPath('temp'), 'durango-bot-attachments', crypto.randomUUID());
+  await fs.mkdir(dir, { recursive: true });
+  const filePath = path.join(dir, name);
+  await fs.writeFile(filePath, bytes);
+  return { ok: true, file: { path: filePath, name, size: bytes.length } };
+});
+
 ipcMain.handle('bots:send', async (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : '';
   const messageId = typeof input?.messageId === 'string' ? input.messageId.slice(0, 128) : '';
   const content = typeof input?.content === 'string' ? input.content.slice(0, 32_000) : '';
-  if (!botId || !messageId || !content.trim()) return { ok: false, error: 'Write a message first.' };
+  let files;
+  try {
+    files = await botAttachmentFiles(input?.files);
+  } catch (error) {
+    return { ok: false, error: error?.message ?? String(error) };
+  }
+  if (!botId || !messageId || (!content.trim() && !files.length)) return { ok: false, error: 'Write a message first.' };
   if (await localBotsMode()) {
     try {
-      return { ok: true, ...(await localBots.send(botId, { messageId, content })) };
+      return { ok: true, ...(await localBots.send(botId, { messageId, content, files })) };
     } catch (error) {
       return localBotsIpcError(error);
     }
@@ -6013,17 +6069,30 @@ ipcMain.handle('bots:send', async (_event, input) => {
   // A bot is in use here: a machine waiting out an idle period (no bots then) answers now.
   botReplyWorker.wake();
   try {
+    // Pinned to the account signed in now (uploads and the message alike).
+    const account = await durangoAccountKey();
+    if (!account) return { ok: false, error: 'Sign in to Durango first.' };
+    const assets = [];
+    for (const file of files) {
+      const uploaded = await durangoClient.uploadBotAttachment({ name: file.name, bytes: await fs.readFile(file.path), contentType: file.contentType, account });
+      if (uploaded?.part) assets.push(uploaded.part);
+    }
     const timeZone = typeof input?.timeZone === 'string' ? input.timeZone.slice(0, 64) : undefined;
     // Sent from this machine: its replies run here first (unless the bot has its own order).
     const machineId = await getDurangoDeviceId().catch(() => null);
     return {
       ok: true,
-      ...(await durangoClient.sendBotMessage(botId, {
-        messageId,
-        content,
-        ...(timeZone ? { timeZone } : {}),
-        ...(machineId ? { machineId } : {}),
-      })),
+      ...(await durangoClient.sendBotMessage(
+        botId,
+        {
+          messageId,
+          content,
+          ...(assets.length ? { assets } : {}),
+          ...(timeZone ? { timeZone } : {}),
+          ...(machineId ? { machineId } : {}),
+        },
+        { account }
+      )),
     };
   } catch (error) {
     return durangoIpcError(error);

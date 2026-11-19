@@ -609,6 +609,24 @@ test('a message counts as sent only once it is saved', async () => {
   await engine.stop();
 });
 
+test('files sent to a signed-out bot are kept with the message and reach its reply', async () => {
+  const { engine, runner, dir } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  const source = path.join(dir, '..', `attach-${Date.now()}.txt`);
+  await fs.writeFile(source, 'hello file');
+  await engine.send(primary.id, { messageId: 'f1', content: 'Read this', files: [{ path: source, name: 'brief.txt' }] });
+  await waitFor(() => runner.lanes.length === 1);
+  const lane = runner.lanes[0].lane;
+  assert.match(lane.prompt, /\[attached file: brief\.txt\]/);
+  assert.equal(lane.attachments.length, 1);
+  assert.equal(await fs.readFile(lane.attachments[0].path, 'utf8'), 'hello file', 'a copy in the bots folder');
+  const thread = await engine.thread(primary.id);
+  assert.deepEqual(thread.messages[0].files, [{ name: 'brief.txt', size: 10 }]);
+  runner.lanes[0].finish({ text: 'Got it.' });
+  await engine.idle();
+  await engine.stop();
+});
+
 test('projects get no bot on their own: create_bot with a project makes it; notes work without a bot', async () => {
   const { engine, runner } = makeEngine({
     listProjects: async () => [{ id: 'proj_7', name: 'Shop', path: '/Users/me/shop', repoId: 'repo_shop' }],

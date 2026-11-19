@@ -436,6 +436,11 @@ export const normalizeBotLane = (lane) => {
     prompt: str(lane.prompt),
     tools,
     heartbeatMs: clampInt(lane.heartbeatMs, 2_000, 60_000, BOT_LANE_DEFAULT_HEARTBEAT_MS),
+    /** Files attached in the conversation, with download links (saved for Claude Code). */
+    attachments: (Array.isArray(lane.attachments) ? lane.attachments : [])
+      .filter((item) => item && typeof item.url === 'string' && /^https:\/\//.test(item.url))
+      .slice(0, 10)
+      .map((item) => ({ id: str(item.id), name: str(item.name) || 'file', contentType: str(item.contentType), url: item.url })),
   };
 };
 
@@ -748,8 +753,14 @@ export const createDurangoClient = ({
       });
     },
     /** `{ messageId, content, timeZone? }` → `{ seq }`. Never blocked by a reply in progress. */
-    async sendBotMessage(botId, body) {
-      return await request('POST', `/bots/${encodeURIComponent(str(botId))}/messages`, { body });
+    async sendBotMessage(botId, body, { account } = {}) {
+      return await request('POST', `/bots/${encodeURIComponent(str(botId))}/messages`, { body, ...(account ? { account } : {}) });
+    },
+    /** A file for a bot message, saved to the person's library → `{ part, attachment }` (send `part` in `assets`). */
+    async uploadBotAttachment({ name, bytes, contentType, account }) {
+      const form = new FormData();
+      form.append('file', new Blob([bytes], { type: contentType || 'application/octet-stream' }), str(name) || 'file');
+      return await request('POST', '/bots/attachments', { form, timeout: Math.max(timeoutMs, 180_000), ...(account ? { account } : {}) });
     },
     /** A project's bot, created the first time: `{ name, repoId?, machineId?, projectId?, timeZone? }` → the bot. */
     async ensureProjectBot(body) {

@@ -506,6 +506,14 @@ const normalizeMessage = (raw) =>
         content: raw.content,
         authorLabel: typeof raw.authorLabel === 'string' && raw.authorLabel ? raw.authorLabel : null,
         createdAt: finite(raw.createdAt, 0),
+        // Files sent with it, copied into the bots folder (attachments/<message id>/).
+        ...(Array.isArray(raw.attachments) && raw.attachments.length
+          ? {
+              attachments: raw.attachments
+                .filter((item) => item && typeof item.name === 'string' && typeof item.path === 'string')
+                .map((item) => ({ name: item.name, path: item.path, size: finite(item.size, 0), contentType: str(item.contentType) })),
+            }
+          : {}),
       }
     : null;
 
@@ -800,7 +808,7 @@ export const createLocalBotEngine = ({
   };
 
   /** Stores an incoming message (the person's, or labelled) and wakes the bot. Idempotent by id. */
-  const appendInbox = (entry, { id, content, authorLabel = null }) => {
+  const appendInbox = (entry, { id, content, authorLabel = null, attachments = null }) => {
     if (id) {
       const existing = entry.messages.find((message) => message.id === id);
       if (existing) return existing;
@@ -813,6 +821,7 @@ export const createLocalBotEngine = ({
       content,
       authorLabel,
       createdAt: now(),
+      ...(attachments?.length ? { attachments } : {}),
     };
     bot.nextSeq += 1;
     entry.messages.push(message);
@@ -875,7 +884,11 @@ export const createLocalBotEngine = ({
     if (message.role === 'assistant') return `${botName} (you)`;
     return message.authorLabel ? `[${message.authorLabel}]` : 'Person';
   };
-  const renderLine = (message, botName) => `${speaker(message, botName)}:\n${message.content.trim() || '(no text)'}`;
+  const renderLine = (message, botName) => {
+    const files = (message.attachments ?? []).map((item) => `[attached file: ${item.name}]`).join('\n');
+    const text = message.content.trim();
+    return `${speaker(message, botName)}:\n${[text, files].filter(Boolean).join('\n') || '(no text)'}`;
+  };
 
   const renderContext = (entry, reply, claims) => {
     const { bot } = entry;
@@ -1000,6 +1013,10 @@ export const createLocalBotEngine = ({
       tools: threadTools ? [...LOCAL_BOT_TOOLS, ...BOT_THREAD_TOOLS] : LOCAL_BOT_TOOLS,
       threads: 'local',
       heartbeatMs: HEARTBEAT_MS,
+      // Files attached in the conversation (the newest): the runner copies them for Claude Code.
+      attachments: entry.messages
+        .flatMap((message) => (message.attachments ?? []).map((item) => ({ id: message.id, name: item.name, path: item.path })))
+        .slice(-10),
     };
   };
 
@@ -1705,7 +1722,9 @@ export const createLocalBotEngine = ({
           // recognises it whatever else was added meanwhile.
           ...(message.id ? { id: String(message.id) } : {}),
           role: message.role,
-          content: message.content,
+          content: message.attachments?.length
+            ? `${message.content}${message.content ? '\n' : ''}[attached on this device: ${message.attachments.map((item) => item.name).join(', ')}]`
+            : message.content,
           authorLabel: message.authorLabel,
           createdAt: message.createdAt,
           // Not answered here yet: Durango answers it after the upload.
@@ -1762,7 +1781,10 @@ export const createLocalBotEngine = ({
       const runtime = runtimes.get(entry.bot.id);
       return {
         bot: toDesktopBot(entry),
-        messages: entry.messages.slice(-count).map((message) => ({ ...message })),
+        messages: entry.messages.slice(-count).map(({ attachments, ...message }) => ({
+          ...message,
+          ...(attachments?.length ? { files: attachments.map((item) => ({ name: item.name, size: item.size })) } : {}),
+        })),
         live: runtime
           ? [...runtime.replies.values()].map((reply) => ({
               messageId: reply.id,
@@ -1783,12 +1805,29 @@ export const createLocalBotEngine = ({
       changed();
     },
     /** The person's message: stored, then answered (never blocked by a reply in progress). → { seq } */
-    async send(botId, { messageId, content } = {}) {
+    async send(botId, { messageId, content, files = [] } = {}) {
       await ensureLoaded();
       const entry = entryFor(botId);
       const text = str(content);
-      if (!text.trim()) throw new LocalBotError('invalid', 'Write a message first.');
-      const message = appendInbox(entry, { id: str(messageId).slice(0, 128) || undefined, content: text });
+      const picked = (Array.isArray(files) ? files : []).filter((file) => file && typeof file.path === 'string' && file.path).slice(0, 10);
+      if (!text.trim() && !picked.length) throw new LocalBotError('invalid', 'Write a message first.');
+      const id = str(messageId).slice(0, 128) || newId('lm');
+      // Copied into the bots folder: the message keeps them even if the originals move.
+      const attachments = [];
+      if (picked.length && !entry.messages.some((message) => message.id === id)) {
+        const dir = path.join(storageDir(), 'attachments', id.replace(/[^A-Za-z0-9_-]/g, '_'));
+        await fs.mkdir(dir, { recursive: true });
+        for (const file of picked) {
+          const stat = await fs.stat(file.path).catch(() => null);
+          if (!stat?.isFile()) throw new LocalBotError('invalid', `Can't read ${path.basename(file.path)}.`);
+          if (stat.size > 25 * 1024 * 1024) throw new LocalBotError('invalid', `${path.basename(file.path)} is over 25 MB.`);
+          const name = (str(file.name) || path.basename(file.path)).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').slice(0, 120) || 'file';
+          const target = path.join(dir, `${attachments.length}-${name}`);
+          await fs.copyFile(file.path, target);
+          attachments.push({ name, path: target, size: stat.size, contentType: str(file.contentType) });
+        }
+      }
+      const message = appendInbox(entry, { id, content: text, ...(attachments.length ? { attachments } : {}) });
       // "Sent" only once it is on disk (a retry with the same id is harmless).
       if (!(await (entry.saved ?? Promise.resolve(true)))) {
         throw new LocalBotError('storage', 'Couldn’t save your message on this device. Try again.');
