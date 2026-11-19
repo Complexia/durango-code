@@ -48,6 +48,7 @@ import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
 import { localMediaSrc } from './attachments';
+import { botDraftKey, loadBotDraft, projectBotDraftKey, restoreUnsentBotDraft, useBotDraftSaver } from './botDrafts';
 import { BotActionsRow, BotCards, BotFileGallery, threadIsHere, useMessageFiles, type BotActionHandlers } from './BotReplyCards';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { sortProjectsByLatestThreadStart } from './projectOrder';
@@ -481,6 +482,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               onBotAdded={botAdded}
               threadActions={threadActions}
               attentionThreadIds={attentionThreadIds}
+              account={account}
             />
           ) : selectedBotId ? (
             <BotPane
@@ -611,7 +613,9 @@ const ProjectPage: React.FC<{
   onBotAdded: (bot: DesktopBot) => void;
   threadActions: SidebarV2Actions;
   attentionThreadIds: ReadonlyMap<string, number>;
-}> = ({ entry, onBack, onOpenBot, onNewThread, onOpenThread, onBotAdded, threadActions, attentionThreadIds }) => {
+  /** The account the Bots view shows ('local' signed out): unsent prompts are kept per account. */
+  account: string | null;
+}> = ({ entry, onBack, onOpenBot, onNewThread, onOpenThread, onBotAdded, threadActions, attentionThreadIds, account }) => {
   const [bot, setBot] = useState<DesktopBot | null>(entry.bot);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<ProjectTab>('threads');
@@ -670,6 +674,7 @@ const ProjectPage: React.FC<{
         <div className="mx-auto w-full max-w-[1080px] px-8 pb-10 pt-7">
           <ProjectBotBox
             entry={entry}
+            account={account}
             bot={bot}
             local={local}
             onOpenBot={onOpenBot}
@@ -782,13 +787,17 @@ const ProjectPage: React.FC<{
  */
 const ProjectBotBox: React.FC<{
   entry: ProjectEntry;
+  account: string | null;
   bot: DesktopBot | null;
   local: boolean;
   onOpenBot: (botId: string) => void;
   onBotCreated: (bot: DesktopBot) => void;
   onError: (error: string | null) => void;
-}> = ({ entry, bot, local, onOpenBot, onBotCreated, onError }) => {
-  const [draft, setDraft] = useState('');
+}> = ({ entry, account, bot, local, onOpenBot, onBotCreated, onError }) => {
+  const draftKey = projectBotDraftKey(account, entry.id);
+  const [draft, setDraft] = useState(() => loadBotDraft(draftKey).text);
+  const draftSaver = useBotDraftSaver(draftKey);
+  useEffect(() => draftSaver.save(draft), [draftSaver, draft]);
   const [busy, setBusy] = useState<'create' | 'send' | null>(null);
   const [sent, setSent] = useState(false);
   const botId = bot?.id ?? null;
@@ -831,10 +840,18 @@ const ProjectBotBox: React.FC<{
   };
 
   const send = async () => {
-    const content = draft.trim();
+    const sentText = draft;
+    const content = sentText.trim();
     if (!content || busy) return;
+    // Forget the saved copy now: leaving the page before the send finishes
+    // must not bring a sent prompt back. A failed send puts it back.
+    draftSaver.discard();
+    const unsent = () => restoreUnsentBotDraft(draftKey, { text: sentText, files: [] });
     const target = await ensureBot();
-    if (!target) return;
+    if (!target) {
+      unsent();
+      return;
+    }
     setBusy('send');
     onError(null);
     let timeZone: string | undefined;
@@ -846,10 +863,12 @@ const ProjectBotBox: React.FC<{
     const result = await window.orion?.sendBotMessage?.({ botId: target.id, messageId: newBotMessageId(), content, ...(timeZone ? { timeZone } : {}) });
     setBusy(null);
     if (!result?.ok) {
+      unsent();
       onError(result?.error ?? 'Couldn’t send that.');
       return;
     }
-    setDraft('');
+    // Text typed while it was sending stays.
+    setDraft((current) => (current === sentText ? '' : current));
     setSent(true);
   };
 
@@ -1440,7 +1459,7 @@ const BotPane: React.FC<{
         </button>
       )}
       </div>
-      <BotComposer botName={bot.name} paused={bot.paused} onSend={(text, files) => void send(text, files)} />
+      <BotComposer draftKey={botDraftKey(bot.id)} botName={bot.name} paused={bot.paused} onSend={(text, files) => void send(text, files)} />
     </div>
   );
 };
@@ -2321,9 +2340,18 @@ const fileToAttachment = async (file: File): Promise<BotAttachmentFile | null> =
 };
 
 /** Always open: messages queue while the bot works, like texting a person. Files attach by button, paste or drop. */
-const BotComposer: React.FC<{ botName: string; paused: boolean; onSend: (text: string, files: BotAttachmentFile[]) => void }> = ({ botName, paused, onSend }) => {
-  const [text, setText] = useState('');
-  const [files, setFiles] = useState<BotAttachmentFile[]>([]);
+const BotComposer: React.FC<{
+  draftKey: string;
+  botName: string;
+  paused: boolean;
+  onSend: (text: string, files: BotAttachmentFile[]) => void;
+}> = ({ draftKey, botName, paused, onSend }) => {
+  // The unsent draft (text and files) comes back after switching bots, tabs or threads, and after a restart.
+  const [initialDraft] = useState(() => loadBotDraft(draftKey));
+  const [text, setText] = useState(initialDraft.text);
+  const [files, setFiles] = useState<BotAttachmentFile[]>(initialDraft.files);
+  const draftSaver = useBotDraftSaver(draftKey);
+  useEffect(() => draftSaver.save(text, files), [draftSaver, text, files]);
   const [dragging, setDragging] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);

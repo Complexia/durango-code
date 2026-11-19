@@ -463,6 +463,15 @@ export type ComposerDraft = {
   attachments: FileAttachment[];
 };
 
+/** A file in an unsent bot message: a path on this computer (thumbnails are rebuilt from it). */
+export type BotDraftFile = { path: string; name: string; size: number };
+
+/** What the user typed into a bot's prompt box but has not sent yet. */
+export type BotDraft = {
+  text: string;
+  files: BotDraftFile[];
+};
+
 export type Message = {
   id: string;
   role: 'user' | 'agent' | 'system';
@@ -1286,6 +1295,12 @@ interface OrionState {
    */
   composerDrafts: Record<string, ComposerDraft>;
 
+  /**
+   * Unsent bot prompts by box: a bot's conversation (`bot:<botId>`) or a
+   * project page's ask box (`project:<projectId>`). Only non-empty drafts.
+   */
+  botDrafts: Record<string, BotDraft>;
+
   // Saved views (splits the user can return to)
   savedViews: SavedView[];
   /**
@@ -1402,6 +1417,8 @@ interface OrionState {
   updateThreadTranscript: (threadId: string, recipe: (transcript: ThreadTranscript) => ThreadTranscript) => void;
   /** Remember (or, when empty, forget) a thread's unsent composer draft. */
   setComposerDraft: (threadId: string, draft: ComposerDraft) => void;
+  /** Remember (or, when empty, forget) an unsent bot prompt. */
+  setBotDraft: (key: string, draft: BotDraft) => void;
   deleteThread: (id: string) => void;
   addMessageToThread: (threadId: string, message: Omit<Message, 'id' | 'ts'>) => string;
   appendToThreadMessage: (threadId: string, messageId: string, chunk: string) => void;
@@ -2282,6 +2299,7 @@ const PERSISTED_SOURCE_KEYS = [
   'activeTab',
   'appearanceSettings',
   'browserSettings',
+  'botDrafts',
   'composerDrafts',
   'deploymentSettings',
   'durangoSettings',
@@ -2323,6 +2341,7 @@ const buildPersistedSettings = (state: OrionState) => ({
         selectedThreadId: state.selectedThreadId,
         paneThreadIds: state.paneThreadIds,
         composerDrafts: state.composerDrafts,
+        botDrafts: state.botDrafts,
         savedViews: state.savedViews,
         activeSavedViewId: state.activeSavedViewId,
         splitViewSettings: {
@@ -2395,6 +2414,7 @@ export const useOrionStore = create<OrionState>()(
       selectedThreadId: null,
       paneThreadIds: [],
       composerDrafts: {},
+      botDrafts: {},
       savedViews: [],
       activeSavedViewId: null,
       splitViewSettings: defaultSplitViewSettings,
@@ -3199,6 +3219,18 @@ export const useOrionStore = create<OrionState>()(
           return { composerDrafts: { ...state.composerDrafts, [threadId]: draft } };
         }),
 
+      setBotDraft: (key, draft) =>
+        set((state) => {
+          const current = state.botDrafts[key];
+          if (!draft.text.trim() && draft.files.length === 0) {
+            if (!current) return state;
+            const { [key]: _removed, ...botDrafts } = state.botDrafts;
+            return { botDrafts };
+          }
+          if (current?.text === draft.text && current.files === draft.files) return state;
+          return { botDrafts: { ...state.botDrafts, [key]: draft } };
+        }),
+
       deleteThread: (id) =>
         set((state) => {
           // A deleted thread leaves every saved view it appeared in; a view
@@ -3723,6 +3755,7 @@ export const useOrionStore = create<OrionState>()(
         // (pruneOrphanComposerDrafts); the head loaded here may be partial.
         merged.composerDrafts =
           merged.composerDrafts && typeof merged.composerDrafts === 'object' ? merged.composerDrafts : {};
+        merged.botDrafts = merged.botDrafts && typeof merged.botDrafts === 'object' ? merged.botDrafts : {};
         // Saved views outlive their threads on disk, so they get the same
         // treatment: drop dead ids, and drop any view that is no longer a
         // split. Stores written before saved views existed have none.
