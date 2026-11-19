@@ -49,6 +49,7 @@
     "test:ui-improvements": "node --no-warnings --experimental-strip-types scripts/test-ui-improvements.mjs",
     "test:code-tab": "node --no-warnings --experimental-strip-types scripts/test-code-tab.mjs",
     "test:no-project": "bun scripts/test-no-project.ts",
+    "test:project-order": "bun scripts/test-project-order.ts",
     "test:sidebar-v2": "bun scripts/test-sidebar-v2.ts && bun scripts/test-sidebar-v2-update.ts && bun scripts/test-sidebar-v2-update.ts --failed-backfill",
     "test:thread-transcripts": "bun scripts/test-thread-transcripts.ts",
     "test:workspace-sync-threads": "node --no-warnings scripts/test-workspace-sync-threads.mjs",

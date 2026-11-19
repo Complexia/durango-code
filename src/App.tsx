@@ -227,6 +227,7 @@ import { withThreadStartReservation } from './app/turnStart';
 import { buildMcpMentionsContext, mergeMcpAttachments, parseMcpMentions } from './app/orionMcps';
 import { ORION_MCPS_CHANGED_EVENT } from './app/McpsSettings';
 import { getThreadActivityTime } from './app/time';
+import { sortProjectsByLatestThreadStart } from './app/projectOrder';
 import {
   deriveTitle,
   getGoalTitleSeed,
@@ -1756,26 +1757,13 @@ const App: React.FC = () => {
     .map((part) => part[0]?.toUpperCase())
     .join('');
 
-  // Order projects by their most recently active thread (same activity signal
-  // as the Recent agents list) so current work stays at the top. Projects with
-  // no threads sort last, keeping their insertion order. Merely selecting a
-  // project does not reorder the sidebar.
-  const sortedProjects = useMemo(() => {
-    const lastActivityByProject = new Map<string, number>();
-    for (const thread of threads) {
-      const ts = getThreadActivityTime(thread).getTime();
-      const prev = lastActivityByProject.get(thread.projectId) ?? -Infinity;
-      if (ts > prev) lastActivityByProject.set(thread.projectId, ts);
-    }
-    return [...projects].sort(
-      (a, b) => (lastActivityByProject.get(b.id) ?? -Infinity) - (lastActivityByProject.get(a.id) ?? -Infinity)
-    );
-  }, [projects, threads]);
+  // Projects where a thread was most recently started come first (see
+  // sortProjectsByLatestThreadStart); selecting a project doesn't reorder it.
+  const sortedProjects = useMemo(() => sortProjectsByLatestThreadStart(projects, threads), [projects, threads]);
 
   // The Recent agents section spans every project, so its "new thread" button
-  // has no project of its own: it targets the project the last thread ran in.
-  // sortedProjects is already ordered by most recent thread activity, so that
-  // is simply the topmost project in the sidebar.
+  // has no project of its own: it targets the topmost project in the sidebar,
+  // the one where a thread was most recently started.
   const recentAgentsTargetProject = sortedProjects[0] ?? null;
 
   // Subagent threads live in the in-thread subagents bar, not the sidebar.

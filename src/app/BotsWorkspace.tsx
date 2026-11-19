@@ -46,6 +46,7 @@ import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
+import { sortProjectsByLatestThreadStart } from './projectOrder';
 import { useSidebarResize } from './useSidebarResize';
 import {
   botInboxSource,
@@ -310,10 +311,11 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   }, [threads]);
 
   // The projects window: projects open here (each with its bot once it
-  // exists), then project bots of projects open elsewhere.
+  // exists), the one where a thread was most recently started first, then
+  // project bots of projects open elsewhere.
   const projectEntries = useMemo<ProjectEntry[]>(() => {
     const list = bots ?? [];
-    const here = projects.map((project) => {
+    const here = sortProjectsByLatestThreadStart(projects, threads).map((project) => {
       const key = projectKeys[project.id] ?? null;
       return { id: project.id, name: project.name, path: project.path, bot: projectBotFor(list, key ?? undefined), key, threads: threadsByProject.get(project.id) ?? [] };
     });
@@ -322,7 +324,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       .filter((bot) => bot.project && !shown.has(bot.id))
       .map((bot) => ({ id: `bot:${bot.id}`, name: bot.project!.name, path: null, bot, key: bot.project!.key, threads: [] }));
     return [...here, ...elsewhere];
-  }, [bots, projectKeys, projects, threadsByProject]);
+  }, [bots, projectKeys, projects, threads, threadsByProject]);
 
   const openBot = (botId: string) => setSidebarV3Settings({ selectedBotId: botId, view: 'bot' });
   // A thread opened from a project page shows in the usual thread view (the
