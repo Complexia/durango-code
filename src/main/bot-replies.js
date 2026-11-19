@@ -5,6 +5,7 @@ import path from 'node:path';
 import { DurangoError } from './durango-client.js';
 import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
+import { SHIP_VIA_THREAD_MESSAGE } from './bot-thread-tools.js';
 
 // Bot replies: a Durango bot's reply, run here on the person's own Claude Code.
 //
@@ -153,7 +154,8 @@ export const botProjectsNote = ({ projects, accessMode, threads }) => {
   ];
   if (threads) {
     lines.push(
-      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. Write complete instructions: the thread sees nothing of this conversation (the project\'s notes are added for it). See where a project stands with list_threads and read_thread (the person\'s threads too), and steer a thread with message_thread (a follow-up turn there, reported back like a task).'
+      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. Write complete instructions: the thread sees nothing of this conversation (the project\'s notes are added for it). See where a project stands with list_threads and read_thread (the person\'s threads too), and steer a thread with message_thread (a follow-up turn there, reported back like a task).',
+      `To ship a change (land, deploy, merge, release), message the thread that made it (message_thread; its id is in the task report) with something like "${SHIP_VIA_THREAD_MESSAGE}": it knows how its project ships. A thread on another of the person's machines: delegate_task with \`thread_id\` (and no \`project\`). Land or deploy yourself only when the person explicitly tells you to.`
     );
   }
   return lines.join('\n');
@@ -936,7 +938,7 @@ export const createBotReplyWorker = ({
         startProjectThread({
           projectId: target.project.id,
           // The project's notes first (Durango keeps them), then the work.
-          prompt: `${created.brief ? `${created.brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${lane.botName}" that asked for this.`,
+          prompt: `${created.brief ? `${created.brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome (with the change id and its URL, if you opened one): it goes back to the bot "${lane.botName}" that asked for this.`,
           key: created.taskId,
           botName: lane.botName,
           title: created.title || title,
@@ -954,6 +956,7 @@ export const createBotReplyWorker = ({
         taskId: created.taskId,
         title: created.title || title,
         project: target.project.name,
+        ...(started.threadId ? { threadId: started.threadId } : {}),
         status: 'running',
         note: 'A Durango Code thread is working on it in that project on this computer; the person can watch it in the app. Its report will arrive in your inbox.',
       };
@@ -979,7 +982,7 @@ export const createBotReplyWorker = ({
       const started = await Promise.resolve(
         startThreadFollowUp({
           threadId: entry.id,
-          prompt: `${message}\n\n(From the bot "${lane.botName}": end with a concise report of the outcome; it goes back to the bot.)`,
+          prompt: `${message}\n\n(From the bot "${lane.botName}": end with a concise report of the outcome, with the change id and its URL if there is one; it goes back to the bot.)`,
           key: created.taskId,
           botName: lane.botName,
           accessMode: settings.accessMode,
@@ -1001,6 +1004,20 @@ export const createBotReplyWorker = ({
           if (name === 'read_thread') return { result: await threadTools.read(input ?? {}) };
           if (!startThreadFollowUp) return { result: { ok: false, error: 'Follow-ups are not available here.' } };
           return { result: await messageThreadHere(input ?? {}, toolCallId) };
+        } catch (error) {
+          return { result: { ok: false, error: error?.message ?? String(error) } };
+        }
+      }
+      // delegate_task with `thread_id` (a follow-up in an existing thread, e.g.
+      // to ship its change): a thread here is a message_thread; one on another
+      // machine goes to Durango, which sends it there.
+      if (name === 'delegate_task' && String(input?.thread_id ?? '').trim()) {
+        const here = threadTools && startThreadFollowUp ? await threadTools.findThread(input.thread_id).catch(() => null) : null;
+        if (!here) return callServerTool({ name, input, toolCallId });
+        try {
+          return {
+            result: await messageThreadHere({ thread_id: here.entry.id, message: input.instructions, title: input.title }, toolCallId),
+          };
         } catch (error) {
           return { result: { ok: false, error: error?.message ?? String(error) } };
         }

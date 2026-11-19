@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoModelIdForClaude } from './bot-replies.js';
-import { BOT_THREAD_TOOLS } from './bot-thread-tools.js';
+import { BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, withThreadReportFooter } from './bot-thread-tools.js';
 
 // Local bots: Durango bots that live on this device, for people who aren't
 // signed in to Durango. Same semantics as Durango's bots (always-on
@@ -67,6 +67,8 @@ Schedules (manage_routine): when the person wants something done regularly or at
 Other bots:
 - The person can have many bots, each with its own job (e.g. a job hunter, a news digest). When they want a standing helper for an ongoing job, create one with create_bot: a clear name, a precise job, and usually a routine. Tell them it exists and what it will do.
 - Talk to another bot with message_bot (asynchronous: its answer comes back to your inbox later) and check on it with read_bot. Don't micromanage: bots run on their own.
+
+${BOT_SHIPPING_RULE}
 
 Acting for the person: draft first and confirm before anything irreversible or public (sending email or messages, posting, buying, applying, deleting), unless they told you to go ahead for that kind of thing.`;
 
@@ -1227,7 +1229,7 @@ export const createLocalBotEngine = ({
     const started = await Promise.resolve(
       startProjectThread({
         projectId: project.id,
-        prompt: `${brief ? `${brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this.`,
+        prompt: `${brief ? `${brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome (with the change id and its URL, if you opened one): it goes back to the bot "${entry.bot.name}" that asked for this.`,
         key,
         botName: entry.bot.name,
         title: task.title,
@@ -1509,6 +1511,7 @@ export const createLocalBotEngine = ({
               taskId: task.id,
               title: task.title,
               project: task.project,
+              ...(task.threadId ? { threadId: task.threadId } : {}),
               status: 'running',
               note: 'A Durango Code thread is working on it in that project; the person can watch it in the app. Its report will arrive in your inbox.',
             };
@@ -1649,13 +1652,13 @@ export const createLocalBotEngine = ({
           const message = str(input.message).trim();
           if (!message) throw new Error('message_thread needs a message.');
           const runtime = runtimeFor(self.bot.id);
-          const task = { id: newId('lt'), title: clip(oneLine(input.title) || `Follow-up: ${thread.title || 'thread'}`, 80), project: null, startedAt: now() };
+          const task = { id: newId('lt'), title: clip(oneLine(input.title) || `Follow-up: ${thread.title || 'thread'}`, 80), project: null, threadId: thread.id, startedAt: now() };
           const key = `${self.bot.id}:${task.id}`;
           runtime.threads.set(key, task);
           const started = await Promise.resolve(
             startThreadFollowUp({
               threadId: thread.id,
-              prompt: `${message}\n\n(From the bot "${self.bot.name}": end with a concise report of the outcome; it goes back to the bot.)`,
+              prompt: `${message}\n\n(From the bot "${self.bot.name}": end with a concise report of the outcome, with the change id and its URL if there is one; it goes back to the bot.)`,
               key,
               botName: self.bot.name,
               accessMode: getAccessMode() || 'read-only',
@@ -1859,10 +1862,12 @@ export const createLocalBotEngine = ({
       runtime.threads.delete(str(key));
       const title = task?.title ?? 'Durango Code thread';
       const where = task?.project ? `the Durango Code thread in ${task.project}` : 'the Durango Code thread';
+      // Which thread it was, so the bot can follow up there (e.g. to ship the change).
+      const thread = { threadId: str(threadId).trim() || task?.threadId || '', project: task?.project ?? null };
       const report =
         outcome === 'finished'
-          ? `${str(summary).trim() || 'The thread finished without a written summary.'}\n\n(From ${where}${threadId ? `, ${threadId}` : ''}.)`
-          : `The task couldn't finish (${where}): ${clip(oneLine(error) || 'the thread stopped.', 300)}`;
+          ? withThreadReportFooter(str(summary).trim() || 'The thread finished without a written summary.', thread)
+          : withThreadReportFooter(`The task couldn't finish (${where}): ${clip(oneLine(error) || 'the thread stopped.', 300)}`, thread);
       appendInbox(entry, { content: report, authorLabel: inboxLabel('task', title) });
       return { ok: true };
     },

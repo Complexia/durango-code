@@ -459,7 +459,7 @@ test('delegate_task with a project starts a Durango Code thread; its outcome is 
 
   await engine.threadSettled({ key: started[0].key, threadId: 'thread_9', outcome: 'finished', summary: 'The Clerk webhook secret is wrong.' });
   await waitFor(() => runner.lanes.length === 3, { label: 'reply to the thread report' });
-  assert.match(runner.lanes[2].lane.prompt, /\[Task: Debug signups\]:\nThe Clerk webhook secret is wrong\.\n\n\(From the Durango Code thread in Durango, thread_9\.\)/);
+  assert.match(runner.lanes[2].lane.prompt, /\[Task: Debug signups\]:\nThe Clerk webhook secret is wrong\.\n\n\(Durango Code thread thread_9, project Durango\. Follow up there, e\.g\. to ship it, with message_thread thread_id "thread_9"\.\)/);
   runner.lanes[2].finish({ text: 'Found it.' });
   await engine.idle();
   assert.deepEqual(await engine.threadSettled({ key: 'gone:lt_x', outcome: 'failed' }), { ok: false });

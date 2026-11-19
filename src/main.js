@@ -88,7 +88,7 @@ import {
 } from './main/durango-dispatch.js';
 import { createBotReplyWorker, createClaudeLaneRunner, createClaudeOneShot, normalizeBotSettings } from './main/bot-replies.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
-import { createBotThreadTools } from './main/bot-thread-tools.js';
+import { createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
 import {
   createDeployWatcher,
   createSourceConfigFetcher,
@@ -4786,9 +4786,18 @@ const botReplyWorker = createBotReplyWorker({
 // Reports a bot task's thread outcome to Durango, retrying a few times.
 // `retry: true` = it never got through (offline, signed out): the renderer
 // keeps the outcome unreported and tries again later.
-const reportBotTaskThread = async ({ taskId, outcome, summary, error }) => {
+// The report ends with the thread's id (and this machine), so the bot can
+// follow up there with message_thread, e.g. to ship the change it made.
+const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error }) => {
   const machineId = await getDurangoDeviceId().catch(() => null);
   if (!machineId || !taskId) return { ok: false, retry: true };
+  if (threadId) {
+    const thread = { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true };
+    // Kept short enough that Durango's clip of the report never cuts the footer.
+    const head = (text) => String(text ?? '').trim().slice(0, 10_000);
+    if (outcome === 'finished') summary = withThreadReportFooter(head(summary) || 'The Durango Code thread finished without a written summary.', thread);
+    else error = withThreadReportFooter(head(error) || 'it stopped.', thread);
+  }
   for (const delay of [0, 2_000, 10_000, 30_000]) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try {
@@ -5032,6 +5041,7 @@ ipcMain.handle('durango:dispatchSettled', (_event, input) =>
   typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(BOT_TASK_DISPATCH_PREFIX)
     ? reportBotTaskThread({
         taskId: input.dispatchId.slice(BOT_TASK_DISPATCH_PREFIX.length),
+        threadId: typeof input?.threadId === 'string' ? input.threadId : undefined,
         outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
         summary: typeof input?.summary === 'string' ? input.summary : undefined,
         error: typeof input?.error === 'string' ? input.error : undefined,

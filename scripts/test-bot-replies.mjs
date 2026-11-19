@@ -23,7 +23,7 @@ import {
   normalizeBotSettings,
   saveLaneAttachments,
 } from '../src/main/bot-replies.js';
-import { createBotThreadTools } from '../src/main/bot-thread-tools.js';
+import { createBotThreadTools, threadReportFooter, withThreadReportFooter } from '../src/main/bot-thread-tools.js';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-bot-replies-'));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -763,6 +763,63 @@ try {
     assert.equal(results.fails.ok, false);
     assert.equal(results.fails.error, 'No window.');
     assert.deepEqual(reports, [{ taskId: 'task_3', machineId: 'machine-1', outcome: 'failed', error: 'No window.' }], 'a thread that never started is reported failed');
+  });
+
+  await test('delegate_task with thread_id: a thread here gets a follow-up (e.g. to ship it); one elsewhere goes to Durango', async () => {
+    const client = createFakeClient({ claim: laneClaims([makeLane()]) });
+    const tasks = [];
+    client.createBotLaneTask = async (input) => {
+      tasks.push(input);
+      return { taskId: `task_${tasks.length}`, title: input.title };
+    };
+    const followUps = [];
+    const threadTools = createBotThreadTools({
+      readIndex: async () => ({ entries: [{ id: 'thread_here', projectId: 'p1', title: 'Fix spinner', status: 'idle', activityAt: 1 }] }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }],
+    });
+    let results;
+    startWorker(
+      {
+        client,
+        getMachineInfo: async () => ({ name: 'Roma MacBook', projects: [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }], models: [] }),
+        startProjectThread: async () => ({ ok: true, threadId: 'unused' }),
+        startThreadFollowUp: async (input) => {
+          followUps.push(input);
+          return { ok: true };
+        },
+        threadTools,
+        runLane: async (lane, ctx) => {
+          const call = (input) => ctx.callTool({ name: 'delegate_task', input, toolCallId: 't' }).then((out) => out.result);
+          results = {
+            here: await call({ title: 'Ship it', instructions: 'Ship this change now.', thread_id: 'thread_here', project: 'Durango' }),
+            elsewhere: await call({ title: 'Ship there', instructions: 'Ship this change now.', thread_id: 'thread_on_omarchy' }),
+          };
+          return { text: 'Shipping.' };
+        },
+      },
+      { accessMode: 'workspace-write' }
+    );
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(results.here.ok, true);
+    assert.equal(results.here.threadId, 'thread_here');
+    assert.equal(followUps.length, 1, 'a follow-up in the existing thread, not a new thread');
+    assert.equal(followUps[0].threadId, 'thread_here');
+    assert.match(followUps[0].prompt, /^Ship this change now\.\n\n\(From the bot/);
+    assert.equal(tasks[0].title, 'Ship it');
+    assert.equal(tasks[0].project, undefined);
+    assert.deepEqual(client.calls.tool.map((call) => call.input.thread_id), ['thread_on_omarchy'], 'a thread not here: Durango sends it to its machine');
+  });
+
+  await test('thread reports end with the thread id for message_thread', () => {
+    assert.equal(threadReportFooter({}), '');
+    assert.equal(
+      threadReportFooter({ threadId: 't1', project: 'Site', machine: 'Mac' }),
+      '(Durango Code thread t1, project Site, on Mac. Follow up there, e.g. to ship it, with message_thread thread_id "t1".)'
+    );
+    assert.match(threadReportFooter({ threadId: 't1', cloud: true }), /or delegate_task thread_id "t1" from the cloud/);
+    assert.equal(withThreadReportFooter('Done.', { threadId: 't1' }), 'Done.\n\n(Durango Code thread t1. Follow up there, e.g. to ship it, with message_thread thread_id "t1".)');
+    assert.equal(withThreadReportFooter('Done.', {}), 'Done.');
   });
 
   await test('thread tools: only allowed projects, newest first, by project name; reads resolve unique ids', async () => {
