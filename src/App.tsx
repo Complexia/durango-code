@@ -176,6 +176,7 @@ import {
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
 import { dispatchProjectsPayload, durangoDispatchOutcome } from './app/durangoDispatch';
+import { threadStartedByBot } from './app/botSettle';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
 import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
@@ -8899,6 +8900,10 @@ const App: React.FC = () => {
             }
           }
           if (title) updateThread(threadId, { title });
+          // A bot's thread: that bot may settle it once its work is finished (settle_thread).
+          if (dispatch.origin === 'bot') {
+            updateThread(threadId, { startedByBot: dispatchSource.replace(/^your bot /, '').slice(0, 80) || 'bot' });
+          }
           const accessLabel =
             accessModeOptions.find((option) => option.value === requestedAccessMode)?.label ?? 'Read only';
           const askedForEdits = dispatch.requestedAccessMode === 'auto-edit' && requestedAccessMode === 'read-only';
@@ -9149,6 +9154,40 @@ const App: React.FC = () => {
         }
         const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
         if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+        // A bot's settle_thread: only a thread a bot started (threadStartedByBot),
+        // only to settle it, and never while a turn runs or is starting.
+        if (command.botOnly) {
+          if (!sidebarState.settledAt || Object.keys(sidebarState).length !== 1) {
+            return { ok: false, threadId, error: 'A bot can only settle a thread.' };
+          }
+          const messages = thread.startedByBot
+            ? null
+            : await ensureThreadTranscript(threadId)
+                .then((transcript) => transcript?.messages ?? [])
+                .catch(() => []);
+          // Looked at again after the load: a turn may have started meanwhile.
+          const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+          if (!current) return { ok: false, error: 'Thread not found on this machine.' };
+          if (!threadStartedByBot(current, messages)) {
+            return { ok: false, threadId, error: 'Only a thread a bot started can be settled by a bot; this one was started by the person or elsewhere.' };
+          }
+          if (
+            current.status === 'running' ||
+            pendingTurnStartsRef.current.has(threadId) ||
+            Boolean(activeRunsByThreadRef.current[threadId])
+          ) {
+            return { ok: false, threadId, error: 'That thread is running a turn: settle it only once its work is finished.' };
+          }
+          if (current.settledAt) return { ok: true, threadId };
+          updateThread(threadId, {
+            settledAt: sidebarState.settledAt,
+            snoozedAt: undefined,
+            wokeAt: undefined,
+            wokeReason: undefined,
+            finishedUnseenAt: undefined,
+          });
+          return { ok: true, threadId };
+        }
         const updates: Partial<Thread> = {};
         if (sidebarState.settledAt) {
           // Like settleThread: a running thread stays in the sidebar.

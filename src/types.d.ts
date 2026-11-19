@@ -512,6 +512,8 @@ export type RemoteCommandRequest = {
     kind: 'runTurn' | 'stopTurn' | 'steerTurn' | 'addProject' | 'answerQuestion' | 'userAction' | 'threadState';
     /** threadState: settle, snooze or pin the thread (null = undo); absent keys stay. */
     sidebarState?: import('./store').ThreadSidebarState;
+    /** threadState from a bot (settle_thread): only a thread a bot started. */
+    botOnly?: boolean;
     /** answerQuestion: which question, and the answers per question id. */
     runId?: string;
     requestId?: string | number;

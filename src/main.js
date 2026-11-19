@@ -4648,7 +4648,12 @@ const dispatchWorker = createDispatchWorker({
       source: { machineId: 'durango-chat', machineName: dispatchSourceLabel(dispatch) },
       durangoDispatch: {
         id: dispatch.id,
-        origin: dispatch.origin === 'tasks' || dispatch.origin === 'api' ? dispatch.origin : 'chat',
+        origin:
+          typeof dispatch.bot === 'string' && dispatch.bot.trim()
+            ? 'bot'
+            : dispatch.origin === 'tasks' || dispatch.origin === 'api'
+              ? dispatch.origin
+              : 'chat',
         sourceLabel: dispatchSourceLabel(dispatch),
         followUp: Boolean(threadId),
         taskId: dispatch.taskId,
@@ -4743,10 +4748,23 @@ const startBotThreadFollowUp = (prefix) => async ({ threadId, prompt, key, botNa
 };
 
 // list_threads / read_thread over this machine's threads in the projects bots may use.
+// settle_thread files a thread away as the person's Settle button does; the
+// renderer refuses one no bot started (botOnly) or one running a turn.
 const botThreadTools = createBotThreadTools({
   readIndex: () => readThreadsIndex(),
   readThread: (args) => readThreadForAgent(args),
   getProjects: () => botProjects(),
+  settleThread: (threadId) =>
+    requestDispatchRendererCommand(
+      {
+        kind: 'threadState',
+        threadId,
+        sidebarState: { settledAt: new Date().toISOString() },
+        botOnly: true,
+        source: { machineId: 'durango-bot', machineName: 'your bot' },
+      },
+      30_000
+    ),
 });
 
 // This machine's bot presence (name, projects with their keys, Claude

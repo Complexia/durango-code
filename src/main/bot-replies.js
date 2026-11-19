@@ -6,6 +6,29 @@ import { DurangoError } from './durango-client.js';
 import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
 import { SHIP_VIA_THREAD_MESSAGE } from './bot-thread-tools.js';
+
+// What a settle from Durango (the claim's settleThreads) can't ever do here:
+// acknowledged at once. Anything else (no window, a save that failed) is
+// tried again on later polls, up to SETTLE_ATTEMPTS times.
+const SETTLE_FINAL_ERROR =
+  /^No thread |matches several threads|a bot started|can only settle|running a turn|still running|runs on another machine|not found on this machine|not available here/i;
+const SETTLE_ATTEMPTS = 5;
+
+// A Durango bot's settle_thread on a machine: as on Durango, it can name the
+// machine that has the thread (used when it isn't this one).
+const withRunOn = (definition) =>
+  definition?.name === 'settle_thread'
+    ? {
+        ...definition,
+        inputSchema: {
+          ...definition.inputSchema,
+          properties: {
+            ...definition.inputSchema.properties,
+            run_on: { type: 'string', maxLength: 80, description: 'The machine that has it (list_machines), when it is not this one and you know it.' },
+          },
+        },
+      }
+    : definition;
 import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles } from './bot-reply-extras.js';
 import {
   BOT_SESSION_RESET_TOKENS,
@@ -174,7 +197,7 @@ export const botProjectsNote = ({ projects, accessMode, threads }) => {
   ];
   if (threads) {
     lines.push(
-      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), and steer a thread with message_thread (a follow-up turn there, reported back like a task).',
+      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), steer a thread with message_thread (a follow-up turn there, reported back like a task), and settle a thread a bot started with settle_thread once its work is truly finished.',
       `To ship a change (land, deploy, merge, release), message the thread that made it (message_thread; its id is in the task report) with something like "${SHIP_VIA_THREAD_MESSAGE}": it knows how its project ships. A thread on another of the person's machines: delegate_task with \`thread_id\` (and no \`project\`). Land or deploy yourself only when the person explicitly tells you to.`
     );
   }
@@ -875,8 +898,9 @@ const isLaneGone = (error) =>
  *   caller (POST …/bots/tasks/:taskId/report, key = the task id)
  * - startThreadFollowUp({ threadId, prompt, key, botName, accessMode }): a follow-up turn
  *   in an existing thread here, reported the same way (message_thread)
- * - threadTools: createBotThreadTools(...) (bot-thread-tools.js): list_threads and
- *   read_thread here; with startThreadFollowUp, message_thread
+ * - threadTools: createBotThreadTools(...) (bot-thread-tools.js): list_threads,
+ *   read_thread and settle_thread here; with startThreadFollowUp, message_thread. Its
+ *   settle also handles the claim's settleThreads (settle_thread from the cloud)
  * - stopThread(threadId, taskId): stops that task's run in a thread here (a task cancelled on Durango; a later turn is left alone)
  * - uploadReplyFile({ path, name, size }): uploads a file the reply attached to the
  *   person's library → its asset `{ id, name, kind }` (POST /api/v1/bots/attachments)
@@ -927,6 +951,44 @@ export const createBotReplyWorker = ({
   const awaitingThread = new Map(); // task id -> until when (its thread isn't known yet)
   const stopping = new Set();
   const stopAcks = new Set();
+  // settle_thread from a reply elsewhere (the cloud, another machine): Durango
+  // hands the thread ids to every machine that may have them (the claim's
+  // settleThreads), until each acknowledges. A machine without the thread
+  // acknowledges too; one whose window can't take it now tries again.
+  const settling = new Set();
+  const settleAcks = new Set();
+  const settleAttempts = new Map(); // thread id -> failed attempts so far
+  const settleQueuedThreads = (threadIds, isCurrent = () => true) => {
+    for (const threadId of Array.isArray(threadIds) ? threadIds : []) {
+      if (typeof threadId !== 'string' || !threadId || settling.has(threadId) || settleAcks.has(threadId)) continue;
+      if (!threadTools) {
+        settleAcks.add(threadId);
+        continue;
+      }
+      settling.add(threadId);
+      void Promise.resolve()
+        // Turned off or signed out meanwhile: left for a later poll.
+        .then(() => (isCurrent() ? threadTools.settle({ thread_id: threadId }, { exact: true }) : null))
+        .catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
+        .then((result) => {
+          if (!result) return;
+          const error = String(result.error ?? '');
+          if (!result.ok && !SETTLE_FINAL_ERROR.test(error)) {
+            const attempts = (settleAttempts.get(threadId) ?? 0) + 1;
+            settleAttempts.set(threadId, attempts);
+            while (settleAttempts.size > 100) settleAttempts.delete(settleAttempts.keys().next().value);
+            if (attempts < SETTLE_ATTEMPTS) {
+              log(`settling thread ${threadId} failed (will retry):`, error);
+              return;
+            }
+          }
+          if (!result.ok && !/^No thread /.test(error)) log(`thread ${threadId} not settled:`, error);
+          settleAttempts.delete(threadId);
+          settleAcks.add(threadId);
+        })
+        .finally(() => settling.delete(threadId));
+    }
+  };
   const stopTaskThread = (taskId, threadId) => {
     if (stopping.has(taskId)) return;
     stopping.add(taskId);
@@ -1222,6 +1284,17 @@ export const createBotReplyWorker = ({
     };
 
     const callTool = async ({ name, input, toolCallId }) => {
+      // settle_thread: a thread here is settled here; one elsewhere goes to
+      // Durango, which hands it to the machine that has it.
+      if (name === 'settle_thread') {
+        const here = threadTools ? await threadTools.findThread(input?.thread_id).catch(() => null) : null;
+        if (!here) return callServerTool({ name, input, toolCallId });
+        try {
+          return { result: await threadTools.settle({ ...(input ?? {}), thread_id: here.entry.id }) };
+        } catch (error) {
+          return { result: { ok: false, error: error?.message ?? String(error) } };
+        }
+      }
       if (threadTools && (name === 'list_threads' || name === 'read_thread' || name === 'message_thread')) {
         try {
           if (name === 'list_threads') return { result: await threadTools.list(input ?? {}) };
@@ -1263,7 +1336,11 @@ export const createBotReplyWorker = ({
       try {
         // Threads in a project start here (delegate_task `project`); the
         // thread tools read and follow up this machine's threads.
-        outcome = await runLane({ ...lane, threads: 'machine', tools: threadTools ? [...lane.tools, ...threadTools.definitions] : lane.tools }, {
+        // This machine's thread tools replace Durango's of the same name (settle_thread).
+        const tools = threadTools
+          ? [...lane.tools.filter((tool) => !threadTools.names.includes(tool?.name)), ...threadTools.definitions.map(withRunOn)]
+          : lane.tools;
+        outcome = await runLane({ ...lane, threads: 'machine', tools }, {
           signal: abort.signal,
           accessMode: settings.accessMode,
           update,
@@ -1376,17 +1453,20 @@ export const createBotReplyWorker = ({
         const machineId = await getMachineId();
         const info = await Promise.resolve(getMachineInfo()).catch(() => null);
         const acks = [...stopAcks];
+        const settled = [...settleAcks];
         claimed = await client.claimBotLane({
           machineId,
           platform,
           ...(info ? { machine: presenceOf(info) } : {}),
           ...(acks.length ? { ackStopTasks: acks } : {}),
+          ...(settled.length ? { ackSettleThreads: settled } : {}),
           // Replies come as a structured conversation (lane.session): kept sessions.
           features: [BOT_SESSIONS_FEATURE],
           waitMs: claimWaitMs,
           signal,
         });
         for (const id of acks) stopAcks.delete(id);
+        for (const id of settled) settleAcks.delete(id);
         failures = 0;
       } catch (error) {
         if (!current() || isAbort(error)) continue;
@@ -1398,6 +1478,7 @@ export const createBotReplyWorker = ({
         continue;
       }
       stopCancelledTasks(claimed?.stopTasks);
+      if (current()) settleQueuedThreads(claimed?.settleThreads, current);
       // No bots on the account: nothing to answer, so check back much later
       // (wake() — a bot made or messaged here — or a sign-in restarts sooner).
       if (claimed?.idleMs) {

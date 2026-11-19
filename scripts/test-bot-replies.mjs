@@ -820,6 +820,120 @@ try {
     assert.deepEqual(client.calls.tool.map((call) => call.input.thread_id), ['thread_on_omarchy'], 'a thread not here: Durango sends it to its machine');
   });
 
+  await test('settle_thread: a thread here is settled here (its tool replaces Durango\'s); one elsewhere goes to Durango', async () => {
+    const client = createFakeClient({ claim: laneClaims([makeLane({ tools: [{ name: 'settle_thread', description: 'cloud', inputSchema: {} }, { name: 'web_search', description: 'x', inputSchema: {} }] })]) });
+    const settled = [];
+    const threadTools = createBotThreadTools({
+      readIndex: async () => ({ entries: [{ id: 'thread_here', projectId: 'p1', title: 'Fix spinner', status: 'idle', activityAt: 1 }] }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }],
+      settleThread: async (threadId) => {
+        settled.push(threadId);
+        return { ok: true };
+      },
+    });
+    let results;
+    let toolNames;
+    let settleSchema;
+    startWorker({
+      client,
+      threadTools,
+      runLane: async (lane, ctx) => {
+        toolNames = lane.tools.map((tool) => tool.name);
+        settleSchema = lane.tools.find((tool) => tool.name === 'settle_thread' && tool.description !== 'cloud').inputSchema;
+        const call = (input) => ctx.callTool({ name: 'settle_thread', input, toolCallId: 't' }).then((out) => out.result);
+        results = { here: await call({ thread_id: 'thread_here', reason: 'landed' }), elsewhere: await call({ thread_id: 'thread_on_omarchy' }) };
+        return { text: 'Settled.' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(toolNames.filter((name) => name === 'settle_thread').length, 1, 'one settle_thread: this machine\'s');
+    assert.ok(settleSchema.properties.run_on, 'a Durango bot can still name the machine that has it');
+    assert.ok(toolNames.includes('web_search'));
+    assert.equal(results.here.ok, true);
+    assert.deepEqual(settled, ['thread_here']);
+    assert.deepEqual(client.calls.tool.map((call) => call.input.thread_id), ['thread_on_omarchy'], 'a thread not here: Durango queues it for its machine');
+  });
+
+  await test('settle requests from Durango: settled here once, acknowledged on the next claim (unknown threads too); a closed window retries', async () => {
+    // Like Durango: every poll hands out what the machine hasn't acknowledged yet.
+    let pending = ['thread_here', 'thread_elsewhere', 'thread_later', 'thread_saved', 'thread_h', 'thread_refused'];
+    const client = createFakeClient({
+      claim: async (input) => {
+        pending = pending.filter((id) => !(input.ackSettleThreads ?? []).includes(id));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { lane: null, settleThreads: [...pending] };
+      },
+    });
+    const calls = [];
+    let windowOpen = false;
+    const threadTools = createBotThreadTools({
+      readIndex: async () => ({
+        entries: [
+          { id: 'thread_here', projectId: 'p1', title: 'Done', status: 'idle', activityAt: 1 },
+          { id: 'thread_later', projectId: 'p1', title: 'Later', status: 'idle', activityAt: 2 },
+          { id: 'thread_saved', projectId: 'p1', title: 'Save fails once', status: 'idle', activityAt: 3 },
+          { id: 'thread_refused', projectId: 'p1', title: 'The person\'s own', status: 'idle', activityAt: 4 },
+        ],
+      }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }],
+      settleThread: async (threadId) => {
+        calls.push(threadId);
+        if (threadId === 'thread_later' && !windowOpen) {
+          windowOpen = true;
+          return { ok: false, error: 'Open a Durango Code window on this Mac to run agents from Durango Chat.' };
+        }
+        if (threadId === 'thread_saved' && calls.filter((id) => id === 'thread_saved').length === 1) {
+          return { ok: false, error: 'The remote command changed the host, but its thread state could not be saved.' };
+        }
+        if (threadId === 'thread_refused') {
+          return { ok: false, error: 'Only a thread a bot started can be settled by a bot; this one was started by the person or elsewhere.' };
+        }
+        return { ok: true };
+      },
+    });
+    startWorker({ client, threadTools });
+    await waitFor(() => client.calls.claim.some((call) => call.ackSettleThreads?.includes('thread_later')), { label: 'later ack' });
+    await waitFor(() => client.calls.claim.some((call) => call.ackSettleThreads?.includes('thread_saved')), { label: 'saved ack' });
+    await waitFor(() => pending.length === 0, { label: 'all acknowledged' });
+    assert.equal(calls.filter((id) => id === 'thread_saved').length, 2, 'a save that failed is tried again, not dropped');
+    assert.equal(calls.filter((id) => id === 'thread_refused').length, 1, 'a refusal is final: acknowledged, not retried');
+    assert.equal(calls.includes('thread_here') && !calls.includes('thread_h'), true, 'a short id from Durango never matches a thread by prefix');
+    assert.ok(client.calls.claim.some((call) => call.ackSettleThreads?.includes('thread_here') && call.ackSettleThreads.includes('thread_elsewhere')));
+    assert.equal(calls.filter((id) => id === 'thread_here').length, 1, 'a request handed out again before its ack isn\'t settled twice');
+    assert.equal(calls.filter((id) => id === 'thread_later').length, 2, 'retried after the window failure');
+    assert.equal(calls.includes('thread_elsewhere'), false, 'not a thread here: only acknowledged');
+  });
+
+  await test('thread tools: settle needs the thread in an allowed project, never while it runs', async () => {
+    const settled = [];
+    const tools = createBotThreadTools({
+      readIndex: async () => ({
+        entries: [
+          { id: 'idle1', projectId: 'p1', title: 'Idle', status: 'idle' },
+          { id: 'run1', projectId: 'p1', title: 'Running', status: 'idle' },
+          { id: 'hidden', projectId: 'secret', title: 'Not allowed', status: 'idle' },
+        ],
+      }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Site', path: '/x/site' }],
+      liveStatus: (id) => (id === 'run1' ? 'running' : null),
+      settleThread: async (threadId) => {
+        settled.push(threadId);
+        return threadId === 'idle1' ? { ok: true } : { ok: false, error: 'Only a thread a bot started can be settled by a bot.' };
+      },
+    });
+    assert.equal((await tools.settle({ thread_id: 'idle1' })).ok, true);
+    assert.match((await tools.settle({ thread_id: 'run1' })).error, /running a turn/);
+    await assert.rejects(tools.settle({ thread_id: 'hidden' }), /No thread/);
+    await assert.rejects(tools.settle({ thread_id: 'idle' }, { exact: true }), /No thread/, 'a request from Durango needs the full id');
+    assert.deepEqual(settled, ['idle1']);
+    assert.equal((await tools.settle({ thread_id: 'idle' })).ok, true, 'the bot\'s own call may use a unique prefix');
+    const noSettle = createBotThreadTools({ readIndex: async () => ({ entries: [] }), readThread: async () => '', getProjects: () => [] });
+    assert.match((await noSettle.settle({ thread_id: 'x' })).error, /not available/);
+  });
+
   await test('thread reports end with the thread id for message_thread', () => {
     assert.equal(threadReportFooter({}), '');
     assert.equal(

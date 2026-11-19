@@ -755,6 +755,9 @@ try {
   await test('API runs: labelled with the key, follow-ups say "Sent from"', () => {
     assert.equal(dispatchSourceLabel({ origin: 'api', sourceLabel: 'Grok (MCP)' }), 'Grok (MCP) via Durango');
     assert.equal(dispatchSourceLabel({ origin: 'api', sourceLabel: null }), 'the Durango API');
+    // A cloud bot's machine task shows as started by that bot (and the bot may settle its thread).
+    assert.equal(dispatchSourceLabel({ origin: 'chat', bot: 'Durango' }), 'your bot Durango');
+    assert.equal(dispatchSourceLabel({ origin: 'chat', bot: '  ' }), 'Durango Chat');
     assert.equal(buildDispatchPrompt({ origin: 'api', sourceLabel: 'Grok (MCP)', prompt: 'Fix it', sourceChat: null }), '[Started from Grok (MCP) via Durango]\n\nFix it');
     assert.equal(buildDispatchPrompt({ origin: 'api', sourceLabel: 'Grok (MCP)', threadId: 't1', prompt: 'Add a test', sourceChat: null }), '[Sent from Grok (MCP) via Durango]\n\nAdd a test');
   });
@@ -952,7 +955,7 @@ try {
       json: { dispatch: { id: 'd', prompt: 'p', taskId: null, project: { id: null, name: 'x', repoId: null }, modelId: '', accessMode: 'weird', sourceChat: null, createdAt: 'now' } },
     }));
     const { dispatch } = await client.claimDispatch({ machineId: 'm' });
-    assert.deepEqual(dispatch, { id: 'd', origin: 'chat', prompt: 'p', taskId: null, taskUrl: null, project: { id: null, name: 'x', repoId: null }, modelId: null, reasoningEffort: null, accessMode: null, sourceChat: null, threadId: null, sourceLabel: null, createdAt: 'now' });
+    assert.deepEqual(dispatch, { id: 'd', origin: 'chat', prompt: 'p', taskId: null, taskUrl: null, project: { id: null, name: 'x', repoId: null }, modelId: null, reasoningEffort: null, accessMode: null, sourceChat: null, threadId: null, sourceLabel: null, bot: null, createdAt: 'now' });
     server.on('POST', '/api/v1/code/dispatches/claim', () => ({
       json: { dispatch: { id: 'd2', origin: 'api', prompt: 'more', project: {}, threadId: 'thread-9', sourceLabel: 'Grok (MCP)' } },
     }));
@@ -960,6 +963,10 @@ try {
     assert.equal(followUp.origin, 'api');
     assert.equal(followUp.threadId, 'thread-9');
     assert.equal(followUp.sourceLabel, 'Grok (MCP)');
+    server.on('POST', '/api/v1/code/dispatches/claim', () => ({
+      json: { dispatch: { id: 'd3', prompt: 'fix', project: { name: 'x' }, bot: 'Durango' } },
+    }));
+    assert.equal((await client.claimDispatch({ machineId: 'm' })).dispatch.bot, 'Durango', 'a cloud bot\'s task names its bot');
     server.on('POST', '/api/v1/code/dispatches/x', () => ({ status: 409, json: durangoErrorBody('Another machine claimed this dispatch.', 'claimed_elsewhere') }));
     await assert.rejects(client.reportDispatch('x', { status: 'running' }), (error) => error instanceof DurangoError && error.status === 409 && error.apiCode === 'claimed_elsewhere');
   });

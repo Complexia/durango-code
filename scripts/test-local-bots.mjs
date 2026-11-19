@@ -963,6 +963,32 @@ test('thread tools: list and read threads, message_thread is a follow-up reporte
   await engine.idle();
 });
 
+test('settle_thread: the bot settles a thread it judges finished, with the settle rule in its prompt', async () => {
+  const settles = [];
+  const threadTools = {
+    definitions: [],
+    list: async () => ({ ok: true, threads: [] }),
+    read: async () => ({ ok: true, transcript: '' }),
+    findThread: async () => ({ entry: { id: 'thread_1', title: 'Fix spinner' } }),
+    settle: async (input) => {
+      settles.push(input);
+      return { ok: true, threadId: input.thread_id, settled: true };
+    },
+  };
+  const { engine, runner } = makeEngine({ threadTools });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'The spinner change landed.' });
+  await waitFor(() => runner.lanes.length === 1);
+  const lane = runner.lanes[0];
+  assert.match(lane.lane.systemPrompt, /Settling threads: .*settle_thread/);
+  assert.ok(lane.lane.tools.some((tool) => tool.name === 'settle_thread'));
+  const result = (await lane.ctx.callTool({ name: 'settle_thread', input: { thread_id: 'thread_1', reason: 'landed' }, toolCallId: 't' })).result;
+  assert.equal(result.ok, true);
+  assert.deepEqual(settles, [{ thread_id: 'thread_1', reason: 'landed' }]);
+  lane.finish({ text: 'Settled it.' });
+  await engine.idle();
+});
+
 // --- routines ----------------------------------------------------------------------------
 
 test('manage_routine and routine runs', async () => {

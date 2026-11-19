@@ -303,6 +303,8 @@ export const buildMachinePayload = ({
  * API (labelled with the key's name, e.g. "Grok (MCP)").
  */
 export const dispatchSourceLabel = (dispatch) => {
+  // A bot's task from Durango (a reply in the cloud or on another machine).
+  if (typeof dispatch?.bot === 'string' && dispatch.bot.trim()) return `your bot ${dispatch.bot.trim().slice(0, 80)}`;
   if (dispatch?.origin === 'tasks') return 'Durango Tasks';
   if (dispatch?.origin === 'api') {
     const label = String(dispatch?.sourceLabel ?? '').trim().slice(0, 80);

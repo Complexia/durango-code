@@ -702,6 +702,12 @@ export type Thread = {
   /** Sidebar v2: settled (archived) threads leave the list until restored or run again. */
   settledAt?: string;
   /**
+   * Started by one of the person's bots (its name): a bot may settle it
+   * (settle_thread). Threads from before this was kept carry it only in their
+   * first message ("Started by your bot …").
+   */
+  startedByBot?: string;
+  /**
    * Set on threads imported from a Claude Code or Codex session the user ran
    * outside Orion. The session id doubles as the dedupe key for re-imports;
    * agentSessionIds carries the same id so the next turn resumes it.

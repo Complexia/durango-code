@@ -399,6 +399,8 @@ const normalizeDispatch = (dispatch) => {
     threadId: optional(dispatch.threadId),
     /** Who started an `api` run (the API key's name, e.g. "Grok (MCP)"). */
     sourceLabel: optional(dispatch.sourceLabel),
+    /** Started by one of the person's bots: its name. */
+    bot: optional(dispatch.bot)?.slice(0, 80) ?? null,
     createdAt: optional(dispatch.createdAt),
   };
 };
@@ -711,7 +713,7 @@ export const createDurangoClient = ({
     // --- Bot replies on this machine's Claude Code (bot-replies.js) -----------
     /** Long-poll for a bot reply to run here; `{ lane: null }` when none arrived. Polling marks this machine available. */
     /** `machine`: `{ name, projects: string[], models: string[] }`, this machine's bot presence. */
-    async claimBotLane({ machineId, platform, machine, ackStopTasks, features, waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
+    async claimBotLane({ machineId, platform, machine, ackStopTasks, ackSettleThreads, features, waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
       const wait = clampInt(waitMs, 0, DISPATCH_CLAIM_WAIT_MS, DISPATCH_CLAIM_WAIT_MS);
       const data = await request('POST', '/code/bots/claim', {
         body: {
@@ -719,6 +721,7 @@ export const createDurangoClient = ({
           platform,
           ...(machine ? { machine } : {}),
           ...(ackStopTasks?.length ? { ackStopTasks } : {}),
+          ...(ackSettleThreads?.length ? { ackSettleThreads } : {}),
           ...(features?.length ? { features } : {}),
           waitMs: wait,
         },
@@ -729,6 +732,8 @@ export const createDurangoClient = ({
         lane: normalizeBotLane(data.lane),
         // Cancelled bot tasks whose threads run here: stop them.
         stopTasks: Array.isArray(data.stopTasks) ? data.stopTasks.filter((id) => typeof id === 'string' && id).slice(0, 20) : [],
+        // Threads a bot settled from elsewhere (settle_thread): settle them if they are here.
+        settleThreads: Array.isArray(data.settleThreads) ? data.settleThreads.filter((id) => typeof id === 'string' && id).slice(0, 20) : [],
         // The account has no bots: ask again only after this long.
         ...(Number.isFinite(data.idleMs) && data.idleMs > 0 ? { idleMs: Math.min(data.idleMs, 60 * 60_000) } : {}),
       };

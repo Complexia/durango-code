@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoModelIdForClaude } from './bot-replies.js';
-import { BOT_BRIEF_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, withThreadReportFooter } from './bot-thread-tools.js';
+import { BOT_BRIEF_RULE, BOT_SETTLE_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, withThreadReportFooter } from './bot-thread-tools.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -102,6 +102,8 @@ Other bots:
 ${BOT_BRIEF_RULE}
 
 ${BOT_SHIPPING_RULE}
+
+${BOT_SETTLE_RULE}
 
 Acting for the person: draft first and confirm before anything irreversible or public (sending email or messages, posting, buying, applying, deleting), unless they told you to go ahead for that kind of thing.`;
 
@@ -609,7 +611,7 @@ const defaultSleep = (ms) =>
  *   through threadSettled({ key, … }).
  * - startThreadFollowUp({ threadId, prompt, key, botName, accessMode }): a follow-up turn in
  *   a thread (message_thread), settled the same way
- * - threadTools: createBotThreadTools(...) (list_threads, read_thread, findThread)
+ * - threadTools: createBotThreadTools(...) (list_threads, read_thread, findThread, settle)
  * - notify({ title, body })
  * - now(), sleep(ms) (the parallel-reply delay), log(...), onChange()
  * - setTimer(fn, ms) / clearTimer(handle): the routine timer (setInterval by default)
@@ -1895,6 +1897,10 @@ export const createLocalBotEngine = ({
         case 'read_thread': {
           if (!threadTools) throw new Error('Threads are not available here.');
           return name === 'list_threads' ? await threadTools.list(input) : await threadTools.read(input);
+        }
+        case 'settle_thread': {
+          if (!threadTools) throw new Error('Threads are not available here.');
+          return await threadTools.settle(input);
         }
         case 'message_thread': {
           if (!threadTools || !startThreadFollowUp) throw new Error('Follow-ups are not available here.');

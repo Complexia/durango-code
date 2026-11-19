@@ -5,9 +5,18 @@ import path from 'node:path';
 // this machine's projects, read one, and send a follow-up into one. A
 // follow-up is an ordinary turn in that thread (it runs like a message the
 // person sends), and its outcome comes back to the bot's inbox like a task's.
-// Starting new threads is delegate_task with `project`.
+// Starting new threads is delegate_task with `project`. settle_thread puts
+// away a thread a bot started once the bot judges its work truly finished.
 
-export const BOT_THREAD_TOOL_NAMES = ['list_threads', 'read_thread', 'message_thread'];
+export const BOT_THREAD_TOOL_NAMES = ['list_threads', 'read_thread', 'message_thread', 'settle_thread'];
+
+/**
+ * When a bot settles a thread it started (settle_thread): its own call, from
+ * what the thread reports, never a rule on its status. In every bot's
+ * instructions (local-bots.js, bot-replies.js); Durango's copy is in
+ * chat/andromedus/lib/bots/prompt.ts ("Settling threads").
+ */
+export const BOT_SETTLE_RULE = `Settling threads: a Durango Code thread you started stays in the person's sidebar until it is settled. Settle it yourself (settle_thread) only when you judge its work truly finished from what it reports: the change landed or merged, the release went out, the question was answered and nothing is left to do. Leave it unsettled while it is still running or waiting on something (a watcher, a deploy, a long run), while a change is open for review, when it asks the person something or needs their input, or when you aren't sure: "done" in a report alone doesn't mean finished. Settling only files it away (a new message brings it back); it never stops or deletes anything.`;
 
 // What a bot sends the thread that made a change when the person asks to
 // ship it (land, deploy, merge, release). How a project ships is its own (the
@@ -94,6 +103,19 @@ export const BOT_THREAD_TOOLS = [
       required: ['thread_id', 'message'],
     },
   },
+  {
+    name: 'settle_thread',
+    description:
+      "Settle a Durango Code thread a bot started (by id, from a task report): it leaves the person's sidebar list for Settled, like their own Settle button, and comes back if it gets a new message. Call it when you judge, from what the thread reported, that its work is truly finished (e.g. its change landed or merged, the release went out), not while it is running, waiting on something, open for review or needs the person. Only threads a bot started can be settled, and not while a turn runs.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread_id: { type: 'string', minLength: 1, maxLength: 200 },
+        reason: { type: 'string', maxLength: 300, description: 'Why it is finished, in a few words (e.g. "change landed and deployed").' },
+      },
+      required: ['thread_id'],
+    },
+  },
 ];
 
 const projectKey = (value) => String(value ?? '').trim().toLowerCase();
@@ -106,21 +128,24 @@ const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
  * - readThread(args): transcript page text (thread-reader.js readThreadForAgent)
  * - getProjects(): this machine's projects the bot may use ([{ id, name, path }])
  * - liveStatus(threadId): the renderer's status for a thread now, or null (optional)
+ * - settleThread(threadId): settles a thread a bot started, as the person's Settle button
+ *   does → { ok, error? } (optional; main.js asks the renderer, which refuses a thread
+ *   no bot started or one running a turn)
  */
-export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveStatus = () => null }) => {
+export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveStatus = () => null, settleThread = null }) => {
   const projectsById = async () => {
     const list = (await Promise.resolve(getProjects()).catch(() => [])) ?? [];
     return new Map(list.filter((project) => project && typeof project.id === 'string').map((project) => [project.id, project]));
   };
 
-  /** The thread (by exact id or a unique prefix) if it belongs to an allowed project. */
-  const findThread = async (rawId) => {
+  /** The thread (by exact id, or a unique prefix unless `exact`) if it belongs to an allowed project. */
+  const findThread = async (rawId, { exact = false } = {}) => {
     const id = String(rawId ?? '').trim();
     if (!id) throw new Error('thread_id is required.');
     const [{ entries }, projects] = await Promise.all([readIndex(), projectsById()]);
     const visible = entries.filter((entry) => !entry.subagent && projects.has(entry.projectId));
     const matches = visible.filter((entry) => entry.id === id);
-    const found = matches.length ? matches : visible.filter((entry) => entry.id.startsWith(id));
+    const found = matches.length || exact ? matches : visible.filter((entry) => entry.id.startsWith(id));
     if (found.length !== 1) {
       throw new Error(found.length ? `"${id}" matches several threads: use the full id.` : `No thread "${id}" in this computer's projects.`);
     }
@@ -166,6 +191,22 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
         ...(Number.isInteger(input.limit) ? { limit: input.limit } : {}),
       });
       return { ok: true, transcript: text };
+    },
+    /**
+     * settle_thread: a thread here a bot started, once the bot judges its work
+     * finished. `exact`: the full id only (a request from Durango, which every
+     * machine of the person may get).
+     */
+    async settle(input = {}, { exact = false } = {}) {
+      if (!settleThread) return { ok: false, error: 'Settling threads is not available here.' };
+      const { entry } = await findThread(input.thread_id, { exact });
+      // The renderer refuses a running thread too (the index's status can be stale).
+      if (liveStatus(entry.id) === 'running') {
+        return { ok: false, error: 'That thread is running a turn: settle it only once its work is finished.' };
+      }
+      const result = await Promise.resolve(settleThread(entry.id)).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+      if (!result?.ok) return { ok: false, error: result?.error || 'The thread could not be settled.' };
+      return { ok: true, threadId: entry.id, settled: true, note: 'Settled: it moved to Settled in the sidebar; a new message brings it back.' };
     },
   };
 };
