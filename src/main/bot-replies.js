@@ -29,8 +29,7 @@ const withRunOn = (definition) =>
         },
       }
     : definition;
-import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles } from './bot-reply-extras.js';
-import { createReplyText } from './bot-reply-text.js';
+import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles, messageMediaOf } from './bot-reply-extras.js';
 import {
   BOT_SESSION_RESET_TOKENS,
   contextTokensOf,
@@ -84,6 +83,15 @@ export const normalizeBotSettings = (raw) => {
 };
 /** Claim feature: this machine keeps a Claude Code session per bot (bot-sessions.js). */
 export const BOT_SESSIONS_FEATURE = 'bot-sessions';
+// Claim feature: replies go out as messages (the job's `messages`): text a
+// reply writes before a tool call is sent as its own message when the call
+// starts, and the text after its last tool call is its final answer.
+export const BOT_REPLY_MESSAGES_FEATURE = 'reply-messages';
+// A reply's messages before its final answer, at most (Durango's
+// BOT_REPLY_MESSAGES_MAX): past it, the text goes into the final answer.
+export const BOT_REPLY_MESSAGES_MAX = 30;
+/** The id of a reply's `index`-th message before its final answer (Durango's botReplyMessageId). */
+export const botReplyMessageId = (replyMessageId, index) => `${replyMessageId}_m${String(index).padStart(2, '0')}`;
 export const BOT_MAX_LANES = 3;
 export const BOT_MCP_SERVER = 'durango_bot';
 export const BOT_PROGRESS_THROTTLE_MS = 1_000;
@@ -380,9 +388,17 @@ export const createClaudeOneShot = ({
  * lane.session: the conversation, structured (normalizeLaneSession); without
  * it, lane.prompt is sent as is (in a fresh session, cut to the size limit).
  *
- * → (lane, ctx) => { text, modelId, failure?, retryElsewhere?, aborted?, usage?, compact? }
+ * → (lane, ctx) => { text, sent, modelId, failure?, retryElsewhere?, aborted?, usage?, compact? }
  * ctx: { signal, accessMode, update({ text, activeTool }), takeInbox(): Promise<items>,
- *        callTool({ name, input, toolCallId }): Promise<{ result }> }
+ *        callTool({ name, input, toolCallId, message }): Promise<{ result }>,
+ *        sendMessage?({ index, text, modelId }): Promise<boolean> }
+ * With `sendMessage`, the reply is the messages it sends: the text written
+ * before a tool call goes out as message `index` (0, 1, …) when the call
+ * starts, and `text` is the final answer (what it wrote after its last tool
+ * call; `sent` messages came before it). `update` shows the message being
+ * written now; `callTool`'s `message` is the index of the message the call
+ * was made with (null: made before any text of its own, so it goes with the
+ * next message). Without it (a task), `text` is everything the reply wrote.
  * `compact`: the bot's history should be compacted (its kept session grew too large, or
  * compaction fell behind).
  */
@@ -441,7 +457,9 @@ export const createClaudeLaneRunner = ({
       async (args) => {
         const toolCallId = toolUseIds.get(definition.name)?.shift() || randomId();
         try {
-          const { result } = await ctx.callTool({ name: definition.name, input: args ?? {}, toolCallId });
+          // The message this call was made with is sent (and known) first.
+          const message = await messageOfCall(toolCallId);
+          const { result } = await ctx.callTool({ name: definition.name, input: args ?? {}, toolCallId, message });
           return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result ?? null) }] };
         } catch (error) {
           return {
@@ -524,15 +542,86 @@ export const createClaudeLaneRunner = ({
   }
   const withAttachments = (prompt) => (attachmentsNote ? `${prompt}\n\n${attachmentsNote}` : prompt);
 
-  // --- reply text and the tool running -----------------------------------------------
-  const blocks = []; // text blocks of the main loop's assistant messages
+  // --- the reply's messages and the tool running ---------------------------------------
+  // With ctx.sendMessage the reply is the messages it sends, like texting: the
+  // text of a step that calls a tool goes out as its own message when the
+  // call starts (an acknowledgement, a progress update); what it writes after
+  // its last tool call is its final answer. Nothing is joined or left out
+  // afterwards. Without it (a task), everything it writes is one text.
+  const sendsMessages = typeof ctx.sendMessage === 'function';
+  const blocks = []; // finished text blocks of the message being written (main loop)
   let partial = ''; // the text block streaming now
   const toolCalls = new Map(); // tool_use id -> tool name (main loop)
-  // Text before a tool call shows too: an update the reply writes again
-  // (e.g. after show_actions) shows once, from when that block is finished
-  // (bot-reply-text.js); the block streaming now shows as it comes.
-  const replyText = createReplyText();
-  const currentText = () => replyText.text(blocks, partial);
+  let sentCount = 0; // messages sent before the final answer
+  const unsent = []; // index -> text of a message that couldn't be sent: it goes out with the final answer
+  let sending = Promise.resolve(); // every send and file lookup so far
+  const fileLookups = []; // files the sent messages point at, being added
+  let stepId = null; // the main-loop step streaming now (its assistant message id)
+  let stepMessage = null; // the index of the message the step's text went out as
+  const callMessages = new Map(); // tool_use id -> that index (null: no text of its own)
+  const callWaiters = new Map(); // tool_use id -> resolve, for a handler that ran before the loop saw its call
+  let modelOfReply = lane.model ?? null;
+  const pendingText = () =>
+    blocks
+      .map((part) => String(part ?? '').trim())
+      .filter(Boolean)
+      .join('\n\n');
+  // The message being written now (live): its finished blocks and the one streaming.
+  const currentText = () => [pendingText(), partial.trim()].filter(Boolean).join('\n\n');
+  // Sends the message written so far as one of its own → its index, or null (nothing to send).
+  const sendPending = () => {
+    if (!sendsMessages || sentCount >= BOT_REPLY_MESSAGES_MAX) return null;
+    const text = pendingText();
+    if (!text) return null;
+    const index = sentCount;
+    sentCount += 1;
+    blocks.length = 0;
+    const modelId = durangoModelIdForClaude(modelOfReply);
+    // Screenshots and files it names are attached (with its final answer, or
+    // its last message); their local embeds leave the text.
+    const media = attaches ? messageMediaOf(text) : { text, paths: [] };
+    if (media.paths.length) fileLookups.push(replyFiles.add(media.paths, { quiet: true }).catch(() => []));
+    // Handed over now, before the reply writes on: its place and the live text
+    // move on to the next message only once this one is stored.
+    let result;
+    try {
+      result = Promise.resolve(ctx.sendMessage({ index, text: media.text, ...(modelId ? { modelId } : {}) }));
+    } catch {
+      result = Promise.resolve(false);
+    }
+    const stored = result.then(
+      (ok) => ok !== false,
+      () => false
+    );
+    sending = Promise.all([
+      sending,
+      stored.then((ok) => {
+        if (!ok) unsent[index] = text;
+      }),
+    ]);
+    return index;
+  };
+  const noteToolCall = (id) => {
+    if (!callMessages.has(id)) callMessages.set(id, stepMessage);
+    callWaiters.get(id)?.();
+    callWaiters.delete(id);
+  };
+  // The message a tool call was made with, once it was sent (the loop may not have seen the call yet).
+  const messageOfCall = async (toolCallId) => {
+    if (!sendsMessages) return null;
+    if (!callMessages.has(toolCallId)) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 2_000);
+        timer.unref?.();
+        callWaiters.set(toolCallId, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    await sending;
+    return callMessages.get(toolCallId) ?? null;
+  };
   const activeTool = () => {
     const names = [...toolCalls.values()];
     return names.length ? botToolLabel(names[names.length - 1]) : null;
@@ -659,7 +748,7 @@ export const createClaudeLaneRunner = ({
         const mainLoop = !message?.parent_tool_use_id;
         if (message?.type === 'system' && message.subtype === 'init') {
           attempt.sawInit = true;
-          if (typeof message.model === 'string' && message.model) attempt.model = message.model;
+          if (typeof message.model === 'string' && message.model) attempt.model = modelOfReply = message.model;
           if (typeof message.session_id === 'string' && message.session_id) attempt.sessionId = message.session_id;
           continue;
         }
@@ -685,6 +774,10 @@ export const createClaudeLaneRunner = ({
             // A new step: take what arrived meanwhile, read at its next tool result.
             void requestInbox();
           }
+          if (!synthetic && id !== stepId) {
+            stepId = id;
+            stepMessage = null;
+          }
           if (!synthetic && message.message?.usage) attempt.contextTokens = contextTokensOf(message.message.usage);
           for (const block of Array.isArray(message.message?.content) ? message.message.content : []) {
             if (block?.type === 'text' && !synthetic) {
@@ -693,6 +786,9 @@ export const createClaudeLaneRunner = ({
             } else if (block?.type === 'tool_use' && block.id) {
               attempt.usedTools = true;
               toolCalls.set(block.id, block.name);
+              // The step's text is a message of its own, sent as its first call starts.
+              if (stepMessage === null) stepMessage = sendPending();
+              noteToolCall(block.id);
             }
           }
           if (synthetic) partial = '';
@@ -722,6 +818,8 @@ export const createClaudeLaneRunner = ({
           const items = takePending();
           if (!items.length) break;
           attempt.result = null;
+          // What it answered so far is a message of its own; the reply goes on.
+          sendPending();
           update();
           inputQueue.push(userMessage(formatBotInbox(items)));
         }
@@ -757,6 +855,7 @@ export const createClaudeLaneRunner = ({
     !succeeded(attempt) &&
     !ctx.signal?.aborted &&
     !currentText().trim() &&
+    sentCount === 0 &&
     !attempt.usedTools &&
     !attempt.rateLimited &&
     !RETRY_ELSEWHERE_ASSISTANT_ERRORS.has(attempt.assistantError) &&
@@ -799,7 +898,14 @@ export const createClaudeLaneRunner = ({
               model: lane.model ?? null,
               seenSeqs: [...plan.seenSeqs, ...deliveredSeqs].slice(-4_000),
               // This reply, as the thread stores it (its message id).
-              seenIds: [...plan.seenIds, lane.replyMessageId || lane.laneId].filter(Boolean).slice(-4_000),
+              // …and the messages it sent before its final answer.
+              seenIds: [
+                ...plan.seenIds,
+                ...Array.from({ length: sentCount }, (_, index) => botReplyMessageId(lane.replyMessageId || lane.laneId, index)),
+                lane.replyMessageId || lane.laneId,
+              ]
+                .filter(Boolean)
+                .slice(-4_000),
               contextKeys: plan.contextKeys,
               contextTokens: attempt.contextTokens,
               replies: plan.mode === 'resume' ? (claimed.state?.replies ?? 0) + 1 : 1,
@@ -826,16 +932,21 @@ export const createClaudeLaneRunner = ({
   const compact = Boolean(plan.compact || (attempt.contextTokens && attempt.contextTokens > sessionResetTokens));
   const extras = { ...(usage ? { usage: { ...usage, ...sessionInfo } } : {}), ...(compact ? { compact: true } : {}) };
 
-  const written = currentText();
+  // The final answer: what it wrote after its last message, after any message that couldn't be sent.
+  await sending;
+  await Promise.all(fileLookups);
+  const written = [...unsent.filter(Boolean), currentText()].filter((text) => text.trim()).join('\n\n');
   const modelId = durangoModelIdForClaude(attempt.model);
   const withModel = modelId ? { modelId } : {};
-  if (ctx.signal?.aborted) return { text: written, aborted: true, ...withModel, ...extras };
+  // Messages it sent before its final answer.
+  const withSent = sentCount ? { sent: sentCount } : {};
+  if (ctx.signal?.aborted) return { text: written, aborted: true, ...withSent, ...withModel, ...extras };
   // Screenshots the text names are attached too; their /tmp embeds leave the text.
   const { text, files } = attaches
     ? await finishReplyFiles(written, replyFiles).catch(() => ({ text: written, files: replyFiles.list() }))
     : { text: written, files: [] };
   const withFiles = files.length ? { files } : {};
-  if (succeeded(attempt)) return { text, ...withFiles, ...withModel, ...extras };
+  if (succeeded(attempt)) return { text, ...withSent, ...withFiles, ...withModel, ...extras };
 
   const { result, thrown, assistantError } = attempt;
   const resultErrors = Array.isArray(result?.errors) ? result.errors.filter(Boolean).join('; ') : '';
@@ -850,12 +961,12 @@ export const createClaudeLaneRunner = ({
   // older Claude Code that doesn't have the model, an API error) loses nothing
   // by moving: the next place (another machine or the cloud) answers instead.
   const retryElsewhere =
-    !text.trim() ||
+    (!text.trim() && sentCount === 0) ||
     attempt.rateLimited ||
     RETRY_ELSEWHERE_ASSISTANT_ERRORS.has(assistantError) ||
     (Boolean(thrown) && !attempt.sawInit) ||
     isRetryElsewhereError(`${reason}\n${attempt.stderrTail}`);
-  return { text, failure: shorten(reason), retryElsewhere, ...withFiles, ...withModel, ...extras };
+  return { text, failure: shorten(reason), retryElsewhere, ...withSent, ...withFiles, ...withModel, ...extras };
 };
 
 // --- the worker ------------------------------------------------------------------------
@@ -1182,7 +1293,7 @@ export const createBotReplyWorker = ({
       entry.throttleTimer.unref?.();
     };
 
-    const callServerTool = ({ name, input, toolCallId }) =>
+    const callServerTool = ({ name, input, toolCallId, message }) =>
       withRetries(() =>
         client.callBotLaneTool({
           laneId: lane.laneId,
@@ -1191,9 +1302,46 @@ export const createBotReplyWorker = ({
           name,
           input,
           toolCallId,
+          // The message it was made with: a card it shows goes on it.
+          ...(Number.isInteger(message) ? { message } : {}),
           signal: abort.signal,
         })
       );
+
+    // One of the reply's messages before its final answer, in order with the
+    // progress posts (the live text after it shows only what follows it).
+    // → whether it was stored.
+    const sendMessage = ({ index, text, modelId }) => {
+      const next = entry.chain.then(async () => {
+        if (abort.signal.aborted) return false;
+        try {
+          const response = await withRetries(() =>
+            client.sendBotLaneMessage({
+              laneId: lane.laneId,
+              botId: lane.botId,
+              machineId,
+              index,
+              text,
+              ...(modelId ? { modelId } : {}),
+            })
+          );
+          if (response?.stop) {
+            stopLane();
+            return false;
+          }
+          return response?.ok !== false;
+        } catch (error) {
+          if (isLaneGone(error) || (error instanceof DurangoError && error.code === 'not_signed_in')) stopLane();
+          else log(`message ${index} of ${lane.laneId} failed:`, error?.message ?? error);
+          return false;
+        }
+      });
+      entry.chain = next.then(
+        () => [],
+        () => []
+      );
+      return next;
+    };
 
     // delegate_task in one of this machine's projects: a Durango Code thread
     // here, started by this app (no agent dispatch needed); Durango records
@@ -1284,7 +1432,7 @@ export const createBotReplyWorker = ({
       return { ok: true, taskId: created.taskId, threadId: entry.id, status: 'running', note: 'The thread is working on it; the outcome will arrive in your inbox.' };
     };
 
-    const callTool = async ({ name, input, toolCallId }) => {
+    const callTool = async ({ name, input, toolCallId, message }) => {
       // settle_thread: a thread here is settled here; one elsewhere goes to
       // Durango, which hands it to the machine that has it.
       if (name === 'settle_thread') {
@@ -1328,7 +1476,7 @@ export const createBotReplyWorker = ({
           return { result: { ok: false, error: error?.message ?? String(error) } };
         }
       }
-      return callServerTool({ name, input, toolCallId });
+      return callServerTool({ name, input, toolCallId, message });
     };
 
     let outcome;
@@ -1347,6 +1495,8 @@ export const createBotReplyWorker = ({
           update,
           takeInbox: () => send(true),
           callTool,
+          // A Durango that stores a reply's messages one by one (the job's `messages`).
+          ...(lane.messages ? { sendMessage } : {}),
         });
       } catch (error) {
         const reason = error?.message ?? String(error);
@@ -1363,13 +1513,15 @@ export const createBotReplyWorker = ({
       } else {
         const text = String(outcome?.text ?? '').trim();
         const failure = outcome?.failure ? shorten(outcome.failure) : null;
+        // Messages it already sent (their files go on the last one).
+        const sent = Number.isInteger(outcome?.sent) ? outcome.sent : 0;
         body =
           outcome?.retryElsewhere && !text
             ? { text: '', retryElsewhere: true, ...(failure ? { failure } : {}) }
             : { text, ...(failure ? { failure } : {}) };
         if (outcome?.modelId) body.modelId = outcome.modelId;
-        // Its files go up now, in parallel; one that doesn't is named under the text.
-        if (!body.retryElsewhere && body.text && outcome?.files?.length && uploadReplyFile) {
+        // Its files go up now, in parallel (on its final answer, or its last message); one that doesn't is named under the text.
+        if (!body.retryElsewhere && (body.text || sent) && outcome?.files?.length && uploadReplyFile) {
           const uploads = await Promise.all(
             outcome.files.map((file) =>
               Promise.resolve()
@@ -1385,7 +1537,7 @@ export const createBotReplyWorker = ({
           if (assets.length) body.files = assets;
           if (failed.length) {
             log(`attaching ${failed.length} file(s) to ${lane.laneId} failed:`, failed.map((item) => item.error).join('; '));
-            body.text = `${body.text}\n\n_Couldn't attach ${failed.map((item) => item.file.name).join(', ')}._`;
+            body.text = [body.text, `_Couldn't attach ${failed.map((item) => item.file.name).join(', ')}._`].filter(Boolean).join('\n\n');
           }
         }
         // Token usage (logged by Durango) and whether the bot's history should be compacted now.
@@ -1461,8 +1613,9 @@ export const createBotReplyWorker = ({
           ...(info ? { machine: presenceOf(info) } : {}),
           ...(acks.length ? { ackStopTasks: acks } : {}),
           ...(settled.length ? { ackSettleThreads: settled } : {}),
-          // Replies come as a structured conversation (lane.session): kept sessions.
-          features: [BOT_SESSIONS_FEATURE],
+          // Replies come as a structured conversation (lane.session): kept sessions;
+          // and go out as messages (lane.messages).
+          features: [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE],
           waitMs: claimWaitMs,
           signal,
         });

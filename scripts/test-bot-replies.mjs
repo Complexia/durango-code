@@ -14,6 +14,7 @@ import { buildMachinePayload, createDispatchWorker } from '../src/main/durango-d
 import {
   BOT_INBOX_HEADER,
   BOT_REPLIES_CAPABILITY,
+  BOT_REPLY_MESSAGES_FEATURE,
   BOT_SESSIONS_FEATURE,
   createBotSessionStore,
   botProjectsNote,
@@ -25,7 +26,6 @@ import {
   normalizeBotSettings,
   saveLaneAttachments,
 } from '../src/main/bot-replies.js';
-import { blockRepeats, createReplyText, replyTextOf } from '../src/main/bot-reply-text.js';
 import { createBotThreadTools, threadReportFooter, withThreadReportFooter } from '../src/main/bot-thread-tools.js';
 import { cutMiddle, estimateTextTokens, maxPromptTokensFromEnv, planBotPrompt } from '../src/main/bot-sessions.js';
 
@@ -126,7 +126,7 @@ const delta = (text) => ({ type: 'stream_event', parent_tool_use_id: null, event
 
 /** A fake Durango client recording every call; handlers are overridable. */
 const createFakeClient = (overrides = {}) => {
-  const calls = { claim: [], progress: [], tool: [], finish: [] };
+  const calls = { claim: [], progress: [], tool: [], finish: [], message: [], order: [] };
   const client = {
     calls,
     async claimBotLane(input) {
@@ -143,6 +143,7 @@ const createFakeClient = (overrides = {}) => {
     },
     async reportBotLaneProgress(input) {
       calls.progress.push(input);
+      calls.order.push(`progress:${input.text ?? ''}`);
       return overrides.progress ? overrides.progress(input, calls.progress.length) : { stop: false, inbox: [] };
     },
     async callBotLaneTool(input) {
@@ -152,6 +153,11 @@ const createFakeClient = (overrides = {}) => {
     async finishBotLane(input) {
       calls.finish.push(input);
       return { ok: true, stored: true };
+    },
+    async sendBotLaneMessage(input) {
+      calls.message.push(input);
+      calls.order.push(`message:${input.index}`);
+      return { ok: true, stop: false };
     },
   };
   return client;
@@ -622,54 +628,224 @@ try {
     assert.deepEqual(client.calls.finish[0], { laneId: 'lane_1', botId: 'bot_1', machineId: 'machine-1', text: 'x'.repeat(30) });
   });
 
-  await test('an update written again after a tool call shows once; progress lines stay', async () => {
-    const report = 'Done: chg_abc12345xyz fixes the sidebar dots. The fast checks passed and the screenshot is /tmp/dots.png.';
-    const again = '**Done:** chg_abc12345xyz fixes the sidebar dots.\n\nThe fast checks passed and the screenshot is /tmp/dots.png. Tap Ship when it looks right.';
+  // A reply that acknowledges, reports progress, then answers with buttons (and adds a line after them).
+  const ackProgressAnswer = (answer) => async function* ({ next, options, tools }) {
+    await next();
+    yield init('claude-opus-5-5');
+    yield assistant('a1', [{ type: 'text', text: 'On it, checking the change.' }]);
+    yield assistant('a1', [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }]);
+    yield toolResult('tu1');
+    yield assistant('a2', [{ type: 'thinking', thinking: '…' }]);
+    yield assistant('a2', [{ type: 'text', text: 'The checks passed. Writing it up.' }]);
+    yield assistant('a2', [{ type: 'tool_use', id: 'tu2', name: 'Read', input: {} }]);
+    yield toolResult('tu2');
+    yield assistant('a3', [{ type: 'text', text: answer }]);
+    yield assistant('a3', [{ type: 'tool_use', id: 'tu3', name: 'mcp__durango_bot__show_actions', input: {} }]);
+    await options.hooks.PreToolUse[0].hooks[0]({ tool_name: 'mcp__durango_bot__show_actions', tool_use_id: 'tu3', tool_input: {} });
+    await tools.show_actions.handler({ actions: [] });
+    yield toolResult('tu3');
+    yield assistant('a4', [{ type: 'text', text: 'Buttons are below.' }]);
+    yield success();
+  };
+  const actionsLane = (overrides = {}) =>
+    makeLane({ tools: [{ name: 'show_actions', description: 'Buttons', inputSchema: { type: 'object', properties: { actions: { type: 'array' } } } }], ...overrides });
+  const answer = 'Done: chg_abc12345xyz fixes the sidebar dots. The fast checks passed.';
+
+  await test('a reply is the messages it sends: acknowledgement, progress, the answer with its buttons, then what it wrote last', async () => {
     const live = [];
+    const sent = [];
+    const calls = [];
+    const outcome = await sdkRunner(createFakeSdk(ackProgressAnswer(answer)))(actionsLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: ({ text }) => live.push(text),
+      takeInbox: async () => [],
+      callTool: async (call) => {
+        calls.push(call);
+        return { result: { ok: true } };
+      },
+      sendMessage: async (message) => {
+        sent.push(message);
+        return true;
+      },
+    });
+    assert.deepEqual(
+      sent.map(({ index, text }) => [index, text]),
+      [
+        [0, 'On it, checking the change.'],
+        [1, 'The checks passed. Writing it up.'],
+        [2, answer],
+      ]
+    );
+    assert.equal(sent[0].modelId, 'anthropic/claude-opus-5.5');
+    assert.equal(calls[0].message, 2, 'the buttons go on the answer they were made with');
+    assert.equal(outcome.text, 'Buttons are below.', 'the text after the last tool call is the final answer, as written');
+    assert.equal(outcome.sent, 3);
+    assert.equal(live[0], 'On it, checking the change.', 'the acknowledgement shows at once');
+    assert.ok(!live.some((text) => text.includes('On it') && text.includes('checks passed')), 'the live text is only the message being written');
+  });
+
+  await test('the answer written before show_actions is never lost when nothing follows it', async () => {
+    const sent = [];
+    const sdk = createFakeSdk(async function* ({ next, options, tools }) {
+      await next();
+      yield init();
+      yield assistant('a1', [{ type: 'text', text: answer }, { type: 'tool_use', id: 'tu1', name: 'mcp__durango_bot__show_actions', input: {} }]);
+      await options.hooks.PreToolUse[0].hooks[0]({ tool_name: 'mcp__durango_bot__show_actions', tool_use_id: 'tu1', tool_input: {} });
+      await tools.show_actions.handler({ actions: [] });
+      yield toolResult('tu1');
+      yield assistant('a2', [{ type: 'thinking', thinking: 'done' }]);
+      yield success();
+    });
+    const calls = [];
+    const outcome = await sdkRunner(sdk)(actionsLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: () => {},
+      takeInbox: async () => [],
+      callTool: async (call) => {
+        calls.push(call);
+        return { result: { ok: true } };
+      },
+      sendMessage: async (message) => {
+        sent.push(message.text);
+        return true;
+      },
+    });
+    assert.deepEqual(sent, [answer]);
+    assert.equal(calls[0].message, 0);
+    assert.equal(outcome.text, '');
+    assert.equal(outcome.sent, 1);
+  });
+
+  await test('cards made before any text go with the next message; a message that could not be sent goes out with the final answer', async () => {
+    const sdk = createFakeSdk(async function* ({ next, options, tools }) {
+      await next();
+      yield init();
+      yield assistant('a1', [{ type: 'text', text: 'Looking.' }, { type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }]);
+      yield toolResult('tu1');
+      yield assistant('a2', [{ type: 'tool_use', id: 'tu2', name: 'mcp__durango_bot__show_actions', input: {} }]);
+      await options.hooks.PreToolUse[0].hooks[0]({ tool_name: 'mcp__durango_bot__show_actions', tool_use_id: 'tu2', tool_input: {} });
+      await tools.show_actions.handler({ actions: [] });
+      yield toolResult('tu2');
+      yield assistant('a3', [{ type: 'text', text: answer }]);
+      yield success();
+    });
+    const calls = [];
+    const outcome = await sdkRunner(sdk)(actionsLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: () => {},
+      takeInbox: async () => [],
+      callTool: async (call) => {
+        calls.push(call);
+        return { result: { ok: true } };
+      },
+      sendMessage: async () => false,
+    });
+    assert.equal(calls[0].message, null, 'no text of its own: the next message');
+    assert.equal(outcome.text, `Looking.\n\n${answer}`, 'nothing is lost when a message fails to send');
+  });
+
+  await test('a message is handed over before the reply writes on, even when storing it is slow', async () => {
+    const log = [];
+    let release;
+    const slow = new Promise((resolve) => (release = resolve));
     const sdk = createFakeSdk(async function* ({ next }) {
       await next();
-      yield init('claude-opus-5-5');
-      yield assistant('a1', [{ type: 'text', text: 'Checking that now.' }]);
-      yield assistant('a1', [{ type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }]);
+      yield init();
+      yield assistant('a1', [{ type: 'text', text: 'Checking.' }, { type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }]);
       yield toolResult('tu1');
-      yield assistant('a2', [{ type: 'text', text: report }]);
-      yield assistant('a2', [{ type: 'tool_use', id: 'tu2', name: 'mcp__durango_bot__show_actions', input: {} }]);
-      yield toolResult('tu2');
-      yield assistant('a3', [{ type: 'text', text: again }]);
+      yield delta('Answer');
+      yield assistant('a2', [{ type: 'text', text: 'Answer.' }]);
+      release(true);
       yield success();
     });
     const outcome = await sdkRunner(sdk)(makeLane(), {
       signal: new AbortController().signal,
       accessMode: 'full-access',
-      update: ({ text }) => live.push(text),
+      update: ({ text }) => log.push(`update:${text}`),
       takeInbox: async () => [],
       callTool: async () => ({ result: { ok: true } }),
+      sendMessage: (message) => {
+        log.push(`send:${message.text}`);
+        return slow;
+      },
     });
-    assert.equal(outcome.text, `Checking that now.\n\n${again}`);
-    assert.equal(live[0], 'Checking that now.', 'the progress line shows at once');
-    assert.ok(live.includes(`Checking that now.\n\n${report}`), 'the first update shows while the tool runs');
-    assert.equal(blockRepeats('Checking that now.', report), false);
-    assert.equal(replyTextOf(['Looking.', 'Found three.', '']), 'Looking.\n\nFound three.');
+    const sendAt = log.indexOf('send:Checking.');
+    const answerAt = log.findIndex((entry) => entry.startsWith('update:Answer'));
+    assert.ok(sendAt >= 0 && sendAt < answerAt, log.join(' | '));
+    assert.equal(outcome.text, 'Answer.');
   });
 
-  await test('reply text: only real repeats are left out; streaming text always shows', () => {
-    const billing = 'The billing deployment passed all required checks in staging and is ready for review.';
-    const search = 'The search deployment passed all required checks in staging and is ready for review.';
-    assert.equal(replyTextOf([billing, search]), `${billing}\n\n${search}`, 'reports about different things both stay');
-    assert.equal(
-      replyTextOf(['Build passed.', 'Tests failed.', 'Build passed. Tests failed.', 'Build passed. Release ready with no further issues.']),
-      'Tests failed.\n\nBuild passed. Tests failed.\n\nBuild passed. Release ready with no further issues.',
-      'a block is left out only for a shown block that repeats it (no chains)'
+  await test('without sendMessage (a task, an older Durango) everything written is one text', async () => {
+    const outcome = await sdkRunner(createFakeSdk(ackProgressAnswer(answer)))(actionsLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: () => {},
+      takeInbox: async () => [],
+      callTool: async (call) => {
+        assert.equal(call.message, null);
+        return { result: { ok: true } };
+      },
+    });
+    assert.equal(outcome.text, `On it, checking the change.\n\nThe checks passed. Writing it up.\n\n${answer}\n\nButtons are below.`);
+    assert.equal(outcome.sent, undefined);
+  });
+
+  await test('a machine reply sends its messages to Durango in order, its cards on them, then the final answer', async () => {
+    const client = createFakeClient({ claim: laneClaims([actionsLane({ messages: true })]) });
+    startWorker({ client, runLane: sdkRunner(createFakeSdk(ackProgressAnswer(answer))) });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE]);
+    assert.deepEqual(
+      client.calls.message.map(({ index, text }) => [index, text]),
+      [
+        [0, 'On it, checking the change.'],
+        [1, 'The checks passed. Writing it up.'],
+        [2, answer],
+      ]
     );
-    assert.equal(replyTextOf(['Checking that now.', 'As I said, checking that now was quick.']), 'Checking that now.\n\nAs I said, checking that now was quick.');
-    const replyText = createReplyText();
-    const blocks = ['Checking that now.', billing];
-    assert.equal(replyText.text(blocks, 'The billing deployment'), `Checking that now.\n\n${billing}\n\nThe billing deployment`, 'the block streaming now shows as it comes');
-    blocks.push(`${billing} Ship it when ready.`);
-    assert.equal(replyText.text(blocks, ''), `Checking that now.\n\n${billing} Ship it when ready.`, 'once finished, the earlier copy goes');
-    blocks.length = 0;
-    blocks.push('Fresh start.');
-    assert.equal(replyText.text(blocks, ''), 'Fresh start.', 'a cleared and refilled list is read again');
+    assert.equal(client.calls.tool[0].message, 2);
+    assert.equal(client.calls.finish[0].text, 'Buttons are below.');
+    // Progress after a message shows only what follows it.
+    const afterAck = client.calls.order.indexOf('message:0');
+    assert.ok(afterAck >= 0 && client.calls.order.slice(afterAck + 1).every((call) => !call.startsWith('progress:On it')));
+  });
+
+  await test('a reply handed back after sending messages still goes elsewhere (never silently dropped)', async () => {
+    const client = createFakeClient({ claim: laneClaims([makeLane({ messages: true })]) });
+    startWorker({ client, runLane: async () => ({ text: '', sent: 2, retryElsewhere: true, failure: 'usage limit' }) });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(client.calls.finish[0].retryElsewhere, true);
+  });
+
+  await test('screenshots named in an earlier message are attached and leave its text', async () => {
+    const shot = path.join(testRoot, 'shot.png');
+    await fs.writeFile(shot, 'png');
+    const sent = [];
+    const sdk = createFakeSdk(async function* ({ next }) {
+      await next();
+      yield init();
+      yield assistant('a1', [{ type: 'text', text: `Here it is:\n\n![dots](${shot})` }, { type: 'tool_use', id: 'tu1', name: 'Bash', input: {} }]);
+      yield toolResult('tu1');
+      yield assistant('a2', [{ type: 'text', text: 'Done.' }]);
+      yield success();
+    });
+    const outcome = await sdkRunner(sdk)(makeLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: () => {},
+      takeInbox: async () => [],
+      callTool: async () => ({ result: { ok: true } }),
+      sendMessage: async (message) => {
+        sent.push(message.text);
+        return true;
+      },
+    });
+    assert.deepEqual(sent, ['Here it is:']);
+    assert.deepEqual(outcome.files.map((file) => file.path), [shot]);
+    assert.equal(outcome.text, 'Done.');
   });
 
   await test('normal run: SDK options, text assembly, model id', async () => {
@@ -1628,7 +1804,7 @@ try {
       runLane: async () => ({ text: 'hi', usage: { mode: 'resume', input: 5, cacheRead: 100 }, compact: true }),
     });
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
-    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE]);
+    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE]);
     assert.deepEqual(client.calls.finish[0].usage, { mode: 'resume', input: 5, cacheRead: 100 });
     assert.equal(client.calls.finish[0].compact, true);
     const normalized = normalizeBotLane({ laneId: 'l', botId: 'b', session: { history: [], answering: [1], context: [] } });

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { durangoModelIdForClaude } from './bot-replies.js';
+import { BOT_REPLY_MESSAGES_MAX, botReplyMessageId, durangoModelIdForClaude } from './bot-replies.js';
 import { BOT_BRIEF_RULE, BOT_SETTLE_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, threadReportText, withThreadReportFooter } from './bot-thread-tools.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
@@ -73,10 +73,17 @@ How your inbox works:
 - Messages that arrive while you work appear between your tool calls ("Bot inbox: … arrived while you were working"). Take them in: if one is related or quick, fold it into what you're doing and answer it in this same reply (e.g. "and Almaty?" while you look up SF weather: look up both, answer both).
 - Sometimes another reply of yours is already in progress for earlier messages (your context says which). Don't answer those again; answer only yours.
 
+How your replies show: like texting, as messages you choose to send.
+- Whatever you write right before calling tools is sent at once as its own message. What you write after your last tool call is your final answer, its own message too. Nothing you send is merged, shortened or taken back, so write each message once, as the person should read it.
+- Your thinking is never shown. Anything the person should read must be in a message you write, never only in your thinking.
+- First, acknowledge: when a reply needs any tool call, start with one short line that shows you got it and what you're doing ("Nice one on the call. Checking SF weather now."), before the first call. A quick answer that needs no tools is just the answer.
+- Then progress, when it's worth it: during long or multi-step work, send a short update when there's something worth knowing (what you found, what you're on next, a step done), not before every tool call. Quick one- or two-step work needs none.
+- Last, the final answer: once the work is done, write the whole answer as your last message, after your last tool call. Every reply ends with it: never end on a tool call, and never leave the answer in your thinking or only in an earlier progress line.
+- Cards go on the message you write them with: buttons (show_actions), pages (show_html) and questions (ask_user) attach to the text you wrote right before the call in the same step; called with no text before it, they go on the next message you write; files (attach_files) go with your final answer. For buttons under your final answer: call show_actions first (no text before it), then write the answer; don't mention the buttons.
+
 Stay responsive:
 - Reply fast, like a person texting: short, warm, direct. No preambles or recaps of the question.
 - Quick things (a fact, a lookup, a short draft, one or two tool calls) you do yourself, right away.
-- Everything you write shows, text before a tool call too: write each thing once. After show_actions or another tool, don't write your update again; add only what's new, or nothing.
 - Anything bigger (research, multi-step work, long writing, browsing many pages, code, comparing many options) you hand off with delegate_task and tell the person you're on it. Several independent pieces of work: several tasks, started together. The task runs in the background on this computer; its report comes back to your inbox and you then tell the person what matters.
 - Never pretend something is done when it was only handed off or drafted.
 - Your older messages are condensed into your summary. When it lacks a detail you need (exact wording, a link, a number, what was said or decided when), look it up with search_history instead of guessing or asking again.
@@ -91,7 +98,7 @@ Show, don't point: your thread renders rich replies, so use them.
 - Screenshots, images and files the person should see go in the thread itself, never only as a path or a folder with file names. Attach them with attach_files (full paths; images show as thumbnails that open full size). When a task report names screenshots or files, attach them.
 - Diagrams: a \`\`\`mermaid code block in your text renders as a diagram.
 - Visuals: show_html renders a small self-contained, sandboxed HTML page in your reply (a chart, a comparison, a mockup, an explainer).
-- Buttons: show_actions puts buttons under your reply: open a thread a task ran in (open_thread with its id from the report), Ship a change a task made (ship_change with the change id and that thread's id: the person confirms, then the thread ships it), open a link, or 2-4 likely quick replies. Never invent ids or links.
+- Buttons: show_actions puts buttons under the message you wrote with it (see above): open a thread a task ran in (open_thread with its id from the report), Ship a change a task made (ship_change with the change id and that thread's id: the person confirms, then the thread ships it), open a link, or 2-4 likely quick replies. Never invent ids or links.
 
 Where you run: on this computer, through the person's Claude Code, with the tools it allows here and the person's own logins on this computer. You see the person's Durango Code projects on this computer (listed below with their folders); real work in one goes to a Durango Code thread there (delegate_task with \`project\`), which the person can watch in the app. There are no connected apps (Gmail and others) and nothing runs anywhere else: if something needs an account or service you can't reach from here, say so.
 
@@ -1090,12 +1097,9 @@ export const createLocalBotEngine = ({
     entry.bot.requeue = (entry.bot.requeue ?? []).filter((seq) => !seqs.includes(seq));
     entry.bot.inFlight = [...new Set([...(entry.bot.inFlight ?? []), ...seqs])];
     for (const message of items) reply.claimSeqs.push(message.seq);
-    // A reply already placed (it showed text) that takes in a message sent
-    // after its place answers it from here on: it moves below it.
-    if (reply.seq !== undefined && seqs.some((seq) => seq > reply.seq)) {
-      reply.seq = entry.bot.nextSeq;
-      entry.bot.nextSeq += 1;
-    }
+    // A reply is sent as messages: the one showing now keeps its place (it was
+    // written before these were read); what it writes after reading them is
+    // its next message, which takes the next free place, below them.
     persistBot(entry, { messages: false });
     changed();
     return items;
@@ -1227,7 +1231,8 @@ export const createLocalBotEngine = ({
     const session = {
       history: [
         ...entry.messages
-          .filter((message) => message.seq > bot.compactedThroughSeq && message.seq <= lastClaim && !claimSeqs.has(message.seq))
+          // Its own messages after the claims too (a reply stopped midway sent some): it sees what the person saw.
+          .filter((message) => message.seq > bot.compactedThroughSeq && (message.seq <= lastClaim || message.role === 'assistant') && !claimSeqs.has(message.seq))
           .map(row),
         ...claims.map(row),
       ],
@@ -1297,9 +1302,78 @@ export const createLocalBotEngine = ({
     return copied;
   };
 
+  /** A stored message in thread order (a reply placed early stays above what came after it). */
+  const insertMessage = (entry, message) => {
+    const at = entry.messages.findIndex((existing) => existing.seq > message.seq);
+    if (at === -1) entry.messages.push(message);
+    else entry.messages.splice(at, 0, message);
+    trimMessages(entry);
+  };
+
+  // A reply is the messages it sends, like texting (bot-replies.js): what it
+  // writes before a tool call is stored as its own message when the call
+  // starts, the text after its last tool call is its final answer. Cards go on
+  // the message they were made with (reply.cards holds those made before any
+  // text of their own, for the next message).
+  const sendReplyMessage = (entry, reply, { index, text }) => {
+    if (reply.abort.signal.aborted || index >= BOT_REPLY_MESSAGES_MAX) return false;
+    const content = str(text).trim();
+    if (!content) return false;
+    const { bot } = entry;
+    const id = botReplyMessageId(reply.id, index);
+    if (entry.messages.some((message) => message.id === id)) return true;
+    const message = {
+      id,
+      seq: reply.seq ?? bot.nextSeq,
+      role: 'assistant',
+      content,
+      authorLabel: null,
+      createdAt: now(),
+      ...(reply.cards?.length ? { cards: reply.cards } : {}),
+    };
+    if (reply.seq === undefined) bot.nextSeq += 1;
+    // The next message takes its own place when it first shows text.
+    reply.seq = undefined;
+    reply.cards = [];
+    reply.text = '';
+    reply.sent = [...(reply.sent ?? []), id];
+    reply.firstSeq ??= message.seq;
+    insertMessage(entry, message);
+    bot.lastActivityAt = message.createdAt;
+    bot.lastPreview = lastPreview(content);
+    bot.unread += 1;
+    persistBot(entry);
+    changed();
+    return true;
+  };
+
+  /** A stored message changed: a new object in its place (the transcript log saves messages it hasn't seen). */
+  const replaceMessage = (entry, id, change) => {
+    const at = entry.messages.findIndex((item) => item.id === id);
+    if (at === -1) return false;
+    entry.messages[at] = { ...entry.messages[at], ...change(entry.messages[at]) };
+    return true;
+  };
+
+  /** Cards onto a message the reply sent (`id`), or held for its next one. → whether there was room. */
+  const addReplyCards = (entry, reply, cards, id) => {
+    const message = id ? entry.messages.find((item) => item.id === id) : null;
+    if (message) {
+      if ((message.cards?.length ?? 0) + cards.length > LOCAL_REPLY_CARDS_MAX) return false;
+      replaceMessage(entry, id, (current) => ({ cards: [...(current.cards ?? []), ...cards] }));
+      persistBot(entry);
+      changed();
+      return true;
+    }
+    if ((reply.cards ??= []).length + cards.length > LOCAL_REPLY_CARDS_MAX) return false;
+    reply.cards.push(...cards);
+    return true;
+  };
+
   const runReply = async (entry, reply, lane) => {
     const myGeneration = generation;
     const runtime = runtimeFor(entry.bot.id);
+    let cardCount = 0;
     let outcome;
     try {
       outcome = await runLane(lane, {
@@ -1319,15 +1393,17 @@ export const createLocalBotEngine = ({
           changed();
         },
         takeInbox: async () => (reply.abort.signal.aborted ? [] : claim(entry, reply).map(inboxItem)),
-        callTool: async ({ name, input }) => {
-          // Cards stay with this reply (shown under its text once it is stored).
-          const shown = localCard(name, input, `ui-${reply.id}-${(reply.cards ??= []).length}`);
+        callTool: async ({ name, input, message }) => {
+          // A card goes on the message it was made with (or the reply's next one).
+          const shown = localCard(name, input, `ui-${reply.id}-${cardCount}`);
           if (!shown) return { result: await callTool(entry, name, input) };
           if (shown.error) return { result: { ok: false, error: shown.error } };
-          if (reply.cards.length >= LOCAL_REPLY_CARDS_MAX) return { result: { ok: false, error: 'This reply already shows as much as it can.' } };
-          reply.cards.push(shown.card);
+          const id = Number.isInteger(message) ? botReplyMessageId(reply.id, message) : null;
+          if (!addReplyCards(entry, reply, [shown.card], id)) return { result: { ok: false, error: 'This message already shows as much as it can.' } };
+          cardCount += 1;
           return { result: { ok: true, shown: shown.card.component } };
         },
+        sendMessage: async (message) => sendReplyMessage(entry, reply, message),
       });
     } catch (error) {
       outcome = { text: reply.text, failure: error?.message ?? String(error) };
@@ -1337,8 +1413,11 @@ export const createLocalBotEngine = ({
     // in one step: never a moment when it is neither (a poll in between would
     // move its cursor past the reply, and a new message would start a reply
     // that doesn't see this one).
+    const sentIds = reply.sent ?? [];
     const attachments =
-      !reply.abort.signal.aborted && !outcome?.aborted && str(outcome?.text).trim() ? await copyReplyFiles(reply.id, outcome?.files) : [];
+      !reply.abort.signal.aborted && !outcome?.aborted && (str(outcome?.text).trim() || sentIds.length)
+        ? await copyReplyFiles(reply.id, outcome?.files)
+        : [];
     runtime.replies.delete(reply.id);
     const current = myGeneration === generation && entries.get(entry.bot.id) === entry;
     if (!current) return;
@@ -1357,6 +1436,15 @@ export const createLocalBotEngine = ({
     const text = str(outcome?.text).trim();
     const failure = outcome?.failure ? clip(oneLine(outcome.failure), 300) : null;
     const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : '');
+    // Its last message came before its last tool call: that is the answer, and
+    // the files and cards made after it go with it.
+    const last =
+      !content && sentIds.length && (attachments.length || reply.cards?.length)
+        ? replaceMessage(entry, sentIds[sentIds.length - 1], (message) => ({
+            ...(attachments.length ? { attachments: [...(message.attachments ?? []), ...attachments] } : {}),
+            ...(reply.cards?.length ? { cards: [...(message.cards ?? []), ...reply.cards] } : {}),
+          }))
+        : false;
     if (content) {
       const { bot } = entry;
       const message = {
@@ -1370,16 +1458,12 @@ export const createLocalBotEngine = ({
         ...(text && reply.cards?.length ? { cards: reply.cards } : {}),
       };
       if (reply.seq === undefined) bot.nextSeq += 1;
-      // In thread order: a reply placed early stays above what came after it.
-      const at = entry.messages.findIndex((existing) => existing.seq > message.seq);
-      if (at === -1) entry.messages.push(message);
-      else entry.messages.splice(at, 0, message);
-      trimMessages(entry);
+      insertMessage(entry, message);
       bot.lastActivityAt = message.createdAt;
       bot.lastPreview = lastPreview(content);
       bot.unread += 1;
     }
-    persistBot(entry, { messages: Boolean(content) });
+    persistBot(entry, { messages: Boolean(content || last) });
     changed();
     if (!runtime.replies.size && hasUnclaimed(entry) && active && !entry.bot.paused) startReply(entry);
     await compactIfNeeded(entry, { force: outcome?.compact === true });
@@ -2122,6 +2206,7 @@ export const createLocalBotEngine = ({
           ? [...runtime.replies.values()].map((reply) => ({
               messageId: reply.id,
               seq: reply.seq ?? null,
+              firstSeq: reply.firstSeq ?? null,
               place: LOCAL_BOT_PLACE,
               content: reply.text,
               activeTool: reply.activeTool,

@@ -161,6 +161,8 @@ export type DesktopBotLive = {
   activeTool: string | null;
   /** Its place in the thread, taken when it first shows text (null before): later messages go below it. */
   seq?: number | null;
+  /** Its first sent message's place (a reply is several messages): polls read its messages again from there, as cards are added to them. */
+  firstSeq?: number | null;
 };
 
 export type DesktopBotThread = {

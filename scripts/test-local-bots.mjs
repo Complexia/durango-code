@@ -169,7 +169,7 @@ test('a message while idle starts a reply; live progress and the stored reply', 
   assert.deepEqual(thread.bot.replies, [{ messageId: run.lane.laneId, place: LOCAL_BOT_PLACE }]);
   assert.deepEqual(thread.live, [
     // It showed text, so it has its place (seq 2, after the message it answers).
-    { messageId: run.lane.laneId, seq: 2, place: LOCAL_BOT_PLACE, content: 'Checking SF weather now.', activeTool: 'WebSearch' },
+    { messageId: run.lane.laneId, seq: 2, firstSeq: null, place: LOCAL_BOT_PLACE, content: 'Checking SF weather now.', activeTool: 'WebSearch' },
   ]);
 
   run.finish({ text: 'Checking SF weather now.\n\n18°C and sunny.', modelId: 'anthropic/claude-opus-5.5' });
@@ -185,6 +185,79 @@ test('a message while idle starts a reply; live progress and the stored reply', 
   assert.equal(thread.bot.lastPreview, 'Checking SF weather now. 18°C and sunny.');
   await engine.thread(primary.id, { read: true });
   assert.equal((await engine.thread(primary.id)).bot.unread, 0);
+});
+
+test('a reply is the messages it sends: acknowledgement, progress and the answer with its buttons, each in its own place', async () => {
+  const { engine, runner, dir, sleeper } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'q1', content: 'Is the dots fix ready?' });
+  await waitFor(() => runner.lanes.length === 1, { label: 'reply started' });
+  const [run] = runner.lanes;
+  const id = run.lane.laneId;
+  run.ctx.update({ text: 'On it, checking the change.' });
+  assert.equal(await run.ctx.sendMessage({ index: 0, text: 'On it, checking the change.' }), true);
+  run.ctx.update({ text: '' });
+  // The person writes meanwhile: it lands between the reply's messages.
+  await engine.send(primary.id, { messageId: 'q2', content: 'and the docs?' });
+  assert.equal((await run.ctx.takeInbox()).length, 1);
+  sleeper.release();
+  run.ctx.update({ text: 'Checks passed, the docs too.' });
+  assert.equal(await run.ctx.sendMessage({ index: 1, text: 'Checks passed, the docs too.' }), true);
+  // Buttons made with the answer go on it; a repeat of an index changes nothing.
+  assert.equal(await run.ctx.sendMessage({ index: 2, text: 'Ready: chg_abc fixes the dots.' }), true);
+  assert.equal(await run.ctx.sendMessage({ index: 2, text: 'Ready: chg_abc fixes the dots.' }), true);
+  const shown = await run.ctx.callTool({ name: 'show_actions', input: { actions: [{ kind: 'reply', label: 'Ship it' }] }, message: 2 });
+  assert.equal(shown.result.ok, true);
+  run.ctx.update({ text: '' });
+  // Nothing written after the buttons: no final message of its own.
+  run.finish({ text: '', sent: 3 });
+  await engine.idle();
+  const thread = await engine.thread(primary.id);
+  assert.deepEqual(thread.live, []);
+  assert.deepEqual(
+    thread.messages.map((message) => [message.seq, message.role, message.content]),
+    [
+      [1, 'user', 'Is the dots fix ready?'],
+      [2, 'assistant', 'On it, checking the change.'],
+      [3, 'user', 'and the docs?'],
+      [4, 'assistant', 'Checks passed, the docs too.'],
+      [5, 'assistant', 'Ready: chg_abc fixes the dots.'],
+    ]
+  );
+  assert.equal(thread.messages[4].id, `${id}_m02`);
+  assert.deepEqual(thread.messages[4].cards.map((card) => card.component), ['bot-actions']);
+  assert.equal(thread.messages[1].cards, undefined);
+  assert.equal(thread.bot.lastPreview, 'Ready: chg_abc fixes the dots.');
+  assert.ok(!thread.messages.some((message) => message.content.startsWith("Couldn't reply")), 'no failure note');
+  // Saved: a reload reads the same messages and cards.
+  await engine.flush();
+  const reloaded = makeEngine({ dir });
+  const again = await reloaded.engine.thread(primary.id);
+  assert.deepEqual(again.messages.map((message) => message.content), thread.messages.map((message) => message.content));
+  assert.deepEqual(again.messages[4].cards.map((card) => card.component), ['bot-actions']);
+  await reloaded.engine.stop();
+});
+
+test('a reply picked up again after a restart sees the messages the stopped one already sent', async () => {
+  const dir = path.join(testRoot, 'restart-sent');
+  const first = makeEngine({ dir });
+  const [primary] = (await first.engine.list()).bots;
+  await first.engine.send(primary.id, { messageId: 'q', content: 'Check A and B.' });
+  await waitFor(() => first.runner.lanes.length === 1);
+  const run = first.runner.lanes[0];
+  run.ctx.update({ text: 'Checking A.' });
+  assert.equal(await run.ctx.sendMessage({ index: 0, text: 'Checking A.' }), true);
+  await first.engine.flush();
+  await first.engine.stop();
+  const second = makeEngine({ dir });
+  await second.engine.list();
+  await waitFor(() => second.runner.lanes.length === 1, { label: 'picked up again' });
+  const history = second.runner.lanes[0].lane.session.history.map((row) => `${row.role}:${row.text}`);
+  assert.ok(history.includes('assistant:Checking A.'), history.join(' | '));
+  assert.ok(history.includes('user:Check A and B.'), history.join(' | '));
+  second.runner.lanes[0].finish({ text: 'Done with B.' });
+  await second.engine.idle();
+  await second.engine.stop();
 });
 
 test('messages sent mid-reply are taken in between steps', async () => {
@@ -244,7 +317,7 @@ test('a message not taken in within 5 s gets a parallel reply (at most 2)', asyn
   );
 });
 
-test('a placed reply that takes in a later message moves below it, live and once stored', async () => {
+test('a shown message keeps its place when the reply takes in a later one; what it writes after reading goes below it', async () => {
   const dir = path.join(testRoot, 'reply-moves');
   const { engine, runner, sleeper } = makeEngine({ dir });
   const [primary] = (await engine.list()).bots;
@@ -256,21 +329,22 @@ test('a placed reply that takes in a later message moves below it, live and once
   assert.equal((await engine.thread(primary.id)).live[0].seq, 2);
   // The person writes mid-reply: 3, below the reply so far.
   assert.equal((await engine.send(primary.id, { messageId: 'b', content: "wait no, don't" })).seq, 3);
-  // The reply takes it in and answers it: it moves below it.
+  // The reply takes it in: what it showed was written before reading it, so it stays at 2.
   assert.deepEqual((await run.ctx.takeInbox()).map((item) => item.seq), [3]);
-  assert.equal((await engine.thread(primary.id)).live[0].seq, 4);
-  // Nothing new taken: it keeps its place.
-  assert.deepEqual(await run.ctx.takeInbox(), []);
-  run.ctx.update({ text: 'Landing the project-sort change now.\n\nStopped.' });
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 2);
+  assert.equal(await run.ctx.sendMessage({ index: 0, text: 'Landing the project-sort change now.' }), true);
+  run.ctx.update({ text: '' });
+  // Its answer to the new message is its next message: below it.
+  run.ctx.update({ text: 'Stopped.' });
   assert.equal((await engine.thread(primary.id)).live[0].seq, 4);
   sleeper.release();
-  run.finish({ text: 'Landing the project-sort change now.\n\nStopped.' });
+  run.finish({ text: 'Stopped.', sent: 1 });
   await engine.idle();
   const thread = await engine.thread(primary.id);
   assert.deepEqual(
     thread.messages.map((message) => `${message.seq}:${message.role}`),
-    ['1:user', '3:user', '4:assistant'],
-    'stored below the message it answered'
+    ['1:user', '2:assistant', '3:user', '4:assistant'],
+    'each message where it showed'
   );
   await engine.stop();
   // After a reload: the same order.
@@ -278,8 +352,9 @@ test('a placed reply that takes in a later message moves below it, live and once
   const again = await reloaded.engine.thread(primary.id);
   assert.deepEqual(again.messages.map((message) => `${message.seq}:${message.content}`), [
     '1:land the durango change',
+    '2:Landing the project-sort change now.',
     "3:wait no, don't",
-    '4:Landing the project-sort change now.\n\nStopped.',
+    '4:Stopped.',
   ]);
   await reloaded.engine.stop();
 });

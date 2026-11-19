@@ -74,7 +74,8 @@ export const mergeBotMessages = (current: DesktopBotMessage[], incoming: Desktop
 /**
  * Where a poll picks up: after the newest message shown, but before any reply
  * still being written that has taken its place (`seq`) in the thread: it is
- * stored there when it finishes, possibly below messages already shown.
+ * stored there when it finishes, possibly below messages already shown. A
+ * reply that sent messages (`firstSeq`) has them read again until it ends.
  * (Replies that take a place later get one above everything shown.) null: no
  * messages yet (load the newest page).
  */
@@ -83,6 +84,8 @@ export const botPollCursor = (messages: DesktopBotMessage[], live: DesktopBotLiv
   let cursor = messages[messages.length - 1].seq;
   for (const reply of live ?? []) {
     if (typeof reply.seq === 'number' && reply.seq <= cursor) cursor = Math.min(cursor, reply.seq - 1);
+    // Its messages so far are read again: cards are added to them while it runs and when it ends.
+    if (typeof reply.firstSeq === 'number' && reply.firstSeq <= cursor) cursor = Math.min(cursor, reply.firstSeq - 1);
   }
   return cursor;
 };

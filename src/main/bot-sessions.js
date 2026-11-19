@@ -53,7 +53,7 @@ const MESSAGE_OVERHEAD_TOKENS = 4;
 const MIN_BUDGET_TOKENS = 4_000;
 
 export const BOT_REPLY_INSTRUCTION =
-  'Write your reply to the new messages now. Your final text is sent to the person as your message in the thread.';
+  'Write your reply to the new messages now: what you write before a tool call is sent at once as its own message, and what you write after your last tool call is your final answer.';
 
 const str = (value) => (typeof value === 'string' ? value : '');
 

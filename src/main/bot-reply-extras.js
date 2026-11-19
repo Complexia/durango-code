@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -136,6 +137,30 @@ export const createReplyFiles = ({ stat = (file) => fs.stat(file), home = os.hom
 };
 
 /**
+ * One of a reply's messages before its final answer, right away (it is sent
+ * before the reply writes on): the media files its text points at (to attach
+ * with the reply, `paths`), and its text without the image embeds of the ones
+ * on this computer (they show as the reply's files instead).
+ */
+export const messageMediaOf = (text, { home = os.homedir() } = {}) => {
+  const mentioned = mentionedMediaPaths(text);
+  const paths = [...mentioned.paths, ...mentioned.joined];
+  const isFile = (target) => {
+    try {
+      const info = statSync(path.normalize(resolveLocalPath(target, home)));
+      return info.isFile() && info.size <= REPLY_FILE_MAX_BYTES;
+    } catch {
+      return false;
+    }
+  };
+  const stripped = String(text ?? '')
+    .replace(EMBED, (embed, target) => (isFile(target) ? '' : embed))
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { text: stripped || String(text ?? ''), paths };
+};
+
+/**
  * The reply's final text and files: what its text points at is attached too
  * (screenshots named by path, or by name next to their folder), and image
  * embeds of attached files leave the text, since they show as the reply's
@@ -176,7 +201,7 @@ export const LOCAL_CARD_TOOLS = Object.freeze([
   {
     name: 'show_actions',
     description:
-      'Show buttons under your reply that the person can tap. Kinds: open_thread (a Durango Code thread on this computer, thread_id), open_url (a web page, url + label), reply (sends text, or the label, as the person\'s next message: quick replies). ship_change ships a Durango Source change (chg_…) through the thread that made it: give its thread_id from the task report too (the person confirms first; that thread ships it its project\'s way). open_change takes a change id and needs the person signed in. At most 6 buttons; never invent ids or URLs. Call it after your reply\'s text: the buttons show under it, so don\'t write that text again after the call.',
+      'Show buttons under your reply that the person can tap. Kinds: open_thread (a Durango Code thread on this computer, thread_id), open_url (a web page, url + label), reply (sends text, or the label, as the person\'s next message: quick replies). ship_change ships a Durango Source change (chg_…) through the thread that made it: give its thread_id from the task report too (the person confirms first; that thread ships it its project\'s way). open_change takes a change id and needs the person signed in. At most 6 buttons; never invent ids or URLs. The buttons go on the text you wrote right before the call in the same step; called with no text before it, on the next message you write. For buttons under your final answer: call it first, then write the answer (don\'t mention the buttons).',
     inputSchema: {
       type: 'object',
       properties: {

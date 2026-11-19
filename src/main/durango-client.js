@@ -450,6 +450,8 @@ export const normalizeBotLane = (lane) => {
     ...(lane.session && typeof lane.session === 'object' ? { session: lane.session } : {}),
     tools,
     heartbeatMs: clampInt(lane.heartbeatMs, 2_000, 60_000, BOT_LANE_DEFAULT_HEARTBEAT_MS),
+    /** The reply goes out as messages (claim feature "reply-messages"): sendBotLaneMessage, then the final answer. */
+    ...(lane.messages === true ? { messages: true } : {}),
     /** Files attached in the conversation, with download links (saved for Claude Code). */
     attachments: (Array.isArray(lane.attachments) ? lane.attachments : [])
       .filter((item) => item && typeof item.url === 'string' && /^https:\/\//.test(item.url))
@@ -743,7 +745,16 @@ export const createDurangoClient = ({
       const data = await request('POST', botLanePath(laneId, 'progress'), { body, signal });
       return { stop: data.stop === true, inbox: normalizeBotInbox(data.inbox) };
     },
-    /** `{ botId, machineId, name, input, toolCallId }` → `{ result }`. */
+    /**
+     * One of a reply's messages before its final answer (the text it wrote
+     * before a tool call): `{ botId, machineId, index, text, modelId? }` →
+     * `{ ok, stop }` (`stop`: the reply was handed elsewhere; `ok` false: refused).
+     */
+    async sendBotLaneMessage({ laneId, signal, ...body } = {}) {
+      const data = await request('POST', botLanePath(laneId, 'message'), { body, signal });
+      return { ok: data.stop !== true && !data.refused, stop: data.stop === true };
+    },
+    /** `{ botId, machineId, name, input, toolCallId, message? }` → `{ result }` (`message`: the index of the message the call was made with). */
     async callBotLaneTool({ laneId, signal, ...body } = {}) {
       const data = await request('POST', botLanePath(laneId, 'tool'), { body, signal, timeout: BOT_TOOL_TIMEOUT_MS });
       return { result: data.result ?? null };
@@ -1234,6 +1245,10 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async callBotLaneTool({ name } = {}) {
       return { result: { ok: false, error: `Mock Durango has no bot tool ${str(name)}.` } };
+    },
+    async sendBotLaneMessage({ laneId, ...body } = {}) {
+      reports.push({ laneId, message: true, ...body });
+      return { ok: true, stop: false };
     },
     async finishBotLane({ laneId, ...body } = {}) {
       reports.push({ laneId, ...body });
