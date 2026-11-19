@@ -1,17 +1,70 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import ReactMarkdown, { type ExtraProps } from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { Sparkles } from 'lucide-react';
+import { toast } from 'sonner';
 import type { AppUpdateState } from './appTypes';
 
 // The app update's surfaces besides the sidebar button itself: the hover card
 // with what changed, the confirmation before restarting into the update, and
 // the "What's new" notice on the first launch of a new version.
 
+// Release notes are Markdown, one change per line (`- **Title:** text with
+// `code` and [links](https://…)`). Each note renders its inline Markdown only:
+// emphasis, code and links. Block elements (the paragraph, a stray quote or
+// list) are unwrapped to their text so a note stays one tight list item, and
+// raw HTML is never rendered.
+const releaseNoteElements = ['strong', 'em', 'del', 'code', 'a', 'br'];
+const releaseNoteRemarkPlugins = [remarkGfm];
+
+// Links open in the default browser; anything but http(s) stays plain text.
+const ReleaseNoteLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraProps> = ({
+  href,
+  children,
+  node: _node,
+  ...props
+}) => {
+  if (!href || !/^https?:\/\//i.test(href)) return <>{children}</>;
+  const handleClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!window.orion) return;
+    void window.orion
+      .openExternalUrl(href)
+      .then((result) => {
+        if (!result.ok) toast.error(result.error ?? 'Could not open the link.');
+      })
+      .catch(() => toast.error('Could not open the link.'));
+  };
+  return (
+    <a {...props} href={href} title={href} onClick={handleClick}>
+      {children}
+    </a>
+  );
+};
+
+const releaseNoteComponents = { a: ReleaseNoteLink };
+
+export const ReleaseNoteText: React.FC<{ note: string }> = React.memo(({ note }) => (
+  <ReactMarkdown
+    remarkPlugins={releaseNoteRemarkPlugins}
+    allowedElements={releaseNoteElements}
+    unwrapDisallowed
+    skipHtml
+    components={releaseNoteComponents}
+  >
+    {note}
+  </ReactMarkdown>
+));
+
 export const ReleaseNotesList: React.FC<{ notes: string[]; className?: string }> = ({ notes, className }) => (
-  <ul className={`m-0 list-disc space-y-1.5 pl-[18px] text-[12.5px] leading-[1.45] text-neutral-300 ${className ?? ''}`}>
+  <ul
+    className={`release-notes-list m-0 list-disc space-y-1.5 pl-[18px] text-[12.5px] leading-[1.45] text-neutral-300 ${className ?? ''}`}
+  >
     {notes.map((note, index) => (
       <li key={`${index}-${note}`} className="pl-0.5 marker:text-neutral-500">
-        {note}
+        <ReleaseNoteText note={note} />
       </li>
     ))}
   </ul>

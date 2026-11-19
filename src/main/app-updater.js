@@ -80,7 +80,12 @@ export const waitForAppUpdateStagedForInstall = (timeoutMs = APP_UPDATE_STAGE_TI
 
 // durango.sh sends `releaseNotes` as a Markdown list (one change per
 // line). electron-updater passes it through as a string, or as
-// [{ version, note }] from providers that collect several releases.
+// [{ version, note }] from providers that collect several releases. Each
+// note keeps its inline Markdown (bold, `code`, links), which the renderer
+// draws. HTML notes (other providers) lose their tags; only known HTML tags
+// are removed, so a placeholder such as `ws path <name>` stays.
+const htmlTagPattern = /<\/?(?:ul|ol|li|p|div|span|h[1-6]|br|hr|strong|b|em|i|code|pre|a|blockquote)\b[^>]*>/gi;
+
 export const normalizeReleaseNotes = (releaseNotes) => {
   const text = Array.isArray(releaseNotes)
     ? releaseNotes.map((entry) => (typeof entry === 'string' ? entry : entry?.note ?? '')).join('\n')
@@ -89,7 +94,7 @@ export const normalizeReleaseNotes = (releaseNotes) => {
       : '';
   const notes = text
     .replace(/<\/(?:li|p|h\d)>|<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
+    .replace(htmlTagPattern, '')
     .split(/\r?\n/)
     .filter((line) => !/^\s*#/.test(line))
     .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim())

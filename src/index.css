@@ -4973,6 +4973,35 @@ body {
   font-size: 0.9em;
 }
 
+/* Release notes (AppUpdateUi: the update button's card, What's new, Settings):
+   each note's inline Markdown, tinted from the list's own text color so it
+   reads on the dark cards and on a light Settings page alike. */
+.release-notes-list strong {
+  font-weight: 600;
+}
+
+.release-notes-list code {
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  padding: 0.05em 0.3em;
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.release-notes-list a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+html.theme-light .setting-row .release-notes-list {
+  color: var(--text-secondary);
+}
+
 /* Fenced code, diagrams: one frame with a small header (label, actions). */
 .markdown-content .code-block {
   margin: 0.85em 0;

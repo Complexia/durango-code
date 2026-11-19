@@ -151,5 +151,10 @@ assert.equal(
   maxReleaseNotes,
 );
 assert.deepEqual(parseReleaseNotes('## Notes\n\n- One\n* Two\n  3. Three\nFour\n'), ['One', 'Two', 'Three', 'Four']);
+// Notes keep their inline Markdown (the app renders it); only the bullet goes.
+assert.deepEqual(
+  parseReleaseNotes('- **Your bots, answered here:** set `ORION_X=1`, see [bots](https://durango.sh/bots)\n* *Sidebar v3* (experimental)\n'),
+  ['**Your bots, answered here:** set `ORION_X=1`, see [bots](https://durango.sh/bots)', '*Sidebar v3* (experimental)'],
+);
 
 console.log('release manifest tests passed');

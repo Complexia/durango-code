@@ -16,6 +16,7 @@
     "deploy": "node scripts/deploy.mjs",
     "test:release-runtime": "node scripts/test-release-runtime.mjs",
     "test:release-manifest": "node scripts/test-release-manifest.mjs",
+    "test:release-notes-ui": "bun scripts/test-release-notes-ui.tsx",
     "test:release-git": "node scripts/test-release-git.mjs",
     "test:app-identity": "node --no-warnings scripts/test-app-identity.mjs",
     "test:legacy-bundle-rename": "node --no-warnings scripts/test-legacy-bundle-rename.mjs",

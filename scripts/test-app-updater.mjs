@@ -84,6 +84,17 @@ const main = async () => {
     ]);
     assert.deepEqual(updater.normalizeReleaseNotes('<ul><li>One</li><li>Two</li></ul>'), ['One', 'Two']);
     assert.deepEqual(updater.normalizeReleaseNotes([{ version: '9.9.9', note: '* Three' }]), ['Three']);
+    // Inline Markdown stays for the renderer; only HTML tags are dropped.
+    assert.deepEqual(
+      updater.normalizeReleaseNotes(
+        '- **Bots, answered here:** run `durango-code ws path <name>`, see [bots](https://durango.sh/bots)\n* *Faster* sidebar'
+      ),
+      [
+        '**Bots, answered here:** run `durango-code ws path <name>`, see [bots](https://durango.sh/bots)',
+        '*Faster* sidebar',
+      ]
+    );
+    assert.deepEqual(updater.normalizeReleaseNotes('<p>Use <code>a &lt; b</code></p><br/>Two'), ['Use a &lt; b', 'Two']);
     assert.equal(updater.normalizeReleaseNotes(null), null);
     assert.equal(updater.normalizeReleaseNotes('  \n'), null);
 
