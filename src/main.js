@@ -95,6 +95,7 @@ import {
 } from './main/bot-replies.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
+import { botThreadTitle } from './main/bot-thread-title.js';
 import {
   createDeployWatcher,
   createSourceConfigFetcher,
@@ -4704,8 +4705,10 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
 // `<prefix><key>` (durango:dispatchSettled below).
 const LOCAL_BOT_DISPATCH_PREFIX = 'localbot:';
 const BOT_TASK_DISPATCH_PREFIX = 'bottask:';
-const startBotProjectThread = (prefix) => ({ projectId, prompt, key, botName, title, accessMode }) =>
-  requestDispatchRendererCommand({
+const startBotProjectThread = (prefix) => ({ projectId, prompt, key, botName, title, accessMode }) => {
+  // A plain thread title, without a "Bots:" style prefix (bot-thread-title.js).
+  const threadTitle = botThreadTitle(title, botName).slice(0, 80);
+  return requestDispatchRendererCommand({
     kind: 'runTurn',
     projectId,
     prompt: prompt.slice(0, 200_000),
@@ -4715,12 +4718,13 @@ const startBotProjectThread = (prefix) => ({ projectId, prompt, key, botName, ti
       id: `${prefix}${key}`,
       origin: 'bot',
       sourceLabel: `your bot ${botName}`,
-      ...(title ? { title: String(title).slice(0, 80) } : {}),
+      ...(threadTitle ? { title: threadTitle } : {}),
       followUp: false,
       sourceUrl: null,
       requestedAccessMode: accessMode,
     },
   });
+};
 
 // A bot's follow-up turn in an existing thread here (message_thread), reported
 // like a thread it started.

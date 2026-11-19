@@ -357,7 +357,7 @@ export const LOCAL_BOT_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        title: { type: 'string', minLength: 1, maxLength: 80, description: "Short title the person will see, e.g. 'Find 5 remote senior frontend roles'." },
+        title: { type: 'string', minLength: 1, maxLength: 80, description: "Short title the person will see (a project's thread gets it too), in plain words like a normal thread title, e.g. 'Find 5 remote senior frontend roles'. No category or area prefix such as 'Bots:' or your name." },
         instructions: { type: 'string', minLength: 1, maxLength: 16_000, description: 'The brief: what to solve and why, the context and constraints it can\'t find on its own, and anything specific to report back. Goal-level, usually a few sentences: no step-by-step plans.' },
         project: {
           type: 'string',
