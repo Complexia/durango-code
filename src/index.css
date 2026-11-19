@@ -168,6 +168,17 @@ body {
   letter-spacing: 0;
 }
 
+/* Sidebar v3 on a bot: the bot's header (avatar, name, status) sits in the
+   shell bar where the "Bots" title was. The bar stays a window drag region;
+   only the header's buttons opt out. */
+.shell-bot-slot {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(520px, 48vw);
+}
+
 .shell-thread-title-menu {
   max-width: min(260px, 26vw);
   -webkit-app-region: no-drag;
@@ -9603,3 +9614,4 @@ html.theme-light .agents-sidebar :is(.text-neutral-300, .text-neutral-400, .text
 html.theme-light .agents-sidebar :is(.text-neutral-500, .text-neutral-600, .text-zinc-500, .text-zinc-600):not([role="menu"] *) {
   color: var(--text-muted);
 }
+

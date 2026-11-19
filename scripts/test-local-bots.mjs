@@ -10,12 +10,14 @@ import path from 'node:path';
 
 import {
   LOCAL_BOT_PLACE,
+  TRANSCRIPT_LOG_MAX_LINES,
   compactionBoundary,
   createLocalBotEngine,
   durangoModelForLocalBot,
   nextRunAfter,
 } from '../src/main/local-bots.js';
 import { createClaudeOneShot } from '../src/main/bot-replies.js';
+import { EARLIER_HISTORY_MAX_CHARS, SUMMARY_MAX_CHARS, memorySection, parseCompaction } from '../src/main/bot-memory.js';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-local-bots-'));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -156,7 +158,8 @@ test('a message while idle starts a reply; live progress and the stored reply', 
     run.lane.tools.map((tool) => tool.name).sort(),
     [
       'ask_user', 'create_bot', 'delegate_task', 'forget_project_note', 'manage_routine', 'message_bot', 'notify_user',
-      'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'update_bot',
+      'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'search_history', 'show_actions',
+      'show_html', 'update_bot',
     ]
   );
 
@@ -239,6 +242,46 @@ test('a message not taken in within 5 s gets a parallel reply (at most 2)', asyn
     thread.messages.map((message) => `${message.seq}:${message.role}:${message.content}`),
     ['1:user:Write me a long essay', '2:user:quick: 2+2?', '3:user:and 3+3?', '4:assistant:4', '5:assistant:Here is the essay.', '6:assistant:6']
   );
+});
+
+test('a placed reply that takes in a later message moves below it, live and once stored', async () => {
+  const dir = path.join(testRoot, 'reply-moves');
+  const { engine, runner, sleeper } = makeEngine({ dir });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'land the durango change' });
+  await waitFor(() => runner.lanes.length === 1);
+  const run = runner.lanes[0];
+  // It shows text: its place is 2.
+  run.ctx.update({ text: 'Landing the project-sort change now.' });
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 2);
+  // The person writes mid-reply: 3, below the reply so far.
+  assert.equal((await engine.send(primary.id, { messageId: 'b', content: "wait no, don't" })).seq, 3);
+  // The reply takes it in and answers it: it moves below it.
+  assert.deepEqual((await run.ctx.takeInbox()).map((item) => item.seq), [3]);
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 4);
+  // Nothing new taken: it keeps its place.
+  assert.deepEqual(await run.ctx.takeInbox(), []);
+  run.ctx.update({ text: 'Landing the project-sort change now.\n\nStopped.' });
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 4);
+  sleeper.release();
+  run.finish({ text: 'Landing the project-sort change now.\n\nStopped.' });
+  await engine.idle();
+  const thread = await engine.thread(primary.id);
+  assert.deepEqual(
+    thread.messages.map((message) => `${message.seq}:${message.role}`),
+    ['1:user', '3:user', '4:assistant'],
+    'stored below the message it answered'
+  );
+  await engine.stop();
+  // After a reload: the same order.
+  const reloaded = makeEngine({ dir });
+  const again = await reloaded.engine.thread(primary.id);
+  assert.deepEqual(again.messages.map((message) => `${message.seq}:${message.content}`), [
+    '1:land the durango change',
+    "3:wait no, don't",
+    '4:Landing the project-sort change now.\n\nStopped.',
+  ]);
+  await reloaded.engine.stop();
 });
 
 test('a reply is placed after the messages that arrived while it ran', async () => {
@@ -459,7 +502,7 @@ test('delegate_task with a project starts a Durango Code thread; its outcome is 
 
   await engine.threadSettled({ key: started[0].key, threadId: 'thread_9', outcome: 'finished', summary: 'The Clerk webhook secret is wrong.' });
   await waitFor(() => runner.lanes.length === 3, { label: 'reply to the thread report' });
-  assert.match(runner.lanes[2].lane.prompt, /\[Task: Debug signups\]:\nThe Clerk webhook secret is wrong\.\n\n\(From the Durango Code thread in Durango, thread_9\.\)/);
+  assert.match(runner.lanes[2].lane.prompt, /\[Task: Debug signups\]:\nThe Clerk webhook secret is wrong\.\n\n\(Durango Code thread thread_9, project Durango\. Follow up there, e\.g\. to ship it, with message_thread thread_id "thread_9"\.\)/);
   runner.lanes[2].finish({ text: 'Found it.' });
   await engine.idle();
   assert.deepEqual(await engine.threadSettled({ key: 'gone:lt_x', outcome: 'failed' }), { ok: false });
@@ -622,9 +665,95 @@ test('files sent to a signed-out bot are kept with the message and reach its rep
   assert.equal(lane.attachments.length, 1);
   assert.equal(await fs.readFile(lane.attachments[0].path, 'utf8'), 'hello file', 'a copy in the bots folder');
   const thread = await engine.thread(primary.id);
-  assert.deepEqual(thread.messages[0].files, [{ name: 'brief.txt', size: 10 }]);
+  assert.deepEqual(thread.messages[0].files, [{ name: 'brief.txt', size: 10, path: lane.attachments[0].path }], 'with its path here');
   runner.lanes[0].finish({ text: 'Got it.' });
   await engine.idle();
+  await engine.stop();
+});
+
+test('a signed-out reply keeps its files and cards (show_html, show_actions)', async () => {
+  const { engine, runner, dir } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  const shot = path.join(dir, '..', `shot-${Date.now()}.png`);
+  await fs.writeFile(shot, 'png bytes');
+  await engine.send(primary.id, { messageId: 'r1', content: 'Show me the screenshot' });
+  await waitFor(() => runner.lanes.length === 1);
+  const { ctx } = runner.lanes[0];
+  const page = await ctx.callTool({ name: 'show_html', input: { title: 'Flow', html: '<p>hi</p>', height: 'sm' } });
+  assert.deepEqual(page.result, { ok: true, shown: 'html' });
+  const bad = await ctx.callTool({ name: 'show_actions', input: { actions: [{ kind: 'open_url', url: 'javascript:alert(1)', label: 'x' }] } });
+  assert.equal(bad.result.ok, false, 'an unsafe link is refused');
+  await ctx.callTool({
+    name: 'show_actions',
+    input: {
+      actions: [
+        { kind: 'reply', label: 'Looks good' },
+        { kind: 'open_thread', thread_id: 'thr-1' },
+        { kind: 'open_change', change_id: 'nope' },
+        // Ship keeps the thread that made the change: that thread ships it.
+        { kind: 'ship_change', change_id: 'chg_abcdefgh12', thread_id: 'thr-1' },
+      ],
+    },
+  });
+  runner.lanes[0].finish({ text: 'Here it is.', files: [{ path: shot, name: 'shot.png', size: 9 }] });
+  await engine.idle();
+  const thread = await engine.thread(primary.id);
+  const reply = thread.messages.find((message) => message.role === 'assistant');
+  assert.equal(reply.content, 'Here it is.');
+  assert.equal(reply.files.length, 1);
+  assert.equal(reply.files[0].name, 'shot.png');
+  assert.equal(reply.files[0].contentType, 'image/png');
+  assert.equal(await fs.readFile(reply.files[0].path, 'utf8'), 'png bytes', 'a copy in the bots folder');
+  assert.deepEqual(
+    reply.cards.map((card) => [card.component, card.props]),
+    [
+      ['html', { title: 'Flow', html: '<p>hi</p>', height: 'sm' }],
+      [
+        'bot-actions',
+        {
+          actions: [
+            { kind: 'reply', label: 'Looks good' },
+            { kind: 'open_thread', thread_id: 'thr-1' },
+            { kind: 'ship_change', change_id: 'chg_abcdefgh12', thread_id: 'thr-1' },
+          ],
+        },
+      ],
+    ]
+  );
+  // The next reply knows what this one showed.
+  await engine.send(primary.id, { messageId: 'r2', content: 'Thanks' });
+  await waitFor(() => runner.lanes.length === 2);
+  assert.match(runner.lanes[1].lane.prompt, /\[attached file: shot\.png\]\n\[showed a page "Flow"\]\n\[showed buttons\]/);
+  runner.lanes[1].finish({ text: 'Anytime.' });
+  await engine.idle();
+  await engine.stop();
+});
+
+test('a reply with files is live or stored at every moment while its files copy (a poll never skips it)', async () => {
+  const { engine, runner, dir } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  // Big enough that the copy spans several polls.
+  const big = path.join(dir, '..', `big-${Date.now()}.png`);
+  await fs.writeFile(big, Buffer.alloc(48 * 1024 * 1024, 1));
+  await engine.send(primary.id, { messageId: 'p1', content: 'show me' });
+  await waitFor(() => runner.lanes.length === 1);
+  runner.lanes[0].ctx.update({ text: 'Here it is.' });
+  const replyId = (await engine.thread(primary.id)).live[0].messageId;
+  runner.lanes[0].finish({ text: 'Here it is.', files: [{ path: big, name: 'big.png', size: 1 }] });
+  let polls = 0;
+  for (;;) {
+    const thread = await engine.thread(primary.id);
+    const stored = thread.messages.some((message) => message.id === replyId);
+    const live = thread.live.some((reply) => reply.messageId === replyId);
+    assert.ok(stored || live, `poll ${polls}: the reply is neither live nor stored`);
+    if (stored) break;
+    polls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  await engine.idle();
+  const reply = (await engine.thread(primary.id)).messages.find((message) => message.id === replyId);
+  assert.equal(reply.files.length, 1, 'its file was copied');
+  await fs.rm(big, { force: true });
   await engine.stop();
 });
 
@@ -803,7 +932,14 @@ test('persistence round trip', async () => {
   await first.engine.stop();
 
   const files = (await fs.readdir(dir)).sort();
-  assert.deepEqual(files, [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  // Each bot: a snapshot and the append-only log it names.
+  assert.deepEqual(files.filter((file) => !file.endsWith('.log')), [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  for (const id of [created.botId, primary.id]) {
+    const snapshot = JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8'));
+    assert.equal(snapshot.version, 3);
+    // (Created by the first save after the snapshot.)
+    for (const file of files.filter((name) => name.startsWith(`${id}.`) && name.endsWith('.log'))) assert.equal(file, snapshot.log);
+  }
   assert.equal(files.some((file) => file.endsWith('.tmp')), false);
 
   const second = makeEngine({ dir });
@@ -845,7 +981,8 @@ test('compaction folds older messages into the summary', async () => {
   }
   assert.ok(calls.length >= 1, 'summarized');
   assert.equal(calls[0].model, 'claude-haiku-5-5');
-  assert.match(calls[0].systemPrompt, /long-term working summary/);
+  assert.match(calls[0].systemPrompt, /long-term memory/);
+  assert.match(calls[0].prompt, /<previous_earlier>\(none yet\)<\/previous_earlier>/);
   assert.match(calls[0].prompt, /<previous_summary>\(none yet\)<\/previous_summary>/);
   await engine.send(primary.id, { messageId: 'last', content: 'and now?' });
   await waitFor(() => runner.lanes.length === 13);
@@ -898,7 +1035,12 @@ test('exportForSync maps models and markSynced moves the data aside', async () =
   const { movedTo } = await engine.markSynced();
   assert.equal(path.dirname(movedTo), dir);
   assert.match(path.basename(movedTo), /^synced-/);
-  assert.deepEqual((await fs.readdir(movedTo)).sort(), [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  const moved = (await fs.readdir(movedTo)).sort();
+  assert.deepEqual(moved.filter((name) => !name.endsWith('.log')), [`${created.botId}.json`, `${primary.id}.json`, 'bots.json'].sort());
+  // The transcript logs went with their snapshots.
+  const named = await Promise.all([created.botId, primary.id].map(async (id) => JSON.parse(await fs.readFile(path.join(movedTo, `${id}.json`), 'utf8')).log));
+  assert.ok(moved.some((name) => name.endsWith('.log')));
+  for (const name of moved.filter((item) => item.endsWith('.log'))) assert.ok(named.includes(name), name);
   assert.deepEqual((await fs.readdir(dir)).filter((name) => !name.startsWith('synced-')), []);
   assert.equal(await engine.hasDataToSync(), false);
   // Signed out again later: a fresh primary.
@@ -937,6 +1079,301 @@ test('createClaudeOneShot: one turn, no tools, the result text', async () => {
     env: () => ({}),
   });
   await assert.rejects(failing({ model: 'm', systemPrompt: 's', prompt: 'p' }), /error_max_turns/);
+});
+
+// --- long threads: transcript log and paging ----------------------------------------------
+
+/** A bot whose transcript is a version 2 file (the format before the log) with `count` answered messages. */
+const seedVersion2 = async (dir, count) => {
+  const seeded = makeEngine({ dir });
+  const [primary] = (await seeded.engine.list()).bots;
+  await seeded.engine.stop();
+  for (const name of await fs.readdir(dir)) if (name.endsWith('.log')) await fs.rm(path.join(dir, name));
+  const messages = Array.from({ length: count }, (_, index) => ({
+    id: `m${index + 1}`,
+    seq: index + 1,
+    role: index % 2 ? 'assistant' : 'user',
+    content: `message ${index + 1} ${'x'.repeat(200)}`,
+    authorLabel: null,
+    createdAt: 1_700_000_000_000 + index,
+  }));
+  const claims = { nextSeq: count + 1, processedSeq: count, compactedThroughSeq: 0, requeue: [], inFlight: [] };
+  await fs.writeFile(path.join(dir, `${primary.id}.json`), JSON.stringify({ version: 2, botId: primary.id, messages, claims }));
+  return primary.id;
+};
+const logOf = async (dir, id) => JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8')).log;
+const readLines = async (file) => (await fs.readFile(file, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+
+test('a version 2 transcript (2,000 messages) migrates to a snapshot and log with nothing lost', async () => {
+  const dir = path.join(testRoot, `bots-migrate-${Date.now()}`);
+  const id = await seedVersion2(dir, 2_000);
+  const first = makeEngine({ dir });
+  first.engine.setActive(false);
+  let thread = await first.engine.thread(id, { limit: 50 });
+  assert.equal(thread.messages.length, 50);
+  assert.equal(thread.messages.at(-1).seq, 2_000);
+  assert.equal(thread.hasMore, true);
+  // Loading alone writes nothing: the version 2 file stays until a save.
+  assert.equal(JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8')).version, 2);
+  await first.engine.send(id, { messageId: 'new1', content: 'after the migration' });
+  await first.engine.flush();
+  const snapshot = JSON.parse(await fs.readFile(path.join(dir, `${id}.json`), 'utf8'));
+  assert.equal(snapshot.version, 3);
+  assert.match(snapshot.log, new RegExp(`^${id}\\.[0-9a-f]{12}\\.log$`));
+  await first.engine.stop();
+  const second = makeEngine({ dir });
+  second.engine.setActive(false);
+  thread = await second.engine.thread(id, { limit: 500 });
+  assert.equal(thread.messages.at(-1).content, 'after the migration');
+  // Every message, all the way back.
+  const seen = [];
+  let before;
+  for (;;) {
+    const page = await second.engine.thread(id, { limit: 200, ...(before !== undefined ? { beforeSeq: before } : {}) });
+    seen.unshift(...page.messages.map((message) => message.seq));
+    if (!page.hasMore) break;
+    before = page.messages[0].seq;
+  }
+  assert.equal(seen.length, 2_001);
+  assert.deepEqual(seen.slice(0, 3), [1, 2, 3]);
+  assert.deepEqual(seen, [...seen].sort((a, b) => a - b));
+  await second.engine.stop();
+});
+
+test('a save appends what changed instead of rewriting the transcript', async () => {
+  const dir = path.join(testRoot, `bots-append-${Date.now()}`);
+  const id = await seedVersion2(dir, 2_000);
+  const { engine } = makeEngine({ dir });
+  engine.setActive(false);
+  await engine.send(id, { messageId: 'first', content: 'one' });
+  await engine.flush();
+  const snapshotFile = path.join(dir, `${id}.json`);
+  const before = await fs.stat(snapshotFile);
+  const log = path.join(dir, await logOf(dir, id));
+  for (let index = 0; index < 20; index += 1) {
+    await engine.send(id, { messageId: `more${index}`, content: `more ${index}` });
+    await engine.flush();
+  }
+  const after = await fs.stat(snapshotFile);
+  assert.equal(after.mtimeMs, before.mtimeMs, 'the snapshot is not rewritten');
+  assert.equal(after.size, before.size);
+  const lines = await readLines(log);
+  assert.equal(lines.length, 20);
+  // Each line: only the new message (and the claim state), never the history.
+  for (const [index, line] of lines.entries()) {
+    assert.deepEqual(line.add.map((message) => message.id), [`more${index}`]);
+    assert.equal(line.drop, undefined);
+    assert.equal(typeof line.claims.nextSeq, 'number');
+  }
+  assert.ok((await fs.stat(log)).size < 20 * 1_000, 'twenty small lines');
+  // A save with nothing new writes nothing.
+  await engine.markRead(id);
+  await engine.flush();
+  assert.equal((await readLines(log)).length, 20);
+  await engine.stop();
+});
+
+test('a torn last log line (a crash mid-save) is dropped whole and the log keeps working', async () => {
+  const dir = path.join(testRoot, `bots-torn-${Date.now()}`);
+  const first = makeEngine({ dir });
+  first.engine.setActive(false);
+  const [primary] = (await first.engine.list()).bots;
+  await first.engine.send(primary.id, { messageId: 'a', content: 'kept' });
+  await first.engine.send(primary.id, { messageId: 'b', content: 'kept too' });
+  await first.engine.stop();
+  const log = path.join(dir, await logOf(dir, primary.id));
+  await fs.appendFile(log, '{"add":[{"id":"c","seq":3,"role":"user","content":"half writ');
+  const second = makeEngine({ dir });
+  second.engine.setActive(false);
+  let thread = await second.engine.thread(primary.id);
+  assert.deepEqual(thread.messages.map((message) => message.content), ['kept', 'kept too']);
+  assert.equal((await fs.readFile(log, 'utf8')).endsWith('\n'), true, 'the torn tail is cut off');
+  await second.engine.send(primary.id, { messageId: 'd', content: 'after the crash' });
+  await second.engine.stop();
+  const third = makeEngine({ dir });
+  third.engine.setActive(false);
+  thread = await third.engine.thread(primary.id);
+  assert.deepEqual(thread.messages.map((message) => message.content), ['kept', 'kept too', 'after the crash']);
+  await third.engine.stop();
+});
+
+test('a long log is folded into a new snapshot; a stray old log is removed on load', async () => {
+  const dir = path.join(testRoot, `bots-fold-${Date.now()}`);
+  const first = makeEngine({ dir });
+  first.engine.setActive(false);
+  const [primary] = (await first.engine.list()).bots;
+  await first.engine.flush();
+  const firstLog = await logOf(dir, primary.id);
+  for (let index = 0; index < TRANSCRIPT_LOG_MAX_LINES + 5; index += 1) {
+    await first.engine.send(primary.id, { messageId: `n${index}`, content: `note ${index}` });
+    await first.engine.flush();
+  }
+  const secondLog = await logOf(dir, primary.id);
+  assert.notEqual(secondLog, firstLog, 'a new snapshot names a new log');
+  const files = await fs.readdir(dir);
+  assert.equal(files.includes(firstLog), false, 'the old log is removed');
+  assert.ok((await readLines(path.join(dir, secondLog))).length < 10);
+  await first.engine.stop();
+  // A crash between a new snapshot and removing the old log leaves a stray.
+  const stray = `${primary.id}.0123456789ab.log`;
+  await fs.writeFile(path.join(dir, stray), `${JSON.stringify({ add: [{ id: 'ghost', seq: 1, role: 'user', content: 'ghost', createdAt: 0 }] })}\n`);
+  const second = makeEngine({ dir });
+  second.engine.setActive(false);
+  const newest = await second.engine.thread(primary.id, { limit: 500 });
+  const oldest = await second.engine.thread(primary.id, { limit: 500, beforeSeq: newest.messages[0].seq });
+  const all = [...oldest.messages, ...newest.messages];
+  assert.equal(all.length, TRANSCRIPT_LOG_MAX_LINES + 5);
+  assert.equal(oldest.hasMore, false);
+  assert.deepEqual([all[0].content, all.at(-1).content], ['note 0', `note ${TRANSCRIPT_LOG_MAX_LINES + 4}`]);
+  assert.equal(all.some((message) => message.content === 'ghost'), false);
+  assert.equal((await fs.readdir(dir)).includes(stray), false);
+  await second.engine.stop();
+});
+
+test('thread pages: newest, before a seq (all the way back) and after a seq (new ones)', async () => {
+  const dir = path.join(testRoot, `bots-pages-${Date.now()}`);
+  const id = await seedVersion2(dir, 2_000);
+  const { engine } = makeEngine({ dir });
+  engine.setActive(false);
+  const newest = await engine.thread(id, { limit: 40 });
+  assert.deepEqual([newest.messages[0].seq, newest.messages.at(-1).seq, newest.hasMore], [1_961, 2_000, true]);
+  const older = await engine.thread(id, { limit: 40, beforeSeq: 1_961 });
+  assert.deepEqual([older.messages[0].seq, older.messages.at(-1).seq, older.hasMore], [1_921, 1_960, true]);
+  const first = await engine.thread(id, { limit: 40, beforeSeq: 30 });
+  assert.deepEqual([first.messages[0].seq, first.messages.at(-1).seq, first.hasMore], [1, 29, false]);
+  // Nothing new since the newest page.
+  const none = await engine.thread(id, { limit: 40, afterSeq: 2_000 });
+  assert.deepEqual([none.messages.length, none.hasNewer], [0, false]);
+  for (let index = 0; index < 3; index += 1) await engine.send(id, { messageId: `x${index}`, content: `new ${index}` });
+  const fresh = await engine.thread(id, { limit: 2, afterSeq: 2_000 });
+  assert.deepEqual([fresh.messages.map((message) => message.content), fresh.hasNewer], [['new 0', 'new 1'], true]);
+  const rest = await engine.thread(id, { limit: 2, afterSeq: fresh.messages.at(-1).seq });
+  assert.deepEqual([rest.messages.map((message) => message.content), rest.hasNewer], [['new 2'], false]);
+  await engine.stop();
+});
+
+
+test('summary chain: compaction keeps a condensed earlier history next to the latest summary', async () => {
+  // Pure parsing: tags, no tags (all summary, earlier kept), bounds.
+  assert.deepEqual(parseCompaction('<earlier>\n- Nov 2: chose Sato\n</earlier>\n<summary>\nOpen: book Friday.\n</summary>', null), {
+    earlier: '- Nov 2: chose Sato',
+    summary: 'Open: book Friday.',
+  });
+  assert.deepEqual(parseCompaction('Just a summary.', '- older line'), { earlier: '- older line', summary: 'Just a summary.' });
+  assert.deepEqual(parseCompaction('<earlier>(none yet)</earlier><summary>S</summary>', '- kept'), { earlier: '- kept', summary: 'S' });
+  assert.equal(parseCompaction('   ', null), null);
+  const long = parseCompaction(`<earlier>${'e'.repeat(20_000)}</earlier><summary>${'s'.repeat(50_000)}</summary>`, null);
+  assert.ok(long.earlier.length <= EARLIER_HISTORY_MAX_CHARS && long.summary.length <= SUMMARY_MAX_CHARS, 'bounded');
+  assert.equal(memorySection({ summary: null, earlier: 'x' }), null);
+
+  const calls = [];
+  const answers = [
+    '<earlier>\n- Nov 17: the person said hi a lot.\n</earlier>\n<summary>\nThe person likes long messages.\n</summary>',
+    '<earlier>\n- Nov 17: the person said hi a lot.\n- Nov 17: more long messages.\n</earlier>\n<summary>\nStill long messages.\n</summary>',
+  ];
+  const summarize = async (input) => {
+    calls.push(input);
+    return answers[Math.min(calls.length - 1, answers.length - 1)];
+  };
+  const { engine, runner } = makeEngine({ summarize });
+  const [primary] = (await engine.list()).bots;
+  let sent = 0;
+  const say = async (text) => {
+    await engine.send(primary.id, { messageId: `c${sent}`, content: text });
+    sent += 1;
+    await waitFor(() => runner.lanes.length === sent);
+    runner.lanes[sent - 1].finish({ text: `ok ${sent}` });
+    await engine.idle();
+  };
+  for (let index = 0; index < 12; index += 1) await say(`${index} ${'y'.repeat(16_000)}`);
+  assert.equal(calls.length, 1, 'one compaction so far');
+  for (let index = 0; index < 12 && calls.length < 2; index += 1) await say(`more ${index} ${'z'.repeat(16_000)}`);
+  assert.equal(calls.length, 2, 'compacted again');
+  assert.match(calls[1].prompt, /<previous_earlier>\n- Nov 17: the person said hi a lot\.\n<\/previous_earlier>/, 'the chain goes back in');
+  assert.match(calls[1].prompt, /<previous_summary>\nThe person likes long messages\.\n<\/previous_summary>/);
+  await engine.send(primary.id, { messageId: 'last', content: 'and now?' });
+  await waitFor(() => runner.lanes.length === sent + 1);
+  const { systemPrompt } = runner.lanes[sent].lane;
+  assert.match(systemPrompt, /### Earlier history \(condensed\)\n\n- Nov 17: the person said hi a lot\.\n- Nov 17: more long messages\.\n\n### Recent conversation\n\nStill long messages\./);
+  assert.match(systemPrompt, /search_history finds the older messages/);
+  runner.lanes[sent].finish({ text: 'fine' });
+  await engine.idle();
+  const exported = await engine.exportForSync();
+  assert.match(exported.bots[0].earlierSummary, /more long messages/, 'the chain is uploaded at sign-in');
+});
+
+test('search_history finds older messages by keywords and dates, newest first', async () => {
+  const { engine, runner, clock } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  const day = (iso) => Date.parse(iso);
+  const sends = [
+    ['2026-11-10T09:00:00', 'Flight to Tokyo is JL 772, seat 31A.'],
+    ['2026-11-12T09:00:00', 'Hotel in Tokyo: Park Hyatt, booking 99812.'],
+    ['2026-11-15T09:00:00', 'Remind me about the dentist.'],
+  ];
+  for (const [index, [at, text]] of sends.entries()) {
+    clock.now = day(at);
+    await engine.send(primary.id, { messageId: `s${index}`, content: text });
+    await waitFor(() => runner.lanes.length === index + 1);
+    runner.lanes[index].finish({ text: `Noted (${index}).` });
+    await engine.idle();
+  }
+  await engine.send(primary.id, { messageId: 'q', content: 'what was my seat?' });
+  await waitFor(() => runner.lanes.length === 4);
+  const call = (input) => runner.lanes[3].ctx.callTool({ name: 'search_history', input, toolCallId: 't' }).then((out) => out.result);
+  const tokyo = await call({ query: 'tokyo' });
+  assert.equal(tokyo.ok, true);
+  assert.deepEqual(tokyo.results.map((item) => item.snippet), ['Hotel in Tokyo: Park Hyatt, booking 99812.', 'Flight to Tokyo is JL 772, seat 31A.']);
+  assert.equal(tokyo.results[0].from, 'Person');
+  assert.equal(tokyo.results[1].at, new Date(day('2026-11-10T09:00:00')).toISOString());
+  assert.deepEqual((await call({ query: 'Tokyo seat' })).results.map((item) => item.seq), [1], 'every word must appear');
+  assert.deepEqual((await call({ query: 'tokyo', from: '2026-11-11' })).results.length, 1, 'from a date');
+  assert.deepEqual((await call({ query: 'tokyo', to: '2026-11-10' })).results.length, 1, 'to a date (the whole day)');
+  assert.match((await call({ query: 'noted' })).results[0].from, /\(you\)$/, 'its own replies too');
+  assert.match((await call({ query: 'kyoto' })).note, /Nothing matched/);
+  assert.equal((await call({ query: 'a' })).ok, false);
+  runner.lanes[3].finish({ text: '31A.' });
+  await engine.idle();
+});
+
+test('lanes carry the structured conversation; a reply asking for compaction forces one', async () => {
+  const calls = [];
+  const summarize = async (input) => {
+    calls.push(input);
+    return '<earlier>\n- e\n</earlier>\n<summary>\ns\n</summary>';
+  };
+  const { engine, runner } = makeEngine({ summarize });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'x1', content: 'first' });
+  await waitFor(() => runner.lanes.length === 1);
+  runner.lanes[0].finish({ text: 'one' });
+  await engine.idle();
+  await engine.send(primary.id, { messageId: 'x2', content: 'second', authorLabel: null });
+  await waitFor(() => runner.lanes.length === 2);
+  const { lane } = runner.lanes[1];
+  assert.equal(lane.replyMessageId, lane.laneId, "the reply's message id");
+  assert.deepEqual(lane.session.history.map((item) => [item.seq, item.role, item.text]), [[1, 'user', 'first'], [2, 'assistant', 'one'], [3, 'user', 'second']]);
+  assert.equal(lane.session.history[2].id, 'x2');
+  assert.deepEqual(lane.session.answering, [3]);
+  assert.ok(lane.session.context.some((part) => part.steady && /no other bots/.test(part.text)), 'steady parts are marked');
+  assert.ok(lane.session.context.some((part) => !part.steady && /This reply answers/.test(part.text)));
+  runner.lanes[1].finish({ text: 'two' });
+  await engine.idle();
+  assert.equal(calls.length, 0, 'far below the trigger: no compaction');
+
+  // ~30K tokens: under the normal trigger (40K), over the forced one (24K).
+  for (let index = 0; index < 8; index += 1) {
+    await engine.send(primary.id, { messageId: `y${index}`, content: 'w'.repeat(15_000) });
+    await waitFor(() => runner.lanes.length === 3 + index);
+    runner.lanes[2 + index].finish({ text: 'ok' });
+    await engine.idle();
+  }
+  assert.equal(calls.length, 0);
+  await engine.send(primary.id, { messageId: 'z', content: 'go' });
+  await waitFor(() => runner.lanes.length === 11);
+  runner.lanes[10].finish({ text: 'done', compact: true });
+  await engine.idle();
+  assert.equal(calls.length, 1, 'forced');
 });
 
 // --- run -------------------------------------------------------------------------------------

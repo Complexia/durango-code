@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Archive,
+  ArrowDown,
   ArrowUp,
   Bot,
   CalendarClock,
@@ -45,8 +47,21 @@ import { compareSidebarV2Recent, sidebarV2ThreadLists, threadSidebarTone } from 
 import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
+import { localMediaSrc } from './attachments';
+import { BotActionsRow, BotCards, BotFileGallery, threadIsHere, useMessageFiles, type BotActionHandlers } from './BotReplyCards';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
+import { sortProjectsByLatestThreadStart } from './projectOrder';
 import { useSidebarResize } from './useSidebarResize';
+import { useBotsShellSlot } from './botsShellSlot';
+import {
+  BOT_THREAD_FIRST_PAGE,
+  BOT_THREAD_OLDER_PAGE,
+  BOT_THREAD_POLL_PAGE,
+  BOT_THREAD_POLL_ROUNDS,
+  botPollCursor,
+  mergeBotMessages,
+  useBotMessageWindow,
+} from './botThreadWindow';
 import {
   botInboxSource,
   botIsWorking,
@@ -55,6 +70,8 @@ import {
   newBotMessageId,
   projectBotFor,
   relativeBotTime,
+  taskReportActions,
+  taskReportBody,
   type BotProject,
   type BotProjectFile,
   type BotProjectNote,
@@ -310,10 +327,11 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   }, [threads]);
 
   // The projects window: projects open here (each with its bot once it
-  // exists), then project bots of projects open elsewhere.
+  // exists), the one where a thread was most recently started first, then
+  // project bots of projects open elsewhere.
   const projectEntries = useMemo<ProjectEntry[]>(() => {
     const list = bots ?? [];
-    const here = projects.map((project) => {
+    const here = sortProjectsByLatestThreadStart(projects, threads).map((project) => {
       const key = projectKeys[project.id] ?? null;
       return { id: project.id, name: project.name, path: project.path, bot: projectBotFor(list, key ?? undefined), key, threads: threadsByProject.get(project.id) ?? [] };
     });
@@ -322,7 +340,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       .filter((bot) => bot.project && !shown.has(bot.id))
       .map((bot) => ({ id: `bot:${bot.id}`, name: bot.project!.name, path: null, bot, key: bot.project!.key, threads: [] }));
     return [...here, ...elsewhere];
-  }, [bots, projectKeys, projects, threadsByProject]);
+  }, [bots, projectKeys, projects, threads, threadsByProject]);
 
   const openBot = (botId: string) => setSidebarV3Settings({ selectedBotId: botId, view: 'bot' });
   // A thread opened from a project page shows in the usual thread view (the
@@ -332,6 +350,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const openProjectThread = (threadId: string) => {
     threadActions.selectThread(threadId);
     setSidebarV3Settings({ view: 'thread', threadFromProjectId: selectedProjectId });
+  };
+  // A bot reply's Open thread button: the thread in the usual thread view.
+  const openBotThread = (threadId: string) => {
+    if (!threadIsHere(threadId)) return false;
+    threadActions.selectThread(threadId);
+    setSidebarV3Settings({ view: 'thread', threadFromProjectId: null });
+    return true;
   };
   const newProjectThread = (projectId: string) => {
     onNewThread(projectId);
@@ -458,7 +483,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               attentionThreadIds={attentionThreadIds}
             />
           ) : selectedBotId ? (
-            <BotPane key={`${account ?? ''}:${selectedBotId}`} botId={selectedBotId} onChanged={loadBots} onOpenProject={openProjectOfBot} />
+            <BotPane
+              key={`${account ?? ''}:${selectedBotId}`}
+              botId={selectedBotId}
+              onChanged={loadBots}
+              onOpenProject={openProjectOfBot}
+              onOpenThread={openBotThread}
+            />
           ) : (
             <div className="empty-state">
               <div className="empty-state-icon">
@@ -1063,41 +1094,144 @@ const BotRow: React.FC<{
 };
 
 /** One bot's conversation: messages, live replies at the bottom, and a composer that never blocks. */
-const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (bot: DesktopBot) => void }> = ({ botId, onChanged, onOpenProject }) => {
-  const [thread, setThread] = useState<DesktopBotThread | null>(() => botThreadCache.get(botId) ?? null);
+const BotPane: React.FC<{
+  botId: string;
+  onChanged: () => void;
+  onOpenProject: (bot: DesktopBot) => void;
+  /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
+  onOpenThread: (threadId: string) => boolean;
+}> = ({ botId, onChanged, onOpenProject, onOpenThread }) => {
+  // `thread.messages`: every message loaded so far (the newest page, older
+  // pages scrolled back to, and what polls brought), in seq order; unchanged
+  // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
+  const [thread, setThreadState] = useState<DesktopBotThread | null>(() => botThreadCache.get(botId) ?? null);
+  const shellSlot = useBotsShellSlot();
   const [error, setError] = useState<string | null>(null);
   const [outgoing, setOutgoing] = useState<Outgoing[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const working = thread ? botIsWorking(thread.bot) : false;
   const sending = outgoing.some((message) => !message.failed);
+  const threadRef = useRef(thread);
+  const setThread = useCallback(
+    (update: (current: DesktopBotThread | null) => DesktopBotThread | null) => {
+      const next = update(threadRef.current);
+      if (next === threadRef.current) return;
+      threadRef.current = next;
+      if (next) botThreadCache.set(botId, next);
+      setThreadState(next);
+    },
+    [botId]
+  );
 
-  const load = useCallback(async () => {
-    const generation = botCacheGeneration;
-    const result = await window.orion?.getBotThread?.({ botId, limit: 120, read: visible() });
-    if (!result || generation !== botCacheGeneration) return;
-    if (!result.ok || !result.bot) {
-      setError(result.error ?? 'Couldn’t load this bot.');
+  /** A page from Durango (or this device's bots); null when it failed (the error is shown if nothing is). */
+  const fetchPage = useCallback(
+    async (page: { limit: number; beforeSeq?: number; afterSeq?: number }) => {
+      const generation = botCacheGeneration;
+      const result = await window.orion?.getBotThread?.({ botId, read: visible(), ...page });
+      if (!result || generation !== botCacheGeneration) return null;
+      if (!result.ok || !result.bot) {
+        setError(result.error ?? 'Couldn’t load this bot.');
+        return null;
+      }
+      setError(null);
+      return result as DesktopBotThread & { hasNewer?: boolean };
+    },
+    [botId]
+  );
+
+  /** The newest page, replacing what was loaded (opening the thread, or catching up after a long gap). */
+  const loadNewest = useCallback(async () => {
+    const result = await fetchPage({ limit: BOT_THREAD_FIRST_PAGE });
+    if (result) setThread(() => ({ bot: result.bot, live: result.live ?? [], messages: result.messages ?? [], hasMore: result.hasMore === true }));
+  }, [fetchPage, setThread]);
+
+  /**
+   * What changed since the last load: the bot, its live replies, and only the
+   * messages after the cursor (botPollCursor). Nothing new: nothing redraws.
+   */
+  const poll = useCallback(async () => {
+    const shown = threadRef.current;
+    let cursor = shown ? botPollCursor(shown.messages, shown.live) : null;
+    if (cursor === null) {
+      await loadNewest();
       return;
     }
-    setError(null);
-    botThreadCache.set(botId, result as DesktopBotThread);
-    setThread(result as DesktopBotThread);
-  }, [botId]);
+    for (let round = 0; round < BOT_THREAD_POLL_ROUNDS; round += 1) {
+      const result = await fetchPage({ limit: BOT_THREAD_POLL_PAGE, afterSeq: cursor });
+      if (!result) return;
+      setThread((current) => {
+        if (!current) return current;
+        const messages = mergeBotMessages(current.messages, result.messages);
+        const live = result.live ?? [];
+        const same = messages === current.messages && JSON.stringify([current.bot, current.live]) === JSON.stringify([result.bot, live]);
+        return same ? current : { ...current, bot: result.bot, live, messages };
+      });
+      // Durango without cursors (older) sends the newest page: merged above, done.
+      if (result.hasNewer !== true || !result.messages?.length) return;
+      cursor = result.messages[result.messages.length - 1].seq;
+    }
+    // Far behind (away a long time): start again from the newest page.
+    await loadNewest();
+  }, [fetchPage, loadNewest, setThread]);
 
+  /** The page before the oldest loaded message (scrolling back). → whether it loaded. */
+  const loadOlder = useCallback(async () => {
+    const oldest = threadRef.current?.messages[0];
+    if (!oldest) return false;
+    const result = await fetchPage({ limit: BOT_THREAD_OLDER_PAGE, beforeSeq: oldest.seq });
+    if (!result) return false;
+    const older = (result.messages ?? []).filter((message) => message.seq < oldest.seq);
+    setThread((current) =>
+      current
+        ? {
+            ...current,
+            messages: mergeBotMessages(current.messages, older),
+            // Durango without cursors sends the newest page again: nothing older to show.
+            hasMore: older.length > 0 && result.hasMore === true,
+          }
+        : current
+    );
+    return older.length > 0;
+  }, [fetchPage, setThread]);
+
+  // Opening: what is new since the cached copy, or the newest page.
   useEffect(() => {
-    void load();
-  }, [load]);
+    void poll();
+  }, [poll]);
 
   // Brisk while a reply is being written (or just sent), slow otherwise.
+  // A poll that finds nothing new keeps the same thread object, so this
+  // timer is set again by `tick` itself rather than by a redraw.
+  const workingRef = useRef(false);
+  workingRef.current = working || sending;
   useEffect(() => {
-    const timer = window.setTimeout(function tick() {
-      if (visible()) void load();
-    }, working || sending ? THREAD_POLL_ACTIVE_MS : THREAD_POLL_IDLE_MS);
-    return () => window.clearTimeout(timer);
-  }, [load, thread, working, sending]);
+    let timer = 0;
+    let stopped = false;
+    const tick = async () => {
+      if (visible()) await poll().catch(() => {});
+      if (!stopped) timer = window.setTimeout(tick, workingRef.current ? THREAD_POLL_ACTIVE_MS : THREAD_POLL_IDLE_MS);
+    };
+    timer = window.setTimeout(tick, working || sending ? THREAD_POLL_ACTIVE_MS : THREAD_POLL_IDLE_MS);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [poll, working, sending]);
 
-  const stored = useMemo(() => new Set(thread?.messages.map((message) => message.id) ?? []), [thread]);
+  const messageIds = useMemo(() => thread?.messages.map((message) => message.id) ?? [], [thread?.messages]);
+  const stored = useMemo(() => new Set(messageIds), [messageIds]);
+  const { range, onScroll: onWindowScroll, toLatest, settle, loadingOlder } = useBotMessageWindow({
+    ids: messageIds,
+    scrollRef,
+    hasMore: thread?.hasMore === true,
+    loadOlder,
+    resetKey: botId,
+  });
+  // The avatar's fields only: message rows don't redraw on every status change.
+  const faceKey = thread ? `${thread.bot.id}|${thread.bot.name}|${thread.bot.emoji}|${thread.bot.role}|${thread.bot.project?.key ?? ''}` : '';
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- by its face fields
+  const face = useMemo(() => thread?.bot ?? null, [faceKey]);
   const pending = outgoing.filter((message) => !stored.has(message.id));
 
   const send = useCallback(
@@ -1105,6 +1239,7 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
       const content = text.trim();
       if (!content && !files.length) return;
       stick.current = true;
+      toLatest();
       rememberSentPreviews(id, files);
       setOutgoing((current) => [...current.filter((message) => message.id !== id), { id, content, ...(files.length ? { files } : {}) }]);
       let timeZone: string | undefined;
@@ -1127,17 +1262,40 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
       }
       // Stored: it stops saying "Sending…" now, before the thread reloads.
       setOutgoing((current) => current.map((message) => (message.id === id ? { ...message, sent: true } : message)));
-      void load();
+      void poll();
       onChanged();
     },
-    [botId, load, onChanged]
+    [botId, poll, onChanged, toLatest]
   );
+
+  // What reply cards do: a button or an answer sends text as the person's message; Open thread opens it here.
+  const sendRef = useRef(send);
+  sendRef.current = send;
+  const openThreadRef = useRef(onOpenThread);
+  openThreadRef.current = onOpenThread;
+  const handlers = useMemo<BotActionHandlers>(
+    () => ({ onReply: (text) => void sendRef.current(text), onOpenThread: (threadId) => openThreadRef.current(threadId) }),
+    []
+  );
+  // Questions (ask_user cards) the person answered in this thread: question → answer.
+  // The same Map while its answers don't change, so memoized rows don't redraw on every new message.
+  const answeredRef = useRef<{ key: string; map: Map<string, string> }>({ key: '', map: new Map() });
+  const answeredQuestions = useMemo(() => {
+    const answered = new Map<string, string>();
+    for (const message of thread?.messages ?? []) {
+      const match = message.role === 'user' ? /^> \*\*Answering:\*\* (.+)\n\n([\s\S]+)$/.exec(message.content) : null;
+      if (match) answered.set(match[1].trim(), match[2].trim());
+    }
+    const key = JSON.stringify([...answered]);
+    if (key !== answeredRef.current.key) answeredRef.current = { key, map: answered };
+    return answeredRef.current.map;
+  }, [thread?.messages]);
 
   const liveKey = thread?.live.map((reply) => `${reply.messageId}:${reply.content.length}`).join() ?? '';
   useLayoutEffect(() => {
     const element = scrollRef.current;
-    if (element && stick.current) element.scrollTop = element.scrollHeight;
-  }, [thread?.messages.length, pending.length, liveKey]);
+    if (element && stick.current && range.following) element.scrollTop = element.scrollHeight;
+  }, [thread?.messages.length, pending.length, liveKey, range.following]);
 
   if (!thread) {
     return (
@@ -1147,14 +1305,20 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
     );
   }
   const { bot } = thread;
+  const rowBot = face ?? bot;
   const live = thread.live.filter((reply) => !stored.has(reply.messageId));
   // A reply that has shown text has its place: messages sent after that go below it, here and once stored.
   const placed = live.filter((reply): reply is DesktopBotLive & { seq: number } => typeof reply.seq === 'number');
   const unplaced = live.filter((reply) => typeof reply.seq !== 'number');
+  // Only the mounted window (useBotMessageWindow); live replies placed inside it, or below it while following.
+  const shown = thread.messages.slice(range.start, range.end);
+  const fromSeq = range.start > 0 && shown.length ? shown[0].seq : -Infinity;
+  const toSeq = range.following || !shown.length ? Infinity : shown[shown.length - 1].seq;
   const timeline: ({ kind: 'message'; seq: number; message: DesktopBotMessage } | { kind: 'live'; seq: number; reply: DesktopBotLive })[] = [
-    ...thread.messages.map((message) => ({ kind: 'message' as const, seq: message.seq, message })),
-    ...placed.map((reply) => ({ kind: 'live' as const, seq: reply.seq, reply })),
+    ...shown.map((message) => ({ kind: 'message' as const, seq: message.seq, message })),
+    ...placed.filter((reply) => reply.seq > fromSeq && reply.seq <= toSeq).map((reply) => ({ kind: 'live' as const, seq: reply.seq, reply })),
   ].sort((a, b) => a.seq - b.seq);
+  const olderAbove = range.start > 0 || thread.hasMore;
   const starting = !bot.paused && live.length === 0 && (working || pending.some((message) => message.sent));
   const liveRow = (reply: DesktopBotLive) => (
     <AssistantRow key={`live-${reply.messageId}`} bot={bot}>
@@ -1170,37 +1334,49 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
       </div>
     </AssistantRow>
   );
+  // The bot's name and status: in the shell bar's title spot (where "Bots" was),
+  // or as a row atop the pane when that spot isn't on screen.
+  const header = (
+    <>
+      <BotAvatar bot={bot} size="md" />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span className="truncate text-[14px] font-semibold text-[var(--text-primary)]">{bot.name}</span>
+          {bot.role === 'primary' && <span className="shrink-0 text-[11px] text-[var(--text-muted)]">all projects</span>}
+        </div>
+        <div className="flex items-center gap-1.5 text-[11.5px] text-[var(--text-muted)]">
+          {bot.paused ? <Pause size={11} /> : working ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" /> : null}
+          {bot.paused ? 'Paused' : working ? (live.length > 1 ? `Working on ${live.length} replies…` : 'Working…') : bot.needsYou ? 'Waiting on you' : bot.model.split('/').pop()}
+        </div>
+      </div>
+      {bot.project && (
+        <button
+          type="button"
+          onClick={() => onOpenProject(bot)}
+          className="flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-[12px] text-[var(--text-secondary)] transition-colors duration-75 [-webkit-app-region:no-drag] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
+          title="The project: its threads, notes and files"
+        >
+          <FolderOpen size={13} /> {bot.project.name}
+        </button>
+      )}
+    </>
+  );
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
-      <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-white/[0.06] px-4">
-        <BotAvatar bot={bot} size="md" />
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="truncate text-[14px] font-semibold text-neutral-100">{bot.name}</span>
-            {bot.role === 'primary' && <span className="shrink-0 text-[11px] text-neutral-500">all projects</span>}
-          </div>
-          <div className="flex items-center gap-1.5 text-[11.5px] text-neutral-500">
-            {bot.paused ? <Pause size={11} /> : working ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" /> : null}
-            {bot.paused ? 'Paused' : working ? (live.length > 1 ? `Working on ${live.length} replies…` : 'Working…') : bot.needsYou ? 'Waiting on you' : bot.model.split('/').pop()}
-          </div>
-        </div>
-        {bot.project && (
-          <button
-            type="button"
-            onClick={() => onOpenProject(bot)}
-            className="flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] text-neutral-400 transition-colors duration-75 hover:bg-white/[0.06] hover:text-neutral-200"
-            title="The project: its threads, notes and files"
-          >
-            <FolderOpen size={13} /> {bot.project.name}
-          </button>
-        )}
-      </div>
+      {shellSlot ? (
+        createPortal(header, shellSlot)
+      ) : (
+        <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-white/[0.06] px-4">{header}</div>
+      )}
+      <div className="relative min-h-0 flex-1">
       <div
         ref={scrollRef}
-        className="min-h-0 flex-1 overflow-y-auto"
+        className="h-full overflow-y-auto"
         onScroll={(event) => {
           const element = event.currentTarget;
           stick.current = element.scrollHeight - element.scrollTop - element.clientHeight < 120;
+          onWindowScroll();
+          if (stick.current) settle();
         }}
       >
         <div className="mx-auto flex w-full max-w-[760px] flex-col gap-4 px-5 pb-6 pt-5">
@@ -1209,8 +1385,22 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
               Text {bot.name} like a person: send as many messages as you like.
             </div>
           )}
-          {timeline.map((row) => (row.kind === 'message' ? <BotMessage key={row.message.id} bot={bot} message={row.message} /> : liveRow(row.reply)))}
-          {pending.map((message) => (
+          {olderAbove && (
+            // Earlier messages load as you scroll up; it spins only while a page loads.
+            <div className="flex h-5 justify-center text-neutral-600" aria-label="Earlier messages load as you scroll up">
+              {loadingOlder && <Loader2 size={12} className="animate-spin" />}
+            </div>
+          )}
+          {timeline.map((row) =>
+            row.kind === 'message' ? (
+              <div key={row.message.id} data-bot-row={row.message.id} className="flex flex-col">
+                <BotMessage bot={rowBot} message={row.message} handlers={handlers} answeredQuestions={answeredQuestions} />
+              </div>
+            ) : (
+              liveRow(row.reply)
+            )
+          )}
+          {range.following && pending.map((message) => (
             <PersonBubble
               key={message.id}
               content={message.content}
@@ -1227,8 +1417,8 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
               }
             />
           ))}
-          {unplaced.map(liveRow)}
-          {starting && (
+          {range.following && unplaced.map(liveRow)}
+          {range.following && starting && (
             <AssistantRow bot={bot}>
               <div className="flex items-center gap-1.5 text-[11.5px] text-neutral-500">
                 <Loader2 size={11} className="animate-spin" /> Starting…
@@ -1236,6 +1426,19 @@ const BotPane: React.FC<{ botId: string; onChanged: () => void; onOpenProject: (
             </AssistantRow>
           )}
         </div>
+      </div>
+      {!range.following && (
+        <button
+          type="button"
+          onClick={() => {
+            stick.current = true;
+            toLatest();
+          }}
+          className="absolute bottom-3 left-1/2 flex h-7 -translate-x-1/2 items-center gap-1.5 rounded-full bg-neutral-800/95 px-3 text-[12px] text-neutral-200 shadow-lg ring-1 ring-white/10 transition-colors duration-75 hover:bg-neutral-700"
+        >
+          <ArrowDown size={12} /> Latest messages
+        </button>
+      )}
       </div>
       <BotComposer botName={bot.name} paused={bot.paused} onSend={(text, files) => void send(text, files)} />
     </div>
@@ -2050,19 +2253,31 @@ const AssistantRow: React.FC<{ bot: DesktopBot; children: React.ReactNode; copy?
 
 const INBOX_ICON = { routine: CalendarClock, task: ListChecks, bot: Bot } as const;
 
-const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = React.memo(({ bot, message }) => {
+const BotMessage: React.FC<{
+  bot: DesktopBot;
+  message: DesktopBotMessage;
+  handlers: BotActionHandlers;
+  answeredQuestions: ReadonlyMap<string, string>;
+}> = React.memo(({ bot, message, handlers, answeredQuestions }) => {
+  const files = useMessageFiles(message.files);
   if (message.role === 'assistant') {
     const via = message.authorLabel?.startsWith('via ') ? message.authorLabel : null;
+    // Files it attached show under the text (a path it names would show twice).
+    const showsFiles = files.length > 0 || Boolean(message.cards?.some((card) => card.component === 'asset-gallery'));
     return (
-      <AssistantRow bot={bot} copy={message.content}>
-        <MarkdownContent content={message.content} />
+      <AssistantRow bot={bot} copy={copyText(message.content, message.files)}>
+        <MarkdownContent content={message.content} pathPreviews={!showsFiles} />
+        <BotFileGallery files={files} />
+        {message.cards?.length ? <BotCards cards={message.cards} handlers={handlers} answeredQuestions={answeredQuestions} /> : null}
         {via && <div className="mt-1 text-[11px] text-neutral-600">{via}</div>}
       </AssistantRow>
     );
   }
   const source = botInboxSource(message.authorLabel);
-  if (source === 'person') return <PersonBubble content={message.content} files={withSentPreviews(message.id, message.files)} />;
+  if (source === 'person') return <PersonBubble content={message.content} files={withSentPreviews(message.id, personFiles(message.files, files))} />;
   const Icon = INBOX_ICON[source];
+  // A task report carries its thread and change: open or ship them from here.
+  const actions = source === 'task' ? taskReportActions(message.content) : [];
   return (
     <div className="mx-auto w-full max-w-[92%] rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-[12.5px]">
       <div className="flex items-center gap-1.5 text-neutral-400">
@@ -2070,10 +2285,20 @@ const BotMessage: React.FC<{ bot: DesktopBot; message: DesktopBotMessage }> = Re
         <span className="truncate font-medium text-neutral-300">{message.authorLabel}</span>
         <span className="ml-auto text-[10.5px] text-neutral-600">{relativeBotTime(message.createdAt)}</span>
       </div>
-      <div className="mt-1 line-clamp-4 whitespace-pre-wrap text-neutral-400">{message.content}</div>
+      <div className="mt-1 line-clamp-4 whitespace-pre-wrap text-neutral-400">{source === 'task' ? taskReportBody(message.content) : message.content}</div>
+      {actions.length > 0 && <BotActionsRow actions={actions} handlers={handlers} />}
     </div>
   );
 });
+
+/** The person's files with a thumbnail: the one sent from here, else the image loaded from the library. */
+const personFiles = (stored: DesktopBotMessage['files'], shown: ReturnType<typeof useMessageFiles>): BubbleFile[] | undefined =>
+  stored?.map((file, index) => {
+    const loaded = shown[index];
+    const image = loaded && /^image\/(png|jpe?g|gif|webp)$/i.test(loaded.contentType ?? '');
+    const preview = image ? loaded.url ?? (loaded.path ? localMediaSrc(loaded.path, []) : undefined) : undefined;
+    return { name: file.name, ...(file.size ? { size: file.size } : {}), ...(preview ? { preview } : {}) };
+  });
 
 /** Always open: messages queue while the bot works, like texting a person. */
 const BOT_ATTACHMENTS_MAX = 10;

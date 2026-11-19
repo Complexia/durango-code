@@ -86,9 +86,15 @@ import {
   isProjectAllowed,
   normalizeDispatchSettings,
 } from './main/durango-dispatch.js';
-import { createBotReplyWorker, createClaudeLaneRunner, createClaudeOneShot, normalizeBotSettings } from './main/bot-replies.js';
+import {
+  createBotReplyWorker,
+  createBotSessionStore,
+  createClaudeLaneRunner,
+  createClaudeOneShot,
+  normalizeBotSettings,
+} from './main/bot-replies.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
-import { createBotThreadTools } from './main/bot-thread-tools.js';
+import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
 import {
   createDeployWatcher,
   createSourceConfigFetcher,
@@ -222,7 +228,9 @@ import {
   durangoWorkspaceStatus,
   findDurangoWorkspace,
   inspectDurangoWorkspaceProject,
+  landDurangoChange,
   landDurangoWorkspace,
+  locateDurangoChange,
   missingDurangoWorkspaces,
   pruneDurangoWorkspaces,
   removeDurangoWorkspace,
@@ -4677,6 +4685,11 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
   createInputQueue: createClaudeInputQueue,
   botsDir: () => path.join(app.getPath('userData'), 'bots'),
   getProjects: botProjects,
+  // Each bot's Claude Code session, resumed by its next reply here (bot-sessions.js).
+  sessions: createBotSessionStore({
+    dir: () => path.join(app.getPath('userData'), 'bots', '.sessions'),
+    log: (...args) => console.warn('[bot sessions]', ...args),
+  }),
 });
 
 // A Durango Code thread a bot started in a project here (delegate_task
@@ -4769,6 +4782,20 @@ const botReplyWorker = createBotReplyWorker({
   startProjectThread: startBotProjectThread(BOT_TASK_DISPATCH_PREFIX),
   startThreadFollowUp: startBotThreadFollowUp(BOT_TASK_DISPATCH_PREFIX),
   threadTools: botThreadTools,
+  // Files a reply attached (attach_files, screenshots it names): to the person's library.
+  uploadReplyFile: async (file) => {
+    const account = await durangoAccountKey();
+    if (!account) throw new Error('Not signed in to Durango.');
+    const uploaded = await durangoClient.uploadBotAttachment({
+      name: file.name,
+      bytes: await fs.readFile(file.path),
+      contentType: mimeTypeForPath(file.path),
+      account,
+    });
+    const asset = uploaded?.part?.asset;
+    if (!asset?.id) throw new Error('Durango did not store the file.');
+    return { id: asset.id, name: asset.name ?? file.name, kind: asset.kind ?? 'file' };
+  },
   // A task cancelled on Durango: its thread here stops, like a dispatch stopped from Chat.
   stopThread: (threadId, taskId) =>
     requestDispatchRendererCommand(
@@ -4786,9 +4813,18 @@ const botReplyWorker = createBotReplyWorker({
 // Reports a bot task's thread outcome to Durango, retrying a few times.
 // `retry: true` = it never got through (offline, signed out): the renderer
 // keeps the outcome unreported and tries again later.
-const reportBotTaskThread = async ({ taskId, outcome, summary, error }) => {
+// The report ends with the thread's id (and this machine), so the bot can
+// follow up there with message_thread, e.g. to ship the change it made.
+const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error }) => {
   const machineId = await getDurangoDeviceId().catch(() => null);
   if (!machineId || !taskId) return { ok: false, retry: true };
+  if (threadId) {
+    const thread = { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true };
+    // Kept short enough that Durango's clip of the report never cuts the footer.
+    const head = (text) => String(text ?? '').trim().slice(0, 10_000);
+    if (outcome === 'finished') summary = withThreadReportFooter(head(summary) || 'The Durango Code thread finished without a written summary.', thread);
+    else error = withThreadReportFooter(head(error) || 'it stopped.', thread);
+  }
   for (const delay of [0, 2_000, 10_000, 30_000]) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try {
@@ -5027,13 +5063,40 @@ ipcMain.handle('durango:openDeployLog', async (_event, input) => {
   const error = await shell.openPath(log);
   return error ? { ok: false, error } : { ok: true };
 });
+// What a bot task's report carries besides the thread's own words: the thread
+// and the change its workspace holds, so the bot (and its thread view) can put
+// Open thread / View change / Ship buttons on it without guessing ids.
+const botTaskReportRefs = async ({ threadId, workspacePath }) => {
+  const lines = [];
+  if (typeof threadId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(threadId)) lines.push(`Thread: @thread:${threadId}`);
+  if (isPathInput(workspacePath)) {
+    const status = await durangoWorkspaceStatus({ path: workspacePath, remote: true }).catch(() => null);
+    const change = status?.ok ? status.change : null;
+    if (change?.changeId) {
+      lines.push(`Change: ${change.changeId}${change.status ? ` (${change.status})` : ''}${change.url ? ` ${change.url}` : ''}`);
+    }
+    lines.push(`Workspace: ${workspacePath}`);
+  }
+  return lines.length ? `\n\n---\n${lines.join('\n')}` : '';
+};
+
+const withReportRefs = async (input) => {
+  const summary = typeof input?.summary === 'string' ? input.summary : undefined;
+  if (input?.outcome !== 'finished') return summary;
+  const refs = await botTaskReportRefs({ threadId: input?.threadId, workspacePath: input?.workspacePath }).catch(() => '');
+  // The thread's words are clipped first, so the refs (and the thread footer
+  // reportBotTaskThread adds after them, within its 10,000-character clip) survive.
+  return refs ? `${(summary?.trim() || 'The thread finished without a written summary.').slice(0, 9_000)}${refs}` : summary;
+};
+
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
-ipcMain.handle('durango:dispatchSettled', (_event, input) =>
+ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
   typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(BOT_TASK_DISPATCH_PREFIX)
     ? reportBotTaskThread({
         taskId: input.dispatchId.slice(BOT_TASK_DISPATCH_PREFIX.length),
+        threadId: typeof input?.threadId === 'string' ? input.threadId : undefined,
         outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
-        summary: typeof input?.summary === 'string' ? input.summary : undefined,
+        summary: await withReportRefs(input),
         error: typeof input?.error === 'string' ? input.error : undefined,
       })
     : typeof input?.dispatchId === 'string' && input.dispatchId.startsWith(LOCAL_BOT_DISPATCH_PREFIX)
@@ -5041,7 +5104,7 @@ ipcMain.handle('durango:dispatchSettled', (_event, input) =>
         key: input.dispatchId.slice(LOCAL_BOT_DISPATCH_PREFIX.length),
         threadId: typeof input?.threadId === 'string' ? input.threadId : undefined,
         outcome: input?.outcome === 'finished' ? 'finished' : 'failed',
-        summary: typeof input?.summary === 'string' ? input.summary : undefined,
+        summary: await withReportRefs(input),
         error: typeof input?.error === 'string' ? input.error : undefined,
       })
     : dispatchWorker.settle({
@@ -5992,15 +6055,22 @@ ipcMain.handle('bots:projectAction', async (event, input) => {
 ipcMain.handle('bots:thread', async (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : '';
   if (!botId) return { ok: false, error: 'Missing bot id.' };
+  // A page: the newest, the one before `beforeSeq` (scrolling back) or what is new after `afterSeq` (polling).
+  const page = {
+    limit: input?.limit,
+    read: input?.read === true,
+    ...(Number.isSafeInteger(input?.beforeSeq) ? { beforeSeq: input.beforeSeq } : {}),
+    ...(Number.isSafeInteger(input?.afterSeq) ? { afterSeq: input.afterSeq } : {}),
+  };
   if (await localBotsMode()) {
     try {
-      return { ok: true, ...(await localBots.thread(botId, { limit: input?.limit, read: input?.read === true })) };
+      return { ok: true, ...(await localBots.thread(botId, page)) };
     } catch (error) {
       return localBotsIpcError(error);
     }
   }
   try {
-    return { ok: true, ...(await durangoClient.botThread(botId, { limit: input?.limit, read: input?.read === true })) };
+    return { ok: true, ...(await durangoClient.botThread(botId, page)) };
   } catch (error) {
     return durangoIpcError(error);
   }
@@ -6110,6 +6180,72 @@ ipcMain.handle('bots:send', async (_event, input) => {
     };
   } catch (error) {
     return durangoIpcError(error);
+  }
+});
+
+// Files in bot threads (what the person attached, and files a reply attached):
+// read links (an hour) from Durango, by library id. Signed out, files are on
+// this device and the renderer shows them from their paths.
+ipcMain.handle('bots:fileLinks', async (_event, input) => {
+  const ids = (Array.isArray(input?.ids) ? input.ids : []).filter((id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id)).slice(0, 40);
+  if (!ids.length) return { ok: true, files: [] };
+  if (await localBotsMode()) return { ok: true, files: [] };
+  try {
+    return { ok: true, files: await durangoClient.botFileLinks(ids) };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+// A bot reply's Ship button (the renderer asked the person to confirm first).
+// With the thread that made the change: the ship request goes to that thread
+// as a follow-up turn, like a bot's message_thread (the bots' Shipping rule:
+// that thread knows how its project ships). A thread that isn't here →
+// `notHere`, and the renderer asks the bot to send it there. Without a
+// thread: lands the change the way the thread header's Land does.
+ipcMain.handle('bots:shipChange', async (_event, input) => {
+  const changeId = typeof input?.changeId === 'string' ? input.changeId.trim() : '';
+  if (!/^chg_[a-z0-9]{8,40}$/.test(changeId)) return { ok: false, error: 'Not a change id.' };
+  const threadId = typeof input?.threadId === 'string' ? input.threadId.trim() : '';
+  if (threadId) {
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(threadId)) return { ok: false, error: 'Not a thread id.' };
+    const started = await requestDispatchRendererCommand(
+      {
+        kind: 'runTurn',
+        threadId,
+        prompt: `${SHIP_VIA_THREAD_MESSAGE}\n\n(The change: ${changeId}. The person confirmed shipping it with the Ship button on their bot's reply.)`,
+        source: { machineId: 'durango-bot', machineName: 'Ship button' },
+      },
+      30_000
+    ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+    if (started?.ok) return { ok: true, via: 'thread', threadId, changeId };
+    if (/not found on this machine|runs on another machine/i.test(started?.error ?? '')) {
+      return { ok: false, notHere: true, error: started.error };
+    }
+    return { ok: false, error: started?.error ?? 'Could not start the follow-up in that thread.' };
+  }
+  const cliSignIn = await signInBundledCli();
+  if (!cliSignIn.signedIn) return { ok: false, error: cliSignIn.error ?? 'Sign in to Durango Code first.' };
+  return landDurangoChange({ changeId });
+});
+
+// A bot reply's View change button: the change's page on durango.sh (its URL
+// when the bot gave one, else Durango Source's, found from a checkout here).
+ipcMain.handle('bots:openChange', async (_event, input) => {
+  const changeId = typeof input?.changeId === 'string' ? input.changeId.trim() : '';
+  const given = typeof input?.url === 'string' ? externalWebUrl(input.url) : null;
+  try {
+    let target = given;
+    if (!target) {
+      if (!/^chg_[a-z0-9]{8,40}$/.test(changeId)) return { ok: false, error: 'Not a change id.' };
+      await signInBundledCli();
+      target = externalWebUrl((await locateDurangoChange(changeId))?.url ?? '');
+    }
+    if (!target) return { ok: false, error: `Couldn't find ${changeId} in a Durango Source checkout on this computer.` };
+    await shell.openExternal(target);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error?.message ?? 'Could not open the change.' };
   }
 });
 

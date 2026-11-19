@@ -1939,7 +1939,7 @@ type OrionCodexBrowserIntegrationStatus = {
       durangoOpenChat?: (input: { chatId: string; url?: string | null }) => Promise<{ ok: boolean; error?: string }>;
       getBotsMode?: () => Promise<import('./app/bots').BotsModeResult>;
       listBots?: () => Promise<import('./app/bots').BotsListResult>;
-      getBotThread?: (input: { botId: string; limit?: number; read?: boolean }) => Promise<import('./app/bots').BotThreadResult>;
+      getBotThread?: (input: { botId: string; limit?: number; read?: boolean; beforeSeq?: number; afterSeq?: number }) => Promise<import('./app/bots').BotThreadResult>;
       ensureProjectBot?: (input: { projectId: string }) => Promise<import('./app/bots').EnsureProjectBotResult>;
       getBotProject?: (input: import('./app/bots').BotProjectTarget) => Promise<import('./app/bots').BotProjectResult>;
       botProjectAction?: (
@@ -1963,6 +1963,25 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => Promise<{ ok: boolean; seq?: number; error?: string; code?: string }>;
       pickBotAttachments?: () => Promise<{ ok: boolean; files?: import('./app/bots').BotAttachmentFile[]; error?: string }>;
       saveBotAttachment?: (input: { name: string; data: string }) => Promise<{ ok: boolean; file?: import('./app/bots').BotAttachmentFile; error?: string }>;
+      /** Read links (an hour) for library files in bot threads, by id (signed in). */
+      botFileLinks?: (input: { ids: string[] }) => Promise<{ ok: boolean; files?: import('./app/bots').BotFileLink[]; error?: string }>;
+      /**
+       * A bot reply's Ship button (confirm first). With `threadId`: the ship request goes to the
+       * thread that made the change (`notHere` when that thread isn't on this computer).
+       * Without: lands the change like the thread header's Land.
+       */
+      shipBotChange?: (input: { changeId: string; threadId?: string }) => Promise<{
+        ok: boolean;
+        via?: 'thread';
+        threadId?: string;
+        notHere?: boolean;
+        changeId?: string | null;
+        url?: string | null;
+        error?: string;
+        exitCode?: number;
+      }>;
+      /** A bot reply's View change button. */
+      openBotChange?: (input: { changeId: string; url?: string }) => Promise<{ ok: boolean; error?: string }>;
       durangoProfileMemory?: () => Promise<{
         ok: boolean;
         code?: DurangoErrorCode;
@@ -1984,6 +2003,8 @@ type OrionCodexBrowserIntegrationStatus = {
       durangoDispatchSettled?: (input: {
         dispatchId: string;
         threadId: string;
+        /** The thread's Durango workspace: a bot task's report names the change it holds. */
+        workspacePath?: string;
         outcome: 'finished' | 'failed';
         summary?: string;
         error?: string;

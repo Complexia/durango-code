@@ -434,6 +434,8 @@ export const normalizeBotLane = (lane) => {
     /** Appended to Claude Code's system prompt. */
     systemPrompt: str(lane.systemPrompt),
     prompt: str(lane.prompt),
+    /** The conversation, structured (bot-sessions.js normalizeLaneSession): the machine keeps a session per bot. */
+    ...(lane.session && typeof lane.session === 'object' ? { session: lane.session } : {}),
     tools,
     heartbeatMs: clampInt(lane.heartbeatMs, 2_000, 60_000, BOT_LANE_DEFAULT_HEARTBEAT_MS),
     /** Files attached in the conversation, with download links (saved for Claude Code). */
@@ -699,10 +701,17 @@ export const createDurangoClient = ({
     // --- Bot replies on this machine's Claude Code (bot-replies.js) -----------
     /** Long-poll for a bot reply to run here; `{ lane: null }` when none arrived. Polling marks this machine available. */
     /** `machine`: `{ name, projects: string[], models: string[] }`, this machine's bot presence. */
-    async claimBotLane({ machineId, platform, machine, ackStopTasks, waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
+    async claimBotLane({ machineId, platform, machine, ackStopTasks, features, waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
       const wait = clampInt(waitMs, 0, DISPATCH_CLAIM_WAIT_MS, DISPATCH_CLAIM_WAIT_MS);
       const data = await request('POST', '/code/bots/claim', {
-        body: { machineId, platform, ...(machine ? { machine } : {}), ...(ackStopTasks?.length ? { ackStopTasks } : {}), waitMs: wait },
+        body: {
+          machineId,
+          platform,
+          ...(machine ? { machine } : {}),
+          ...(ackStopTasks?.length ? { ackStopTasks } : {}),
+          ...(features?.length ? { features } : {}),
+          waitMs: wait,
+        },
         timeout: wait + (DISPATCH_CLAIM_TIMEOUT_MS - DISPATCH_CLAIM_WAIT_MS),
         signal,
       });
@@ -724,7 +733,7 @@ export const createDurangoClient = ({
       const data = await request('POST', botLanePath(laneId, 'tool'), { body, signal, timeout: BOT_TOOL_TIMEOUT_MS });
       return { result: data.result ?? null };
     },
-    /** `{ botId, machineId, text, modelId?, failure?, retryElsewhere? }` → `{ ok, stored }`. */
+    /** `{ botId, machineId, text, modelId?, failure?, retryElsewhere?, usage?, compact? }` → `{ ok, stored }`. */
     async finishBotLane({ laneId, signal, ...body } = {}) {
       const data = await request('POST', botLanePath(laneId, 'finish'), { body, signal });
       return { ok: data.ok !== false, stored: data.stored === true };
@@ -746,10 +755,20 @@ export const createDurangoClient = ({
       const data = await request('GET', '/bots');
       return { allowed: data.allowed === true, bots: Array.isArray(data.bots) ? data.bots : [] };
     },
-    /** → `{ bot, messages, live, hasMore }`; `read` marks the bot read. */
-    async botThread(botId, { limit, read } = {}) {
+    /**
+     * → `{ bot, messages, live, hasMore, hasNewer? }`: the newest page, the page
+     * before `beforeSeq`, or the new messages after `afterSeq`. `read` marks the bot read.
+     */
+    async botThread(botId, { limit, read, beforeSeq, afterSeq } = {}) {
       return await request('GET', `/bots/${encodeURIComponent(str(botId))}/messages`, {
-        query: { limit: clampInt(limit, 1, 200, 80), ...(read ? { read: '1' } : {}) },
+        query: {
+          limit: clampInt(limit, 1, 200, 80),
+          ...(Number.isSafeInteger(beforeSeq) ? { beforeSeq: String(beforeSeq) } : {}),
+          ...(Number.isSafeInteger(afterSeq) ? { afterSeq: String(afterSeq) } : {}),
+          ...(read ? { read: '1' } : {}),
+          // Replies' cards (files, HTML pages, buttons): this version shows them.
+          cards: '1',
+        },
       });
     },
     /** `{ messageId, content, timeZone? }` → `{ seq }`. Never blocked by a reply in progress. */
@@ -761,6 +780,13 @@ export const createDurangoClient = ({
       const form = new FormData();
       form.append('file', new Blob([bytes], { type: contentType || 'application/octet-stream' }), str(name) || 'file');
       return await request('POST', '/bots/attachments', { form, timeout: Math.max(timeoutMs, 180_000), ...(account ? { account } : {}) });
+    },
+    /** Read links (an hour) for files in the person's bot threads, by library id → `[{ id, name, contentType, byteSize, url }]`. */
+    async botFileLinks(ids) {
+      const data = await request('GET', '/bots/files', { query: { ids: (Array.isArray(ids) ? ids : []).map(str).filter(Boolean).join(',') } });
+      return (Array.isArray(data.files) ? data.files : [])
+        .filter((file) => str(file?.id) && /^https?:\/\//.test(str(file?.url)))
+        .map((file) => ({ id: str(file.id), name: str(file.name), contentType: str(file.contentType), byteSize: Number(file.byteSize) || 0, url: str(file.url) }));
     },
     /** A project's bot, created the first time: `{ name, repoId?, machineId?, projectId?, timeZone? }` → the bot. */
     async ensureProjectBot(body) {
@@ -1200,6 +1226,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async listBots() {
       return { allowed: true, bots: [] };
+    },
+    async botFileLinks() {
+      return [];
     },
     async botThread() {
       return { bot: null, messages: [], live: [], hasMore: false };

@@ -2,7 +2,10 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoModelIdForClaude } from './bot-replies.js';
-import { BOT_THREAD_TOOLS } from './bot-thread-tools.js';
+import { BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, withThreadReportFooter } from './bot-thread-tools.js';
+import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
+import { planBotPrompt } from './bot-sessions.js';
+import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
 
 // Local bots: Durango bots that live on this device, for people who aren't
 // signed in to Durango. Same semantics as Durango's bots (always-on
@@ -11,7 +14,8 @@ import { BOT_THREAD_TOOLS } from './bot-thread-tools.js';
 // message waits more than a few seconds), but every reply runs here through
 // the person's own Claude Code (createClaudeLaneRunner in bot-replies.js), the
 // bots' tools run in this process, and everything is stored as JSON under
-// `<dir>` (bots.json + one `<botId>.json` per bot). When the person signs in,
+// `<dir>` (bots.json, and per bot a `<botId>.json` snapshot plus the
+// append-only log it names; see "storage" below). When the person signs in,
 // exportForSync() is uploaded to their Durango account and markSynced() moves
 // the files aside, so nothing is uploaded twice or deleted.
 
@@ -23,18 +27,23 @@ export const LOCAL_BOT_PARALLEL_AFTER_MS = 5_000;
 export const LOCAL_BOT_MAX_REPLIES = 2;
 export const LOCAL_BOT_MAX_TASKS = 3;
 export const LOCAL_BOT_MESSAGE_CAP = 2_000;
+/** Cards (pages, buttons) one reply may show. */
+const LOCAL_REPLY_CARDS_MAX = 6;
 export const LOCAL_BOT_ROUTINE_TICK_MS = 60_000;
 export const LOCAL_BOT_MIN_INTERVAL_MINUTES = 15;
 export const COMPACT_TRIGGER_TOKENS = 40_000;
 export const COMPACT_KEEP_TOKENS = 12_000;
 export const COMPACT_MIN_KEEP_MESSAGES = 8;
 const HEARTBEAT_MS = 10_000;
-const PROMPT_HISTORY_MAX_CHARS = 240_000;
 const SUMMARY_ROW_CHARS = 8_000;
 const INBOX_LABEL = { routine: 'Routine: ', task: 'Task: ', bot: 'Bot: ' };
 const INDEX_FILE = 'bots.json';
 const PROJECTS_FILE = 'projects.json';
 const PROJECT_FILES_DIR = 'project-files';
+/** A bot's transcript log is folded into its snapshot past this many saves or bytes. */
+export const TRANSCRIPT_LOG_MAX_LINES = 500;
+export const TRANSCRIPT_LOG_MAX_BYTES = 4 * 1024 * 1024;
+const TRANSCRIPT_LOG_NAME = /^[A-Za-z0-9_-]{1,64}\.[0-9a-f]{12}\.log$/;
 export const LOCAL_PROJECT_LIMITS = { noteChars: 2_000, notesPerProject: 200, fileBytes: 10 * 1024 * 1024, filesPerProject: 200, readChars: 60_000, promptNotesChars: 6_000 };
 
 // --- prompts ------------------------------------------------------------------------------
@@ -54,11 +63,18 @@ Stay responsive:
 - Quick things (a fact, a lookup, a short draft, one or two tool calls) you do yourself, right away.
 - Anything bigger (research, multi-step work, long writing, browsing many pages, code, comparing many options) you hand off with delegate_task and tell the person you're on it. Several independent pieces of work: several tasks, started together. The task runs in the background on this computer; its report comes back to your inbox and you then tell the person what matters.
 - Never pretend something is done when it was only handed off or drafted.
+- Your older messages are condensed into your summary. When it lacks a detail you need (exact wording, a link, a number, what was said or decided when), look it up with search_history instead of guessing or asking again.
 
 Routines and reports:
 - A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
+
+Show, don't point: your thread renders rich replies, so use them.
+- Screenshots, images and files the person should see go in the thread itself, never only as a path or a folder with file names. Attach them with attach_files (full paths; images show as thumbnails that open full size). When a task report names screenshots or files, attach them.
+- Diagrams: a \`\`\`mermaid code block in your text renders as a diagram.
+- Visuals: show_html renders a small self-contained, sandboxed HTML page in your reply (a chart, a comparison, a mockup, an explainer).
+- Buttons: show_actions puts buttons under your reply: open a thread a task ran in (open_thread with its id from the report), Ship a change a task made (ship_change with the change id and that thread's id: the person confirms, then the thread ships it), open a link, or 2-4 likely quick replies. Never invent ids or links.
 
 Where you run: on this computer, through the person's Claude Code, with the tools it allows here and the person's own logins on this computer. You see the person's Durango Code projects on this computer (listed below with their folders); real work in one goes to a Durango Code thread there (delegate_task with \`project\`), which the person can watch in the app. There are no connected apps (Gmail and others) and nothing runs anywhere else: if something needs an account or service you can't reach from here, say so.
 
@@ -67,6 +83,8 @@ Schedules (manage_routine): when the person wants something done regularly or at
 Other bots:
 - The person can have many bots, each with its own job (e.g. a job hunter, a news digest). When they want a standing helper for an ongoing job, create one with create_bot: a clear name, a precise job, and usually a routine. Tell them it exists and what it will do.
 - Talk to another bot with message_bot (asynchronous: its answer comes back to your inbox later) and check on it with read_bot. Don't micromanage: bots run on their own.
+
+${BOT_SHIPPING_RULE}
 
 Acting for the person: draft first and confirm before anything irreversible or public (sending email or messages, posting, buying, applying, deleting), unless they told you to go ahead for that kind of thing.`;
 
@@ -78,15 +96,8 @@ A bot handed you this task. It runs in the background on this computer through C
 
 Your final reply is the report the bot receives: lead with the outcome or answer, then the details that matter (links, numbers, names, drafts), concise and complete. If something couldn't be done, say exactly what and why. Don't send, post, buy, apply or delete anything unless the task explicitly says to.`;
 
-export const LOCAL_COMPACTION_PROMPT = `You maintain the long-term working summary of an always-on assistant bot's conversation with a person. The bot will see ONLY this summary plus the most recent messages, so anything you drop is forgotten.
-
-Merge the previous summary with the new messages into one updated summary. Keep, concretely (names, numbers, dates, links, ids, exact wording of preferences):
-1. Standing instructions and preferences the person gave (how they want things done, what not to do).
-2. Open items: requests not yet finished, promises the bot made, questions waiting on the person, tasks running and what they were for.
-3. Decisions made and their reasons; things already done (so they aren't redone).
-4. Key facts learned about the person, their situation and their projects.
-5. The bot's other bots / routines it set up, and what they are for (if mentioned).
-Drop greetings, chit-chat, and detail that no longer matters. Resolved items shrink to one line. Use short headed sections and bullet points, newest state wins over older. Write in third person ("The person…", "You (the bot)…"). Stay under 1,200 words. Output only the summary.`;
+/** The summarizer's instructions: the summary chain (bot-memory.js). */
+export const LOCAL_COMPACTION_PROMPT = COMPACTION_PROMPT;
 
 // --- small helpers ------------------------------------------------------------------------
 
@@ -294,6 +305,7 @@ const LOCAL_PROJECT_TOOLS = [
 ];
 
 export const LOCAL_BOT_TOOLS = [
+  SEARCH_HISTORY_TOOL,
   {
     name: 'delegate_task',
     description:
@@ -457,6 +469,8 @@ const normalizeBot = (raw, now) => {
     needsYou: raw?.needsYou === true,
     paused: raw?.paused === true,
     summary: typeof raw?.summary === 'string' && raw.summary.trim() ? raw.summary : null,
+    // The summary chain's condensed older part (bot-memory.js).
+    earlierSummary: typeof raw?.earlierSummary === 'string' && raw.earlierSummary.trim() ? raw.earlierSummary : null,
     compactedThroughSeq: Number.isInteger(raw?.compactedThroughSeq) ? raw.compactedThroughSeq : 0,
     routines: (Array.isArray(raw?.routines) ? raw.routines : []).map(normalizeRoutine).filter(Boolean),
     nextSeq: Number.isInteger(raw?.nextSeq) && raw.nextSeq > 0 ? raw.nextSeq : 1,
@@ -512,6 +526,14 @@ const normalizeMessage = (raw) =>
               attachments: raw.attachments
                 .filter((item) => item && typeof item.name === 'string' && typeof item.path === 'string')
                 .map((item) => ({ name: item.name, path: item.path, size: finite(item.size, 0), contentType: str(item.contentType) })),
+            }
+          : {}),
+        // A reply's cards (show_html pages, show_actions buttons), as Durango Chat's ui parts.
+        ...(Array.isArray(raw.cards) && raw.cards.length
+          ? {
+              cards: raw.cards
+                .filter((card) => card && typeof card.id === 'string' && typeof card.component === 'string' && card.props && typeof card.props === 'object')
+                .map((card) => ({ id: card.id, component: card.component, props: card.props })),
             }
           : {}),
       }
@@ -614,7 +636,13 @@ export const createLocalBotEngine = ({
    * Queues a write of `snapshot()` (read when the write starts; null skips it).
    * → whether it landed (never rejects; a failure is logged).
    */
-  const persistFile = (name, snapshot) => {
+  const persistFile = (name, snapshot) =>
+    persistWith(name, async (file) => {
+      const data = snapshot();
+      if (data != null) await atomicWrite(file, JSON.stringify(data));
+    });
+  /** Queues `write(file)` behind the file's earlier writes (one queued at a time). → whether it landed. */
+  const persistWith = (name, write) => {
     const file = path.join(storageDir(), name);
     if (queued.has(file)) return writes.get(file);
     queued.add(file);
@@ -624,9 +652,7 @@ export const createLocalBotEngine = ({
       .then(async () => {
         queued.delete(file);
         if (myGeneration !== generation) return true;
-        const data = snapshot();
-        if (data == null) return true;
-        await atomicWrite(file, JSON.stringify(data));
+        await write(file);
         return true;
       })
       .catch((error) => {
@@ -646,19 +672,85 @@ export const createLocalBotEngine = ({
     requeue: bot.requeue ?? [],
     inFlight: bot.inFlight ?? [],
   });
+  // A bot's transcript (its messages and claim state) is a snapshot,
+  // `<id>.json` `{ version: 3, messages, claims, log }`, plus the append-only
+  // log it names, `<id>.<12 hex>.log`. Each save appends one JSON line: the
+  // messages added (or replaced) and dropped since the last save, and the
+  // claim state. So a save costs what changed, not the whole history (up to
+  // LOCAL_BOT_MESSAGE_CAP messages). One line is one save: a crash mid-write
+  // leaves a torn last line, dropped whole on load, so a claim never lands
+  // without the message it names, nor a message marked answered without its
+  // reply. Past TRANSCRIPT_LOG_MAX_* (or after a failed append) the snapshot
+  // is rewritten (temp + rename) naming a fresh log, then the old log is
+  // removed: a crash in between leaves the new snapshot with an empty log,
+  // and the stray old log is removed on the next load. Version 2 files (the
+  // whole transcript, no log) load as they are and become a snapshot on their
+  // first save. Messages are never changed in place (a change replaces the
+  // object), so what changed is found by identity against `entry.disk`.
+  const newTranscriptLog = (id) => `${id}.${crypto.randomBytes(6).toString('hex')}.log`;
+  const diskStateOf = (entry, log, claims, lines = 0, bytes = 0) => ({
+    log,
+    messages: new Map(entry.messages.map((message) => [message.id, message])),
+    claims: JSON.stringify(claims),
+    lines,
+    bytes,
+  });
+  const snapshotTranscript = async (entry) => {
+    const base = storageDir();
+    const id = entry.bot.id;
+    const log = newTranscriptLog(id);
+    const claims = claimStateOf(entry.bot);
+    // What this snapshot holds, taken with its text (the entry changes during the write).
+    const text = JSON.stringify({ version: 3, botId: id, messages: entry.messages, claims, log });
+    const disk = diskStateOf(entry, log, claims);
+    await atomicWrite(path.join(base, `${id}.json`), text);
+    const previous = entry.disk?.log;
+    entry.disk = disk;
+    if (previous) await fs.rm(path.join(base, previous), { force: true }).catch(() => {});
+  };
+  const appendTranscript = async (entry) => {
+    const disk = entry.disk;
+    if (!disk?.log || disk.lines >= TRANSCRIPT_LOG_MAX_LINES || disk.bytes >= TRANSCRIPT_LOG_MAX_BYTES) {
+      await snapshotTranscript(entry);
+      return;
+    }
+    const claims = claimStateOf(entry.bot);
+    const claimsText = JSON.stringify(claims);
+    const add = [];
+    const ids = new Set();
+    for (const message of entry.messages) {
+      ids.add(message.id);
+      if (disk.messages.get(message.id) !== message) add.push(message);
+    }
+    const drop = [];
+    for (const id of disk.messages.keys()) if (!ids.has(id)) drop.push(id);
+    if (!add.length && !drop.length && claimsText === disk.claims) return;
+    const line = `${JSON.stringify({ ...(add.length ? { add } : {}), ...(drop.length ? { drop } : {}), claims })}\n`;
+    try {
+      await fs.mkdir(storageDir(), { recursive: true });
+      await fs.appendFile(path.join(storageDir(), disk.log), line, 'utf8');
+    } catch (error) {
+      // It may have written part of the line: the next save starts a fresh log.
+      disk.log = null;
+      throw error;
+    }
+    for (const id of drop) disk.messages.delete(id);
+    for (const message of add) disk.messages.set(message.id, message);
+    disk.claims = claimsText;
+    disk.lines += 1;
+    disk.bytes += Buffer.byteLength(line);
+  };
   /**
-   * Saves a bot: its transcript file holds its messages and its claim state
-   * together (one atomic write), so a crash never leaves a claim without the
-   * message it names, or a message marked answered without its reply. The
-   * index (the bot list and settings) is saved too. → whether both landed.
+   * Saves a bot: what changed in its transcript (see above) and the index
+   * (the bot list and settings). → whether both landed.
    */
   // eslint-disable-next-line no-unused-vars -- callers still say whether messages changed
   const persistBot = (entry, _options = {}) => {
     const index = persistIndex();
     const id = entry.bot.id;
-    const transcript = persistFile(`${id}.json`, () => {
+    const transcript = persistWith(`${id}.json`, async () => {
       const current = entries.get(id);
-      return current ? { version: 2, botId: id, messages: current.messages, claims: claimStateOf(current.bot) } : null;
+      if (current) await appendTranscript(current);
     });
     const saved = Promise.all([index, transcript]).then(([a, b]) => a && b);
     entry.saved = saved;
@@ -685,6 +777,69 @@ export const createLocalBotEngine = ({
     }
   };
 
+  /**
+   * A transcript log's saves, in order. A torn last line (a crash mid-append)
+   * is cut off the file, so the next append starts on a line of its own.
+   */
+  const readTranscriptLog = async (file) => {
+    let text;
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') log(`couldn't read ${path.basename(file)}:`, error?.message ?? error);
+      return { saves: [], lines: 0, bytes: 0 };
+    }
+    const end = text.lastIndexOf('\n') + 1;
+    if (end < text.length) {
+      text = text.slice(0, end);
+      await fs.truncate(file, Buffer.byteLength(text)).catch((error) => log(`couldn't trim ${path.basename(file)}:`, error?.message ?? error));
+    }
+    const saves = [];
+    let lines = 0;
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      lines += 1;
+      try {
+        const save = JSON.parse(line);
+        if (save && typeof save === 'object') saves.push(save);
+      } catch {
+        log(`skipped an unreadable line in ${path.basename(file)}`);
+      }
+    }
+    return { saves, lines, bytes: Buffer.byteLength(text) };
+  };
+  /** A bot's transcript: its snapshot with its log's saves applied (version 2 files have no log). */
+  const readTranscript = async (base, id) => {
+    const file = await readJson(path.join(base, `${id}.json`));
+    let messages = (Array.isArray(file?.messages) ? file.messages : []).map(normalizeMessage).filter(Boolean);
+    let claims = file?.claims && typeof file.claims === 'object' ? file.claims : null;
+    const logName = typeof file?.log === 'string' && TRANSCRIPT_LOG_NAME.test(file.log) && file.log.startsWith(`${id}.`) ? file.log : null;
+    let lines = 0;
+    let bytes = 0;
+    if (logName) {
+      const replay = await readTranscriptLog(path.join(base, logName));
+      const byId = new Map(messages.map((message) => [message.id, message]));
+      for (const save of replay.saves) {
+        for (const dropped of Array.isArray(save.drop) ? save.drop : []) byId.delete(dropped);
+        for (const raw of Array.isArray(save.add) ? save.add : []) {
+          const message = normalizeMessage(raw);
+          if (message) byId.set(message.id, message);
+        }
+        if (save.claims && typeof save.claims === 'object') claims = save.claims;
+      }
+      messages = [...byId.values()];
+      ({ lines, bytes } = replay);
+    }
+    // Logs a crash left behind (between a new snapshot and removing the old
+    // log). Only next to a snapshot that was read: else they're kept.
+    const strays = !file ? [] : (await fs.readdir(base).catch(() => [])).filter(
+      (name) => name !== logName && name.startsWith(`${id}.`) && TRANSCRIPT_LOG_NAME.test(name)
+    );
+    for (const name of strays) await fs.rm(path.join(base, name), { force: true }).catch(() => {});
+    messages.sort((a, b) => a.seq - b.seq);
+    return { messages, claims, log: logName, lines, bytes };
+  };
+
   const ensureLoaded = () => {
     loaded ??= (async () => {
       const base = storageDir();
@@ -693,13 +848,12 @@ export const createLocalBotEngine = ({
       for (const raw of Array.isArray(index?.bots) ? index.bots : []) {
         const bot = normalizeBot(raw, now());
         if (!/^[A-Za-z0-9_-]{1,64}$/.test(bot.id) || next.has(bot.id)) continue;
-        const file = await readJson(path.join(base, `${bot.id}.json`));
-        const messages = (Array.isArray(file?.messages) ? file.messages : []).map(normalizeMessage).filter(Boolean);
-        messages.sort((a, b) => a.seq - b.seq);
+        const transcript = await readTranscript(base, bot.id);
+        const { messages } = transcript;
         // The claim state saved with these messages wins over the index's
         // (written separately, it may be ahead of or behind the transcript).
-        if (file?.claims && typeof file.claims === 'object') {
-          const claims = file.claims;
+        if (transcript.claims) {
+          const claims = transcript.claims;
           if (Number.isInteger(claims.processedSeq)) bot.processedSeq = claims.processedSeq;
           if (Number.isInteger(claims.compactedThroughSeq)) bot.compactedThroughSeq = claims.compactedThroughSeq;
           if (Number.isInteger(claims.nextSeq) && claims.nextSeq > 0) bot.nextSeq = Math.max(1, claims.nextSeq);
@@ -708,7 +862,11 @@ export const createLocalBotEngine = ({
         }
         const lastSeq = messages.length ? messages[messages.length - 1].seq : 0;
         if (bot.nextSeq <= lastSeq) bot.nextSeq = lastSeq + 1;
-        next.set(bot.id, { bot, messages, compacting: false });
+        const entry = { bot, messages, compacting: false };
+        // What is on disk: unchanged messages are never written again. The
+        // claim state as read (the requeue just above isn't saved yet).
+        entry.disk = diskStateOf(entry, transcript.log, transcript.claims ?? {}, transcript.lines, transcript.bytes);
+        next.set(bot.id, entry);
       }
       entries = next;
     })();
@@ -875,22 +1033,19 @@ export const createLocalBotEngine = ({
     entry.bot.requeue = (entry.bot.requeue ?? []).filter((seq) => !seqs.includes(seq));
     entry.bot.inFlight = [...new Set([...(entry.bot.inFlight ?? []), ...seqs])];
     for (const message of items) reply.claimSeqs.push(message.seq);
+    // A reply already placed (it showed text) that takes in a message sent
+    // after its place answers it from here on: it moves below it.
+    if (reply.seq !== undefined && seqs.some((seq) => seq > reply.seq)) {
+      reply.seq = entry.bot.nextSeq;
+      entry.bot.nextSeq += 1;
+    }
     persistBot(entry, { messages: false });
     changed();
     return items;
   };
 
-  const speaker = (message, botName) => {
-    if (message.role === 'assistant') return `${botName} (you)`;
-    return message.authorLabel ? `[${message.authorLabel}]` : 'Person';
-  };
-  const renderLine = (message, botName) => {
-    const files = (message.attachments ?? []).map((item) => `[attached file: ${item.name}]`).join('\n');
-    const text = message.content.trim();
-    return `${speaker(message, botName)}:\n${[text, files].filter(Boolean).join('\n') || '(no text)'}`;
-  };
-
-  const renderContext = (entry, reply, claims) => {
+  /** This turn's context in parts; `steady` ones go to a kept session only when they change (bot-sessions.js). */
+  const renderContextParts = (entry, reply, claims) => {
     const { bot } = entry;
     const at = now();
     const counts = { person: 0, routine: 0, task: 0, bot: 0 };
@@ -903,8 +1058,8 @@ export const createLocalBotEngine = ({
     ].filter(Boolean);
     const zone = timeZone();
     const lines = [
-      '(Bot context, not from the person.)',
-      `This reply answers: ${parts.length ? parts.join(', ') : 'nothing new'} (the last messages above). Handle each one.`,
+      { text: '(Bot context, not from the person.)' },
+      { text: `This reply answers: ${parts.length ? parts.join(', ') : 'nothing new'} (the last messages above). Handle each one.` },
     ];
     const runtime = runtimeFor(bot.id);
     const others = [...runtime.replies.values()].filter((other) => other !== reply);
@@ -912,40 +1067,42 @@ export const createLocalBotEngine = ({
       const seqs = new Set(others.flatMap((other) => other.claimSeqs));
       const answering = entry.messages.filter((message) => seqs.has(message.seq));
       if (answering.length) {
-        lines.push(
-          `Another reply of yours is already answering: ${answering
+        lines.push({
+          text: `Another reply of yours is already answering: ${answering
             .map((message) => `"${clip(oneLine(message.content), 120)}"`)
-            .join('; ')}. Don't answer those here.`
-        );
+            .join('; ')}. Don't answer those here.`,
+        });
       }
     }
-    lines.push(
-      `You're running on this computer (${platform}) through the person's Claude Code. Now: ${formatAt(at)}${zone ? ` (${zone})` : ''}.`
-    );
+    lines.push({
+      text: `You're running on this computer (${platform}) through the person's Claude Code. Now: ${formatAt(at)}${zone ? ` (${zone})` : ''}.`,
+    });
     if (counts.person === 0) {
-      lines.push("The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention.");
+      lines.push({ text: "The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention." });
     }
     if (runtime.tasks.size || runtime.threads.size) {
-      lines.push(
-        `Your tasks still running: ${[...runtime.tasks.values(), ...runtime.threads.values()]
+      lines.push({
+        steady: true,
+        text: `Your tasks still running: ${[...runtime.tasks.values(), ...runtime.threads.values()]
           .map(
             (task) =>
               `"${task.title}" (${task.id}${task.project ? `, a Durango Code thread in ${task.project}` : ''}, started ${ago(task.startedAt, at)})`
           )
-          .join('; ')}.`
-      );
+          .join('; ')}.`,
+      });
     }
     if (bot.routines.length) {
-      lines.push(
-        `Your routines: ${bot.routines
+      lines.push({
+        steady: true,
+        text: `Your routines: ${bot.routines
           .map(
             (routine) =>
               `"${routine.title}" (${routine.id}): ${scheduleText(routine.schedule)}${
                 !routine.enabled ? ', off' : routine.nextRunAt ? `, next ${formatAt(routine.nextRunAt)}` : ''
               }`
           )
-          .join('; ')}.`
-      );
+          .join('; ')}.`,
+      });
     }
     const roster = sortedEntries()
       .filter((other) => other !== entry)
@@ -958,11 +1115,14 @@ export const createLocalBotEngine = ({
         return `- ${other.bot.name} (${other.bot.id}; ${state}). Job: ${other.bot.job || 'general'}.${last}`;
       });
     if (roster.length) {
-      lines.push(`${bot.role === 'primary' ? "The person's other bots" : "The person's other bots (message them with message_bot)"}:\n${roster.join('\n')}`);
+      lines.push({
+        steady: true,
+        text: `${bot.role === 'primary' ? "The person's other bots" : "The person's other bots (message them with message_bot)"}:\n${roster.join('\n')}`,
+      });
     } else if (bot.role === 'primary') {
-      lines.push('The person has no other bots yet.');
+      lines.push({ steady: true, text: 'The person has no other bots yet.' });
     }
-    return lines.join('\n');
+    return lines;
   };
 
   const botSystemPrompt = (bot) =>
@@ -972,9 +1132,7 @@ export const createLocalBotEngine = ({
       bot.role === 'primary' ? LOCAL_PRIMARY_BOT_PROMPT : null,
       bot.job.trim() ? `## Your job\n\n${bot.job.trim()}` : null,
       bot.project ? projectSection(bot.project) : null,
-      bot.summary?.trim()
-        ? `## Your earlier conversation with the person (summary)\n\nOlder messages of your thread were condensed into this summary; the messages after it follow in full.\n\n${bot.summary.trim()}`
-        : null,
+      memorySection({ summary: bot.summary, earlier: bot.earlierSummary }),
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -983,34 +1141,46 @@ export const createLocalBotEngine = ({
     const { bot } = entry;
     const claimSeqs = new Set(claims.map((message) => message.seq));
     const lastClaim = claims[claims.length - 1].seq;
-    const earlierAll = entry.messages.filter(
-      (message) => message.seq > bot.compactedThroughSeq && message.seq <= lastClaim && !claimSeqs.has(message.seq)
-    );
-    // Bounded even when compaction keeps failing: the newest earlier messages.
-    const earlier = [];
-    let chars = 0;
-    for (let index = earlierAll.length - 1; index >= 0; index -= 1) {
-      const line = renderLine(earlierAll[index], bot.name);
-      if (chars + line.length > PROMPT_HISTORY_MAX_CHARS && earlier.length) break;
-      chars += line.length;
-      earlier.unshift(line);
-    }
-    const prompt = [
-      earlier.length ? `<conversation_so_far>\n${earlier.join('\n\n')}\n</conversation_so_far>` : null,
-      `<new_messages>\n${claims.map((message) => renderLine(message, bot.name)).join('\n\n')}\n</new_messages>`,
-      `<context>\n${renderContext(entry, reply, claims)}\n</context>`,
-      'Write your reply to the new messages now. Your final text is sent to the person as your message in the thread.',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const row = (message) => {
+      // Files and cards (show_html pages, buttons) it carried, named so the bot knows what it showed.
+      const files = [
+        ...(message.attachments ?? []).map((item) => `[attached file: ${item.name}]`),
+        ...(message.cards ?? []).map((card) => `[showed ${card.component === 'html' ? `a page "${card.props?.title ?? ''}"` : 'buttons'}]`),
+      ].join('\n');
+      return {
+        id: message.id,
+        seq: message.seq,
+        role: message.role,
+        text: [message.content.trim(), files].filter(Boolean).join('\n'),
+        ...(message.role === 'user' && message.authorLabel ? { label: message.authorLabel } : {}),
+      };
+    };
+    // The conversation after the summary, the messages this reply answers last.
+    // The runner sends a kept session only what it hasn't seen, and keeps a
+    // fresh prompt within the size limit (bot-sessions.js).
+    const session = {
+      history: [
+        ...entry.messages
+          .filter((message) => message.seq > bot.compactedThroughSeq && message.seq <= lastClaim && !claimSeqs.has(message.seq))
+          .map(row),
+        ...claims.map(row),
+      ],
+      answering: claims.map((message) => message.seq),
+      context: renderContextParts(entry, reply, claims),
+    };
+    // The whole conversation as one prompt (a runner without kept sessions).
+    const prompt = planBotPrompt({ botName: bot.name, session, basis: '', busy: true }).prompt;
     return {
       laneId: reply.id,
       botId: bot.id,
       botName: bot.name,
+      // The reply's message id in the thread (a kept session knows it has seen it).
+      replyMessageId: reply.id,
       model: bot.model,
       systemPrompt: botSystemPrompt(bot),
       prompt,
-      tools: threadTools ? [...LOCAL_BOT_TOOLS, ...BOT_THREAD_TOOLS] : LOCAL_BOT_TOOLS,
+      session,
+      tools: [...LOCAL_BOT_TOOLS, ...LOCAL_CARD_TOOLS, ...(threadTools ? BOT_THREAD_TOOLS : [])],
       threads: 'local',
       heartbeatMs: HEARTBEAT_MS,
       // Files attached in the conversation (the newest): the runner copies them for Claude Code.
@@ -1039,6 +1209,28 @@ export const createLocalBotEngine = ({
     track(runReply(entry, reply, lane));
   };
 
+  /** A reply's files (attach_files, screenshots it named) → copies in attachments/<reply id>/. */
+  const copyReplyFiles = async (replyId, files) => {
+    const picked = (Array.isArray(files) ? files : []).filter((file) => file && typeof file.path === 'string').slice(0, 10);
+    if (!picked.length) return [];
+    const dir = path.join(storageDir(), 'attachments', replyId.replace(/[^A-Za-z0-9_-]/g, '_'));
+    const copied = [];
+    try {
+      await fs.mkdir(dir, { recursive: true });
+    } catch {
+      return [];
+    }
+    for (const file of picked) {
+      const name = (str(file.name) || path.basename(file.path)).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').slice(0, 120) || 'file';
+      const target = path.join(dir, `${copied.length}-${name}`);
+      try {
+        await fs.copyFile(file.path, target);
+        copied.push({ name, path: target, size: finite(file.size, 0), contentType: guessContentType(name) });
+      } catch {}
+    }
+    return copied;
+  };
+
   const runReply = async (entry, reply, lane) => {
     const myGeneration = generation;
     const runtime = runtimeFor(entry.bot.id);
@@ -1061,11 +1253,26 @@ export const createLocalBotEngine = ({
           changed();
         },
         takeInbox: async () => (reply.abort.signal.aborted ? [] : claim(entry, reply).map(inboxItem)),
-        callTool: async ({ name, input }) => ({ result: await callTool(entry, name, input) }),
+        callTool: async ({ name, input }) => {
+          // Cards stay with this reply (shown under its text once it is stored).
+          const shown = localCard(name, input, `ui-${reply.id}-${(reply.cards ??= []).length}`);
+          if (!shown) return { result: await callTool(entry, name, input) };
+          if (shown.error) return { result: { ok: false, error: shown.error } };
+          if (reply.cards.length >= LOCAL_REPLY_CARDS_MAX) return { result: { ok: false, error: 'This reply already shows as much as it can.' } };
+          reply.cards.push(shown.card);
+          return { result: { ok: true, shown: shown.card.component } };
+        },
       });
     } catch (error) {
       outcome = { text: reply.text, failure: error?.message ?? String(error) };
     }
+    // Files it attached, copied into the bots folder like the person's. Done
+    // while the reply is still live, so it leaves the live list and is stored
+    // in one step: never a moment when it is neither (a poll in between would
+    // move its cursor past the reply, and a new message would start a reply
+    // that doesn't see this one).
+    const attachments =
+      !reply.abort.signal.aborted && !outcome?.aborted && str(outcome?.text).trim() ? await copyReplyFiles(reply.id, outcome?.files) : [];
     runtime.replies.delete(reply.id);
     const current = myGeneration === generation && entries.get(entry.bot.id) === entry;
     if (!current) return;
@@ -1086,7 +1293,16 @@ export const createLocalBotEngine = ({
     const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : '');
     if (content) {
       const { bot } = entry;
-      const message = { id: reply.id, seq: reply.seq ?? bot.nextSeq, role: 'assistant', content, authorLabel: null, createdAt: now() };
+      const message = {
+        id: reply.id,
+        seq: reply.seq ?? bot.nextSeq,
+        role: 'assistant',
+        content,
+        authorLabel: null,
+        createdAt: now(),
+        ...(attachments.length ? { attachments } : {}),
+        ...(text && reply.cards?.length ? { cards: reply.cards } : {}),
+      };
       if (reply.seq === undefined) bot.nextSeq += 1;
       // In thread order: a reply placed early stays above what came after it.
       const at = entry.messages.findIndex((existing) => existing.seq > message.seq);
@@ -1100,16 +1316,17 @@ export const createLocalBotEngine = ({
     persistBot(entry, { messages: Boolean(content) });
     changed();
     if (!runtime.replies.size && hasUnclaimed(entry) && active && !entry.bot.paused) startReply(entry);
-    await compactIfNeeded(entry);
+    await compactIfNeeded(entry, { force: outcome?.compact === true });
   };
 
   // --- compaction ---------------------------------------------------------------------
 
-  const compactIfNeeded = async (entry) => {
+  /** `force`: a reply's kept session grew too large (or compaction fell behind): fold at a lower trigger. */
+  const compactIfNeeded = async (entry, { force = false } = {}) => {
     if (!summarize || entry.compacting) return;
     const { bot } = entry;
     const rows = entry.messages.filter((message) => message.seq > bot.compactedThroughSeq);
-    const boundary = compactionBoundary(rows);
+    const boundary = compactionBoundary(rows, force ? { trigger: COMPACT_KEEP_TOKENS * 2 } : {});
     if (boundary === null) return;
     entry.compacting = true;
     const myGeneration = generation;
@@ -1125,14 +1342,12 @@ export const createLocalBotEngine = ({
       const summary = await summarize({
         model: LOCAL_BOT_COMPACTION_MODEL,
         systemPrompt: LOCAL_COMPACTION_PROMPT,
-        prompt: [
-          bot.summary?.trim() ? `<previous_summary>\n${bot.summary.trim()}\n</previous_summary>` : '<previous_summary>(none yet)</previous_summary>',
-          `<new_messages>\n${transcript}\n</new_messages>`,
-        ].join('\n\n'),
+        prompt: compactionInput({ earlier: bot.earlierSummary, summary: bot.summary, transcript }),
       });
-      const text = str(summary).trim();
-      if (!text || myGeneration !== generation || entries.get(bot.id) !== entry || bot.compactedThroughSeq !== expected) return;
-      bot.summary = text;
+      const memory = parseCompaction(summary, bot.earlierSummary);
+      if (!memory || myGeneration !== generation || entries.get(bot.id) !== entry || bot.compactedThroughSeq !== expected) return;
+      bot.summary = memory.summary;
+      bot.earlierSummary = memory.earlier;
       bot.compactedThroughSeq = boundary;
       trimMessages(entry);
       persistBot(entry);
@@ -1161,6 +1376,8 @@ export const createLocalBotEngine = ({
       systemPrompt: `${LOCAL_TASK_PROMPT}\n\nThe bot "${entry.bot.name}" handed you the task "${task.title}". The task follows as the message.`,
       prompt: instructions,
       tools: [],
+      // Its report names files by full path; the bot attaches them in its reply.
+      replyFiles: false,
       heartbeatMs: HEARTBEAT_MS,
     };
     track(
@@ -1227,7 +1444,7 @@ export const createLocalBotEngine = ({
     const started = await Promise.resolve(
       startProjectThread({
         projectId: project.id,
-        prompt: `${brief ? `${brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this.`,
+        prompt: `${brief ? `${brief}\n\n` : ''}${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this. ${BOT_REPORT_GUIDE}`,
         key,
         botName: entry.bot.name,
         title: task.title,
@@ -1509,6 +1726,7 @@ export const createLocalBotEngine = ({
               taskId: task.id,
               title: task.title,
               project: task.project,
+              ...(task.threadId ? { threadId: task.threadId } : {}),
               status: 'running',
               note: 'A Durango Code thread is working on it in that project; the person can watch it in the app. Its report will arrive in your inbox.',
             };
@@ -1567,6 +1785,8 @@ export const createLocalBotEngine = ({
           appendInbox(target, { content: message, authorLabel: inboxLabel('bot', self.bot.name) });
           return { ok: true, to: target.bot.name };
         }
+        case 'search_history':
+          return searchMessages(self.messages, { query: input.query, from: input.from, to: input.to, limit: input.limit, botName: self.bot.name });
         case 'read_bot': {
           const target = entryFor(input.bot_id);
           const limit = Math.min(40, Math.max(1, Number.isInteger(input.limit) ? input.limit : 10));
@@ -1649,13 +1869,13 @@ export const createLocalBotEngine = ({
           const message = str(input.message).trim();
           if (!message) throw new Error('message_thread needs a message.');
           const runtime = runtimeFor(self.bot.id);
-          const task = { id: newId('lt'), title: clip(oneLine(input.title) || `Follow-up: ${thread.title || 'thread'}`, 80), project: null, startedAt: now() };
+          const task = { id: newId('lt'), title: clip(oneLine(input.title) || `Follow-up: ${thread.title || 'thread'}`, 80), project: null, threadId: thread.id, startedAt: now() };
           const key = `${self.bot.id}:${task.id}`;
           runtime.threads.set(key, task);
           const started = await Promise.resolve(
             startThreadFollowUp({
               threadId: thread.id,
-              prompt: `${message}\n\n(From the bot "${self.bot.name}": end with a concise report of the outcome; it goes back to the bot.)`,
+              prompt: `${message}\n\n(From the bot "${self.bot.name}": end with a concise report of the outcome; it goes back to the bot. ${BOT_REPORT_GUIDE})`,
               key,
               botName: self.bot.name,
               accessMode: getAccessMode() || 'read-only',
@@ -1727,6 +1947,7 @@ export const createLocalBotEngine = ({
         job: bot.job,
         model: durangoModelForLocalBot(bot.model),
         summary: bot.summary,
+        ...(bot.earlierSummary ? { earlierSummary: bot.earlierSummary } : {}),
         messages: messages.map((message) => ({
           // Its id here: the upload keys it by this, so a retried upload
           // recognises it whatever else was added meanwhile.
@@ -1780,7 +2001,12 @@ export const createLocalBotEngine = ({
       await ensurePrimary();
       return { allowed: true, bots: sortedEntries().map(toDesktopBot) };
     },
-    async thread(botId, { limit = 120, read = false } = {}) {
+    /**
+     * A page of a bot's thread (oldest first) and its replies being written:
+     * the newest `limit`, the `limit` before `beforeSeq` (`hasMore`: older
+     * ones left), or the first `limit` after `afterSeq` (`hasNewer`: more after).
+     */
+    async thread(botId, { limit = 120, read = false, beforeSeq, afterSeq } = {}) {
       await ensureLoaded();
       const entry = entryFor(botId);
       if (read && entry.bot.unread) {
@@ -1789,11 +2015,38 @@ export const createLocalBotEngine = ({
       }
       const count = Math.min(500, Math.max(1, Number.isInteger(limit) ? limit : 120));
       const runtime = runtimes.get(entry.bot.id);
+      const all = entry.messages;
+      // Messages are kept in seq order: the first index whose seq is above `seq`.
+      const indexAfter = (seq) => {
+        let low = 0;
+        let high = all.length;
+        while (low < high) {
+          const middle = (low + high) >> 1;
+          if (all[middle].seq <= seq) low = middle + 1;
+          else high = middle;
+        }
+        return low;
+      };
+      let start;
+      let end;
+      let hasNewer;
+      if (Number.isInteger(afterSeq)) {
+        start = indexAfter(afterSeq);
+        end = Math.min(all.length, start + count);
+        hasNewer = end < all.length;
+      } else {
+        end = Number.isInteger(beforeSeq) ? indexAfter(beforeSeq - 1) : all.length;
+        start = Math.max(0, end - count);
+      }
       return {
         bot: toDesktopBot(entry),
-        messages: entry.messages.slice(-count).map(({ attachments, ...message }) => ({
+        ...(hasNewer !== undefined ? { hasNewer } : {}),
+        messages: all.slice(start, end).map(({ attachments, ...message }) => ({
           ...message,
-          ...(attachments?.length ? { files: attachments.map((item) => ({ name: item.name, size: item.size })) } : {}),
+          // On this device: the files themselves (Durango Code shows images from their path).
+          ...(attachments?.length
+            ? { files: attachments.map((item) => ({ name: item.name, size: item.size, path: item.path, ...(item.contentType ? { contentType: item.contentType } : {}) })) }
+            : {}),
         })),
         live: runtime
           ? [...runtime.replies.values()].map((reply) => ({
@@ -1804,7 +2057,7 @@ export const createLocalBotEngine = ({
               activeTool: reply.activeTool,
             }))
           : [],
-        hasMore: entry.messages.length > count,
+        hasMore: hasNewer === undefined && start > 0,
       };
     },
     async markRead(botId) {
@@ -1859,10 +2112,12 @@ export const createLocalBotEngine = ({
       runtime.threads.delete(str(key));
       const title = task?.title ?? 'Durango Code thread';
       const where = task?.project ? `the Durango Code thread in ${task.project}` : 'the Durango Code thread';
+      // Which thread it was, so the bot can follow up there (e.g. to ship the change).
+      const thread = { threadId: str(threadId).trim() || task?.threadId || '', project: task?.project ?? null };
       const report =
         outcome === 'finished'
-          ? `${str(summary).trim() || 'The thread finished without a written summary.'}\n\n(From ${where}${threadId ? `, ${threadId}` : ''}.)`
-          : `The task couldn't finish (${where}): ${clip(oneLine(error) || 'the thread stopped.', 300)}`;
+          ? withThreadReportFooter(str(summary).trim() || 'The thread finished without a written summary.', thread)
+          : withThreadReportFooter(`The task couldn't finish (${where}): ${clip(oneLine(error) || 'the thread stopped.', 300)}`, thread);
       appendInbox(entry, { content: report, authorLabel: inboxLabel('task', title) });
       return { ok: true };
     },
@@ -1970,6 +2225,7 @@ export const createLocalBotEngine = ({
       await ensureLoaded();
       await flush();
       const ids = [...entries.keys()];
+      const logs = [...entries.values()].flatMap((entry) => (entry.disk?.log ? [entry.disk.log] : []));
       generation += 1;
       abortAll();
       entries = new Map();
@@ -1980,7 +2236,7 @@ export const createLocalBotEngine = ({
       const target = path.join(base, `synced-${stamp}`);
       await fs.mkdir(target, { recursive: true });
       projectStore = null;
-      for (const name of [INDEX_FILE, PROJECTS_FILE, PROJECT_FILES_DIR, ...ids.map((id) => `${id}.json`)]) {
+      for (const name of [INDEX_FILE, PROJECTS_FILE, PROJECT_FILES_DIR, ...ids.map((id) => `${id}.json`), ...logs]) {
         await fs.rename(path.join(base, name), path.join(target, name)).catch((error) => {
           if (error?.code !== 'ENOENT') throw error;
         });
