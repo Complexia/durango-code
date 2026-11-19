@@ -349,7 +349,7 @@ test('create_bot, message_bot, read_bot and update_bot', async () => {
   await waitFor(() => runner.lanes.length === 2, { label: 'new bot replies' });
   const newsRun = runner.lanes[1];
   assert.equal(newsRun.lane.botId, created.botId);
-  assert.equal(newsRun.lane.model, 'claude-sonnet-5-5');
+  assert.equal(newsRun.lane.model, 'claude-sonnet-5-5', 'woken by another bot: background runs stay on Sonnet (replies to the person: Opus)');
   assert.match(newsRun.lane.prompt, /\[Bot: Durango\]:\nSay hi to the person\./);
   assert.match(newsRun.lane.prompt, /1 message from other bots/);
   assert.match(newsRun.lane.prompt, /Your routines: "Morning digest" \(lr[a-z0-9]+\): daily at 07:30 \(every day\), next /);
@@ -393,6 +393,125 @@ test('create_bot, message_bot, read_bot and update_bot', async () => {
   assert.deepEqual(await call('nope', {}), { ok: false, error: 'No tool named nope.' });
   runner.lanes[0].finish({ text: 'Done: News is set up.' });
   await engine.idle();
+});
+
+test('models: bots on the old default move to Opus, chosen ones stay; switching keeps the thread', async () => {
+  const dir = path.join(testRoot, `bots-${(dirCount += 1)}`);
+  await fs.mkdir(dir, { recursive: true });
+  const stored = (id, role, extra) => ({ id, name: id, role, job: '', createdAt: 1, lastActivityAt: 1, ...extra });
+  await fs.writeFile(
+    path.join(dir, 'bots.json'),
+    JSON.stringify({
+      version: 1,
+      bots: [
+        stored('lbprimary', 'primary', { model: 'claude-opus-5-5' }),
+        stored('lbolddefault', 'bot', { model: 'claude-sonnet-5-5' }),
+        stored('lbchosen', 'bot', { model: 'claude-sonnet-5-5', modelChosen: true }),
+        stored('lbhaiku', 'bot', { model: 'claude-haiku-5-5' }),
+      ],
+    })
+  );
+  const { engine, runner } = makeEngine({ dir });
+  const listed = await engine.list();
+  const model = (id) => listed.bots.find((bot) => bot.id === id).model;
+  assert.equal(model('lbolddefault'), 'claude-opus-5-5', 'the old default follows the new one');
+  assert.equal(model('lbchosen'), 'claude-sonnet-5-5', 'a chosen model stays');
+  assert.equal(model('lbhaiku'), 'claude-haiku-5-5');
+  assert.deepEqual(listed.modelChoices.map((choice) => choice.id), ['claude-opus-5-5', 'claude-fable-5-2', 'claude-sonnet-5-5', 'claude-haiku-5-5']);
+
+  // A reply running when the person switches finishes on its model; the next one runs on the new one.
+  await engine.send('lbolddefault', { messageId: 'm1', content: 'Hi' });
+  await waitFor(() => runner.lanes.length === 1);
+  assert.equal(runner.lanes[0].lane.model, 'claude-opus-5-5');
+  const switched = await engine.setModel('lbolddefault', 'claude-sonnet-5-5');
+  assert.equal(switched.model, 'claude-sonnet-5-5');
+  runner.lanes[0].finish({ text: 'Hello.' });
+  await engine.idle();
+  await engine.send('lbolddefault', { messageId: 'm2', content: 'Still you?' });
+  await waitFor(() => runner.lanes.length === 2);
+  const next = runner.lanes[1].lane;
+  assert.equal(next.model, 'claude-sonnet-5-5');
+  // Same conversation: the earlier exchange is in the new reply's history.
+  assert.deepEqual(next.session.history.map((row) => row.text), ['Hi', 'Hello.', 'Still you?']);
+  runner.lanes[1].finish({ text: 'Yes.' });
+  await engine.idle();
+  await assert.rejects(engine.setModel('lbolddefault', 'gpt-9'), /Pick one of the bot models/);
+
+  // Chosen survives a restart (it doesn't fall back to the default), and goes to Durango as a choice.
+  await engine.stop();
+  const again = makeEngine({ dir });
+  assert.equal((await again.engine.list()).bots.find((bot) => bot.id === 'lbolddefault').model, 'claude-sonnet-5-5');
+  const exported = (await again.engine.exportForSync()).bots;
+  assert.equal(exported.find((bot) => bot.localId === 'lbolddefault').modelChosen, true);
+  assert.equal(exported.find((bot) => bot.localId === 'lbhaiku').modelChosen, false);
+  await again.engine.stop();
+});
+
+test("models: only replies to the person moved to Opus; a bot's background runs stay on Sonnet until a model is chosen", async () => {
+  const dir = path.join(testRoot, `bots-${(dirCount += 1)}`);
+  await fs.mkdir(dir, { recursive: true });
+  const stored = (id, role, extra) => ({ id, name: id, role, job: '', createdAt: 1, lastActivityAt: 1, ...extra });
+  await fs.writeFile(
+    path.join(dir, 'bots.json'),
+    JSON.stringify({ version: 1, bots: [stored('lbprimary', 'primary', { model: 'claude-opus-5-5' }), stored('lbwork', 'bot', {}), stored('lbother', 'bot', {})] })
+  );
+  const { engine, runner } = makeEngine({ dir });
+  // Answers whatever is still running (task reports wake the bot again) until it is quiet.
+  const settle = async () => {
+    for (let round = 0; round < 20; round += 1) {
+      await delay(20);
+      const open = runner.running();
+      if (!open.length) break;
+      for (const run of open) run.finish({ text: 'ok' });
+    }
+    await engine.idle();
+  };
+  await engine.list();
+  await engine.send('lbwork', { messageId: 'w1', content: 'Plan my week' });
+  await waitFor(() => runner.lanes.length === 1);
+  const work = runner.lanes[0];
+  assert.equal(work.lane.model, 'claude-opus-5-5', 'replies to the person: Opus');
+  const call = (name, input) => work.ctx.callTool({ name, input, toolCallId: `t-${name}` }).then((out) => out.result);
+  assert.equal((await call('delegate_task', { title: 'Research', instructions: 'Look things up.' })).ok, true);
+  await waitFor(() => runner.lanes.length === 2, { label: 'task started' });
+  assert.equal(runner.lanes[1].lane.model, 'claude-sonnet-5-5', 'a delegated task: Sonnet, as before');
+  runner.lanes[1].finish({ text: 'Found it.' });
+  assert.equal((await call('message_bot', { bot_id: 'lbother', message: 'Ping' })).ok, true);
+  await waitFor(() => runner.lanes.some((run) => run.lane.botId === 'lbother'), { label: 'other bot wakes' });
+  const otherWake = runner.lanes.find((run) => run.lane.botId === 'lbother');
+  assert.equal(otherWake.lane.model, 'claude-sonnet-5-5', 'a bot-to-bot wake: Sonnet, as before');
+  otherWake.finish({ text: 'Pong.' });
+  work.finish({ text: 'On it.' });
+  await settle();
+
+  // Once the person picks a model, everything the bot runs uses it (as before).
+  await engine.setModel('lbother', 'claude-haiku-5-5');
+  const before = runner.lanes.length;
+  await engine.send('lbwork', { messageId: 'w2', content: 'Tell Other again' });
+  await waitFor(() => runner.lanes.length === before + 1);
+  const work2 = runner.lanes[before];
+  await work2.ctx.callTool({ name: 'message_bot', input: { bot_id: 'lbother', message: 'Ping again' }, toolCallId: 't2' });
+  await waitFor(() => runner.lanes.slice(before + 1).some((run) => run.lane.botId === 'lbother'), { label: 'other bot wakes again' });
+  const wake2 = runner.lanes.slice(before + 1).find((run) => run.lane.botId === 'lbother');
+  assert.equal(wake2.lane.model, 'claude-haiku-5-5');
+  wake2.finish({ text: 'Pong.' });
+  work2.finish({ text: 'Done.' });
+  await settle();
+  await engine.stop();
+});
+
+test("models: a choice that can't be saved is reported and not kept", async () => {
+  const { engine, dir } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  await engine.idle();
+  await fs.chmod(dir, 0o500);
+  try {
+    await assert.rejects(engine.setModel(primary.id, 'claude-sonnet-5-5'), /Couldn’t save the model/);
+  } finally {
+    await fs.chmod(dir, 0o700);
+  }
+  assert.equal((await engine.list()).bots[0].model, 'claude-opus-5-5');
+  await engine.stop();
 });
 
 test('notify_user and ask_user', async () => {
@@ -1001,7 +1120,7 @@ test('exportForSync maps models and markSynced moves the data aside', async () =
   assert.equal(durangoModelForLocalBot('claude-opus-5-5'), 'anthropic/claude-opus-5.5');
   assert.equal(durangoModelForLocalBot('claude-sonnet-5-5'), 'anthropic/claude-sonnet-5.5');
   assert.equal(durangoModelForLocalBot('claude-haiku-5-5'), 'anthropic/claude-haiku-5.5');
-  assert.equal(durangoModelForLocalBot('weird'), 'anthropic/claude-sonnet-5.5');
+  assert.equal(durangoModelForLocalBot('weird'), 'anthropic/claude-opus-5.5');
 
   const { engine, runner, dir } = makeEngine();
   const [primary] = (await engine.list()).bots;
@@ -1030,7 +1149,7 @@ test('exportForSync maps models and markSynced moves the data aside', async () =
   ]);
   assert.equal(typeof main.messages[0].createdAt, 'number');
   assert.equal(gym.localId, created.botId);
-  assert.equal(gym.model, 'anthropic/claude-sonnet-5.5');
+  assert.equal(gym.model, 'anthropic/claude-opus-5.5');
   assert.equal(gym.job, 'You plan workouts.');
   assert.deepEqual(gym.routines, [{ title: 'Plan', instructions: 'Plan the week.', schedule: { kind: 'daily', localTime: '06:00', days: [1], timeZone: 'Australia/Sydney' } }]);
 

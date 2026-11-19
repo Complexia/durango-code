@@ -5873,6 +5873,28 @@ ipcMain.handle('bots:list', async () => {
   }
 });
 
+// The person picks a bot's reply model (Bots view header). Only the setting
+// changes: a reply already running finishes on its model, the next one runs on
+// the new one (chat/docs/bots.md → "Switching a bot's model").
+ipcMain.handle('bots:setModel', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId : '';
+  const model = typeof input?.model === 'string' ? input.model : '';
+  if (!botId || !model) return { ok: false, error: 'Pick a model.' };
+  if (await localBotsMode()) {
+    try {
+      return { ok: true, bot: await localBots.setModel(botId, model) };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const result = await durangoClient.setBotModel(botId, model);
+    return { ok: true, model: result.model };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
 // Each Durango Code project's key (convex/botPolicy.ts projectKeyFor): its
 // Source repository when it has one, else this machine's project. Sidebar v3
 // finds a project's bot by it.

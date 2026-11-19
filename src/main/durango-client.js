@@ -365,6 +365,16 @@ const normalizeConnector = (connector, baseUrl) => {
   };
 };
 
+/** The models a bot can be set to (GET /api/v1/bots modelChoices), or null when Durango sent none. */
+const normalizeBotModelChoices = (value) => {
+  if (!Array.isArray(value)) return null;
+  const choices = value
+    .filter((choice) => choice && typeof choice.id === 'string' && choice.id && typeof choice.label === 'string')
+    .slice(0, 30)
+    .map((choice) => ({ id: choice.id, label: choice.label, note: typeof choice.note === 'string' ? choice.note : '', claude: choice.claude === true }));
+  return choices.length ? choices : null;
+};
+
 const normalizeDispatch = (dispatch) => {
   if (!dispatch || typeof dispatch !== 'object' || typeof dispatch.id !== 'string' || !dispatch.id) return null;
   const project = dispatch.project && typeof dispatch.project === 'object' ? dispatch.project : {};
@@ -750,10 +760,19 @@ export const createDurangoClient = ({
       return { ok: data.ok === true };
     },
     // --- Bots (Sidebar v3): the person's Durango bots and their threads ---------
-    /** → `{ allowed, bots }` (the primary first). */
+    /** → `{ allowed, bots, modelChoices }` (the primary first; modelChoices: null from an older Durango). */
     async listBots() {
       const data = await request('GET', '/bots');
-      return { allowed: data.allowed === true, bots: Array.isArray(data.bots) ? data.bots : [] };
+      return {
+        allowed: data.allowed === true,
+        bots: Array.isArray(data.bots) ? data.bots : [],
+        modelChoices: normalizeBotModelChoices(data.modelChoices),
+      };
+    },
+    /** Sets a bot's reply model (one of `modelChoices`) → `{ model }`. */
+    async setBotModel(botId, model) {
+      const data = await request('PATCH', `/bots/${encodeURIComponent(str(botId))}`, { body: { model: str(model) } });
+      return { model: typeof data.model === 'string' ? data.model : str(model) };
     },
     /**
      * → `{ bot, messages, live, hasMore, hasNewer? }`: the newest page, the page
@@ -1225,7 +1244,10 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       return MOCK_CHATS.find((chat) => chat.id === chatId)?.url ?? `${DEFAULT_DURANGO_URL}/chats`;
     },
     async listBots() {
-      return { allowed: true, bots: [] };
+      return { allowed: true, bots: [], modelChoices: null };
+    },
+    async setBotModel(_botId, model) {
+      return { model: str(model) };
     },
     async botFileLinks() {
       return [];

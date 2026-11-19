@@ -20,8 +20,23 @@ import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection,
 // the files aside, so nothing is uploaded twice or deleted.
 
 export const LOCAL_BOT_PLACE = 'machine:local';
-export const LOCAL_BOT_DEFAULT_MODEL = 'claude-sonnet-5-5';
+export const LOCAL_BOT_DEFAULT_MODEL = 'claude-opus-5-5';
 export const LOCAL_PRIMARY_BOT_MODEL = 'claude-opus-5-5';
+/** What bots other than the primary started on before 2026-11-19: a bot still on it that nobody chose moves to the default. */
+const LOCAL_BOT_PREVIOUS_DEFAULT_MODEL = 'claude-sonnet-5-5';
+/**
+ * Routine wakes, task reports, bot-to-bot messages and delegated tasks of a
+ * bot other than the primary that nobody chose a model for: they stay on what
+ * they ran on before replies moved to Opus (localLaneModel).
+ */
+export const LOCAL_BOT_BACKGROUND_MODEL = 'claude-sonnet-5-5';
+/** Models a local bot can be set to (its Claude Code on this machine). */
+export const LOCAL_BOT_MODEL_CHOICES = [
+  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', note: 'Smartest (the default)', claude: true },
+  { id: 'claude-fable-5-2', label: 'Claude Fable 5.2', note: 'Deep reasoning', claude: true },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', note: 'Fast and capable', claude: true },
+  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', note: 'Cheapest', claude: true },
+];
 export const LOCAL_BOT_COMPACTION_MODEL = 'claude-haiku-5-5';
 export const LOCAL_BOT_PARALLEL_AFTER_MS = 5_000;
 export const LOCAL_BOT_MAX_REPLIES = 2;
@@ -137,6 +152,31 @@ const claudeModelFrom = (value) => {
   const raw = oneLine(value).toLowerCase().replace(/^anthropic\//, '').replace(/\./g, '-');
   return /^claude-[a-z0-9-]{2,60}(\[1m\])?$/.test(raw) ? raw : null;
 };
+
+/**
+ * Sets a bot's model (the person in the Bots view, or update_bot) and marks it
+ * chosen. Only the field changes: a reply already running finishes on its
+ * model; the next one runs on the new model with the same summary and
+ * messages, in a kept Claude Code session of its own (bot-sessions.js keys
+ * them by bot and model), so its prompt cache starts over once. → changed.
+ */
+const applyModel = (bot, value) => {
+  const model = claudeModelFrom(value);
+  if (!model) throw new Error(`Use a Claude model id: ${LOCAL_BOT_MODEL_CHOICES.map((choice) => choice.id).join(', ')}.`);
+  bot.modelChosen = true;
+  if (bot.model === model) return false;
+  bot.model = model;
+  return true;
+};
+
+/**
+ * The model a local run uses. Replies to the person: the bot's model. Other
+ * runs (routines, reports, other bots, delegated tasks): the same for the
+ * primary and for a bot whose model was chosen (as before), else
+ * LOCAL_BOT_BACKGROUND_MODEL, so moving replies to Opus didn't move them.
+ */
+export const localLaneModel = (bot, { person }) =>
+  person || bot.role === 'primary' || bot.modelChosen === true ? bot.model : LOCAL_BOT_BACKGROUND_MODEL;
 
 const estimateTokens = (text) => Math.ceil(str(text).length / 4);
 
@@ -359,7 +399,7 @@ export const LOCAL_BOT_TOOLS = [
   },
   {
     name: 'update_bot',
-    description: `Change a bot (yourself by default): its name, job, emoji, Claude model (e.g. "${LOCAL_PRIMARY_BOT_MODEL}", "${LOCAL_BOT_DEFAULT_MODEL}", "claude-haiku-5-5"), or pause/resume it. A paused bot keeps its messages and answers them when resumed.`,
+    description: `Change a bot (yourself by default): its name, job, emoji, Claude model (${LOCAL_BOT_MODEL_CHOICES.map((choice) => `"${choice.id}"`).join(', ')}; the next reply runs on it), or pause/resume it. A paused bot keeps its messages and answers them when resumed.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -455,6 +495,14 @@ const normalizeRoutine = (raw) => {
   };
 };
 
+/** A stored bot's model; one still on the previous default that nobody chose follows the current default. */
+const storedModel = (raw, role) => {
+  const fallback = role === 'primary' ? LOCAL_PRIMARY_BOT_MODEL : LOCAL_BOT_DEFAULT_MODEL;
+  const model = claudeModelFrom(raw?.model);
+  if (!model) return fallback;
+  return model === LOCAL_BOT_PREVIOUS_DEFAULT_MODEL && raw?.modelChosen !== true ? fallback : model;
+};
+
 const normalizeBot = (raw, now) => {
   const role = raw?.role === 'primary' ? 'primary' : 'bot';
   return {
@@ -463,7 +511,9 @@ const normalizeBot = (raw, now) => {
     emoji: str(raw?.emoji) || null,
     role,
     job: str(raw?.job),
-    model: claudeModelFrom(raw?.model) ?? (role === 'primary' ? LOCAL_PRIMARY_BOT_MODEL : LOCAL_BOT_DEFAULT_MODEL),
+    model: storedModel(raw, role),
+    // Set when the person (or the bot, asked to) chose its model; unset: it follows the default.
+    ...(raw?.modelChosen === true ? { modelChosen: true } : {}),
     createdAt: finite(raw?.createdAt, now),
     lastActivityAt: finite(raw?.lastActivityAt, now),
     lastPreview: typeof raw?.lastPreview === 'string' ? raw.lastPreview : null,
@@ -1178,7 +1228,7 @@ export const createLocalBotEngine = ({
       botName: bot.name,
       // The reply's message id in the thread (a kept session knows it has seen it).
       replyMessageId: reply.id,
-      model: bot.model,
+      model: localLaneModel(bot, { person: claims.some((message) => message.role === 'user' && inboxSourceOf(message.authorLabel) === 'person') }),
       systemPrompt: botSystemPrompt(bot),
       prompt,
       session,
@@ -1374,7 +1424,7 @@ export const createLocalBotEngine = ({
       laneId: task.id,
       botId: entry.bot.id,
       botName: entry.bot.name,
-      model: entry.bot.model,
+      model: localLaneModel(entry.bot, { person: false }),
       systemPrompt: `${LOCAL_TASK_PROMPT}\n\nThe bot "${entry.bot.name}" handed you the task "${task.title}". The task follows as the message.`,
       prompt: instructions,
       tools: [],
@@ -1749,11 +1799,7 @@ export const createLocalBotEngine = ({
         case 'update_bot': {
           const target = input.bot_id ? entryFor(input.bot_id) : self;
           const { bot } = target;
-          if (input.model !== undefined) {
-            const model = claudeModelFrom(input.model);
-            if (!model) throw new Error('Use a Claude model id, e.g. "claude-sonnet-5-5".');
-            bot.model = model;
-          }
+          if (input.model !== undefined) applyModel(bot, input.model);
           if (input.name !== undefined && oneLine(input.name)) bot.name = clip(oneLine(input.name), 40);
           if (input.job !== undefined) bot.job = str(input.job).trim();
           if (input.emoji !== undefined) bot.emoji = clip(oneLine(input.emoji), 8) || null;
@@ -1933,6 +1979,8 @@ export const createLocalBotEngine = ({
         role: bot.role,
         job: bot.job,
         model: durangoModelForLocalBot(bot.model),
+        // Picked by the person (or the bot): Durango keeps it; else the bot follows Durango's default.
+        modelChosen: bot.modelChosen === true,
         summary: bot.summary,
         ...(bot.earlierSummary ? { earlierSummary: bot.earlierSummary } : {}),
         messages: messages.map((message) => ({
@@ -1986,7 +2034,24 @@ export const createLocalBotEngine = ({
     ensurePrimary: async () => toDesktopBot(await ensurePrimary()),
     async list() {
       await ensurePrimary();
-      return { allowed: true, bots: sortedEntries().map(toDesktopBot) };
+      return { allowed: true, bots: sortedEntries().map(toDesktopBot), modelChoices: LOCAL_BOT_MODEL_CHOICES };
+    },
+    /** The person picks a bot's model (one of LOCAL_BOT_MODEL_CHOICES); the next reply runs on it. → the bot. */
+    async setModel(botId, model) {
+      await ensureLoaded();
+      const entry = entryFor(botId);
+      if (!LOCAL_BOT_MODEL_CHOICES.some((choice) => choice.id === model)) throw new Error('Pick one of the bot models.');
+      const before = { model: entry.bot.model, modelChosen: entry.bot.modelChosen };
+      applyModel(entry.bot, model);
+      // Saved before it is reported: a failed write puts the old model back.
+      if (!(await persistBot(entry, { messages: false }))) {
+        entry.bot.model = before.model;
+        if (before.modelChosen) entry.bot.modelChosen = true;
+        else delete entry.bot.modelChosen;
+        throw new Error('Couldn’t save the model on this computer. Try again.');
+      }
+      changed();
+      return toDesktopBot(entry);
     },
     /**
      * A page of a bot's thread (oldest first) and its replies being written:

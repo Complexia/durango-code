@@ -178,9 +178,19 @@ export type BotsListResult = {
   projectKeys?: Record<string, string>;
   /** Whose bots these are ("local", or a hash of the Durango account): cached data of another account is dropped. */
   account?: string;
+  /** The models a bot can be set to; null or absent (an older Durango): no picker. */
+  modelChoices?: BotModelChoice[] | null;
   error?: string;
   code?: string;
 };
+
+/** A model a bot can be set to. `claude`: it can also reply on a machine's Claude Code (others reply from Durango's cloud). */
+export type BotModelChoice = { id: string; label: string; note: string; claude: boolean };
+export type SetBotModelResult = { ok: boolean; model?: string; bot?: DesktopBot; error?: string; code?: string };
+
+/** A bot's model as a short name: its choice's label, else the id's last part ("anthropic/claude-opus-5.5" → "claude-opus-5.5"). */
+export const botModelLabel = (model: string, choices: readonly BotModelChoice[] | null | undefined) =>
+  choices?.find((choice) => choice.id === model)?.label ?? model.split('/').pop() ?? model;
 
 /** The bot of a project (by the project's key), if it exists yet. */
 export const projectBotFor = (bots: DesktopBot[], key: string | undefined) =>

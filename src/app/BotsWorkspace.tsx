@@ -68,6 +68,7 @@ import {
 import {
   botInboxSource,
   botIsWorking,
+  botModelLabel,
   LOCAL_BOT_PLACE,
   formatFileSize,
   newBotMessageId,
@@ -84,7 +85,9 @@ import {
   type DesktopBotMessage,
   type DesktopBotThread,
   type BotAttachmentFile,
+  type BotModelChoice,
 } from './bots';
+import { BotModelMenu } from './BotModelMenu';
 
 // The sidebar's Bots tab (once "Sidebar v3" in Settings → Experimental): the
 // sidebar lists the person's Durango bots under the shared header
@@ -148,6 +151,8 @@ type BotListCache = {
   allowed: boolean;
   mode: 'local' | 'durango' | null;
   cloudOnly: boolean;
+  /** The models a bot can be set to (null: an older Durango, no picker). */
+  modelChoices: BotModelChoice[] | null;
 };
 let botListCache: BotListCache | null = null;
 const botThreadCache = new Map<string, DesktopBotThread>();
@@ -231,6 +236,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const { sidebarRef, resizeHandle } = useSidebarResize({ storageKey: AGENTS_SIDEBAR_STORAGE_KEY, label: 'Agents sidebar' });
   const [bots, setBots] = useState<DesktopBot[] | null>(() => botListCache?.bots ?? null);
   const [projectKeys, setProjectKeys] = useState<Record<string, string>>(() => botListCache?.projectKeys ?? {});
+  const [modelChoices, setModelChoices] = useState<BotModelChoice[] | null>(() => botListCache?.modelChoices ?? null);
   const [listError, setListError] = useState<string | null>(null);
   const [allowed, setAllowed] = useState(() => botListCache?.allowed ?? true);
   const [mode, setMode] = useState<'local' | 'durango' | null>(() => botListCache?.mode ?? null);
@@ -280,6 +286,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     setBots(result.bots ?? []);
     noteBotList(result.allowed === false ? null : (result.bots ?? []));
     setProjectKeys(result.projectKeys ?? {});
+    setModelChoices(result.modelChoices ?? null);
     botListCache = {
       account: nextAccount,
       bots: result.bots ?? [],
@@ -287,6 +294,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       allowed: result.allowed !== false,
       mode: nextMode,
       cloudOnly: nextCloudOnly,
+      modelChoices: result.modelChoices ?? null,
     };
   }, []);
 
@@ -478,6 +486,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             <BotPane
               key={`${account ?? ''}:${selectedBotId}`}
               botId={selectedBotId}
+              modelChoices={modelChoices}
+              local={mode === 'local'}
               onChanged={loadBots}
               onOpenProject={openProjectOfBot}
               onOpenThread={openBotThread}
@@ -1105,11 +1115,15 @@ const BotRow: React.FC<{
 /** One bot's conversation: messages, live replies at the bottom, and a composer that never blocks. */
 const BotPane: React.FC<{
   botId: string;
+  /** The models the bot can be set to (null: no picker). */
+  modelChoices: BotModelChoice[] | null;
+  /** The bots are this computer's own (signed out). */
+  local: boolean;
   onChanged: () => void;
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
-}> = ({ botId, onChanged, onOpenProject, onOpenThread }) => {
+}> = ({ botId, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
   // `thread.messages`: every message loaded so far (the newest page, older
   // pages scrolled back to, and what polls brought), in seq order; unchanged
   // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
@@ -1300,6 +1314,19 @@ const BotPane: React.FC<{
     return answeredRef.current.map;
   }, [thread?.messages]);
 
+  /** The person picks the bot's reply model: saved, then shown at once (the next poll confirms it). → an error, or null. */
+  const pickModel = useCallback(
+    async (model: string) => {
+      const result = await window.orion?.setBotModel?.({ botId, model });
+      if (!result?.ok) return result?.error ?? 'Couldn’t change the model. Try again.';
+      const saved = result.bot?.model ?? result.model ?? model;
+      setThread((current) => (current ? { ...current, bot: { ...current.bot, model: saved } } : current));
+      onChanged();
+      return null;
+    },
+    [botId, onChanged, setThread]
+  );
+
   const liveKey = thread?.live.map((reply) => `${reply.messageId}:${reply.content.length}`).join() ?? '';
   useLayoutEffect(() => {
     const element = scrollRef.current;
@@ -1355,7 +1382,7 @@ const BotPane: React.FC<{
         </div>
         <div className="flex items-center gap-1.5 text-[11.5px] text-[var(--text-muted)]">
           {bot.paused ? <Pause size={11} /> : working ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" /> : null}
-          {bot.paused ? 'Paused' : working ? (live.length > 1 ? `Working on ${live.length} replies…` : 'Working…') : bot.needsYou ? 'Waiting on you' : bot.model.split('/').pop()}
+          {bot.paused ? 'Paused' : working ? (live.length > 1 ? `Working on ${live.length} replies…` : 'Working…') : bot.needsYou ? 'Waiting on you' : modelChoices?.length ? null : botModelLabel(bot.model, modelChoices)}
         </div>
       </div>
       {bot.project && (
@@ -1368,6 +1395,7 @@ const BotPane: React.FC<{
           <FolderOpen size={13} /> {bot.project.name}
         </button>
       )}
+      {modelChoices?.length ? <BotModelMenu model={bot.model} choices={modelChoices} local={local} onPick={pickModel} /> : null}
     </>
   );
   return (

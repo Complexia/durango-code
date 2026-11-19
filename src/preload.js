@@ -466,6 +466,7 @@ contextBridge.exposeInMainWorld('orion', {
   // Bots (Sidebar v3)
   getBotsMode: () => ipcRenderer.invoke('bots:mode'),
   listBots: () => ipcRenderer.invoke('bots:list'),
+  setBotModel: (input) => ipcRenderer.invoke('bots:setModel', input),
   getBotThread: (input) => ipcRenderer.invoke('bots:thread', input),
   sendBotMessage: (input) => ipcRenderer.invoke('bots:send', input),
   pickBotAttachments: () => ipcRenderer.invoke('bots:pickAttachments'),
