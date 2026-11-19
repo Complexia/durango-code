@@ -5,6 +5,20 @@ import path from 'node:path';
 import { DurangoError } from './durango-client.js';
 import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
+import {
+  BOT_SESSION_RESET_TOKENS,
+  contextTokensOf,
+  createBotSessionStore,
+  cutMiddle,
+  estimateTextTokens,
+  maxPromptTokensFromEnv,
+  normalizeLaneSession,
+  planBotPrompt,
+  replyUsageOf,
+  sessionBasis,
+} from './bot-sessions.js';
+
+export { createBotSessionStore };
 
 // Bot replies: a Durango bot's reply, run here on the person's own Claude Code.
 //
@@ -42,6 +56,8 @@ export const normalizeBotSettings = (raw) => {
     accessMode: BOT_DEFAULT_ACCESS_MODE,
   };
 };
+/** Claim feature: this machine keeps a Claude Code session per bot (bot-sessions.js). */
+export const BOT_SESSIONS_FEATURE = 'bot-sessions';
 export const BOT_MAX_LANES = 3;
 export const BOT_MCP_SERVER = 'durango_bot';
 export const BOT_PROGRESS_THROTTLE_MS = 1_000;
@@ -88,6 +104,9 @@ const RETRY_ELSEWHERE_ASSISTANT_ERRORS = new Set([
 ]);
 const RETRY_ELSEWHERE_TEXT =
   /usage limit|rate[ _-]?limit|limit reached|out of (?:extra )?usage|credit balance|not logged in|\/login|log ?in again|invalid api key|oauth|authenticat|unauthori[sz]ed|ENOENT|EACCES|spawn|native binary|executable not found|cannot find module/i;
+
+/** The model refused the prompt for its size. */
+const PROMPT_TOO_LONG = /prompt is too long|too many (?:input )?tokens|context (?:length|window)|maximum context/i;
 
 /** Error text that reads as a usage limit, a signed-out Claude Code or a missing runtime. */
 export const isRetryElsewhereError = (text) => RETRY_ELSEWHERE_TEXT.test(String(text ?? ''));
@@ -324,13 +343,21 @@ export const createClaudeOneShot = ({
  * - env(): the claude process environment
  * - getProjects(): this machine's Durango Code projects the reply may use
  *   ([{ name, path }], already limited to the ones allowed for Durango)
+ * - sessions: createBotSessionStore(...) (bot-sessions.js): each bot's kept
+ *   Claude Code session, resumed by its next reply (null: a fresh session every reply)
+ * - maxPromptTokens / sessionResetTokens: the prompt size limits (bot-sessions.js)
+ * - log(...): one line per reply with its token usage
  *
  * lane.threads: how the reply starts Durango Code threads in a project
  * ('machine' | 'local'; absent for tasks), see botProjectsNote.
+ * lane.session: the conversation, structured (normalizeLaneSession); without
+ * it, lane.prompt is sent as is (in a fresh session, cut to the size limit).
  *
- * → (lane, ctx) => { text, modelId, failure?, retryElsewhere?, aborted? }
+ * → (lane, ctx) => { text, modelId, failure?, retryElsewhere?, aborted?, usage?, compact? }
  * ctx: { signal, accessMode, update({ text, activeTool }), takeInbox(): Promise<items>,
  *        callTool({ name, input, toolCallId }): Promise<{ result }> }
+ * `compact`: the bot's history should be compacted (its kept session grew too large, or
+ * compaction fell behind).
  */
 export const createClaudeLaneRunner = ({
   loadSdk,
@@ -343,6 +370,10 @@ export const createClaudeLaneRunner = ({
   mkdir = (dir) => fs.mkdir(dir, { recursive: true }),
   randomId = () => crypto.randomUUID(),
   downloadAttachment = defaultDownload,
+  sessions = null,
+  maxPromptTokens = maxPromptTokensFromEnv(),
+  sessionResetTokens = BOT_SESSION_RESET_TOKENS,
+  log = (...args) => console.info('[bot replies]', ...args),
 }) => async (lane, ctx) => {
   const accessMode = ctx.accessMode || 'read-only';
   let sdk;
@@ -371,6 +402,39 @@ export const createClaudeLaneRunner = ({
     download: downloadAttachment,
   }).catch(() => '');
   const z = zod?.z ?? zod;
+  const systemAppend = projectsNote ? `${lane.systemPrompt}\n\n${projectsNote}` : lane.systemPrompt;
+
+  // --- the prompt: a kept session's next message, or a fresh session's whole conversation --
+  const session = normalizeLaneSession(lane.session);
+  const keptSessions = session && sessions ? sessions : null;
+  // One kept session per bot and model: replies to the person (the bot's
+  // model) and routine runs (its cheap routine model) don't reset each other.
+  const sessionKey = lane.model ? `${lane.botId}__${String(lane.model).replace(/[^A-Za-z0-9_-]/g, '_')}` : lane.botId;
+  const claimed = keptSessions ? await keptSessions.begin(sessionKey) : { state: null, busy: false };
+  const basis = sessionBasis({ systemPrompt: systemAppend, model: lane.model, tools: lane.tools });
+  const planFor = (state, budget = maxPromptTokens) =>
+    session
+      ? planBotPrompt({
+          botName: lane.botName,
+          session,
+          state,
+          basis,
+          // Without a store nothing is kept: a fresh, unkept session.
+          busy: claimed.busy || !keptSessions,
+          systemTokens: estimateTextTokens(systemAppend),
+          maxPromptTokens: budget,
+          sessionResetTokens,
+        })
+      : {
+          mode: 'fresh',
+          keep: false,
+          reason: 'legacy',
+          // A prompt built by an older Durango: cut in the middle (its oldest messages) to the limit.
+          prompt: cutMiddle(lane.prompt, Math.max(4_000, budget - estimateTextTokens(systemAppend))),
+          compact: false,
+        };
+  let plan = planFor(claimed.state);
+  const withAttachments = (prompt) => (attachmentsNote ? `${prompt}\n\n${attachmentsNote}` : prompt);
 
   // --- reply text and the tool running -----------------------------------------------
   const blocks = []; // text blocks of the main loop's assistant messages
@@ -389,6 +453,7 @@ export const createClaudeLaneRunner = ({
 
   // --- inbox: taken between steps, read at the next tool result or turn end -------
   const pendingInbox = [];
+  const deliveredSeqs = []; // inbox messages the session read
   let inboxRequest = null;
   const requestInbox = () => {
     if (inboxRequest) return inboxRequest;
@@ -405,11 +470,16 @@ export const createClaudeLaneRunner = ({
       });
     return inboxRequest;
   };
+  const takePending = () => {
+    const items = pendingInbox.splice(0);
+    for (const item of items) if (Number.isInteger(item?.seq)) deliveredSeqs.push(item.seq);
+    return items;
+  };
   // Like a steer in an agent thread (claudeSteerHooks): the main loop reads
   // what arrived at its next tool result, without interrupting the step.
   const deliverAtToolResult = (hookEventName) => async (input) => {
     if (input?.agent_id) return { continue: true };
-    const items = pendingInbox.splice(0);
+    const items = takePending();
     void requestInbox();
     if (!items.length) return { continue: true };
     return { hookSpecificOutput: { hookEventName, additionalContext: formatBotInbox(items) } };
@@ -450,149 +520,243 @@ export const createClaudeLaneRunner = ({
   };
 
   // --- the run -------------------------------------------------------------------------
-  const inputQueue = createInputQueue();
-  const abortController = new AbortController();
-  let stderrTail = '';
-  const onAbort = () => {
-    inputQueue.close();
+  // One attempt: a resumed session that turns out missing or broken gets a
+  // second, fresh one (before anything was written).
+  const runAttempt = async (attemptPlan) => {
+    const inputQueue = createInputQueue();
+    const abortController = new AbortController();
+    const attempt = {
+      model: lane.model,
+      sawInit: false,
+      sessionId: null,
+      result: null,
+      assistantError: null,
+      rateLimited: false,
+      thrown: null,
+      stderrTail: '',
+      contextTokens: 0,
+    };
+    let lastAssistantId = null;
+    let query = null;
+    const onAbort = () => {
+      inputQueue.close();
+      try {
+        abortController.abort();
+      } catch {}
+    };
+    ctx.signal?.addEventListener('abort', onAbort, { once: true });
+    const baseEnv = env();
     try {
-      abortController.abort();
-    } catch {}
-  };
-  ctx.signal?.addEventListener('abort', onAbort, { once: true });
-
-  let model = lane.model;
-  let sawInit = false;
-  let result = null;
-  let assistantError = null;
-  let rateLimited = false;
-  let lastAssistantId = null;
-  let thrown = null;
-  let query = null;
-  try {
-    inputQueue.push(userMessage(attachmentsNote ? `${lane.prompt}\n\n${attachmentsNote}` : lane.prompt));
-    query = sdk.query({
-      prompt: inputQueue.stream(),
-      options: {
-        cwd,
-        ...(lane.model ? { model: lane.model } : {}),
-        systemPrompt: {
-          type: 'preset',
-          preset: 'claude_code',
-          append: projectsNote ? `${lane.systemPrompt}\n\n${projectsNote}` : lane.systemPrompt,
+      inputQueue.push(userMessage(withAttachments(attemptPlan.prompt)));
+      query = sdk.query({
+        prompt: inputQueue.stream(),
+        options: {
+          cwd,
+          ...(lane.model ? { model: lane.model } : {}),
+          systemPrompt: { type: 'preset', preset: 'claude_code', append: systemAppend },
+          settingSources: ['user', 'project', 'local'],
+          includePartialMessages: true,
+          ...(projects.length ? { additionalDirectories: projects.map((project) => project.path) } : {}),
+          mcpServers,
+          ...claudePermissionOptionsForAccessMode(accessMode),
+          ...(accessMode !== 'full-access' && botTools.length
+            ? { allowedTools: lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`) }
+            : {}),
+          canUseTool: async (toolName, toolInput) =>
+            toolName.startsWith(BOT_TOOL_PREFIX)
+              ? { behavior: 'allow', updatedInput: toolInput }
+              : { behavior: 'deny', message: toolDenial(toolName, accessMode) },
+          hooks: {
+            PreToolUse: [{ hooks: [recordToolUse] }],
+            PostToolUse: [{ hooks: [deliverAtToolResult('PostToolUse')] }],
+            PostToolUseFailure: [{ hooks: [deliverAtToolResult('PostToolUseFailure')] }],
+          },
+          // The kept session: resumed. A session that won't be kept isn't saved.
+          ...(attemptPlan.mode === 'resume' ? { resume: attemptPlan.sessionId } : {}),
+          ...(attemptPlan.keep ? {} : { persistSession: false }),
+          ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
+          abortController,
+          stderr: (data) => {
+            attempt.stderrTail = `${attempt.stderrTail}${data}`.slice(-2000);
+          },
+          // A bot's conversation is picked up again after the person's pauses
+          // (often more than 5 minutes): the hour-long prompt cache (Claude
+          // Code's default on a Claude subscription; an API key's default is 5
+          // minutes). The person's own setting wins.
+          env: baseEnv?.CLAUDE_CODE_PROMPT_CACHE_TTL ? baseEnv : { ...baseEnv, CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' },
         },
-        settingSources: ['user', 'project', 'local'],
-        includePartialMessages: true,
-        ...(projects.length ? { additionalDirectories: projects.map((project) => project.path) } : {}),
-        mcpServers,
-        ...claudePermissionOptionsForAccessMode(accessMode),
-        ...(accessMode !== 'full-access' && botTools.length
-          ? { allowedTools: lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`) }
-          : {}),
-        canUseTool: async (toolName, toolInput) =>
-          toolName.startsWith(BOT_TOOL_PREFIX)
-            ? { behavior: 'allow', updatedInput: toolInput }
-            : { behavior: 'deny', message: toolDenial(toolName, accessMode) },
-        hooks: {
-          PreToolUse: [{ hooks: [recordToolUse] }],
-          PostToolUse: [{ hooks: [deliverAtToolResult('PostToolUse')] }],
-          PostToolUseFailure: [{ hooks: [deliverAtToolResult('PostToolUseFailure')] }],
-        },
-        ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
-        abortController,
-        stderr: (data) => {
-          stderrTail = `${stderrTail}${data}`.slice(-2000);
-        },
-        env: env(),
-      },
-    });
-    for await (const message of query) {
-      if (ctx.signal?.aborted) break;
-      const mainLoop = !message?.parent_tool_use_id;
-      if (message?.type === 'system' && message.subtype === 'init') {
-        sawInit = true;
-        if (typeof message.model === 'string' && message.model) model = message.model;
-        continue;
-      }
-      if (message?.type === 'rate_limit_event') {
-        if (message.rate_limit_info?.status === 'rejected') rateLimited = true;
-        continue;
-      }
-      if (message?.type === 'stream_event' && mainLoop) {
-        const event = message.event;
-        if (event?.type === 'content_block_start' && event.content_block?.type === 'text') partial = '';
-        if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-          partial += event.delta.text ?? '';
-          update();
-        }
-        continue;
-      }
-      if (message?.type === 'assistant' && mainLoop) {
-        if (message.error) assistantError = message.error;
-        const synthetic = Boolean(message.error) || message.message?.model === '<synthetic>';
-        const id = message.message?.id ?? null;
-        if (!synthetic && id !== lastAssistantId) {
-          lastAssistantId = id;
-          // A new step: take what arrived meanwhile, read at its next tool result.
-          void requestInbox();
-        }
-        for (const block of Array.isArray(message.message?.content) ? message.message.content : []) {
-          if (block?.type === 'text' && !synthetic) {
-            blocks.push(String(block.text ?? ''));
-            partial = '';
-          } else if (block?.type === 'tool_use' && block.id) {
-            toolCalls.set(block.id, block.name);
-          }
-        }
-        if (synthetic) partial = '';
-        update();
-        continue;
-      }
-      if (message?.type === 'user' && mainLoop) {
-        const content = message.message?.content;
-        let changed = false;
-        for (const block of Array.isArray(content) ? content : []) {
-          if (block?.type === 'tool_result' && block.tool_use_id && toolCalls.delete(block.tool_use_id)) changed = true;
-        }
-        if (changed) update();
-        continue;
-      }
-      if (message?.type === 'result') {
-        result = message;
-        partial = '';
-        toolCalls.clear();
-        if (message.is_error || message.subtype !== 'success') break;
-        // Before finishing: anything that reached the bot meanwhile continues
-        // this reply (like a steer at a turn's end).
-        if (inboxRequest) await inboxRequest;
-        await requestInbox();
+      });
+      for await (const message of query) {
         if (ctx.signal?.aborted) break;
-        const items = pendingInbox.splice(0);
-        if (!items.length) break;
-        result = null;
-        update();
-        inputQueue.push(userMessage(formatBotInbox(items)));
+        const mainLoop = !message?.parent_tool_use_id;
+        if (message?.type === 'system' && message.subtype === 'init') {
+          attempt.sawInit = true;
+          if (typeof message.model === 'string' && message.model) attempt.model = message.model;
+          if (typeof message.session_id === 'string' && message.session_id) attempt.sessionId = message.session_id;
+          continue;
+        }
+        if (message?.type === 'rate_limit_event') {
+          if (message.rate_limit_info?.status === 'rejected') attempt.rateLimited = true;
+          continue;
+        }
+        if (message?.type === 'stream_event' && mainLoop) {
+          const event = message.event;
+          if (event?.type === 'content_block_start' && event.content_block?.type === 'text') partial = '';
+          if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+            partial += event.delta.text ?? '';
+            update();
+          }
+          continue;
+        }
+        if (message?.type === 'assistant' && mainLoop) {
+          if (message.error) attempt.assistantError = message.error;
+          const synthetic = Boolean(message.error) || message.message?.model === '<synthetic>';
+          const id = message.message?.id ?? null;
+          if (!synthetic && id !== lastAssistantId) {
+            lastAssistantId = id;
+            // A new step: take what arrived meanwhile, read at its next tool result.
+            void requestInbox();
+          }
+          if (!synthetic && message.message?.usage) attempt.contextTokens = contextTokensOf(message.message.usage);
+          for (const block of Array.isArray(message.message?.content) ? message.message.content : []) {
+            if (block?.type === 'text' && !synthetic) {
+              blocks.push(String(block.text ?? ''));
+              partial = '';
+            } else if (block?.type === 'tool_use' && block.id) {
+              toolCalls.set(block.id, block.name);
+            }
+          }
+          if (synthetic) partial = '';
+          update();
+          continue;
+        }
+        if (message?.type === 'user' && mainLoop) {
+          const content = message.message?.content;
+          let changed = false;
+          for (const block of Array.isArray(content) ? content : []) {
+            if (block?.type === 'tool_result' && block.tool_use_id && toolCalls.delete(block.tool_use_id)) changed = true;
+          }
+          if (changed) update();
+          continue;
+        }
+        if (message?.type === 'result') {
+          attempt.result = message;
+          if (typeof message.session_id === 'string' && message.session_id) attempt.sessionId = message.session_id;
+          partial = '';
+          toolCalls.clear();
+          if (message.is_error || message.subtype !== 'success') break;
+          // Before finishing: anything that reached the bot meanwhile continues
+          // this reply (like a steer at a turn's end).
+          if (inboxRequest) await inboxRequest;
+          await requestInbox();
+          if (ctx.signal?.aborted) break;
+          const items = takePending();
+          if (!items.length) break;
+          attempt.result = null;
+          update();
+          inputQueue.push(userMessage(formatBotInbox(items)));
+        }
       }
+    } catch (error) {
+      attempt.thrown = error;
+    } finally {
+      ctx.signal?.removeEventListener('abort', onAbort);
+      inputQueue.close();
+      try {
+        query?.close?.();
+      } catch {}
+      try {
+        abortController.abort();
+      } catch {}
     }
-  } catch (error) {
-    thrown = error;
+    return attempt;
+  };
+
+  const succeeded = (attempt) => attempt.result && !attempt.result.is_error && attempt.result.subtype === 'success';
+  const failureText = (attempt) =>
+    [
+      attempt.thrown?.message ?? '',
+      Array.isArray(attempt.result?.errors) ? attempt.result.errors.join('; ') : '',
+      typeof attempt.result?.result === 'string' ? attempt.result.result : '',
+      attempt.assistantError ?? '',
+      attempt.stderrTail,
+    ].join('\n');
+  // Failed before writing anything, for a reason another try here can fix
+  // (not a usage limit, a sign-in or a missing runtime).
+  const retryableHere = (attempt) =>
+    !succeeded(attempt) &&
+    !ctx.signal?.aborted &&
+    !currentText().trim() &&
+    !attempt.rateLimited &&
+    !RETRY_ELSEWHERE_ASSISTANT_ERRORS.has(attempt.assistantError) &&
+    !isRetryElsewhereError(failureText(attempt));
+  const startOver = async (nextPlan) => {
+    plan = nextPlan;
+    blocks.length = 0;
+    partial = '';
+    toolCalls.clear();
+    return await runAttempt(plan);
+  };
+  let attempt;
+  let resumeFailed = false;
+  try {
+    attempt = await runAttempt(plan.mode === 'resume' ? { ...plan, sessionId: claimed.state.sessionId } : plan);
+    if (plan.mode === 'resume' && retryableHere(attempt)) {
+      // The kept session couldn't be resumed (missing, broken): start over fresh.
+      resumeFailed = true;
+      attempt = await startOver(planFor(null));
+    }
+    if (retryableHere(attempt) && PROMPT_TOO_LONG.test(failureText(attempt))) {
+      // The estimate was off (a reply never fails for its size): half the room.
+      attempt = await startOver(planFor(null, Math.floor(maxPromptTokens / 2)));
+    }
   } finally {
-    ctx.signal?.removeEventListener('abort', onAbort);
-    inputQueue.close();
-    try {
-      query?.close?.();
-    } catch {}
-    try {
-      abortController.abort();
-    } catch {}
+    // The session is kept only after a complete reply; anything else starts the next one fresh.
+    if (keptSessions && !claimed.busy) {
+      const keep = plan.keep && attempt && succeeded(attempt) && !ctx.signal?.aborted && attempt.sessionId;
+      await keptSessions.end(
+        sessionKey,
+        keep
+          ? {
+              sessionId: attempt.sessionId,
+              basis,
+              model: lane.model ?? null,
+              seenSeqs: [...plan.seenSeqs, ...deliveredSeqs].slice(-4_000),
+              // This reply, as the thread stores it (its message id).
+              seenIds: [...plan.seenIds, lane.replyMessageId || lane.laneId].filter(Boolean).slice(-4_000),
+              contextKeys: plan.contextKeys,
+              contextTokens: attempt.contextTokens,
+              replies: plan.mode === 'resume' ? (claimed.state?.replies ?? 0) + 1 : 1,
+            }
+          : null
+      );
+    }
   }
 
-  const text = currentText();
-  const modelId = durangoModelIdForClaude(model);
-  const withModel = modelId ? { modelId } : {};
-  if (ctx.signal?.aborted) return { text, aborted: true, ...withModel };
-  if (result && !result.is_error && result.subtype === 'success') return { text, ...withModel };
+  const usage = attempt.result?.usage ? replyUsageOf(attempt.result) : null;
+  const sessionInfo = {
+    mode: plan.mode,
+    reason: resumeFailed ? 'broken' : plan.reason,
+    contextTokens: attempt.contextTokens,
+    ...(plan.omitted ? { omitted: plan.omitted } : {}),
+    ...(plan.shrunk ? { shrunk: plan.shrunk } : {}),
+  };
+  if (usage) {
+    log(
+      `bot ${lane.botId} reply usage`,
+      JSON.stringify({ model: attempt.model, ...sessionInfo, ...usage, uncached: usage.input })
+    );
+  }
+  const compact = Boolean(plan.compact || (attempt.contextTokens && attempt.contextTokens > sessionResetTokens));
+  const extras = { ...(usage ? { usage: { ...usage, ...sessionInfo } } : {}), ...(compact ? { compact: true } : {}) };
 
+  const text = currentText();
+  const modelId = durangoModelIdForClaude(attempt.model);
+  const withModel = modelId ? { modelId } : {};
+  if (ctx.signal?.aborted) return { text, aborted: true, ...withModel, ...extras };
+  if (succeeded(attempt)) return { text, ...withModel, ...extras };
+
+  const { result, thrown, assistantError } = attempt;
   const resultErrors = Array.isArray(result?.errors) ? result.errors.filter(Boolean).join('; ') : '';
   const reason =
     (thrown ? thrown?.message ?? String(thrown) : '') ||
@@ -606,11 +770,11 @@ export const createClaudeLaneRunner = ({
   // by moving: the next place (another machine or the cloud) answers instead.
   const retryElsewhere =
     !text.trim() ||
-    rateLimited ||
+    attempt.rateLimited ||
     RETRY_ELSEWHERE_ASSISTANT_ERRORS.has(assistantError) ||
-    (Boolean(thrown) && !sawInit) ||
-    isRetryElsewhereError(`${reason}\n${stderrTail}`);
-  return { text, failure: shorten(reason), retryElsewhere, ...withModel };
+    (Boolean(thrown) && !attempt.sawInit) ||
+    isRetryElsewhereError(`${reason}\n${attempt.stderrTail}`);
+  return { text, failure: shorten(reason), retryElsewhere, ...withModel, ...extras };
 };
 
 // --- the worker ------------------------------------------------------------------------
@@ -1049,6 +1213,9 @@ export const createBotReplyWorker = ({
             ? { text: '', retryElsewhere: true, ...(failure ? { failure } : {}) }
             : { text, ...(failure ? { failure } : {}) };
         if (outcome?.modelId) body.modelId = outcome.modelId;
+        // Token usage (logged by Durango) and whether the bot's history should be compacted now.
+        if (outcome?.usage) body.usage = outcome.usage;
+        if (outcome?.compact) body.compact = true;
         // A take that never got through: its messages (if it claimed any)
         // never reached this reply, so they go back to the inbox.
         if (entry.pendingTakeId && !body.retryElsewhere) body.lostTakes = [entry.pendingTakeId];
@@ -1117,6 +1284,8 @@ export const createBotReplyWorker = ({
           platform,
           ...(info ? { machine: presenceOf(info) } : {}),
           ...(acks.length ? { ackStopTasks: acks } : {}),
+          // Replies come as a structured conversation (lane.session): kept sessions.
+          features: [BOT_SESSIONS_FEATURE],
           waitMs: claimWaitMs,
           signal,
         });

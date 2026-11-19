@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoModelIdForClaude } from './bot-replies.js';
+import { planBotPrompt } from './bot-sessions.js';
+import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
 import { BOT_THREAD_TOOLS } from './bot-thread-tools.js';
 
 // Local bots: Durango bots that live on this device, for people who aren't
@@ -29,7 +31,6 @@ export const COMPACT_TRIGGER_TOKENS = 40_000;
 export const COMPACT_KEEP_TOKENS = 12_000;
 export const COMPACT_MIN_KEEP_MESSAGES = 8;
 const HEARTBEAT_MS = 10_000;
-const PROMPT_HISTORY_MAX_CHARS = 240_000;
 const SUMMARY_ROW_CHARS = 8_000;
 const INBOX_LABEL = { routine: 'Routine: ', task: 'Task: ', bot: 'Bot: ' };
 const INDEX_FILE = 'bots.json';
@@ -54,6 +55,7 @@ Stay responsive:
 - Quick things (a fact, a lookup, a short draft, one or two tool calls) you do yourself, right away.
 - Anything bigger (research, multi-step work, long writing, browsing many pages, code, comparing many options) you hand off with delegate_task and tell the person you're on it. Several independent pieces of work: several tasks, started together. The task runs in the background on this computer; its report comes back to your inbox and you then tell the person what matters.
 - Never pretend something is done when it was only handed off or drafted.
+- Your older messages are condensed into your summary. When it lacks a detail you need (exact wording, a link, a number, what was said or decided when), look it up with search_history instead of guessing or asking again.
 
 Routines and reports:
 - A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
@@ -78,15 +80,8 @@ A bot handed you this task. It runs in the background on this computer through C
 
 Your final reply is the report the bot receives: lead with the outcome or answer, then the details that matter (links, numbers, names, drafts), concise and complete. If something couldn't be done, say exactly what and why. Don't send, post, buy, apply or delete anything unless the task explicitly says to.`;
 
-export const LOCAL_COMPACTION_PROMPT = `You maintain the long-term working summary of an always-on assistant bot's conversation with a person. The bot will see ONLY this summary plus the most recent messages, so anything you drop is forgotten.
-
-Merge the previous summary with the new messages into one updated summary. Keep, concretely (names, numbers, dates, links, ids, exact wording of preferences):
-1. Standing instructions and preferences the person gave (how they want things done, what not to do).
-2. Open items: requests not yet finished, promises the bot made, questions waiting on the person, tasks running and what they were for.
-3. Decisions made and their reasons; things already done (so they aren't redone).
-4. Key facts learned about the person, their situation and their projects.
-5. The bot's other bots / routines it set up, and what they are for (if mentioned).
-Drop greetings, chit-chat, and detail that no longer matters. Resolved items shrink to one line. Use short headed sections and bullet points, newest state wins over older. Write in third person ("The person…", "You (the bot)…"). Stay under 1,200 words. Output only the summary.`;
+/** The summarizer's instructions: the summary chain (bot-memory.js). */
+export const LOCAL_COMPACTION_PROMPT = COMPACTION_PROMPT;
 
 // --- small helpers ------------------------------------------------------------------------
 
@@ -294,6 +289,7 @@ const LOCAL_PROJECT_TOOLS = [
 ];
 
 export const LOCAL_BOT_TOOLS = [
+  SEARCH_HISTORY_TOOL,
   {
     name: 'delegate_task',
     description:
@@ -457,6 +453,8 @@ const normalizeBot = (raw, now) => {
     needsYou: raw?.needsYou === true,
     paused: raw?.paused === true,
     summary: typeof raw?.summary === 'string' && raw.summary.trim() ? raw.summary : null,
+    // The summary chain's condensed older part (bot-memory.js).
+    earlierSummary: typeof raw?.earlierSummary === 'string' && raw.earlierSummary.trim() ? raw.earlierSummary : null,
     compactedThroughSeq: Number.isInteger(raw?.compactedThroughSeq) ? raw.compactedThroughSeq : 0,
     routines: (Array.isArray(raw?.routines) ? raw.routines : []).map(normalizeRoutine).filter(Boolean),
     nextSeq: Number.isInteger(raw?.nextSeq) && raw.nextSeq > 0 ? raw.nextSeq : 1,
@@ -880,17 +878,8 @@ export const createLocalBotEngine = ({
     return items;
   };
 
-  const speaker = (message, botName) => {
-    if (message.role === 'assistant') return `${botName} (you)`;
-    return message.authorLabel ? `[${message.authorLabel}]` : 'Person';
-  };
-  const renderLine = (message, botName) => {
-    const files = (message.attachments ?? []).map((item) => `[attached file: ${item.name}]`).join('\n');
-    const text = message.content.trim();
-    return `${speaker(message, botName)}:\n${[text, files].filter(Boolean).join('\n') || '(no text)'}`;
-  };
-
-  const renderContext = (entry, reply, claims) => {
+  /** This turn's context in parts; `steady` ones go to a kept session only when they change (bot-sessions.js). */
+  const renderContextParts = (entry, reply, claims) => {
     const { bot } = entry;
     const at = now();
     const counts = { person: 0, routine: 0, task: 0, bot: 0 };
@@ -903,8 +892,8 @@ export const createLocalBotEngine = ({
     ].filter(Boolean);
     const zone = timeZone();
     const lines = [
-      '(Bot context, not from the person.)',
-      `This reply answers: ${parts.length ? parts.join(', ') : 'nothing new'} (the last messages above). Handle each one.`,
+      { text: '(Bot context, not from the person.)' },
+      { text: `This reply answers: ${parts.length ? parts.join(', ') : 'nothing new'} (the last messages above). Handle each one.` },
     ];
     const runtime = runtimeFor(bot.id);
     const others = [...runtime.replies.values()].filter((other) => other !== reply);
@@ -912,40 +901,42 @@ export const createLocalBotEngine = ({
       const seqs = new Set(others.flatMap((other) => other.claimSeqs));
       const answering = entry.messages.filter((message) => seqs.has(message.seq));
       if (answering.length) {
-        lines.push(
-          `Another reply of yours is already answering: ${answering
+        lines.push({
+          text: `Another reply of yours is already answering: ${answering
             .map((message) => `"${clip(oneLine(message.content), 120)}"`)
-            .join('; ')}. Don't answer those here.`
-        );
+            .join('; ')}. Don't answer those here.`,
+        });
       }
     }
-    lines.push(
-      `You're running on this computer (${platform}) through the person's Claude Code. Now: ${formatAt(at)}${zone ? ` (${zone})` : ''}.`
-    );
+    lines.push({
+      text: `You're running on this computer (${platform}) through the person's Claude Code. Now: ${formatAt(at)}${zone ? ` (${zone})` : ''}.`,
+    });
     if (counts.person === 0) {
-      lines.push("The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention.");
+      lines.push({ text: "The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention." });
     }
     if (runtime.tasks.size || runtime.threads.size) {
-      lines.push(
-        `Your tasks still running: ${[...runtime.tasks.values(), ...runtime.threads.values()]
+      lines.push({
+        steady: true,
+        text: `Your tasks still running: ${[...runtime.tasks.values(), ...runtime.threads.values()]
           .map(
             (task) =>
               `"${task.title}" (${task.id}${task.project ? `, a Durango Code thread in ${task.project}` : ''}, started ${ago(task.startedAt, at)})`
           )
-          .join('; ')}.`
-      );
+          .join('; ')}.`,
+      });
     }
     if (bot.routines.length) {
-      lines.push(
-        `Your routines: ${bot.routines
+      lines.push({
+        steady: true,
+        text: `Your routines: ${bot.routines
           .map(
             (routine) =>
               `"${routine.title}" (${routine.id}): ${scheduleText(routine.schedule)}${
                 !routine.enabled ? ', off' : routine.nextRunAt ? `, next ${formatAt(routine.nextRunAt)}` : ''
               }`
           )
-          .join('; ')}.`
-      );
+          .join('; ')}.`,
+      });
     }
     const roster = sortedEntries()
       .filter((other) => other !== entry)
@@ -958,11 +949,14 @@ export const createLocalBotEngine = ({
         return `- ${other.bot.name} (${other.bot.id}; ${state}). Job: ${other.bot.job || 'general'}.${last}`;
       });
     if (roster.length) {
-      lines.push(`${bot.role === 'primary' ? "The person's other bots" : "The person's other bots (message them with message_bot)"}:\n${roster.join('\n')}`);
+      lines.push({
+        steady: true,
+        text: `${bot.role === 'primary' ? "The person's other bots" : "The person's other bots (message them with message_bot)"}:\n${roster.join('\n')}`,
+      });
     } else if (bot.role === 'primary') {
-      lines.push('The person has no other bots yet.');
+      lines.push({ steady: true, text: 'The person has no other bots yet.' });
     }
-    return lines.join('\n');
+    return lines;
   };
 
   const botSystemPrompt = (bot) =>
@@ -972,9 +966,7 @@ export const createLocalBotEngine = ({
       bot.role === 'primary' ? LOCAL_PRIMARY_BOT_PROMPT : null,
       bot.job.trim() ? `## Your job\n\n${bot.job.trim()}` : null,
       bot.project ? projectSection(bot.project) : null,
-      bot.summary?.trim()
-        ? `## Your earlier conversation with the person (summary)\n\nOlder messages of your thread were condensed into this summary; the messages after it follow in full.\n\n${bot.summary.trim()}`
-        : null,
+      memorySection({ summary: bot.summary, earlier: bot.earlierSummary }),
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -983,33 +975,41 @@ export const createLocalBotEngine = ({
     const { bot } = entry;
     const claimSeqs = new Set(claims.map((message) => message.seq));
     const lastClaim = claims[claims.length - 1].seq;
-    const earlierAll = entry.messages.filter(
-      (message) => message.seq > bot.compactedThroughSeq && message.seq <= lastClaim && !claimSeqs.has(message.seq)
-    );
-    // Bounded even when compaction keeps failing: the newest earlier messages.
-    const earlier = [];
-    let chars = 0;
-    for (let index = earlierAll.length - 1; index >= 0; index -= 1) {
-      const line = renderLine(earlierAll[index], bot.name);
-      if (chars + line.length > PROMPT_HISTORY_MAX_CHARS && earlier.length) break;
-      chars += line.length;
-      earlier.unshift(line);
-    }
-    const prompt = [
-      earlier.length ? `<conversation_so_far>\n${earlier.join('\n\n')}\n</conversation_so_far>` : null,
-      `<new_messages>\n${claims.map((message) => renderLine(message, bot.name)).join('\n\n')}\n</new_messages>`,
-      `<context>\n${renderContext(entry, reply, claims)}\n</context>`,
-      'Write your reply to the new messages now. Your final text is sent to the person as your message in the thread.',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const row = (message) => {
+      const files = (message.attachments ?? []).map((item) => `[attached file: ${item.name}]`).join('\n');
+      return {
+        id: message.id,
+        seq: message.seq,
+        role: message.role,
+        text: [message.content.trim(), files].filter(Boolean).join('\n'),
+        ...(message.role === 'user' && message.authorLabel ? { label: message.authorLabel } : {}),
+      };
+    };
+    // The conversation after the summary, the messages this reply answers last.
+    // The runner sends a kept session only what it hasn't seen, and keeps a
+    // fresh prompt within the size limit (bot-sessions.js).
+    const session = {
+      history: [
+        ...entry.messages
+          .filter((message) => message.seq > bot.compactedThroughSeq && message.seq <= lastClaim && !claimSeqs.has(message.seq))
+          .map(row),
+        ...claims.map(row),
+      ],
+      answering: claims.map((message) => message.seq),
+      context: renderContextParts(entry, reply, claims),
+    };
+    // The whole conversation as one prompt (a runner without kept sessions).
+    const prompt = planBotPrompt({ botName: bot.name, session, basis: '', busy: true }).prompt;
     return {
       laneId: reply.id,
       botId: bot.id,
       botName: bot.name,
+      // The reply's message id in the thread (a kept session knows it has seen it).
+      replyMessageId: reply.id,
       model: bot.model,
       systemPrompt: botSystemPrompt(bot),
       prompt,
+      session,
       tools: threadTools ? [...LOCAL_BOT_TOOLS, ...BOT_THREAD_TOOLS] : LOCAL_BOT_TOOLS,
       threads: 'local',
       heartbeatMs: HEARTBEAT_MS,
@@ -1100,16 +1100,17 @@ export const createLocalBotEngine = ({
     persistBot(entry, { messages: Boolean(content) });
     changed();
     if (!runtime.replies.size && hasUnclaimed(entry) && active && !entry.bot.paused) startReply(entry);
-    await compactIfNeeded(entry);
+    await compactIfNeeded(entry, { force: outcome?.compact === true });
   };
 
   // --- compaction ---------------------------------------------------------------------
 
-  const compactIfNeeded = async (entry) => {
+  /** `force`: a reply's kept session grew too large (or compaction fell behind): fold at a lower trigger. */
+  const compactIfNeeded = async (entry, { force = false } = {}) => {
     if (!summarize || entry.compacting) return;
     const { bot } = entry;
     const rows = entry.messages.filter((message) => message.seq > bot.compactedThroughSeq);
-    const boundary = compactionBoundary(rows);
+    const boundary = compactionBoundary(rows, force ? { trigger: COMPACT_KEEP_TOKENS * 2 } : {});
     if (boundary === null) return;
     entry.compacting = true;
     const myGeneration = generation;
@@ -1125,14 +1126,12 @@ export const createLocalBotEngine = ({
       const summary = await summarize({
         model: LOCAL_BOT_COMPACTION_MODEL,
         systemPrompt: LOCAL_COMPACTION_PROMPT,
-        prompt: [
-          bot.summary?.trim() ? `<previous_summary>\n${bot.summary.trim()}\n</previous_summary>` : '<previous_summary>(none yet)</previous_summary>',
-          `<new_messages>\n${transcript}\n</new_messages>`,
-        ].join('\n\n'),
+        prompt: compactionInput({ earlier: bot.earlierSummary, summary: bot.summary, transcript }),
       });
-      const text = str(summary).trim();
-      if (!text || myGeneration !== generation || entries.get(bot.id) !== entry || bot.compactedThroughSeq !== expected) return;
-      bot.summary = text;
+      const memory = parseCompaction(summary, bot.earlierSummary);
+      if (!memory || myGeneration !== generation || entries.get(bot.id) !== entry || bot.compactedThroughSeq !== expected) return;
+      bot.summary = memory.summary;
+      bot.earlierSummary = memory.earlier;
       bot.compactedThroughSeq = boundary;
       trimMessages(entry);
       persistBot(entry);
@@ -1567,6 +1566,8 @@ export const createLocalBotEngine = ({
           appendInbox(target, { content: message, authorLabel: inboxLabel('bot', self.bot.name) });
           return { ok: true, to: target.bot.name };
         }
+        case 'search_history':
+          return searchMessages(self.messages, { query: input.query, from: input.from, to: input.to, limit: input.limit, botName: self.bot.name });
         case 'read_bot': {
           const target = entryFor(input.bot_id);
           const limit = Math.min(40, Math.max(1, Number.isInteger(input.limit) ? input.limit : 10));
@@ -1727,6 +1728,7 @@ export const createLocalBotEngine = ({
         job: bot.job,
         model: durangoModelForLocalBot(bot.model),
         summary: bot.summary,
+        ...(bot.earlierSummary ? { earlierSummary: bot.earlierSummary } : {}),
         messages: messages.map((message) => ({
           // Its id here: the upload keys it by this, so a retried upload
           // recognises it whatever else was added meanwhile.

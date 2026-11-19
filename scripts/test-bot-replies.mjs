@@ -9,11 +9,13 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { DurangoError, accountKeyOf, createDurangoClient } from '../src/main/durango-client.js';
+import { DurangoError, accountKeyOf, createDurangoClient, normalizeBotLane } from '../src/main/durango-client.js';
 import { buildMachinePayload, createDispatchWorker } from '../src/main/durango-dispatch.js';
 import {
   BOT_INBOX_HEADER,
   BOT_REPLIES_CAPABILITY,
+  BOT_SESSIONS_FEATURE,
+  createBotSessionStore,
   botProjectsNote,
   botToolLabel,
   createBotReplyWorker,
@@ -24,6 +26,7 @@ import {
   saveLaneAttachments,
 } from '../src/main/bot-replies.js';
 import { createBotThreadTools } from '../src/main/bot-thread-tools.js';
+import { cutMiddle, estimateTextTokens, maxPromptTokensFromEnv, planBotPrompt } from '../src/main/bot-sessions.js';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-bot-replies-'));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -656,7 +659,7 @@ try {
     assert.ok((await fs.stat(options.cwd)).isDirectory(), 'per-bot directory created');
     assert.equal(options.permissionMode, 'bypassPermissions', 'bot replies always run with Full access');
     assert.equal(options.pathToClaudeCodeExecutable, '/opt/claude');
-    assert.deepEqual(options.env, { TEST_ENV: '1' });
+    assert.deepEqual(options.env, { TEST_ENV: '1', CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' }, 'the hour-long prompt cache');
     assert.deepEqual(options.mcpServers, {}, 'no tools → no bot server');
     assert.equal((await options.canUseTool('Bash', { command: 'ls' })).behavior, 'deny', 'no one here to approve');
     assert.ok(sdk.runs[0].closed, 'query closed when done');
@@ -1018,6 +1021,259 @@ try {
     startWorker({ client, runLane: async () => ({ text: 'ok' }), reportRetryDelaysMs: [5, 5, 5] });
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish after retries' });
     assert.equal(attempts, 3);
+  });
+
+  // --- kept sessions (bot-sessions.js) -------------------------------------------------
+
+  const row = (seq, role, text, extra = {}) => ({ id: `m${seq}`, seq, role, text, ...extra });
+  const sessionLane = (history, answering, overrides = {}) =>
+    makeLane({
+      prompt: '',
+      session: { history, answering, context: [{ text: '(Bot context, not from the person.)' }, { text: 'Roster: nobody.', steady: true }] },
+      ...overrides,
+    });
+  /** A fake SDK that reports a session id and usage (context window `window`). */
+  const sessionSdk = ({ sessionId = 'sess-1', window = 30_000, fail = null } = {}) =>
+    createFakeSdk(async function* ({ next, options }) {
+      await next();
+      if (fail && fail(options)) {
+        yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['No conversation found with session ID: gone'], session_id: 'x' };
+        return;
+      }
+      yield { ...init(), session_id: options.resume ?? sessionId };
+      // Each user message (the prompt, then inbox items at the turn's end) gets an answer.
+      for (let turn = 1; ; turn += 1) {
+        const text = turn === 1 ? 'Done.' : 'And that too.';
+        const usage = { input_tokens: 10, cache_read_input_tokens: window - 1_000, cache_creation_input_tokens: 900, output_tokens: 90 };
+        yield assistant(`a${turn}`, [{ type: 'text', text }], { message: { id: `a${turn}`, model: 'claude-opus-5-5', content: [{ type: 'text', text }], usage } });
+        yield { ...success(), session_id: options.resume ?? sessionId, usage: { ...usage, cache_creation: { ephemeral_1h_input_tokens: 900 } }, total_cost_usd: 0.01 };
+        if (!(await next())) return;
+      }
+    });
+  const sessionSdkReason = (run) => (run.options.resume ? 'resume' : 'fresh');
+  const sessionCtx = (inbox = []) => ({ update: () => {}, takeInbox: async () => inbox.splice(0), callTool: async () => ({ result: null }) });
+
+  await test('kept session: the first reply seeds it, the next resumes it with only what is new', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-a') });
+    const sdk = sessionSdk();
+    const logs = [];
+    const runLane = sdkRunner(sdk, { sessions, log: (...args) => logs.push(args.join(' ')) });
+    const history = [row(1, 'user', 'Book a table for Friday.'), row(2, 'assistant', 'Which place?'), row(3, 'user', 'Sato, 7pm.')];
+    const first = await runLane(sessionLane(history, [3], { replyMessageId: 'r4' }), sessionCtx());
+    assert.equal(first.text, 'Done.');
+    assert.equal(sdk.runs[0].options.resume, undefined, 'a new session');
+    assert.equal(sdk.runs[0].options.persistSession, undefined, 'kept (saved to disk)');
+    assert.match(textOf(sdk.runs[0].inputs[0]), /<conversation_so_far>\nPerson:\nBook a table for Friday\.\n\nScout \(you\):\nWhich place\?\n<\/conversation_so_far>/);
+    assert.match(textOf(sdk.runs[0].inputs[0]), /<new_messages>\nPerson:\nSato, 7pm\.\n<\/new_messages>/);
+    assert.match(textOf(sdk.runs[0].inputs[0]), /Roster: nobody\./);
+    assert.deepEqual(first.usage && { mode: first.usage.mode, reason: first.usage.reason, read: first.usage.cacheRead, write1h: first.usage.cacheWrite1h }, { mode: 'fresh', reason: 'new', read: 29_000, write1h: 900 });
+    assert.match(logs[0], /bot bot_1 reply usage/);
+
+    // Next reply: the thread now has this reply (r4), a reply that ran in the cloud meanwhile, and a new message.
+    const later = [
+      ...history,
+      { id: 'r4', seq: 4, role: 'assistant', text: 'Done.' },
+      row(5, 'user', 'Also lunch Sat?'),
+      row(6, 'assistant', 'Booked lunch (from the cloud).'),
+      row(7, 'user', 'Thanks! And Sunday?'),
+    ];
+    const second = await runLane(sessionLane(later, [7], { laneId: 'lane_2', replyMessageId: 'r8' }), sessionCtx());
+    assert.equal(second.text, 'Done.');
+    assert.equal(sdk.runs[1].options.resume, 'sess-1', 'resumed');
+    const prompt = textOf(sdk.runs[1].inputs[0]);
+    assert.doesNotMatch(prompt, /Book a table|Which place|conversation_so_far/, 'nothing the session has seen');
+    assert.doesNotMatch(prompt, /Scout \(you\):\nDone\./, 'its own reply is not repeated');
+    assert.match(prompt, /<since_your_last_reply>[\s\S]*Person:\nAlso lunch Sat\?\n\nScout \(you\):\nBooked lunch \(from the cloud\)\.\n<\/since_your_last_reply>/);
+    assert.match(prompt, /<new_messages>\nPerson:\nThanks! And Sunday\?\n<\/new_messages>/);
+    assert.doesNotMatch(prompt, /Roster: nobody\./, 'unchanged steady context is not sent again');
+    assert.match(prompt, /\(The rest of your context is as in your last message here\.\)/);
+    assert.match(prompt, /\(Bot context, not from the person\.\)/, 'per-turn context still goes');
+    assert.equal(second.usage.mode, 'resume');
+  });
+
+  await test('kept session: a new summary (system prompt), a failure or a crash starts over', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-b') });
+    const sdk = sessionSdk();
+    const runLane = sdkRunner(sdk, { sessions });
+    const history = [row(1, 'user', 'hi')];
+    await runLane(sessionLane(history, [1]), sessionCtx());
+    // Compaction ran: the bot's system prompt (its summary) changed.
+    const next = [...history, { id: 'msg_1', seq: 2, role: 'assistant', text: 'Done.' }, row(3, 'user', 'again')];
+    const reset = await runLane(sessionLane(next, [3], { systemPrompt: 'You are Scout.\n\n## Summary\nThey said hi.' }), sessionCtx());
+    assert.equal(sdk.runs[1].options.resume, undefined, 'a new basis starts a new session');
+    assert.equal(reset.usage.reason, 'basis');
+    assert.match(textOf(sdk.runs[1].inputs[0]), /<conversation_so_far>/, 'seeded with the recent messages');
+
+    // A failed reply drops the session.
+    const failing = createFakeSdk(async function* ({ next }) {
+      await next();
+      yield { ...init(), session_id: 'sess-x' };
+      yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['boom'] };
+    });
+    await sdkRunner(failing, { sessions })(sessionLane(next, [3], { systemPrompt: 'You are Scout.\n\n## Summary\nThey said hi.' }), sessionCtx());
+    await runLane(sessionLane(next, [3], { systemPrompt: 'You are Scout.\n\n## Summary\nThey said hi.' }), sessionCtx());
+    assert.equal(sdk.runs[2].options.resume, undefined, 'nothing kept after a failure');
+    assert.equal(sessionSdkReason(sdk.runs[2]), 'fresh');
+
+    // A crash mid-reply (begin without end) leaves no session behind.
+    const crashDir = path.join(testRoot, 'sessions-crash');
+    const before = createBotSessionStore({ dir: crashDir });
+    await before.begin('bot_1');
+    await before.end('bot_1', { sessionId: 's', basis: 'b', seenSeqs: [], seenIds: [], contextKeys: [], contextTokens: 1 });
+    const crashed = createBotSessionStore({ dir: crashDir });
+    assert.equal((await crashed.begin('bot_1')).state?.sessionId, 's');
+    // ...the app dies here; on the next start:
+    const restarted = createBotSessionStore({ dir: crashDir });
+    assert.equal((await restarted.begin('bot_1')).state, null);
+  });
+
+  await test('kept session: a second reply at once gets its own unkept session; a broken resume retries fresh', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-c') });
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const sdk = createFakeSdk(async function* ({ next, options }) {
+      await next();
+      yield { ...init(), session_id: options.resume ?? 'sess-c' };
+      if (options.persistSession !== false) await gate;
+      yield assistant('a1', [{ type: 'text', text: 'ok' }]);
+      yield { ...success(), session_id: options.resume ?? 'sess-c', usage: { input_tokens: 1, output_tokens: 1 } };
+    });
+    const runLane = sdkRunner(sdk, { sessions });
+    const history = [row(1, 'user', 'long job'), row(2, 'user', 'quick: 2+2?')];
+    const first = runLane(sessionLane(history.slice(0, 1), [1]), sessionCtx());
+    await waitFor(() => sdk.runs.length === 1);
+    const second = await runLane(sessionLane(history, [2], { laneId: 'lane_2', replyMessageId: 'r2' }), sessionCtx());
+    assert.equal(second.text, 'ok');
+    assert.equal(sdk.runs[1].options.persistSession, false, 'the parallel reply is not kept');
+    assert.equal(second.usage.reason, 'busy');
+    assert.match(textOf(sdk.runs[1].inputs[0]), /<conversation_so_far>\nPerson:\nlong job/);
+    release();
+    await first;
+
+    // The kept session's file disappears (cleared by Claude Code): the resume fails, the reply retries fresh.
+    const broken = sessionSdk({ fail: (options) => Boolean(options.resume) });
+    const result = await sdkRunner(broken, { sessions })(
+      sessionLane([...history.slice(0, 1), { id: 'msg_1', seq: 3, role: 'assistant', text: 'ok' }, row(4, 'user', 'and now?')], [4], { laneId: 'lane_3' }),
+      sessionCtx()
+    );
+    assert.equal(broken.runs.length, 2, 'retried');
+    assert.equal(broken.runs[0].options.resume, 'sess-c');
+    assert.equal(broken.runs[1].options.resume, undefined);
+    assert.equal(result.text, 'Done.');
+    assert.equal(result.usage.reason, 'broken');
+    assert.match(textOf(broken.runs[1].inputs[0]), /<conversation_so_far>[\s\S]*long job/, 'the fresh one has the conversation');
+  });
+
+  await test('kept session: grows past the reset size → starts over and asks for compaction; inbox items count as seen', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-d') });
+    const big = sessionSdk({ window: 120_000 });
+    const runLane = sdkRunner(big, { sessions, sessionResetTokens: 100_000 });
+    const inbox = [{ seq: 2, source: 'person', label: null, content: 'and one more' }];
+    const first = await runLane(sessionLane([row(1, 'user', 'research this')], [1]), sessionCtx(inbox));
+    assert.equal(first.compact, true, 'a session past the reset size asks for compaction');
+    const second = await runLane(
+      sessionLane([row(1, 'user', 'research this'), row(2, 'user', 'and one more'), { id: 'msg_1', seq: 3, role: 'assistant', text: 'Done.' }, row(4, 'user', 'next')], [4]),
+      sessionCtx()
+    );
+    assert.equal(big.runs[1].options.resume, undefined, 'too large to resume');
+    assert.equal(second.usage.reason, 'size');
+    assert.equal(second.compact, true);
+
+    // Inbox items read mid-reply are seen: not repeated on resume.
+    const small = sessionSdk({ sessionId: 'sess-e' });
+    const sessionsE = createBotSessionStore({ dir: path.join(testRoot, 'sessions-e') });
+    const lane = sdkRunner(small, { sessions: sessionsE });
+    // The end-of-turn take delivers seq 2 into the session.
+    await lane(sessionLane([row(1, 'user', 'a')], [1]), sessionCtx([{ seq: 2, source: 'person', label: null, content: 'b' }]));
+    await lane(
+      sessionLane([row(1, 'user', 'a'), row(2, 'user', 'b'), { id: 'msg_1', seq: 3, role: 'assistant', text: 'Done.' }, row(4, 'user', 'c')], [4]),
+      sessionCtx()
+    );
+    assert.equal(small.runs[1].options.resume, 'sess-e');
+    assert.doesNotMatch(textOf(small.runs[1].inputs[0]), /since_your_last_reply/, 'b was read mid-reply');
+  });
+
+  await test('prompt size cap: oversized pastes are cut, the oldest messages left out, the new ones kept', async () => {
+    const paste = 'x'.repeat(400_000); // ~100K tokens
+    const history = [
+      ...Array.from({ length: 40 }, (_, index) => row(index + 1, index % 2 ? 'assistant' : 'user', `${index} ${'y'.repeat(20_000)}`)),
+      row(41, 'user', `Here is the log:\n${paste}`),
+    ];
+    const plan = planBotPrompt({ botName: 'Scout', session: { history, answering: [41], context: [] }, basis: 'b', maxPromptTokens: 60_000 });
+    assert.equal(plan.mode, 'fresh');
+    assert.ok(plan.estimatedTokens <= 60_000, `within the limit (${plan.estimatedTokens})`);
+    assert.ok(estimateTextTokens(plan.prompt) <= 62_000);
+    assert.ok(plan.omitted > 0 && plan.omitted % 8 === 0, 'left out in chunks');
+    assert.match(plan.prompt, /oldest messages after your summary were left out to fit the context window\. search_history finds them\./);
+    assert.match(plan.prompt, /characters omitted to fit the model's context window/, 'the paste was cut with a marker');
+    assert.match(plan.prompt, /<new_messages>\nPerson:\nHere is the log:/, 'the new message stays');
+    assert.equal(plan.compact, true, 'compaction fell behind');
+    assert.match(plan.prompt, /<conversation_so_far>\n\(Automatic note[\s\S]*\nPerson:\n/, 'the kept part starts with an incoming message');
+
+    // Under the limit: unchanged.
+    const small = planBotPrompt({ botName: 'Scout', session: { history: history.slice(0, 3), answering: [3], context: [] }, basis: 'b' });
+    assert.equal(small.omitted, 0);
+    assert.equal(small.shrunk, 0);
+    assert.equal(maxPromptTokensFromEnv({ DURANGO_BOT_MAX_PROMPT_TOKENS: '80000' }), 80_000);
+    assert.equal(maxPromptTokensFromEnv({ DURANGO_BOT_MAX_PROMPT_TOKENS: '5' }), 150_000);
+    assert.match(cutMiddle('a'.repeat(100), 5), /^a+\n\n\[… \d+ characters omitted/);
+
+    // An older Durango's single prompt is cut in the middle to the limit.
+    const sdk = sessionSdk();
+    await sdkRunner(sdk, { maxPromptTokens: 30_000 })(makeLane({ prompt: `START ${'z'.repeat(400_000)} END` }), sessionCtx());
+    const sent = textOf(sdk.runs[0].inputs[0]);
+    assert.ok(estimateTextTokens(sent) < 31_000);
+    assert.match(sent, /^START/);
+    assert.match(sent, /END$/);
+  });
+
+  await test('kept session: a resumed session that would pass the limit starts over, trimmed', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-f') });
+    const sdk = sessionSdk({ window: 50_000 });
+    const runLane = sdkRunner(sdk, { sessions, maxPromptTokens: 60_000 });
+    await runLane(sessionLane([row(1, 'user', 'hi')], [1]), sessionCtx());
+    // While away, the cloud answered a lot.
+    const away = Array.from({ length: 10 }, (_, index) => row(10 + index, index % 2 ? 'assistant' : 'user', 'w'.repeat(20_000)));
+    const result = await runLane(sessionLane([row(1, 'user', 'hi'), { id: 'msg_1', seq: 2, role: 'assistant', text: 'Done.' }, ...away, row(30, 'user', 'back')], [30]), sessionCtx());
+    assert.equal(sdk.runs[1].options.resume, undefined);
+    assert.equal(result.usage.reason, 'size');
+    assert.ok(estimateTextTokens(textOf(sdk.runs[1].inputs[0])) <= 60_000);
+  });
+
+  await test('kept session: one per bot and model, so routine runs on the cheap model do not reset the main one', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-g') });
+    let count = 0;
+    const sdk = createFakeSdk(async function* ({ next, options }) {
+      await next();
+      const id = options.resume ?? `sess-${(count += 1)}`;
+      yield { ...init(options.model), session_id: id };
+      yield assistant('a', [{ type: 'text', text: 'ok' }]);
+      yield { ...success(), session_id: id, usage: { input_tokens: 1, output_tokens: 1 } };
+    });
+    const runLane = sdkRunner(sdk, { sessions });
+    await runLane(sessionLane([row(1, 'user', 'hi')], [1], { model: 'claude-opus-5-5' }), sessionCtx());
+    await runLane(sessionLane([row(1, 'user', 'hi'), row(2, 'user', '[Routine: digest]\ngo')], [2], { model: 'claude-haiku-5-5', laneId: 'l2' }), sessionCtx());
+    await runLane(sessionLane([row(1, 'user', 'hi'), row(2, 'user', '[Routine: digest]\ngo'), row(3, 'user', 'thanks')], [3], { model: 'claude-opus-5-5', laneId: 'l3' }), sessionCtx());
+    assert.deepEqual(sdk.runs.map((run) => run.options.resume ?? null), [null, null, 'sess-1']);
+    assert.match(textOf(sdk.runs[2].inputs[0]), /<since_your_last_reply>[\s\S]*Routine: digest/);
+  });
+
+  await test('the claim asks for structured conversations; usage and compaction go back with the finish', async () => {
+    const client = createFakeClient({ claim: laneClaims([makeLane()]) });
+    startWorker({
+      client,
+      isOnline: () => true,
+      isAvailable: async () => true,
+      runLane: async () => ({ text: 'hi', usage: { mode: 'resume', input: 5, cacheRead: 100 }, compact: true }),
+    });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE]);
+    assert.deepEqual(client.calls.finish[0].usage, { mode: 'resume', input: 5, cacheRead: 100 });
+    assert.equal(client.calls.finish[0].compact, true);
+    const normalized = normalizeBotLane({ laneId: 'l', botId: 'b', session: { history: [], answering: [1], context: [] } });
+    assert.deepEqual(normalized.session, { history: [], answering: [1], context: [] });
   });
 } finally {
   await fs.rm(testRoot, { recursive: true, force: true });

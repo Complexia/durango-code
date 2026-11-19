@@ -86,7 +86,13 @@ import {
   isProjectAllowed,
   normalizeDispatchSettings,
 } from './main/durango-dispatch.js';
-import { createBotReplyWorker, createClaudeLaneRunner, createClaudeOneShot, normalizeBotSettings } from './main/bot-replies.js';
+import {
+  createBotReplyWorker,
+  createBotSessionStore,
+  createClaudeLaneRunner,
+  createClaudeOneShot,
+  normalizeBotSettings,
+} from './main/bot-replies.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { createBotThreadTools } from './main/bot-thread-tools.js';
 import {
@@ -4677,6 +4683,11 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
   createInputQueue: createClaudeInputQueue,
   botsDir: () => path.join(app.getPath('userData'), 'bots'),
   getProjects: botProjects,
+  // Each bot's Claude Code session, resumed by its next reply here (bot-sessions.js).
+  sessions: createBotSessionStore({
+    dir: () => path.join(app.getPath('userData'), 'bots', '.sessions'),
+    log: (...args) => console.warn('[bot sessions]', ...args),
+  }),
 });
 
 // A Durango Code thread a bot started in a project here (delegate_task

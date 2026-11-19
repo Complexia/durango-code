@@ -16,6 +16,7 @@ import {
   nextRunAfter,
 } from '../src/main/local-bots.js';
 import { createClaudeOneShot } from '../src/main/bot-replies.js';
+import { EARLIER_HISTORY_MAX_CHARS, SUMMARY_MAX_CHARS, memorySection, parseCompaction } from '../src/main/bot-memory.js';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-local-bots-'));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -156,7 +157,7 @@ test('a message while idle starts a reply; live progress and the stored reply', 
     run.lane.tools.map((tool) => tool.name).sort(),
     [
       'ask_user', 'create_bot', 'delegate_task', 'forget_project_note', 'manage_routine', 'message_bot', 'notify_user',
-      'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'update_bot',
+      'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'search_history', 'update_bot',
     ]
   );
 
@@ -845,7 +846,8 @@ test('compaction folds older messages into the summary', async () => {
   }
   assert.ok(calls.length >= 1, 'summarized');
   assert.equal(calls[0].model, 'claude-haiku-5-5');
-  assert.match(calls[0].systemPrompt, /long-term working summary/);
+  assert.match(calls[0].systemPrompt, /long-term memory/);
+  assert.match(calls[0].prompt, /<previous_earlier>\(none yet\)<\/previous_earlier>/);
   assert.match(calls[0].prompt, /<previous_summary>\(none yet\)<\/previous_summary>/);
   await engine.send(primary.id, { messageId: 'last', content: 'and now?' });
   await waitFor(() => runner.lanes.length === 13);
@@ -937,6 +939,130 @@ test('createClaudeOneShot: one turn, no tools, the result text', async () => {
     env: () => ({}),
   });
   await assert.rejects(failing({ model: 'm', systemPrompt: 's', prompt: 'p' }), /error_max_turns/);
+});
+
+
+test('summary chain: compaction keeps a condensed earlier history next to the latest summary', async () => {
+  // Pure parsing: tags, no tags (all summary, earlier kept), bounds.
+  assert.deepEqual(parseCompaction('<earlier>\n- Nov 2: chose Sato\n</earlier>\n<summary>\nOpen: book Friday.\n</summary>', null), {
+    earlier: '- Nov 2: chose Sato',
+    summary: 'Open: book Friday.',
+  });
+  assert.deepEqual(parseCompaction('Just a summary.', '- older line'), { earlier: '- older line', summary: 'Just a summary.' });
+  assert.deepEqual(parseCompaction('<earlier>(none yet)</earlier><summary>S</summary>', '- kept'), { earlier: '- kept', summary: 'S' });
+  assert.equal(parseCompaction('   ', null), null);
+  const long = parseCompaction(`<earlier>${'e'.repeat(20_000)}</earlier><summary>${'s'.repeat(50_000)}</summary>`, null);
+  assert.ok(long.earlier.length <= EARLIER_HISTORY_MAX_CHARS && long.summary.length <= SUMMARY_MAX_CHARS, 'bounded');
+  assert.equal(memorySection({ summary: null, earlier: 'x' }), null);
+
+  const calls = [];
+  const answers = [
+    '<earlier>\n- Nov 17: the person said hi a lot.\n</earlier>\n<summary>\nThe person likes long messages.\n</summary>',
+    '<earlier>\n- Nov 17: the person said hi a lot.\n- Nov 17: more long messages.\n</earlier>\n<summary>\nStill long messages.\n</summary>',
+  ];
+  const summarize = async (input) => {
+    calls.push(input);
+    return answers[Math.min(calls.length - 1, answers.length - 1)];
+  };
+  const { engine, runner } = makeEngine({ summarize });
+  const [primary] = (await engine.list()).bots;
+  let sent = 0;
+  const say = async (text) => {
+    await engine.send(primary.id, { messageId: `c${sent}`, content: text });
+    sent += 1;
+    await waitFor(() => runner.lanes.length === sent);
+    runner.lanes[sent - 1].finish({ text: `ok ${sent}` });
+    await engine.idle();
+  };
+  for (let index = 0; index < 12; index += 1) await say(`${index} ${'y'.repeat(16_000)}`);
+  assert.equal(calls.length, 1, 'one compaction so far');
+  for (let index = 0; index < 12 && calls.length < 2; index += 1) await say(`more ${index} ${'z'.repeat(16_000)}`);
+  assert.equal(calls.length, 2, 'compacted again');
+  assert.match(calls[1].prompt, /<previous_earlier>\n- Nov 17: the person said hi a lot\.\n<\/previous_earlier>/, 'the chain goes back in');
+  assert.match(calls[1].prompt, /<previous_summary>\nThe person likes long messages\.\n<\/previous_summary>/);
+  await engine.send(primary.id, { messageId: 'last', content: 'and now?' });
+  await waitFor(() => runner.lanes.length === sent + 1);
+  const { systemPrompt } = runner.lanes[sent].lane;
+  assert.match(systemPrompt, /### Earlier history \(condensed\)\n\n- Nov 17: the person said hi a lot\.\n- Nov 17: more long messages\.\n\n### Recent conversation\n\nStill long messages\./);
+  assert.match(systemPrompt, /search_history finds the older messages/);
+  runner.lanes[sent].finish({ text: 'fine' });
+  await engine.idle();
+  const exported = await engine.exportForSync();
+  assert.match(exported.bots[0].earlierSummary, /more long messages/, 'the chain is uploaded at sign-in');
+});
+
+test('search_history finds older messages by keywords and dates, newest first', async () => {
+  const { engine, runner, clock } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  const day = (iso) => Date.parse(iso);
+  const sends = [
+    ['2026-11-10T09:00:00', 'Flight to Tokyo is JL 772, seat 31A.'],
+    ['2026-11-12T09:00:00', 'Hotel in Tokyo: Park Hyatt, booking 99812.'],
+    ['2026-11-15T09:00:00', 'Remind me about the dentist.'],
+  ];
+  for (const [index, [at, text]] of sends.entries()) {
+    clock.now = day(at);
+    await engine.send(primary.id, { messageId: `s${index}`, content: text });
+    await waitFor(() => runner.lanes.length === index + 1);
+    runner.lanes[index].finish({ text: `Noted (${index}).` });
+    await engine.idle();
+  }
+  await engine.send(primary.id, { messageId: 'q', content: 'what was my seat?' });
+  await waitFor(() => runner.lanes.length === 4);
+  const call = (input) => runner.lanes[3].ctx.callTool({ name: 'search_history', input, toolCallId: 't' }).then((out) => out.result);
+  const tokyo = await call({ query: 'tokyo' });
+  assert.equal(tokyo.ok, true);
+  assert.deepEqual(tokyo.results.map((item) => item.snippet), ['Hotel in Tokyo: Park Hyatt, booking 99812.', 'Flight to Tokyo is JL 772, seat 31A.']);
+  assert.equal(tokyo.results[0].from, 'Person');
+  assert.equal(tokyo.results[1].at, new Date(day('2026-11-10T09:00:00')).toISOString());
+  assert.deepEqual((await call({ query: 'Tokyo seat' })).results.map((item) => item.seq), [1], 'every word must appear');
+  assert.deepEqual((await call({ query: 'tokyo', from: '2026-11-11' })).results.length, 1, 'from a date');
+  assert.deepEqual((await call({ query: 'tokyo', to: '2026-11-10' })).results.length, 1, 'to a date (the whole day)');
+  assert.match((await call({ query: 'noted' })).results[0].from, /\(you\)$/, 'its own replies too');
+  assert.match((await call({ query: 'kyoto' })).note, /Nothing matched/);
+  assert.equal((await call({ query: 'a' })).ok, false);
+  runner.lanes[3].finish({ text: '31A.' });
+  await engine.idle();
+});
+
+test('lanes carry the structured conversation; a reply asking for compaction forces one', async () => {
+  const calls = [];
+  const summarize = async (input) => {
+    calls.push(input);
+    return '<earlier>\n- e\n</earlier>\n<summary>\ns\n</summary>';
+  };
+  const { engine, runner } = makeEngine({ summarize });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'x1', content: 'first' });
+  await waitFor(() => runner.lanes.length === 1);
+  runner.lanes[0].finish({ text: 'one' });
+  await engine.idle();
+  await engine.send(primary.id, { messageId: 'x2', content: 'second', authorLabel: null });
+  await waitFor(() => runner.lanes.length === 2);
+  const { lane } = runner.lanes[1];
+  assert.equal(lane.replyMessageId, lane.laneId, "the reply's message id");
+  assert.deepEqual(lane.session.history.map((item) => [item.seq, item.role, item.text]), [[1, 'user', 'first'], [2, 'assistant', 'one'], [3, 'user', 'second']]);
+  assert.equal(lane.session.history[2].id, 'x2');
+  assert.deepEqual(lane.session.answering, [3]);
+  assert.ok(lane.session.context.some((part) => part.steady && /no other bots/.test(part.text)), 'steady parts are marked');
+  assert.ok(lane.session.context.some((part) => !part.steady && /This reply answers/.test(part.text)));
+  runner.lanes[1].finish({ text: 'two' });
+  await engine.idle();
+  assert.equal(calls.length, 0, 'far below the trigger: no compaction');
+
+  // ~30K tokens: under the normal trigger (40K), over the forced one (24K).
+  for (let index = 0; index < 8; index += 1) {
+    await engine.send(primary.id, { messageId: `y${index}`, content: 'w'.repeat(15_000) });
+    await waitFor(() => runner.lanes.length === 3 + index);
+    runner.lanes[2 + index].finish({ text: 'ok' });
+    await engine.idle();
+  }
+  assert.equal(calls.length, 0);
+  await engine.send(primary.id, { messageId: 'z', content: 'go' });
+  await waitFor(() => runner.lanes.length === 11);
+  runner.lanes[10].finish({ text: 'done', compact: true });
+  await engine.idle();
+  assert.equal(calls.length, 1, 'forced');
 });
 
 // --- run -------------------------------------------------------------------------------------

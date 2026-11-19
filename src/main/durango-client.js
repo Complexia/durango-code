@@ -434,6 +434,8 @@ export const normalizeBotLane = (lane) => {
     /** Appended to Claude Code's system prompt. */
     systemPrompt: str(lane.systemPrompt),
     prompt: str(lane.prompt),
+    /** The conversation, structured (bot-sessions.js normalizeLaneSession): the machine keeps a session per bot. */
+    ...(lane.session && typeof lane.session === 'object' ? { session: lane.session } : {}),
     tools,
     heartbeatMs: clampInt(lane.heartbeatMs, 2_000, 60_000, BOT_LANE_DEFAULT_HEARTBEAT_MS),
     /** Files attached in the conversation, with download links (saved for Claude Code). */
@@ -699,10 +701,17 @@ export const createDurangoClient = ({
     // --- Bot replies on this machine's Claude Code (bot-replies.js) -----------
     /** Long-poll for a bot reply to run here; `{ lane: null }` when none arrived. Polling marks this machine available. */
     /** `machine`: `{ name, projects: string[], models: string[] }`, this machine's bot presence. */
-    async claimBotLane({ machineId, platform, machine, ackStopTasks, waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
+    async claimBotLane({ machineId, platform, machine, ackStopTasks, features, waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
       const wait = clampInt(waitMs, 0, DISPATCH_CLAIM_WAIT_MS, DISPATCH_CLAIM_WAIT_MS);
       const data = await request('POST', '/code/bots/claim', {
-        body: { machineId, platform, ...(machine ? { machine } : {}), ...(ackStopTasks?.length ? { ackStopTasks } : {}), waitMs: wait },
+        body: {
+          machineId,
+          platform,
+          ...(machine ? { machine } : {}),
+          ...(ackStopTasks?.length ? { ackStopTasks } : {}),
+          ...(features?.length ? { features } : {}),
+          waitMs: wait,
+        },
         timeout: wait + (DISPATCH_CLAIM_TIMEOUT_MS - DISPATCH_CLAIM_WAIT_MS),
         signal,
       });
@@ -724,7 +733,7 @@ export const createDurangoClient = ({
       const data = await request('POST', botLanePath(laneId, 'tool'), { body, signal, timeout: BOT_TOOL_TIMEOUT_MS });
       return { result: data.result ?? null };
     },
-    /** `{ botId, machineId, text, modelId?, failure?, retryElsewhere? }` → `{ ok, stored }`. */
+    /** `{ botId, machineId, text, modelId?, failure?, retryElsewhere?, usage?, compact? }` → `{ ok, stored }`. */
     async finishBotLane({ laneId, signal, ...body } = {}) {
       const data = await request('POST', botLanePath(laneId, 'finish'), { body, signal });
       return { ok: data.ok !== false, stored: data.stored === true };
