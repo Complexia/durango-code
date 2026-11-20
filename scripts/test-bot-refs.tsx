@@ -68,11 +68,14 @@ let answer: { changes: Record<string, unknown>; threads: Record<string, unknown>
   },
 };
 
-const { MarkdownContent } = await import('../src/app/markdown');
+const { MarkdownContent, StreamingMarkdownContent } = await import('../src/app/markdown');
 const { listenForThreadLinks } = await import('../src/app/botRefLinks');
 const { requestBotRef, findBotRefs, threadForLink, botRefFromAnswer, botRefTiming, watchBotRef, readBotRef } = await import(
   '../src/app/botRefs'
 );
+
+// Batches go out sooner here than in the app (where an id still streaming in is replaced first).
+botRefTiming.batchDelayMs = 20;
 
 // Titles load in one batch.
 for (const id of [change, landed, missing]) requestBotRef('change', id);
@@ -81,7 +84,7 @@ await new Promise((resolve) => setTimeout(resolve, 80));
 assert.equal(asked.length, 1, 'one request for the batch');
 assert.deepEqual(asked[0].changes.sort(), [change, landed, missing].sort());
 
-const html = (content: string, botRefs = true) => renderToStaticMarkup(<MarkdownContent content={content} botRefs={botRefs} />);
+const html = (content: string, refLinks = true) => renderToStaticMarkup(<MarkdownContent content={content} refLinks={refLinks} />);
 
 const reply = html(
   [
@@ -103,6 +106,15 @@ assert.match(reply, new RegExp(`, ${unknownId}, `), 'an unknown bare id stays te
 assert.match(reply, /@thread:deadbeef-0000/);
 assert.match(reply, /<pre[\s\S]*chg_vydj323rliixemtqg74d/, 'code blocks are left alone');
 assert.equal(reply.match(/class="thread-reference/g)?.length, 4);
+
+// An agent's message in a normal thread (streamed or stored) gets the same links.
+const agent = renderToStaticMarkup(
+  <StreamingMarkdownContent content={`Done. Ship this in 1.0.219 with ${change} and ${missing}; details in ${here.id}.`} refLinks />
+);
+assert.match(agent, /class="thread-reference change-reference"[\s\S]*?<span>Bots: every bot on Opus 5.5<\/span>/);
+assert.match(agent, /<span>Fix sidebar dots<\/span>/);
+assert.match(agent, new RegExp(` and ${missing};`), 'an unknown change stays as written');
+assert.doesNotMatch(renderToStaticMarkup(<StreamingMarkdownContent content={`with ${change}`} />), /thread-reference/, 'off unless asked for');
 
 // Outside bot replies nothing changes: ids stay as written.
 const thread = html(`Opened \`${change}\` in ${elsewhereId}.`, false);
@@ -210,6 +222,48 @@ const afterUnwatch = lookups();
 await wait(200);
 assert.equal(lookups(), afterUnwatch, 'refs off screen are not asked again');
 console.log('bot ref revalidation tests passed');
+
+// An id still streaming in is replaced on screen before its batch goes out: only the whole id is asked for.
+const whole = 'chg_whndaj4mkfvhjum737mz';
+const before = asked.length;
+const unwatchPartial = watchBotRef('change', whole.slice(0, 14));
+unwatchPartial();
+const unwatchWhole = watchBotRef('change', whole);
+await wait(60);
+const sent = asked.slice(before).flatMap((input) => input.changes);
+assert.deepEqual(sent, [whole], 'the partial id is never asked for');
+unwatchWhole();
+console.log('streaming id tests passed');
+
+// Markdown links to a ref (`[name](@thread:<id>)`, `[name](chg_…)`) open it, in bot replies and agents' messages alike.
+const linked = renderToStaticMarkup(
+  <StreamingMarkdownContent content={`Open [the sidebar thread](@thread:${here.id}) and [the change](${change}); [docs](https://example.com) stay links.`} refLinks />
+);
+assert.match(linked, /<button[^>]*class="thread-reference"[^>]*>[\s\S]*?<span>Fix sidebar dots<\/span><\/button>/, 'a markdown link to @thread opens the thread');
+assert.match(linked, /class="thread-reference change-reference"[\s\S]*?<span>Bots: every bot on Opus 5.5<\/span>/, 'a markdown link to a change opens it');
+assert.match(linked, /<a href="https:\/\/example.com"/);
+assert.doesNotMatch(linked, /href=""/, 'no dead links');
+// An unknown thread in that form keeps its label as text.
+assert.match(html(`[Old thread](@thread:deadbeef-0000)`), />Old thread</);
+// `See:@thread:<id>` still links, as it did before agents' messages moved to this matcher.
+assert.match(html(`See:@thread:${here.id}`), /<span>Fix sidebar dots<\/span>/);
+assert.deepEqual(findBotRefs(`see:${change} x:${here.id}`), [], 'other refs after a colon stay text');
+console.log('markdown link ref tests passed');
+
+// A ref asked for outright is never dropped when a batch is full.
+{
+  const before = asked.length;
+  const many = Array.from({ length: 50 }, (_, index) => `chg_full${String(index).padStart(8, '0')}`);
+  const stops = many.map((id) => watchBotRef('change', id));
+  const extra = 'chg_explicit0000000000';
+  requestBotRef('change', extra);
+  await wait(120);
+  const sent = asked.slice(before).flatMap((input) => input.changes);
+  assert.ok(sent.includes(extra), 'sent in the next batch');
+  assert.equal(new Set(sent).size, 51, 'all 50 watched plus the one asked for');
+  for (const stop of stops) stop();
+  console.log('batch limit tests passed');
+}
 
 // orion://thread/<id> links (the web's thread links) name a thread id, nothing else.
 const { threadOpenLinkId } = await import('../src/main/thread-links.js');

@@ -546,18 +546,19 @@ export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink, pre: Ma
 const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences, remarkMediaPathPreviews];
 // For a message that shows its files itself (a bot reply's attachments): paths it names stay text.
 const markdownRemarkPluginsNoPathPreviews = [remarkGfm, remarkThreadReferences];
-// Bot replies: the changes and threads they name show as links with their titles (./botRefs.tsx).
+// Bot replies and agents' messages: the changes and threads they name show as
+// links with their titles (./botRefs.tsx).
 const botReplyRemarkPlugins = [remarkGfm, remarkBotRefs, remarkChatReferences, remarkMediaPathPreviews];
 const botReplyRemarkPluginsNoPathPreviews = [remarkGfm, remarkBotRefs, remarkChatReferences];
 const markdownRehypePlugins = [rehypeMarkdownTables];
 
 // The rendered blocks of one markdown document, without a container, so the
 // segments of a streaming message can share one `.markdown-content`.
-const MarkdownBlocks: React.FC<{ content: string; pathPreviews?: boolean; botRefs?: boolean }> = React.memo(({ content, pathPreviews = true, botRefs = false }) => (
+const MarkdownBlocks: React.FC<{ content: string; pathPreviews?: boolean; refLinks?: boolean }> = React.memo(({ content, pathPreviews = true, refLinks = false }) => (
   <MarkdownSourceContext.Provider value={content}>
     <ReactMarkdown
       remarkPlugins={
-        botRefs
+        refLinks
           ? pathPreviews
             ? botReplyRemarkPlugins
             : botReplyRemarkPluginsNoPathPreviews
@@ -574,10 +575,13 @@ const MarkdownBlocks: React.FC<{ content: string; pathPreviews?: boolean; botRef
   </MarkdownSourceContext.Provider>
 ));
 
-/** `botRefs`: a bot reply, whose change and thread ids show as links with their titles (./botRefs.tsx). */
-export const MarkdownContent: React.FC<{ content: string; pathPreviews?: boolean; botRefs?: boolean }> = React.memo(({ content, pathPreviews, botRefs = false }) => {
-  const blocks = <MarkdownBlocks content={content} pathPreviews={pathPreviews} botRefs={botRefs} />;
-  return <div className="markdown-content">{botRefs ? <BotRefsContext.Provider value>{blocks}</BotRefsContext.Provider> : blocks}</div>;
+/**
+ * `refLinks`: a bot reply or an agent's message, whose change and thread ids
+ * show as links with their titles (./botRefs.tsx).
+ */
+export const MarkdownContent: React.FC<{ content: string; pathPreviews?: boolean; refLinks?: boolean }> = React.memo(({ content, pathPreviews, refLinks = false }) => {
+  const blocks = <MarkdownBlocks content={content} pathPreviews={pathPreviews} refLinks={refLinks} />;
+  return <div className="markdown-content">{refLinks ? <BotRefsContext.Provider value>{blocks}</BotRefsContext.Provider> : blocks}</div>;
 });
 
 // How large the live (re-parsed every render) tail of a streaming message may
@@ -636,8 +640,9 @@ type FrozenMarkdown = { segments: string[]; joined: string };
  * native memory (the cause of the runaway-memory crashes on long threads).
  * This wrapper freezes the already-streamed prefix into memoized segments at
  * safe block boundaries, so each update re-parses only a small live tail.
+ * `refLinks` as on MarkdownContent (agents' messages).
  */
-export const StreamingMarkdownContent: React.FC<{ content: string }> = React.memo(({ content }) => {
+export const StreamingMarkdownContent: React.FC<{ content: string; refLinks?: boolean }> = React.memo(({ content, refLinks = false }) => {
   const frozenRef = useRef<FrozenMarkdown>({ segments: [], joined: '' });
   let frozen = frozenRef.current;
   // Anything but a pure append (a different message's text after a key reuse,
@@ -664,12 +669,13 @@ export const StreamingMarkdownContent: React.FC<{ content: string }> = React.mem
   // margin (`.markdown-content > :first-child` would zero it in a container of
   // its own) and margins between segments collapse as usual.
   if (!frozen.segments.length && !tail.trim()) return null;
-  return (
-    <div className="markdown-content">
+  const blocks = (
+    <>
       {frozen.segments.map((segment, index) => (
-        <MarkdownBlocks key={index} content={segment} />
+        <MarkdownBlocks key={index} content={segment} refLinks={refLinks} />
       ))}
-      {tail.trim() ? <MarkdownBlocks content={tail} /> : null}
-    </div>
+      {tail.trim() ? <MarkdownBlocks content={tail} refLinks={refLinks} /> : null}
+    </>
   );
+  return <div className="markdown-content">{refLinks ? <BotRefsContext.Provider value>{blocks}</BotRefsContext.Provider> : blocks}</div>;
 });

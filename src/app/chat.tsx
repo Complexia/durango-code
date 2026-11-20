@@ -514,7 +514,7 @@ const AgentRunPart = React.memo(function AgentRunPart({
         ) : segment.kind === 'btw' ? (
           <React.Fragment key={`btw-${segment.exchange.id}`}>{renderBtwAside?.(segment.exchange)}</React.Fragment>
         ) : segment.text.trim() ? (
-          <StreamingMarkdownContent key={`text-${index}`} content={segment.text} />
+          <StreamingMarkdownContent key={`text-${index}`} content={segment.text} refLinks />
         ) : null
       )}
       {thinking && !lastSegment && <ThinkingRow />}
@@ -645,7 +645,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   return (
     <div className={`message ${message.role}${message.role === 'user' && message.steer ? ' steered' : ''}`}>
       {message.role === 'agent' ? (
-        <StreamingMarkdownContent content={message.content} />
+        <StreamingMarkdownContent content={message.content} refLinks />
       ) : (
         <>
           {messageTasks.map((messageTask) => {
@@ -1421,7 +1421,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
         )}
         {exchange.answer && (
           <div className="btw-aside-answer">
-            <StreamingMarkdownContent content={exchange.answer} />
+            <StreamingMarkdownContent content={exchange.answer} refLinks />
           </div>
         )}
         {exchange.status === 'error' &&

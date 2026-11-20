@@ -4,9 +4,10 @@ import { toast } from 'sonner';
 import { type Thread, useOrionStore } from '../store';
 import { resolveThreadReference } from './promptContext';
 
-// Changes and threads in bot replies, shown as links with their titles.
-// Bots write a Durango Source change as its id (`chg_…`) and a Durango Code
-// thread as `@thread:<id>` or its bare id; in a bot reply each becomes a chip
+// Changes and threads in bot replies and agents' thread messages, shown as
+// links with their titles. Bots and agents write a Durango Source change as
+// its id (`chg_…`) and a Durango Code thread as `@thread:<id>` or its bare id;
+// in their messages (MarkdownContent / StreamingMarkdownContent `refLinks`) each becomes a chip
 // with the title: a thread this computer has (also another machine's,
 // mirrored here) opens in the usual thread view, a change opens its page.
 // Titles of changes, and of threads that live on another computer, come from
@@ -31,13 +32,14 @@ export const BotRefsContext = createContext(false);
 
 /**
  * `@thread:<id>`, a change id, or a bare UUID (thread ids are UUIDs), standing
- * alone as a whole token: not inside a path (`/` or `\`), URL, file name
+ * alone as a whole token (`See:@thread:<id>` counts, as it always did for
+ * @thread): not inside a path (`/` or `\`), URL, file name
  * (`chg_….md`) or longer word, and never part of one. A bare UUID only
  * becomes a link when it is a thread. In bot replies this is the only matcher
  * for `@thread:` (markdown.tsx runs the older plugin for `@chat:` only there).
  */
 const REF_PATTERN =
-  /(?<![\w./\\:@-])(?:@thread:([A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)|(chg_[a-z0-9]{8,40})|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}))(?![\w/\\-]|\.\w)/g;
+  /(?:(?<![A-Za-z0-9._/\\-])@thread:([A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)|(?<![\w./\\:@-])(chg_[a-z0-9]{8,40})|(?<![\w./\\:@-])([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}))(?![\w/\\-]|\.\w)/g;
 
 export const findBotRefs = (text: string): BotRefMatch[] => {
   if (!text.includes('@thread:') && !text.includes('chg_') && !text.includes('-')) return [];
@@ -92,6 +94,13 @@ const linkRefs = (node: MdNode) => {
       if (last < child.value.length) out.push({ type: 'text', value: child.value.slice(last) });
       return out;
     }
+    if (child.type === 'link' && child.url) {
+      // A markdown link to a ref, `[name](@thread:<id>)` or `[name](chg_…)`: react-markdown
+      // would drop that target (not a URL), leaving text you can't click. It keeps its label.
+      const refs = findBotRefs(child.url.trim());
+      if (refs.length === 1 && refs[0].text === child.url.trim()) return [{ ...child, url: refHref(refs[0]) }];
+      return [child];
+    }
     if (child.type === 'inlineCode' && child.value) {
       // Only a code span that is exactly one ref.
       const value = child.value.trim();
@@ -114,7 +123,9 @@ export const botRefTiming = {
   foundTtlMs: 10 * 60_000,
   // Not found (yet: a thread that hasn't synced), signed out, or the lookup failed.
   missingTtlMs: 2 * 60_000,
-  batchDelayMs: 30,
+  // Long enough that an id still streaming in (`chg_abcd…`) is replaced on
+  // screen before its batch goes out, so it is never asked for (flush).
+  batchDelayMs: 120,
   // At most one revalidation round this often, whatever expires.
   minRevalidateDelayMs: 5_000,
 };
@@ -122,6 +133,8 @@ export const botRefTiming = {
 const entries = new Map<string, Entry>();
 const queued = new Set<string>();
 const inFlight = new Set<string>();
+/** Refs asked for outright (requestBotRef), not by a link on screen. */
+const requested = new Set<string>();
 const listeners = new Set<() => void>();
 /** Refs on screen (key → mounted links), asked again when their title expires. */
 const active = new Map<string, number>();
@@ -145,11 +158,15 @@ export const clearBotRefs = () => {
   entries.clear();
   queued.clear();
   inFlight.clear();
+  requested.clear();
   notify();
 };
 
 /** Asks Durango for a ref's title (batched with the others asked for now). */
-export const requestBotRef = (kind: BotRefKind, id: string) => request(`${kind}:${id}`);
+export const requestBotRef = (kind: BotRefKind, id: string) => {
+  requested.add(`${kind}:${id}`);
+  request(`${kind}:${id}`);
+};
 
 const request = (key: string) => {
   const entry = entries.get(key);
@@ -172,10 +189,17 @@ const flush = async () => {
   timer = null;
   const ask = { change: [] as string[], thread: [] as string[] };
   for (const key of queued) {
+    // No longer on screen (an id that was still streaming in, a message scrolled away): not asked for.
+    if (!active.has(key) && !requested.has(key)) {
+      queued.delete(key);
+      continue;
+    }
     const [kind, id] = [key.slice(0, 6), key.slice(7)] as [BotRefKind, string];
+    // Past REFS_MAX it waits for the next batch (still marked if it was asked for outright).
     if (ask[kind].length < REFS_MAX) {
       ask[kind].push(id);
       queued.delete(key);
+      requested.delete(key);
       inFlight.add(key);
     }
   }
