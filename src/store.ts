@@ -407,6 +407,12 @@ export type AgentActivity = {
   /** Provider tool kind (execute/edit/read/search/fetch/task/plan) for iconography. */
   kind?: string;
   title: string;
+  /**
+   * The tool a tool step calls, as the provider names it (`Bash`,
+   * `mcp__orion__wait_for_background_tasks`, Codex's `orion.machine_run_agent`):
+   * read by code that acts on which tool runs, so it doesn't parse `title`.
+   */
+  toolName?: string;
   detail?: string;
   /** Transient IPC-only append. It is folded into detail before persistence. */
   detailDelta?: string;

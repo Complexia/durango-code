@@ -1,4 +1,4 @@
-import type { Message, Thread } from '../store';
+import type { AgentActivity, Message, Thread } from '../store';
 
 // Renderer side of Durango Chat dispatch (main: src/main/durango-dispatch.js).
 
@@ -57,6 +57,29 @@ const dispatchRunPositions = (runs: Message[], offset: number) => {
   while (runs[positions.length + offset]?.continuation) positions.push(positions.length + offset);
   return positions;
 };
+
+/**
+ * The run a running dispatched thread is on for whoever dispatched it: the
+ * dispatched run or a turn it resumed by itself, possibly ended while the
+ * thread waits on background work it started, with its position among the
+ * thread's runs (its reports' sequence numbers come from it). Null when the
+ * thread isn't running or a turn the person started took over (that work is
+ * theirs).
+ */
+export const durangoDispatchLiveRunAt = (
+  thread: Pick<Thread, 'status' | 'durangoDispatch'>,
+  messages: Message[]
+): { run: Message; position: number } | null => {
+  const dispatch = thread.durangoDispatch;
+  if (!dispatch || thread.status !== 'running') return null;
+  const runs = messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run');
+  const positions = dispatchRunPositions(runs, dispatch.runOffset ?? 0);
+  const last = positions[positions.length - 1];
+  return last !== undefined && last === runs.length - 1 ? { run: runs[last], position: last } : null;
+};
+
+export const durangoDispatchLiveRun = (thread: Pick<Thread, 'status' | 'durangoDispatch'>, messages: Message[]): Message | null =>
+  durangoDispatchLiveRunAt(thread, messages)?.run ?? null;
 
 /**
  * Whether `durangoDispatch` may have a report left to send (cheap: from the
@@ -348,6 +371,410 @@ export const startDurangoDispatchReporter = ({
   return () => {
     stopped = true;
     unsubscribe();
+    for (const timer of timers) clearTimer(timer);
+    timers.clear();
+  };
+};
+
+// While a thread a bot dispatched still runs, tell the bot when it can't go on
+// without the person (a permission prompt, a question, an action only they can
+// take) and when it has gone quiet with nothing of its own to wait on. Reports
+// (app/durangoDispatch.ts) only go out when a turn ends, so without this a
+// blocked thread looks exactly like a working one to its bot.
+//
+// A notice leaves this machine (Durango stores it in the bot's inbox), so it
+// says what kind of thing is waiting and never carries the call itself: no
+// tool arguments, no approval card details (Claude resolves secret refs into
+// a call's input before it asks, so the card can hold a credential).
+
+/** Quiet this long, with nothing it started to wait on, and the thread "looks stuck". */
+export const DISPATCH_STUCK_AFTER_MS = 15 * 60_000;
+const CHECK_EVERY_MS = 60_000;
+const RETRY_MS = 60_000;
+const DETAIL_MAX_CHARS = 1_500;
+const REASON_MAX_CHARS = 300;
+
+/** A pending question or approval card (CodexQuestionRequest's shape, as main lists it). */
+export type PendingInputRequest = {
+  requestId: string | number;
+  /** The agent run that asked (main's run id). */
+  runId?: string;
+  /** Answered with an ordinary message later; the thread doesn't wait on it. */
+  async?: boolean;
+  detail?: string;
+  approval?: {
+    toolName?: string;
+    /** Why the agent's harness asked (Claude Code's decision reason). */
+    reason?: string;
+    command?: string;
+    path?: string;
+    url?: string;
+    input?: string;
+    purpose?: string;
+    title?: string;
+  };
+  questions: Array<{ id?: string; header: string; question: string; options?: Array<{ label: string }> | null }>;
+};
+
+export type DispatchNoticeInput = {
+  dispatchId: string;
+  threadId: string;
+  kind: 'input' | 'stuck';
+  /** One notice per key and dispatch. */
+  key: string;
+  /**
+   * The sequence number the live run's final report will carry
+   * (dispatchReportSeq): Durango drops a notice for a run it already has
+   * that report for, so a notice that arrives late never contradicts it.
+   */
+  seq: number;
+  detail: string;
+};
+
+type NoticesState = {
+  threads: Thread[];
+  transcripts: Record<string, { messages: Message[] } | undefined>;
+};
+
+export type DurangoDispatchNoticesDeps = {
+  getState: () => NoticesState;
+  subscribe: (listener: (state: NoticesState, previous: NoticesState) => void) => () => void;
+  /** Agent turn events (window.orion.onAgentTurnEvent): any of them but `user-input` is progress. */
+  onTurnEvent: (listener: (event: { threadId?: string; type: string }) => void) => (() => void) | undefined;
+  /** The questions and approvals waiting on the person in this thread (main's pending lists). */
+  pendingInput: (threadId: string) => Promise<PendingInputRequest[]>;
+  /** The run message a main run id writes to, when known: a request from another run isn't this run's. */
+  runMessageId?: (runId: string) => string | undefined;
+  /** Main's durango:dispatchNotice: `{ retry: true }` (or a throw) = not delivered. */
+  notice: (input: DispatchNoticeInput) => Promise<unknown> | unknown;
+  now?: () => number;
+  setTimer?: (callback: () => void, ms: number) => unknown;
+  clearTimer?: (timer: unknown) => void;
+  stuckAfterMs?: number;
+  checkEveryMs?: number;
+};
+
+const clipNotice = (text: string, max: number) => {
+  const value = text.trim();
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+};
+
+const isApproval = (request: PendingInputRequest) =>
+  Boolean(request.approval) || (request.questions.length === 1 && request.questions[0]?.id === 'permission');
+
+/** Pieces of a call's input long enough to matter (a path, a token, an argument). */
+const inputPieces = (request: PendingInputRequest) => {
+  const approval = request.approval ?? {};
+  const texts = [approval.command, approval.path, approval.url, approval.input];
+  const pieces = new Set<string>();
+  for (const text of texts) {
+    if (typeof text !== 'string') continue;
+    for (const piece of text.split(/[\s"'`=:,;()[\]{}<>|&]+/)) if (piece.length >= 6) pieces.add(piece);
+  }
+  return pieces;
+};
+
+/**
+ * Why the harness asked, when that is safe to send: one line of its own words
+ * that repeats nothing from the call (Claude Code's safety reasons are fixed
+ * sentences; one that quotes the command, a path or a value is left out).
+ */
+export const safeApprovalReason = (request: PendingInputRequest) => {
+  const reason = (request.approval?.reason ?? '').replace(/\s+/g, ' ').trim();
+  if (!reason || reason.length > REASON_MAX_CHARS) return '';
+  for (const piece of inputPieces(request)) if (reason.includes(piece)) return '';
+  return reason;
+};
+
+/** A tool's name for the bot: `Bash`, `machine_run_agent` (an MCP tool by its own name). */
+const plainToolName = (name: string) => name.trim().split('__').pop()?.split('.').pop()?.trim() || '';
+
+/** What a pending card asks of the person, for the bot to pass on. Never the call itself (see above). */
+export const pendingInputText = (request: PendingInputRequest) => {
+  if (isApproval(request)) {
+    const tool = plainToolName(request.approval?.toolName || request.questions[0]?.header || '') || 'a tool';
+    const reason = safeApprovalReason(request);
+    return clipNotice(
+      [
+        `It is waiting for the person to approve a ${tool} call in the thread (what the call does is shown there, not here).`,
+        reason ? `Why it asked: ${reason}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      DETAIL_MAX_CHARS
+    );
+  }
+  const lines = request.questions.map((question) => {
+    const options = (question.options ?? []).map((option) => option.label).filter(Boolean);
+    return `- ${question.question}${options.length ? ` (options: ${options.join(' / ')})` : ''}`;
+  });
+  return clipNotice(`It asked the person:\n${lines.join('\n')}`, DETAIL_MAX_CHARS);
+};
+
+/** request_user_action: what the agent asked the person to do, and the page (no query string or fragment). */
+export const userActionText = (action: { action: string; url?: string }) => {
+  let page = '';
+  if (action.url) {
+    try {
+      const url = new URL(action.url);
+      if (url.protocol === 'https:' || url.protocol === 'http:') page = `${url.origin}${url.pathname === '/' ? '' : url.pathname}`;
+    } catch {
+      page = '';
+    }
+  }
+  return clipNotice(`It asked the person to: ${action.action}${page ? `\n${page}` : ''}`, DETAIL_MAX_CHARS);
+};
+
+// Tools an agent waits on by its own choice: a background wait it set up, a
+// subagent, a monitor. A quiet thread inside one of them isn't stuck.
+const SELF_WAIT_TOOLS = new Set([
+  'wait_for_background_tasks',
+  'Monitor',
+  'TaskOutput',
+  'Agent',
+  'Task',
+  'spawn_subagent',
+  'machine_run_agent',
+  'browser_wait_for',
+  'ScheduleWakeup',
+]);
+
+/**
+ * The tool a step runs: its `toolName` (set by the drivers), else read from
+ * the title of older steps, Claude's `Tool - mcp__orion__x` and Codex's
+ * `Tool - orion.x` alike.
+ */
+export const activityToolName = (activity: Pick<AgentActivity, 'title' | 'toolName'>) =>
+  plainToolName(activity.toolName || activity.title.replace(/^Tool - /, ''));
+
+/**
+ * Whether a quiet run is waiting on something it started itself: its turn
+ * ended while the thread stays Working on background tasks or agents it
+ * started, or the step in progress is one of those waits.
+ */
+export const runWaitsOnItself = (run: Message) => {
+  if (run.status !== 'running') return true;
+  return (run.activities ?? []).some(
+    (activity) =>
+      activity.status === 'running' &&
+      (activity.kind === 'task' || (activity.type === 'tool' && SELF_WAIT_TOOLS.has(activityToolName(activity))))
+  );
+};
+
+/** When the run last showed progress, from the transcript alone. */
+const runProgressAt = (run: Message) => {
+  let latest = Date.parse(run.startedAt ?? run.ts) || 0;
+  for (const activity of run.activities ?? []) latest = Math.max(latest, Date.parse(activity.ts) || 0);
+  return latest;
+};
+
+// What a stuck notice says about the step in progress: its kind and tool,
+// never its arguments or output.
+const stepText = (activity: AgentActivity) => {
+  if (activity.type === 'command') return 'a shell command';
+  const tool = activityToolName(activity);
+  return tool ? `the ${tool} tool` : 'a tool call';
+};
+
+const stuckText = (run: Message, quietMs: number) => {
+  const minutes = Math.round(quietMs / 60_000);
+  const step = [...(run.activities ?? [])].reverse().find((activity) => activity.status === 'running');
+  // Its own words so far, as its report would carry them.
+  const words = run.content.trim();
+  return clipNotice(
+    [
+      `No progress for ${minutes} minutes.`,
+      step ? `The step in progress: ${stepText(step)} (what it runs is in the thread).` : 'No step is running: it is waiting on the model.',
+      words ? `Its last words so far: ${words.length > 400 ? `…${words.slice(-400).trimStart()}` : words}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    DETAIL_MAX_CHARS
+  );
+};
+
+export const startDurangoDispatchNotices = ({
+  getState,
+  subscribe,
+  onTurnEvent,
+  pendingInput,
+  runMessageId,
+  notice,
+  now = () => Date.now(),
+  setTimer = (callback, ms) => setTimeout(callback, ms),
+  clearTimer = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
+  stuckAfterMs = DISPATCH_STUCK_AFTER_MS,
+  checkEveryMs = CHECK_EVERY_MS,
+}: DurangoDispatchNoticesDeps) => {
+  const startedAt = now();
+  // Latest turn event per thread: the transcript keeps no timestamp for streamed text.
+  const progressAt = new Map<string, number>();
+  const sent = new Set<string>();
+  // A pending-list read per thread at a time; a change while one is out reads again after it.
+  const reading = new Set<string>();
+  const readAgain = new Set<string>();
+  // Threads last seen waiting on a card: they need the person, not a "looks stuck".
+  const waitingOnPerson = new Set<string>();
+  const timers = new Set<unknown>();
+  let tick: unknown = null;
+  let stopped = false;
+
+  const later = (callback: () => void, ms: number) => {
+    const timer = setTimer(() => {
+      timers.delete(timer);
+      if (!stopped) callback();
+    }, ms);
+    timers.add(timer);
+    return timer;
+  };
+
+  type Live = { thread: Thread; run: Message; position: number };
+  const liveOf = (thread: Thread, transcripts: NoticesState['transcripts']): Live | null => {
+    if (!thread.durangoDispatch || thread.status !== 'running') return null;
+    const messages = transcripts[thread.id]?.messages;
+    const live = messages ? durangoDispatchLiveRunAt(thread, messages) : null;
+    return live ? { thread, ...live } : null;
+  };
+  /** Running threads a dispatch is still working for, with that run. */
+  const liveThreads = () => {
+    const { threads, transcripts } = getState();
+    const live: Live[] = [];
+    for (const thread of threads) {
+      const found = liveOf(thread, transcripts);
+      if (found) live.push(found);
+    }
+    return live;
+  };
+  const liveThread = (threadId: string) => {
+    const { threads, transcripts } = getState();
+    const thread = threads.find((candidate) => candidate.id === threadId);
+    return thread ? liveOf(thread, transcripts) : null;
+  };
+  const sameRun = (a: Live | null, b: Live | null) =>
+    Boolean(a && b && a.thread.durangoDispatch?.id === b.thread.durangoDispatch?.id && a.run.id === b.run.id);
+
+  const send = (live: Live, kind: DispatchNoticeInput['kind'], key: string, detail: string) => {
+    const dispatchId = live.thread.durangoDispatch?.id;
+    if (!dispatchId) return;
+    const id = `${dispatchId}\n${key}`;
+    if (sent.has(id)) return;
+    sent.add(id);
+    const threadId = live.thread.id;
+    let result: unknown;
+    try {
+      result = notice({ dispatchId, threadId, kind, key, seq: dispatchReportSeq(live.position, false), detail });
+    } catch (error) {
+      result = Promise.reject(error);
+    }
+    void Promise.resolve(result)
+      .then(
+        (value) => (value as { retry?: boolean } | undefined)?.retry !== true,
+        () => false
+      )
+      .then((delivered) => {
+        if (delivered) return;
+        // Not delivered: look again later and send it only if it still holds
+        // (the request may have been answered, the run may have ended).
+        later(() => {
+          sent.delete(id);
+          const current = liveThread(threadId);
+          if (current) checkThread(current);
+        }, RETRY_MS);
+      });
+  };
+
+  // Actions the agent asked the person for (request_user_action) while it runs.
+  const checkUserActions = (live: Live) => {
+    for (const action of live.thread.userActions ?? []) send(live, 'input', `action:${action.id}`, userActionText(action));
+  };
+
+  const checkStuck = (live: Live) => {
+    const { thread, run } = live;
+    if (waitingOnPerson.has(thread.id) || (thread.userActions?.length ?? 0) > 0 || runWaitsOnItself(run)) return;
+    const last = Math.max(progressAt.get(thread.id) ?? startedAt, runProgressAt(run));
+    const quiet = now() - last;
+    if (quiet < stuckAfterMs) return;
+    // Once per quiet stretch: progress after it starts a new one.
+    send(live, 'stuck', `stuck:${run.id}:${last}`, stuckText(run, quiet));
+  };
+
+  // Questions and approvals live in main: read them for this thread, then
+  // (with what is waiting on the person now known) look for "stuck".
+  const checkPendingInput = (threadId: string) => {
+    if (reading.has(threadId)) {
+      readAgain.add(threadId);
+      return;
+    }
+    const before = liveThread(threadId);
+    if (!before) return;
+    reading.add(threadId);
+    void Promise.resolve()
+      .then(() => pendingInput(threadId))
+      .then(
+        (requests) => {
+          if (stopped) return;
+          // Only while the same dispatched run is still the live one.
+          const live = liveThread(threadId);
+          if (!live || !sameRun(before, live)) return;
+          const blocking = requests.filter((request) => !request.async);
+          if (blocking.length) waitingOnPerson.add(threadId);
+          else waitingOnPerson.delete(threadId);
+          for (const request of blocking) {
+            const owner = request.runId && runMessageId ? runMessageId(request.runId) : undefined;
+            if (owner !== undefined && owner !== live.run.id) continue;
+            send(live, 'input', `input:${request.requestId}`, pendingInputText(request));
+          }
+          checkStuck(live);
+        },
+        () => undefined
+      )
+      .finally(() => {
+        reading.delete(threadId);
+        if (readAgain.delete(threadId) && !stopped) checkPendingInput(threadId);
+      });
+  };
+
+  const checkThread = (live: Live) => {
+    checkUserActions(live);
+    checkPendingInput(live.thread.id);
+  };
+
+  const checkAll = () => {
+    if (stopped) return;
+    for (const live of liveThreads()) checkThread(live);
+  };
+
+  // The periodic look runs only while some dispatched thread is working.
+  const schedule = () => {
+    if (tick !== null || stopped || liveThreads().length === 0) return;
+    tick = later(() => {
+      tick = null;
+      checkAll();
+      schedule();
+    }, checkEveryMs);
+  };
+
+  const unsubscribeEvents = onTurnEvent((event) => {
+    if (stopped || !event.threadId) return;
+    if (event.type !== 'user-input' && event.type !== 'prompt-suggestion') progressAt.set(event.threadId, now());
+    if (event.type !== 'user-input') return;
+    if (liveThread(event.threadId)) checkPendingInput(event.threadId);
+  });
+  const unsubscribeState = subscribe((state, previous) => {
+    if (stopped || state.threads === previous.threads) return;
+    const before = new Map(previous.threads.map((thread) => [thread.id, thread]));
+    for (const live of liveThreads()) {
+      if (before.get(live.thread.id)?.userActions !== live.thread.userActions) checkUserActions(live);
+    }
+    schedule();
+  });
+  checkAll();
+  schedule();
+
+  return () => {
+    stopped = true;
+    unsubscribeEvents?.();
+    unsubscribeState();
     for (const timer of timers) clearTimer(timer);
     timers.clear();
   };

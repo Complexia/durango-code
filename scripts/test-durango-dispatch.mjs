@@ -32,7 +32,30 @@ import {
 } from '../src/main/durango-dispatch.js';
 import { checkoutFolderName, chooseCheckoutDir, cliSupportsClone, createSourceCheckout, sourceCheckoutRoot } from '../src/main/source-checkout.js';
 import { linuxPasswordStore } from '../src/main/linux-password-store-policy.js';
-import { durangoDispatchHasNewRuns, durangoDispatchOutcome, dispatchSummaryText, startDurangoDispatchReporter } from '../src/app/durangoDispatch.ts';
+import {
+  DISPATCH_STUCK_AFTER_MS,
+  activityToolName,
+  durangoDispatchHasNewRuns,
+  durangoDispatchLiveRun,
+  durangoDispatchLiveRunAt,
+  durangoDispatchOutcome,
+  dispatchSummaryText,
+  pendingInputText,
+  runWaitsOnItself,
+  safeApprovalReason,
+  startDurangoDispatchNotices,
+  startDurangoDispatchReporter,
+  userActionText,
+} from '../src/app/durangoDispatch.ts';
+// stream-adapters.js as a plain Node module (its one Electron import is a seam):
+// the Claude driver builds a run's steps with it.
+const { extractActivitiesFromJsonEvent } = await import(
+  `data:text/javascript;base64,${Buffer.from(
+    (await fs.readFile(new URL('../src/main/stream-adapters.js', import.meta.url), 'utf8'))
+      .replace("import { shell } from 'electron';", 'const shell = {};')
+      .replace("import path from 'node:path';", "import path from 'node:path';")
+  ).toString('base64')}`
+);
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-durango-dispatch-'));
 
@@ -1210,6 +1233,358 @@ try {
     assert.match(quiet.sent[0].summary, /^The background work it was waiting on has ended/);
     assert.equal(quiet.state.threads[0].durangoDispatch.reportedSeq, 2);
     quiet.stop();
+  });
+
+  // --- Notices: a running bot thread that needs the person or looks stuck -----
+  const noticesWorld = ({ pending = async () => [], notice = () => ({ ok: true }), runMessageId } = {}) => {
+    let state = { threads: [], transcripts: {} };
+    const listeners = new Set();
+    const eventListeners = new Set();
+    let clock = 1_000_000;
+    const timers = [];
+    const sent = [];
+    const set = (patch) => {
+      const previous = state;
+      state = { ...state, ...patch };
+      for (const listener of [...listeners]) listener(state, previous);
+    };
+    const stop = startDurangoDispatchNotices({
+      getState: () => state,
+      subscribe: (listener) => (listeners.add(listener), () => listeners.delete(listener)),
+      onTurnEvent: (listener) => (eventListeners.add(listener), () => eventListeners.delete(listener)),
+      pendingInput: (threadId) => pending(threadId),
+      ...(runMessageId ? { runMessageId } : {}),
+      notice: (input) => {
+        sent.push(input);
+        return notice(input);
+      },
+      setTimer: (callback, ms) => {
+        const timer = { at: clock + ms, callback };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => timers.splice(timers.indexOf(timer), 1),
+      now: () => clock,
+    });
+    const flush = async () => {
+      for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+    const tick = async (ms) => {
+      const until = clock + ms;
+      for (;;) {
+        const due = timers.filter((t) => t.at <= until).sort((a, b) => a.at - b.at)[0];
+        if (!due) break;
+        timers.splice(timers.indexOf(due), 1);
+        clock = due.at;
+        due.callback();
+        await flush();
+      }
+      clock = until;
+      await flush();
+    };
+    const emit = async (event) => {
+      for (const listener of [...eventListeners]) listener(event);
+      await flush();
+    };
+    return { get state() { return state; }, set, sent, tick, emit, stop, flush, get clock() { return clock; } };
+  };
+  const botThread = (fields = {}) => ({
+    id: 't1', status: 'running', summary: { agentRunCount: 1 },
+    durangoDispatch: { id: 'bottask:task1', sourceUrl: null, startedAt: 'x' }, ...fields,
+  });
+  const iso = (ms) => new Date(ms).toISOString();
+  const deferred = () => {
+    let resolve;
+    const promise = new Promise((done) => (resolve = done));
+    return { promise, resolve };
+  };
+  // An approval card as main lists it (claude-input.js: approvalView + the generic card).
+  const approvalCard = (fields = {}) => ({
+    requestId: 'req-1', runId: 'run-1', threadId: 't1',
+    approval: {
+      toolName: 'Bash', title: 'Claude wants to run a command',
+      reason: "Claude Code can't be sure it read this command the way the shell will, so it can't rule out a dangerous removal. Read the command, and don't go ahead if you can't tell what it does.",
+      command: 'cd ~/repo; for w in a b; do git -C ~/.durango/ws/$w add -AN .; done',
+    },
+    detail: 'Compare workspaces\n\ncd ~/repo; for w in a b; do git -C ~/.durango/ws/$w add -AN .; done',
+    questions: [{ id: 'permission', header: 'Bash', question: 'Claude wants to run a command', options: [{ label: 'Allow once' }, { label: 'Deny' }] }],
+    ...fields,
+  });
+
+  await test('notices: the live dispatched run, not the person\'s own turn', () => {
+    const run = agentRun({ status: 'running' });
+    assert.equal(durangoDispatchLiveRun(botThread(), [run]), run);
+    assert.equal(durangoDispatchLiveRun(botThread({ status: 'idle' }), [run]), null);
+    const resumed = agentRun({ status: 'running', continuation: true });
+    assert.equal(durangoDispatchLiveRun(botThread(), [agentRun({ status: 'done' }), resumed]), resumed);
+    assert.deepEqual(durangoDispatchLiveRunAt(botThread(), [agentRun({ status: 'done' }), resumed]), { run: resumed, position: 1 });
+    const theirs = agentRun({ status: 'running' });
+    assert.equal(durangoDispatchLiveRun(botThread(), [agentRun({ status: 'done' }), { id: 'u', role: 'user', content: 'mine', ts: 'x' }, theirs]), null);
+    assert.equal(durangoDispatchLiveRun({ status: 'running' }, [run]), null);
+  });
+
+  await test('notices: an approval card on a bot thread goes to its bot at once, with the tool and why, never the call (the 85-minute release thread)', async () => {
+    let cards = [];
+    const world = noticesWorld({ pending: async () => cards });
+    const run = agentRun({ status: 'running', startedAt: iso(1_000_000), activities: [] });
+    world.set({ threads: [botThread()], transcripts: { t1: { messages: [run] } } });
+    await world.tick(0);
+    assert.equal(world.sent.length, 0, 'nothing pending yet');
+    cards = [approvalCard()];
+    await world.emit({ threadId: 't1', type: 'user-input' });
+    assert.equal(world.sent.length, 1);
+    assert.deepEqual({ ...world.sent[0], detail: undefined }, { dispatchId: 'bottask:task1', threadId: 't1', kind: 'input', key: 'input:req-1', seq: 2, detail: undefined });
+    assert.match(world.sent[0].detail, /approve a Bash call/);
+    assert.match(world.sent[0].detail, /Why it asked: Claude Code can't be sure it read this command/);
+    assert.doesNotMatch(world.sent[0].detail, /git -C|durango\/ws|Compare workspaces/, 'no part of the call leaves the machine');
+    // Seen again (another event, the periodic look): sent once.
+    await world.emit({ threadId: 't1', type: 'user-input' });
+    await world.tick(5 * 60_000);
+    assert.equal(world.sent.length, 1);
+    // Waiting on the person is not "stuck", however long it lasts.
+    await world.tick(2 * DISPATCH_STUCK_AFTER_MS);
+    assert.equal(world.sent.filter((n) => n.kind === 'stuck').length, 0);
+    world.stop();
+  });
+
+  await test('notices: an approval for a call that carries a secret sends none of it', () => {
+    // Shaped like a live Stripe key (built at runtime so it reads as no secret here).
+    const secret = ['sk', 'live', '51Hx9QaZ7Rk2PdVtYw3mNcB8'].join('_');
+    const request = approvalCard({
+      approval: {
+        toolName: 'mcp__stripe__create_refund', title: `Claude wants to call create_refund with api_key ${secret}`,
+        reason: `Approve the refund with key ${secret}?`,
+        input: JSON.stringify({ api_key: secret, charge: 'ch_3PqR' }, null, 2), purpose: 'Refund the charge',
+      },
+      detail: `Refund the charge\n\n${JSON.stringify({ api_key: secret, charge: 'ch_3PqR' })}`,
+      questions: [{ id: 'permission', header: 'create_refund', question: `Claude wants to call create_refund with api_key ${secret}` }],
+    });
+    const text = pendingInputText(request);
+    assert.match(text, /approve a create_refund call/);
+    assert.ok(!text.includes(secret), text);
+    assert.ok(!text.includes('ch_3PqR'), text);
+    assert.equal(safeApprovalReason(request), '', 'a reason that repeats the call is left out');
+    assert.equal(safeApprovalReason(approvalCard({ approval: { toolName: 'Bash', command: 'rm -rf build', reason: "Command argument 'build' uses a provider path" } })), "Command argument 'build' uses a provider path", 'short pieces are not matched');
+    assert.equal(safeApprovalReason(approvalCard({ approval: { toolName: 'Bash', command: 'cat /etc/secrets.env', reason: "Path '/etc/secrets.env' resolves near a sensitive file" } })), '');
+    assert.equal(safeApprovalReason(approvalCard({ approval: { toolName: 'Bash', command: 'ls', reason: 'Hook says no.\nSecond line' } })), 'Hook says no. Second line');
+  });
+
+  await test('notices: questions and request_user_action reach the bot; async questions and other threads don\'t', async () => {
+    const world = noticesWorld({
+      pending: async (threadId) => threadId === 't1'
+        ? [
+            { requestId: 7, threadId, questions: [{ id: '0', header: 'Deploy', question: 'Which environment?', options: [{ label: 'staging' }, { label: 'prod' }] }] },
+            { requestId: 8, threadId, async: true, questions: [{ id: '0', header: 'Later', question: 'Anything else?' }] },
+          ]
+        : [{ requestId: 9, threadId, questions: [{ id: '0', header: 'Q', question: 'Mine?' }] }],
+    });
+    const run = agentRun({ status: 'running', startedAt: iso(1_000_000) });
+    const own = { id: 't2', status: 'running', summary: { agentRunCount: 1 } };
+    world.set({ threads: [botThread(), own], transcripts: { t1: { messages: [run] }, t2: { messages: [agentRun({ status: 'running' })] } } });
+    await world.emit({ threadId: 't1', type: 'user-input' });
+    await world.emit({ threadId: 't2', type: 'user-input' });
+    assert.deepEqual(world.sent.map((n) => n.key), ['input:7']);
+    assert.match(world.sent[0].detail, /Which environment\? \(options: staging \/ prod\)/);
+    world.set({ threads: [botThread({ userActions: [{ id: 'ua_1', action: 'Sign in to npm', url: 'https://www.npmjs.com/login?next=%2Fsettings%2Ftokens&token=abc123', requestedAt: 'x' }] }), own] });
+    await world.tick(0);
+    assert.deepEqual(world.sent.map((n) => n.key), ['input:7', 'action:ua_1']);
+    assert.equal(world.sent[1].detail, 'It asked the person to: Sign in to npm\nhttps://www.npmjs.com/login', 'the page, without its query');
+    assert.equal(userActionText({ action: 'Plug in the phone', url: 'javascript:alert(1)' }), 'It asked the person to: Plug in the phone');
+    world.stop();
+  });
+
+  await test('notices: a request from another run, or read while the run changed, is not sent', async () => {
+    // The request's run (main's run id) writes to another run message.
+    const world = noticesWorld({ pending: async () => [approvalCard({ runId: 'old-run' })], runMessageId: (runId) => (runId === 'old-run' ? 'm-old' : undefined) });
+    const run = agentRun({ id: 'm-live', status: 'running', startedAt: iso(1_000_000) });
+    world.set({ threads: [botThread()], transcripts: { t1: { messages: [run] } } });
+    await world.emit({ threadId: 't1', type: 'user-input' });
+    assert.equal(world.sent.length, 0);
+    world.stop();
+    // The list was read for the dispatched run; by the time it came back the person had started their own turn.
+    const read = deferred();
+    const raced = noticesWorld({ pending: () => read.promise });
+    const dispatched = agentRun({ id: 'm-a', status: 'running', startedAt: iso(1_000_000) });
+    raced.set({ threads: [botThread()], transcripts: { t1: { messages: [dispatched] } } });
+    await raced.emit({ threadId: 't1', type: 'user-input' });
+    raced.set({ transcripts: { t1: { messages: [{ ...dispatched, status: 'done' }, { id: 'u', role: 'user', content: 'mine', ts: 'x' }, agentRun({ id: 'm-b', status: 'running' })] } } });
+    read.resolve([approvalCard()]);
+    await raced.flush();
+    assert.equal(raced.sent.length, 0);
+    raced.stop();
+  });
+
+  await test('notices: a request that arrives during a pending-list read is read right after it; "stuck" waits for the fresh list', async () => {
+    const reads = [];
+    const world = noticesWorld({
+      pending: () => {
+        const read = deferred();
+        reads.push(read);
+        return read.promise;
+      },
+    });
+    const run = agentRun({ id: 'run1', status: 'running', startedAt: iso(1_000_000), activities: [] });
+    world.set({ threads: [botThread()], transcripts: { t1: { messages: [run] } } });
+    await world.emit({ threadId: 't1', type: 'user-input' });
+    assert.equal(reads.length, 1, 'the first look reads the list');
+    // A card appears (user-input) while that read is still out: not lost.
+    await world.emit({ threadId: 't1', type: 'user-input' });
+    assert.equal(reads.length, 1, 'one read at a time');
+    reads[0].resolve([]);
+    await world.flush();
+    assert.equal(reads.length, 2, 'read again right after');
+    reads[1].resolve([approvalCard()]);
+    await world.flush();
+    assert.deepEqual(world.sent.map((n) => n.key), ['input:req-1']);
+    world.stop();
+
+    // Quiet for 15 minutes, and the card shows up just as the periodic look runs:
+    // the look waits for the list, so no "looks stuck" goes out for a thread waiting on the person.
+    const later = [];
+    const quiet = noticesWorld({
+      pending: () => {
+        const read = deferred();
+        later.push(read);
+        return read.promise;
+      },
+    });
+    quiet.set({ threads: [botThread()], transcripts: { t1: { messages: [agentRun({ id: 'run2', status: 'running', startedAt: iso(1_000_000), activities: [] })] } } });
+    for (let minute = 1; minute < 15; minute += 1) {
+      await quiet.tick(60_000);
+      later.shift().resolve([]);
+      await quiet.flush();
+    }
+    await quiet.tick(60_000);
+    assert.equal(quiet.sent.length, 0, 'nothing before the fresh list is in');
+    later.shift().resolve([approvalCard({ requestId: 'req-2' })]);
+    await quiet.flush();
+    assert.deepEqual(quiet.sent.map((n) => n.kind), ['input']);
+    quiet.stop();
+  });
+
+  await test('notices: a quiet bot thread reports "looks stuck" once per quiet stretch, without the step\'s arguments', async () => {
+    const world = noticesWorld();
+    const run = agentRun({ id: 'run1', status: 'running', startedAt: iso(1_000_000), content: 'Comparing the workspaces.', activities: [] });
+    world.set({ threads: [botThread()], transcripts: { t1: { messages: [run] } } });
+    await world.tick(DISPATCH_STUCK_AFTER_MS - 60_000);
+    assert.equal(world.sent.length, 0, 'not yet');
+    await world.tick(60_000);
+    assert.equal(world.sent.length, 1);
+    assert.equal(world.sent[0].kind, 'stuck');
+    assert.equal(world.sent[0].seq, 2);
+    assert.match(world.sent[0].detail, /No progress for 15 minutes/);
+    assert.match(world.sent[0].detail, /waiting on the model/);
+    assert.match(world.sent[0].detail, /Comparing the workspaces/);
+    await world.tick(DISPATCH_STUCK_AFTER_MS);
+    assert.equal(world.sent.length, 1, 'once for this quiet stretch');
+    // Progress, then quiet again: a new stretch.
+    await world.emit({ threadId: 't1', type: 'chunk' });
+    await world.tick(DISPATCH_STUCK_AFTER_MS + 60_000);
+    assert.equal(world.sent.length, 2);
+    assert.notEqual(world.sent[1].key, world.sent[0].key);
+    world.stop();
+    const busy = noticesWorld();
+    const command = { id: 'c', type: 'command', title: 'Command - curl -H "Authorization: Bearer tok_123456789" https://api', detail: 'curl …', toolName: 'Bash', status: 'running', ts: iso(1_000_000) };
+    busy.set({ threads: [botThread()], transcripts: { t1: { messages: [agentRun({ status: 'running', startedAt: iso(1_000_000), activities: [command] })] } } });
+    await busy.tick(DISPATCH_STUCK_AFTER_MS + 60_000);
+    assert.match(busy.sent[0].detail, /The step in progress: a shell command/);
+    assert.doesNotMatch(busy.sent[0].detail, /tok_123456789|curl/);
+    busy.stop();
+  });
+
+  await test('notices: no "looks stuck" while it waits on what it started itself (Claude and Codex step shapes)', async () => {
+    const tool = (title, fields = {}) => ({ id: title, type: 'tool', title, status: 'running', ts: iso(1_000_000), ...fields });
+    assert.equal(runWaitsOnItself(agentRun({ status: 'done', statusText: 'Waiting on 1 background task…' })), true);
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [tool('Tool - mcp__orion__wait_for_background_tasks')] })), true);
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [tool('Tool - Agent')] })), true);
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [tool('Tool - Monitor')] })), true);
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [{ ...tool('Tool - Agent'), status: 'done' }] })), false);
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [{ id: 'c', type: 'command', title: 'Command - git diff', status: 'running', ts: 'x' }] })), false);
+    // Claude: the step as the driver builds it from the SDK's tool_use block.
+    const [claudeStep] = extractActivitiesFromJsonEvent({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'mcp__orion__machine_run_agent', input: { machine: 'omarchy', prompt: 'Build it' } }] },
+    });
+    assert.equal(claudeStep.toolName, 'mcp__orion__machine_run_agent');
+    assert.equal(activityToolName(claudeStep), 'machine_run_agent');
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [{ ...claudeStep, id: 'a', ts: iso(1_000_000) }] })), true);
+    // Codex (codex-driver.js mcpToolCall): `Tool - orion.machine_run_agent`, toolName `orion.machine_run_agent`.
+    const codexStep = tool('Tool - orion.machine_run_agent', { toolName: 'orion.machine_run_agent' });
+    assert.equal(activityToolName(codexStep), 'machine_run_agent');
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [codexStep] })), true);
+    // A Codex step saved before steps carried toolName: read from its title.
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [tool('Tool - orion.machine_run_agent')] })), true);
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [tool('Tool - orion.wait_for_background_tasks')] })), true);
+    assert.equal(runWaitsOnItself(agentRun({ status: 'running', activities: [tool('Tool - orion.browser_click', { toolName: 'orion.browser_click' })] })), false);
+    const world = noticesWorld();
+    world.set({
+      threads: [botThread()],
+      transcripts: { t1: { messages: [agentRun({ status: 'done', startedAt: iso(1_000_000), statusText: 'Waiting on 2 background tasks…' })] } },
+    });
+    await world.tick(3 * DISPATCH_STUCK_AFTER_MS);
+    assert.equal(world.sent.length, 0);
+    world.stop();
+    const codexWait = noticesWorld();
+    codexWait.set({ threads: [botThread()], transcripts: { t1: { messages: [agentRun({ status: 'running', startedAt: iso(1_000_000), activities: [codexStep] })] } } });
+    await codexWait.tick(3 * DISPATCH_STUCK_AFTER_MS);
+    assert.equal(codexWait.sent.length, 0, 'a Codex thread waiting on machine_run_agent is not stuck');
+    codexWait.stop();
+  });
+
+  await test('notices: an undelivered notice is sent again only while it still holds', async () => {
+    let fail = true;
+    const world = noticesWorld({ notice: () => (fail ? { ok: false, retry: true } : { ok: true }) });
+    world.set({ threads: [botThread({ userActions: [{ id: 'ua_1', action: 'Approve the deploy', requestedAt: 'x' }] })], transcripts: { t1: { messages: [agentRun({ status: 'running', startedAt: iso(1_000_000) })] } } });
+    await world.tick(0);
+    assert.equal(world.sent.length, 1);
+    fail = false;
+    await world.tick(2 * 60_000 + 1);
+    assert.equal(world.sent.length, 2, 'tried again');
+    await world.tick(10 * 60_000);
+    assert.equal(world.sent.length, 2, 'delivered: once');
+    world.stop();
+    // Answered before the retry: never sent again.
+    let cards = [approvalCard()];
+    const answered = noticesWorld({ pending: async () => cards, notice: () => ({ ok: false, retry: true }) });
+    answered.set({ threads: [botThread()], transcripts: { t1: { messages: [agentRun({ status: 'running', startedAt: iso(1_000_000) })] } } });
+    await answered.emit({ threadId: 't1', type: 'user-input' });
+    assert.equal(answered.sent.length, 1);
+    cards = [];
+    await answered.tick(5 * 60_000);
+    assert.equal(answered.sent.length, 1, 'the person answered it: not resent');
+    answered.stop();
+    const idle = noticesWorld();
+    idle.set({ threads: [{ id: 'x', status: 'running', summary: { agentRunCount: 1 } }], transcripts: { x: { messages: [agentRun({ status: 'running' })] } } });
+    await idle.tick(3 * DISPATCH_STUCK_AFTER_MS);
+    assert.equal(idle.sent.length, 0);
+    idle.stop();
+  });
+
+  await test('notices: pendingInputText describes approvals and questions', () => {
+    assert.match(pendingInputText({ requestId: 1, questions: [{ id: 'permission', header: 'Write', question: 'Allow Claude to use Write?' }] }), /^It is waiting for the person to approve a Write call in the thread/);
+    assert.match(pendingInputText({ requestId: 1, questions: [{ id: '0', header: 'H', question: 'Ship it?' }] }), /^It asked the person:\n- Ship it\?$/);
+  });
+
+  await test('dispatch worker: notice posts to the dispatch\'s notice route with the thread, machine and run number; one attempt', async () => {
+    const notices = (id) => server.requests.filter((request) => request.path === `/api/v1/code/dispatches/${id}/notice`).map((request) => request.body);
+    server.on('POST', '/api/v1/code/dispatches/disp_n/notice', () => ({ json: { ok: true } }));
+    const { worker } = makeWorker();
+    const result = await worker.notice({ dispatchId: 'disp_n', threadId: 'thread-9', kind: 'input', key: 'input:r1', seq: 2, detail: 'It asked the person: x' });
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(notices('disp_n').at(-1), {
+      machineId: 'device-uuid-1',
+      notice: { kind: 'input', key: 'input:r1', seq: 2, detail: 'It asked the person: x' },
+      codeThreadId: 'thread-9',
+    });
+    assert.equal(reports('disp_n').length, 0, 'never on the report route');
+    server.on('POST', '/api/v1/code/dispatches/disp_n/notice', () => ({ json: { ok: true, stale: true } }));
+    assert.deepEqual(await worker.notice({ dispatchId: 'disp_n', threadId: 'thread-9', kind: 'input', key: 'input:r2', seq: 2, detail: 'd' }), { ok: true, stale: true });
+    const before = notices('disp_n').length;
+    server.on('POST', '/api/v1/code/dispatches/disp_n/notice', () => ({ status: 503, json: { error: { message: 'down' } } }));
+    assert.equal((await worker.notice({ dispatchId: 'disp_n', threadId: 'thread-9', kind: 'stuck', key: 's', seq: 2, detail: 'd' })).retry, true);
+    assert.equal(notices('disp_n').length, before + 1, 'one attempt: the renderer resends only if it still holds');
+    server.on('POST', '/api/v1/code/dispatches/disp_n/notice', () => ({ status: 404, json: { error: { message: 'Not found' } } }));
+    assert.deepEqual(await worker.notice({ dispatchId: 'disp_n', threadId: 'thread-9', kind: 'stuck', key: 's', seq: 2, detail: 'd' }), { ok: false }, 'a Durango without notices: final');
   });
 
 } finally {

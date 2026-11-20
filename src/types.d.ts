@@ -2018,6 +2018,20 @@ type OrionCodexBrowserIntegrationStatus = {
         /** The report's sequence number (two per agent run, odd while waiting): later reports have higher ones. */
         seq?: number;
       }) => Promise<{ ok: boolean; skipped?: boolean; retry?: boolean }>;
+      /**
+       * A dispatched thread (a bot's task) still runs but needs the person
+       * (`input`: an approval, a question, an action) or looks stuck: tells
+       * whoever started it now. One notice per `key`.
+       */
+      durangoDispatchNotice?: (input: {
+        dispatchId: string;
+        threadId: string;
+        kind: 'input' | 'stuck';
+        key: string;
+        /** The live run's final report sequence number (a notice for a run already reported is dropped). */
+        seq: number;
+        detail: string;
+      }) => Promise<{ ok: boolean; skipped?: boolean; retry?: boolean }>;
       onDurangoDispatchState?: (cb: (state: DurangoDispatchState) => void) => () => void;
       onDurangoFocusThread?: (cb: (payload: { threadId: string }) => void) => () => void;
       workspaceSyncConfigure?: (

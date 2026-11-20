@@ -753,6 +753,95 @@ test('local bots: a thread whose turn ends while it still waits says so, and rep
   await engine.idle();
 });
 
+test('local bots: a running thread that needs the person tells the bot at once, once per notice', async () => {
+  const started = [];
+  const { engine, runner } = makeEngine({
+    listProjects: async () => [{ id: 'proj_1', name: 'Durango', path: '/Users/me/durango' }],
+    startProjectThread: async (input) => {
+      started.push(input);
+      return { ok: true, threadId: 'thread_3' };
+    },
+  });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'Land the bot changes.' });
+  await waitFor(() => runner.lanes.length === 1);
+  await runner.lanes[0].ctx.callTool({ name: 'delegate_task', input: { title: 'Land bot changes', instructions: 'Land them.', project: 'Durango' }, toolCallId: 't' });
+  runner.lanes[0].finish({ text: 'On it.' });
+  await waitFor(() => runner.running().length === 0);
+
+  const notice = { key: started[0].key, threadId: 'thread_3', kind: 'input', noticeKey: 'input:req-1', seq: 2, detail: 'It is waiting for the person to approve a Bash call in the thread (what the call does is shown there, not here).' };
+  assert.deepEqual(await engine.threadNotice(notice), { ok: true });
+  await waitFor(() => runner.lanes.length === 2, { label: 'reply to the notice' });
+  const prompt = runner.lanes[1].lane.prompt;
+  assert.match(prompt, /\[Task: Land bot changes\]:\nNEEDS THE PERSON: the task "Land bot changes" is blocked/);
+  assert.match(prompt, /approve a Bash call/);
+  assert.match(prompt, /message_thread thread_id "thread_3"/);
+  assert.match(prompt, /Your tasks still running/, 'still a running task: a notice is not its report');
+  runner.lanes[1].finish({ text: 'The thread needs you to approve a command.' });
+  await waitFor(() => runner.running().length === 0);
+  // The same notice again (a retry): nothing new.
+  await engine.threadNotice(notice);
+  await engine.idle();
+  assert.equal(runner.lanes.length, 2);
+  assert.deepEqual(await engine.threadNotice({ ...notice, kind: 'other' }), { ok: false });
+  assert.deepEqual(await engine.threadNotice({ ...notice, key: 'gone:lt_x' }), { ok: false });
+
+  // Its turn reports (seq 2); a notice about that turn arriving after it is dropped.
+  await engine.threadSettled({ key: started[0].key, threadId: 'thread_3', outcome: 'finished', summary: 'Landed.', seq: 2 });
+  await waitFor(() => runner.lanes.length === 3, { label: 'reply to the report' });
+  runner.lanes[2].finish({ text: 'Landed.' });
+  await waitFor(() => runner.running().length === 0);
+  assert.deepEqual(await engine.threadNotice({ ...notice, noticeKey: 'input:late' }), { ok: true, stale: true });
+  await engine.idle();
+  assert.equal(runner.lanes.length, 3, 'no reply to a stale notice');
+  assert.ok(!(await engine.thread((await engine.list()).bots[0].id)).messages.some((message) => /input_late/.test(message.id ?? '')));
+  // A turn the thread resumes by itself (seq 4) still notifies.
+  assert.deepEqual(await engine.threadNotice({ ...notice, noticeKey: 'input:next', seq: 4 }), { ok: true });
+  await waitFor(() => runner.lanes.length === 4, { label: 'reply to the resumed turn\'s notice' });
+  runner.lanes[3].finish({ text: 'Again.' });
+  await waitFor(() => runner.running().length === 0);
+});
+
+test('local bots: a notice is acknowledged only once it is saved; a retry saves it', async () => {
+  const dir = path.join(testRoot, `bots-notice-readonly-${Date.now()}`);
+  const started = [];
+  const { engine, runner } = makeEngine({
+    dir,
+    listProjects: async () => [{ id: 'proj_1', name: 'Durango', path: '/Users/me/durango' }],
+    startProjectThread: async (input) => {
+      started.push(input);
+      return { ok: true, threadId: 'thread_4' };
+    },
+  });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'Release it.' });
+  await waitFor(() => runner.lanes.length === 1);
+  await runner.lanes[0].ctx.callTool({ name: 'delegate_task', input: { title: 'Release', instructions: 'Release it.', project: 'Durango' }, toolCallId: 't' });
+  runner.lanes[0].finish({ text: 'On it.' });
+  await waitFor(() => runner.running().length === 0);
+  await engine.flush();
+  const notice = { key: started[0].key, threadId: 'thread_4', kind: 'input', noticeKey: 'input:r9', seq: 2, detail: 'It asked the person:\n- Which environment?' };
+  // The bots folder can't be written to: not acknowledged, so the desktop sends it again.
+  await fs.chmod(dir, 0o500);
+  try {
+    assert.deepEqual(await engine.threadNotice(notice), { ok: false, retry: true });
+    // The retry while it still can't save: the message is in memory, not on disk; still not acknowledged.
+    assert.deepEqual(await engine.threadNotice(notice), { ok: false, retry: true });
+  } finally {
+    await fs.chmod(dir, 0o700);
+  }
+  // The retry once it can: the message it already holds is saved, then acknowledged.
+  assert.deepEqual(await engine.threadNotice(notice), { ok: true });
+  await waitFor(() => runner.lanes.length >= 2, { label: 'reply to the notice' });
+  for (const lane of runner.lanes.slice(1)) if (!lane.done) lane.finish({ text: 'Noted.' });
+  await waitFor(() => runner.running().length === 0);
+  await engine.stop();
+  const reloaded = makeEngine({ dir });
+  const thread = await reloaded.engine.thread((await reloaded.engine.list()).bots[0].id);
+  assert.ok(thread.messages.some((message) => /NEEDS THE PERSON: the task "Release"/.test(message.content)), 'on disk');
+  await reloaded.engine.stop();
+});
+
 test('project bots: one per project, notes and files in their instructions and in threads they start', async () => {
   const started = [];
   const { engine, runner } = makeEngine({

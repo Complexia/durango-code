@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { BOT_REPLY_MESSAGES_MAX, botReplyMessageId, durangoModelIdForClaude } from './bot-replies.js';
-import { BOT_BRIEF_RULE, BOT_SETTLE_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, threadReportText, withThreadReportFooter } from './bot-thread-tools.js';
+import { BOT_BRIEF_RULE, BOT_SETTLE_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, threadNoticeText, threadReportText, withThreadReportFooter } from './bot-thread-tools.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -92,6 +92,7 @@ Routines and reports:
 - A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
 - A task report that starts "NOT FINISHED YET" (or says the task isn't finished yet) is an update, not the outcome: the thread is still working in the background and reports again when it finishes. Tell the person briefly where it stands if it matters, don't report it as done, and don't start the work again.
+- "NEEDS THE PERSON" from a task's thread: it is blocked on the person (an approval, a question, an action) and stays blocked until they answer in that thread. Tell them right away what it needs, in a line or two. "LOOKS STUCK": check the thread before you cancel or redo the work.
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
 
 Show, don't point: your thread renders rich replies, so use them.
@@ -675,7 +676,8 @@ export const createLocalBotEngine = ({
     let runtime = runtimes.get(botId);
     if (!runtime) {
       // reportedThreads: threads that already reported (key → task), for the reports of turns they resume by themselves.
-      runtime = { replies: new Map(), tasks: new Map(), threads: new Map(), reportedThreads: new Map(), pendingChecks: 0 };
+      // reportedSeqs: each thread's latest report number (key → seq): a notice for a run that already reported is dropped.
+      runtime = { replies: new Map(), tasks: new Map(), threads: new Map(), reportedThreads: new Map(), reportedSeqs: new Map(), pendingChecks: 0 };
       runtimes.set(botId, runtime);
     }
     return runtime;
@@ -2260,12 +2262,16 @@ export const createLocalBotEngine = ({
      * on background work, so it isn't done; it reports again (same key) for
      * each turn it later resumes by itself.
      */
-    async threadSettled({ key, threadId, outcome, summary, error, waiting } = {}) {
+    async threadSettled({ key, threadId, outcome, summary, error, waiting, seq } = {}) {
       await ensureLoaded();
       const [botId] = str(key).split(':');
       const entry = entries.get(botId);
       if (!entry) return { ok: false };
       const runtime = runtimeFor(botId);
+      if (Number.isSafeInteger(seq) && seq > 0) {
+        runtime.reportedSeqs.set(str(key), Math.max(seq, runtime.reportedSeqs.get(str(key)) ?? 0));
+        while (runtime.reportedSeqs.size > 200) runtime.reportedSeqs.delete(runtime.reportedSeqs.keys().next().value);
+      }
       const running = runtime.threads.get(str(key));
       const task = running ?? runtime.reportedThreads.get(str(key));
       runtime.threads.delete(str(key));
@@ -2292,6 +2298,40 @@ export const createLocalBotEngine = ({
           : withThreadReportFooter(`The task couldn't finish (${where}): ${clip(oneLine(error) || 'the thread stopped.', 300)}`, thread);
       appendInbox(entry, { content: report, authorLabel: inboxLabel('task', title) });
       return { ok: true };
+    },
+    /**
+     * A thread a bot started (`key` as for threadSettled) still runs but needs
+     * the person (`kind: 'input'`: an approval, a question, an action) or
+     * looks stuck (`'stuck'`): the bot hears it now, before any report. One
+     * inbox message per `noticeKey`. `seq`: the live run's final report
+     * number; once that run has reported, its notices are dropped
+     * (`{ ok: true, stale: true }`). Acknowledged only once the message is on
+     * disk: `{ ok: false, retry: true }` otherwise, and a retry with the same
+     * key saves the message it already holds.
+     */
+    async threadNotice({ key, threadId, kind, noticeKey, seq, detail } = {}) {
+      await ensureLoaded();
+      const [botId] = str(key).split(':');
+      const entry = entries.get(botId);
+      const id = str(noticeKey).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120);
+      if (!entry || !id || (kind !== 'input' && kind !== 'stuck')) return { ok: false };
+      const runtime = runtimeFor(botId);
+      const reported = runtime.reportedSeqs.get(str(key));
+      if (reported !== undefined && Number.isSafeInteger(seq) && seq <= reported) return { ok: true, stale: true };
+      const task = runtime.threads.get(str(key)) ?? runtime.reportedThreads.get(str(key));
+      const title = task?.title ?? 'Durango Code thread';
+      const thread = { threadId: str(threadId).trim() || task?.threadId || '', project: task?.project ?? null };
+      const message = appendInbox(entry, {
+        id: `notice_${str(key).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120)}_${id}`,
+        content: withThreadReportFooter(threadNoticeText(title, kind, clip(str(detail), 4_000)), thread),
+        authorLabel: inboxLabel('task', title),
+      });
+      // On disk: in the saved transcript, or (trimmed past the cap) no longer kept at all.
+      const onDisk = () => entries.get(botId) !== entry || !entry.messages.includes(message) || entry.disk?.messages?.get(message.id) === message;
+      let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
+      // A retry of a notice whose save failed (or hasn't run): save it again.
+      if (!saved) saved = (await persistBot(entry)) && onDisk();
+      return saved ? { ok: true } : { ok: false, retry: true };
     },
     /** Routines fire and waiting messages are answered only while active (signed out of Durango). */
     setActive(next) {

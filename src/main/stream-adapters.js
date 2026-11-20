@@ -260,6 +260,7 @@ export const codexActivityFromItem = (item, eventType) => {
       ...base,
       type: 'tool',
       title: `Tool - ${name || 'MCP'}`,
+      ...(name ? { toolName: name } : {}),
       detail: stringifySummary(item.arguments ?? ''),
       input: formatToolInput(item.arguments),
     };
@@ -563,6 +564,7 @@ export const activityFromCandidate = (candidate) => {
   const activity = {
     type: candidate.is_error === true ? 'error' : isResult ? 'result' : isCommand ? 'command' : 'tool',
     title,
+    ...(rawName && !isResult ? { toolName: rawName } : {}),
     detail,
     status: candidate.is_error === true ? 'error' : isResult ? 'done' : 'running',
   };

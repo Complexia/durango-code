@@ -712,6 +712,17 @@ export const createDurangoClient = ({
       await request('POST', `/code/dispatches/${encodeURIComponent(id)}`, { body: report });
       return { ok: true };
     },
+    /**
+     * The dispatched thread (a bot's machine task) still runs but needs the
+     * person or looks stuck: `{ machineId, codeThreadId?, notice: { kind, key, seq, detail } }`
+     * → `{ ok, stale? }`. Its own route: a Durango without it answers 404, never a report.
+     */
+    async noticeDispatch(dispatchId, body) {
+      const id = str(dispatchId).trim();
+      if (!id) throw new DurangoError('api', 'A dispatch id is required.');
+      const data = await request('POST', `/code/dispatches/${encodeURIComponent(id)}/notice`, { body });
+      return { ok: data.ok === true, ...(data.stale === true ? { stale: true } : {}) };
+    },
     // --- Bot replies on this machine's Claude Code (bot-replies.js) -----------
     /** Long-poll for a bot reply to run here; `{ lane: null }` when none arrived. Polling marks this machine available. */
     /** `machine`: `{ name, projects: string[], models: string[] }`, this machine's bot presence. */
@@ -774,6 +785,16 @@ export const createDurangoClient = ({
     async reportBotTask({ taskId, ...body } = {}) {
       const data = await request('POST', `/code/bots/tasks/${encodeURIComponent(str(taskId))}/report`, { body });
       return { ok: data.ok === true };
+    },
+    /**
+     * That thread still runs but needs the person or looks stuck:
+     * `{ machineId, notice: { kind, key, seq, detail } }` → `{ ok, stale? }`.
+     * Never on /report: a Durango from before notices would take it for a
+     * report without an outcome and fail the task ("the thread stopped").
+     */
+    async noticeBotTask({ taskId, ...body } = {}) {
+      const data = await request('POST', `/code/bots/tasks/${encodeURIComponent(str(taskId))}/notice`, { body });
+      return { ok: data.ok === true, ...(data.stale === true ? { stale: true } : {}) };
     },
     // --- Bots (Sidebar v3): the person's Durango bots and their threads ---------
     /** → `{ allowed, bots, modelChoices }` (the primary first; modelChoices: null from an older Durango). */
@@ -1230,6 +1251,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       await waitFor(Math.min(waitMs, 25_000), signal);
       return { dispatch: null };
     },
+    async noticeDispatch() {
+      return { ok: false };
+    },
     async reportDispatch(dispatchId, report) {
       reports.push({ dispatchId, ...report });
       console.log(`[durango mock] dispatch ${dispatchId} → ${report?.status}${report?.error ? ` (${report.error})` : ''}`);
@@ -1258,6 +1282,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       throw new DurangoError('api', 'Mock Durango has no bot tasks.');
     },
     async reportBotTask() {
+      return { ok: false };
+    },
+    async noticeBotTask() {
       return { ok: false };
     },
     async chatUrl(chatId) {

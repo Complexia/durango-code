@@ -935,6 +935,12 @@ assert.equal(astraWire.some((message) => message.method === 'thread/compact/star
 await astraDriver.dispose();
 assert.equal(codexAppServerActivityFromItem({ id: 'sleep-1', type: 'sleep', durationMs: 5000 }, false).title, 'Waiting');
 assert.match(codexAppServerActivityFromItem({ id: 'call-1', type: 'functionCallOutput', name: 'exec', namespace: 'functions', output: 'completed' }, true).title, /functions.exec/);
+// Steps carry the tool they call (read by the bot-thread stuck check, app/durangoDispatch.ts).
+assert.deepEqual(
+  (({ title, toolName }) => ({ title, toolName }))(codexAppServerActivityFromItem({ id: 'mcp-1', type: 'mcpToolCall', server: 'orion', tool: 'machine_run_agent', arguments: { machine: 'omarchy' } }, false)),
+  { title: 'Tool - orion.machine_run_agent', toolName: 'orion.machine_run_agent' }
+);
+assert.equal(codexAppServerActivityFromItem({ id: 'call-2', type: 'dynamicToolCall', name: 'wait_for_background_tasks', namespace: 'orion' }, false).toolName, 'orion.wait_for_background_tasks');
 
 // Every resume error must retain the native conversation, including errors
 // that used to be treated as an expired/missing session. Never run the latest

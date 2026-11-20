@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from './claude-input.js';
-import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
+import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { CLAUDE_CHROME_BROWSER_TIPS, claudeChromeLeaseHooks } from './claude-chrome.js';
 import { claudeForegroundWaitHooks } from './claude-foreground-wait.js';
 import { existsSync } from 'node:fs';
@@ -2367,11 +2367,14 @@ export const createClaudeSdkSession = ({
         effort: sdkOptions.effort,
         // Servers the user connected to Orion (and enabled or @-mentioned)
         // are trusted like Codex's pre-approved ones; Read only still asks.
+        // Full access approves what Claude Code's own safety checks still ask
+        // about (claude-env.js fullAccessApproves).
         canUseTool: (toolName, toolInput, toolOptions) =>
-          sdkOptions.accessMode !== 'read-only' &&
-          Object.keys(session.orionMcpServers ?? {}).some((name) =>
-            toolName.startsWith(`mcp__${name}__`)
-          )
+          (sdkOptions.accessMode !== 'read-only' &&
+            Object.keys(session.orionMcpServers ?? {}).some((name) =>
+              toolName.startsWith(`mcp__${name}__`)
+            )) ||
+          fullAccessApproves(sdkOptions.accessMode, toolName, toolOptions)
             ? Promise.resolve({ behavior: 'allow', updatedInput: toolInput })
             : session.userInputs.canUseTool(toolName, toolInput, toolOptions),
         includePartialMessages: true,

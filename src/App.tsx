@@ -175,7 +175,7 @@ import {
   remoteThreadRuntime,
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
-import { dispatchProjectsPayload, startDurangoDispatchReporter } from './app/durangoDispatch';
+import { dispatchProjectsPayload, startDurangoDispatchNotices, startDurangoDispatchReporter } from './app/durangoDispatch';
 import { threadStartedByBot } from './app/botSettle';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
@@ -9286,6 +9286,27 @@ const App: React.FC = () => {
       },
     });
   }, [updateThread]);
+
+  // While a dispatched thread (a bot's task) still runs, its bot hears at once
+  // when it needs the person or looks stuck (startDurangoDispatchNotices).
+  useEffect(() => {
+    const notice = window.orion?.durangoDispatchNotice;
+    if (!notice) return undefined;
+    return startDurangoDispatchNotices({
+      getState: () => useOrionStore.getState(),
+      subscribe: (listener) => useOrionStore.subscribe(listener),
+      onTurnEvent: (listener) => window.orion?.onAgentTurnEvent?.(listener),
+      pendingInput: async (threadId) => {
+        const [codex, claude] = await Promise.all([
+          window.orion?.getCodexQuestions?.(threadId),
+          window.orion?.getClaudeQuestions?.(threadId),
+        ]);
+        return [...(codex ?? []), ...(claude ?? [])].filter((request) => request.threadId === threadId);
+      },
+      runMessageId: (runId) => runOutputMessages.current.get(runId)?.messageId,
+      notice: (input) => notice(input),
+    });
+  }, []);
 
   // A thread on another machine ends its turn there and its synced copy
   // brings the new status here: the linked tasks that turn carried leave

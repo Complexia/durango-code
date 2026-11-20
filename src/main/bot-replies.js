@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DurangoError } from './durango-client.js';
-import { claudePermissionOptionsForAccessMode, withClaudeEnv } from './claude-env.js';
+import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
 import { SHIP_VIA_THREAD_MESSAGE } from './bot-thread-tools.js';
 
@@ -308,6 +308,11 @@ const toolDenial = (toolName, accessMode) => {
   }
   if (toolName === 'ExitPlanMode') {
     return 'This bot reply runs Read only on this machine: answer without changing anything here.';
+  }
+  if (accessMode === 'full-access') {
+    // Full access approves Claude Code's own safety-check asks; this one came
+    // from the person's ask rules or a hook on this machine.
+    return `This machine's settings (an ask rule or a hook) require a person to approve this ${toolName} call, and no one is at this machine during a bot reply. Do without it, or say in your reply what you would need.`;
   }
   return `No one is at this machine to approve ${toolName} for this bot reply (it runs with the machine's ${accessMode} access). Do without it, or say in your reply what you would need.`;
 };
@@ -710,8 +715,8 @@ export const createClaudeLaneRunner = ({
           ...(accessMode !== 'full-access' && botTools.length
             ? { allowedTools: [...lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`), ...(attaches ? [`${BOT_TOOL_PREFIX}${ATTACH_FILES_TOOL.name}`] : [])] }
             : {}),
-          canUseTool: async (toolName, toolInput) =>
-            toolName.startsWith(BOT_TOOL_PREFIX)
+          canUseTool: async (toolName, toolInput, toolOptions) =>
+            toolName.startsWith(BOT_TOOL_PREFIX) || fullAccessApproves(accessMode, toolName, toolOptions)
               ? { behavior: 'allow', updatedInput: toolInput }
               : { behavior: 'deny', message: toolDenial(toolName, accessMode) },
           hooks: {

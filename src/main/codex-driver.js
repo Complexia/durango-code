@@ -201,6 +201,7 @@ export const codexAppServerActivityFromItem = (item, completed) => {
       ...base,
       type: 'tool',
       title: `Tool - ${name || 'MCP'}`,
+      ...(name ? { toolName: name } : {}),
       detail: stringifySummary(item.arguments ?? ''),
       input: formatToolInput(item.arguments),
     };
@@ -226,6 +227,7 @@ export const codexAppServerActivityFromItem = (item, completed) => {
       ...base,
       type: 'tool',
       title: `Tool - ${[item.namespace, item.name || item.tool].filter(Boolean).join('.') || 'Codex'}`,
+      ...(item.name || item.tool ? { toolName: [item.namespace, item.name || item.tool].filter(Boolean).join('.') } : {}),
       input: formatToolInput(item.arguments),
       output: formatToolOutput(item.output ?? item.contentItems),
     };

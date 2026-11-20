@@ -892,7 +892,16 @@ try {
       ['attach_files'],
       'no bot tools: only attach_files (a reply shows files from here)'
     );
-    assert.equal((await options.canUseTool('Bash', { command: 'ls' })).behavior, 'deny', 'no one here to approve');
+    // Full access: Claude Code's own shell safety-check asks are approved
+    // (nobody is here to answer); questions, a user's ask rule and a hook's
+    // ask are not. Option shapes as the real SDK passes them
+    // (scripts/test-claude-safety-asks.mjs drives the runtimes).
+    const unclear = "Claude Code can't be sure it read this command the way the shell will, so it can't rule out a dangerous removal. Read the command, and don't go ahead if you can't tell what it does.";
+    assert.equal((await options.canUseTool('Bash', { command: 'cd /repo; for w in a; do git -C $w add -AN .; done' }, { decisionReason: unclear, displayName: 'Bash', toolUseID: 't1', requestId: 'r1' })).behavior, 'allow');
+    assert.equal((await options.canUseTool('AskUserQuestion', { questions: [] }, {})).behavior, 'deny', 'no one here to answer');
+    assert.equal((await options.canUseTool('Bash', { command: 'echo hello' }, { displayName: 'Bash', description: 'Say hello', toolUseID: 't2', requestId: 'r2' })).behavior, 'deny', "a user's ask rule (no reason, no matchedAskRule)");
+    assert.equal((await options.canUseTool('Bash', { command: 'echo hello' }, { decisionReason: 'Hook wants a person to confirm', displayName: 'Bash', toolUseID: 't3', requestId: 'r3' })).behavior, 'deny', "a hook's ask");
+    assert.equal((await options.canUseTool('Bash', { command: 'cd /repo; git status' }, { decisionReason: unclear, matchedAskRule: { source: 'userSettings', toolName: 'Bash' } })).behavior, 'deny', "a rule-forced ask carrying a safety reason");
     assert.ok(sdk.runs[0].closed, 'query closed when done');
   });
 

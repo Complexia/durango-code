@@ -5150,6 +5150,7 @@ ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
         summary: await withReportRefs(input),
         error: typeof input?.error === 'string' ? input.error : undefined,
         waiting: dispatchWaiting(input),
+        seq: dispatchSeq(input),
       })
     : dispatchWorker.settle({
     dispatchId: typeof input?.dispatchId === 'string' ? input.dispatchId : '',
@@ -5161,6 +5162,45 @@ ipcMain.handle('durango:dispatchSettled', async (_event, input) =>
     seq: dispatchSeq(input),
   })
 );
+
+// A thread a bot started still runs but needs the person (`kind: 'input'`) or
+// looks stuck (`'stuck'`, startDurangoDispatchNotices in app/durangoDispatch.ts): its bot hears it now
+// instead of only when the turn ends. Same three routes as dispatchSettled.
+// `seq` is the live run's final report number: a notice that arrives after
+// that report is dropped. Each route tries once and says `{ retry: true }` when
+// it didn't get through; the renderer sends it again only if it still holds,
+// so a notice for a request the person answered meanwhile is never resent.
+const sendBotTaskNotice = async ({ taskId, threadId, kind, key, seq, detail }) => {
+  const machineId = await getDurangoDeviceId().catch(() => null);
+  if (!machineId || !taskId) return { ok: false, retry: true };
+  const thread = threadId ? { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true } : null;
+  const text = String(detail ?? '').trim().slice(0, 3_000);
+  const notice = { kind, key, seq, detail: thread ? withThreadReportFooter(text, thread) : text };
+  try {
+    return await durangoClient.noticeBotTask({ taskId, machineId, notice });
+  } catch (failure) {
+    console.warn('[durango bots] a bot task notice failed:', failure?.message ?? failure);
+    // 4xx (a Durango without notices answers 404): final.
+    if (failure instanceof DurangoError && failure.code === 'api' && failure.status && failure.status < 500) return { ok: false };
+    return { ok: false, retry: true };
+  }
+};
+ipcMain.handle('durango:dispatchNotice', async (_event, input) => {
+  const dispatchId = typeof input?.dispatchId === 'string' ? input.dispatchId : '';
+  const threadId = typeof input?.threadId === 'string' ? input.threadId : undefined;
+  const kind = input?.kind === 'input' || input?.kind === 'stuck' ? input.kind : null;
+  const key = typeof input?.key === 'string' ? input.key.trim().slice(0, 120) : '';
+  const seq = dispatchSeq(input);
+  const detail = typeof input?.detail === 'string' ? input.detail : '';
+  if (!dispatchId || !kind || !key || seq === undefined) return { ok: false };
+  if (dispatchId.startsWith(BOT_TASK_DISPATCH_PREFIX)) {
+    return sendBotTaskNotice({ taskId: dispatchId.slice(BOT_TASK_DISPATCH_PREFIX.length), threadId, kind, key, seq, detail });
+  }
+  if (dispatchId.startsWith(LOCAL_BOT_DISPATCH_PREFIX)) {
+    return localBots.threadNotice({ key: dispatchId.slice(LOCAL_BOT_DISPATCH_PREFIX.length), threadId, kind, noticeKey: key, seq, detail });
+  }
+  return dispatchWorker.notice({ dispatchId, threadId, kind, key, seq, detail });
+});
 
 ipcMain.handle('app:openExternalUrl', async (_event, url) => {
   try {

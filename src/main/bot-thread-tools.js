@@ -80,6 +80,22 @@ export const threadReportText = ({ summary, waiting, later = false } = {}) => {
   return later ? `A later report from the thread, after its earlier one:\n\n${text}` : text;
 };
 
+/**
+ * What a bot hears from a thread it started that is still running: it is
+ * blocked on the person (`input`: an approval, a question, an action), or it
+ * went quiet with nothing of its own to wait on (`stuck`). Durango's own copy:
+ * threadNoticeText in chat/convex/botPolicy.ts.
+ */
+export const threadNoticeText = (title, kind, detail) => {
+  const name = String(title ?? '').replace(/\s+/g, ' ').trim().slice(0, 120) || 'Durango Code thread';
+  const head =
+    kind === 'input'
+      ? `NEEDS THE PERSON: the task "${name}" is blocked: its thread is waiting for the person and does nothing until they answer. Tell the person now, in your reply, what it's waiting for; they answer it in that thread in Durango Code. This isn't its report: it reports when its work ends.`
+      : `LOOKS STUCK: the task "${name}" is still running but has shown no progress for a while, and it isn't waiting on anything it started itself (a command, a subagent, a background wait). Check before you assume it hung (read the thread, or send it a message), and tell the person if it needs them. This isn't its report.`;
+  const body = String(detail ?? '').trim();
+  return body ? `${head}\n\n${body}` : head;
+};
+
 const MAX_LISTED = 40;
 
 export const BOT_THREAD_TOOLS = [

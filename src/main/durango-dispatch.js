@@ -919,6 +919,32 @@ export const createDispatchWorker = ({
       const result = await queueReport(entry, body, { retries: reportRetryDelaysMs });
       return { ok: result !== 'failed' && result !== 'retry', result, ...(result === 'retry' ? { retry: true } : {}) };
     },
+    /**
+     * The dispatched thread still runs but needs the person (`kind: 'input'`)
+     * or looks stuck (`'stuck'`): Durango passes it to the bot whose task this
+     * is (a Durango Chat dispatch takes nothing). `seq`: the live run's final
+     * report number, so Durango drops it once that run has reported. One
+     * attempt: `{ retry: true }` when it didn't get through, and the renderer
+     * sends it again only if it still holds (the request may be answered by
+     * then).
+     */
+    async notice({ dispatchId, threadId, kind, key, seq, detail }) {
+      if (!dispatchId || cancelled.has(dispatchId)) return { ok: true, skipped: true };
+      const machineId = await machineIdForReports();
+      if (!machineId) return { ok: false, retry: true };
+      const body = {
+        machineId,
+        notice: { kind, key, seq, detail: truncateText(detail, DISPATCH_SUMMARY_MAX_CHARS) },
+        ...(threadId ? { codeThreadId: threadId } : {}),
+      };
+      try {
+        const result = await client.noticeDispatch(dispatchId, body);
+        return { ok: result.ok !== false, ...(result.stale ? { stale: true } : {}) };
+      } catch (error) {
+        if (error instanceof DurangoError && error.code === 'api' && error.status && error.status < 500) return { ok: false };
+        return { ok: false, retry: true };
+      }
+    },
     /** Quit: stop polling and heartbeats (in-flight runs die with the app). */
     stop() {
       settings = { ...settings, enabled: false };
