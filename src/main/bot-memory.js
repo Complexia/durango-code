@@ -70,14 +70,24 @@ export const parseCompaction = (text, previousEarlier = null) => {
   return { earlier: keptEarlier ? clip(keptEarlier, EARLIER_HISTORY_MAX_CHARS) : null, summary: clip(summary, SUMMARY_MAX_CHARS) };
 };
 
+/**
+ * Where the bot's memory starts in its instructions. It is their last section,
+ * here and in Durango's cloud (chat/andromedus/lib/bots/prompt.ts uses the
+ * same heading and intro): a machine reply keeps its session across a new summary
+ * (bot-sessions.js splitMemorySection).
+ */
+export const MEMORY_SECTION_HEADING = '## Your earlier conversation with the person (summary)';
+/** The memory section's first paragraph (the same text in Durango's cloud). */
+export const MEMORY_SECTION_INTRO =
+  "Older messages of your thread were condensed into this memory; the messages after it follow in full. When you need a detail it doesn't have (exact wording, a link, a number, a name, what was said or decided when), search_history finds the older messages.";
+
 /** The bot's memory as a section of its instructions (null without one). */
 export const memorySection = ({ summary, earlier }) => {
   if (!str(summary).trim()) return null;
-  const intro =
-    "Older messages of your thread were condensed into this memory; the messages after it follow in full. When you need a detail it doesn't have (exact wording, a link, a number, a name, what was said or decided when), search_history finds the older messages.";
+  const intro = MEMORY_SECTION_INTRO;
   return str(earlier).trim()
-    ? `## Your earlier conversation with the person (summary)\n\n${intro}\n\n### Earlier history (condensed)\n\n${str(earlier).trim()}\n\n### Recent conversation\n\n${str(summary).trim()}`
-    : `## Your earlier conversation with the person (summary)\n\n${intro}\n\n${str(summary).trim()}`;
+    ? `${MEMORY_SECTION_HEADING}\n\n${intro}\n\n### Earlier history (condensed)\n\n${str(earlier).trim()}\n\n### Recent conversation\n\n${str(summary).trim()}`
+    : `${MEMORY_SECTION_HEADING}\n\n${intro}\n\n${str(summary).trim()}`;
 };
 
 export const SEARCH_HISTORY_TOOL = {

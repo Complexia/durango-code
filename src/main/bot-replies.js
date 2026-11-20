@@ -32,6 +32,8 @@ const withRunOn = (definition) =>
     : definition;
 import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles, messageMediaOf } from './bot-reply-extras.js';
 import {
+  BOT_SESSION_COLD_MS,
+  BOT_SESSION_MAX_TOKENS,
   BOT_SESSION_RESET_TOKENS,
   contextTokensOf,
   createBotSessionStore,
@@ -42,6 +44,7 @@ import {
   planBotPrompt,
   replyUsageOf,
   sessionBasis,
+  splitMemorySection,
 } from './bot-sessions.js';
 
 export { createBotSessionStore };
@@ -318,7 +321,27 @@ const toolDenial = (toolName, accessMode) => {
   return `No one is at this machine to approve ${toolName} for this bot reply (it runs with the machine's ${accessMode} access). Do without it, or say in your reply what you would need.`;
 };
 
+const str = (value) => (typeof value === 'string' ? value : '');
+
 const defaultClaudeEnv = () => withClaudeEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' });
+
+/**
+ * A bot reply's Claude Code environment: the hour-long prompt cache (Claude
+ * Code's default on a Claude subscription; an API key's default is 5
+ * minutes), since a bot's conversation is picked up again after the person's
+ * pauses. The person's own setting wins.
+ */
+export const botClaudeEnv = (baseEnv) =>
+  str(baseEnv?.CLAUDE_CODE_PROMPT_CACHE_TTL).trim() ? baseEnv : { ...baseEnv, CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' };
+
+const truthyEnv = (value) => /^(1|true|yes|on)$/i.test(str(value).trim());
+
+/** How long a kept session's prompt cache lasts with that environment, less a margin (bot-sessions.js `cold`). */
+export const botCacheColdMs = (baseEnv) => {
+  const resolved = botClaudeEnv(baseEnv ?? {});
+  if (truthyEnv(resolved.FORCE_PROMPT_CACHING_5M)) return 4.5 * 60_000;
+  return str(resolved.CLAUDE_CODE_PROMPT_CACHE_TTL).trim().toLowerCase() === '1h' ? BOT_SESSION_COLD_MS : 4.5 * 60_000;
+};
 
 /**
  * One prompt, one answer, no tools (a local bot's history summary). deps:
@@ -386,7 +409,8 @@ export const createClaudeOneShot = ({
  *   ([{ name, path }], already limited to the ones allowed for Durango)
  * - sessions: createBotSessionStore(...) (bot-sessions.js): each bot's kept
  *   Claude Code session, resumed by its next reply (null: a fresh session every reply)
- * - maxPromptTokens / sessionResetTokens: the prompt size limits (bot-sessions.js)
+ * - maxPromptTokens / sessionResetTokens / sessionMaxTokens: the prompt and session size limits (bot-sessions.js)
+ * - sessionColdMs: a kept session unused this long starts over (default: from the prompt cache's TTL)
  * - log(...): one line per reply with its token usage
  *
  * lane.threads: how the reply starts Durango Code threads in a project
@@ -422,6 +446,8 @@ export const createClaudeLaneRunner = ({
   sessions = null,
   maxPromptTokens = maxPromptTokensFromEnv(),
   sessionResetTokens = BOT_SESSION_RESET_TOKENS,
+  sessionMaxTokens = BOT_SESSION_MAX_TOKENS,
+  sessionColdMs = null,
   log = (...args) => console.info('[bot replies]', ...args),
 }) => async (lane, ctx) => {
   const accessMode = ctx.accessMode || 'read-only';
@@ -514,7 +540,11 @@ export const createClaudeLaneRunner = ({
   // One kept session per bot and model: replies to the person (the bot's
   // model) and routine runs (its cheap routine model) don't reset each other.
   const sessionKey = lane.model ? `${lane.botId}__${String(lane.model).replace(/[^A-Za-z0-9_-]/g, '_')}` : lane.botId;
-  const basis = sessionBasis({ systemPrompt: systemAppend, model: lane.model, tools: lane.tools });
+  // Its basis leaves out the bot's summary: a kept session goes on with the
+  // instructions it started with (the summary it had then) after compaction.
+  const { steady: steadyPrompt, memory } = splitMemorySection(lane.systemPrompt);
+  const basis = sessionBasis({ systemPrompt: projectsNote ? `${steadyPrompt}\n\n${projectsNote}` : steadyPrompt, model: lane.model, tools: lane.tools });
+  const coldAfterMs = sessionColdMs ?? botCacheColdMs(env());
   // Checked out from here until the reply ends (the `finally` below hands it
   // back); nothing that can throw runs before that `try` without handing it back.
   const claimed = keptSessions ? await keptSessions.begin(sessionKey) : { state: null, busy: false };
@@ -530,6 +560,9 @@ export const createClaudeLaneRunner = ({
           systemTokens: estimateTextTokens(systemAppend),
           maxPromptTokens: budget,
           sessionResetTokens,
+          sessionMaxTokens,
+          coldAfterMs,
+          memory,
         })
       : {
           mode: 'fresh',
@@ -678,6 +711,9 @@ export const createClaudeLaneRunner = ({
     const abortController = new AbortController();
     const attempt = {
       model: lane.model,
+      // A resumed session goes on with the instructions it started with (its
+      // cache); a fresh one gets the bot's current ones.
+      systemAppend: attemptPlan.mode === 'resume' && typeof attemptPlan.systemAppend === 'string' ? attemptPlan.systemAppend : systemAppend,
       sawInit: false,
       sessionId: null,
       result: null,
@@ -707,7 +743,7 @@ export const createClaudeLaneRunner = ({
         options: {
           cwd,
           ...(lane.model ? { model: lane.model } : {}),
-          systemPrompt: { type: 'preset', preset: 'claude_code', append: systemAppend },
+          systemPrompt: { type: 'preset', preset: 'claude_code', append: attempt.systemAppend },
           settingSources: ['user', 'project', 'local'],
           includePartialMessages: true,
           ...(projects.length ? { additionalDirectories: projects.map((project) => project.path) } : {}),
@@ -742,11 +778,7 @@ export const createClaudeLaneRunner = ({
           stderr: (data) => {
             attempt.stderrTail = `${attempt.stderrTail}${data}`.slice(-2000);
           },
-          // A bot's conversation is picked up again after the person's pauses
-          // (often more than 5 minutes): the hour-long prompt cache (Claude
-          // Code's default on a Claude subscription; an API key's default is 5
-          // minutes). The person's own setting wins.
-          env: baseEnv?.CLAUDE_CODE_PROMPT_CACHE_TTL ? baseEnv : { ...baseEnv, CLAUDE_CODE_PROMPT_CACHE_TTL: '1h' },
+          env: botClaudeEnv(baseEnv),
         },
       });
       for await (const message of query) {
@@ -882,7 +914,9 @@ export const createClaudeLaneRunner = ({
   let attempt;
   let resumeFailed = false;
   try {
-    attempt = await runAttempt(plan.mode === 'resume' ? { ...plan, sessionId: claimed.state.sessionId } : plan);
+    attempt = await runAttempt(
+      plan.mode === 'resume' ? { ...plan, sessionId: claimed.state.sessionId, systemAppend: claimed.state.systemAppend } : plan
+    );
     if (plan.mode === 'resume' && retryableHere(attempt)) {
       // The kept session couldn't be resumed (missing, broken): start over fresh.
       resumeFailed = true;
@@ -902,6 +936,8 @@ export const createClaudeLaneRunner = ({
           ? {
               sessionId: attempt.sessionId,
               basis,
+              systemAppend: attempt.systemAppend,
+              memoryKey: plan.memoryKey,
               model: lane.model ?? null,
               seenSeqs: [...plan.seenSeqs, ...deliveredSeqs].slice(-4_000),
               // This reply, as the thread stores it (its message id).

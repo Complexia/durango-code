@@ -12,6 +12,8 @@ import path from 'node:path';
 import { DurangoError, accountKeyOf, createDurangoClient, normalizeBotLane } from '../src/main/durango-client.js';
 import { buildMachinePayload, createDispatchWorker } from '../src/main/durango-dispatch.js';
 import {
+  botCacheColdMs,
+  botClaudeEnv,
   BOT_INBOX_HEADER,
   BOT_REPLIES_CAPABILITY,
   BOT_REPLY_MESSAGES_FEATURE,
@@ -27,7 +29,8 @@ import {
   saveLaneAttachments,
 } from '../src/main/bot-replies.js';
 import { createBotThreadTools, threadReportFooter, withThreadReportFooter } from '../src/main/bot-thread-tools.js';
-import { cutMiddle, estimateTextTokens, maxPromptTokensFromEnv, planBotPrompt } from '../src/main/bot-sessions.js';
+import { MEMORY_SECTION_HEADING, MEMORY_SECTION_INTRO, memorySection } from '../src/main/bot-memory.js';
+import { cutMiddle, estimateTextTokens, maxPromptTokensFromEnv, planBotPrompt, sessionBasis, splitMemorySection } from '../src/main/bot-sessions.js';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-bot-replies-'));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1776,7 +1779,7 @@ try {
   await test('kept session: a resumed session that would pass the limit starts over, trimmed', async () => {
     const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-f') });
     const sdk = sessionSdk({ window: 50_000 });
-    const runLane = sdkRunner(sdk, { sessions, maxPromptTokens: 60_000 });
+    const runLane = sdkRunner(sdk, { sessions, maxPromptTokens: 60_000, sessionMaxTokens: 60_000 });
     await runLane(sessionLane([row(1, 'user', 'hi')], [1]), sessionCtx());
     // While away, the cloud answered a lot.
     const away = Array.from({ length: 10 }, (_, index) => row(10 + index, index % 2 ? 'assistant' : 'user', 'w'.repeat(20_000)));
@@ -1784,6 +1787,68 @@ try {
     assert.equal(sdk.runs[1].options.resume, undefined);
     assert.equal(result.usage.reason, 'size');
     assert.ok(estimateTextTokens(textOf(sdk.runs[1].inputs[0])) <= 60_000);
+  });
+
+  await test('kept session: a new summary keeps the session and the instructions it started with', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-memory') });
+    const sdk = sessionSdk();
+    const runLane = sdkRunner(sdk, { sessions });
+    const withMemory = (summary, job = 'You are Scout.') => `${job}\n\n${memorySection({ summary })}`;
+    const history = [row(1, 'user', 'hi')];
+    await runLane(sessionLane(history, [1], { systemPrompt: withMemory('They said hello.') }), sessionCtx());
+    // Compaction ran: only the summary changed.
+    const next = [...history, { id: 'msg_1', seq: 2, role: 'assistant', text: 'Done.' }, row(3, 'user', 'again')];
+    const kept = await runLane(sessionLane(next, [3], { systemPrompt: withMemory('They said hi twice.') }), sessionCtx());
+    assert.equal(sdk.runs[1].options.resume, 'sess-1', 'resumed across the new summary');
+    assert.equal(kept.usage.reason, 'resume');
+    assert.match(sdk.runs[1].options.systemPrompt.append, /They said hello\./, 'with the instructions it started with (its cache)');
+    assert.doesNotMatch(sdk.runs[1].options.systemPrompt.append, /twice/);
+    // ...and the new summary goes in its prompt once (it may cover messages answered elsewhere, then compacted).
+    assert.match(textOf(sdk.runs[1].inputs[0]), /^<memory_updated>[\s\S]*They said hi twice\.\n<\/memory_updated>/);
+    const next2 = [...next, { id: 'msg_1b', seq: 4, role: 'assistant', text: 'Done.' }, row(5, 'user', 'and again')];
+    await runLane(sessionLane(next2, [5], { systemPrompt: withMemory('They said hi twice.'), laneId: 'lane_m3' }), sessionCtx());
+    assert.equal(sdk.runs[2].options.resume, 'sess-1');
+    assert.doesNotMatch(textOf(sdk.runs[2].inputs[0]), /memory_updated/, 'not again');
+    assert.match(sdk.runs[2].options.systemPrompt.append, /They said hello\./, 'still the instructions it started with');
+    // The job changed: a new basis, and the fresh session gets the current summary.
+    const later = [...next2, { id: 'msg_2', seq: 6, role: 'assistant', text: 'Done.' }, row(7, 'user', 'more')];
+    const reset = await runLane(sessionLane(later, [7], { systemPrompt: withMemory('They said hi twice.', 'You are Scout, a chef.'), laneId: 'lane_m4' }), sessionCtx());
+    assert.equal(reset.usage.reason, 'basis');
+    assert.match(sdk.runs[3].options.systemPrompt.append, /They said hi twice\./);
+
+    const section = memorySection({ summary: 'sum' });
+    assert.deepEqual(splitMemorySection(`A\n\n${section}`), { steady: 'A', memory: section });
+    assert.deepEqual(splitMemorySection('A only'), { steady: 'A only', memory: '' });
+    assert.equal(splitMemorySection(section).steady, '');
+    // The heading alone (say, in the bot's job text) is not the memory: a later edit still changes the steady part.
+    const job = `Write recaps titled\n${MEMORY_SECTION_HEADING}\n\nthen more job text`;
+    assert.equal(splitMemorySection(`${job}\n\n${section}`).steady, job);
+    assert.equal(splitMemorySection(job).steady, job);
+    // A copy of the section inside the summary: split at the first, the real one.
+    assert.equal(splitMemorySection(`A\n\n${memorySection({ summary: `quoted:\n${MEMORY_SECTION_HEADING}\n\n${MEMORY_SECTION_INTRO}` })}`).steady, 'A');
+
+  });
+
+  await test('kept session: kept well past a fresh start size; an expired cache starts over', async () => {
+    const session = { history: [row(1, 'user', 'hi'), { id: 'm', seq: 2, role: 'assistant', text: 'ok' }, row(3, 'user', 'next')], answering: [3], context: [] };
+    const now = Date.parse('2026-11-20T10:00:00Z');
+    const state = { sessionId: 's', basis: 'b', seenSeqs: [1, 2], seenIds: [], contextKeys: [], contextTokens: 120_000, updatedAt: now - 10 * 60_000 };
+    const warm = planBotPrompt({ botName: 'Scout', session, state, basis: 'b', now });
+    assert.equal(warm.mode, 'resume', 'a 120K session is kept (fresh sessions start at 70-90K)');
+    const big = planBotPrompt({ botName: 'Scout', session, state: { ...state, contextTokens: 170_000 }, basis: 'b', now });
+    assert.equal(big.reason, 'size');
+    const cold = planBotPrompt({ botName: 'Scout', session, state: { ...state, updatedAt: now - 2 * 3_600_000 }, basis: 'b', now });
+    assert.deepEqual([cold.mode, cold.reason, cold.keep], ['fresh', 'cold', true]);
+    assert.match(cold.prompt, /<conversation_so_far>/);
+    const short = planBotPrompt({ botName: 'Scout', session, state, basis: 'b', now, coldAfterMs: 5 * 60_000 });
+    assert.equal(short.reason, 'cold', 'a 5-minute cache TTL goes cold sooner');
+    assert.notEqual(sessionBasis({ systemPrompt: 'a', model: 'm', tools: [] }), sessionBasis({ systemPrompt: 'b', model: 'm', tools: [] }));
+    // The cache TTL the SDK gets decides when a session goes cold.
+    assert.equal(botCacheColdMs({}), 55 * 60_000);
+    assert.equal(botCacheColdMs({ CLAUDE_CODE_PROMPT_CACHE_TTL: '' }), 55 * 60_000, 'empty = the 1h default');
+    assert.equal(botCacheColdMs({ CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }), 4.5 * 60_000);
+    assert.equal(botCacheColdMs({ FORCE_PROMPT_CACHING_5M: '1' }), 4.5 * 60_000);
+    assert.equal(botClaudeEnv({ CLAUDE_CODE_PROMPT_CACHE_TTL: '' }).CLAUDE_CODE_PROMPT_CACHE_TTL, '1h');
   });
 
   await test('kept session: one per bot and model, so routine runs on the cheap model do not reset the main one', async () => {

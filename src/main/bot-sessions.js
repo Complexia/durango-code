@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { MEMORY_SECTION_HEADING, MEMORY_SECTION_INTRO } from './bot-memory.js';
 
 // Bot sessions: one resumed Claude Code session per bot, so a bot reply on
 // this machine reads its conversation from the prompt cache instead of
@@ -15,11 +16,22 @@ import path from 'node:path';
 // elsewhere meanwhile, the new ones) and this turn's context. The session
 // starts over, seeded with the summary (in the system prompt) and the recent
 // messages, when:
-// - its basis changes: the bot's appended system prompt (a new summary after
-//   compaction, a job or project note change), its model or its tools;
+// - its basis changes: the bot's appended system prompt (a job or project
+//   note change), its model or its tools. A new summary after compaction is
+//   not one: the kept session saw those messages itself, so it goes on with
+//   the system prompt it started with (its cache stays valid) and the next
+//   fresh session gets the new summary;
 // - it is missing or broken (a failed, stopped or crashed reply drops it);
+// - its prompt cache has expired (`coldAfterMs` since its last reply): a
+//   resume would write the whole session to the cache again, a fresh start
+//   only the summary and the recent messages;
 // - its context grew past `sessionResetTokens` (tool results pile up in a
-//   session), or the next prompt would pass `maxPromptTokens`.
+//   session), or the next prompt would take it past `sessionMaxTokens`.
+// A fresh session already starts at 70-90K tokens (Claude Code's own prompt,
+// the bot's instructions and summary, the recent messages), and starting over
+// writes all but Claude Code's part to the cache again (at the 1-hour price,
+// twice the input price), while a resumed reply reads its context at a tenth
+// of the input price: so a session is kept until well past that.
 // Sessions are kept per bot and model (replies to the person and routine runs
 // use different models, so different caches anyway).
 // A second reply for the same bot while one runs gets a fresh session of its
@@ -39,7 +51,11 @@ import path from 'node:path';
 /** The bot's part of a reply's prompt (its system prompt and the conversation) stays under this. */
 export const BOT_MAX_PROMPT_TOKENS = 150_000;
 /** A resumed session whose context passed this starts over (tool results pile up in a session). */
-export const BOT_SESSION_RESET_TOKENS = 100_000;
+export const BOT_SESSION_RESET_TOKENS = 160_000;
+/** A resumed session's context plus the next prompt stays under this (else it starts over). */
+export const BOT_SESSION_MAX_TOKENS = 180_000;
+/** A kept session unused this long has lost its prompt cache (1-hour TTL): it starts over instead. */
+export const BOT_SESSION_COLD_MS = 55 * 60_000;
 /** Older messages above this are cut in the middle once the prompt is over budget (as in the cloud). */
 export const BOT_MAX_OLDER_MESSAGE_TOKENS = 6_000;
 /** Any one message above this (a huge paste, a long task report) is cut in the middle. */
@@ -102,6 +118,28 @@ export const sessionBasis = ({ systemPrompt, model, tools }) =>
   ).slice(0, 32);
 
 const contextKey = (text) => hash(text).slice(0, 16);
+
+const MEMORY_MARKER = `${MEMORY_SECTION_HEADING}\n\n${MEMORY_SECTION_INTRO}`;
+
+/**
+ * The bot's instructions split at its memory (their last section: bot-memory.js
+ * MEMORY_SECTION_HEADING and its intro paragraph, the first place they appear
+ * at the start of a line): `steady` is what a kept session depends on (its
+ * basis), `memory` the summary that compaction rewrites. Without that
+ * section it is all steady. Pure.
+ */
+export const splitMemorySection = (systemPrompt) => {
+  const text = str(systemPrompt);
+  const at = text.startsWith(MEMORY_MARKER) ? 0 : text.indexOf(`\n${MEMORY_MARKER}`);
+  if (at < 0) return { steady: text, memory: '' };
+  return { steady: text.slice(0, at).trimEnd(), memory: text.slice(at).trim() };
+};
+
+const memoryKeyOf = (memory) => hash(str(memory)).slice(0, 16);
+
+/** The bot's new summary, for a kept session that started with an older one. */
+const memoryUpdateBlock = (memory) =>
+  `<memory_updated>\nYour memory was compacted since this conversation started here. This replaces the summary in your instructions (it may cover messages you haven't seen in this conversation):\n\n${str(memory).trim()}\n</memory_updated>`;
 
 /**
  * A lane's structured conversation (`lane.session`), validated:
@@ -231,8 +269,9 @@ export const renderFreshPrompt = ({ botName, earlier, answering, context, omitte
     .join('\n\n');
 
 /** A kept session's next prompt: what it hasn't seen, the new messages, the changed context. Pure. */
-export const renderResumePrompt = ({ botName, unseen, answering, context, unchangedNote }) =>
+export const renderResumePrompt = ({ botName, unseen, answering, context, unchangedNote, memoryUpdate = null }) =>
   [
+    memoryUpdate ? memoryUpdateBlock(memoryUpdate) : null,
     unseen.length
       ? `<since_your_last_reply>\nMessages in your thread since your last reply in this conversation (answered by another reply of yours, or that came in meanwhile), oldest first:\n\n${unseen
           .map((row) => renderRow(row, botName))
@@ -254,6 +293,12 @@ const capList = (values) => [...new Set(values)].slice(-SEEN_MAX);
  * - basis: sessionBasis(...) of this reply
  * - busy: another reply of this bot holds the kept session
  * - systemTokens: estimated tokens of the bot's appended system prompt
+ * - now / coldAfterMs: a kept session last used (state.updatedAt) longer ago
+ *   than `coldAfterMs` starts over (its prompt cache expired)
+ * - memory: the bot's current memory section (splitMemorySection). A kept
+ *   session keeps the instructions it started with; when the memory changed
+ *   since (state.memoryKey), the new one goes in its next prompt, since
+ *   compaction may have folded in messages it never saw (answered elsewhere).
  * → { mode: 'resume' | 'fresh', keep, reason, prompt, estimatedTokens,
  *     omitted, shrunk, compact, seenSeqs, seenIds, contextKeys }
  * `keep`: whether this reply's session is kept for the next one.
@@ -269,7 +314,12 @@ export const planBotPrompt = ({
   systemTokens = 0,
   maxPromptTokens = BOT_MAX_PROMPT_TOKENS,
   sessionResetTokens = BOT_SESSION_RESET_TOKENS,
+  sessionMaxTokens = BOT_SESSION_MAX_TOKENS,
+  now = Date.now(),
+  coldAfterMs = BOT_SESSION_COLD_MS,
+  memory = '',
 }) => {
+  const memoryKey = memoryKeyOf(memory);
   const answeringSet = new Set(session.answering);
   const answeringRows = session.history.filter((row) => answeringSet.has(row.seq));
   const earlierRows = session.history.filter((row) => !answeringSet.has(row.seq));
@@ -281,6 +331,7 @@ export const planBotPrompt = ({
   if (!busy && state) {
     if (state.basis !== basis || !state.sessionId) reason = 'basis';
     else if ((state.contextTokens ?? 0) > sessionResetTokens) reason = 'size';
+    else if (Number.isFinite(state.updatedAt) && now - state.updatedAt > coldAfterMs) reason = 'cold';
   }
   if (reason === 'resume') {
     const seenSeqs = new Set(state.seenSeqs ?? []);
@@ -289,20 +340,21 @@ export const planBotPrompt = ({
     const sentKeys = new Set(state.contextKeys ?? []);
     const parts = session.context.filter((part) => !(part.steady && sentKeys.has(contextKey(part.text))));
     const unchangedNote = parts.length < session.context.length;
-    const budget = maxPromptTokens - (state.contextTokens ?? 0);
+    const memoryUpdate = (state.memoryKey ?? memoryKeyOf('')) !== memoryKey && str(memory).trim() ? memory : null;
+    const budget = Math.max(sessionMaxTokens, maxPromptTokens) - (state.contextTokens ?? 0);
     const fit = fitConversation({
       earlier: unseenAll,
       answering: answeringRows,
       botName,
       budget: Number.MAX_SAFE_INTEGER,
-      fixedTokens: contextTokens(parts),
+      fixedTokens: contextTokens(parts) + (memoryUpdate ? estimateTextTokens(memoryUpdateBlock(memoryUpdate)) : 0),
     });
     if (fit.estimatedTokens <= budget) {
       return {
         mode: 'resume',
         keep: true,
         reason,
-        prompt: renderResumePrompt({ botName, unseen: fit.earlier, answering: fit.answering, context: parts, unchangedNote }),
+        prompt: renderResumePrompt({ botName, unseen: fit.earlier, answering: fit.answering, context: parts, unchangedNote, memoryUpdate }),
         estimatedTokens: (state.contextTokens ?? 0) + fit.estimatedTokens,
         omitted: 0,
         shrunk: fit.shrunk,
@@ -310,6 +362,7 @@ export const planBotPrompt = ({
         seenSeqs: capList([...(state.seenSeqs ?? []), ...session.history.map((row) => row.seq)]),
         seenIds: capList([...(state.seenIds ?? []), ...session.history.map((row) => row.id).filter(Boolean)]),
         contextKeys: capList([...(state.contextKeys ?? []), ...session.context.filter((part) => part.steady).map((part) => contextKey(part.text))]),
+        memoryKey,
       };
     }
     reason = 'size';
@@ -334,6 +387,7 @@ export const planBotPrompt = ({
     seenSeqs: capList(session.history.map((row) => row.seq)),
     seenIds: capList(session.history.map((row) => row.id).filter(Boolean)),
     contextKeys: capList(session.context.filter((part) => part.steady).map((part) => contextKey(part.text))),
+    memoryKey,
   };
 };
 
