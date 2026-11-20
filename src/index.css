@@ -9116,6 +9116,17 @@ html.theme-light .setting-row .release-notes-list {
   flex-shrink: 0;
 }
 
+/* A bot reply's thread that lives on another computer: its title, not a link. */
+.thread-reference.is-elsewhere {
+  opacity: 0.75;
+  cursor: default;
+}
+
+.thread-reference.is-elsewhere:hover {
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  background: var(--accent-soft);
+}
+
 .message.user .thread-reference {
   border-color: rgb(255 255 255 / 35%);
   background: rgb(255 255 255 / 16%);

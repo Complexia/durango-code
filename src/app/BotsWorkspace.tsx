@@ -1358,7 +1358,7 @@ const BotPane: React.FC<{
   const starting = !bot.paused && live.length === 0 && (working || pending.some((message) => message.sent));
   const liveRow = (reply: DesktopBotLive) => (
     <AssistantRow key={`live-${reply.messageId}`} bot={bot}>
-      {reply.content ? <MarkdownContent content={reply.content} /> : null}
+      {reply.content ? <MarkdownContent content={reply.content} botRefs /> : null}
       <div className="mt-1 flex items-center gap-1.5 text-[11.5px] text-neutral-500">
         <Loader2 size={11} className="animate-spin" />
         {reply.activeTool ? `Using ${reply.activeTool}` : reply.content ? 'Writing…' : 'Thinking…'}
@@ -2303,7 +2303,7 @@ const BotMessage: React.FC<{
     const showsFiles = files.length > 0 || Boolean(message.cards?.some((card) => card.component === 'asset-gallery'));
     return (
       <AssistantRow bot={bot} copy={copyText(message.content, message.files)}>
-        <MarkdownContent content={message.content} pathPreviews={!showsFiles} />
+        <MarkdownContent content={message.content} pathPreviews={!showsFiles} botRefs />
         <BotFileGallery files={files} />
         {message.cards?.length ? <BotCards cards={message.cards} handlers={handlers} answeredQuestions={answeredQuestions} /> : null}
         {via && <div className="mt-1 text-[11px] text-neutral-600">{via}</div>}

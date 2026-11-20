@@ -12,6 +12,7 @@ import { CodeBlock } from './CodeBlock';
 import { fenceLanguage } from './codeHighlight';
 import { MermaidBlock } from './MermaidBlock';
 import { chatIdFromReference, chatReferencePattern, knownDurangoChat, knownDurangoChats, knownDurangoChatUrl } from './durangoChats';
+import { BotRefLink, BotRefsContext, parseBotRefHref, remarkBotRefs } from './botRefs';
 
 // Candidate base directories (in priority order) used to resolve relative
 // media paths that agents emit in markdown — the thread's project path, plus
@@ -174,10 +175,11 @@ export const ChatReferenceLink: React.FC<{ reference: string; children: React.Re
 type ReferenceMatch = { kind: 'thread' | 'chat'; start: number; text: string; reference: string };
 
 // @thread and @chat references in one pass, in text order. Their prefixes
-// differ, so matches never overlap.
-const findReferences = (text: string): ReferenceMatch[] => {
+// differ, so matches never overlap. `threads` false: @chat only (bot replies,
+// whose @thread refs remarkBotRefs links).
+const findReferences = (text: string, threads = true): ReferenceMatch[] => {
   const matches: ReferenceMatch[] = [];
-  if (text.includes('@thread:')) {
+  if (threads && text.includes('@thread:')) {
     for (const match of text.matchAll(threadReferencePattern)) {
       matches.push({ kind: 'thread', start: match.index ?? 0, text: match[0], reference: match[1] });
     }
@@ -230,10 +232,10 @@ const referenceLinkNode = (match: Pick<ReferenceMatch, 'kind' | 'reference'>, ch
   children,
 });
 
-const splitThreadReferences = (value: string): MarkdownNode[] | null => {
+const splitThreadReferences = (value: string, threads: boolean): MarkdownNode[] | null => {
   const nodes: MarkdownNode[] = [];
   let last = 0;
-  for (const match of findReferences(value)) {
+  for (const match of findReferences(value, threads)) {
     const { start } = match;
     if (start > last) nodes.push({ type: 'text', value: value.slice(last, start) });
     nodes.push(referenceLinkNode(match, [{ type: 'text', value: match.text }]));
@@ -244,28 +246,30 @@ const splitThreadReferences = (value: string): MarkdownNode[] | null => {
   return nodes;
 };
 
-const linkThreadReferences = (node: MarkdownNode) => {
+const linkThreadReferences = (node: MarkdownNode, threads: boolean) => {
   // Text already inside a link keeps that link's target.
   if (!node.children || node.type === 'link' || node.type === 'linkReference') return;
   node.children = node.children.flatMap((child) => {
-    if (child.type === 'text' && child.value) return splitThreadReferences(child.value) ?? [child];
+    if (child.type === 'text' && child.value) return splitThreadReferences(child.value, threads) ?? [child];
     if (child.type === 'inlineCode' && child.value) {
       // Only a code span that is exactly one reference, e.g. `@thread:<id>`
       // or `@chat:<id>`.
-      const match = findReferences(child.value.trim());
+      const match = findReferences(child.value.trim(), threads);
       if (match.length === 1 && match[0].text === child.value.trim()) {
         return [referenceLinkNode(match[0], [child])];
       }
       return [child];
     }
-    linkThreadReferences(child);
+    linkThreadReferences(child, threads);
     return [child];
   });
 };
 
 // Remark plugin: turn `@thread:<id or mention token>` and `@chat:<…>` in prose
 // into links the `a` renderer below opens as threads / Durango chats.
-export const remarkThreadReferences = () => (tree: MarkdownNode) => linkThreadReferences(tree);
+export const remarkThreadReferences = () => (tree: MarkdownNode) => linkThreadReferences(tree, true);
+// Bot replies: `@chat:<…>` only; their thread refs have one matcher, remarkBotRefs (./botRefs.tsx).
+const remarkChatReferences = () => (tree: MarkdownNode) => linkThreadReferences(tree, false);
 
 export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraProps> = ({
   href,
@@ -274,7 +278,14 @@ export const MarkdownLink: React.FC<React.ComponentPropsWithoutRef<'a'> & ExtraP
   ...props
 }) => {
   const baseDirs = useContext(MarkdownBaseDirContext);
+  const botReply = useContext(BotRefsContext);
 
+  // A change or thread a bot reply names (remarkBotRefs), and @thread links there.
+  const botRef = parseBotRefHref(href);
+  if (botRef) return <BotRefLink kind={botRef.kind} id={botRef.id}>{children}</BotRefLink>;
+  if (botReply && href?.startsWith(THREAD_REFERENCE_SCHEME)) {
+    return <BotRefLink kind="thread" id={href.slice(THREAD_REFERENCE_SCHEME.length)}>{children}</BotRefLink>;
+  }
   if (href?.startsWith(THREAD_REFERENCE_SCHEME)) {
     return (
       <ThreadReferenceLink reference={href.slice(THREAD_REFERENCE_SCHEME.length)}>
@@ -535,14 +546,25 @@ export const markdownComponents = { img: MarkdownMedia, a: MarkdownLink, pre: Ma
 const markdownRemarkPlugins = [remarkGfm, remarkThreadReferences, remarkMediaPathPreviews];
 // For a message that shows its files itself (a bot reply's attachments): paths it names stay text.
 const markdownRemarkPluginsNoPathPreviews = [remarkGfm, remarkThreadReferences];
+// Bot replies: the changes and threads they name show as links with their titles (./botRefs.tsx).
+const botReplyRemarkPlugins = [remarkGfm, remarkBotRefs, remarkChatReferences, remarkMediaPathPreviews];
+const botReplyRemarkPluginsNoPathPreviews = [remarkGfm, remarkBotRefs, remarkChatReferences];
 const markdownRehypePlugins = [rehypeMarkdownTables];
 
 // The rendered blocks of one markdown document, without a container, so the
 // segments of a streaming message can share one `.markdown-content`.
-const MarkdownBlocks: React.FC<{ content: string; pathPreviews?: boolean }> = React.memo(({ content, pathPreviews = true }) => (
+const MarkdownBlocks: React.FC<{ content: string; pathPreviews?: boolean; botRefs?: boolean }> = React.memo(({ content, pathPreviews = true, botRefs = false }) => (
   <MarkdownSourceContext.Provider value={content}>
     <ReactMarkdown
-      remarkPlugins={pathPreviews ? markdownRemarkPlugins : markdownRemarkPluginsNoPathPreviews}
+      remarkPlugins={
+        botRefs
+          ? pathPreviews
+            ? botReplyRemarkPlugins
+            : botReplyRemarkPluginsNoPathPreviews
+          : pathPreviews
+            ? markdownRemarkPlugins
+            : markdownRemarkPluginsNoPathPreviews
+      }
       rehypePlugins={markdownRehypePlugins}
       urlTransform={markdownUrlTransform}
       components={markdownComponents}
@@ -552,11 +574,11 @@ const MarkdownBlocks: React.FC<{ content: string; pathPreviews?: boolean }> = Re
   </MarkdownSourceContext.Provider>
 ));
 
-export const MarkdownContent: React.FC<{ content: string; pathPreviews?: boolean }> = React.memo(({ content, pathPreviews }) => (
-  <div className="markdown-content">
-    <MarkdownBlocks content={content} pathPreviews={pathPreviews} />
-  </div>
-));
+/** `botRefs`: a bot reply, whose change and thread ids show as links with their titles (./botRefs.tsx). */
+export const MarkdownContent: React.FC<{ content: string; pathPreviews?: boolean; botRefs?: boolean }> = React.memo(({ content, pathPreviews, botRefs = false }) => {
+  const blocks = <MarkdownBlocks content={content} pathPreviews={pathPreviews} botRefs={botRefs} />;
+  return <div className="markdown-content">{botRefs ? <BotRefsContext.Provider value>{blocks}</BotRefsContext.Provider> : blocks}</div>;
+});
 
 // How large the live (re-parsed every render) tail of a streaming message may
 // grow before its stable prefix is frozen into a memoized segment.

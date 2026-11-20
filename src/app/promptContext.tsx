@@ -500,7 +500,10 @@ export const buildRemoteThreadMentionsContext = (
 
 // `@thread:<ref>` references in chat text, where <ref> is a full thread id or
 // an @thread mention token. Group 1 is the ref without the `@thread:` prefix.
-export const threadReferencePattern = /(?<![A-Za-z0-9._/-])@thread:([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/g;
+// The ref is a whole token: never the start of a longer one (`@thread:t_42`,
+// `@thread:notes.md`, `@thread:a/b`, `@thread:a\b`), which stays text.
+export const threadReferencePattern =
+  /(?<![A-Za-z0-9._/\\-])@thread:([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)(?![\w/\\-]|\.\w)/g;
 
 // Resolve a thread reference written in chat — by users or agents — to a known
 // thread: exact id first, then the id fragment that ends a mention token (or

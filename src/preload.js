@@ -475,6 +475,13 @@ contextBridge.exposeInMainWorld('orion', {
   getBotProject: (input) => ipcRenderer.invoke('bots:project', input),
   botProjectAction: (input) => ipcRenderer.invoke('bots:projectAction', input),
   botFileLinks: (input) => ipcRenderer.invoke('bots:fileLinks', input),
+  botRefs: (input) => ipcRenderer.invoke('bots:refs', input),
+  takeThreadOpenRequest: () => ipcRenderer.invoke('threads:takeOpenRequest'),
+  onThreadOpenRequest: (callback) => {
+    const listener = (_event, threadId) => callback(threadId);
+    ipcRenderer.on('threads:openRequest', listener);
+    return () => ipcRenderer.removeListener('threads:openRequest', listener);
+  },
   shipBotChange: (input) => ipcRenderer.invoke('bots:shipChange', input),
   openBotChange: (input) => ipcRenderer.invoke('bots:openChange', input),
   durangoProfileMemory: () => ipcRenderer.invoke('durango:profileMemory'),

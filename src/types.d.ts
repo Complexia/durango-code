@@ -1970,6 +1970,9 @@ type OrionCodexBrowserIntegrationStatus = {
       saveBotAttachment?: (input: { name: string; data: string }) => Promise<{ ok: boolean; file?: import('./app/bots').BotAttachmentFile; error?: string }>;
       /** Read links (an hour) for library files in bot threads, by id (signed in). */
       botFileLinks?: (input: { ids: string[] }) => Promise<{ ok: boolean; files?: import('./app/bots').BotFileLink[]; error?: string }>;
+      botRefs?: (input: { changes: string[]; threads: string[] }) => Promise<{ ok: boolean; error?: string } & Partial<import('./app/botRefs').BotRefs>>;
+      takeThreadOpenRequest?: () => Promise<string | null>;
+      onThreadOpenRequest?: (callback: (threadId: string) => void) => () => void;
       /**
        * A bot reply's Ship button (confirm first). With `threadId`: the ship request goes to the
        * thread that made the change (`notHere` when that thread isn't on this computer).

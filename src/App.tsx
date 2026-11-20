@@ -260,6 +260,7 @@ const BotsWorkspace = React.lazy(() => loadBotsWorkspace().then((module) => ({ d
 import ThemeLayer from './app/themes/ThemeLayer';
 import { CommunityInstallDialog } from './app/themes/CommunityThemes';
 import { setBotsShellSlot } from './app/botsShellSlot';
+import { useBotRefLinks } from './app/botRefLinks';
 import { BotsTabLoading, loadBotsWorkspace } from './app/SidebarModeHeader';
 // Remote control is opt-in and rarely on screen; keep its view out of the
 // startup chunk like the settings page.
@@ -1095,6 +1096,8 @@ const App: React.FC = () => {
   // Durango Source images in Markdown load as this account (./app/sourceAttachments.ts).
   const sourceAttachmentAccount = accountState.authenticated ? accountState.user?.id ?? null : null;
   useEffect(() => setSourceAttachmentAccount(sourceAttachmentAccount), [sourceAttachmentAccount]);
+  // Bot replies' change and thread links: orion://thread/<id> from durango.sh, titles per account (./app/botRefs.tsx).
+  useBotRefLinks(sourceAttachmentAccount);
   const [accountBusy, setAccountBusy] = useState(false);
   const [computerUsePerms, setComputerUsePerms] = useState<OrionComputerUsePermissions | null>(null);
   const [computerUseBusyKind, setComputerUseBusyKind] = useState<OrionComputerUsePermissionKind | null>(null);

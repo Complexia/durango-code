@@ -844,6 +844,25 @@ export const createDurangoClient = ({
         .filter((file) => str(file?.id) && /^https?:\/\//.test(str(file?.url)))
         .map((file) => ({ id: str(file.id), name: str(file.name), contentType: str(file.contentType), byteSize: Number(file.byteSize) || 0, url: str(file.url) }));
     },
+    /**
+     * Titles for the changes and threads bot replies name: `{ changes: [chg_…], threads: [id] }` →
+     * `{ changes: { [id]: { title, status, url } }, threads: { [id]: { title } } }` (only what the account can read).
+     */
+    async botRefs({ changes = [], threads = [] } = {}) {
+      const query = {};
+      if (changes.length) query.changes = changes.join(',');
+      if (threads.length) query.threads = threads.join(',');
+      const data = await request('GET', '/bots/refs', { query });
+      const out = { changes: {}, threads: {} };
+      for (const [id, ref] of Object.entries(data?.changes && typeof data.changes === 'object' ? data.changes : {})) {
+        const url = str(ref?.url);
+        if (str(ref?.title) && /^https?:\/\//.test(url)) out.changes[id] = { title: str(ref.title), status: str(ref.status), url };
+      }
+      for (const [id, ref] of Object.entries(data?.threads && typeof data.threads === 'object' ? data.threads : {})) {
+        if (str(ref?.title)) out.threads[id] = { title: str(ref.title) };
+      }
+      return out;
+    },
     /** A project's bot, created the first time: `{ name, repoId?, machineId?, projectId?, timeZone? }` → the bot. */
     async ensureProjectBot(body) {
       const data = await request('POST', '/bots/projects', { body });
@@ -1298,6 +1317,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async botFileLinks() {
       return [];
+    },
+    async botRefs() {
+      return { changes: {}, threads: {} };
     },
     async botThread() {
       return { bot: null, messages: [], live: [], hasMore: false };

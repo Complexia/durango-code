@@ -162,6 +162,7 @@ import {
   themeInstallLinkSlug,
   unshareTheme,
 } from './main/theme-community.js';
+import { createThreadOpenLinks } from './main/thread-links.js';
 import { configureT3Themes, exportThemeToT3, importT3Theme, t3FileName } from './main/theme-t3.js';
 import { createBrowserManager } from './main/browser/manager.js';
 import { browserScreenshotsDirectory } from './main/browser/security.js';
@@ -1196,6 +1197,9 @@ const handleThemeInstallLink = (rawUrl) => {
   return true;
 };
 
+// orion://thread/<id> (a thread link in a bot reply on durango.sh): opens that thread here.
+const threadOpenLinks = createThreadOpenLinks({ protocol: appProtocol, getWindow: () => BrowserWindow.getAllWindows()[0] ?? null });
+
 app.on('second-instance', (_event, argv) => {
   const callbackUrl = argv.find((arg) => isDesktopAuthCallbackUrl(arg));
   if (callbackUrl) {
@@ -1203,6 +1207,8 @@ app.on('second-instance', (_event, argv) => {
   }
   const themeLink = argv.find((arg) => themeInstallLinkSlug(arg, appProtocol));
   if (themeLink) handleThemeInstallLink(themeLink);
+  const threadLink = argv.find((arg) => arg.startsWith(`${appProtocol}://thread/`));
+  if (threadLink) threadOpenLinks.handle(threadLink);
 
   const [window] = BrowserWindow.getAllWindows();
   if (window) {
@@ -1214,6 +1220,7 @@ app.on('second-instance', (_event, argv) => {
 app.on('open-url', (event, url) => {
   event.preventDefault();
   if (handleThemeInstallLink(url)) return;
+  if (threadOpenLinks.handle(url)) return;
   void handleDesktopAuthCallback(url);
 });
 
@@ -1675,6 +1682,8 @@ app.whenReady().then(async () => {
 
   const startupThemeLink = process.argv.find((arg) => themeInstallLinkSlug(arg, appProtocol));
   if (startupThemeLink) pendingThemeInstall = themeInstallLinkSlug(startupThemeLink, appProtocol);
+  const startupThreadLink = process.argv.find((arg) => arg.startsWith(`${appProtocol}://thread/`));
+  if (startupThreadLink) threadOpenLinks.handle(startupThreadLink);
   const startupAuthUrl = process.argv.find((arg) => isDesktopAuthCallbackUrl(arg));
   if (startupAuthUrl) {
     void handleDesktopAuthCallback(startupAuthUrl);
@@ -6305,6 +6314,22 @@ ipcMain.handle('bots:send', async (_event, input) => {
     return durangoIpcError(error);
   }
 });
+
+// Titles for the changes and Durango Code threads bot replies name (shown as
+// links): from Durango, only what the account can read. Signed out: none.
+ipcMain.handle('bots:refs', async (_event, input) => {
+  const ids = (value, pattern) =>
+    [...new Set((Array.isArray(value) ? value : []).filter((id) => typeof id === 'string' && pattern.test(id)))].slice(0, 50);
+  const changes = ids(input?.changes, /^chg_[a-z0-9]{8,40}$/);
+  const threads = ids(input?.threads, /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/);
+  if ((!changes.length && !threads.length) || (await localBotsMode())) return { ok: true, changes: {}, threads: {} };
+  try {
+    return { ok: true, ...(await durangoClient.botRefs({ changes, threads })) };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+ipcMain.handle('threads:takeOpenRequest', () => threadOpenLinks.take());
 
 // Files in bot threads (what the person attached, and files a reply attached):
 // read links (an hour) from Durango, by library id. Signed out, files are on
