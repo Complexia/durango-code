@@ -61,6 +61,9 @@ import { claudeSdkSessions, createClaudeInputQueue, discardClaudeBackgroundShell
 import { unwatchUserActions, watchUserAction } from './main/user-actions.js';
 import { answerSecretRequest, listPendingSecretRequests, startSecretFileSweeps } from './main/secret-requests.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
+import { buildUsageReport, createUsageStore, latestCodexLimits } from './main/usage-stats.js';
+import { loadUsagePrices, refreshUsagePrices, usagePricesInfo } from './main/usage-pricing.js';
+import { claudeRateLimits, configureUsageLimits } from './main/usage-limits.js';
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
@@ -9170,6 +9173,58 @@ ipcMain.handle('devServers:open', async (_event, input) => {
 ipcMain.handle('devServers:kill', async (_event, input) =>
   killDevServers({ targets: Array.isArray(input?.targets) ? input.targets : [] })
 );
+
+// Usage view: token usage from the agents' session logs on this machine,
+// priced at API list prices (src/main/usage-stats.js). The first scan reads
+// every log (seconds for gigabytes); later ones read only what was appended.
+configureUsageLimits(() => app.getPath('userData'));
+let usageStore = null;
+const getUsageStore = () => {
+  usageStore ??= createUsageStore({
+    cacheFile: path.join(app.getPath('userData'), 'usage-cache.json'),
+    onProgress: (progress) => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed()) window.webContents.send('usage:progress', progress);
+      }
+    },
+  });
+  return usageStore;
+};
+
+const USAGE_RANGES = new Set(['24h', '7d', '30d', '90d']);
+const USAGE_SOURCES = new Set(['all', 'durango', 'thread', 'subagent', 'bot', 'other']);
+
+ipcMain.handle('usage:report', async (_event, input) => {
+  try {
+    const userData = app.getPath('userData');
+    await loadUsagePrices(userData);
+    void refreshUsagePrices(userData);
+    const store = getUsageStore();
+    await store.scan({ force: input?.refresh === true });
+    const links = new Map();
+    for (const link of Array.isArray(input?.links) ? input.links : []) {
+      if (typeof link?.sessionId !== 'string' || !link.sessionId) continue;
+      if (link.kind === 'thread' || link.kind === 'subagent') links.set(link.sessionId, link.kind);
+    }
+    const report = buildUsageReport(store.entries(), {
+      range: USAGE_RANGES.has(input?.range) ? input.range : '7d',
+      provider: typeof input?.provider === 'string' ? input.provider : 'all',
+      source: USAGE_SOURCES.has(input?.source) ? input.source : 'all',
+      links,
+    });
+    return {
+      ok: true,
+      report: {
+        ...report,
+        generatedAt: Date.now(),
+        prices: usagePricesInfo(),
+        limits: { claude: claudeRateLimits(), codex: latestCodexLimits(store.entries()) },
+      },
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
 
 ipcMain.handle('path:basename', (_e, p) => path.basename(p));
 ipcMain.handle('path:dirname', (_e, p) => path.dirname(p));

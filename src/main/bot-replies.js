@@ -5,6 +5,7 @@ import path from 'node:path';
 import { DurangoError } from './durango-client.js';
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
+import { recordClaudeRateLimit } from './usage-limits.js';
 import { SHIP_VIA_THREAD_MESSAGE } from './bot-thread-tools.js';
 
 // What a settle from Durango (the claim's settleThreads) can't ever do here:
@@ -758,6 +759,7 @@ export const createClaudeLaneRunner = ({
           continue;
         }
         if (message?.type === 'rate_limit_event') {
+          recordClaudeRateLimit(message);
           if (message.rate_limit_info?.status === 'rejected') attempt.rateLimited = true;
           continue;
         }

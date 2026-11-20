@@ -321,6 +321,71 @@ export type DevServerEntry = {
   threadSource: 'agent' | 'terminal' | 'session' | null;
 };
 
+export type UsageRange = '24h' | '7d' | '30d' | '90d';
+export type UsageSourceFilter = 'all' | 'durango' | 'thread' | 'subagent' | 'bot' | 'other';
+export type UsageReportInput = {
+  range: UsageRange;
+  provider: string;
+  source: UsageSourceFilter;
+  refresh?: boolean;
+  /** Agent session ids of Durango Code threads, so their usage is attributed. */
+  links: Array<{ sessionId: string; kind: 'thread' | 'subagent' }>;
+};
+export type UsageScanProgress = { done: number; total: number; scanning: boolean };
+export type UsageTokens = { input: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number };
+export type UsageRow = {
+  cost: number;
+  tokens: UsageTokens;
+  totalTokens: number;
+  sessions: number;
+  share: number;
+  tokenShare: number;
+};
+export type UsageRateWindow = {
+  used_percent?: number;
+  window_minutes?: number;
+  resets_at?: number;
+} | null;
+export type UsageReport = {
+  range: UsageRange;
+  generatedAt: number;
+  window: { start: number; end: number; bucket: 'hour' | 'day'; bucketMs: number };
+  totals: {
+    cost: number;
+    savings: number;
+    sessions: number;
+    totalTokens: number;
+    tokens: UsageTokens;
+    unpricedTokens: number;
+    ownCostTokens: number;
+  };
+  providers: Array<UsageRow & { id: string }>;
+  models: Array<UsageRow & { provider: string; model: string; priced: boolean }>;
+  sources: Array<UsageRow & { id: 'thread' | 'subagent' | 'bot' | 'other' }>;
+  series: Array<{ start: number; cost: Record<string, number>; tokens: Record<string, number> }>;
+  costByType: { input: number; cacheRead: number; cacheWrite: number; output: number; other: number };
+  costBySpeed: { standard: number; fast: number; fastPremium: number; fastTokens: number };
+  unpricedModels: string[];
+  availableProviders: string[];
+  prices: { source: 'bundled' | 'gateway'; fetchedAt: string | null };
+  limits: {
+    claude: Record<
+      string,
+      { status: string | null; utilization: number | null; resetsAt: number | null; usingOverage: boolean; overageStatus: string | null; at: number }
+    >;
+    codex: {
+      at: number;
+      value: {
+        primary?: UsageRateWindow;
+        secondary?: UsageRateWindow;
+        plan_type?: string | null;
+        credits?: { has_credits?: boolean; unlimited?: boolean; balance?: string | null } | null;
+        rate_limit_reached_type?: string | null;
+      };
+    } | null;
+  };
+};
+
 export type DevServersListResult = {
   ok: boolean;
   servers: DevServerEntry[];
@@ -1392,6 +1457,9 @@ type OrionCodexBrowserIntegrationStatus = {
       }>;
       /** `roots` are project/workspace directories; servers outside them (and unattributed to a thread) are excluded. */
       listDevServers?: (input?: { roots?: string[] }) => Promise<DevServersListResult>;
+      /** Usage view report built from the agents' session logs (see src/main/usage-stats.js). */
+      usageReport?: (input: UsageReportInput) => Promise<{ ok: true; report: UsageReport } | { ok: false; error: string }>;
+      onUsageProgress?: (callback: (progress: UsageScanProgress) => void) => () => void;
       /** Opens a validated localhost HTTP URL for a listed dev-server port. */
       openDevServer?: (input: { port: number }) => Promise<{ ok: boolean; error?: string }>;
       /** `port` re-verifies each pid still holds it, so a stale row cannot kill a recycled pid. */

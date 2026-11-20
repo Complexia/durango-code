@@ -150,6 +150,12 @@ contextBridge.exposeInMainWorld('orion', {
   shareProviderMcp: (input) => ipcRenderer.invoke('providerMcps:share', input),
   // Dev servers (Settings > Dev Servers)
   listDevServers: (input) => ipcRenderer.invoke('devServers:list', input),
+  usageReport: (input) => ipcRenderer.invoke('usage:report', input),
+  onUsageProgress: (callback) => {
+    const listener = (_event, data) => callback(data);
+    ipcRenderer.on('usage:progress', listener);
+    return () => ipcRenderer.removeListener('usage:progress', listener);
+  },
   openDevServer: (input) => ipcRenderer.invoke('devServers:open', input),
   killDevServers: (input) => ipcRenderer.invoke('devServers:kill', input),
 

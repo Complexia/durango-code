@@ -6,6 +6,7 @@ import { claudeForegroundWaitHooks } from './claude-foreground-wait.js';
 import { existsSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
+import { recordClaudeRateLimit } from './usage-limits.js';
 import { captureGitChangeSnapshot, summarizeChangedFiles } from './git-utils.js';
 import { requestSubagentSpawn, requestSubagentStop } from './mcp-bridge.js';
 import { READ_THREAD_DEFAULT_LIMIT, READ_THREAD_MAX_LIMIT, readThreadForAgent } from './thread-reader.js';
@@ -1672,6 +1673,7 @@ export const listClaudeSlashCommands = async ({ sender, threadId, projectPath })
 
 export const handleClaudeSessionMessage = async (session, message) => {
   session.lastActivityAt = Date.now();
+  recordClaudeRateLimit(message);
   if (!session.sessionId) {
     const sessionId = extractSessionIdFromJsonEvent('claude', message);
     if (sessionId) {

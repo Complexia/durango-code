@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  ChartColumn,
   Cast,
   ChevronDown,
   Cloud,
@@ -65,6 +66,8 @@ import DevServersSettings from './DevServersSettings';
 import DevicesSettings from './DevicesSettings';
 import WorkspacesSettings from './WorkspacesSettings';
 import RemoteControlSettings from './RemoteControlSettings';
+
+const UsageSettings = React.lazy(() => import('./UsageSettings'));
 import { orchestrationRoleMeta } from './promptContext';
 import type {
   AppUpdateState,
@@ -404,6 +407,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
             { id: 'dev-servers', label: 'Dev Servers', Icon: Server },
             { id: 'workspaces', label: 'Workspaces', Icon: FolderGit2 },
             { id: 'cosmetics', label: 'Themes', Icon: Palette, isNew: themesNew },
+            { id: 'usage', label: 'Usage', Icon: ChartColumn },
             { id: 'experimental', label: 'Experimental', Icon: FlaskConical },
           ].map(({ id, label, Icon, isNew }: { id: string; label: string; Icon: typeof Palette; isNew?: boolean }) => (
             <button
@@ -445,11 +449,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           {settingsTab === 'dev-servers' && 'DEV SERVERS'}
           {settingsTab === 'workspaces' && 'WORKSPACES'}
           {settingsTab === 'cosmetics' && 'THEMES'}
+          {settingsTab === 'usage' && 'USAGE'}
           {settingsTab === 'experimental' && 'EXPERIMENTAL'}
         </div>
 
         <div
-          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'cosmetics' || settingsTab === 'workspaces' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'devices' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
+          className={`settings-panel${settingsTab === 'general' || settingsTab === 'experimental' || settingsTab === 'usage' || settingsTab === 'cosmetics' || settingsTab === 'workspaces' || settingsTab === 'skills' || settingsTab === 'dev-servers' || settingsTab === 'devices' || settingsTab === 'remote-control' ? ' settings-panel-grouped' : ''}`}
         >
           {settingsTab === 'account' && (
             <>
@@ -1777,6 +1782,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
           )}
 
           {settingsTab === 'workspaces' && <WorkspacesSettings />}
+
+          {settingsTab === 'usage' && (
+            <React.Suspense fallback={null}>
+              <UsageSettings />
+            </React.Suspense>
+          )}
 
           {settingsTab === 'cosmetics' && (
             <>

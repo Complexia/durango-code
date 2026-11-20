@@ -128,4 +128,5 @@ export type SettingsTab =
   | 'dev-servers'
   | 'workspaces'
   | 'cosmetics'
+  | 'usage'
   | 'experimental';
