@@ -68,6 +68,19 @@ export const providerUpdaterConfigs = [
     statusCommand: ['provider', 'list'],
   },
   {
+    id: 'antigravity',
+    label: 'Antigravity',
+    command: 'agy',
+    // The release channel the official installer and `agy update` read: one
+    // manifest per platform ({ version, url, sha512 }).
+    readLatestVersion: () => readAntigravityLatestVersion(),
+    updateCommands: [['update']],
+    verifyAfterUpdate: true,
+    // Sign-in is agy's paste-the-code flow (startAntigravityLogin), not a
+    // detached login command.
+    statusCommand: ['models'],
+  },
+  {
     id: 'fx',
     label: 'fx',
     command: 'fx',
@@ -424,6 +437,41 @@ export const readClaudeLatestVersion = async (commandPath) => {
   return readNpmLatestVersion(`@anthropic-ai/claude-code@${channel}`);
 };
 
+const ANTIGRAVITY_MANIFEST_BASE =
+  'https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests';
+
+// The installer's platform key: darwin_arm64, linux_amd64(_musl), windows_amd64.
+export const antigravityPlatformKey = (platform = process.platform, arch = process.arch) => {
+  if (!['darwin', 'linux', 'win32'].includes(platform) || !['x64', 'arm64'].includes(arch)) return null;
+  const os = platform === 'win32' ? 'windows' : platform;
+  const musl =
+    platform === 'linux' &&
+    typeof process.report?.getReport === 'function' &&
+    !process.report.getReport()?.header?.glibcVersionRuntime;
+  return `${os}_${arch === 'x64' ? 'amd64' : 'arm64'}${musl ? '_musl' : ''}`;
+};
+
+export const readAntigravityLatestVersion = async () => {
+  const key = antigravityPlatformKey();
+  if (!key) return null;
+  try {
+    const response = await fetch(`${ANTIGRAVITY_MANIFEST_BASE}/${key}.json`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) return null;
+    const manifest = await response.json();
+    return typeof manifest?.version === 'string' ? parseVersion(manifest.version) : null;
+  } catch {
+    return null;
+  }
+};
+
+// `agy models` lists `<id>\t<name>` rows only when a Google sign-in works.
+export const parseAntigravityModelRows = (output) =>
+  String(output || '')
+    .split(/\r?\n/)
+    .filter((line) => /^[A-Za-z0-9][\w.\-/]*\t+\S/.test(line.trim()));
+
 export const parseJsonFromOutput = (output) => {
   const text = String(output || '').trim();
   if (!text) return null;
@@ -601,6 +649,19 @@ export const getProviderAuthStatus = async (config) => {
         status: authenticated ? 'authenticated' : lowerOutput ? 'unauthenticated' : 'unknown',
         label: authenticated ? 'Authenticated' : 'Not authenticated',
         detail: output.split(/\r?\n/).find((line) => line.trim()) || output,
+      };
+    }
+
+    if (config.id === 'antigravity') {
+      const rows = parseAntigravityModelRows(output);
+      const ready = rows.length > 0;
+      return {
+        authenticated: ready,
+        status: ready ? 'authenticated' : lowerOutput ? 'unauthenticated' : 'unknown',
+        label: ready ? 'Signed in' : 'Not signed in',
+        detail: ready
+          ? `Signed in — ${rows.length} model${rows.length === 1 ? '' : 's'} available`
+          : output.split(/\r?\n/).find((line) => line.trim() && !/^Fetching/i.test(line)) || output,
       };
     }
 
@@ -993,7 +1054,112 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
   }
 };
 
+// Antigravity sign-in. `agy acp --login` always uses Google's code flow, even
+// on a terminal: it prints a Google link whose redirect lands on an
+// antigravity.google page showing a code, then reads that code (or the
+// page's full URL) from stdin and exits 0 once the sign-in is stored in the
+// OS keyring. Durango opens the link and passes the code the user pastes
+// (submitAntigravityLoginCode). One login runs at a time.
+const ANTIGRAVITY_LOGIN_TIMEOUT_MS = 15 * 60 * 1000;
+let antigravityLogin = null;
+
+const stopAntigravityLogin = () => {
+  const login = antigravityLogin;
+  antigravityLogin = null;
+  if (!login) return;
+  clearTimeout(login.timer);
+  try {
+    login.child.kill();
+  } catch {}
+};
+
+export const parseAntigravityLoginUrl = (output) => {
+  const match = /https:\/\/accounts\.google\.com\/o\/oauth2\/[^\s"'<>]+(?=\s)/.exec(String(output || ''));
+  return match ? match[0] : null;
+};
+
+const startAntigravityLogin = () => {
+  stopAntigravityLogin();
+  const child = spawn(loginShell, ['-lc', 'agy acp --login'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+  });
+  const login = { child, output: '', exit: null, timer: null };
+  antigravityLogin = login;
+  login.timer = setTimeout(() => {
+    if (antigravityLogin === login) stopAntigravityLogin();
+  }, ANTIGRAVITY_LOGIN_TIMEOUT_MS);
+  const completion = new Promise((resolve) => {
+    child.once('error', (error) => resolve({ ok: false, error: getProcessErrorMessage(error) }));
+    child.once('exit', (code, signal) => {
+      clearTimeout(login.timer);
+      if (antigravityLogin === login) antigravityLogin = null;
+      const tail = login.output.trim().split(/\r?\n/).filter(Boolean).pop() || '';
+      resolve({
+        ok: code === 0,
+        code,
+        signal,
+        ...(code === 0 ? {} : { error: tail || `Sign-in exited with code ${code ?? signal}.` }),
+      });
+    });
+  });
+  login.exit = completion;
+  const urlReady = new Promise((resolve) => {
+    const onData = (chunk) => {
+      login.output = `${login.output}${chunk.toString()}`.slice(-20000);
+      const url = parseAntigravityLoginUrl(login.output);
+      if (url) resolve(url);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    void completion.then(() => resolve(null));
+    setTimeout(() => resolve(null), 30000);
+  });
+  return urlReady.then((url) => {
+    if (!url) {
+      if (antigravityLogin === login) stopAntigravityLogin();
+      const tail = login.output.trim().split(/\r?\n/).filter(Boolean).pop();
+      return {
+        result: { ok: false, error: tail || 'Antigravity did not print a sign-in link.' },
+        completion: null,
+      };
+    }
+    return { result: { ok: true, codeRequired: true, url }, completion };
+  });
+};
+
+// Pass the code (or the landing page's full URL) to the waiting login and
+// report whether agy accepted it.
+export const submitAntigravityLoginCode = async (code) => {
+  const login = antigravityLogin;
+  const value = String(code || '').trim();
+  if (!login) return { ok: false, error: 'The Antigravity sign-in expired. Start it again.' };
+  if (!value || /[\r\n]/.test(value)) return { ok: false, error: 'Paste the code from the Antigravity page.' };
+  try {
+    login.child.stdin.write(`${value}\n`);
+  } catch (error) {
+    return { ok: false, error: getProcessErrorMessage(error) };
+  }
+  const outcome = await Promise.race([
+    login.exit,
+    new Promise((resolve) => setTimeout(() => resolve(null), 60000)),
+  ]);
+  if (!outcome) {
+    if (antigravityLogin === login) stopAntigravityLogin();
+    return { ok: false, error: 'Antigravity did not confirm the sign-in. Start it again.' };
+  }
+  return outcome.ok ? { ok: true } : { ok: false, error: outcome.error };
+};
+
+export const cancelAntigravityLogin = () => {
+  stopAntigravityLogin();
+  return { ok: true };
+};
+
 export const authenticateProviderTool = async (providerId) => {
+  if (providerId === 'antigravity' && (await resolveCommandPath('agy'))) {
+    return startAntigravityLogin();
+  }
   const config = providerUpdaterConfigs.find((provider) => provider.id === providerId);
   if (!config) {
     return {

@@ -1122,7 +1122,16 @@ export type OpenFile = {
   diskRevision?: number;
 };
 
-export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'fx' | 'muse' | 'opencode';
+export type ProviderId =
+  | 'grok'
+  | 'codex'
+  | 'claude'
+  | 'cursor'
+  | 'kimi'
+  | 'antigravity'
+  | 'fx'
+  | 'muse'
+  | 'opencode';
 
 export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
 export type BrowserUseMode = 'disabled' | 'builtin' | 'extension' | 'mcp';
@@ -1192,6 +1201,7 @@ export const defaultProviderSettings: ProviderSettings = {
   claude: { enabled: true },
   cursor: { enabled: true },
   kimi: { enabled: true },
+  antigravity: { enabled: true },
   fx: { enabled: true },
   muse: { enabled: true },
   opencode: { enabled: true },

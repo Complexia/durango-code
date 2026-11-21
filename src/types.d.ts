@@ -1488,7 +1488,7 @@ type OrionCodexBrowserIntegrationStatus = {
       saveImageAttachment?: NonNullable<Window['orion']>['saveAttachment'];
       listAgentModels: (input?: { force?: boolean }) => Promise<Array<{
         id: string;
-        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'fx' | 'muse' | 'opencode';
+        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'antigravity' | 'fx' | 'muse' | 'opencode';
         providerLabel: string;
         label: string;
         slug: string;
@@ -1602,7 +1602,15 @@ type OrionCodexBrowserIntegrationStatus = {
       authenticateProvider: (providerId: string) => Promise<{
         ok: boolean;
         error?: string;
+        /** The sign-in finishes on a page showing a code to paste back (Antigravity). */
+        codeRequired?: boolean;
+        url?: string;
       }>;
+      submitProviderAuthCode?: (input: { providerId: string; code: string }) => Promise<{
+        ok: boolean;
+        error?: string;
+      }>;
+      cancelProviderAuth?: (providerId: string) => Promise<{ ok: boolean }>;
       onProviderAuthenticated: (
         callback: (event: { providerId: string }) => void
       ) => () => void;

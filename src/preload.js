@@ -229,6 +229,8 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('providers:updateProgress', listener);
   },
   authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
+  submitProviderAuthCode: (input) => ipcRenderer.invoke('providers:submitAuthCode', input),
+  cancelProviderAuth: (providerId) => ipcRenderer.invoke('providers:cancelAuth', providerId),
   getFxConnections: () => ipcRenderer.invoke('fx:getConnections'),
   installFx: () => ipcRenderer.invoke('fx:install'),
   connectFx: (target) => ipcRenderer.invoke('fx:connect', target),

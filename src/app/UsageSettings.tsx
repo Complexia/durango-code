@@ -810,7 +810,7 @@ const UsageSettings = React.memo(function UsageSettings() {
           </div>
 
           <p className="usage-footnote">
-            Read from Claude Code, Codex and Grok Build session logs on this Mac. Kimi Code, OpenCode, Cursor and Muse runs aren&apos;t counted yet, and runs on
+            Read from Claude Code, Codex and Grok Build session logs on this Mac. Kimi Code, Antigravity, OpenCode, Cursor and Muse runs aren&apos;t counted yet, and runs on
             your other machines stay on those machines.
             {report.unpricedModels.length > 0 &&
               ` No list price for ${report.unpricedModels.join(', ')}: ${formatUsageTokens(report.totals.unpricedTokens)} tokens are counted without a cost.`}
