@@ -816,7 +816,13 @@ export const providerJsonAdapters = {
     reasoning: () => '',
     activities: () => [],
   },
-  // fx turns only run over ACP; its driver handles every message.
+  // fx and Antigravity turns only run over ACP; their drivers handle every
+  // message.
+  antigravity: {
+    text: () => '',
+    reasoning: () => '',
+    activities: () => [],
+  },
   fx: {
     text: () => '',
     reasoning: () => '',
@@ -857,4 +863,4 @@ export const isTerminalJsonEvent = (providerId, value) =>
   (providerId === 'muse' && value?.payload_type === 'run.terminal.completed');
 
 export const sendsJsonEvents = (providerId) =>
-  ['claude', 'codex', 'cursor', 'grok', 'kimi', 'fx', 'muse', 'opencode'].includes(providerId);
+  ['claude', 'codex', 'cursor', 'grok', 'kimi', 'antigravity', 'fx', 'muse', 'opencode'].includes(providerId);

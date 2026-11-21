@@ -75,6 +75,7 @@ import { validateAgentWorkspace } from './main/agent-run-preflight.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getDetachedGitHead, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteerableRunDrivers, steerFxRun } from './main/fx-driver.js';
 import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
+import { antigravityReadOnlyOneShot, antigravityStatsFromPromptResult, createAntigravityAcpDriver } from './main/antigravity-driver.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { guardVisualFrames } from './main/visual-tools.js';
 import { attachTextContextMenu } from './main/text-context-menu.js';
@@ -120,7 +121,7 @@ import {
   onAgentModelsChanged,
 } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, getSyncLedgerFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
-import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
+import { authenticateProviderTool, cancelAntigravityLogin, checkProviderUpdates, submitAntigravityLoginCode, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellPathSyncPromise, shellQuote, startShellPathSync } from './main/shell-env.js';
 import { initDevices, registerDeviceIpc, shutdownDevices } from './main/devices/device-ipc.js';
@@ -5816,6 +5817,11 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
 
 ipcMain.handle('providers:authenticate', async (event, providerId) => {
   const { result, completion } = await authenticateProviderTool(providerId);
+  // Antigravity's sign-in waits for a code the user pastes from the page
+  // this link lands on (submitAuthCode below).
+  if (result?.ok && result.codeRequired && result.url) {
+    void shell.openExternal(result.url).catch(() => {});
+  }
   if (result?.ok) {
     invalidateAgentModelsCache();
     const sender = event.sender;
@@ -5833,6 +5839,17 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
   }
   return result;
 });
+
+ipcMain.handle('providers:submitAuthCode', async (_event, input) => {
+  if (input?.providerId !== 'antigravity') return { ok: false, error: 'This provider takes no sign-in code.' };
+  const result = await submitAntigravityLoginCode(input?.code);
+  if (result.ok) invalidateAgentModelsCache();
+  return result;
+});
+
+ipcMain.handle('providers:cancelAuth', (_event, providerId) =>
+  providerId === 'antigravity' ? cancelAntigravityLogin() : { ok: true }
+);
 
 // fx connections (Settings → Providers → fx): subscription logins run fx's
 // own browser sign-in, detached like other provider logins.
@@ -6715,7 +6732,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // One spawn of the provider CLI. If resuming a prior session fails before
     // producing output, close() falls back to a single fresh attempt.
     const useAcp =
-      model.providerId === 'grok' || model.providerId === 'kimi' || model.providerId === 'fx';
+      model.providerId === 'grok' ||
+      model.providerId === 'kimi' ||
+      model.providerId === 'antigravity' ||
+      model.providerId === 'fx';
     // Codex goal runs (/goal) are driven over `codex app-server` JSON-RPC —
     // the goal runtime auto-continues turns only inside a live app-server.
     const useCodexGoal =
@@ -7430,6 +7450,25 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
               },
               onTurnEnd: (result) => {
                 const stats = fxStatsFromPromptResult(result);
+                if (stats) runStats = stats;
+                finishDriverRun();
+              },
+            },
+          })
+        : model.providerId === 'antigravity'
+        ? createAntigravityAcpDriver({
+            child,
+            cwd: input.projectPath,
+            model,
+            promptText: input.prompt,
+            attachments: input.attachments,
+            resumeSessionId,
+            accessMode: input.accessMode || 'full-access',
+            mcpServers: orionAcpMcpServers(orionMcp),
+            callbacks: {
+              ...sharedDriverCallbacks,
+              onTurnEnd: (result) => {
+                const stats = antigravityStatsFromPromptResult(result);
                 if (stats) runStats = stats;
                 finishDriverRun();
               },
@@ -8653,6 +8692,11 @@ const runOneShotAgentText = async (
   // execution.
   if (model.providerId === 'kimi') {
     return (await kimiPlanModeOneShot(model, prompt, cwd, { signal, threadId })) || '';
+  }
+  // Antigravity turns only run over ACP; Read only policy denies every
+  // non-read tool, so the hidden turn cannot change anything.
+  if (model.providerId === 'antigravity') {
+    return (await antigravityReadOnlyOneShot(model, prompt, cwd, { signal, threadId })) || '';
   }
   // fx turns only run over ACP; its ask mode with every permission denied
   // keeps the hidden turn read-only.

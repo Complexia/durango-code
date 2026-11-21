@@ -53,6 +53,14 @@ follows T3 Code's device support (`apps/server/src/device/`,
 `docs/internals/devices.md`). No T3 Code source is copied; where a Durango Code
 file follows that design, it says so in a comment.
 
+The Antigravity provider (`src/main/antigravity-driver.js`) follows what T3 Code
+documents about Google's `agy acp` runtime (`docs/user/providers-antigravity.md`,
+`docs/internals/providers.md`, `apps/server/src/provider/acp/Antigravity*.ts`):
+native questions arriving as `interaction_` permission requests, `refusal` as
+the quota stop reason, and the release manifest the CLI updates from. The
+Antigravity mark (`assets/antigravity-icon.png`) is the image T3 Code ships in
+`apps/web/src/components/Icons.tsx`; it is Google's trademark.
+
 ```
 MIT License
 

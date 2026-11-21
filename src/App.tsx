@@ -221,6 +221,7 @@ import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
 import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
 import { RestartToUpdateDialog, WhatsNewNotice } from './app/AppUpdateUi';
 import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
+import { ProviderAuthCodePrompt } from './app/ProviderAuthCodePrompt';
 import { addPromptContext, parseCodexReviewCommand } from './app/slashCommands';
 import type { SlashCommandInfo } from './types';
 import { withThreadStartReservation } from './app/turnStart';
@@ -3643,6 +3644,12 @@ const App: React.FC = () => {
     }
   }, [accountBusy]);
 
+  // A sign-in that ends on a page showing a code to paste back (Antigravity).
+  const [providerAuthCodePrompt, setProviderAuthCodePrompt] = useState<{
+    providerId: string;
+    url: string;
+  } | null>(null);
+
   const handleAuthenticateProvider = useCallback(
     async (providerId: string) => {
       if (!window.orion?.authenticateProvider || authenticatingProviderId) return;
@@ -3650,7 +3657,9 @@ const App: React.FC = () => {
       setAuthenticatingProviderId(providerId);
       try {
         const result = await window.orion.authenticateProvider(providerId);
-        if (result.ok) {
+        if (result.ok && result.codeRequired && result.url) {
+          setProviderAuthCodePrompt({ providerId, url: result.url });
+        } else if (result.ok) {
           toast.info('Authentication started');
         } else {
           toast.error(result.error ?? 'Could not start authentication');
@@ -5968,7 +5977,7 @@ const App: React.FC = () => {
         providerOptions: normalizedProviderSettings[model.providerId]?.options,
         // These native providers consume attachments directly as well as
         // retaining the text/path context for later file and crop tools.
-        ...(['kimi', 'fx', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
+        ...(['kimi', 'antigravity', 'fx', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
           ? { attachments: turnAttachments } : {}),
         ...(model.providerId === 'codex'
           ? {
@@ -11253,6 +11262,22 @@ const App: React.FC = () => {
           models={utilityCandidateModels}
           onSelect={(model) => setTextGenerationSettings({ modelId: model.id })}
           onDismiss={() => setTextGenerationPromptDismissed(true)}
+        />
+      )}
+
+      {providerAuthCodePrompt && (
+        <ProviderAuthCodePrompt
+          key={providerAuthCodePrompt.url}
+          providerId={providerAuthCodePrompt.providerId}
+          providerLabel={
+            agentProviders.find((provider) => provider.id === providerAuthCodePrompt.providerId)?.label ??
+            providerAuthCodePrompt.providerId
+          }
+          url={providerAuthCodePrompt.url}
+          onDone={(signedIn) => {
+            setProviderAuthCodePrompt(null);
+            if (signedIn) toast.success('Signed in');
+          }}
         />
       )}
 

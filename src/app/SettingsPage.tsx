@@ -1077,7 +1077,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   } else if (authenticated) {
                     const raw = status?.auth?.detail || 'Authenticated';
                     subtitle =
-                      provider.id === 'opencode' || provider.id === 'fx'
+                      provider.id === 'opencode' || provider.id === 'fx' || provider.id === 'antigravity'
                         ? raw
                         : /authenticated/i.test(raw)
                           ? raw
