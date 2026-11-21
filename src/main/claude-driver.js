@@ -141,9 +141,7 @@ export const WAIT_FOR_BACKGROUND_TASKS_DESCRIPTION =
 // The tool is usually deferred (only its name is listed), so say when to use it.
 export const CLAUDE_BACKGROUND_WAIT_TIP = [
   '# Background commands (Durango Code)',
-  'Never wait in the foreground. Anything that can run for more than a couple of minutes (a deploy, a release, a long build or test run, a loop that polls until something finishes) goes in the background: a foreground command blocks the thread with no progress and no way to steer you until it exits, so Durango Code refuses foreground Bash calls with a timeout over 5 minutes, and polling loops or blocking TaskOutput waits over 2.',
-  'When you start a background Bash command (run_in_background) and will wait for its result before you are done, such as a build, deploy, release, test run or a wait-until loop, call mcp__orion__wait_for_background_tasks with its task id right after starting it. Durango Code then keeps the thread Working until it finishes and you are re-invoked. Without it, ending your turn shows the thread as finished while you are still waiting. Skip it for work you leave running (dev servers, watchers).',
-  'Make a background command exit as soon as its work is done: a pipeline only ends when every part has, so never feed a prompt from a pipeline padded with a long `sleep`, and give polling loops a stop condition.',
+  'Run anything that can take more than a couple of minutes (deploys, releases, long builds or tests, wait-until loops) with run_in_background: Durango Code refuses foreground Bash calls with a timeout over 5 minutes, and polling loops or blocking TaskOutput waits over 2. When you will wait for its result before you are done, call mcp__orion__wait_for_background_tasks with its task id right after starting it, so the thread stays Working until it finishes (not for dev servers or watchers). Make background commands exit when their work is done (no pipelines padded with `sleep`, polling loops with a stop condition).',
 ].join('\n');
 
 // SDK hooks are one object per session; join each event's matchers.
@@ -158,21 +156,24 @@ const mergeClaudeHooks = (...sets) => {
 // Same reason: say when to reach for request_user_action (user-actions.js).
 export const CLAUDE_USER_ACTION_TIP = [
   '# Actions only the user can take (Durango Code)',
-  'When you need the user to do something outside this chat, such as finishing a login or authorization in a browser window you opened (npm login, OAuth, a device code), approving a prompt on their machine, or giving you a value you cannot get yourself that is not a secret, call mcp__orion__request_user_action with one clear instruction (and the url, if there is one). If a command tells when it is done (`npm whoami`, `gh auth status`), pass it as `check` and Durango Code watches it for you. Durango Code flags the thread as needing them and pins the action above the composer, so it is not lost among your messages. Keep working on anything that does not depend on it; when you run out of such work, end your turn instead of waiting or polling. You are told when it is done without being interrupted: at your next tool call, or in a new turn if you have ended yours. That message starts with "Done:"; if the user replied instead, it starts with "Not done:" followed by what they want instead, so follow it rather than asking again. Call mcp__orion__resolve_user_action with the returned action_id if you see it is done before you are told.',
+  'When the user must do something outside this chat (a browser login or OAuth you started, a device code, approving a prompt on their machine), call mcp__orion__request_user_action instead of asking in a message.',
 ].join('\n');
 
-// Same reason, and the tool is always loaded too (`alwaysLoad`): an agent
-// that never sees request_secret asks for the value in chat.
+// Same reason: an agent that doesn't know request_secret asks for the value
+// in chat. The tool itself is deferred (its description carries the rules).
+// The hints in the system prompt stay one or two lines each: they are sent
+// with every call of every thread, and each tool's description (read only
+// when the tool is loaded) carries the details.
 export const CLAUDE_SECRET_TIP = [
   '# Secrets only the user has (Durango Code)',
-  'When the next step needs a secret only the user has (an API key or token for a CLI or API you run, a password or sudo password, a PIN, a 2FA or pairing code), call mcp__orion__request_secret with a label and a short reason (and a url where they get it): never ask for it in chat, and never hand the step to the user\'s own terminal instead. The user enters it in a private card; you get back the path of an owner-only file holding it. Read the file only inside the command that needs it (`TOKEN="$(cat <file>)" cli …`, `sudo -S -p \'\' <cmd> < <file>`), and never print the value or copy it into code, commits, prompts, subagent briefs, memory or replies. To hand a secret to a tool instead of a command (typing a password into a sign-in form with browser_type, an API key in the arguments of a connected app\'s tool, Claude in Chrome), ask with `delivery: "ref"` and pass the returned `dsr_…` ref where the value goes; the tool gets the value and you never see it. If the user pasted a secret in chat, save it with request_secret `value` and pass the file or ref on from then on. If they decline, do not ask again; say what is blocked.',
+  "When you need a secret only the user has (API key, token, password, sudo password, PIN, 2FA or pairing code), call mcp__orion__request_secret: never ask for it in chat or hand the step to the user's terminal.",
 ].join('\n');
 
 // Say when to illustrate with show_html (visual-tools.js); the tool
 // description carries the page rules.
 export const CLAUDE_VISUALS_TIP = [
   '# Visuals in the thread (Durango Code)',
-  'When a picture explains something better than prose (numbers worth charting, an architecture or data flow, a comparison of options, a UI idea, a sequence of steps), illustrate it with mcp__orion__show_html: it renders a small self-contained HTML page inline where you call it. Reach for it whenever the user asks to see, visualize, diagram or compare something. Not for short answers, code changes or files the user wants on disk. Then give the takeaway in a sentence instead of restating the page.',
+  'When a chart, diagram or comparison explains something better than prose, or the user asks to see or visualize something, show it with mcp__orion__show_html.',
 ].join('\n');
 
 // Mirrored in mcp-bridge-shim.cjs's spawn_subagent schema; keep in step.
@@ -485,7 +486,7 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
               signal: extra?.signal instanceof AbortSignal ? extra.signal : undefined,
             })
           ),
-        { annotations: { readOnlyHint: true }, alwaysLoad: true }
+        { annotations: { readOnlyHint: true } }
       ),
       // Inline visuals (visual-tools.js). Mirrored in mcp-bridge-shim.cjs;
       // test-durango-tools.mjs keeps them in sync.

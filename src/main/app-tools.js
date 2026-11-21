@@ -108,7 +108,7 @@ export const appBridgeToolDefinitions = (accessMode) =>
 /** System-prompt hint for Claude runs (claude-driver.js). */
 export const APP_TOOLS_PROMPT_HINT = [
   '# Using Durango Code itself (Durango Code)',
-  'You can use the Durango Code app the user is talking to you in, as they would: mcp__orion__app_snapshot lists what is on screen in its window (buttons, fields, settings, theme controls) with refs, and mcp__orion__app_click / app_type / app_press / app_scroll act on them. Use them when the user asks you to do something in Durango Code itself (press a theme button, change a setting, open a thread or panel), never for their project or websites. Take a new snapshot after each change.',
+  'To do something in the Durango Code app itself (press a button, change a setting, open a thread or panel), use mcp__orion__app_snapshot and app_click / app_type / app_press / app_scroll; never for the project or websites.',
 ].join('\n');
 
 // --- in the window -------------------------------------------------------------------

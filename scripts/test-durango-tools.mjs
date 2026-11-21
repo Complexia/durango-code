@@ -364,7 +364,7 @@ try {
     for (const [key, property] of Object.entries(SECRET_TOOL_INPUT_SCHEMAS[name].properties)) {
       assert.equal(entry.schema[key].description, property.description, `${name}.${key} description`);
     }
-    assert.equal(entry.extra?.alwaysLoad, true, `${name} is never deferred behind tool search`);
+    assert.notEqual(entry.extra?.alwaysLoad, true, `${name} is deferred (its system-prompt hint names it)`);
   }
   const claudeSecret = await registered.find((entry) => entry.name === 'request_secret').handler({ label: 'Token', reason: 'For the deploy.' });
   assert.equal(claudeSecret.isError, true, 'no window: the agent is told what to do without the card');
