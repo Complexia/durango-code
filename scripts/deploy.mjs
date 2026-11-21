@@ -1,6 +1,14 @@
 #!/usr/bin/env node
 
-import { HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import {
+  AbortMultipartUploadCommand,
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  S3Client,
+  UploadPartCommand,
+} from '@aws-sdk/client-s3';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -28,6 +36,10 @@ import {
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const macAppBundleName = `${productName}.app`;
+// Artifacts larger than this upload in parts (uploadFileMultipart).
+const MULTIPART_THRESHOLD_BYTES = 32 * 1024 * 1024;
+const MULTIPART_PART_BYTES = 8 * 1024 * 1024;
+const MULTIPART_CONCURRENCY = 4;
 
 relaunchWithPinnedNode({ rootDir });
 
@@ -189,17 +201,23 @@ for (const [format, artifactPath] of releaseArtifacts) {
     },
   };
 
-  await sendWithRetry(
-    async () => {
-      const body = createReadStream(artifactPath);
-      try {
-        return await client.send(new PutObjectCommand({ ...upload, Body: body }));
-      } finally {
-        body.destroy();
-      }
-    },
-    `upload ${key}`,
-  );
+  if (stat.size > MULTIPART_THRESHOLD_BYTES) {
+    // One PUT of a few hundred MB fails outright when a slow or flaky link
+    // drops it (EPIPE) and can only restart from zero; parts retry alone.
+    await uploadFileMultipart(client, upload, artifactPath, stat.size);
+  } else {
+    await sendWithRetry(
+      async () => {
+        const body = createReadStream(artifactPath);
+        try {
+          return await client.send(new PutObjectCommand({ ...upload, Body: body }));
+        } finally {
+          body.destroy();
+        }
+      },
+      `upload ${key}`,
+    );
+  }
   await verifyUploadedArtifact(client, config.bucket, key, stat.size, sha256);
 
   artifacts.push({
@@ -524,6 +542,75 @@ async function uploadJson(client, bucket, key, value, cacheControl) {
     `upload ${key}`,
   );
   console.log(`Uploaded ${key}`);
+}
+
+/** Uploads a large file in parts (each read into memory, so a retry resends it whole). */
+async function uploadFileMultipart(client, upload, filePath, size) {
+  const { ContentLength: _contentLength, ...createParams } = upload;
+  const { UploadId } = await sendWithRetry(
+    () => client.send(new CreateMultipartUploadCommand(createParams)),
+    `start upload ${upload.Key}`,
+  );
+  const partCount = Math.ceil(size / MULTIPART_PART_BYTES);
+  const parts = new Array(partCount);
+  const file = await fs.open(filePath, 'r');
+  let next = 0;
+  let sentBytes = 0;
+  let lastLoggedPercent = 0;
+  try {
+    const worker = async () => {
+      while (next < partCount) {
+        const index = next;
+        next += 1;
+        const start = index * MULTIPART_PART_BYTES;
+        const length = Math.min(MULTIPART_PART_BYTES, size - start);
+        const body = Buffer.alloc(length);
+        await file.read(body, 0, length, start);
+        const { ETag } = await sendWithRetry(
+          () =>
+            client.send(
+              new UploadPartCommand({
+                Bucket: upload.Bucket,
+                Key: upload.Key,
+                UploadId,
+                PartNumber: index + 1,
+                Body: body,
+                ContentLength: length,
+              }),
+            ),
+          `upload ${upload.Key} part ${index + 1}/${partCount}`,
+          8,
+        );
+        parts[index] = { ETag, PartNumber: index + 1 };
+        sentBytes += length;
+        const percent = Math.floor((sentBytes / size) * 10) * 10;
+        if (percent > lastLoggedPercent) {
+          lastLoggedPercent = percent;
+          console.log(`upload ${upload.Key}: ${percent}%`);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(MULTIPART_CONCURRENCY, partCount) }, worker));
+    await sendWithRetry(
+      () =>
+        client.send(
+          new CompleteMultipartUploadCommand({
+            Bucket: upload.Bucket,
+            Key: upload.Key,
+            UploadId,
+            MultipartUpload: { Parts: parts },
+          }),
+        ),
+      `finish upload ${upload.Key}`,
+    );
+  } catch (error) {
+    await client
+      .send(new AbortMultipartUploadCommand({ Bucket: upload.Bucket, Key: upload.Key, UploadId }))
+      .catch(() => {});
+    throw error;
+  } finally {
+    await file.close();
+  }
 }
 
 async function verifyUploadedArtifact(client, bucket, key, expectedSize, expectedSha256) {
