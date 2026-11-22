@@ -12,7 +12,7 @@ import { SelectMenu } from './SelectMenu';
 
 // Providers whose only browser choice is the built-in one (Claude and Codex
 // have their own rows).
-const BUILTIN_ONLY_PROVIDERS: ProviderId[] = ['grok', 'cursor', 'kimi', 'opencode', 'fx', 'muse'];
+const BUILTIN_ONLY_PROVIDERS: ProviderId[] = ['grok', 'cursor', 'kimi', 'antigravity', 'opencode', 'fx', 'muse'];
 
 /** Claude's setting, migrating the old Claude in Chrome toggle (`chrome: true`). */
 export const claudeBrowserMode = (options: ProviderRuntimeOptions | undefined): ProviderBrowserMode =>

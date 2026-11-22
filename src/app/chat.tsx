@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
+import { Check, ChevronDown, ChevronRight, CircleCheck, Copy, Pencil, Sparkles, SquareKanban, Terminal, X, Zap } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { findThread, isNoProjectId, STEERED_RUN_CAPTION, threadRecordOf, type AgentActivity, type BtwExchange, type LinkedBoardTask, type Message, type Thread, useOrionStore } from '../store';
 import type { AgentModel } from '../agentCatalog';
@@ -268,6 +268,7 @@ export const PROVIDER_AUTH_ERROR_PATTERNS: RegExp[] = [
   /\b401\b[^\n]{0,40}unauthorized/i,
   /unauthorized[^\n]{0,40}\b401\b/i,
   /run\s+`?(codex|cursor-agent|grok|opencode|claude|kimi|muse|fx)\s+(auth\s+)?login/i,
+  /sign in to antigravity/i,
   /please (log ?in|sign ?in)/i,
 ];
 
@@ -577,6 +578,8 @@ export type ChatMessageProps = {
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
   onDiscardClaudeBackgroundTasks?: (messageId: string, runId: string) => void;
+  /** Set on the user's own messages while the thread is idle: edit it and continue from there. */
+  onEdit?: (messageId: string) => void;
 };
 
 export const ChatMessage = React.memo(function ChatMessage({
@@ -592,6 +595,7 @@ export const ChatMessage = React.memo(function ChatMessage({
   onAuthenticateProvider,
   authenticatingProviderId,
   onDiscardClaudeBackgroundTasks,
+  onEdit,
 }: ChatMessageProps) {
   const attachments = message.attachments ?? [];
   const messageTasks = message.linkedTasks ?? [];
@@ -709,6 +713,17 @@ export const ChatMessage = React.memo(function ChatMessage({
       )}
       {(message.role === 'user' || message.role === 'agent') && message.content.trim() && (
         <CopyMessageButton text={message.content} />
+      )}
+      {message.role === 'user' && onEdit && (
+        <button
+          type="button"
+          className="message-copy-btn message-edit-btn"
+          onClick={() => onEdit(message.id)}
+          aria-label="Edit message"
+          title="Edit and continue from here"
+        >
+          <Pencil size={13} />
+        </button>
       )}
     </div>
   );
@@ -969,6 +984,8 @@ export type ChatTranscriptProps = {
   onAuthenticateProvider: (providerId: string) => void;
   onDiscardClaudeBackgroundTasks: (threadId: string, messageId: string, runId: string) => void;
   onSteerQueuedMessage: (threadId: string, queuedId: string) => void;
+  /** Edit an earlier user message: the transcript is cut there and the text goes back to the composer. */
+  onEditMessage?: (threadId: string, messageId: string) => void;
 };
 
 /**
@@ -1081,6 +1098,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   onAuthenticateProvider,
   onDiscardClaudeBackgroundTasks,
   onSteerQueuedMessage,
+  onEditMessage,
 }: ChatTranscriptProps) {
   // This thread's shell and transcript only: other threads' output, and
   // streaming into another pane, never re-render this one.
@@ -1364,6 +1382,15 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     (taskId: string) => onMarkTaskDone(threadId, taskId),
     [onMarkTaskDone, threadId]
   );
+  const handleEditMessage = useCallback(
+    (messageId: string) => onEditMessage?.(threadId, messageId),
+    [onEditMessage, threadId]
+  );
+  // Only while nothing runs: editing drops every later message and the
+  // provider sessions, which a live run still writes to. A thread that runs
+  // on another machine keeps its sessions there.
+  const canEditMessages =
+    Boolean(onEditMessage) && !isSending && thread?.status !== 'running' && !thread?.remote && !thread?.subagent;
   const handleUnlinkTask = useCallback(
     (taskId: string) => onUnlinkTask(threadId, taskId),
     [onUnlinkTask, threadId]
@@ -1539,6 +1566,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                 <React.Fragment key={message.id}>
                   <ChatMessage
                     message={message}
+                    onEdit={canEditMessages ? handleEditMessage : undefined}
                     liveTasks={hasTasks ? thread.linkedTasks : undefined}
                     taskBusy={hasTasks ? isSending : undefined}
                     onMarkTaskDone={handleMarkTaskDone}

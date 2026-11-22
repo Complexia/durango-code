@@ -749,6 +749,13 @@ export type Thread = {
    * once the fork reports its own session id.
    */
   pendingForkProviders?: ProviderId[];
+  /**
+   * Set when the user edited an earlier message: the transcript was cut
+   * before it and every provider session dropped (no CLI can rewind its own
+   * conversation), so the next turn starts a fresh session and carries the
+   * kept conversation as context. Cleared once that turn starts.
+   */
+  pendingResumeContext?: string;
   /** Thread this one was branched from, if any. */
   branchedFromThreadId?: string;
   /** Driver thread that spawned this one as a subagent, if any. */
@@ -1122,7 +1129,16 @@ export type OpenFile = {
   diskRevision?: number;
 };
 
-export type ProviderId = 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'fx' | 'muse' | 'opencode';
+export type ProviderId =
+  | 'grok'
+  | 'codex'
+  | 'claude'
+  | 'cursor'
+  | 'kimi'
+  | 'antigravity'
+  | 'fx'
+  | 'muse'
+  | 'opencode';
 
 export type CodexSettingMode = 'inherit' | 'enabled' | 'disabled';
 export type BrowserUseMode = 'disabled' | 'builtin' | 'extension' | 'mcp';
@@ -1192,6 +1208,7 @@ export const defaultProviderSettings: ProviderSettings = {
   claude: { enabled: true },
   cursor: { enabled: true },
   kimi: { enabled: true },
+  antigravity: { enabled: true },
   fx: { enabled: true },
   muse: { enabled: true },
   opencode: { enabled: true },

@@ -64,6 +64,7 @@ import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-
 import { buildUsageReport, createUsageStore, latestCodexLimits } from './main/usage-stats.js';
 import { loadUsagePrices, refreshUsagePrices, usagePricesInfo } from './main/usage-pricing.js';
 import { claudeRateLimits, configureUsageLimits } from './main/usage-limits.js';
+import { configureCodexLiveLimits, readProviderUsageLimits } from './main/provider-usage-limits.js';
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
@@ -75,6 +76,8 @@ import { validateAgentWorkspace } from './main/agent-run-preflight.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getDetachedGitHead, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteerableRunDrivers, steerFxRun } from './main/fx-driver.js';
 import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
+import { antigravityChildTranscriptPath, handleAntigravitySubagentLine, resolveAntigravityChild } from './main/antigravity-child-work.js';
+import { antigravityReadOnlyOneShot, antigravityRunDrivers, antigravityStatsFromPromptResult, createAntigravityAcpDriver, steerAntigravityRun } from './main/antigravity-driver.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { guardVisualFrames } from './main/visual-tools.js';
 import { attachTextContextMenu } from './main/text-context-menu.js';
@@ -120,7 +123,7 @@ import {
   onAgentModelsChanged,
 } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, getSyncLedgerFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
-import { authenticateProviderTool, checkProviderUpdates, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
+import { authenticateProviderTool, cancelAntigravityLogin, checkProviderUpdates, submitAntigravityLoginCode, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
 import { activeAgentRuns, finalizingAgentRuns, killAgentChild, startingAgentRuns, stoppedAgentRuns, trackAgentShutdown, waitForAgentThreadShutdowns, waitForPendingAgentShutdowns } from './main/run-registry.js';
 import { checkCommandAvailable, execFileAsync, loginShell, runShellCommand, shellPathSyncPromise, shellQuote, startShellPathSync } from './main/shell-env.js';
 import { initDevices, registerDeviceIpc, shutdownDevices } from './main/devices/device-ipc.js';
@@ -5816,6 +5819,11 @@ ipcMain.handle('providers:updateAll', async (_event, input = {}) => {
 
 ipcMain.handle('providers:authenticate', async (event, providerId) => {
   const { result, completion } = await authenticateProviderTool(providerId);
+  // Antigravity's sign-in waits for a code the user pastes from the page
+  // this link lands on (submitAuthCode below).
+  if (result?.ok && result.codeRequired && result.url) {
+    void shell.openExternal(result.url).catch(() => {});
+  }
   if (result?.ok) {
     invalidateAgentModelsCache();
     const sender = event.sender;
@@ -5833,6 +5841,17 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
   }
   return result;
 });
+
+ipcMain.handle('providers:submitAuthCode', async (_event, input) => {
+  if (input?.providerId !== 'antigravity') return { ok: false, error: 'This provider takes no sign-in code.' };
+  const result = await submitAntigravityLoginCode(input?.code);
+  if (result.ok) invalidateAgentModelsCache();
+  return result;
+});
+
+ipcMain.handle('providers:cancelAuth', (_event, providerId) =>
+  providerId === 'antigravity' ? cancelAntigravityLogin() : { ok: true }
+);
 
 // fx connections (Settings → Providers → fx): subscription logins run fx's
 // own browser sign-in, detached like other provider logins.
@@ -6715,7 +6734,10 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     // One spawn of the provider CLI. If resuming a prior session fails before
     // producing output, close() falls back to a single fresh attempt.
     const useAcp =
-      model.providerId === 'grok' || model.providerId === 'kimi' || model.providerId === 'fx';
+      model.providerId === 'grok' ||
+      model.providerId === 'kimi' ||
+      model.providerId === 'antigravity' ||
+      model.providerId === 'fx';
     // Codex goal runs (/goal) are driven over `codex app-server` JSON-RPC —
     // the goal runtime auto-continues turns only inside a live app-server.
     const useCodexGoal =
@@ -7167,6 +7189,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       codexGoalRunDrivers.delete(runId);
       codexSteerableRunDrivers.delete(runId);
       fxSteerableRunDrivers.delete(runId);
+      antigravityRunDrivers.delete(runId);
       codexAppServerLease?.release();
       codexAppServerLease = null;
       orionMcp?.release();
@@ -7435,6 +7458,61 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
               },
             },
           })
+        : model.providerId === 'antigravity'
+        ? createAntigravityAcpDriver({
+            child,
+            cwd: input.projectPath,
+            model,
+            promptText: input.prompt,
+            attachments: input.attachments,
+            resumeSessionId,
+            accessMode: input.accessMode || 'full-access',
+            mcpServers: orionAcpMcpServers(orionMcp),
+            threadId: input.threadId,
+            callbacks: {
+              ...sharedDriverCallbacks,
+              // Each invoke_subagent child shows as a live subagent thread
+              // fed by its own transcript (antigravity-child-work.js).
+              onSubagentSpawn: ({ id, role, prompt, parentSessionId }) => {
+                let childId = null;
+                subagentTracker.start(
+                  { id, title: role, kind: 'antigravity agent', ...(prompt ? { prompt } : {}) },
+                  {
+                    resolveFile: async () => {
+                      childId ??= await resolveAntigravityChild(parentSessionId, id);
+                      const file = childId ? antigravityChildTranscriptPath(childId) : null;
+                      return file && existsSync(file) ? file : null;
+                    },
+                    handleLine: handleAntigravitySubagentLine,
+                  }
+                );
+              },
+              onSubagentDone: (id, info) => subagentTracker.finish(id, info),
+              onSessionBroken: () => {
+                emitAgentEvent(event.sender, {
+                  runId,
+                  threadId: input.threadId,
+                  type: 'session-broken',
+                  providerId: 'antigravity',
+                });
+              },
+              // A spawn_subagent child asks whoever spawned it: its question
+              // stays in its reply text (agy prints the choices) instead of a
+              // card the user would answer for someone else.
+              ...(input.spawnedSubagent
+                ? {}
+                : {
+                    onUserInput: () => {
+                      emitAgentEvent(event.sender, { runId, threadId: input.threadId, type: 'user-input' });
+                    },
+                  }),
+              onTurnEnd: (result) => {
+                const stats = antigravityStatsFromPromptResult(result);
+                if (stats) runStats = stats;
+                finishDriverRun();
+              },
+            },
+          })
         : model.providerId === 'kimi'
         ? createKimiAcpDriver({
             child,
@@ -7554,6 +7632,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         : null;
     if (useCodexGoal && acpDriver) codexGoalRunDrivers.set(runId, acpDriver);
     if (model.providerId === 'fx' && acpDriver) fxSteerableRunDrivers.set(runId, acpDriver);
+    if (model.providerId === 'antigravity' && acpDriver) antigravityRunDrivers.set(runId, acpDriver);
     if (useCodexAppServer && !useCodexGoal && !useCodexReview && acpDriver) {
       codexSteerableRunDrivers.set(runId, acpDriver);
     }
@@ -7664,6 +7743,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         clearFinalizeTimers();
         codexSteerableRunDrivers.delete(runId);
         fxSteerableRunDrivers.delete(runId);
+        antigravityRunDrivers.delete(runId);
         await acpDriver?.dispose?.();
         codexSpawnWatcher?.stop();
         kimiSpawnWatcher?.stop();
@@ -7699,6 +7779,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         clearFinalizeTimers();
         codexSteerableRunDrivers.delete(runId);
         fxSteerableRunDrivers.delete(runId);
+        antigravityRunDrivers.delete(runId);
         await acpDriver?.dispose?.();
         codexSpawnWatcher?.stop();
         kimiSpawnWatcher?.stop();
@@ -7765,6 +7846,7 @@ ipcMain.handle('agent:steerTurn', async (_event, runId, text, attachments) => {
   forgetAgentRunOutputMessage(runId);
   if (await steerCodexAppServerRun(runId, text, attachments)) return true;
   if (await steerFxRun(runId, text, attachments)) return true;
+  if (await steerAntigravityRun(runId, text, attachments)) return true;
   return await steerClaudeSdkRun(runId, text, attachments);
 });
 
@@ -7785,7 +7867,11 @@ ipcMain.handle('agent:notifyTurn', async (event, { threadId, runId, providerId, 
     status: 'done',
   };
   if (typeof runId === 'string' && runId) {
-    if ((await steerCodexAppServerRun(runId, text, [])) || (await steerFxRun(runId, text, []))) {
+    if (
+      (await steerCodexAppServerRun(runId, text, [])) ||
+      (await steerFxRun(runId, text, [])) ||
+      (await steerAntigravityRun(runId, text, []))
+    ) {
       emitAgentEvent(event.sender, { runId, threadId, type: 'activity', activity });
       return true;
     }
@@ -7812,7 +7898,7 @@ ipcMain.handle('agent:answerSecretRequest', (_event, input) => answerSecretReque
 ipcMain.handle('agent:listSecretRequests', () => listPendingSecretRequests());
 
 const listCodexQuestions = (threadId) => {
-  const drivers = new Map([...codexSteerableRunDrivers, ...codexGoalRunDrivers]);
+  const drivers = new Map([...codexSteerableRunDrivers, ...codexGoalRunDrivers, ...antigravityRunDrivers]);
   return [...completedCodexQuestions.list(threadId), ...[...drivers].flatMap(([runId, driver]) =>
     (driver.getUserInputs?.() ?? [])
       .filter((request) => request.threadId === threadId)
@@ -7827,7 +7913,8 @@ const listAgentQuestions = (threadId) => [...listCodexQuestions(threadId), ...li
 ipcMain.handle('agent:getCodexQuestions', (_event, threadId) => listCodexQuestions(threadId));
 
 ipcMain.handle('agent:answerCodexQuestions', async (event, runId, requestId, answers, text) => {
-  const driver = codexSteerableRunDrivers.get(runId) ?? codexGoalRunDrivers.get(runId);
+  const driver =
+    codexSteerableRunDrivers.get(runId) ?? codexGoalRunDrivers.get(runId) ?? antigravityRunDrivers.get(runId);
   if (typeof text === 'string' && text.trim()) {
     const question = driver?.getUserInputs?.().find((entry) => entry.requestId === requestId) ??
       completedCodexQuestions.list().find((entry) => entry.runId === runId && entry.requestId === requestId);
@@ -7878,6 +7965,7 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
   await codexSteerableRunDrivers.get(runId)?.dispose?.();
   codexSteerableRunDrivers.delete(runId);
   fxSteerableRunDrivers.delete(runId);
+  antigravityRunDrivers.delete(runId);
   // Stopping a goal run = pausing the goal: ask the app-server to record the
   // pause (so the stored goal matches reality and /goal resume works) before
   // the process goes down.
@@ -8654,6 +8742,11 @@ const runOneShotAgentText = async (
   if (model.providerId === 'kimi') {
     return (await kimiPlanModeOneShot(model, prompt, cwd, { signal, threadId })) || '';
   }
+  // Antigravity turns only run over ACP; Read only policy denies every
+  // non-read tool, so the hidden turn cannot change anything.
+  if (model.providerId === 'antigravity') {
+    return (await antigravityReadOnlyOneShot(model, prompt, cwd, { signal, threadId })) || '';
+  }
   // fx turns only run over ACP; its ask mode with every permission denied
   // keeps the hidden turn read-only.
   if (model.providerId === 'fx') {
@@ -9220,6 +9313,23 @@ ipcMain.handle('usage:report', async (_event, input) => {
         prices: usagePricesInfo(),
         limits: { claude: claudeRateLimits(), codex: latestCodexLimits(store.entries()) },
       },
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+// Limits read live from Antigravity's, Grok's and Codex's own quota
+// endpoints (provider-usage-limits.js); only the Limits tab asks.
+ipcMain.handle('usage:liveLimits', async (_event, input) => {
+  try {
+    configureCodexLiveLimits(codexAppServerManager, app.getVersion?.() ?? '0.0.0');
+    return {
+      ok: true,
+      limits: await readProviderUsageLimits({
+        force: input?.force === true,
+        ...(Array.isArray(input?.providers) ? { providers: input.providers.filter((id) => typeof id === 'string') } : {}),
+      }),
     };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

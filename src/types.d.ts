@@ -386,6 +386,28 @@ export type UsageReport = {
   };
 };
 
+/** One provider's plan limits read live (src/main/provider-usage-limits.js). */
+export type LiveProviderLimits = {
+  status: 'ok' | 'signed-out' | 'expired' | 'unavailable' | 'error';
+  detail?: string;
+  plan?: string | null;
+  at: number;
+  windows?: Array<{
+    id: string;
+    label: string;
+    usedPercent: number;
+    resetsAt: number | null;
+    windowMinutes: number | null;
+    detail?: string;
+  }>;
+};
+export type LiveUsageLimits = {
+  antigravity?: LiveProviderLimits;
+  grok?: LiveProviderLimits;
+  /** The Codex app-server's own snapshot, in the session logs' shape; `status` alone when it can't be read live. */
+  codex?: (NonNullable<UsageReport['limits']['codex']> & { live?: boolean }) | { status: string; at: number };
+};
+
 export type DevServersListResult = {
   ok: boolean;
   servers: DevServerEntry[];
@@ -1459,6 +1481,8 @@ type OrionCodexBrowserIntegrationStatus = {
       listDevServers?: (input?: { roots?: string[] }) => Promise<DevServersListResult>;
       /** Usage view report built from the agents' session logs (see src/main/usage-stats.js). */
       usageReport?: (input: UsageReportInput) => Promise<{ ok: true; report: UsageReport } | { ok: false; error: string }>;
+      /** Plan limits read live from the providers (src/main/provider-usage-limits.js). */
+      usageLiveLimits?: (input?: { force?: boolean; providers?: string[] }) => Promise<{ ok: true; limits: LiveUsageLimits } | { ok: false; error: string }>;
       onUsageProgress?: (callback: (progress: UsageScanProgress) => void) => () => void;
       /** Opens a validated localhost HTTP URL for a listed dev-server port. */
       openDevServer?: (input: { port: number }) => Promise<{ ok: boolean; error?: string }>;
@@ -1488,7 +1512,7 @@ type OrionCodexBrowserIntegrationStatus = {
       saveImageAttachment?: NonNullable<Window['orion']>['saveAttachment'];
       listAgentModels: (input?: { force?: boolean }) => Promise<Array<{
         id: string;
-        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'fx' | 'muse' | 'opencode';
+        providerId: 'grok' | 'codex' | 'claude' | 'cursor' | 'kimi' | 'antigravity' | 'fx' | 'muse' | 'opencode';
         providerLabel: string;
         label: string;
         slug: string;
@@ -1602,7 +1626,15 @@ type OrionCodexBrowserIntegrationStatus = {
       authenticateProvider: (providerId: string) => Promise<{
         ok: boolean;
         error?: string;
+        /** The sign-in finishes on a page showing a code to paste back (Antigravity). */
+        codeRequired?: boolean;
+        url?: string;
       }>;
+      submitProviderAuthCode?: (input: { providerId: string; code: string }) => Promise<{
+        ok: boolean;
+        error?: string;
+      }>;
+      cancelProviderAuth?: (providerId: string) => Promise<{ ok: boolean }>;
       onProviderAuthenticated: (
         callback: (event: { providerId: string }) => void
       ) => () => void;
@@ -1883,7 +1915,7 @@ type OrionCodexBrowserIntegrationStatus = {
       onAgentTurnEvent?: (cb: (event: {
         runId: string;
         threadId: string;
-        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'subagent' | 'subagent-chunk' | 'subagent-activity' | 'user-input' | 'prompt-suggestion';
+        type: 'started' | 'chunk' | 'activity' | 'session' | 'error' | 'done' | 'goal' | 'background-settled' | 'subagent' | 'subagent-chunk' | 'subagent-activity' | 'user-input' | 'prompt-suggestion' | 'session-broken';
         /** prompt-suggestion events only: the agent's predicted next user prompt for this thread. */
         suggestion?: string;
         /** started events only: the persistent claude session opened this turn itself (background task finished). */

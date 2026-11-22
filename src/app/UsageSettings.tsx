@@ -2,8 +2,8 @@ import React from 'react';
 import { Check, ChevronDown, Info, RefreshCw } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useOrionStore } from '../store';
-import { ClaudeBrandIcon, CodexBrandIcon, GrokBrandIcon } from '../providerIcons';
-import type { UsageRange, UsageReport, UsageScanProgress, UsageSourceFilter } from '../types';
+import { AntigravityBrandIcon, ClaudeBrandIcon, CodexBrandIcon, GrokBrandIcon } from '../providerIcons';
+import type { LiveProviderLimits, LiveUsageLimits, UsageRange, UsageReport, UsageScanProgress, UsageSourceFilter } from '../types';
 
 // Settings → Usage: how much the coding agents are used on this machine, read
 // from their own session logs (src/main/usage-stats.js). Token counts are what
@@ -448,8 +448,51 @@ const LimitMeter = ({ name, used, detail, status }: { name: string; used: number
   );
 };
 
+// One provider's live limits (provider-usage-limits.js): its windows, or why
+// there are none.
+const LiveLimitsBody = ({ limits, loading, empty }: { limits: LiveProviderLimits | undefined; loading: boolean; empty: string }) => {
+  if (!limits) return <p className="usage-empty-note">{loading ? 'Checking…' : empty}</p>;
+  if (limits.status !== 'ok') return <p className="usage-empty-note">{limits.detail || empty}</p>;
+  if (!limits.windows?.length) return <p className="usage-empty-note">{empty}</p>;
+  return (
+    <>
+      {limits.windows.map((window) => (
+        <LimitMeter
+          key={window.id}
+          name={window.label}
+          used={window.usedPercent}
+          detail={resetLabel(window.resetsAt)}
+        />
+      ))}
+    </>
+  );
+};
+
 const LimitsView = ({ report }: { report: UsageReport }) => {
-  const codex = report.limits.codex;
+  const [live, setLive] = React.useState<LiveUsageLimits | null>(null);
+  const [liveLoading, setLiveLoading] = React.useState<Record<string, boolean>>({});
+  // Each provider's card fills in as its own read lands: Codex may first have
+  // to start its app-server, which takes several seconds.
+  const loadLive = React.useCallback(async (force = false) => {
+    const read = window.orion?.usageLiveLimits;
+    if (!read) return;
+    await Promise.all(
+      ['antigravity', 'grok', 'codex'].map(async (providerId) => {
+        setLiveLoading((current) => ({ ...current, [providerId]: true }));
+        try {
+          const result = await read({ force, providers: [providerId] });
+          if (result.ok) setLive((current) => ({ ...(current ?? {}), ...result.limits }));
+        } finally {
+          setLiveLoading((current) => ({ ...current, [providerId]: false }));
+        }
+      })
+    );
+  }, []);
+  React.useEffect(() => {
+    void loadLive();
+  }, [loadLive]);
+  const liveCodex = live?.codex && 'value' in live.codex ? live.codex : null;
+  const codex = liveCodex ?? report.limits.codex;
   const claudeEntries = Object.entries(report.limits.claude ?? {}).sort(([a], [b]) => Object.keys(CLAUDE_WINDOWS).indexOf(a) - Object.keys(CLAUDE_WINDOWS).indexOf(b));
   const claudeAt = claudeEntries.reduce((latest, [, value]) => Math.max(latest, value.at), 0);
   return (
@@ -486,7 +529,7 @@ const LimitsView = ({ report }: { report: UsageReport }) => {
           <CodexBrandIcon size={16} />
           <span>Codex</span>
           {codex?.value?.plan_type && <span className="usage-pill">{codex.value.plan_type}</span>}
-          {codex && <span className="usage-card-meta">Reported {relativeTime(codex.at)}</span>}
+          {codex && <span className="usage-card-meta">{liveCodex ? 'Live' : 'Reported'} {relativeTime(codex.at)}</span>}
         </div>
         {!codex ? (
           <p className="usage-empty-note">No Codex session on this Mac has reported plan limits yet.</p>
@@ -512,16 +555,46 @@ const LimitsView = ({ report }: { report: UsageReport }) => {
             )}
           </>
         )}
-        <p className="usage-card-foot">From the latest rate-limit snapshot in Codex&apos;s session logs. It updates with each Codex turn, so it can be behind if Codex last ran a while ago.</p>
+        <p className="usage-card-foot">
+          {liveCodex
+            ? 'Read live from Codex with its own sign-in.'
+            : "From the latest rate-limit snapshot in Codex's session logs. It updates with each Codex turn, so it can be behind if Codex last ran a while ago."}
+        </p>
+      </section>
+
+      <section className="usage-card">
+        <div className="usage-card-title">
+          <AntigravityBrandIcon size={16} />
+          <span>Antigravity</span>
+          {live?.antigravity?.plan && <span className="usage-pill">{live.antigravity.plan}</span>}
+          <span className="usage-card-meta">
+            {live?.antigravity?.at ? `${live.antigravity.status === 'ok' ? 'Live' : 'Checked'} ${relativeTime(live.antigravity.at)}` : ''}
+          </span>
+          <button type="button" className="usage-icon-button h-6 w-6" onClick={() => void loadLive(true)} disabled={liveLoading.antigravity === true} title="Check again" aria-label="Check live limits again">
+            <RefreshCw size={12} className={liveLoading.antigravity === true ? 'animate-spin' : ''} />
+          </button>
+        </div>
+        <LiveLimitsBody limits={live?.antigravity} loading={liveLoading.antigravity === true} empty="Antigravity reported no limits." />
+        <p className="usage-card-foot">
+          Read live from Google with Antigravity&apos;s own sign-in. Models in a group share its limit, and usage outside Durango Code counts too.
+        </p>
       </section>
 
       <section className="usage-card">
         <div className="usage-card-title">
           <GrokBrandIcon size={16} />
           <span>Grok Build</span>
+          <span className="usage-card-meta">
+            {live?.grok?.at ? `${live.grok.status === 'ok' ? 'Live' : 'Checked'} ${relativeTime(live.grok.at)}` : ''}
+          </span>
+          <button type="button" className="usage-icon-button h-6 w-6" onClick={() => void loadLive(true)} disabled={liveLoading.grok === true} title="Check again" aria-label="Check live limits again">
+            <RefreshCw size={12} className={liveLoading.grok === true ? 'animate-spin' : ''} />
+          </button>
         </div>
-        <p className="usage-empty-note">Grok Build doesn&apos;t record plan limits in its sessions, so there is nothing to show.</p>
+        <LiveLimitsBody limits={live?.grok} loading={liveLoading.grok === true} empty="Grok reported no limits." />
+        <p className="usage-card-foot">Read live from grok.com with Grok Build&apos;s own sign-in: the share of this period&apos;s credits used.</p>
       </section>
+
     </div>
   );
 };
@@ -810,7 +883,7 @@ const UsageSettings = React.memo(function UsageSettings() {
           </div>
 
           <p className="usage-footnote">
-            Read from Claude Code, Codex and Grok Build session logs on this Mac. Kimi Code, OpenCode, Cursor and Muse runs aren&apos;t counted yet, and runs on
+            Read from Claude Code, Codex and Grok Build session logs on this Mac. Kimi Code, Antigravity, OpenCode, Cursor and Muse runs aren&apos;t counted yet, and runs on
             your other machines stay on those machines.
             {report.unpricedModels.length > 0 &&
               ` No list price for ${report.unpricedModels.join(', ')}: ${formatUsageTokens(report.totals.unpricedTokens)} tokens are counted without a cost.`}

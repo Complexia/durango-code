@@ -151,6 +151,7 @@ contextBridge.exposeInMainWorld('orion', {
   // Dev servers (Settings > Dev Servers)
   listDevServers: (input) => ipcRenderer.invoke('devServers:list', input),
   usageReport: (input) => ipcRenderer.invoke('usage:report', input),
+  usageLiveLimits: (input) => ipcRenderer.invoke('usage:liveLimits', input),
   onUsageProgress: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('usage:progress', listener);
@@ -229,6 +230,8 @@ contextBridge.exposeInMainWorld('orion', {
     return () => ipcRenderer.removeListener('providers:updateProgress', listener);
   },
   authenticateProvider: (providerId) => ipcRenderer.invoke('providers:authenticate', providerId),
+  submitProviderAuthCode: (input) => ipcRenderer.invoke('providers:submitAuthCode', input),
+  cancelProviderAuth: (providerId) => ipcRenderer.invoke('providers:cancelAuth', providerId),
   getFxConnections: () => ipcRenderer.invoke('fx:getConnections'),
   installFx: () => ipcRenderer.invoke('fx:install'),
   connectFx: (target) => ipcRenderer.invoke('fx:connect', target),

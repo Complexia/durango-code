@@ -305,6 +305,17 @@ export const commandForModel = (model, input) => {
     return ['kimi', ...extraArgs, 'acp'];
   }
 
+  if (model.providerId === 'antigravity') {
+    // agy always speaks ACP (`agy acp`): the prompt, cwd, session resume
+    // (session/load), model (session/set_model) and permission mode travel
+    // over the dialog, and every approval is answered by the driver's
+    // access-mode policy. Flags such as --add-dir follow the subcommand.
+    // Full access also skips agy's own approvals: its subagents' requests
+    // never reach ACP, so without this a child stalls on its first command.
+    const skipArgs = accessMode === 'full-access' ? ['--dangerously-skip-permissions'] : [];
+    return ['agy', 'acp', ...skipArgs, ...extraArgs];
+  }
+
   if (model.providerId === 'fx') {
     // fx always speaks ACP (`fx acp`): the route (provider + model), cwd,
     // session resume and permission mode travel over the dialog, and its

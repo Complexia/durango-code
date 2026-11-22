@@ -204,6 +204,7 @@ import {
   buildModelMentionsContext,
   buildOrchestrationContext,
   buildReviewThreadContext,
+  buildEditedThreadContext,
   buildRemoteThreadMentionsContext,
   buildThreadMentionsContext,
   linkedTaskFromBoardTask,
@@ -221,6 +222,7 @@ import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
 import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
 import { RestartToUpdateDialog, WhatsNewNotice } from './app/AppUpdateUi';
 import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
+import { ProviderAuthCodePrompt } from './app/ProviderAuthCodePrompt';
 import { addPromptContext, parseCodexReviewCommand } from './app/slashCommands';
 import type { SlashCommandInfo } from './types';
 import { withThreadStartReservation } from './app/turnStart';
@@ -1087,6 +1089,11 @@ const App: React.FC = () => {
   const [whatsNew, setWhatsNew] = useState<WhatsNewState | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
   const [authenticatingProviderId, setAuthenticatingProviderId] = useState<string | null>(null);
+  // "Edit" on an earlier user message: its text is in the composer, and the
+  // next send from that thread replaces it and everything after it.
+  const [editingMessages, setEditingMessages] = useState<
+    Record<string, { messageId: string; previousDraft: { text: string; attachments: FileAttachment[] } }>
+  >({});
   const [accountState, setAccountState] = useState<OrionAccountState>({
     authenticated: false,
     user: null,
@@ -3643,6 +3650,37 @@ const App: React.FC = () => {
     }
   }, [accountBusy]);
 
+  // "Edit" on an earlier user message: its text (and attachments) go back
+  // to the composer; sendMessage cuts the transcript when it's sent.
+  const beginEditMessage = useCallback(
+    (threadId: string, messageId: string) => {
+      // A turn still starting (preflight) would put its own draft back if it fails.
+      if (pendingTurnStartsRef.current.has(threadId)) return;
+      const message = loadedMessages(threadId)?.find((entry) => entry.id === messageId);
+      if (!message || message.role !== 'user') return;
+      const attachments = (message.attachments ?? []).map((attachment) => ({ ...attachment }));
+      // An attachments-only message stores a placeholder as its text.
+      const text = attachments.length > 0 && message.content === 'Attached file' ? '' : message.content;
+      let previousDraft: { text: string; attachments: FileAttachment[] } = { text: '', attachments: [] };
+      composerDraft.updateThreadDraft(threadId, (draft) => {
+        previousDraft = { text: draft.text, attachments: draft.attachments };
+        return { ...draft, text, attachments };
+      });
+      setEditingMessages((current) => ({
+        ...current,
+        // Editing another message of the same thread keeps the draft from before the first edit.
+        [threadId]: { messageId, previousDraft: current[threadId]?.previousDraft ?? previousDraft },
+      }));
+    },
+    [composerDraft]
+  );
+
+  // A sign-in that ends on a page showing a code to paste back (Antigravity).
+  const [providerAuthCodePrompt, setProviderAuthCodePrompt] = useState<{
+    providerId: string;
+    url: string;
+  } | null>(null);
+
   const handleAuthenticateProvider = useCallback(
     async (providerId: string) => {
       if (!window.orion?.authenticateProvider || authenticatingProviderId) return;
@@ -3650,7 +3688,9 @@ const App: React.FC = () => {
       setAuthenticatingProviderId(providerId);
       try {
         const result = await window.orion.authenticateProvider(providerId);
-        if (result.ok) {
+        if (result.ok && result.codeRequired && result.url) {
+          setProviderAuthCodePrompt({ providerId, url: result.url });
+        } else if (result.ok) {
           toast.info('Authentication started');
         } else {
           toast.error(result.error ?? 'Could not start authentication');
@@ -4605,6 +4645,19 @@ const App: React.FC = () => {
 
       if (event.type === 'session' && event.sessionId && event.providerId) {
         setThreadAgentSession(tracked.threadId, event.providerId as ProviderId, event.sessionId);
+      }
+      // The provider's native session can't continue (Antigravity's saved
+      // thinking no longer validates): the next turn starts a fresh one and
+      // carries this thread's conversation, as after an edit.
+      if (event.type === 'session-broken' && event.providerId) {
+        const brokenThread = useOrionStore.getState().threads.find((candidate) => candidate.id === tracked.threadId);
+        if (brokenThread) {
+          updateThread(tracked.threadId, {
+            agentSessionIds: { ...brokenThread.agentSessionIds, [event.providerId]: undefined },
+            pendingResumeContext:
+              buildEditedThreadContext(loadedMessages(tracked.threadId) ?? [], 'session-broken') || undefined,
+          });
+        }
       }
 
       if (event.type === 'chunk' && event.chunk) {
@@ -5809,8 +5862,11 @@ const App: React.FC = () => {
       const turnAttachments = [...taskAttachments, ...attachments];
       const userContent = promptText || (attachments.length > 0 ? 'Attached file' : '');
       let agentPrompt = buildPromptWithAttachments(promptText, attachments);
+      // Claude and Antigravity expand slash commands (/goal, /compact, …) only
+      // at the very start of the prompt, so added context goes after them.
       const preserveSlashCommandStart =
-        model.providerId === 'claude' && promptText.trimStart().startsWith('/');
+        (model.providerId === 'claude' || model.providerId === 'antigravity') &&
+        promptText.trimStart().startsWith('/');
       const addAgentContext = (context: string | null) => {
         if (context) {
           agentPrompt = addPromptContext(agentPrompt, context, preserveSlashCommandStart);
@@ -5831,7 +5887,13 @@ const App: React.FC = () => {
       // into this first fresh turn. The branched parent still does not absorb
       // every child transcript.
       // startTurnForThread loaded and holds the transcript.
-      addAgentContext(inheritedSubagentResumeContext(thread, loadedMessages(threadId) ?? [], model.providerId));
+      // The user edited an earlier message (or the native session broke): this
+      // fresh session gets the conversation kept before it, which already
+      // covers what an inherited child would carry. Cleared once the run
+      // has started, so a failed start keeps it for the retry.
+      const resumeContext = thread.pendingResumeContext;
+      if (resumeContext) addAgentContext(resumeContext);
+      else addAgentContext(inheritedSubagentResumeContext(thread, loadedMessages(threadId) ?? [], model.providerId));
       // @-model mentions in the user's original text: tell the agent which
       // models were referenced so it can delegate to them. Works on any
       // thread, not just Orion ones.
@@ -5968,7 +6030,7 @@ const App: React.FC = () => {
         providerOptions: normalizedProviderSettings[model.providerId]?.options,
         // These native providers consume attachments directly as well as
         // retaining the text/path context for later file and crop tools.
-        ...(['kimi', 'fx', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
+        ...(['kimi', 'antigravity', 'fx', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
           ? { attachments: turnAttachments } : {}),
         ...(model.providerId === 'codex'
           ? {
@@ -6012,6 +6074,10 @@ const App: React.FC = () => {
         ...(turnReportsToAgent(thread, fromAgent) ? { spawnedSubagent: true } : {}),
       });
       void startup.then((result) => {
+        if (result.ok && resumeContext) {
+          const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+          if (current?.pendingResumeContext === resumeContext) updateThread(threadId, { pendingResumeContext: undefined });
+        }
         if (result.ok && result.runId) {
           if (result.runId !== runId) {
             runOutputMessages.current.delete(runId);
@@ -7727,8 +7793,10 @@ const App: React.FC = () => {
     // branch: pause/clear act on the live run, and set/resume must never be
     // queued as plain follow-up text. Claude-backed threads fall through so a
     // custom Claude command named /goal still reaches the CLI's expander.
+    // Antigravity runs /goal natively: the text goes to agy as typed, and the
+    // turn lasts until agy reports the goal done (or the user stops it).
     const goalMatch = promptText.match(/^\/goal(?:\s+([\s\S]+))?$/i);
-    if (goalMatch && !selectedThreadClaudeBacked) {
+    if (goalMatch && !selectedThreadClaudeBacked && selectedAgentModel?.providerId !== 'antigravity') {
       void handleGoalCommand(promptText, goalMatch[1]?.trim() ?? '');
       return;
     }
@@ -7803,6 +7871,46 @@ const App: React.FC = () => {
       if (providerId) setActiveProviderTab(providerId);
       setModelPickerOpen(true);
       return;
+    }
+
+    // Sending an edited earlier message (only an ordinary message: the slash
+    // commands above act without consuming the edit). Cut the transcript
+    // before it and drop the provider sessions (no CLI can rewind its own
+    // conversation); the fresh session's first turn carries the kept
+    // messages as context.
+    const pendingEdit = editingMessages[selectedThreadId];
+    if (pendingEdit) {
+      if (isSending || pendingTurnStartsRef.current.has(selectedThreadId)) {
+        toast.error('Wait for the agent to finish, or stop it, before sending the edited message.');
+        return;
+      }
+      const editedThreadId = selectedThreadId;
+      const messages = loadedMessages(editedThreadId) ?? [];
+      const index = messages.findIndex((message) => message.id === pendingEdit.messageId);
+      setEditingMessages(({ [editedThreadId]: _done, ...rest }) => rest);
+      if (index !== -1) {
+        const kept = messages.slice(0, index);
+        // Claude keeps a live session per thread in main and would carry on
+        // the old conversation whatever the renderer drops (same as /clear).
+        try {
+          await window.orion?.clearClaudeSession?.(editedThreadId);
+        } catch {}
+        useOrionStore.getState().updateThreadTranscript(editedThreadId, (transcript) => ({
+          ...transcript,
+          messages: transcript.messages.slice(0, index),
+          btwExchanges: transcript.btwExchanges?.filter(
+            (exchange) => !exchange.afterMessageId || kept.some((message) => message.id === exchange.afterMessageId)
+          ),
+        }));
+        const context = buildEditedThreadContext(kept);
+        updateThread(editedThreadId, {
+          agentSessionIds: {},
+          pendingForkProviders: undefined,
+          // A Codex goal lived in the dropped session.
+          goal: undefined,
+          pendingResumeContext: context || undefined,
+        });
+      }
     }
 
     // Agent mid-run: hold the message; it dispatches when the current turn ends.
@@ -10311,6 +10419,29 @@ const App: React.FC = () => {
         split={threadPanes.length > 1}
       />
       {composerGitBar}
+      {editingMessages[selectedThread.id] && (
+        <div className="mx-auto mb-2 flex w-full max-w-[var(--chat-column-width,760px)] items-center gap-2 rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-2 text-[12.5px] text-[var(--text-secondary)]">
+          <span className="min-w-0 flex-1">
+            Editing an earlier message. Sending it replaces that message and everything after it, and the agent starts a fresh session with the conversation before it.
+          </span>
+          <button
+            type="button"
+            className="shrink-0 rounded-[var(--radius-sm)] px-2 py-1 text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
+            onClick={() => {
+              const threadId = selectedThread.id;
+              const previous = editingMessages[threadId]?.previousDraft;
+              setEditingMessages(({ [threadId]: _cancelled, ...rest }) => rest);
+              composerDraft.updateThreadDraft(threadId, (draft) => ({
+                ...draft,
+                text: previous?.text ?? '',
+                attachments: previous?.attachments ?? [],
+              }));
+            }}
+          >
+            Cancel
+          </button>
+        </div>
+      )}
       <Composer
         controller={composerDraft}
         threadId={selectedThread.id}
@@ -10883,6 +11014,7 @@ const App: React.FC = () => {
                         onAuthenticateProvider={handleAuthenticateProvider}
                         onDiscardClaudeBackgroundTasks={discardClaudeBackgroundTasks}
                         onSteerQueuedMessage={steerQueuedMessage}
+                        onEditMessage={beginEditMessage}
                       />
                     )}
                     {pane.focused ? composerNode : null}
@@ -11253,6 +11385,22 @@ const App: React.FC = () => {
           models={utilityCandidateModels}
           onSelect={(model) => setTextGenerationSettings({ modelId: model.id })}
           onDismiss={() => setTextGenerationPromptDismissed(true)}
+        />
+      )}
+
+      {providerAuthCodePrompt && (
+        <ProviderAuthCodePrompt
+          key={providerAuthCodePrompt.url}
+          providerId={providerAuthCodePrompt.providerId}
+          providerLabel={
+            agentProviders.find((provider) => provider.id === providerAuthCodePrompt.providerId)?.label ??
+            providerAuthCodePrompt.providerId
+          }
+          url={providerAuthCodePrompt.url}
+          onDone={(signedIn) => {
+            setProviderAuthCodePrompt(null);
+            if (signedIn) toast.success('Signed in');
+          }}
         />
       )}
 

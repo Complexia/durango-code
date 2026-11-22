@@ -1,10 +1,10 @@
-const mcpBridgeProviderIds = new Set(['codex', 'cursor', 'grok', 'kimi', 'fx', 'muse', 'opencode']);
+const mcpBridgeProviderIds = new Set(['codex', 'cursor', 'grok', 'kimi', 'antigravity', 'fx', 'muse', 'opencode']);
 
 // Bridge providers whose CLI keeps MCP tool definitions out of the model's
 // context until the agent looks a tool up, as Claude's deferred tools do:
 // Codex (0.169: deferred `mcp__orion` namespace, searched from code mode),
 // Grok (search_tool / use_tool) and Cursor (MCP meta tool with slim
-// descriptors). The others (Kimi, OpenCode, Muse, fx) send every listed
+// descriptors). The others (Kimi, Antigravity, OpenCode, Muse, fx) send every listed
 // tool's full definition with each request, so their bridge shim lists
 // one-line summaries and serves full definitions through load_tools
 // (--compact-tools in mcp-bridge-shim.cjs).

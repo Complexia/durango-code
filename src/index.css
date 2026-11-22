@@ -3544,6 +3544,10 @@ body {
   left: -34px;
 }
 
+.message.user .message-edit-btn {
+  left: -64px;
+}
+
 .message.agent .message-copy-btn {
   right: -34px;
 }

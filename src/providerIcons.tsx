@@ -1,5 +1,6 @@
 import type { SVGProps } from 'react';
 import orionIconUrl from '../assets/icon.png';
+import antigravityIconUrl from '../assets/antigravity-icon.png';
 
 export type ProviderIconProps = SVGProps<SVGSVGElement> & {
   size?: number;
@@ -67,6 +68,13 @@ export const KimiBrandIcon = ({ size = 24, className, ...props }: ProviderIconPr
     {...props}
   >
     <path d="M5.4 0h13.2A5.4 5.4 0 0 1 24 5.4v13.2a5.4 5.4 0 0 1-5.4 5.4H5.4A5.4 5.4 0 0 1 0 18.6V5.4A5.4 5.4 0 0 1 5.4 0zm1.85 4.75h2.9v6.02l5.53-6.02h3.72l-5.6 6.06 5.86 8.44h-3.54l-4.26-6.24-1.71 1.84v4.4h-2.9V4.75z" />
+  </svg>
+);
+
+/** Google Antigravity mark (the gradient arch), as T3 Code ships it. */
+export const AntigravityBrandIcon = ({ size = 24, className, ...props }: ProviderIconProps) => (
+  <svg viewBox="0 0 128 128" {...iconProps(size, className)} {...props}>
+    <image href={antigravityIconUrl} width="128" height="128" />
   </svg>
 );
 

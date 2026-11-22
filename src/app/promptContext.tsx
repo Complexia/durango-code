@@ -146,6 +146,51 @@ export const buildReviewThreadContext = (thread: Pick<Thread, 'linkedTasks'>, me
   return sections.join('\n\n');
 };
 
+// "Edit" on an earlier message cuts the transcript before it and starts a
+// fresh provider session (a CLI can't rewind its own conversation). The kept
+// messages travel as context on that fresh session's first turn, newest
+// first within the limit, the way T3 Code replays an Antigravity thread.
+export const EDITED_THREAD_CONTEXT_MAX_CHARS = 80_000;
+export const buildEditedThreadContext = (messages: Message[], reason: 'edited' | 'session-broken' = 'edited') => {
+  const entries = messages
+    .filter(
+      (message) =>
+        (message.role === 'user' || message.role === 'agent') && message.content.trim().length > 0
+    )
+    .map((message) => {
+      const role = message.role === 'user' ? 'User' : 'Assistant';
+      const attachments = (message.attachments ?? [])
+        .map((attachment) => `${attachment.name}: ${attachment.path}`)
+        .join('\n');
+      return `${role}:\n${message.content.trim()}${attachments ? `\n\nAttachments:\n${attachments}` : ''}`;
+    });
+  if (entries.length === 0) return '';
+  const selected: string[] = [];
+  let selectedChars = 0;
+  let truncated = false;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    const separatorChars = selected.length > 0 ? 6 : 0;
+    if (selectedChars + separatorChars + entry.length > EDITED_THREAD_CONTEXT_MAX_CHARS) {
+      truncated = true;
+      if (selected.length === 0) selected.push(entry.slice(-EDITED_THREAD_CONTEXT_MAX_CHARS));
+      break;
+    }
+    selected.unshift(entry);
+    selectedChars += separatorChars + entry.length;
+  }
+  return [
+    '[Orion thread context]',
+    reason === 'edited'
+      ? 'The user edited an earlier message, so this is a fresh session. These are the messages of this thread before the edited one; continue the conversation from them. Work already done in the workspace (file changes, commands) stays as it is.'
+      : "The previous session of this thread could not continue, so this is a fresh session. These are the thread's messages so far; continue the conversation from them. Work already done in the workspace (file changes, commands) stays as it is.",
+    ...(truncated ? ['Earlier messages were omitted to fit the context limit.'] : []),
+    '',
+    selected.join('\n\n---\n\n'),
+    '[/Orion thread context]',
+  ].join('\n');
+};
+
 // Human labels for the Orion orchestrator's delegation roles — shared by the
 // Settings → Orchestration tab and the orchestration payload/prompt so the
 // names the user configures are the names the orchestrator sees.
@@ -221,11 +266,11 @@ export const buildOrchestrationContext = (
   ];
   if (accessMode === 'read-only') {
     lines.push(
-      'Access mode: Read only. Every delegated CLI must remain read-only: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`; cursor uses `--mode plan --sandbox enabled`; grok uses `--permission-mode plan`. Never use bypass, force, auto-approve, or browser-control flags. Kimi may only be delegated through the `spawn_subagent` tool, whose child inherits this access mode; never invoke kimi prompt mode directly because it auto-approves every tool and cannot be made read-only.'
+      'Access mode: Read only. Every delegated CLI must remain read-only: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`; cursor uses `--mode plan --sandbox enabled`; grok uses `--permission-mode plan`. Never use bypass, force, auto-approve, or browser-control flags. Kimi may only be delegated through the `spawn_subagent` tool, whose child inherits this access mode; never invoke kimi prompt mode directly because it auto-approves every tool and cannot be made read-only. The same holds for Antigravity (`agy`): delegate it only through `spawn_subagent`.'
     );
   } else if (accessMode === 'workspace-write') {
     lines.push(
-      'Access mode: Workspace write. Delegated CLIs must remain sandboxed to the workspace: codex uses `--sandbox workspace-write`; claude uses `--permission-mode acceptEdits`; cursor uses `--sandbox enabled --force`; grok uses `--permission-mode acceptEdits`. Do not disable a sandbox or use unrestricted bypass flags. Kimi may only be delegated through the `spawn_subagent` tool, whose child inherits this access mode; never invoke kimi prompt mode directly because it auto-approves every tool and cannot be sandboxed.'
+      'Access mode: Workspace write. Delegated CLIs must remain sandboxed to the workspace: codex uses `--sandbox workspace-write`; claude uses `--permission-mode acceptEdits`; cursor uses `--sandbox enabled --force`; grok uses `--permission-mode acceptEdits`. Do not disable a sandbox or use unrestricted bypass flags. Kimi may only be delegated through the `spawn_subagent` tool, whose child inherits this access mode; never invoke kimi prompt mode directly because it auto-approves every tool and cannot be sandboxed. The same holds for Antigravity (`agy`): delegate it only through `spawn_subagent`.'
     );
   } else {
     lines.push(

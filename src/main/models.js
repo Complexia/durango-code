@@ -215,6 +215,30 @@ export const cursorFallbackModels = [
   },
 ];
 
+// Antigravity's model list for a Google sign-in (agy 1.5.14, 2026-11-21).
+// The live list comes from `agy models` and replaces this block; it depends
+// on the account's plan. Gemini ids carry the thinking level.
+const antigravityFallbackRows = [
+  ['gemini-3.8-flash-high', 'Gemini 3.8 Flash (High)'],
+  ['gemini-3.8-flash-medium', 'Gemini 3.8 Flash (Medium)'],
+  ['gemini-3.8-flash-low', 'Gemini 3.8 Flash (Low)'],
+  ['claude-sonnet-4-6', 'Claude Sonnet 4.6 (Thinking)'],
+  ['claude-opus-4-6-thinking', 'Claude Opus 4.6 (Thinking)'],
+  ['gpt-oss-120b-medium', 'GPT-OSS 120B (Medium)'],
+];
+export const antigravityFavoriteModelSlugs = new Set(['gemini-3.8-flash-high']);
+const antigravityModel = ([slug, label], index) => ({
+  id: `antigravity:${slug}`,
+  providerId: 'antigravity',
+  providerLabel: 'Antigravity',
+  label,
+  slug,
+  command: 'agy',
+  ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+  favorite: antigravityFavoriteModelSlugs.has(slug),
+});
+export const antigravityFallbackModels = antigravityFallbackRows.map(antigravityModel);
+
 // Kimi Code's managed models (K3.1 Pro shipped 2026-10-23), in the order
 // listKimiModels pins them; the live list (including any user-added
 // providers) comes from `kimi provider list --json` and replaces this block.
@@ -512,6 +536,7 @@ export const agentModels = [
   },
   claudeCodeCliModel,
   ...kimiFallbackModels,
+  ...antigravityFallbackModels,
   ...fxFallbackModels,
   ...museFallbackModels,
   ...cursorFallbackModels,
@@ -691,6 +716,34 @@ export const listKimiModels = async () => {
         };
       })
       .filter(Boolean);
+  } catch {
+    return [];
+  }
+};
+
+// `agy models` prints the signed-in account's models as `<id>\t<name>`
+// lines (after a "Fetching available models..." banner). It needs a Google
+// sign-in; signed out it prints nothing usable and the fallback stays.
+export const parseAntigravityModelsOutput = (output) => {
+  const rows = [];
+  const seen = new Set();
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const match = /^([A-Za-z0-9][\w.\-/]*)\t+(.+)$/.exec(line.trim());
+    if (!match || seen.has(match[1])) continue;
+    seen.add(match[1]);
+    rows.push([match[1], match[2].trim()]);
+  }
+  return rows.map(antigravityModel);
+};
+
+export const listAntigravityModels = async () => {
+  if (!(await checkCommandAvailable('agy'))) return [];
+  try {
+    const { stdout } = await execFileAsync('agy', ['models'], {
+      timeout: 20000,
+      env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+    });
+    return parseAntigravityModelsOutput(stdout);
   } catch {
     return [];
   }
@@ -1055,8 +1108,8 @@ export const spliceProviderModels = (models, providerId, replacements) => {
 };
 
 // One live reader per provider. Codex, Grok, Claude and Muse parse the
-// catalog their CLI already caches on disk (no spawn, no auth); Cursor, Kimi
-// and OpenCode have to spawn their CLI; fx lists Durango's chat catalog. A
+// catalog their CLI already caches on disk (no spawn, no auth); Cursor, Kimi,
+// Antigravity and OpenCode have to spawn their CLI; fx lists Durango's chat catalog. A
 // reader returns [] when it cannot discover anything, which keeps that
 // provider's previous block.
 export const agentModelDiscoverers = {
@@ -1064,6 +1117,7 @@ export const agentModelDiscoverers = {
   codex: listCodexModels,
   claude: listClaudeModels,
   kimi: listKimiModels,
+  antigravity: listAntigravityModels,
   fx: listFxModels,
   muse: listMuseModels,
   cursor: listCursorAgentModels,
@@ -1075,6 +1129,7 @@ const providerCommands = {
   codex: 'codex',
   claude: 'claude',
   kimi: 'kimi',
+  antigravity: 'agy',
   fx: 'fx',
   muse: 'muse',
   cursor: 'cursor-agent',

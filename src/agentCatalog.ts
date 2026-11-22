@@ -1,4 +1,5 @@
 import {
+  AntigravityBrandIcon,
   ClaudeBrandIcon,
   CodexBrandIcon,
   CursorBrandIcon,
@@ -18,6 +19,7 @@ export type AgentProviderId =
   | 'claude'
   | 'cursor'
   | 'kimi'
+  | 'antigravity'
   | 'fx'
   | 'muse'
   | 'opencode';
@@ -526,6 +528,18 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
       placeholder: '--add-dir /path',
     },
   ],
+  // Antigravity turns run over `agy acp`; model and permissions travel in
+  // the JSON-RPC dialog. Extra flags follow the subcommand (e.g. --add-dir).
+  antigravity: [
+    {
+      key: 'extraArgs',
+      label: 'Extra CLI flags',
+      description:
+        'Appended after `agy acp` on every Antigravity invocation (e.g. --add-dir /path, --sandbox). Quotes are respected.',
+      type: 'string',
+      placeholder: '--add-dir /path',
+    },
+  ],
   // fx turns run over `fx acp`; global flags (--add-dir, --context-limit)
   // must precede the subcommand. Routing (subscriptions, Durango credits,
   // Vercel AI Gateway) has its own panel in Settings → Providers → fx.
@@ -560,8 +574,8 @@ export const providerOptionDefs: Record<AgentProviderId, ProviderOptionDef[]> = 
 // steer: deliver the message INTO the running turn without interrupting it —
 // the same behavior as typing while Claude Code works. This needs a live
 // mid-turn input channel: Claude folds the message into its persistent SDK
-// session, Codex uses app-server's native turn/steer, and fx takes a
-// steering session/prompt over its ACP dialog. The other
+// session, Codex uses app-server's native turn/steer, and fx and Antigravity
+// take a steering session/prompt over their ACP dialog. The other
 // harnesses run one-shot per turn or hold a single-prompt ACP dialog, so a
 // follow-up cannot reach the running turn — it queues and sends when that
 // turn finishes. Steer must never kill the running process; that is Stop's job.
@@ -573,6 +587,7 @@ export const providerFollowUpSupport: Record<AgentProviderId, { queue: boolean; 
   claude: { queue: true, steer: true },
   cursor: { queue: true, steer: false },
   kimi: { queue: true, steer: false },
+  antigravity: { queue: true, steer: true },
   fx: { queue: true, steer: true },
   muse: { queue: true, steer: false },
   opencode: { queue: true, steer: false },
@@ -584,6 +599,7 @@ export const agentProviders: AgentProvider[] = [
   { id: 'codex', label: 'Codex', icon: CodexBrandIcon },
   { id: 'claude', label: 'Claude', icon: ClaudeBrandIcon },
   { id: 'kimi', label: 'Kimi', icon: KimiBrandIcon },
+  { id: 'antigravity', label: 'Antigravity', icon: AntigravityBrandIcon },
   { id: 'fx', label: 'fx', icon: FxBrandIcon },
   { id: 'muse', label: 'Muse', icon: MuseBrandIcon },
   { id: 'cursor', label: 'Cursor', icon: CursorBrandIcon },
@@ -784,6 +800,55 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Kimi',
     label: 'K3-256k',
     slug: 'kimi-code/k3-256k',
+    shortcut: '⌘6',
+  },
+  {
+    id: 'antigravity:gemini-3.8-flash-high',
+    providerId: 'antigravity',
+    providerLabel: 'Antigravity',
+    label: 'Gemini 3.8 Flash (High)',
+    slug: 'gemini-3.8-flash-high',
+    shortcut: '⌘1',
+    favorite: true,
+  },
+  {
+    id: 'antigravity:gemini-3.8-flash-medium',
+    providerId: 'antigravity',
+    providerLabel: 'Antigravity',
+    label: 'Gemini 3.8 Flash (Medium)',
+    slug: 'gemini-3.8-flash-medium',
+    shortcut: '⌘2',
+  },
+  {
+    id: 'antigravity:gemini-3.8-flash-low',
+    providerId: 'antigravity',
+    providerLabel: 'Antigravity',
+    label: 'Gemini 3.8 Flash (Low)',
+    slug: 'gemini-3.8-flash-low',
+    shortcut: '⌘3',
+  },
+  {
+    id: 'antigravity:claude-sonnet-4-6',
+    providerId: 'antigravity',
+    providerLabel: 'Antigravity',
+    label: 'Claude Sonnet 4.6 (Thinking)',
+    slug: 'claude-sonnet-4-6',
+    shortcut: '⌘4',
+  },
+  {
+    id: 'antigravity:claude-opus-4-6-thinking',
+    providerId: 'antigravity',
+    providerLabel: 'Antigravity',
+    label: 'Claude Opus 4.6 (Thinking)',
+    slug: 'claude-opus-4-6-thinking',
+    shortcut: '⌘5',
+  },
+  {
+    id: 'antigravity:gpt-oss-120b-medium',
+    providerId: 'antigravity',
+    providerLabel: 'Antigravity',
+    label: 'GPT-OSS 120B (Medium)',
+    slug: 'gpt-oss-120b-medium',
     shortcut: '⌘6',
   },
   // fx models are Durango catalog ids; each turn routes to a connected
