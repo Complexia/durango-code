@@ -5,18 +5,19 @@ import { useOrionStore } from '../store';
 import { AntigravityBrandIcon, ClaudeBrandIcon, CodexBrandIcon, GrokBrandIcon } from '../providerIcons';
 import type { LiveProviderLimits, LiveUsageLimits, UsageRange, UsageReport, UsageScanProgress, UsageSourceFilter } from '../types';
 
-// Settings → Usage: how much the coding agents are used on this machine, read
-// from their own session logs (src/main/usage-stats.js). Token counts are what
-// the agents logged; every dollar figure is an API-price estimate.
+// Settings → Usage: plan limits across every provider plus token usage and
+// API-price estimates read from the agents' own session logs
+// (src/main/usage-stats.js, src/main/provider-usage-limits.js).
 
-type UsageView = 'cost' | 'tokens' | 'limits';
+type UsageView = 'cost' | 'tokens';
 
 const PROVIDERS: Record<string, { label: string; Icon: typeof ClaudeBrandIcon; color: string }> = {
   claude: { label: 'Claude Code', Icon: ClaudeBrandIcon, color: 'var(--usage-claude)' },
   codex: { label: 'Codex', Icon: CodexBrandIcon, color: 'var(--usage-codex)' },
+  antigravity: { label: 'Antigravity', Icon: AntigravityBrandIcon, color: 'var(--usage-antigravity)' },
   grok: { label: 'Grok Build', Icon: GrokBrandIcon, color: 'var(--usage-grok)' },
 };
-const PROVIDER_ORDER = ['claude', 'codex', 'grok'];
+const PROVIDER_ORDER = ['claude', 'codex', 'antigravity', 'grok'];
 
 const RANGES: Array<{ id: UsageRange; label: string }> = [
   { id: '24h', label: 'Past 24h' },
@@ -398,15 +399,15 @@ const BreakdownBar = ({ title, parts, aside }: { title: string; parts: Array<{ i
 
 const CLAUDE_WINDOWS: Record<string, string> = {
   five_hour: '5-hour session',
-  seven_day: 'Weekly, all models',
-  seven_day_opus: 'Weekly, Opus',
-  seven_day_sonnet: 'Weekly, Sonnet',
-  seven_day_overage_included: 'Weekly, incl. extra usage',
+  seven_day: 'Weekly · all models',
+  seven_day_opus: 'Weekly · Opus',
+  seven_day_sonnet: 'Weekly · Sonnet',
+  seven_day_overage_included: 'Weekly · incl. extra usage',
   overage: 'Extra usage',
   unknown: 'Usage limit',
 };
 
-const windowName = (minutes?: number) => {
+const windowName = (minutes?: number | null) => {
   if (!minutes) return 'Usage window';
   if (minutes === 300) return '5-hour window';
   if (minutes === 10080) return 'Weekly';
@@ -418,16 +419,42 @@ const windowName = (minutes?: number) => {
 const relativeTime = (time: number) => {
   const diff = time - Date.now();
   const abs = Math.abs(diff);
+  if (abs < 45_000) return 'just now';
   const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
   if (abs < 60 * 60 * 1000) return formatter.format(Math.round(diff / 60000), 'minute');
   if (abs < 48 * 60 * 60 * 1000) return formatter.format(Math.round(diff / 3_600_000), 'hour');
   return formatter.format(Math.round(diff / 86_400_000), 'day');
 };
 
+const countdown = (time: number) => {
+  const ms = time - Date.now();
+  if (ms <= 0) return null;
+  const totalMinutes = Math.max(1, Math.round(ms / 60_000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return hours > 0 ? `in ${days}d ${hours}h` : `in ${days}d`;
+  if (hours > 0) return minutes > 0 ? `in ${hours}h ${minutes}m` : `in ${hours}h`;
+  return `in ${minutes}m`;
+};
+
 const resetLabel = (time: number | null | undefined) => {
   if (!time) return null;
   if (time <= Date.now()) return 'Reset since this report';
-  return `Resets ${relativeTime(time)} · ${new Date(time).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })}`;
+  const left = countdown(time);
+  const clock = new Date(time).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  return `Resets ${left ?? relativeTime(time)} · ${clock}`;
+};
+
+const formatUsedPercent = (used: number | null, status?: string | null) => {
+  if (used === null) {
+    if (status === 'rejected') return 'Limit reached';
+    if (status === 'allowed_warning') return 'Approaching limit';
+    if (status === 'allowed') return 'Within limit';
+    return '—';
+  }
+  if (used > 0 && used < 1) return '<1% used';
+  return `${Math.round(used)}% used`;
 };
 
 const LimitMeter = ({ name, used, detail, status }: { name: string; used: number | null; detail: string | null; status?: string | null }) => {
@@ -435,13 +462,11 @@ const LimitMeter = ({ name, used, detail, status }: { name: string; used: number
   return (
     <div className="usage-limit-row">
       <div className="usage-limit-head">
-        <span>{name}</span>
-        <span className="usage-num">
-          {used === null ? (status === 'rejected' ? 'Limit reached' : status === 'allowed_warning' ? 'Approaching limit' : status === 'allowed' ? 'Within limit' : '—') : `${Math.round(used)}% used`}
-        </span>
+        <span className="usage-limit-name">{name}</span>
+        <span className="usage-num">{formatUsedPercent(used, status)}</span>
       </div>
       <div className={`usage-limit-track ${level}`}>
-        <span style={{ width: `${Math.min(100, Math.max(used ?? 0, used === null ? 0 : 1))}%` }} />
+        <span style={{ width: `${Math.min(100, Math.max(used ?? 0, used === null || used === 0 ? 0 : 1.5))}%` }} />
       </div>
       {detail && <div className="usage-limit-detail">{detail}</div>}
     </div>
@@ -451,7 +476,7 @@ const LimitMeter = ({ name, used, detail, status }: { name: string; used: number
 // One provider's live limits (provider-usage-limits.js): its windows, or why
 // there are none.
 const LiveLimitsBody = ({ limits, loading, empty }: { limits: LiveProviderLimits | undefined; loading: boolean; empty: string }) => {
-  if (!limits) return <p className="usage-empty-note">{loading ? 'Checking…' : empty}</p>;
+  if (!limits) return <p className="usage-empty-note">{loading ? 'Checking live limits…' : empty}</p>;
   if (limits.status !== 'ok') return <p className="usage-empty-note">{limits.detail || empty}</p>;
   if (!limits.windows?.length) return <p className="usage-empty-note">{empty}</p>;
   return (
@@ -464,138 +489,268 @@ const LiveLimitsBody = ({ limits, loading, empty }: { limits: LiveProviderLimits
           detail={resetLabel(window.resetsAt)}
         />
       ))}
+      {limits.extra && (
+        <div className="usage-limit-extra">
+          <span>{limits.extra}</span>
+        </div>
+      )}
     </>
   );
 };
 
-const LimitsView = ({ report }: { report: UsageReport }) => {
-  const [live, setLive] = React.useState<LiveUsageLimits | null>(null);
-  const [liveLoading, setLiveLoading] = React.useState<Record<string, boolean>>({});
-  // Each provider's card fills in as its own read lands: Codex may first have
-  // to start its app-server, which takes several seconds.
-  const loadLive = React.useCallback(async (force = false) => {
-    const read = window.orion?.usageLiveLimits;
-    if (!read) return;
-    await Promise.all(
-      ['antigravity', 'grok', 'codex'].map(async (providerId) => {
-        setLiveLoading((current) => ({ ...current, [providerId]: true }));
-        try {
-          const result = await read({ force, providers: [providerId] });
-          if (result.ok) setLive((current) => ({ ...(current ?? {}), ...result.limits }));
-        } finally {
-          setLiveLoading((current) => ({ ...current, [providerId]: false }));
-        }
-      })
-    );
-  }, []);
-  React.useEffect(() => {
-    void loadLive();
-  }, [loadLive]);
+const PlanLimitsSection = ({
+  report,
+  live,
+  liveLoading,
+  providerFilter,
+  onRefreshProvider,
+  onRefreshAll,
+}: {
+  report: UsageReport | null;
+  live: LiveUsageLimits | null;
+  liveLoading: Record<string, boolean>;
+  providerFilter: string;
+  onRefreshProvider: (providerId: string) => void;
+  onRefreshAll: () => void;
+}) => {
+  const anyLoading = Object.values(liveLoading).some(Boolean);
+  const show = (id: string) => providerFilter === 'all' || providerFilter === id;
+
+  // Claude: live OAuth usage when available, else cached SDK rate_limit_event fallback.
+  const liveClaudeOk = live?.claude?.status === 'ok' && Boolean(live.claude.windows?.length);
+  const claudeEntries = Object.entries(report?.limits.claude ?? {}).sort(
+    ([a], [b]) => Object.keys(CLAUDE_WINDOWS).indexOf(a) - Object.keys(CLAUDE_WINDOWS).indexOf(b)
+  );
+  const claudeFallbackAt = claudeEntries.reduce((latest, [, value]) => Math.max(latest, value.at), 0);
+
+  // Codex: live (app-server or ChatGPT OAuth usage) when available, else latest session-log snapshot.
   const liveCodex = live?.codex && 'value' in live.codex ? live.codex : null;
-  const codex = liveCodex ?? report.limits.codex;
-  const claudeEntries = Object.entries(report.limits.claude ?? {}).sort(([a], [b]) => Object.keys(CLAUDE_WINDOWS).indexOf(a) - Object.keys(CLAUDE_WINDOWS).indexOf(b));
-  const claudeAt = claudeEntries.reduce((latest, [, value]) => Math.max(latest, value.at), 0);
+  const liveCodexStatus = live?.codex && !('value' in live.codex) ? live.codex : null;
+  const codex = liveCodex ?? report?.limits.codex ?? null;
+  const codexWindows = codex
+    ? [
+        ...[codex.value.primary, codex.value.secondary]
+          .filter((limit): limit is NonNullable<typeof limit> => Boolean(limit))
+          .map((limit, index) => ({
+            key: `codex-${index}`,
+            name: windowName(limit.window_minutes),
+            used: typeof limit.used_percent === 'number' ? limit.used_percent : null,
+            resetsAt: typeof limit.resets_at === 'number' ? limit.resets_at * 1000 : null,
+          })),
+        ...(codex.value.additional ?? []).map((limit, index) => ({
+          key: `codex-extra-${index}`,
+          name: limit.window_minutes ? `${limit.label} · ${windowName(limit.window_minutes)}` : limit.label,
+          used: typeof limit.used_percent === 'number' ? limit.used_percent : null,
+          resetsAt: typeof limit.resets_at === 'number' ? limit.resets_at * 1000 : null,
+        })),
+      ]
+    : [];
+
   return (
-    <div className="usage-limits">
-      <section className="usage-card">
-        <div className="usage-card-title">
-          <ClaudeBrandIcon size={16} />
-          <span>Claude Code</span>
-          {claudeAt > 0 && <span className="usage-card-meta">Reported {relativeTime(claudeAt)}</span>}
+    <section className="usage-limits-section" aria-label="Plan limits">
+      <div className="usage-limits-header">
+        <div className="usage-limits-heading">
+          <span>Plan limits</span>
+          <span className="usage-muted">5-hour, weekly and credit quotas across providers</span>
         </div>
-        {claudeEntries.length === 0 ? (
-          <p className="usage-empty-note">
-            Claude Code reports its plan limits while it runs. They show here after the next Claude Code run in Durango Code (a thread or a bot reply).
-          </p>
-        ) : (
-          claudeEntries.map(([type, value]) => {
-            const used = value.utilization === null ? null : value.utilization <= 1 ? value.utilization * 100 : value.utilization;
-            return (
-              <LimitMeter
-                key={type}
-                name={CLAUDE_WINDOWS[type] ?? type.replace(/_/g, ' ')}
-                used={used}
-                status={value.status}
-                detail={[resetLabel(value.resetsAt), value.usingOverage ? 'Using extra usage' : null].filter(Boolean).join(' · ') || null}
-              />
-            );
-          })
+        <button
+          type="button"
+          className="usage-limits-refresh"
+          onClick={onRefreshAll}
+          disabled={anyLoading}
+          title="Refresh live plan limits"
+        >
+          <RefreshCw size={12} className={anyLoading ? 'animate-spin' : ''} />
+          <span>{anyLoading ? 'Checking…' : 'Refresh limits'}</span>
+        </button>
+      </div>
+
+      <div className={`usage-limits ${providerFilter !== 'all' ? 'is-single' : ''}`}>
+        {show('claude') && (
+          <div className="usage-card">
+            <div className="usage-card-title">
+              <ClaudeBrandIcon size={15} />
+              <span>Claude Code</span>
+              {live?.claude?.plan && <span className="usage-pill">{live.claude.plan}</span>}
+              <InfoTip>
+                {liveClaudeOk
+                  ? "Read live from Anthropic with Claude Code's own sign-in (5-hour, weekly and model-scoped plan windows)."
+                  : 'Read live from Anthropic when signed in, with fallback to the rate-limit events Claude Code reports during runs in Durango Code.'}
+              </InfoTip>
+              <span className="usage-card-meta">
+                {liveLoading.claude
+                  ? 'Checking…'
+                  : liveClaudeOk && live?.claude?.at
+                    ? `Live · ${relativeTime(live.claude.at)}`
+                    : claudeFallbackAt > 0
+                      ? `Reported ${relativeTime(claudeFallbackAt)}`
+                      : live?.claude?.at
+                        ? `Checked ${relativeTime(live.claude.at)}`
+                        : ''}
+              </span>
+              <button
+                type="button"
+                className="usage-icon-button h-6 w-6"
+                onClick={() => onRefreshProvider('claude')}
+                disabled={liveLoading.claude === true}
+                title="Refresh Claude Code limits"
+                aria-label="Refresh Claude Code limits"
+              >
+                <RefreshCw size={12} className={liveLoading.claude === true ? 'animate-spin' : ''} />
+              </button>
+            </div>
+            <div className="usage-card-body">
+              {liveClaudeOk ? (
+                <LiveLimitsBody limits={live?.claude} loading={liveLoading.claude === true} empty="Claude Code reported no active limits." />
+              ) : claudeEntries.length > 0 ? (
+                claudeEntries.map(([type, value]) => {
+                  const used = value.utilization === null ? null : value.utilization <= 1 ? value.utilization * 100 : value.utilization;
+                  return (
+                    <LimitMeter
+                      key={type}
+                      name={CLAUDE_WINDOWS[type] ?? type.replace(/_/g, ' ')}
+                      used={used}
+                      status={value.status}
+                      detail={[resetLabel(value.resetsAt), value.usingOverage ? 'Using extra usage' : null].filter(Boolean).join(' · ') || null}
+                    />
+                  );
+                })
+              ) : (
+                <LiveLimitsBody
+                  limits={live?.claude}
+                  loading={liveLoading.claude === true}
+                  empty="Sign in to Claude Code or run a Claude turn to see plan limits."
+                />
+              )}
+            </div>
+          </div>
         )}
-        <p className="usage-card-foot">From the plan usage Claude Code reports with each request in Durango Code (threads and bot replies), so it is as current as the last Claude run.</p>
-      </section>
 
-      <section className="usage-card">
-        <div className="usage-card-title">
-          <CodexBrandIcon size={16} />
-          <span>Codex</span>
-          {codex?.value?.plan_type && <span className="usage-pill">{codex.value.plan_type}</span>}
-          {codex && <span className="usage-card-meta">{liveCodex ? 'Live' : 'Reported'} {relativeTime(codex.at)}</span>}
-        </div>
-        {!codex ? (
-          <p className="usage-empty-note">No Codex session on this Mac has reported plan limits yet.</p>
-        ) : (
-          <>
-            {[codex.value.primary, codex.value.secondary].filter(Boolean).map((limit, index) => (
-              <LimitMeter
-                key={index}
-                name={windowName(limit?.window_minutes)}
-                used={typeof limit?.used_percent === 'number' ? limit.used_percent : null}
-                detail={resetLabel(typeof limit?.resets_at === 'number' ? limit.resets_at * 1000 : null)}
-              />
-            ))}
-            {codex.value.credits && (codex.value.credits.balance || codex.value.credits.unlimited) && (
-              <div className="usage-limit-row">
-                <div className="usage-limit-head">
-                  <span>Credits</span>
-                  <span className="usage-num">
-                    {codex.value.credits.unlimited ? 'Unlimited' : Number(codex.value.credits.balance).toLocaleString(undefined, { maximumFractionDigits: 0 })}
-                  </span>
-                </div>
-              </div>
-            )}
-          </>
+        {show('codex') && (
+          <div className="usage-card">
+            <div className="usage-card-title">
+              <CodexBrandIcon size={15} />
+              <span>Codex</span>
+              {codex?.value?.plan_type && <span className="usage-pill">{codex.value.plan_type}</span>}
+              <InfoTip>
+                {liveCodex
+                  ? "Read live from Codex with its ChatGPT sign-in (5-hour, weekly and credit windows)."
+                  : "Read live from Codex when signed in, falling back to the latest rate-limit snapshot in Codex's session logs."}
+              </InfoTip>
+              <span className="usage-card-meta">
+                {liveLoading.codex
+                  ? 'Checking…'
+                  : codex
+                    ? `${liveCodex ? 'Live · ' : 'Reported '}${relativeTime(codex.at)}`
+                    : liveCodexStatus?.at
+                      ? `Checked ${relativeTime(liveCodexStatus.at)}`
+                      : ''}
+              </span>
+              <button
+                type="button"
+                className="usage-icon-button h-6 w-6"
+                onClick={() => onRefreshProvider('codex')}
+                disabled={liveLoading.codex === true}
+                title="Refresh Codex limits"
+                aria-label="Refresh Codex limits"
+              >
+                <RefreshCw size={12} className={liveLoading.codex === true ? 'animate-spin' : ''} />
+              </button>
+            </div>
+            <div className="usage-card-body">
+              {!codex ? (
+                <p className="usage-empty-note">
+                  {liveLoading.codex
+                    ? 'Checking live limits…'
+                    : liveCodexStatus?.detail || 'No Codex plan limits available yet.'}
+                </p>
+              ) : (
+                <>
+                  {codexWindows.map((win) => (
+                    <LimitMeter key={win.key} name={win.name} used={win.used} detail={resetLabel(win.resetsAt)} />
+                  ))}
+                  {codex.value.credits && (codex.value.credits.balance || codex.value.credits.unlimited) && (
+                    <div className="usage-limit-extra">
+                      <span>Credits</span>
+                      <span className="usage-num">
+                        {codex.value.credits.unlimited
+                          ? 'Unlimited'
+                          : Number(codex.value.credits.balance).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                      </span>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
         )}
-        <p className="usage-card-foot">
-          {liveCodex
-            ? 'Read live from Codex with its own sign-in.'
-            : "From the latest rate-limit snapshot in Codex's session logs. It updates with each Codex turn, so it can be behind if Codex last ran a while ago."}
-        </p>
-      </section>
 
-      <section className="usage-card">
-        <div className="usage-card-title">
-          <AntigravityBrandIcon size={16} />
-          <span>Antigravity</span>
-          {live?.antigravity?.plan && <span className="usage-pill">{live.antigravity.plan}</span>}
-          <span className="usage-card-meta">
-            {live?.antigravity?.at ? `${live.antigravity.status === 'ok' ? 'Live' : 'Checked'} ${relativeTime(live.antigravity.at)}` : ''}
-          </span>
-          <button type="button" className="usage-icon-button h-6 w-6" onClick={() => void loadLive(true)} disabled={liveLoading.antigravity === true} title="Check again" aria-label="Check live limits again">
-            <RefreshCw size={12} className={liveLoading.antigravity === true ? 'animate-spin' : ''} />
-          </button>
-        </div>
-        <LiveLimitsBody limits={live?.antigravity} loading={liveLoading.antigravity === true} empty="Antigravity reported no limits." />
-        <p className="usage-card-foot">
-          Read live from Google with Antigravity&apos;s own sign-in. Models in a group share its limit, and usage outside Durango Code counts too.
-        </p>
-      </section>
+        {show('antigravity') && (
+          <div className="usage-card">
+            <div className="usage-card-title">
+              <AntigravityBrandIcon size={15} />
+              <span>Antigravity</span>
+              {live?.antigravity?.plan && <span className="usage-pill">{live.antigravity.plan}</span>}
+              <InfoTip align="end">
+                Read live from Google with Antigravity&apos;s own sign-in. Models in a group share its 5-hour and weekly limits, including usage outside Durango Code.
+              </InfoTip>
+              <span className="usage-card-meta">
+                {liveLoading.antigravity
+                  ? 'Checking…'
+                  : live?.antigravity?.at
+                    ? `${live.antigravity.status === 'ok' ? 'Live · ' : 'Checked '}${relativeTime(live.antigravity.at)}`
+                    : ''}
+              </span>
+              <button
+                type="button"
+                className="usage-icon-button h-6 w-6"
+                onClick={() => onRefreshProvider('antigravity')}
+                disabled={liveLoading.antigravity === true}
+                title="Refresh Antigravity limits"
+                aria-label="Refresh Antigravity limits"
+              >
+                <RefreshCw size={12} className={liveLoading.antigravity === true ? 'animate-spin' : ''} />
+              </button>
+            </div>
+            <div className="usage-card-body">
+              <LiveLimitsBody limits={live?.antigravity} loading={liveLoading.antigravity === true} empty="Antigravity reported no limits." />
+            </div>
+          </div>
+        )}
 
-      <section className="usage-card">
-        <div className="usage-card-title">
-          <GrokBrandIcon size={16} />
-          <span>Grok Build</span>
-          <span className="usage-card-meta">
-            {live?.grok?.at ? `${live.grok.status === 'ok' ? 'Live' : 'Checked'} ${relativeTime(live.grok.at)}` : ''}
-          </span>
-          <button type="button" className="usage-icon-button h-6 w-6" onClick={() => void loadLive(true)} disabled={liveLoading.grok === true} title="Check again" aria-label="Check live limits again">
-            <RefreshCw size={12} className={liveLoading.grok === true ? 'animate-spin' : ''} />
-          </button>
-        </div>
-        <LiveLimitsBody limits={live?.grok} loading={liveLoading.grok === true} empty="Grok reported no limits." />
-        <p className="usage-card-foot">Read live from grok.com with Grok Build&apos;s own sign-in: the share of this period&apos;s credits used.</p>
-      </section>
-
-    </div>
+        {show('grok') && (
+          <div className="usage-card">
+            <div className="usage-card-title">
+              <GrokBrandIcon size={15} />
+              <span>Grok Build</span>
+              <InfoTip align="end">
+                Read live from grok.com with Grok Build&apos;s own sign-in: the share of this period&apos;s subscription credits used.
+              </InfoTip>
+              <span className="usage-card-meta">
+                {liveLoading.grok
+                  ? 'Checking…'
+                  : live?.grok?.at
+                    ? `${live.grok.status === 'ok' ? 'Live · ' : 'Checked '}${relativeTime(live.grok.at)}`
+                    : ''}
+              </span>
+              <button
+                type="button"
+                className="usage-icon-button h-6 w-6"
+                onClick={() => onRefreshProvider('grok')}
+                disabled={liveLoading.grok === true}
+                title="Refresh Grok Build limits"
+                aria-label="Refresh Grok Build limits"
+              >
+                <RefreshCw size={12} className={liveLoading.grok === true ? 'animate-spin' : ''} />
+              </button>
+            </div>
+            <div className="usage-card-body">
+              <LiveLimitsBody limits={live?.grok} loading={liveLoading.grok === true} empty="Grok reported no limits." />
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
   );
 };
 
@@ -612,6 +767,8 @@ const UsageSettings = React.memo(function UsageSettings() {
   const [loading, setLoading] = React.useState(true);
   const [progress, setProgress] = React.useState<UsageScanProgress | null>(null);
   const [showAllModels, setShowAllModels] = React.useState(false);
+  const [live, setLive] = React.useState<LiveUsageLimits | null>(null);
+  const [liveLoading, setLiveLoading] = React.useState<Record<string, boolean>>({});
   const requestRef = React.useRef(0);
 
   // Agent session ids → Durango Code threads, so usage can be attributed.
@@ -631,6 +788,26 @@ const UsageSettings = React.memo(function UsageSettings() {
   linksRef.current = links;
 
   React.useEffect(() => window.orion?.onUsageProgress?.((next) => setProgress(next)), []);
+
+  const loadLive = React.useCallback(async (force = false, targetProviders: string[] = PROVIDER_ORDER) => {
+    const read = window.orion?.usageLiveLimits;
+    if (!read) return;
+    await Promise.all(
+      targetProviders.map(async (providerId) => {
+        setLiveLoading((current) => ({ ...current, [providerId]: true }));
+        try {
+          const result = await read({ force, providers: [providerId] });
+          if (result.ok) setLive((current) => ({ ...(current ?? {}), ...result.limits }));
+        } finally {
+          setLiveLoading((current) => ({ ...current, [providerId]: false }));
+        }
+      })
+    );
+  }, []);
+
+  React.useEffect(() => {
+    void loadLive(false);
+  }, [loadLive]);
 
   const load = React.useCallback(
     async (refresh = false) => {
@@ -657,8 +834,8 @@ const UsageSettings = React.memo(function UsageSettings() {
   }, [load]);
 
   const providerOptions: MenuOption[] = [
-    { value: 'all', label: 'All agents', hint: 'Claude Code, Codex and Grok Build' },
-    ...PROVIDER_ORDER.filter((id) => !report || report.availableProviders.includes(id)).map((id) => {
+    { value: 'all', label: 'All agents', hint: 'Claude Code, Codex, Antigravity and Grok Build' },
+    ...PROVIDER_ORDER.filter((id) => !report || report.availableProviders.includes(id) || id === provider).map((id) => {
       const { Icon, label } = PROVIDERS[id];
       return { value: id, label, icon: <Icon size={14} /> };
     }),
@@ -667,6 +844,7 @@ const UsageSettings = React.memo(function UsageSettings() {
 
   const firstScan = loading && !report;
   const showCost = view === 'cost';
+  const refreshingAll = loading || Object.values(liveLoading).some(Boolean);
 
   return (
     <div className="usage-page">
@@ -686,17 +864,35 @@ const UsageSettings = React.memo(function UsageSettings() {
             options={[
               { id: 'cost', label: 'Cost' },
               { id: 'tokens', label: 'Tokens' },
-              { id: 'limits', label: 'Limits' },
             ]}
             onChange={setView}
           />
-          <button type="button" className="usage-icon-button" title="Rescan session logs" aria-label="Rescan session logs" onClick={() => void load(true)} disabled={loading}>
-            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+          <button
+            type="button"
+            className="usage-icon-button"
+            title="Refresh usage logs and plan limits"
+            aria-label="Refresh usage logs and plan limits"
+            onClick={() => {
+              void load(true);
+              void loadLive(true, provider === 'all' ? PROVIDER_ORDER : [provider]);
+            }}
+            disabled={refreshingAll}
+          >
+            <RefreshCw size={14} className={refreshingAll ? 'animate-spin' : ''} />
           </button>
         </div>
       </div>
 
       {error && <div className="usage-error">{error}</div>}
+
+      <PlanLimitsSection
+        report={report}
+        live={live}
+        liveLoading={liveLoading}
+        providerFilter={provider}
+        onRefreshProvider={(providerId) => void loadLive(true, [providerId])}
+        onRefreshAll={() => void loadLive(true, provider === 'all' ? PROVIDER_ORDER : [provider])}
+      />
 
       {firstScan && (
         <div className="usage-scanning">
@@ -710,9 +906,7 @@ const UsageSettings = React.memo(function UsageSettings() {
         </div>
       )}
 
-      {report && view === 'limits' && <LimitsView report={report} />}
-
-      {report && view !== 'limits' && (
+      {report && (
         <div className={`usage-body ${loading ? 'is-loading' : ''}`}>
           <div className="usage-top">
             <div className="usage-summary">
@@ -725,8 +919,8 @@ const UsageSettings = React.memo(function UsageSettings() {
                     <InfoTip>
                       What these calls would cost at each provider&apos;s public API list prices (Vercel AI Gateway catalog
                       {report.prices.fetchedAt ? `, prices from ${new Date(report.prices.fetchedAt).toLocaleDateString()}` : ''}). It is not
-                      your bill: Claude, ChatGPT and Grok subscriptions charge a flat price. Token counts are exact, as the agents logged
-                      them. Grok Build&apos;s figures are its own estimate.
+                      your bill: Claude, ChatGPT, Google AI and Grok subscriptions charge a flat price. Token counts are exact, as the agents
+                      logged them. Grok Build&apos;s figures are its own estimate.
                     </InfoTip>
                   </>
                 ) : (
@@ -883,7 +1077,7 @@ const UsageSettings = React.memo(function UsageSettings() {
           </div>
 
           <p className="usage-footnote">
-            Read from Claude Code, Codex and Grok Build session logs on this Mac. Kimi Code, Antigravity, OpenCode, Cursor and Muse runs aren&apos;t counted yet, and runs on
+            Read from Claude Code, Codex, Antigravity and Grok Build session logs on this Mac. Kimi Code, OpenCode, Cursor and Muse runs aren&apos;t counted yet, and runs on
             your other machines stay on those machines.
             {report.unpricedModels.length > 0 &&
               ` No list price for ${report.unpricedModels.join(', ')}: ${formatUsageTokens(report.totals.unpricedTokens)} tokens are counted without a cost.`}

@@ -7,11 +7,13 @@ import path from 'node:path';
 import { buildUsageReport, createUsageStore, latestCodexLimits } from '../src/main/usage-stats.js';
 import { priceUsage, pricesForModel } from '../src/main/usage-pricing.js';
 import { claudeRateLimits, configureUsageLimits, recordClaudeRateLimit } from '../src/main/usage-limits.js';
+import { claudeWindowsFromOAuthUsage, codexLimitsFromWhamUsage } from '../src/main/provider-usage-limits.js';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'usage-stats-'));
 const roots = {
   claude: path.join(root, 'claude', 'projects'),
   codex: [path.join(root, 'codex', 'sessions'), path.join(root, 'codex', 'archived_sessions')],
+  antigravity: path.join(root, 'antigravity', 'brain'),
   grok: path.join(root, 'grok', 'sessions'),
 };
 const now = Date.parse('2026-11-20T12:00:00Z');
@@ -90,10 +92,31 @@ await fs.writeFile(
   })
 );
 
+// Antigravity parent + child subagent transcripts.
+const agyParent = 'agy-parent-1';
+const agyChild = 'agy-child-1';
+await fs.mkdir(path.join(roots.antigravity, agyParent, '.system_generated', 'logs'), { recursive: true });
+await fs.mkdir(path.join(roots.antigravity, agyParent, '.system_generated', 'subagents'), { recursive: true });
+await fs.mkdir(path.join(roots.antigravity, agyChild, '.system_generated', 'logs'), { recursive: true });
+await fs.writeFile(path.join(roots.antigravity, agyParent, '.system_generated', 'subagents', `${agyChild}.json`), JSON.stringify({ state: 'SUBAGENT_STATE_DONE' }));
+await fs.writeFile(
+  path.join(roots.antigravity, agyParent, '.system_generated', 'logs', 'transcript.jsonl'),
+  jsonl([
+    { step_index: 0, type: 'USER_INPUT', created_at: at(2), content: 'hello' },
+    { step_index: 1, type: 'PLANNER_RESPONSE', created_at: at(2), model: 'gemini-4-neon-high', input_tokens: 1000, cache_read_tokens: 5000, output_tokens: 100 },
+  ])
+);
+await fs.writeFile(
+  path.join(roots.antigravity, agyChild, '.system_generated', 'logs', 'transcript.jsonl'),
+  jsonl([
+    { step_index: 1, type: 'PLANNER_RESPONSE', created_at: at(1.5), model: 'gemini-3.8-flash-low', input_tokens: 400, cache_read_tokens: 600, output_tokens: 40 },
+  ])
+);
+
 const cacheFile = path.join(root, 'cache.json');
 const store = createUsageStore({ roots, cacheFile });
 await store.scan({ force: true });
-const links = new Map([['sess-a', 'thread'], ['01a1f660-46e1-71e0-bf1f-0de2c27f4b7f', 'subagent']]);
+const links = new Map([['sess-a', 'thread'], ['01a1f660-46e1-71e0-bf1f-0de2c27f4b7f', 'subagent'], [agyParent, 'thread']]);
 const report = buildUsageReport(store.entries(), { range: '24h', links, now });
 
 const claude = report.providers.find((row) => row.id === 'claude');
@@ -113,18 +136,28 @@ assert.equal(grok.tokens.input, 200);
 assert.ok(Math.abs(grok.cost - 0.0025) < 1e-9, "grok uses its own cost (ticks are 1e-10 USD)");
 assert.ok(Math.abs(report.costByType.other - 0.0025) < 1e-9);
 
-// Sources: sess-a is a thread, its sidechain call a subagent; agent-x1's parent is a thread.
+const antigravity = report.providers.find((row) => row.id === 'antigravity');
+assert.equal(antigravity.tokens.input, 1000 + 400);
+assert.equal(antigravity.tokens.cacheRead, 5000 + 600);
+assert.equal(antigravity.tokens.output, 100 + 40);
+assert.equal(antigravity.sessions, 2, 'antigravity parent + child subagent');
+assert.ok(antigravity.cost > 0, 'antigravity gemini models are priced');
+
+// Sources: sess-a + agyParent are threads; sidechain, agent-x1, linked codex, and agyChild are subagents.
 const bySource = Object.fromEntries(report.sources.map((row) => [row.id, row]));
-assert.equal(bySource.thread.tokens.output, 2 * 50, 'sess-a calls 1 and 2');
-assert.equal(bySource.subagent.tokens.output, 50 + 50 + 20 + 40, 'sidechain call, subagent file, linked codex subagent');
+assert.equal(bySource.thread.tokens.output, 2 * 50 + 100, 'sess-a calls 1 and 2 + agyParent');
+assert.equal(bySource.subagent.tokens.output, 50 + 50 + 20 + 40 + 40, 'sidechain call, subagent file, linked codex subagent, agy child');
 assert.equal(bySource.bot.tokens.output, 50);
 const durangoOnly = buildUsageReport(store.entries(), { range: '24h', links, now, source: 'durango' });
 assert.equal(durangoOnly.sources.some((row) => row.id === 'other'), false);
 
-// Pricing: Opus 5.5 list prices; 1h cache writes at 2× input; fast mode table.
+// Pricing: Opus 5.5 list prices; 1h cache writes at 2× input; fast mode table; Antigravity Gemini & 3p models.
 assert.equal(pricesForModel('claude', 'claude-opus-5-5')?.id, 'anthropic/claude-opus-5.5');
 assert.equal(pricesForModel('claude', 'claude-haiku-4-5-20251001')?.id, 'anthropic/claude-haiku-4.5');
 assert.equal(pricesForModel('codex', 'gpt-6.2-sol')?.id, 'openai/gpt-6.2-sol');
+assert.equal(pricesForModel('antigravity', 'gemini-3.8-flash-low')?.id, 'google/gemini-3.8-flash');
+assert.equal(pricesForModel('antigravity', 'gemini-4-neon-high')?.id, 'google/gemini-4-neon');
+assert.equal(pricesForModel('antigravity', 'claude-opus-4-6-thinking')?.id, 'anthropic/claude-opus-4.6');
 assert.equal(pricesForModel('claude', 'claude-imaginary-1'), null);
 const opus = pricesForModel('claude', 'claude-opus-5-5').rates;
 const priced = priceUsage('claude', 'claude-opus-5-5', { input: 1e6, cacheRead: 1e6, cacheWrite5m: 1e6, cacheWrite1h: 1e6, output: 1e6 });
@@ -168,6 +201,43 @@ recordClaudeRateLimit({ type: 'rate_limit_event', rate_limit_info: { status: 'al
 assert.deepEqual(claudeRateLimits().seven_day, { status: 'allowed', utilization: 0.01, resetsAt: 1795744800000, usingOverage: false, overageStatus: 'rejected', at: now + 1 });
 assert.equal(claudeRateLimits().five_hour.utilization, 0.4);
 assert.equal(claudeRateLimits().five_hour.status, null);
+
+// Live OAuth usage parsing: Claude & Codex wham.
+const claudeLive = claudeWindowsFromOAuthUsage({
+  five_hour: { utilization: 18, resets_at: '2026-11-22T15:00:00Z' },
+  seven_day: { utilization: 5, resets_at: '2026-11-27T02:00:00Z' },
+  limits: [
+    { kind: 'weekly_all', group: 'weekly', percent: 5, resets_at: '2026-11-27T02:00:00Z' },
+    { kind: 'weekly_scoped', group: 'weekly', percent: 12, resets_at: '2026-11-27T02:00:00Z', scope: { model: { display_name: 'Fable' } } },
+  ],
+  extra_usage: { is_enabled: true, utilization: 25 },
+});
+assert.deepEqual(
+  claudeLive.map((w) => [w.id, w.label, w.usedPercent]),
+  [
+    ['five_hour', '5-hour session', 18],
+    ['seven_day', 'Weekly · all models', 5],
+    ['weekly_fable', 'Weekly · Fable', 12],
+    ['extra_usage', 'Extra usage', 25],
+  ]
+);
+
+const codexWham = codexLimitsFromWhamUsage({
+  plan_type: 'prolite',
+  rate_limit: {
+    primary_window: { used_percent: 12, limit_window_seconds: 18000, reset_at: 1795360000 },
+    secondary_window: { used_percent: 3, limit_window_seconds: 604800, reset_at: 1795649183 },
+  },
+  code_review_rate_limit: {
+    primary_window: { used_percent: 40, limit_window_seconds: 604800, reset_at: 1795649183 },
+  },
+  credits: { has_credits: true, unlimited: false, balance: '75000.00' },
+});
+assert.equal(codexWham.value.plan_type, 'prolite');
+assert.deepEqual(codexWham.value.primary, { used_percent: 12, window_minutes: 300, resets_at: 1795360000 });
+assert.deepEqual(codexWham.value.secondary, { used_percent: 3, window_minutes: 10080, resets_at: 1795649183 });
+assert.equal(codexWham.value.additional[0].label, 'Code review');
+assert.equal(codexWham.value.credits.balance, '75000.00');
 
 await fs.rm(root, { recursive: true, force: true });
 console.log('usage stats: ok');

@@ -2,7 +2,7 @@
 // $ per million tokens. Do not edit by hand.
 export default {
  "source": "https://ai-gateway.vercel.sh/v1/models",
- "fetchedAt": "2026-11-20T03:12:09.719Z",
+ "fetchedAt": "2026-11-22T10:26:04.492Z",
  "models": {
   "anthropic/claude-fable-5": {
    "input": 10,
@@ -221,6 +221,327 @@ export default {
    "output": 10,
    "input_cache_read": 0.1,
    "input_cache_write": 2.5
+  },
+  "google/gemini-2.5-flash": {
+   "input": 0.3,
+   "output": 2.5,
+   "input_cache_read": 0.03,
+   "fast": {
+    "input": 0.54,
+    "output": 4.5,
+    "input_cache_read": 0.054
+   }
+  },
+  "google/gemini-2.5-flash-image": {
+   "input": 0.3,
+   "output": 2.5,
+   "input_cache_read": 0.03
+  },
+  "google/gemini-2.5-flash-lite": {
+   "input": 0.1,
+   "output": 0.4,
+   "input_cache_read": 0.01,
+   "fast": {
+    "input": 0.18,
+    "output": 0.72,
+    "input_cache_read": 0.018
+   }
+  },
+  "google/gemini-2.5-pro": {
+   "input": 1.25,
+   "input_tiers": [
+    {
+     "cost": 1.25,
+     "min": 0
+    },
+    {
+     "cost": 2.5,
+     "min": 200001
+    }
+   ],
+   "output": 10,
+   "output_tiers": [
+    {
+     "cost": 10,
+     "min": 0
+    },
+    {
+     "cost": 15,
+     "min": 200001
+    }
+   ],
+   "input_cache_read": 0.125,
+   "input_cache_read_tiers": [
+    {
+     "cost": 0.125,
+     "min": 0
+    },
+    {
+     "cost": 0.25,
+     "min": 200001
+    }
+   ],
+   "fast": {
+    "input": 2.25,
+    "output": 18,
+    "input_cache_read": 0.225
+   }
+  },
+  "google/gemini-3-flash": {
+   "input": 0.5,
+   "input_tiers": [
+    {
+     "cost": 0.5,
+     "min": 0
+    },
+    {
+     "cost": 0.5,
+     "min": 200001
+    }
+   ],
+   "output": 3,
+   "output_tiers": [
+    {
+     "cost": 3,
+     "min": 0
+    },
+    {
+     "cost": 3,
+     "min": 200001
+    }
+   ],
+   "input_cache_read": 0.05,
+   "input_cache_read_tiers": [
+    {
+     "cost": 0.05,
+     "min": 0
+    },
+    {
+     "cost": 0.05,
+     "min": 200001
+    }
+   ],
+   "fast": {
+    "input": 0.9,
+    "output": 5.4,
+    "input_cache_read": 0.09
+   }
+  },
+  "google/gemini-3-pro-image": {
+   "input": 2,
+   "output": 12,
+   "input_cache_read": 0.2
+  },
+  "google/gemini-3.1-flash-image": {
+   "input": 0.5,
+   "output": 3,
+   "input_cache_read": 0.05
+  },
+  "google/gemini-3.1-flash-lite": {
+   "input": 0.25,
+   "output": 1.5,
+   "input_cache_read": 0.03,
+   "fast": {
+    "input": 0.45,
+    "output": 2.7,
+    "input_cache_read": 0.045
+   }
+  },
+  "google/gemini-3.1-flash-lite-image": {
+   "input": 0.25,
+   "output": 1.5,
+   "input_cache_read": 0.03
+  },
+  "google/gemini-3.1-pro-preview": {
+   "input": 2,
+   "input_tiers": [
+    {
+     "cost": 2,
+     "min": 0
+    },
+    {
+     "cost": 4,
+     "min": 200001
+    }
+   ],
+   "output": 12,
+   "output_tiers": [
+    {
+     "cost": 12,
+     "min": 0
+    },
+    {
+     "cost": 18,
+     "min": 200001
+    }
+   ],
+   "input_cache_read": 0.2,
+   "input_cache_read_tiers": [
+    {
+     "cost": 0.2,
+     "min": 0
+    },
+    {
+     "cost": 0.4,
+     "min": 200001
+    }
+   ],
+   "fast": {
+    "input": 3.6,
+    "output": 21.6,
+    "input_cache_read": 0.36
+   }
+  },
+  "google/gemini-3.5-flash": {
+   "input": 1.5,
+   "output": 9,
+   "input_cache_read": 0.15,
+   "fast": {
+    "input": 2.7,
+    "output": 16.2,
+    "input_cache_read": 0.27
+   }
+  },
+  "google/gemini-3.5-flash-lite": {
+   "input": 0.3,
+   "output": 2.5,
+   "input_cache_read": 0.03,
+   "fast": {
+    "input": 0.54,
+    "output": 4.5,
+    "input_cache_read": 0.054
+   }
+  },
+  "google/gemini-3.5-transcribe": {
+   "input": 2,
+   "output": 12
+  },
+  "google/gemini-3.5-transcribe-live": {
+   "input": 0.0001
+  },
+  "google/gemini-3.6-flash": {
+   "input": 0.75,
+   "output": 3.75,
+   "input_cache_read": 0.075,
+   "fast": {
+    "input": 1.35,
+    "output": 6.75,
+    "input_cache_read": 0.135
+   }
+  },
+  "google/gemini-3.7-flash": {
+   "input": 0.75,
+   "output": 3.75,
+   "input_cache_read": 0.075,
+   "fast": {
+    "input": 1.35,
+    "output": 6.75,
+    "input_cache_read": 0.135
+   }
+  },
+  "google/gemini-3.8-flash": {
+   "input": 0.75,
+   "output": 3.75,
+   "input_cache_read": 0.075,
+   "fast": {
+    "input": 1.35,
+    "output": 6.75,
+    "input_cache_read": 0.135
+   }
+  },
+  "google/gemini-3.8-flash-lite-tts": {
+   "input": 0.5,
+   "output": 6
+  },
+  "google/gemini-3.8-flash-tts": {
+   "input": 0.5,
+   "output": 9
+  },
+  "google/gemini-3.8-live": {
+   "input": 0.75,
+   "output": 4.5
+  },
+  "google/gemini-3.8-live-extended-thinking": {
+   "input": 0.75,
+   "output": 4.5
+  },
+  "google/gemini-4-argon": {
+   "input": 2,
+   "output": 10,
+   "input_cache_read": 0.1,
+   "fast": {
+    "input": 3.6,
+    "output": 18,
+    "input_cache_read": 0.18
+   }
+  },
+  "google/gemini-4-carbon": {
+   "input": 2,
+   "output": 10,
+   "input_cache_read": 0.1,
+   "fast": {
+    "input": 3.6,
+    "output": 18,
+    "input_cache_read": 0.18
+   }
+  },
+  "google/gemini-4-hydrogen": {
+   "input": 1.5,
+   "output": 7.5,
+   "input_cache_read": 0.075,
+   "fast": {
+    "input": 2.7,
+    "output": 13.5,
+    "input_cache_read": 0.135
+   }
+  },
+  "google/gemini-4-neon": {
+   "input": 3,
+   "output": 15,
+   "input_cache_read": 0.15,
+   "fast": {
+    "input": 5.4,
+    "output": 27,
+    "input_cache_read": 0.27
+   }
+  },
+  "google/gemini-decision-1": {
+   "input": 0.1,
+   "output": 0
+  },
+  "google/gemini-embedding-001": {
+   "input": 0.15
+  },
+  "google/gemini-embedding-2": {
+   "input": 0.2
+  },
+  "google/gemini-nano-banana-2.1": {
+   "input": 1.5,
+   "output": 7.5,
+   "input_cache_read": 0.15
+  },
+  "google/gemini-omni-1.2-flash": {
+   "input": 1.5,
+   "output": 9
+  },
+  "google/gemini-omni-flash-preview": {
+   "input": 1.5,
+   "output": 9
+  },
+  "google/gemma-4-26b-a4b-it": {
+   "input": 0.15,
+   "output": 0.6,
+   "input_cache_read": 0.015
+  },
+  "google/gemma-4-31b-it": {
+   "input": 0.14,
+   "output": 0.4
+  },
+  "google/text-embedding-005": {
+   "input": 0.025
+  },
+  "google/text-multilingual-embedding-002": {
+   "input": 0.025
   },
   "moonshotai/kimi-k2": {
    "input": 0.57,

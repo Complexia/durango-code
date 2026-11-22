@@ -1,11 +1,9 @@
 // Plan limits read live from the providers' own quota endpoints, with the
-// sign-in their CLI already stored (the Usage view's Limits tab). Claude
-// limits arrive during runs (usage-limits.js) and Codex limits from its
-// session logs (usage-stats.js); Antigravity and Grok record none locally,
-// so they are asked directly, the way T3 Code reads them
-// (apps/server/src/provider/antigravityUsageLimits.ts,
-// packages/provider-grok/src/server/usageLimits.ts). Nothing is refreshed or
-// written: an expired token reads as "run a turn to renew it".
+// sign-in their CLI already stored (Settings → Usage). Every provider
+// (Claude Code, Codex, Antigravity, Grok Build) is queried directly; Claude
+// and Codex also keep local fallbacks from SDK rate_limit_event messages
+// (usage-limits.js) and Codex session logs (usage-stats.js). Nothing is
+// refreshed or written: an expired token reads as "run a turn to renew it".
 
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
@@ -36,6 +34,195 @@ const clampPercent = (value) => Math.min(100, Math.max(0, value));
 const isoTime = (value) => {
   const time = typeof value === 'string' ? Date.parse(value) : NaN;
   return Number.isFinite(time) ? time : null;
+};
+
+// --- Claude Code -------------------------------------------------------------
+
+const titleCase = (value) => {
+  const text = String(value || '').trim();
+  return text ? `${text[0].toUpperCase()}${text.slice(1)}` : null;
+};
+
+const claudeCredentialsPath = () =>
+  path.join(path.resolve(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')), '.credentials.json');
+
+const readClaudeToken = async () => {
+  let raw = null;
+  if (process.platform === 'darwin') {
+    raw = await execText('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w']);
+  }
+  if (!raw) {
+    try {
+      raw = await fs.readFile(claudeCredentialsPath(), 'utf8');
+    } catch {
+      raw = null;
+    }
+  }
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const oauth = parsed?.claudeAiOauth ?? parsed;
+    if (typeof oauth?.accessToken !== 'string' || !oauth.accessToken) return null;
+    const rawExpiry = Number(oauth.expiresAt);
+    const expiresAt = Number.isFinite(rawExpiry) && rawExpiry > 0 ? (rawExpiry < 1e12 ? rawExpiry * 1000 : rawExpiry) : null;
+    return {
+      accessToken: oauth.accessToken,
+      expiresAt,
+      plan: titleCase(oauth.subscriptionType),
+    };
+  } catch {
+    return null;
+  }
+};
+
+const CLAUDE_OAUTH_WINDOWS = [
+  ['five_hour', '5-hour session', 300],
+  ['seven_day', 'Weekly · all models', 10080],
+  ['seven_day_opus', 'Weekly · Opus', 10080],
+  ['seven_day_sonnet', 'Weekly · Sonnet', 10080],
+  ['seven_day_cowork', 'Weekly · Cowork', 10080],
+];
+
+/** /api/oauth/usage → normalized rate-limit windows (5-hour, weekly, scoped model limits, extra usage). */
+export const claudeWindowsFromOAuthUsage = (body) => {
+  if (!body || typeof body !== 'object') return [];
+  const windows = [];
+  const seenIds = new Set();
+  const seenModels = new Set();
+  for (const [key, label, windowMinutes] of CLAUDE_OAUTH_WINDOWS) {
+    const entry = body[key];
+    if (!entry || typeof entry !== 'object') continue;
+    if (typeof entry.utilization !== 'number' || !Number.isFinite(entry.utilization)) continue;
+    windows.push({
+      id: key,
+      label,
+      usedPercent: clampPercent(entry.utilization),
+      resetsAt: isoTime(entry.resets_at),
+      windowMinutes,
+    });
+    seenIds.add(key);
+    if (key === 'seven_day_opus') seenModels.add('opus');
+    if (key === 'seven_day_sonnet') seenModels.add('sonnet');
+  }
+  for (const limit of Array.isArray(body.limits) ? body.limits : []) {
+    if (!limit || typeof limit !== 'object') continue;
+    if (typeof limit.percent !== 'number' || !Number.isFinite(limit.percent)) continue;
+    if ((limit.kind === 'five_hour' || limit.group === '5h' || limit.group === 'session') && !seenIds.has('five_hour')) {
+      windows.unshift({
+        id: 'five_hour',
+        label: '5-hour session',
+        usedPercent: clampPercent(limit.percent),
+        resetsAt: isoTime(limit.resets_at),
+        windowMinutes: 300,
+      });
+      seenIds.add('five_hour');
+      continue;
+    }
+    if (limit.kind === 'weekly_all' && !seenIds.has('seven_day')) {
+      windows.push({
+        id: 'seven_day',
+        label: 'Weekly · all models',
+        usedPercent: clampPercent(limit.percent),
+        resetsAt: isoTime(limit.resets_at),
+        windowMinutes: 10080,
+      });
+      seenIds.add('seven_day');
+      continue;
+    }
+    const scopedName = typeof limit.scope?.model?.display_name === 'string' ? limit.scope.model.display_name.trim() : '';
+    if (scopedName && !seenModels.has(scopedName.toLowerCase())) {
+      const id = `weekly_${scopedName.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`;
+      if (!seenIds.has(id)) {
+        windows.push({
+          id,
+          label: `Weekly · ${scopedName}`,
+          usedPercent: clampPercent(limit.percent),
+          resetsAt: isoTime(limit.resets_at),
+          windowMinutes: limit.group === '5h' ? 300 : 10080,
+        });
+        seenIds.add(id);
+        seenModels.add(scopedName.toLowerCase());
+      }
+    }
+  }
+  if (body.extra_usage?.is_enabled && typeof body.extra_usage.utilization === 'number' && Number.isFinite(body.extra_usage.utilization)) {
+    windows.push({
+      id: 'extra_usage',
+      label: 'Extra usage',
+      usedPercent: clampPercent(body.extra_usage.utilization),
+      resetsAt: null,
+      windowMinutes: null,
+    });
+  }
+  return windows;
+};
+
+const claudeExtraUsageNote = (body) => {
+  const extra = body?.extra_usage;
+  const spend = body?.spend;
+  if (extra?.is_enabled) {
+    const currency = extra.currency || 'USD';
+    const scale = 10 ** (Number.isFinite(Number(extra.decimal_places)) ? Number(extra.decimal_places) : 2);
+    const fmt = (minor) =>
+      typeof minor === 'number' && Number.isFinite(minor)
+        ? (minor / scale).toLocaleString('en-US', { style: 'currency', currency, minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        : null;
+    const used = fmt(extra.used_credits);
+    const limit = fmt(extra.monthly_limit);
+    if (used && limit) return `Extra usage: ${used} of ${limit}`;
+    if (used) return `Extra usage: ${used} used`;
+    return 'Extra usage enabled';
+  }
+  if (spend?.enabled && typeof spend.used?.amount_minor === 'number') {
+    const scale = 10 ** (Number.isFinite(Number(spend.used.exponent)) ? Number(spend.used.exponent) : 2);
+    const used = (spend.used.amount_minor / scale).toLocaleString('en-US', {
+      style: 'currency',
+      currency: spend.used.currency || 'USD',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+    return `Extra usage: ${used} used`;
+  }
+  return null;
+};
+
+export const readClaudeLimits = async () => {
+  const token = await readClaudeToken();
+  if (!token) {
+    if (process.env.ANTHROPIC_API_KEY) {
+      return { status: 'unavailable', detail: 'Claude Code uses an API key here (ANTHROPIC_API_KEY), which has no plan limits.' };
+    }
+    return { status: 'signed-out', detail: 'Sign in to Claude Code to see live plan limits.' };
+  }
+  if (token.expiresAt && token.expiresAt <= Date.now() + 60_000) {
+    return { status: 'expired', detail: "Claude Code's sign-in token has expired. Run a Claude turn to renew it, then refresh." };
+  }
+  try {
+    const response = await fetchJson('https://api.anthropic.com/api/oauth/usage', {
+      headers: {
+        Authorization: `Bearer ${token.accessToken}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': 'claude-code/2.1.0',
+      },
+    });
+    if (response.status === 401) {
+      return { status: 'expired', detail: "Claude Code's sign-in has expired. Run a Claude turn to renew it, then refresh." };
+    }
+    if (!response.ok) {
+      const message = typeof response.body?.error === 'string' ? response.body.error : response.body?.error?.message;
+      return { status: 'error', detail: message || `HTTP ${response.status}` };
+    }
+    const windows = claudeWindowsFromOAuthUsage(response.body);
+    const extra = claudeExtraUsageNote(response.body);
+    return {
+      status: 'ok',
+      windows,
+      ...(token.plan ? { plan: token.plan } : {}),
+      ...(extra ? { extra } : {}),
+    };
+  } catch (error) {
+    return { status: 'error', detail: error?.message || String(error) };
+  }
 };
 
 // --- Antigravity -------------------------------------------------------------
@@ -321,15 +508,102 @@ export const readCodexLiveLimits = async (manager, clientVersion = '0.0.0') => {
   }
 };
 
+const whamWindow = (window) =>
+  window && typeof window === 'object'
+    ? {
+        used_percent: typeof window.used_percent === 'number' && Number.isFinite(window.used_percent) ? clampPercent(window.used_percent) : null,
+        window_minutes:
+          typeof window.limit_window_seconds === 'number' && Number.isFinite(window.limit_window_seconds) && window.limit_window_seconds > 0
+            ? Math.round(window.limit_window_seconds / 60)
+            : null,
+        resets_at: typeof window.reset_at === 'number' && Number.isFinite(window.reset_at) ? window.reset_at : null,
+      }
+    : null;
+
+/** ChatGPT /backend-api/wham/usage → Codex limits snapshot (same shape as session logs + app-server). */
+export const codexLimitsFromWhamUsage = (body) => {
+  if (!body || typeof body !== 'object') return null;
+  const primary = whamWindow(body.rate_limit?.primary_window);
+  const secondary = whamWindow(body.rate_limit?.secondary_window);
+  const additional = [];
+  const codeReview = whamWindow(body.code_review_rate_limit?.primary_window);
+  if (codeReview) additional.push({ label: 'Code review', ...codeReview });
+  for (const extra of Array.isArray(body.additional_rate_limits) ? body.additional_rate_limits : []) {
+    const win = whamWindow(extra?.rate_limit?.primary_window);
+    if (!win) continue;
+    const label = String(extra.limit_name || extra.metered_feature || 'Additional limit').trim();
+    additional.push({ label, ...win });
+  }
+  const credits =
+    body.credits && typeof body.credits === 'object'
+      ? {
+          balance: body.credits.balance ?? null,
+          unlimited: body.credits.unlimited === true,
+          has_credits: body.credits.has_credits === true,
+        }
+      : null;
+  if (!primary && !secondary && !additional.length && !credits) return null;
+  return {
+    at: Date.now(),
+    live: true,
+    value: {
+      primary,
+      secondary,
+      ...(additional.length ? { additional } : {}),
+      ...(credits ? { credits } : {}),
+      plan_type: typeof body.plan_type === 'string' ? body.plan_type : null,
+      ...(typeof body.rate_limit_reached_type === 'string' ? { rate_limit_reached_type: body.rate_limit_reached_type } : {}),
+    },
+  };
+};
+
+export const readCodexWhamLimits = async () => {
+  const codexHome = path.resolve(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
+  let auth = null;
+  try {
+    auth = JSON.parse(await fs.readFile(path.join(codexHome, 'auth.json'), 'utf8'));
+  } catch {
+    if (process.env.OPENAI_API_KEY) {
+      return { status: 'unavailable', detail: 'Codex uses an API key here (OPENAI_API_KEY), which has no plan limits.' };
+    }
+    return { status: 'signed-out', detail: 'Sign in to Codex with your ChatGPT account to see live limits.' };
+  }
+  const accessToken = auth?.tokens?.access_token;
+  if (typeof accessToken !== 'string' || !accessToken) {
+    if (auth?.auth_mode === 'api_key' || auth?.OPENAI_API_KEY || process.env.OPENAI_API_KEY) {
+      return { status: 'unavailable', detail: 'Codex uses an API key here, which has no plan limits.' };
+    }
+    return { status: 'signed-out', detail: 'Sign in to Codex with your ChatGPT account to see live limits.' };
+  }
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  if (typeof auth?.tokens?.account_id === 'string' && auth.tokens.account_id) {
+    headers['ChatGPT-Account-Id'] = auth.tokens.account_id;
+  }
+  try {
+    const response = await fetchJson('https://chatgpt.com/backend-api/wham/usage', { headers });
+    if (response.status === 401) {
+      return { status: 'expired', detail: "Codex's sign-in has expired. Run a Codex turn to renew it, then refresh." };
+    }
+    if (!response.ok) {
+      const message = typeof response.body?.detail === 'string' ? response.body.detail : response.body?.error?.message;
+      return { status: 'error', detail: message || `HTTP ${response.status}` };
+    }
+    return codexLimitsFromWhamUsage(response.body) ?? { status: 'unavailable', detail: 'Codex reported no plan limits.' };
+  } catch (error) {
+    return { status: 'error', detail: error?.message || String(error) };
+  }
+};
+
 // --- cache -------------------------------------------------------------------
 
 const cache = new Map();
 const inFlight = new Map();
 let codexReader = async () => null;
 const readers = {
+  claude: readClaudeLimits,
+  codex: async () => (await codexReader()) ?? (await readCodexWhamLimits()),
   antigravity: readAntigravityLimits,
   grok: readGrokLimits,
-  codex: async () => (await codexReader()) ?? { status: 'unavailable' },
 };
 
 /** Lets main.js hand over the shared Codex app-server without importing Electron here. */

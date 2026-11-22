@@ -156,7 +156,7 @@ export const antigravityFailureFromErrorText = (text, { stopReason, reachedModel
   })();
   if (stopReason === 'refusal' || QUOTA_EXHAUSTED.test(value)) {
     return {
-      message: `You have reached your Antigravity quota for this period.${resetSuffix(resetAtFrom(value, now))} Check Settings → Usage → Limits.`,
+      message: `You have reached your Antigravity quota for this period.${resetSuffix(resetAtFrom(value, now))} Check Settings → Usage.`,
       brokenSession: false,
     };
   }

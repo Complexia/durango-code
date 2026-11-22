@@ -2,18 +2,24 @@
 // machine, priced at API list prices (usage-pricing.js).
 //
 // Sources (each records every API call with its token breakdown):
-//   claude — $CLAUDE_CONFIG_DIR/projects/<project>/<session>.jsonl, one
-//            assistant line per content block carrying message.usage
-//            (cache writes split 5m/1h, usage.speed "fast"). Subagents write
-//            <session>/subagents/agent-<id>.jsonl. Forked sessions copy their
-//            history, so calls are deduplicated by message id + request id.
-//   codex  — $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl. Current
-//            versions write token_usage_record per response (keyed by
-//            response_id); older ones only cumulative token_count events,
-//            counted as deltas. token_count also carries the plan's rate
-//            limits, which the Limits view shows.
-//   grok   — ~/.grok/sessions/<cwd>/<session>/usage.json, per turn and model,
-//            with Grok Build's own cost estimate (costUsdTicks, 1e-10 USD).
+//   claude      — $CLAUDE_CONFIG_DIR/projects/<project>/<session>.jsonl, one
+//                 assistant line per content block carrying message.usage
+//                 (cache writes split 5m/1h, usage.speed "fast"). Subagents
+//                 write <session>/subagents/agent-<id>.jsonl. Forked sessions
+//                 copy their history, so calls are deduplicated by message id +
+//                 request id.
+//   codex       — $CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl. Current
+//                 versions write token_usage_record per response (keyed by
+//                 response_id); older ones only cumulative token_count events,
+//                 counted as deltas. token_count also carries the plan's rate
+//                 limits, which the Usage view shows as a fallback.
+//   antigravity — $ANTIGRAVITY_CLI_HOME/brain/<session>/.system_generated/logs/
+//                 transcript.jsonl (default ~/.gemini/antigravity-cli/brain).
+//                 Each PLANNER_RESPONSE step records model, input_tokens
+//                 (uncached), cache_read_tokens and output_tokens.
+//   grok        — ~/.grok/sessions/<cwd>/<session>/usage.json, per turn and
+//                 model, with Grok Build's own cost estimate (costUsdTicks,
+//                 1e-10 USD).
 //
 // Parsing is incremental: logs are append-only, so each file's records and
 // parser state are cached (userData/usage-cache.json) with the byte offset
@@ -22,6 +28,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { priceUsage } from './usage-pricing.js';
 
 const CACHE_VERSION = 1;
@@ -34,6 +41,7 @@ export const usageLogRoots = (env = process.env, home = os.homedir()) => ({
     path.join(path.resolve(env.CODEX_HOME || path.join(home, '.codex')), 'sessions'),
     path.join(path.resolve(env.CODEX_HOME || path.join(home, '.codex')), 'archived_sessions'),
   ],
+  antigravity: path.join(path.resolve(env.ANTIGRAVITY_CLI_HOME || path.join(home, '.gemini', 'antigravity-cli')), 'brain'),
   grok: path.join(home, '.grok', 'sessions'),
 });
 
@@ -187,6 +195,92 @@ export const parseCodexLine = (line, file) => {
   file.records.push([time, state.model || 'unknown', tokens.input, tokens.cached, tokens.cacheWrite, 0, tokens.output, tokens.reasoning, fast, `delta:${file.records.length}`, null, 0]);
 };
 
+// --- antigravity --------------------------------------------------------------
+
+export const parseAntigravityLine = (line, file) => {
+  if (!line.includes('"PLANNER_RESPONSE"')) return;
+  let entry;
+  try {
+    entry = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (entry?.type !== 'PLANNER_RESPONSE') return;
+  const time = Date.parse(entry.created_at);
+  if (!Number.isFinite(time)) return;
+  const input = count(entry.input_tokens);
+  const cacheRead = count(entry.cache_read_tokens);
+  const cacheWrite = count(entry.cache_creation_tokens ?? entry.cache_write_tokens);
+  const output = count(entry.output_tokens);
+  const reasoning = count(entry.thought_tokens ?? entry.reasoning_tokens);
+  if (input + cacheRead + cacheWrite + output <= 0) return;
+  const model = typeof entry.model === 'string' && entry.model ? entry.model : 'antigravity';
+  const step = entry.step_index ?? file.records.length;
+  file.records.push([
+    time,
+    model,
+    input,
+    cacheRead,
+    cacheWrite,
+    0,
+    output,
+    reasoning,
+    0,
+    `agy:${file.sessionId}:${step}`,
+    null,
+    input + cacheRead + cacheWrite,
+  ]);
+};
+
+let sqliteModule;
+const readAntigravitySummaries = async (brainRoot) => {
+  const summaries = new Map();
+  if (!brainRoot) return summaries;
+  const dbPath = path.join(path.dirname(brainRoot), 'conversation_summaries.db');
+  try {
+    await fs.access(dbPath);
+  } catch {
+    return summaries;
+  }
+  if (sqliteModule === undefined) {
+    try {
+      sqliteModule = await import('node:sqlite');
+    } catch {
+      sqliteModule = null;
+    }
+  }
+  if (!sqliteModule) return summaries;
+  let db = null;
+  try {
+    db = new sqliteModule.DatabaseSync(dbPath, { readOnly: true });
+    db.exec('PRAGMA busy_timeout = 100');
+    const rows = db
+      .prepare('SELECT conversation_id, workspace_uris, parent_conversation_id FROM conversation_summaries')
+      .all();
+    for (const row of rows) {
+      if (typeof row?.conversation_id !== 'string' || !row.conversation_id) continue;
+      let cwd = null;
+      if (typeof row.workspace_uris === 'string' && row.workspace_uris) {
+        try {
+          const uris = JSON.parse(row.workspace_uris);
+          const first = Array.isArray(uris) ? uris.find((uri) => typeof uri === 'string' && uri.startsWith('file://')) : null;
+          if (first) cwd = fileURLToPath(first);
+        } catch {}
+      }
+      const parentSessionId =
+        typeof row.parent_conversation_id === 'string' && row.parent_conversation_id ? row.parent_conversation_id : null;
+      summaries.set(row.conversation_id, { cwd, parentSessionId });
+    }
+  } catch {
+    // Summaries DB is optional; transcript files still count without it.
+  } finally {
+    try {
+      db?.close();
+    } catch {}
+  }
+  return summaries;
+};
+
 // --- grok ---------------------------------------------------------------------
 
 export const parseGrokUsage = (text, file) => {
@@ -268,6 +362,52 @@ export const discoverUsageFiles = async (roots = usageLogRoots()) => {
       if (!path.basename(file).startsWith('rollout-')) continue;
       const id = path.basename(file, '.jsonl').match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i)?.[1];
       files.push({ path: file, provider: 'codex', sessionId: id ?? path.basename(file, '.jsonl') });
+    }
+  }
+  if (roots.antigravity) {
+    let sessions = [];
+    try {
+      sessions = await fs.readdir(roots.antigravity, { withFileTypes: true });
+    } catch {
+      sessions = [];
+    }
+    const summaries = sessions.length ? await readAntigravitySummaries(roots.antigravity) : new Map();
+    const parentByChild = new Map();
+    for (const [id, info] of summaries) {
+      if (info.parentSessionId) parentByChild.set(id, info.parentSessionId);
+    }
+    // Also discover parent→child links from brain/<parent>/.system_generated/subagents/*.json
+    // so subagent attribution works even without conversation_summaries.db.
+    for (const session of sessions) {
+      if (!session.isDirectory()) continue;
+      let subagents = [];
+      try {
+        subagents = await fs.readdir(path.join(roots.antigravity, session.name, '.system_generated', 'subagents'));
+      } catch {
+        continue;
+      }
+      for (const name of subagents) {
+        if (!name.endsWith('.json')) continue;
+        const childId = name.slice(0, -'.json'.length);
+        if (childId && !parentByChild.has(childId)) parentByChild.set(childId, session.name);
+      }
+    }
+    for (const session of sessions) {
+      if (!session.isDirectory()) continue;
+      const transcriptPath = path.join(roots.antigravity, session.name, '.system_generated', 'logs', 'transcript.jsonl');
+      try {
+        await fs.access(transcriptPath);
+      } catch {
+        continue;
+      }
+      const summary = summaries.get(session.name);
+      files.push({
+        path: transcriptPath,
+        provider: 'antigravity',
+        sessionId: session.name,
+        parentSessionId: parentByChild.get(session.name) ?? null,
+        cwd: summary?.cwd ?? null,
+      });
     }
   }
   let projects = [];
@@ -406,13 +546,38 @@ export const createUsageStore = ({ cacheFile = null, roots = usageLogRoots(), on
       return false;
     }
     let entry = files.get(descriptor.path);
-    if (entry && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs) return false;
+    if (entry && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs) {
+      let metaChanged = false;
+      if (descriptor.parentSessionId && !entry.parentSessionId) {
+        entry.parentSessionId = descriptor.parentSessionId;
+        metaChanged = true;
+      }
+      if (descriptor.cwd && !entry.meta?.cwd) {
+        entry.meta ??= {};
+        entry.meta.cwd = descriptor.cwd;
+        metaChanged = true;
+      }
+      return metaChanged;
+    }
     // Rewritten (smaller) files and non-append formats start over.
     if (!entry || stat.size < entry.offset || descriptor.provider === 'grok') entry = freshEntry(descriptor);
+    else {
+      if (descriptor.parentSessionId && !entry.parentSessionId) entry.parentSessionId = descriptor.parentSessionId;
+      if (descriptor.cwd && !entry.meta?.cwd) {
+        entry.meta ??= {};
+        entry.meta.cwd = descriptor.cwd;
+      }
+    }
     if (descriptor.provider === 'grok') {
       parseGrokUsage(await fs.readFile(descriptor.path, 'utf8'), entry);
     } else {
-      await readAppended(descriptor.path, entry, descriptor.provider === 'claude' ? parseClaudeLine : parseCodexLine);
+      const parseLine =
+        descriptor.provider === 'claude'
+          ? parseClaudeLine
+          : descriptor.provider === 'antigravity'
+            ? parseAntigravityLine
+            : parseCodexLine;
+      await readAppended(descriptor.path, entry, parseLine);
     }
     entry.size = stat.size;
     entry.mtimeMs = stat.mtimeMs;
@@ -471,7 +636,7 @@ export const createUsageStore = ({ cacheFile = null, roots = usageLogRoots(), on
 
 // --- report -------------------------------------------------------------------
 
-export const USAGE_PROVIDER_LABELS = { claude: 'Claude Code', codex: 'Codex', grok: 'Grok Build' };
+export const USAGE_PROVIDER_LABELS = { claude: 'Claude Code', codex: 'Codex', antigravity: 'Antigravity', grok: 'Grok Build' };
 export const USAGE_SOURCE_LABELS = {
   thread: 'Threads',
   subagent: 'Subagents',

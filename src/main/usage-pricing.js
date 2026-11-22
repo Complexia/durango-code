@@ -16,7 +16,7 @@ import bundledPrices from './usage-prices.js';
 
 export const USAGE_PRICES_URL = 'https://ai-gateway.vercel.sh/v1/models';
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const PRICED_VENDORS = new Set(['anthropic', 'openai', 'spacexai', 'xai', 'moonshotai']);
+const PRICED_VENDORS = new Set(['anthropic', 'openai', 'google', 'spacexai', 'xai', 'moonshotai']);
 const RATE_FIELDS = ['input', 'output', 'input_cache_read', 'input_cache_write'];
 
 const perMillion = (value) => {
@@ -107,7 +107,20 @@ export const usagePricesInfo = () => ({ source: activeSource, fetchedAt: activeC
 
 // --- model id → catalog id ---------------------------------------------------
 
-const VENDOR_BY_PROVIDER = { claude: 'anthropic', codex: 'openai', grok: 'spacexai', kimi: 'moonshotai' };
+const VENDOR_BY_PROVIDER = { claude: 'anthropic', codex: 'openai', antigravity: 'google', grok: 'spacexai', kimi: 'moonshotai' };
+
+const VARIANT_SUFFIX = /-(build|fast|latest|preview|thinking|none|minimal|low|medium|high|xhigh|max|ultra)$/;
+
+const candidateVendors = (provider, model) => {
+  if (provider === 'antigravity') {
+    if (model.startsWith('claude-')) return ['anthropic', 'google'];
+    if (/^(gpt-|o[1-9])/.test(model)) return ['openai', 'google'];
+    return ['google', 'anthropic', 'openai'];
+  }
+  const vendor = VENDOR_BY_PROVIDER[provider];
+  if (!vendor) return [];
+  return vendor === 'spacexai' ? ['spacexai', 'xai'] : [vendor];
+};
 
 const candidateIds = (provider, model) => {
   const raw = String(model || '')
@@ -120,14 +133,21 @@ const candidateIds = (provider, model) => {
   // claude-haiku-4-5-20251001 → claude-haiku-4-5; claude-opus-5-5 → claude-opus-5.5
   const undated = raw.replace(/-\d{8}$/, '');
   names.add(undated);
-  names.add(undated.replace(/-(\d+)-(\d)$/, '-$1.$2'));
-  // grok-4.7-build, gpt-6.2-sol-fast → their base model
-  for (const name of [...names]) names.add(name.replace(/-(build|fast|latest|preview)$/, ''));
-  const vendor = VENDOR_BY_PROVIDER[provider];
+  names.add(undated.replace(/-(\d+)-(\d)(?=-|$)/, '-$1.$2'));
+  // grok-4.7-build, gpt-6.2-sol-fast, gemini-3.8-flash-low, claude-opus-4-6-thinking → base model
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (const name of [...names]) {
+      const stripped = name.replace(VARIANT_SUFFIX, '');
+      if (stripped && stripped !== name) {
+        names.add(stripped);
+        names.add(stripped.replace(/-(\d+)-(\d)(?=-|$)/, '-$1.$2'));
+      }
+    }
+  }
+  const vendors = candidateVendors(provider, raw);
   const ids = [];
-  for (const name of names) {
-    if (vendor) ids.push(`${vendor}/${name}`);
-    if (vendor === 'spacexai') ids.push(`xai/${name}`);
+  for (const vendor of vendors) {
+    for (const name of names) ids.push(`${vendor}/${name}`);
   }
   return ids;
 };

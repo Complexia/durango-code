@@ -378,6 +378,12 @@ export type UsageReport = {
       value: {
         primary?: UsageRateWindow;
         secondary?: UsageRateWindow;
+        additional?: Array<{
+          label: string;
+          used_percent?: number | null;
+          window_minutes?: number | null;
+          resets_at?: number | null;
+        }>;
         plan_type?: string | null;
         credits?: { has_credits?: boolean; unlimited?: boolean; balance?: string | null } | null;
         rate_limit_reached_type?: string | null;
@@ -391,6 +397,7 @@ export type LiveProviderLimits = {
   status: 'ok' | 'signed-out' | 'expired' | 'unavailable' | 'error';
   detail?: string;
   plan?: string | null;
+  extra?: string | null;
   at: number;
   windows?: Array<{
     id: string;
@@ -402,10 +409,11 @@ export type LiveProviderLimits = {
   }>;
 };
 export type LiveUsageLimits = {
+  claude?: LiveProviderLimits;
   antigravity?: LiveProviderLimits;
   grok?: LiveProviderLimits;
-  /** The Codex app-server's own snapshot, in the session logs' shape; `status` alone when it can't be read live. */
-  codex?: (NonNullable<UsageReport['limits']['codex']> & { live?: boolean }) | { status: string; at: number };
+  /** Codex live snapshot (shared app-server or ChatGPT OAuth usage API), in the session logs' shape; `status` alone when unavailable. */
+  codex?: (NonNullable<UsageReport['limits']['codex']> & { live?: boolean }) | { status: string; detail?: string; at: number };
 };
 
 export type DevServersListResult = {
