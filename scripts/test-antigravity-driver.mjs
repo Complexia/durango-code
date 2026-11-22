@@ -448,6 +448,124 @@ await check('fake: a finished background command with no reply ends the turn', a
   assert.equal(agent.events.turnEnds.length, 1);
 });
 
+// agy's session database (conversations/<id>.db) under a throwaway HOME.
+const withAgyHome = async (fn) => {
+  const realHome = process.env.HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fake-home-'));
+  const { DatabaseSync } = await import('node:sqlite');
+  const databases = [];
+  const conversation = (id) => {
+    const dir = path.join(home, '.gemini', 'antigravity-cli', 'conversations');
+    fs.mkdirSync(dir, { recursive: true });
+    const database = new DatabaseSync(path.join(dir, `${id}.db`));
+    database.exec('CREATE TABLE IF NOT EXISTS steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, step_payload blob)');
+    databases.push(database);
+    return {
+      step: (idx, status, type = 132) =>
+        database.prepare('INSERT OR REPLACE INTO steps (idx, step_type, status) VALUES (?, ?, ?)').run(idx, type, status),
+    };
+  };
+  process.env.HOME = home;
+  try {
+    await fn({ home, conversation });
+  } finally {
+    process.env.HOME = realHome;
+    for (const database of databases) database.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+};
+
+await check("fake: a background command holds the turn for as long as agy's step runs, with no idle limit", async () => {
+  await withAgyHome(async ({ conversation }) => {
+    const sessionId = '21111111-2222-4333-8444-555555555555';
+    const session = conversation(sessionId);
+    // A step an earlier, killed run left RUNNING doesn't hold this turn.
+    session.step(0, 2);
+    const prompt = deferred();
+    const respond = baseRespond([prompt]);
+    const agent = fakeAgent({ respond: (method, params) => (method === 'session/new' ? { sessionId } : respond(method, params)) });
+    void agent.driver.start();
+    await tick(20);
+    const command = { toolCallId: 'cmd-1', name: 'run_command', kind: 'execute', rawInput: { CommandLine: 'bun run deploy' } };
+    agent.notify({ sessionUpdate: 'tool_call', ...command, status: 'in_progress' });
+    session.step(1, 3, 15);
+    session.step(2, 2);
+    session.step(3, 3, 15);
+    prompt.resolve({ stopReason: 'end_turn' });
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 0, 'waits while the command step runs');
+
+    // ACP says done (or its update was lost) while agy's own step still runs.
+    agent.notify({ sessionUpdate: 'tool_call_update', ...command, status: 'completed' });
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 0, "agy's step, not the ACP view, decides");
+
+    session.step(2, 3);
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 1, 'ends once the step is done and all is quiet');
+    assert.doesNotMatch(agent.events.text, /Stopped waiting/);
+  });
+});
+
+await check('fake: a command the ACP view missed still holds the turn', async () => {
+  await withAgyHome(async ({ conversation }) => {
+    const sessionId = '31111111-2222-4333-8444-555555555555';
+    const session = conversation(sessionId);
+    const prompt = deferred();
+    const respond = baseRespond([prompt]);
+    const agent = fakeAgent({ respond: (method, params) => (method === 'session/new' ? { sessionId } : respond(method, params)) });
+    void agent.driver.start();
+    await tick(20);
+    session.step(0, 3, 15);
+    session.step(1, 2);
+    prompt.resolve({ stopReason: 'end_turn' });
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 0);
+    session.step(1, 6); // CANCELED
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 1);
+  });
+});
+
+await check('fake: a subagent waiting on an approval is reported stalled; other work is not cut short', async () => {
+  await withAgyHome(async ({ home, conversation }) => {
+    const sessionId = '41111111-2222-4333-8444-555555555555';
+    const childId = '51111111-2222-4333-8444-555555555555';
+    const brain = (id, ...parts) => path.join(home, '.gemini', 'antigravity-cli', 'brain', id, '.system_generated', ...parts);
+    fs.mkdirSync(brain(sessionId, 'subagents'), { recursive: true });
+    fs.mkdirSync(brain(childId, 'messages'), { recursive: true });
+    fs.writeFileSync(brain(sessionId, 'subagents', `${childId}.json`), JSON.stringify({ conversationId: childId, state: 'SUBAGENT_STATE_ALIVE' }));
+    fs.writeFileSync(
+      brain(childId, 'messages', 'launch.json'),
+      JSON.stringify({ id: 'launch', sender: sessionId, sourceMetadata: { tool: { toolCall: { id: 'sub-1' } } } })
+    );
+    const session = conversation(sessionId);
+    const child = conversation(childId);
+    const prompt = deferred();
+    const respond = baseRespond([prompt]);
+    const agent = fakeAgent({
+      respond: (method, params) => (method === 'session/new' ? { sessionId } : respond(method, params)),
+      accessMode: 'workspace-write',
+    });
+    void agent.driver.start();
+    await tick(20);
+    agent.notify({ sessionUpdate: 'tool_call', toolCallId: 'sub-1', name: 'invoke_subagent', kind: 'other', status: 'in_progress', rawInput: { Role: 'Helper', Prompt: 'do it' } });
+    agent.notify({ sessionUpdate: 'tool_call_update', toolCallId: 'sub-1', name: 'invoke_subagent', status: 'completed' });
+    session.step(0, 3, 15);
+    session.step(1, 2); // the parent's own background command
+    child.step(0, 3, 15);
+    child.step(1, 9); // WAITING on an approval
+    prompt.resolve({ stopReason: 'end_turn' });
+    await tick(4000);
+    assert.deepEqual(agent.events.done, [['sub-1', { status: 'error' }]], 'the waiting child is stalled');
+    assert.equal(agent.events.turnEnds.length, 0, "the parent's command still holds the turn");
+    session.step(1, 3);
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 1);
+    assert.match(agent.events.text, /subagent stopped: it needed an approval/);
+  });
+});
+
 await check('fake: grouped model sends resolved flat id and falls back to model + thought_level config options', async () => {
   const groupedModel = {
     providerId: 'antigravity',

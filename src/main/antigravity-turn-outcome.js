@@ -80,6 +80,50 @@ export const antigravityStepCursor = async (sessionId) => {
   }
 };
 
+// agy's CortexStepStatus (numbers from agy 1.5.14's protobuf descriptor).
+// agy updates a step's status in place: a backgrounded command's step stays
+// RUNNING until the command exits, and a step that needs a person (an
+// approval nobody can give) stays WAITING.
+const ACTIVE_STEP_STATUSES = [
+  1, // PENDING
+  2, // RUNNING
+  11, // QUEUED
+];
+const GENERATING_STEP_STATUS = 8;
+const WAITING_STEP_STATUS = 9;
+
+/**
+ * What agy still has in flight in a conversation, from its own step
+ * statuses: counts of the steps after `cursor` that are running (commands,
+ * tools), generating (a model step) or waiting on a person. null when the
+ * database can't be read. A cursor taken when the process started leaves out
+ * steps an earlier, killed process left RUNNING.
+ */
+export const antigravityConversationWork = async (sessionId, cursor = -1) => {
+  const database = await openReadOnly(sessionDatabasePath(sessionId));
+  if (!database) return null;
+  try {
+    const row = database
+      .prepare(
+        `SELECT
+           coalesce(sum(status IN (${ACTIVE_STEP_STATUSES.join(', ')})), 0) AS running,
+           coalesce(sum(status = ?), 0) AS generating,
+           coalesce(sum(status = ?), 0) AS waiting
+         FROM steps WHERE idx > ?`
+      )
+      .get(GENERATING_STEP_STATUS, WAITING_STEP_STATUS, cursor);
+    return {
+      running: Number(row?.running ?? 0),
+      generating: Number(row?.generating ?? 0),
+      waiting: Number(row?.waiting ?? 0),
+    };
+  } catch {
+    return null;
+  } finally {
+    database.close();
+  }
+};
+
 const resetAtFrom = (text, now) => {
   const stamp = RESET_TIMESTAMP.exec(text)?.[1];
   if (stamp) {

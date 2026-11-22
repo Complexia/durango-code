@@ -6,7 +6,7 @@ import { loginShell } from './shell-env.js';
 import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 import { createWorkspaceBoundary } from './workspace-boundary.js';
 import { antigravityToolLabel } from './antigravity-tool-labels.js';
-import { antigravityStepCursor, antigravityTurnFailure } from './antigravity-turn-outcome.js';
+import { antigravityConversationWork, antigravityStepCursor, antigravityTurnFailure } from './antigravity-turn-outcome.js';
 import {
   ANTIGRAVITY_SUBAGENT_TOOLS,
   antigravityChildReport,
@@ -145,12 +145,14 @@ export const createAntigravityAcpDriver = ({
   let ended = false;
   let promptSequence = 0;
   let stepCursor = -1;
+  // The session's last step before this process's first prompt: steps at or
+  // before it belong to earlier runs (a killed run can leave one RUNNING).
+  let runStepCursor = null;
   // Subagents launched this turn (by launch toolCallId) and the wait for
   // them after the prompt ends (see settleAfterPrompt).
   const children = new Map();
   let settleTimer = null;
   let settling = false;
-  let settleStartedAt = 0;
   let replyOpen = false;
   // A command was still running when a prompt ended (agy moved it to the
   // background): when it finishes, agy wakes the model to carry on by itself.
@@ -736,6 +738,7 @@ export const createAntigravityAcpDriver = ({
     // The outcome check reads only the steps this prompt (or a later steer)
     // added: snapshot the session's step index first.
     stepCursor = await antigravityStepCursor(activeSessionId);
+    runStepCursor ??= stepCursor;
     if (ended) return;
     await followPrompt(sequence, request('session/prompt', { sessionId: activeSessionId, prompt }));
   };
@@ -763,28 +766,37 @@ export const createAntigravityAcpDriver = ({
               : `stopped (${stopReason})`;
       return fail(`Antigravity turn ${detail}.`);
     }
-    settleAfterPrompt(response.result ?? {});
+    // A command agy moved to the background can be missing from the ACP view
+    // (its in_progress update raced the prompt response): its own step says.
+    const work = await antigravityConversationWork(activeSessionId, runStepCursor ?? stepCursor);
+    if (sequence !== promptSequence || ended) return;
+    settleAfterPrompt(response.result ?? {}, work);
   };
 
   // The prompt has ended, but agy may not be done: subagents keep working
   // and report back, and the parent then replies by itself (its own text,
   // closed by a usage_update). A command that outlives its WaitMsBeforeAsync
-  // moves to the background (it stays in_progress over ACP) and the model
-  // often ends its prompt to wait for it; when it finishes, agy wakes the
-  // model the same way (verified on agy 1.5.14). The turn (and the agy
-  // process) stays open until every child has reported, nothing runs, the
-  // woken reply has finished, and nothing arrived for 3s.
+  // moves to the background and the model often ends its prompt to wait for
+  // it; when it finishes, agy wakes the model the same way (verified on agy
+  // 1.5.14). The agy process is this turn's: ending the turn ends it and
+  // everything it still runs. So the turn stays open for as long as agy's own
+  // record says work is in flight, however long that is: every child has
+  // reported, no step of this run is running (agy's session database), the
+  // woken reply has finished, and nothing arrived for 3s. There is no idle
+  // limit: a long silent command (a release upload) is work, not a stall. A
+  // command that never exits (a dev server) keeps the thread Working until
+  // the person stops it or steers the model to stop it.
   const SETTLE_POLL_MS = 1000;
   const SETTLE_QUIET_MS = 3000;
   // A launch whose child never appears on disk (it failed to spawn) isn't
-  // waited on for longer than this.
+  // waited on for longer than this. A child that did spawn is on disk within
+  // moments of its launch call completing.
   const UNRESOLVED_CHILD_MS = 20_000;
-  // Children's own approvals never reach ACP: below Full access a child that
-  // needs one waits forever, so give up sooner there.
-  const settleIdleLimitMs = () => (accessMode === 'full-access' ? 10 * 60 * 1000 : 90 * 1000);
-  const SETTLE_MAX_MS = 60 * 60 * 1000;
   const runningCommands = () =>
     [...toolCalls.values()].some((state) => state.kind === 'execute' && state.status === 'running');
+  // Children whose own step waits on a person: their approvals never reach
+  // ACP, so nobody can answer them and they can't go on.
+  let stalledChildren = 0;
 
   const markChildDone = (child, info) => {
     if (child.done) return;
@@ -809,18 +821,33 @@ export const createAntigravityAcpDriver = ({
           status: report !== null ? 'done' : 'error',
           ...(report ? { summary: report.slice(0, 4000) } : {}),
         });
+        continue;
+      }
+      // Seen waiting on two polls in a row, so a step agy is about to move
+      // on from isn't mistaken for one nobody will answer.
+      const work = await antigravityConversationWork(child.childId);
+      child.waitingPolls = work?.waiting > 0 ? (child.waitingPolls ?? 0) + 1 : 0;
+      if (child.waitingPolls >= 2) {
+        stalledChildren += 1;
+        markChildDone(child, { status: 'error' });
       }
     }
   };
 
-  const settleAfterPrompt = (result) => {
+  const stalledChildrenNotice = () =>
+    !stalledChildren
+      ? undefined
+      : accessMode !== 'full-access'
+        ? "_An Antigravity subagent stopped: it needed an approval, and subagents can't ask for one. Below Full access they stall on any command or edit; switch to Full access to let them work._"
+        : "_An Antigravity subagent stopped: it was waiting for an approval subagents can't ask for._";
+
+  const settleAfterPrompt = (result, initialWork = null) => {
     turnActive = true;
     settling = true;
     settleGeneration += 1;
     const generation = settleGeneration;
-    settleStartedAt = Date.now();
     const current = () => !ended && settling && generation === settleGeneration;
-    const finishTurn = (notice) => {
+    const finishTurn = () => {
       if (!current()) return;
       ended = true;
       turnActive = false;
@@ -831,6 +858,7 @@ export const createAntigravityAcpDriver = ({
       }
       cancelUserInputs();
       flushHeldText();
+      const notice = stalledChildrenNotice();
       if (notice) callbacks.onText(`${textSeen ? '\n\n' : ''}${notice}`);
       callbacks.onTurnEnd({ ...result, usage: { ...usageTotals } }, activeSessionId);
     };
@@ -841,33 +869,31 @@ export const createAntigravityAcpDriver = ({
       // A steer (or the end of the run) during the reads above owns the turn now.
       if (!current()) return;
       const waitingOnChildren = [...children.values()].some((child) => !child.done);
-      const commandsRunning = runningCommands();
+      // agy's step statuses are the record of what it still runs: a command
+      // whose ACP completion never arrived doesn't hold the turn, and one
+      // the ACP view missed does. The ACP view stands in only when the
+      // database can't be read.
+      const work = await antigravityConversationWork(activeSessionId, runStepCursor ?? stepCursor);
+      if (!current()) return;
+      const commandsRunning = work ? work.running > 0 : runningCommands();
+      const generating = Boolean(work?.generating);
       // A child reported (or a background command finished) and agy woke
       // the model, but its reply hasn't streamed yet or is between steps: a
       // thinking model can be silent for well over the quiet period.
       const replyPending =
         !waitingOnChildren &&
         !commandsRunning &&
+        !generating &&
         !replyOpen &&
         (children.size > 0 || commandOutlivedPrompt) &&
         (await antigravityPendingReply(activeSessionId));
       if (!current()) return;
-      const busy = waitingOnChildren || replyOpen || replyPending || commandsRunning || pendingUserInputs.size > 0;
-      const quietFor = Date.now() - lastUpdateAt;
-      if (!busy && quietFor >= SETTLE_QUIET_MS) return finishTurn();
-      if (Date.now() - settleStartedAt > SETTLE_MAX_MS) {
-        return finishTurn('_Stopped waiting for Antigravity after an hour._');
-      }
-      if (busy && quietFor > settleIdleLimitMs() && pendingUserInputs.size === 0) {
-        return finishTurn(
-          waitingOnChildren && accessMode !== 'full-access'
-            ? "_An Antigravity subagent stopped making progress. Subagents can't ask for approvals, so below Full access they stall on any command or edit. Switch to Full access to let them work._"
-            : '_Stopped waiting for Antigravity: nothing happened for a while._'
-        );
-      }
+      const busy =
+        waitingOnChildren || commandsRunning || generating || replyOpen || replyPending || pendingUserInputs.size > 0;
+      if (!busy && Date.now() - lastUpdateAt >= SETTLE_QUIET_MS) return finishTurn();
       settleTimer = setTimeout(() => void tick(), SETTLE_POLL_MS);
     };
-    if (runningCommands()) commandOutlivedPrompt = true;
+    if (runningCommands() || initialWork?.running > 0) commandOutlivedPrompt = true;
     // Plain turns (no children, nothing running, nobody asked) end right
     // away. A /goal turn always waits out the quiet period: agy can keep
     // pursuing the goal after the prompt's response.
