@@ -14,7 +14,6 @@ import {
   mergeBotMessages,
 } from '../src/app/botThreadWindow.ts';
 import { botShipRequestText, parseBotAction, taskReportActions, taskReportBody } from '../src/app/bots.ts';
-import { threadStartedByBot } from '../src/app/botSettle.ts';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -164,23 +163,6 @@ test("Ship buttons keep the change's thread; the bot's fallback request names it
   assert.equal(parseBotAction({ kind: 'ship_change', change_id: 'chg_abcdefgh12', thread_id: 'bad id!' }).thread_id, undefined);
   assert.equal(parseBotAction({ kind: 'open_change', change_id: 'chg_abcdefgh12', thread_id: 't_42' }).thread_id, undefined);
   assert.match(botShipRequestText({ change_id: 'chg_abcdefgh12', thread_id: 't_42' }), /^Ship chg_abcdefgh12 now \(I confirmed\): send it to the thread that made it \(Durango Code thread t_42\)/);
-});
-
-test('settle_thread: only threads a bot started, marked or (older ones) from their first messages', () => {
-  const msg = (role, content) => ({ id: content.slice(0, 8), role, content, ts: '' });
-  const brief = 'Fix the build.\n\nWhen you\'re done, end with a concise report of the outcome: it goes back to the bot "Durango" that asked for this.';
-  assert.equal(threadStartedByBot({ startedByBot: 'Durango' }, null), true, 'marked: no transcript needed');
-  assert.equal(threadStartedByBot({}, [msg('system', 'Started by your bot Durango. Access: Full access.'), msg('user', 'Fix it.')]), true);
-  // A cloud bot's thread from before: labelled Durango Chat, but its first prompt is a bot's brief.
-  assert.equal(threadStartedByBot({}, [msg('system', 'Started remotely from Durango Chat. Access: Full access.'), msg('user', `[Started from Durango Chat]\n\n${brief}`)]), true);
-  // The person's own chat dispatch, and the person's thread a bot only followed up in.
-  assert.equal(threadStartedByBot({}, [msg('system', 'Started remotely from Durango Chat.'), msg('user', 'Fix the build please.')]), false);
-  assert.equal(
-    threadStartedByBot({}, [msg('user', 'My own thread.'), msg('agent', 'Done.'), msg('system', 'Follow-up sent remotely from your bot Durango.'), msg('user', brief)]),
-    false
-  );
-  assert.equal(threadStartedByBot({}, []), false);
-  assert.equal(threadStartedByBot({}, null), false);
 });
 
 for (const { name, fn } of tests) {

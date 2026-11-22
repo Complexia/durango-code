@@ -721,11 +721,7 @@ export type Thread = {
   wokeReason?: 'finished' | 'attention';
   /** Sidebar v2: settled (archived) threads leave the list until restored or run again. */
   settledAt?: string;
-  /**
-   * Started by one of the person's bots (its name): a bot may settle it
-   * (settle_thread). Threads from before this was kept carry it only in their
-   * first message ("Started by your bot …").
-   */
+  /** Started by one of the person's bots (its name). */
   startedByBot?: string;
   /**
    * Set on threads imported from a Claude Code or Codex session the user ran

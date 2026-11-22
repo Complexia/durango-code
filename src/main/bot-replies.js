@@ -8,17 +8,19 @@ import { zodShapeForInputSchema } from './json-schema-zod.js';
 import { recordClaudeRateLimit } from './usage-limits.js';
 import { SHIP_VIA_THREAD_MESSAGE } from './bot-thread-tools.js';
 
-// What a settle from Durango (the claim's settleThreads) can't ever do here:
-// acknowledged at once. Anything else (no window, a save that failed) is
-// tried again on later polls, up to SETTLE_ATTEMPTS times.
-const SETTLE_FINAL_ERROR =
-  /^No thread |matches several threads|a bot started|can only settle|running a turn|still running|runs on another machine|not found on this machine|not available here/i;
-const SETTLE_ATTEMPTS = 5;
+// What a thread action from Durango (the claim's threadActions / legacy
+// settleThreads) can't ever do here: acknowledged at once. Anything else (no
+// window, a save that failed) is tried again on later polls, up to
+// THREAD_ACTION_ATTEMPTS times. (`a bot started|can only settle` stays for
+// backwards compatibility with older desktop error messages.)
+const THREAD_ACTION_FINAL_ERROR =
+  /^No thread |matches several threads|a bot started|can only settle|running a turn|still running|no running turn|title is required|unsupported thread action|runs on another machine|not found on this machine|not available here/i;
+const THREAD_ACTION_ATTEMPTS = 5;
 
-// A Durango bot's settle_thread on a machine: as on Durango, it can name the
+// A Durango bot's manage_thread on a machine: as on Durango, it can name the
 // machine that has the thread (used when it isn't this one).
 const withRunOn = (definition) =>
-  definition?.name === 'settle_thread'
+  definition?.name === 'manage_thread' || definition?.name === 'settle_thread'
     ? {
         ...definition,
         inputSchema: {
@@ -91,6 +93,8 @@ export const BOT_SESSIONS_FEATURE = 'bot-sessions';
 // reply writes before a tool call is sent as its own message when the call
 // starts, and the text after its last tool call is its final answer.
 export const BOT_REPLY_MESSAGES_FEATURE = 'reply-messages';
+/** Claim feature: this machine drains queued threadActions and runs manage_thread locally. */
+export const BOT_THREAD_ACTIONS_FEATURE = 'thread-actions';
 // A reply's messages before its final answer, at most (Durango's
 // BOT_REPLY_MESSAGES_MAX): past it, the text goes into the final answer.
 export const BOT_REPLY_MESSAGES_MAX = 30;
@@ -210,7 +214,7 @@ export const botProjectsNote = ({ projects, accessMode, threads }) => {
   ];
   if (threads) {
     lines.push(
-      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), steer a thread with message_thread (a follow-up turn there, reported back like a task), and settle a thread a bot started with settle_thread once its work is truly finished.',
+      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), steer a thread with message_thread (a follow-up turn there, reported back like a task), and manage any thread (bot-started or the person\'s own) with manage_thread: settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, stop, or delete when explicitly asked.',
       `To ship a change (land, deploy, merge, release), message the thread that made it (message_thread; its id is in the task report) with something like "${SHIP_VIA_THREAD_MESSAGE}": it knows how its project ships. A thread on another of the person's machines: delegate_task with \`thread_id\` (and no \`project\`). Land or deploy yourself only when the person explicitly tells you to.`
     );
   }
@@ -1054,8 +1058,8 @@ const isLaneGone = (error) =>
  * - startThreadFollowUp({ threadId, prompt, key, botName, accessMode }): a follow-up turn
  *   in an existing thread here, reported the same way (message_thread)
  * - threadTools: createBotThreadTools(...) (bot-thread-tools.js): list_threads,
- *   read_thread and settle_thread here; with startThreadFollowUp, message_thread. Its
- *   settle also handles the claim's settleThreads (settle_thread from the cloud)
+ *   read_thread and manage_thread here; with startThreadFollowUp, message_thread. Its
+ *   manage also handles the claim's threadActions and legacy settleThreads (from the cloud)
  * - stopThread(threadId, taskId): stops that task's run in a thread here (a task cancelled on Durango; a later turn is left alone)
  * - uploadReplyFile({ path, name, size }): uploads a file the reply attached to the
  *   person's library → its asset `{ id, name, kind }` (POST /api/v1/bots/attachments)
@@ -1106,10 +1110,11 @@ export const createBotReplyWorker = ({
   const awaitingThread = new Map(); // task id -> until when (its thread isn't known yet)
   const stopping = new Set();
   const stopAcks = new Set();
-  // settle_thread from a reply elsewhere (the cloud, another machine): Durango
-  // hands the thread ids to every machine that may have them (the claim's
-  // settleThreads), until each acknowledges. A machine without the thread
-  // acknowledges too; one whose window can't take it now tries again.
+  // manage_thread (and legacy settle_thread) from a reply elsewhere (the cloud,
+  // another machine): Durango hands pending actions to every machine that may
+  // have the thread (the claim's threadActions / settleThreads), until each
+  // acknowledges. A machine without the thread acknowledges too; one whose
+  // window can't take it now tries again.
   const settling = new Set();
   const settleAcks = new Set();
   const settleAttempts = new Map(); // thread id -> failed attempts so far
@@ -1128,11 +1133,11 @@ export const createBotReplyWorker = ({
         .then((result) => {
           if (!result) return;
           const error = String(result.error ?? '');
-          if (!result.ok && !SETTLE_FINAL_ERROR.test(error)) {
+          if (!result.ok && !THREAD_ACTION_FINAL_ERROR.test(error)) {
             const attempts = (settleAttempts.get(threadId) ?? 0) + 1;
             settleAttempts.set(threadId, attempts);
             while (settleAttempts.size > 100) settleAttempts.delete(settleAttempts.keys().next().value);
-            if (attempts < SETTLE_ATTEMPTS) {
+            if (attempts < THREAD_ACTION_ATTEMPTS) {
               log(`settling thread ${threadId} failed (will retry):`, error);
               return;
             }
@@ -1142,6 +1147,57 @@ export const createBotReplyWorker = ({
           settleAcks.add(threadId);
         })
         .finally(() => settling.delete(threadId));
+    }
+  };
+  const runningThreadActions = new Set();
+  const threadActionAcks = new Set();
+  const threadActionAttempts = new Map(); // action id -> failed attempts so far
+  // Per-thread promise chain so multiple queued actions on the same thread
+  // (e.g. rename then settle) run strictly in array order rather than racing.
+  const threadActionChains = new Map(); // thread id -> tail promise
+  const runQueuedThreadActions = (actions, isCurrent = () => true) => {
+    for (const item of Array.isArray(actions) ? actions : []) {
+      const id = typeof item?.id === 'string' ? item.id : '';
+      const threadId = typeof item?.threadId === 'string' ? item.threadId : '';
+      const action = typeof item?.action === 'string' ? item.action : '';
+      if (!id || runningThreadActions.has(id) || threadActionAcks.has(id)) continue;
+      if (!threadTools || !threadId || !action) {
+        threadActionAcks.add(id);
+        continue;
+      }
+      const invoke = () =>
+        typeof threadTools.manage === 'function'
+          ? threadTools.manage({ thread_id: threadId, action, ...(item.title ? { title: item.title } : {}) }, { exact: true })
+          : action === 'settle' && typeof threadTools.settle === 'function'
+            ? threadTools.settle({ thread_id: threadId }, { exact: true })
+            : { ok: false, error: `Managing threads (${action}) is not available here.` };
+      runningThreadActions.add(id);
+      const prev = threadActionChains.get(threadId) ?? Promise.resolve();
+      const step = prev
+        // Turned off or signed out meanwhile: left for a later poll.
+        .then(() => (isCurrent() ? invoke() : null))
+        .catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
+        .then((result) => {
+          if (!result) return;
+          const error = String(result.error ?? '');
+          if (!result.ok && !THREAD_ACTION_FINAL_ERROR.test(error)) {
+            const attempts = (threadActionAttempts.get(id) ?? 0) + 1;
+            threadActionAttempts.set(id, attempts);
+            while (threadActionAttempts.size > 100) threadActionAttempts.delete(threadActionAttempts.keys().next().value);
+            if (attempts < THREAD_ACTION_ATTEMPTS) {
+              log(`thread action ${action} on ${threadId} failed (will retry):`, error);
+              return;
+            }
+          }
+          if (!result.ok && !/^No thread /.test(error)) log(`thread ${threadId} action ${action} not applied:`, error);
+          threadActionAttempts.delete(id);
+          threadActionAcks.add(id);
+        })
+        .finally(() => {
+          runningThreadActions.delete(id);
+          if (threadActionChains.get(threadId) === step) threadActionChains.delete(threadId);
+        });
+      threadActionChains.set(threadId, step);
     }
   };
   const stopTaskThread = (taskId, threadId) => {
@@ -1476,13 +1532,19 @@ export const createBotReplyWorker = ({
     };
 
     const callTool = async ({ name, input, toolCallId, message }) => {
-      // settle_thread: a thread here is settled here; one elsewhere goes to
-      // Durango, which hands it to the machine that has it.
-      if (name === 'settle_thread') {
-        const here = threadTools ? await threadTools.findThread(input?.thread_id).catch(() => null) : null;
+      // manage_thread (and legacy settle_thread): a thread here is updated here;
+      // one elsewhere goes to Durango, which hands it to the machine that has it.
+      if (name === 'manage_thread' || name === 'settle_thread') {
+        const normalized = name === 'settle_thread' ? { ...(input ?? {}), action: 'settle' } : (input ?? {});
+        const isDelete = String(normalized?.action ?? '').trim().toLowerCase() === 'delete';
+        const here = threadTools ? await threadTools.findThread(input?.thread_id, { exact: isDelete }).catch(() => null) : null;
         if (!here) return callServerTool({ name, input, toolCallId });
         try {
-          return { result: await threadTools.settle({ ...(input ?? {}), thread_id: here.entry.id }) };
+          const outcome =
+            typeof threadTools.manage === 'function'
+              ? await threadTools.manage({ ...normalized, thread_id: here.entry.id })
+              : await threadTools.settle({ ...normalized, thread_id: here.entry.id });
+          return { result: outcome };
         } catch (error) {
           return { result: { ok: false, error: error?.message ?? String(error) } };
         }
@@ -1527,10 +1589,11 @@ export const createBotReplyWorker = ({
       void send(false); // started: the first heartbeat
       try {
         // Threads in a project start here (delegate_task `project`); the
-        // thread tools read and follow up this machine's threads.
-        // This machine's thread tools replace Durango's of the same name (settle_thread).
+        // thread tools read, follow up and manage this machine's threads.
+        // This machine's thread tools replace Durango's (manage_thread / legacy settle_thread).
+        const replacedNames = threadTools ? new Set([...threadTools.names, 'settle_thread']) : null;
         const tools = threadTools
-          ? [...lane.tools.filter((tool) => !threadTools.names.includes(tool?.name)), ...threadTools.definitions.map(withRunOn)]
+          ? [...lane.tools.filter((tool) => !replacedNames.has(tool?.name)), ...threadTools.definitions.map(withRunOn)]
           : lane.tools;
         outcome = await runLane({ ...lane, threads: 'machine', tools }, {
           signal: abort.signal,
@@ -1650,20 +1713,23 @@ export const createBotReplyWorker = ({
         const info = await Promise.resolve(getMachineInfo()).catch(() => null);
         const acks = [...stopAcks];
         const settled = [...settleAcks];
+        const actionAcks = [...threadActionAcks];
         claimed = await client.claimBotLane({
           machineId,
           platform,
           ...(info ? { machine: presenceOf(info) } : {}),
           ...(acks.length ? { ackStopTasks: acks } : {}),
           ...(settled.length ? { ackSettleThreads: settled } : {}),
+          ...(actionAcks.length ? { ackThreadActions: actionAcks } : {}),
           // Replies come as a structured conversation (lane.session): kept sessions;
-          // and go out as messages (lane.messages).
-          features: [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE],
+          // go out as messages (lane.messages); and drain queued threadActions.
+          features: [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE],
           waitMs: claimWaitMs,
           signal,
         });
         for (const id of acks) stopAcks.delete(id);
         for (const id of settled) settleAcks.delete(id);
+        for (const id of actionAcks) threadActionAcks.delete(id);
         failures = 0;
       } catch (error) {
         if (!current() || isAbort(error)) continue;
@@ -1675,7 +1741,10 @@ export const createBotReplyWorker = ({
         continue;
       }
       stopCancelledTasks(claimed?.stopTasks);
-      if (current()) settleQueuedThreads(claimed?.settleThreads, current);
+      if (current()) {
+        settleQueuedThreads(claimed?.settleThreads, current);
+        runQueuedThreadActions(claimed?.threadActions, current);
+      }
       // No bots on the account: nothing to answer, so check back much later
       // (wake() — a bot made or messaged here — or a sign-in restarts sooner).
       if (claimed?.idleMs) {

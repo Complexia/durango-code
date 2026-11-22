@@ -18,6 +18,7 @@ import {
   BOT_REPLIES_CAPABILITY,
   BOT_REPLY_MESSAGES_FEATURE,
   BOT_SESSIONS_FEATURE,
+  BOT_THREAD_ACTIONS_FEATURE,
   createBotSessionStore,
   botProjectsNote,
   botToolLabel,
@@ -800,7 +801,7 @@ try {
     const client = createFakeClient({ claim: laneClaims([actionsLane({ messages: true })]) });
     startWorker({ client, runLane: sdkRunner(createFakeSdk(ackProgressAnswer(answer))) });
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
-    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE]);
+    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE]);
     assert.deepEqual(
       client.calls.message.map(({ index, text }) => [index, text]),
       [
@@ -1059,118 +1060,203 @@ try {
     assert.deepEqual(client.calls.tool.map((call) => call.input.thread_id), ['thread_on_omarchy'], 'a thread not here: Durango sends it to its machine');
   });
 
-  await test('settle_thread: a thread here is settled here (its tool replaces Durango\'s); one elsewhere goes to Durango', async () => {
-    const client = createFakeClient({ claim: laneClaims([makeLane({ tools: [{ name: 'settle_thread', description: 'cloud', inputSchema: {} }, { name: 'web_search', description: 'x', inputSchema: {} }] })]) });
-    const settled = [];
+  await test('manage_thread: a thread here is managed here (its tool replaces Durango\'s); one elsewhere goes to Durango', async () => {
+    const client = createFakeClient({
+      claim: laneClaims([
+        makeLane({
+          tools: [
+            { name: 'manage_thread', description: 'cloud', inputSchema: {} },
+            { name: 'settle_thread', description: 'legacy-cloud', inputSchema: {} },
+            { name: 'web_search', description: 'x', inputSchema: {} },
+          ],
+        }),
+      ]),
+    });
+    const managed = [];
     const threadTools = createBotThreadTools({
       readIndex: async () => ({ entries: [{ id: 'thread_here', projectId: 'p1', title: 'Fix spinner', status: 'idle', activityAt: 1 }] }),
       readThread: async () => '',
       getProjects: () => [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }],
-      settleThread: async (threadId) => {
-        settled.push(threadId);
+      manageThread: async (req) => {
+        managed.push(req);
         return { ok: true };
       },
     });
     let results;
     let toolNames;
-    let settleSchema;
+    let manageSchema;
     startWorker({
       client,
       threadTools,
       runLane: async (lane, ctx) => {
         toolNames = lane.tools.map((tool) => tool.name);
-        settleSchema = lane.tools.find((tool) => tool.name === 'settle_thread' && tool.description !== 'cloud').inputSchema;
-        const call = (input) => ctx.callTool({ name: 'settle_thread', input, toolCallId: 't' }).then((out) => out.result);
-        results = { here: await call({ thread_id: 'thread_here', reason: 'landed' }), elsewhere: await call({ thread_id: 'thread_on_omarchy' }) };
-        return { text: 'Settled.' };
+        manageSchema = lane.tools.find((tool) => tool.name === 'manage_thread' && tool.description !== 'cloud').inputSchema;
+        const call = (name, input) => ctx.callTool({ name, input, toolCallId: 't' }).then((out) => out.result);
+        results = {
+          settleHere: await call('manage_thread', { thread_id: 'thread_here', action: 'settle', reason: 'landed' }),
+          snoozeHere: await call('manage_thread', { thread_id: 'thread_here', action: 'snooze' }),
+          renameHere: await call('manage_thread', { thread_id: 'thread_here', action: 'rename', title: 'New title' }),
+          legacySettleHere: await call('settle_thread', { thread_id: 'thread_here' }),
+          elsewhere: await call('manage_thread', { thread_id: 'thread_on_omarchy', action: 'pin' }),
+        };
+        return { text: 'Updated.' };
       },
     });
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
-    assert.equal(toolNames.filter((name) => name === 'settle_thread').length, 1, 'one settle_thread: this machine\'s');
-    assert.ok(settleSchema.properties.run_on, 'a Durango bot can still name the machine that has it');
+    assert.equal(toolNames.filter((name) => name === 'manage_thread').length, 1, 'one manage_thread: this machine\'s');
+    assert.equal(toolNames.includes('settle_thread'), false, 'legacy settle_thread replaced by manage_thread');
+    assert.ok(manageSchema.properties.run_on, 'a Durango bot can still name the machine that has it');
     assert.ok(toolNames.includes('web_search'));
-    assert.equal(results.here.ok, true);
-    assert.deepEqual(settled, ['thread_here']);
-    assert.deepEqual(client.calls.tool.map((call) => call.input.thread_id), ['thread_on_omarchy'], 'a thread not here: Durango queues it for its machine');
+    assert.equal(results.settleHere.ok, true);
+    assert.equal(results.snoozeHere.ok, true);
+    assert.equal(results.renameHere.ok, true);
+    assert.equal(results.legacySettleHere.ok, true);
+    assert.deepEqual(managed, [
+      { threadId: 'thread_here', action: 'settle' },
+      { threadId: 'thread_here', action: 'snooze' },
+      { threadId: 'thread_here', action: 'rename', title: 'New title' },
+      { threadId: 'thread_here', action: 'settle' },
+    ]);
+    assert.deepEqual(
+      client.calls.tool.map((call) => ({ name: call.name, thread_id: call.input.thread_id, action: call.input.action })),
+      [{ name: 'manage_thread', thread_id: 'thread_on_omarchy', action: 'pin' }],
+      'a thread not here: Durango queues it for its machine'
+    );
   });
 
-  await test('settle requests from Durango: settled here once, acknowledged on the next claim (unknown threads too); a closed window retries', async () => {
+  await test('threadActions and legacy settleThreads from Durango: run once, acknowledged on the next claim; a closed window retries', async () => {
     // Like Durango: every poll hands out what the machine hasn't acknowledged yet.
-    let pending = ['thread_here', 'thread_elsewhere', 'thread_later', 'thread_saved', 'thread_h', 'thread_refused'];
+    let pendingSettles = ['thread_here', 'thread_elsewhere', 'thread_later', 'thread_saved', 'thread_h'];
+    let pendingActions = [
+      { id: 'ta_snooze', threadId: 'thread_here', action: 'snooze' },
+      { id: 'ta_rename', threadId: 'thread_here', action: 'rename', title: 'Renamed remotely' },
+      { id: 'ta_elsewhere', threadId: 'thread_elsewhere', action: 'delete' },
+      { id: 'ta_short', threadId: 'thread_h', action: 'delete' },
+      { id: 'ta_stop_idle', threadId: 'thread_here', action: 'stop' },
+      { id: 'ta_later', threadId: 'thread_later', action: 'unsettle' },
+    ];
     const client = createFakeClient({
       claim: async (input) => {
-        pending = pending.filter((id) => !(input.ackSettleThreads ?? []).includes(id));
+        pendingSettles = pendingSettles.filter((id) => !(input.ackSettleThreads ?? []).includes(id));
+        pendingActions = pendingActions.filter((item) => !(input.ackThreadActions ?? []).includes(item.id));
         await new Promise((resolve) => setTimeout(resolve, 5));
-        return { lane: null, settleThreads: [...pending] };
+        return { lane: null, settleThreads: [...pendingSettles], threadActions: [...pendingActions] };
       },
     });
     const calls = [];
-    let windowOpen = false;
+    let settleWindowOpen = false;
+    let actionWindowOpen = false;
     const threadTools = createBotThreadTools({
       readIndex: async () => ({
         entries: [
           { id: 'thread_here', projectId: 'p1', title: 'Done', status: 'idle', activityAt: 1 },
           { id: 'thread_later', projectId: 'p1', title: 'Later', status: 'idle', activityAt: 2 },
           { id: 'thread_saved', projectId: 'p1', title: 'Save fails once', status: 'idle', activityAt: 3 },
-          { id: 'thread_refused', projectId: 'p1', title: 'The person\'s own', status: 'idle', activityAt: 4 },
         ],
       }),
       readThread: async () => '',
       getProjects: () => [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }],
-      settleThread: async (threadId) => {
-        calls.push(threadId);
-        if (threadId === 'thread_later' && !windowOpen) {
-          windowOpen = true;
+      manageThread: async ({ threadId, action, title }) => {
+        // Delay snooze longer than rename so an unchained concurrent runner would finish rename first.
+        if (threadId === 'thread_here' && action === 'snooze') await new Promise((resolve) => setTimeout(resolve, 25));
+        calls.push({ threadId, action, ...(title ? { title } : {}) });
+        if (threadId === 'thread_later' && action === 'settle' && !settleWindowOpen) {
+          settleWindowOpen = true;
           return { ok: false, error: 'Open a Durango Code window on this Mac to run agents from Durango Chat.' };
         }
-        if (threadId === 'thread_saved' && calls.filter((id) => id === 'thread_saved').length === 1) {
+        if (threadId === 'thread_later' && action === 'unsettle' && !actionWindowOpen) {
+          actionWindowOpen = true;
+          return { ok: false, error: 'Open a Durango Code window on this Mac to run agents from Durango Chat.' };
+        }
+        if (threadId === 'thread_saved' && calls.filter((c) => c.threadId === 'thread_saved').length === 1) {
           return { ok: false, error: 'The remote command changed the host, but its thread state could not be saved.' };
         }
-        if (threadId === 'thread_refused') {
-          return { ok: false, error: 'Only a thread a bot started can be settled by a bot; this one was started by the person or elsewhere.' };
+        if (action === 'stop') {
+          return { ok: false, error: 'No running turn on that thread.' };
         }
         return { ok: true };
       },
     });
     startWorker({ client, threadTools });
-    await waitFor(() => client.calls.claim.some((call) => call.ackSettleThreads?.includes('thread_later')), { label: 'later ack' });
+    await waitFor(() => client.calls.claim.some((call) => call.ackSettleThreads?.includes('thread_later')), { label: 'later settle ack' });
     await waitFor(() => client.calls.claim.some((call) => call.ackSettleThreads?.includes('thread_saved')), { label: 'saved ack' });
-    await waitFor(() => pending.length === 0, { label: 'all acknowledged' });
-    assert.equal(calls.filter((id) => id === 'thread_saved').length, 2, 'a save that failed is tried again, not dropped');
-    assert.equal(calls.filter((id) => id === 'thread_refused').length, 1, 'a refusal is final: acknowledged, not retried');
-    assert.equal(calls.includes('thread_here') && !calls.includes('thread_h'), true, 'a short id from Durango never matches a thread by prefix');
-    assert.ok(client.calls.claim.some((call) => call.ackSettleThreads?.includes('thread_here') && call.ackSettleThreads.includes('thread_elsewhere')));
-    assert.equal(calls.filter((id) => id === 'thread_here').length, 1, 'a request handed out again before its ack isn\'t settled twice');
-    assert.equal(calls.filter((id) => id === 'thread_later').length, 2, 'retried after the window failure');
-    assert.equal(calls.includes('thread_elsewhere'), false, 'not a thread here: only acknowledged');
+    await waitFor(() => pendingSettles.length === 0 && pendingActions.length === 0, { label: 'all acknowledged' });
+    assert.equal(calls.filter((c) => c.threadId === 'thread_saved').length, 2, 'a save that failed is tried again, not dropped');
+    assert.equal(calls.filter((c) => c.action === 'stop').length, 1, 'no running turn is final: acknowledged, not retried');
+    assert.equal(calls.some((c) => c.threadId === 'thread_h'), false, 'a short id from Durango never matches a thread by prefix');
+    assert.equal(calls.some((c) => c.threadId === 'thread_elsewhere'), false, 'not a thread here: only acknowledged');
+    assert.equal(calls.filter((c) => c.threadId === 'thread_here' && c.action === 'settle').length, 1, 'settle not applied twice');
+    assert.equal(calls.filter((c) => c.threadId === 'thread_here' && c.action === 'snooze').length, 1, 'snooze applied once');
+    assert.deepEqual(
+      calls.filter((c) => c.threadId === 'thread_here' && c.action !== 'settle').map((c) => c.action),
+      ['snooze', 'rename', 'stop'],
+      'actions on the same thread run strictly in queued order'
+    );
+    assert.deepEqual(
+      calls.filter((c) => c.action === 'rename'),
+      [{ threadId: 'thread_here', action: 'rename', title: 'Renamed remotely' }]
+    );
+    assert.ok(client.calls.claim.some((call) => call.features?.includes('thread-actions')), 'claims advertise thread-actions feature');
+    assert.equal(calls.filter((c) => c.threadId === 'thread_later' && c.action === 'settle').length, 2, 'settle retried after window failure');
+    assert.equal(calls.filter((c) => c.threadId === 'thread_later' && c.action === 'unsettle').length, 2, 'action retried after window failure');
   });
 
-  await test('thread tools: settle needs the thread in an allowed project, never while it runs', async () => {
-    const settled = [];
+  await test('thread tools: manage needs an allowed project, validates action/title, never settles while running, supports all actions', async () => {
+    const ops = [];
     const tools = createBotThreadTools({
       readIndex: async () => ({
         entries: [
-          { id: 'idle1', projectId: 'p1', title: 'Idle', status: 'idle' },
-          { id: 'run1', projectId: 'p1', title: 'Running', status: 'idle' },
+          { id: 'idle1', projectId: 'p1', title: 'Idle', status: 'idle', shell: { settledAt: '2026-11-20T00:00:00.000Z' } },
+          { id: 'run1', projectId: 'p1', title: 'Running', status: 'idle', shell: { snoozedAt: '2026-11-20T00:00:00.000Z' } },
+          { id: 'pin1', projectId: 'p1', title: 'Pinned', status: 'idle', shell: { pinnedAt: '2026-11-20T00:00:00.000Z' } },
           { id: 'hidden', projectId: 'secret', title: 'Not allowed', status: 'idle' },
         ],
       }),
       readThread: async () => '',
       getProjects: () => [{ id: 'p1', name: 'Site', path: '/x/site' }],
       liveStatus: (id) => (id === 'run1' ? 'running' : null),
-      settleThread: async (threadId) => {
-        settled.push(threadId);
-        return threadId === 'idle1' ? { ok: true } : { ok: false, error: 'Only a thread a bot started can be settled by a bot.' };
+      manageThread: async (req) => {
+        ops.push(req);
+        return { ok: true };
       },
     });
-    assert.equal((await tools.settle({ thread_id: 'idle1' })).ok, true);
-    assert.match((await tools.settle({ thread_id: 'run1' })).error, /running a turn/);
-    await assert.rejects(tools.settle({ thread_id: 'hidden' }), /No thread/);
-    await assert.rejects(tools.settle({ thread_id: 'idle' }, { exact: true }), /No thread/, 'a request from Durango needs the full id');
-    assert.deepEqual(settled, ['idle1']);
-    assert.equal((await tools.settle({ thread_id: 'idle' })).ok, true, 'the bot\'s own call may use a unique prefix');
-    const noSettle = createBotThreadTools({ readIndex: async () => ({ entries: [] }), readThread: async () => '', getProjects: () => [] });
-    assert.match((await noSettle.settle({ thread_id: 'x' })).error, /not available/);
+    assert.equal((await tools.manage({ thread_id: 'idle1', action: 'settle' })).ok, true);
+    assert.equal((await tools.manage({ thread_id: 'idle1', action: 'unsettle' })).ok, true);
+    assert.equal((await tools.manage({ thread_id: 'run1', action: 'snooze' })).ok, true, 'running threads can be snoozed');
+    assert.equal((await tools.manage({ thread_id: 'run1', action: 'unsnooze' })).ok, true);
+    assert.equal((await tools.manage({ thread_id: 'idle1', action: 'pin' })).ok, true);
+    assert.equal((await tools.manage({ thread_id: 'idle1', action: 'unpin' })).ok, true);
+    assert.equal((await tools.manage({ thread_id: 'idle1', action: 'rename', title: '  Clean  title  ' })).title, 'Clean title');
+    assert.equal((await tools.manage({ thread_id: 'run1', action: 'stop' })).ok, true);
+    assert.equal((await tools.manage({ thread_id: 'idle1', action: 'delete' })).ok, true);
+    assert.match((await tools.manage({ thread_id: 'run1', action: 'settle' })).error, /running a turn/);
+    assert.match((await tools.manage({ thread_id: 'idle1', action: 'rename', title: '   ' })).error, /title is required/);
+    assert.match((await tools.manage({ thread_id: 'idle1', action: 'bogus' })).error, /Unsupported thread action/);
+    await assert.rejects(tools.manage({ thread_id: 'hidden', action: 'settle' }), /No thread/);
+    await assert.rejects(tools.manage({ thread_id: 'idle', action: 'settle' }, { exact: true }), /No thread/, 'a request from Durango needs the full id');
+    await assert.rejects(tools.manage({ thread_id: 'idle', action: 'delete' }), /No thread/, 'delete always requires the exact full thread id');
+    assert.equal((await tools.manage({ thread_id: 'idle', action: 'snooze' })).ok, true, 'non-delete calls may use a unique prefix');
+    // Mirrored thread notes stay honest on rename/delete.
+    const mirrorTools = createBotThreadTools({
+      readIndex: async () => ({ entries: [{ id: 'mirror1', projectId: 'p1', title: 'Mirror', status: 'idle' }] }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Site', path: '/x/site' }],
+      manageThread: async () => ({ ok: true, mirrored: true }),
+    });
+    assert.match((await mirrorTools.manage({ thread_id: 'mirror1', action: 'delete' })).note, /mirrored copy/);
+    assert.match((await mirrorTools.manage({ thread_id: 'mirror1', action: 'rename', title: 'X' })).note, /mirrored copy/);
+    // list_threads surfaces sidebar state and supports filtering by state
+    const settledList = await tools.list({ state: 'settled' });
+    assert.deepEqual(settledList.threads.map((t) => ({ id: t.id, settled: t.settled })), [{ id: 'idle1', settled: true }]);
+    const snoozedList = await tools.list({ state: 'snoozed' });
+    assert.deepEqual(snoozedList.threads.map((t) => ({ id: t.id, snoozed: t.snoozed })), [{ id: 'run1', snoozed: true }]);
+    const pinnedList = await tools.list({ state: 'pinned' });
+    assert.deepEqual(pinnedList.threads.map((t) => ({ id: t.id, pinned: t.pinned })), [{ id: 'pin1', pinned: true }]);
+    const activeList = await tools.list({ state: 'active' });
+    assert.deepEqual(activeList.threads.map((t) => t.id), ['pin1']);
+    const noManage = createBotThreadTools({ readIndex: async () => ({ entries: [] }), readThread: async () => '', getProjects: () => [] });
+    assert.match((await noManage.manage({ thread_id: 'x', action: 'settle' })).error, /not available/);
+    assert.match((await noManage.manage({ thread_id: 'x', action: 'snooze' })).error, /not available/);
   });
 
   await test('thread reports end with the thread id for message_thread', () => {
@@ -1878,7 +1964,7 @@ try {
       runLane: async () => ({ text: 'hi', usage: { mode: 'resume', input: 5, cacheRead: 100 }, compact: true }),
     });
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
-    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE]);
+    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE]);
     assert.deepEqual(client.calls.finish[0].usage, { mode: 'resume', input: 5, cacheRead: 100 });
     assert.equal(client.calls.finish[0].compact, true);
     const normalized = normalizeBotLane({ laneId: 'l', botId: 'b', session: { history: [], answering: [1], context: [] } });

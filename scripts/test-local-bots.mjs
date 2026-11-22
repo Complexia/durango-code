@@ -1178,29 +1178,37 @@ test('thread tools: list and read threads, message_thread is a follow-up reporte
   await engine.idle();
 });
 
-test('settle_thread: the bot settles a thread it judges finished, with the settle rule in its prompt', async () => {
-  const settles = [];
+test('manage_thread: the bot manages any thread (settle, snooze, rename, …), with the rule in its prompt', async () => {
+  const managed = [];
   const threadTools = {
     definitions: [],
     list: async () => ({ ok: true, threads: [] }),
     read: async () => ({ ok: true, transcript: '' }),
     findThread: async () => ({ entry: { id: 'thread_1', title: 'Fix spinner' } }),
-    settle: async (input) => {
-      settles.push(input);
-      return { ok: true, threadId: input.thread_id, settled: true };
+    manage: async (input) => {
+      managed.push(input);
+      return { ok: true, threadId: input.thread_id, action: input.action };
     },
   };
   const { engine, runner } = makeEngine({ threadTools });
   const [primary] = (await engine.list()).bots;
-  await engine.send(primary.id, { messageId: 'a', content: 'The spinner change landed.' });
+  await engine.send(primary.id, { messageId: 'a', content: 'The spinner change landed, and snooze my other thread.' });
   await waitFor(() => runner.lanes.length === 1);
   const lane = runner.lanes[0];
-  assert.match(lane.lane.systemPrompt, /Settling threads: .*settle_thread/);
-  assert.ok(lane.lane.tools.some((tool) => tool.name === 'settle_thread'));
-  const result = (await lane.ctx.callTool({ name: 'settle_thread', input: { thread_id: 'thread_1', reason: 'landed' }, toolCallId: 't' })).result;
-  assert.equal(result.ok, true);
-  assert.deepEqual(settles, [{ thread_id: 'thread_1', reason: 'landed' }]);
-  lane.finish({ text: 'Settled it.' });
+  assert.match(lane.lane.systemPrompt, /Managing and settling threads \(manage_thread\)/);
+  assert.ok(lane.lane.tools.some((tool) => tool.name === 'manage_thread'));
+  const settled = (await lane.ctx.callTool({ name: 'manage_thread', input: { thread_id: 'thread_1', action: 'settle', reason: 'landed' }, toolCallId: 't1' })).result;
+  const snoozed = (await lane.ctx.callTool({ name: 'manage_thread', input: { thread_id: 'thread_2', action: 'snooze' }, toolCallId: 't2' })).result;
+  const legacy = (await lane.ctx.callTool({ name: 'settle_thread', input: { thread_id: 'thread_3' }, toolCallId: 't3' })).result;
+  assert.equal(settled.ok, true);
+  assert.equal(snoozed.ok, true);
+  assert.equal(legacy.ok, true);
+  assert.deepEqual(managed, [
+    { thread_id: 'thread_1', action: 'settle', reason: 'landed' },
+    { thread_id: 'thread_2', action: 'snooze' },
+    { thread_id: 'thread_3', action: 'settle' },
+  ]);
+  lane.finish({ text: 'Done.' });
   await engine.idle();
 });
 

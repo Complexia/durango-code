@@ -4517,6 +4517,7 @@ const resolveDispatchRendererCommand = (payload) => ({
     threadId: typeof payload?.threadId === 'string' ? payload.threadId : undefined,
     threadTitle: typeof payload?.threadTitle === 'string' ? payload.threadTitle : undefined,
     projectId: typeof payload?.projectId === 'string' ? payload.projectId : undefined,
+    mirrored: payload?.mirrored === true ? true : undefined,
     error: typeof payload?.error === 'string' ? payload.error : undefined,
   }),
 });
@@ -4784,24 +4785,39 @@ const startBotThreadFollowUp = (prefix) => async ({ threadId, prompt, key, botNa
   });
 };
 
-// list_threads / read_thread over this machine's threads in the projects bots may use.
-// settle_thread files a thread away as the person's Settle button does; the
-// renderer refuses one no bot started (botOnly) or one running a turn.
+// list_threads / read_thread / manage_thread over this machine's threads in the
+// projects bots may use. manage_thread works on any thread (whether started by
+// a bot or by the person); the renderer still refuses settling a running turn.
 const botThreadTools = createBotThreadTools({
   readIndex: () => readThreadsIndex(),
   readThread: (args) => readThreadForAgent(args),
   getProjects: () => botProjects(),
-  settleThread: (threadId) =>
-    requestDispatchRendererCommand(
-      {
-        kind: 'threadState',
-        threadId,
-        sidebarState: { settledAt: new Date().toISOString() },
-        botOnly: true,
-        source: { machineId: 'durango-bot', machineName: 'your bot' },
-      },
-      30_000
-    ),
+  manageThread: ({ threadId, action, title }) => {
+    const source = { machineId: 'durango-bot', machineName: 'your bot' };
+    const now = new Date().toISOString();
+    switch (action) {
+      case 'settle':
+        return requestDispatchRendererCommand({ kind: 'threadState', threadId, sidebarState: { settledAt: now }, source }, 30_000);
+      case 'unsettle':
+        return requestDispatchRendererCommand({ kind: 'threadState', threadId, sidebarState: { settledAt: null }, source }, 30_000);
+      case 'snooze':
+        return requestDispatchRendererCommand({ kind: 'threadState', threadId, sidebarState: { settledAt: null, snoozedAt: now }, source }, 30_000);
+      case 'unsnooze':
+        return requestDispatchRendererCommand({ kind: 'threadState', threadId, sidebarState: { snoozedAt: null }, source }, 30_000);
+      case 'pin':
+        return requestDispatchRendererCommand({ kind: 'threadState', threadId, sidebarState: { pinnedAt: now }, source }, 30_000);
+      case 'unpin':
+        return requestDispatchRendererCommand({ kind: 'threadState', threadId, sidebarState: { pinnedAt: null }, source }, 30_000);
+      case 'rename':
+        return requestDispatchRendererCommand({ kind: 'renameThread', threadId, title, source }, 30_000);
+      case 'stop':
+        return requestDispatchRendererCommand({ kind: 'stopTurn', threadId, source }, 30_000);
+      case 'delete':
+        return requestDispatchRendererCommand({ kind: 'deleteThread', threadId, source }, 30_000);
+      default:
+        return Promise.resolve({ ok: false, error: `Unsupported thread action "${action}".` });
+    }
+  },
 });
 
 // This machine's bot presence (name, projects with their keys, Claude

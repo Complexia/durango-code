@@ -1997,9 +1997,13 @@ export const createLocalBotEngine = ({
           if (!threadTools) throw new Error('Threads are not available here.');
           return name === 'list_threads' ? await threadTools.list(input) : await threadTools.read(input);
         }
+        case 'manage_thread': {
+          if (!threadTools) throw new Error('Threads are not available here.');
+          return await threadTools.manage(input);
+        }
         case 'settle_thread': {
           if (!threadTools) throw new Error('Threads are not available here.');
-          return await threadTools.settle(input);
+          return await threadTools.manage({ ...(input ?? {}), action: 'settle' });
         }
         case 'message_thread': {
           if (!threadTools || !startThreadFollowUp) throw new Error('Follow-ups are not available here.');

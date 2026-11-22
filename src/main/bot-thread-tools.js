@@ -2,21 +2,24 @@ import path from 'node:path';
 
 // A bot's Durango Code thread tools, run on this machine (bot-replies.js for
 // a Durango bot's reply here, local-bots.js signed out): list the threads of
-// this machine's projects, read one, and send a follow-up into one. A
-// follow-up is an ordinary turn in that thread (it runs like a message the
-// person sends), and its outcome comes back to the bot's inbox like a task's.
-// Starting new threads is delegate_task with `project`. settle_thread puts
-// away a thread a bot started once the bot judges its work truly finished.
+// this machine's projects, read one, send a follow-up into one, and manage any
+// thread (settle/archive, unsettle/restore, snooze, unsnooze/wake, pin, unpin,
+// rename, stop, delete). A follow-up is an ordinary turn in that thread (it
+// runs like a message the person sends), and its outcome comes back to the
+// bot's inbox like a task's. Starting new threads is delegate_task with `project`.
 
-export const BOT_THREAD_TOOL_NAMES = ['list_threads', 'read_thread', 'message_thread', 'settle_thread'];
+export const BOT_THREAD_ACTIONS = ['settle', 'unsettle', 'snooze', 'unsnooze', 'pin', 'unpin', 'rename', 'stop', 'delete'];
+export const BOT_THREAD_TOOL_NAMES = ['list_threads', 'read_thread', 'message_thread', 'manage_thread'];
 
 /**
- * When a bot settles a thread it started (settle_thread): its own call, from
- * what the thread reports, never a rule on its status. In every bot's
- * instructions (local-bots.js, bot-replies.js); Durango's copy is in
- * chat/andromedus/lib/bots/prompt.ts ("Settling threads").
+ * How a bot manages and settles Durango Code threads (manage_thread): in every
+ * bot's instructions (local-bots.js, bot-replies.js); Durango's copy is in
+ * chat/andromedus/lib/bots/prompt.ts ("Managing and settling threads").
  */
-export const BOT_SETTLE_RULE = `Settling threads: a Durango Code thread you started stays in the person's sidebar until it is settled. Settle it yourself (settle_thread) only when you judge its work truly finished from what it reports: the change landed or merged, the release went out, the question was answered and nothing is left to do. Leave it unsettled while it is still running or waiting on something (a watcher, a deploy, a long run), while a change is open for review, when it asks the person something or needs their input, or when you aren't sure: "done" in a report alone doesn't mean finished. Settling only files it away (a new message brings it back); it never stops or deletes anything.`;
+export const BOT_SETTLE_RULE = `Managing and settling threads (manage_thread): you can manage any Durango Code thread — ones you started, ones other bots started, or the person's own — to settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, stop a running turn, or delete it.
+- Settling on your own: a Durango Code thread stays in the person's sidebar until it is settled. Settle a thread you started yourself (manage_thread with action "settle") only when you judge its work truly finished from what it reports: the change landed or merged, the release went out, the question was answered and nothing is left to do. Leave it unsettled while it is still running or waiting on something (a watcher, a deploy, a long run), while a change is open for review, when it asks the person something or needs their input, or when you aren't sure: "done" in a report alone doesn't mean finished.
+- Any thread and other actions: you may settle, unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename or stop any thread — including threads you didn't start — when the person asks or when it clearly follows from what they asked. Settling only files a thread away (a new message brings it back); it never stops or deletes anything.
+- Deleting: deleting a thread is permanent and cannot be undone. Only use action "delete" when the person explicitly asks you to delete a thread — never on your own.`;
 
 // What a bot sends the thread that made a change when the person asks to
 // ship it (land, deploy, merge, release). How a project ships is its own (the
@@ -102,11 +105,16 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'list_threads',
     description:
-      "List Durango Code threads on this computer, newest first: the person's own and the ones bots started. Filter by project (name) to see where a project stands; each has its id, title, project, status (running, idle, error…) and last activity.",
+      "List Durango Code threads on this computer, newest first: the person's own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), sidebar flags (settled, snoozed, pinned) and last activity.",
     inputSchema: {
       type: 'object',
       properties: {
         project: { type: 'string', maxLength: 200, description: 'Only threads in this project (by name). Omit for all projects.' },
+        state: {
+          type: 'string',
+          enum: ['all', 'active', 'settled', 'snoozed', 'pinned'],
+          description: 'Filter by sidebar state (default "all"). "active" excludes settled and snoozed threads.',
+        },
         limit: { type: 'integer', minimum: 1, maximum: MAX_LISTED, description: `How many (default 15, at most ${MAX_LISTED}).` },
       },
     },
@@ -140,16 +148,23 @@ export const BOT_THREAD_TOOLS = [
     },
   },
   {
-    name: 'settle_thread',
+    name: 'manage_thread',
     description:
-      "Settle a Durango Code thread a bot started (by id, from a task report): it leaves the person's sidebar list for Settled, like their own Settle button, and comes back if it gets a new message. Call it when you judge, from what the thread reported, that its work is truly finished (e.g. its change landed or merged, the release went out), not while it is running, waiting on something, open for review or needs the person. Only threads a bot started can be settled, and not while a turn runs.",
+      "Manage any Durango Code thread on this computer (by id, from list_threads or a task report) — whether started by a bot or by the person: settle (archive), unsettle (restore/unarchive), snooze, unsnooze (wake), pin, unpin, rename (with `title`), stop (stop a running turn), or delete (permanent — requires the full thread_id, and only when the person explicitly asks). Cannot settle a thread while a turn is running.",
     inputSchema: {
       type: 'object',
       properties: {
-        thread_id: { type: 'string', minLength: 1, maxLength: 200 },
-        reason: { type: 'string', maxLength: 300, description: 'Why it is finished, in a few words (e.g. "change landed and deployed").' },
+        thread_id: { type: 'string', minLength: 1, maxLength: 200, description: 'Thread id (full id required for action "delete").' },
+        action: {
+          type: 'string',
+          enum: BOT_THREAD_ACTIONS,
+          description:
+            'What to do: "settle" (archive to Settled), "unsettle" (restore to sidebar), "snooze", "unsnooze" (wake), "pin", "unpin", "rename" (requires `title`), "stop" (stop a running turn), or "delete" (permanent; requires the full thread_id, and only when explicitly asked).',
+        },
+        title: { type: 'string', minLength: 1, maxLength: 200, description: 'New thread title (required for action "rename").' },
+        reason: { type: 'string', maxLength: 300, description: 'Optional short note on why (e.g. "change landed and deployed").' },
       },
-      required: ['thread_id'],
+      required: ['thread_id', 'action'],
     },
   },
 ];
@@ -158,17 +173,40 @@ const projectKey = (value) => String(value ?? '').trim().toLowerCase();
 
 const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
 
+const ACTION_NOTES = {
+  settle: 'Settled: it moved to Settled in the sidebar; a new message brings it back.',
+  unsettle: 'Restored: it is back in the sidebar.',
+  snooze: 'Snoozed: it left the sidebar until its run finishes or it is woken.',
+  unsnooze: 'Woken: it is back in the sidebar.',
+  pin: 'Pinned to the top of the sidebar.',
+  unpin: 'Unpinned from the sidebar.',
+  rename: 'Renamed the thread.',
+  stop: 'Stopped the running turn on that thread.',
+  delete: 'Deleted the thread.',
+};
+
+const entrySidebarFlags = (entry) => {
+  const settledAt = entry?.shell?.settledAt ?? entry?.settledAt ?? null;
+  const snoozedAt = entry?.shell?.snoozedAt ?? entry?.snoozedAt ?? null;
+  const pinnedAt = entry?.shell?.pinnedAt ?? entry?.pinnedAt ?? null;
+  return {
+    settled: Boolean(settledAt),
+    snoozed: Boolean(snoozedAt && !settledAt),
+    pinned: Boolean(pinnedAt),
+  };
+};
+
 /**
  * deps:
  * - readIndex(): { entries } (thread-storage.js readThreadsIndex)
  * - readThread(args): transcript page text (thread-reader.js readThreadForAgent)
  * - getProjects(): this machine's projects the bot may use ([{ id, name, path }])
  * - liveStatus(threadId): the renderer's status for a thread now, or null (optional)
- * - settleThread(threadId): settles a thread a bot started, as the person's Settle button
- *   does → { ok, error? } (optional; main.js asks the renderer, which refuses a thread
- *   no bot started or one running a turn)
+ * - manageThread({ threadId, action, title? }): runs a thread action (settle, unsettle,
+ *   snooze, unsnooze, pin, unpin, rename, stop, delete) on any thread here → { ok, error? }
+ * - settleThread(threadId): legacy fallback for settle only when manageThread is omitted
  */
-export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveStatus = () => null, settleThread = null }) => {
+export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveStatus = () => null, manageThread = null, settleThread = null }) => {
   const projectsById = async () => {
     const list = (await Promise.resolve(getProjects()).catch(() => [])) ?? [];
     return new Map(list.filter((project) => project && typeof project.id === 'string').map((project) => [project.id, project]));
@@ -188,6 +226,46 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
     return { entry: found[0], project: projects.get(found[0].projectId) };
   };
 
+  const manage = async (input = {}, { exact = false } = {}) => {
+    const action = String(input.action ?? '').trim().toLowerCase();
+    if (!BOT_THREAD_ACTIONS.includes(action)) {
+      return { ok: false, error: `Unsupported thread action "${action}". Use one of: ${BOT_THREAD_ACTIONS.join(', ')}.` };
+    }
+    const runner = manageThread ?? (action === 'settle' && settleThread ? ({ threadId }) => settleThread(threadId) : null);
+    if (!runner) {
+      return { ok: false, error: action === 'settle' ? 'Settling threads is not available here.' : `Managing threads (${action}) is not available here.` };
+    }
+    const title = action === 'rename' ? String(input.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+    if (action === 'rename' && !title) {
+      return { ok: false, error: 'A new title is required to rename a thread.' };
+    }
+    // Destructive deletes always require the exact full thread id (never a prefix).
+    const { entry } = await findThread(input.thread_id, { exact: exact || action === 'delete' });
+    // The renderer refuses a running thread too (the index's status can be stale).
+    if (action === 'settle' && liveStatus(entry.id) === 'running') {
+      return { ok: false, error: 'That thread is running a turn: settle it only once its work is finished.' };
+    }
+    const result = await Promise.resolve(
+      runner({ threadId: entry.id, action, ...(title ? { title } : {}) })
+    ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+    if (!result?.ok) return { ok: false, error: result?.error || `The thread could not be updated (${action}).` };
+    const note =
+      result?.mirrored && action === 'delete'
+        ? 'Removed the mirrored copy on this computer (the original thread stays on its host machine).'
+        : result?.mirrored && action === 'rename'
+          ? 'Renamed the mirrored copy on this computer (the thread runs on another machine).'
+          : ACTION_NOTES[action];
+    return {
+      ok: true,
+      threadId: entry.id,
+      action,
+      ...(action === 'settle' ? { settled: true } : {}),
+      ...(title ? { title } : {}),
+      ...(result?.mirrored ? { mirrored: true } : {}),
+      note,
+    };
+  };
+
   return {
     names: BOT_THREAD_TOOL_NAMES,
     definitions: BOT_THREAD_TOOLS,
@@ -204,19 +282,35 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
           error: `No project "${input.project}" on this computer. Projects: ${[...projects.values()].map((candidate) => candidate.name).join(', ') || 'none'}.`,
         };
       }
+      const stateFilter = String(input.state ?? 'all').trim().toLowerCase();
       const limit = Math.min(MAX_LISTED, Math.max(1, Number.isInteger(input.limit) ? input.limit : 15));
       const threads = entries
-        .filter((entry) => !entry.subagent && projects.has(entry.projectId) && (!project || entry.projectId === project.id))
+        .filter((entry) => {
+          if (entry.subagent || !projects.has(entry.projectId)) return false;
+          if (project && entry.projectId !== project.id) return false;
+          const flags = entrySidebarFlags(entry);
+          if (stateFilter === 'active') return !flags.settled && !flags.snoozed;
+          if (stateFilter === 'settled') return flags.settled;
+          if (stateFilter === 'snoozed') return flags.snoozed;
+          if (stateFilter === 'pinned') return flags.pinned;
+          return true;
+        })
         .sort((a, b) => (b.activityAt ?? b.updatedAt ?? 0) - (a.activityAt ?? a.updatedAt ?? 0))
         .slice(0, limit)
-        .map((entry) => ({
-          id: entry.id,
-          title: entry.title || '(untitled)',
-          project: projects.get(entry.projectId)?.name ?? null,
-          status: liveStatus(entry.id) ?? entry.status ?? 'idle',
-          messages: entry.messageCount ?? null,
-          lastActivity: iso(entry.activityAt ?? entry.updatedAt),
-        }));
+        .map((entry) => {
+          const flags = entrySidebarFlags(entry);
+          return {
+            id: entry.id,
+            title: entry.title || '(untitled)',
+            project: projects.get(entry.projectId)?.name ?? null,
+            status: liveStatus(entry.id) ?? entry.status ?? 'idle',
+            ...(flags.settled ? { settled: true } : {}),
+            ...(flags.snoozed ? { snoozed: true } : {}),
+            ...(flags.pinned ? { pinned: true } : {}),
+            messages: entry.messageCount ?? null,
+            lastActivity: iso(entry.activityAt ?? entry.updatedAt),
+          };
+        });
       return { ok: true, threads };
     },
     async read(input = {}) {
@@ -229,20 +323,14 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
       return { ok: true, transcript: text };
     },
     /**
-     * settle_thread: a thread here a bot started, once the bot judges its work
-     * finished. `exact`: the full id only (a request from Durango, which every
-     * machine of the person may get).
+     * manage_thread: settle, unsettle, snooze, unsnooze, pin, unpin, rename,
+     * stop or delete any thread here. `exact`: the full id only (a request
+     * from Durango, which every machine of the person may get).
      */
-    async settle(input = {}, { exact = false } = {}) {
-      if (!settleThread) return { ok: false, error: 'Settling threads is not available here.' };
-      const { entry } = await findThread(input.thread_id, { exact });
-      // The renderer refuses a running thread too (the index's status can be stale).
-      if (liveStatus(entry.id) === 'running') {
-        return { ok: false, error: 'That thread is running a turn: settle it only once its work is finished.' };
-      }
-      const result = await Promise.resolve(settleThread(entry.id)).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
-      if (!result?.ok) return { ok: false, error: result?.error || 'The thread could not be settled.' };
-      return { ok: true, threadId: entry.id, settled: true, note: 'Settled: it moved to Settled in the sidebar; a new message brings it back.' };
+    manage,
+    /** Legacy helper for queued settleThreads from Durango. */
+    settle(input = {}, options = {}) {
+      return manage({ ...(input ?? {}), action: 'settle' }, options);
     },
   };
 };

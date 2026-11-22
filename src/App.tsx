@@ -180,7 +180,6 @@ import {
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
 import { dispatchProjectsPayload, startDurangoDispatchNotices, startDurangoDispatchReporter } from './app/durangoDispatch';
-import { threadStartedByBot } from './app/botSettle';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
 import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
@@ -9064,7 +9063,7 @@ const App: React.FC = () => {
             }
           }
           if (title) updateThread(threadId, { title });
-          // A bot's thread: that bot may settle it once its work is finished (settle_thread).
+          // A bot's thread: record which bot started it.
           if (dispatch.origin === 'bot') {
             updateThread(threadId, { startedByBot: dispatchSource.replace(/^your bot /, '').slice(0, 80) || 'bot' });
           }
@@ -9306,8 +9305,9 @@ const App: React.FC = () => {
         return { ok: true, threadId };
       }
       if (command.kind === 'threadState') {
-        // Settle, snooze or pin (or undo it) from a paired controller's
-        // mirror: filed here exactly as this machine's own buttons would.
+        // Settle, unsettle, snooze, unsnooze, pin or unpin from a paired
+        // controller's mirror or a bot (manage_thread): filed here exactly as
+        // this machine's own buttons would.
         const threadId = command.threadId ?? '';
         const sidebarState = command.sidebarState ?? {};
         if (!state.threads.some((candidate) => candidate.id === threadId)) {
@@ -9318,63 +9318,86 @@ const App: React.FC = () => {
         }
         const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
         if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
-        // A bot's settle_thread: only a thread a bot started (threadStartedByBot),
-        // only to settle it, and never while a turn runs or is starting.
-        if (command.botOnly) {
-          if (!sidebarState.settledAt || Object.keys(sidebarState).length !== 1) {
-            return { ok: false, threadId, error: 'A bot can only settle a thread.' };
-          }
-          const messages = thread.startedByBot
-            ? null
-            : await ensureThreadTranscript(threadId)
-                .then((transcript) => transcript?.messages ?? [])
-                .catch(() => []);
-          // Looked at again after the load: a turn may have started meanwhile.
-          const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
-          if (!current) return { ok: false, error: 'Thread not found on this machine.' };
-          if (!threadStartedByBot(current, messages)) {
-            return { ok: false, threadId, error: 'Only a thread a bot started can be settled by a bot; this one was started by the person or elsewhere.' };
-          }
+        const updates: Partial<Thread> = {};
+        const changedKeys: (keyof ThreadSidebarState)[] = [];
+        if (sidebarState.settledAt) {
+          // Like settleThread: a thread running or starting a turn stays in the sidebar.
           if (
-            current.status === 'running' ||
+            thread.status === 'running' ||
             pendingTurnStartsRef.current.has(threadId) ||
             Boolean(activeRunsByThreadRef.current[threadId])
           ) {
             return { ok: false, threadId, error: 'That thread is running a turn: settle it only once its work is finished.' };
           }
-          if (current.settledAt) return { ok: true, threadId };
-          updateThread(threadId, {
-            settledAt: sidebarState.settledAt,
-            snoozedAt: undefined,
-            wokeAt: undefined,
-            wokeReason: undefined,
-            finishedUnseenAt: undefined,
-          });
-          return { ok: true, threadId };
+          if (!thread.settledAt) {
+            Object.assign(updates, {
+              settledAt: sidebarState.settledAt,
+              snoozedAt: undefined,
+              wokeAt: undefined,
+              wokeReason: undefined,
+              finishedUnseenAt: undefined,
+            });
+            changedKeys.push('settledAt', 'snoozedAt');
+          }
+        } else if ('settledAt' in sidebarState && thread.settledAt) {
+          updates.settledAt = undefined;
+          changedKeys.push('settledAt');
         }
-        const updates: Partial<Thread> = {};
-        if (sidebarState.settledAt) {
-          // Like settleThread: a running thread stays in the sidebar.
-          if (thread.status === 'running') return { ok: false, threadId, error: 'That thread is still running there.' };
-          Object.assign(updates, {
-            settledAt: sidebarState.settledAt,
-            snoozedAt: undefined,
-            wokeAt: undefined,
-            wokeReason: undefined,
-            finishedUnseenAt: undefined,
-          });
-        } else if ('settledAt' in sidebarState) updates.settledAt = undefined;
-        if ('snoozedAt' in sidebarState && !updates.settledAt) {
+        if ('snoozedAt' in sidebarState && !updates.settledAt && !sidebarState.settledAt) {
           if (sidebarState.snoozedAt) {
-            Object.assign(updates, { snoozedAt: sidebarState.snoozedAt, wokeAt: undefined, wokeReason: undefined });
-          } else updates.snoozedAt = undefined;
+            if (!thread.snoozedAt) {
+              Object.assign(updates, { snoozedAt: sidebarState.snoozedAt, wokeAt: undefined, wokeReason: undefined });
+              changedKeys.push('snoozedAt');
+            }
+          } else if (thread.snoozedAt) {
+            updates.snoozedAt = undefined;
+            changedKeys.push('snoozedAt');
+          }
         }
-        if (sidebarState.pinnedAt) updates.pinnedAt = sidebarState.pinnedAt;
-        else if ('pinnedAt' in sidebarState && thread.pinnedAt) {
+        if (sidebarState.pinnedAt) {
+          if (!thread.pinnedAt) {
+            updates.pinnedAt = sidebarState.pinnedAt;
+            changedKeys.push('pinnedAt');
+          }
+        } else if ('pinnedAt' in sidebarState && thread.pinnedAt) {
           Object.assign(updates, { pinnedAt: undefined, unpinnedAt: new Date().toISOString(), hiddenFromRecent: false });
+          changedKeys.push('pinnedAt');
         }
-        if (Object.keys(updates).length > 0) updateThread(threadId, updates);
+        if (Object.keys(updates).length > 0) {
+          updateThread(threadId, updates);
+          if (changedKeys.length > 0) sendSidebarStateToHost(threadId, changedKeys);
+        }
         return { ok: true, threadId };
+      }
+      if (command.kind === 'renameThread') {
+        const threadId = command.threadId ?? '';
+        const title = (command.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+        if (!title) return { ok: false, threadId, error: 'A new title is required to rename a thread.' };
+        if (!state.threads.some((candidate) => candidate.id === threadId)) {
+          return { ok: false, error: 'Thread not found on this machine.' };
+        }
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The command expired or was cancelled.' };
+        }
+        const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+        const mirrored = Boolean(thread.remote?.threadId);
+        updateThread(threadId, { title });
+        return { ok: true, threadId, threadTitle: title, ...(mirrored ? { mirrored: true } : {}) };
+      }
+      if (command.kind === 'deleteThread') {
+        const threadId = command.threadId ?? '';
+        if (!state.threads.some((candidate) => candidate.id === threadId)) {
+          return { ok: false, error: 'Thread not found on this machine.' };
+        }
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The command expired or was cancelled.' };
+        }
+        const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+        const mirrored = Boolean(thread.remote?.threadId);
+        await deleteThreadWithRuntime(threadId);
+        return { ok: true, threadId, ...(mirrored ? { mirrored: true } : {}) };
       }
       return { ok: false, error: 'Unsupported remote command.' };
     };
@@ -9383,7 +9406,7 @@ const App: React.FC = () => {
     if (!window.orion?.onRemoteCommandRequest) return undefined;
     const unsubscribe = window.orion.onRemoteCommandRequest((request) => {
       void (async () => {
-        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; projectId?: string; error?: string };
+        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; projectId?: string; mirrored?: boolean; error?: string };
         const canPrepare = () => Date.now() < request.expiresAt;
         let claimPromise: Promise<boolean> | null = null;
         // `threadId`: the turn's thread, told to the controller with the claim.

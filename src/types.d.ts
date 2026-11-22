@@ -596,11 +596,11 @@ export type RemoteCommandRequest = {
      * cloned, main/source-checkout.js) as a project named `projectName`, or
      * find the project that already has that path; reports `projectId`.
      */
-    kind: 'runTurn' | 'stopTurn' | 'steerTurn' | 'addProject' | 'answerQuestion' | 'userAction' | 'threadState';
+    kind: 'runTurn' | 'stopTurn' | 'steerTurn' | 'addProject' | 'answerQuestion' | 'userAction' | 'threadState' | 'renameThread' | 'deleteThread';
     /** threadState: settle, snooze or pin the thread (null = undo); absent keys stay. */
     sidebarState?: import('./store').ThreadSidebarState;
-    /** threadState from a bot (settle_thread): only a thread a bot started. */
-    botOnly?: boolean;
+    /** renameThread: new title for the thread. */
+    title?: string;
     /** answerQuestion: which question, and the answers per question id. */
     runId?: string;
     requestId?: string | number;
@@ -2325,6 +2325,9 @@ type OrionCodexBrowserIntegrationStatus = {
         commandId: string;
         ok: boolean;
         threadId?: string;
+        threadTitle?: string;
+        projectId?: string;
+        mirrored?: boolean;
         error?: string;
       }) => Promise<{ ok: boolean }>;
       onRemoteState?: (cb: (state: RemoteControlState) => void) => () => void;
