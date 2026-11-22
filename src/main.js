@@ -64,7 +64,7 @@ import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-
 import { buildUsageReport, createUsageStore, latestCodexLimits } from './main/usage-stats.js';
 import { loadUsagePrices, refreshUsagePrices, usagePricesInfo } from './main/usage-pricing.js';
 import { claudeRateLimits, configureUsageLimits } from './main/usage-limits.js';
-import { configureCodexLiveLimits, readProviderUsageLimits } from './main/provider-usage-limits.js';
+import { clearProviderUsageLimitsCache, configureCodexLiveLimits, readProviderUsageLimits } from './main/provider-usage-limits.js';
 import { codexBrowserUseMode, codexUtilityPrivacyOptions, splitCodexConfigContextArgs } from './main/codex-config.js';
 import { codexBrowserOptionsForIntegration, probeCodexBrowserIntegration } from './main/codex-browser-integration.js';
 import { codexAppServerManager } from './main/codex-app-server-manager.js';
@@ -136,6 +136,7 @@ import { createAccountConnectors } from './main/account-connectors.js';
 import { listProviderMcps, shareProviderMcp, withoutClaudeNativeMcps, withoutCodexNativeMcps } from './main/provider-mcps.js';
 import { findKimiSessionIndexEntry, forkSessionOnDisk } from './main/session-fork.js';
 import { addAgentEventListener, emitAgentEvent, sendToAllWindows } from './main/events.js';
+import { createProviderSignInWatch } from './main/provider-sign-in-watch.js';
 import {
   canUndoTheme,
   configureThemeStore,
@@ -1433,6 +1434,21 @@ app.whenReady().then(async () => {
   void configureAgentModelsCache(path.join(app.getPath('userData'), 'agent-models-cache.json')).then(() =>
     getAgentModels().catch(() => {})
   );
+  // A sign-in changed in a terminal (another account, or signed out) shows up
+  // when the user comes back to the window: refresh that provider's models
+  // and status as if it had signed in here (providers:authenticated).
+  const providerSignInWatch = createProviderSignInWatch({
+    onChange: (providerIds) => {
+      invalidateAgentModelsCache();
+      clearProviderUsageLimitsCache(providerIds);
+      getAgentModels({ fresh: true }).catch(() => {});
+      for (const providerId of providerIds) sendToAllWindows('providers:authenticated', { providerId });
+    },
+  });
+  void providerSignInWatch.check();
+  app.on('browser-window-focus', () => {
+    void providerSignInWatch.check();
+  });
 
   // Workspace sync (opt-in, contract in orion-web/docs/workspace-sync.md).
   // Seed the engine from the persisted store so an enabled sync resumes after

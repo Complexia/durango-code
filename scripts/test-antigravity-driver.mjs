@@ -17,6 +17,8 @@ import {
 import { parseAntigravityModelsOutput } from '../src/main/models.js';
 import { parseAntigravityLoginUrl, parseAntigravityModelRows } from '../src/main/provider-updates.js';
 import { commandForModel } from '../src/main/command-for-model.js';
+import { createProviderSignInWatch } from '../src/main/provider-sign-in-watch.js';
+import { readAntigravityLimits } from '../src/main/provider-usage-limits.js';
 import { antigravityVersionError } from '../src/main/antigravity-driver.js';
 import { antigravityFailureFromErrorText } from '../src/main/antigravity-turn-outcome.js';
 import { handleAntigravitySubagentLine } from '../src/main/antigravity-child-work.js';
@@ -140,6 +142,28 @@ await check('subagent transcript lines', () => {
     ['activity', 'step-1-0', 'done', 'total 0'],
     ['text', 'Done.'],
   ]);
+});
+
+await check('sign-in watch reports only providers whose files changed', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-signin-'));
+  const token = path.join(dir, 'antigravity-oauth-token');
+  const other = path.join(dir, 'auth.json');
+  fs.writeFileSync(token, 'a');
+  fs.writeFileSync(other, 'b');
+  const seen = [];
+  const watch = createProviderSignInWatch({
+    files: () => ({ antigravity: [token], grok: [other], codex: [path.join(dir, 'missing.json')] }),
+    onChange: (ids) => seen.push(ids),
+    minIntervalMs: 0,
+  });
+  assert.deepEqual(await watch.check(), [], 'the first check only records the baseline');
+  assert.deepEqual(await watch.check(), []);
+  fs.writeFileSync(token, 'signed in as someone else');
+  assert.deepEqual(await watch.check(), ['antigravity']);
+  fs.rmSync(other);
+  assert.deepEqual(await watch.check(), ['grok'], 'signing out counts too');
+  assert.deepEqual(seen, [['antigravity'], ['grok']]);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 // --- deterministic driver checks against a scripted fake agent ---------------
@@ -482,6 +506,12 @@ if (process.env.AGY_LIVE === '1') {
   const outside = path.join(root, 'outside.txt');
   fs.mkdirSync(workspace);
   let sessionId = null;
+
+  await check('live: Antigravity limits read the current sign-in', async () => {
+    const limits = await readAntigravityLimits();
+    assert.equal(limits.status, 'ok', limits.detail);
+    assert.ok(limits.windows.length > 0);
+  });
 
   await check('live: workspace write allows edits inside, denies commands and outside writes', async () => {
     const seen = await runTurn({

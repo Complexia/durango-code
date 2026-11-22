@@ -51,10 +51,15 @@ export const decodeGoKeyringValue = (value) => {
 };
 
 const readAntigravityToken = async () => {
+  // agy 1.5 keeps the sign-in in a file under its data dir when it can (and
+  // falls back to the OS keyring), the same JSON either way.
   let raw = null;
-  if (process.platform === 'darwin') {
+  try {
+    raw = (await fs.readFile(path.join(os.homedir(), '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'utf8')).trim() || null;
+  } catch {}
+  if (!raw && process.platform === 'darwin') {
     raw = await execText('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w']);
-  } else if (process.platform === 'linux') {
+  } else if (!raw && process.platform === 'linux') {
     raw = await execText('secret-tool', ['lookup', 'service', 'gemini', 'username', 'antigravity']);
   }
   if (!raw) return null;
@@ -115,7 +120,7 @@ const antigravityPlanLabel = (tier) => {
 export const readAntigravityLimits = async () => {
   const token = await readAntigravityToken();
   if (!token) {
-    return { status: 'signed-out', detail: process.platform === 'win32' ? "Reading Antigravity's sign-in isn't supported on Windows yet." : 'Sign in to Antigravity to see its limits.' };
+    return { status: 'signed-out', detail: 'Sign in to Antigravity to see its limits.' };
   }
   if (token.expiresAt && token.expiresAt <= Date.now() + 60_000) {
     return { status: 'expired', detail: "Antigravity's sign-in token has expired. Run an Antigravity turn to renew it, then refresh." };
@@ -345,6 +350,11 @@ const readOnce = (providerId) => {
     inFlight.set(providerId, pending);
   }
   return inFlight.get(providerId);
+};
+
+/** Forget cached reports (a provider's sign-in changed). */
+export const clearProviderUsageLimitsCache = (providerIds = Object.keys(readers)) => {
+  for (const providerId of providerIds) cache.delete(providerId);
 };
 
 /** `{ antigravity, grok, codex }` reports (`at` = when read); cached for a minute unless forced. */
