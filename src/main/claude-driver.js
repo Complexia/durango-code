@@ -1024,6 +1024,8 @@ export const createClaudeTurnState = (runId, snapshot) => ({
   streamContext: { textSeen: false },
   knownToolActivities: new Map(),
   pendingReasoning: '',
+  reasoningSeq: 0,
+  reasoningActive: false,
   reasoningEmitted: false,
   reasoningEmitTimer: null,
   lastReasoningEmitAt: 0,
@@ -1057,7 +1059,13 @@ export const sendClaudeTurnReasoning = (session, turn, status = 'running') => {
     runId: turn.runId,
     threadId: session.threadId,
     type: 'activity',
-    activity: { key: `${turn.runId}:reasoning`, type: 'thought', title: 'Reasoning', detailDelta, status },
+    activity: {
+      key: `${turn.runId}:reasoning:${turn.reasoningSeq ?? 0}`,
+      type: 'thought',
+      title: 'Reasoning',
+      detailDelta,
+      status,
+    },
   });
 };
 
@@ -1081,7 +1089,12 @@ export const finishClaudeTurnReasoning = (session, turn) => {
     clearTimeout(turn.reasoningEmitTimer);
     turn.reasoningEmitTimer = null;
   }
+  if (!turn.reasoningActive && !turn.pendingReasoning && !turn.reasoningEmitted) return;
   sendClaudeTurnReasoning(session, turn, 'done');
+  turn.reasoningActive = false;
+  turn.reasoningEmitted = false;
+  turn.pendingReasoning = '';
+  turn.reasoningSeq = (turn.reasoningSeq ?? 0) + 1;
 };
 
 // Only model output opens a turn on its own; bookkeeping system messages
@@ -1421,6 +1434,8 @@ export const finalizeClaudeTurn = async (session, resultMessage) => {
   if (steers.length && !session.ended && !session.disposed && session.query) {
     finishClaudeTurnReasoning(session, turn);
     const continuation = createClaudeTurnState(turn.runId, turn.snapshot);
+    // Keep reasoning step keys unique across the steered continuation on the same runId.
+    continuation.reasoningSeq = turn.reasoningSeq;
     // Changed-file attribution spans both halves of the visible run.
     for (const filePath of turn.toolWrittenPaths) continuation.toolWrittenPaths.add(filePath);
     // Behind any turn already queued: results arrive in input order.
@@ -1891,7 +1906,8 @@ export const handleClaudeSessionMessage = async (session, message) => {
   }
 
   const reasoningDelta = extractClaudeReasoningFromJsonEvent(message, turn.streamContext);
-  if (reasoningDelta) {
+  if (reasoningDelta && (turn.reasoningActive || reasoningDelta.trim())) {
+    turn.reasoningActive = true;
     turn.pendingReasoning = `${turn.pendingReasoning}${reasoningDelta}`;
     queueClaudeTurnReasoning(session, turn);
   }
@@ -1936,6 +1952,9 @@ export const handleClaudeSessionMessage = async (session, message) => {
         continue;
       }
     }
+    if (!activity.key || !turn.knownToolActivities.has(activity.key)) {
+      finishClaudeTurnReasoning(session, turn);
+    }
     if (activity.key) {
       const { key, status, ...rest } = activity;
       turn.knownToolActivities.set(key, rest);
@@ -1950,6 +1969,7 @@ export const handleClaudeSessionMessage = async (session, message) => {
 
   const text = extractClaudeTextFromJsonEvent(message, turn.streamContext);
   if (text) {
+    finishClaudeTurnReasoning(session, turn);
     turn.streamContext.textSeen = true;
     emitAgentEvent(session.sender, {
       runId: turn.runId,

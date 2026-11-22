@@ -329,6 +329,33 @@ export const collapsedDetailPreview = (activity: AgentActivity) => {
   return flattened;
 };
 
+// Multi-line tail preview for an actively streaming thought row: keeps the
+// latest few lines (capped around 300 chars) so the user can read what the
+// agent is thinking right now without a clipped single-line ticker.
+export const liveThoughtPreview = (detail?: string) => {
+  const raw = (detail ?? '').trim();
+  if (!raw) return '';
+  const window = raw.slice(-1600);
+  const lines = window
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  if (lines.length === 0) return '';
+  const maxLines = 3;
+  const maxChars = 300;
+  const slicedLines = lines.slice(-maxLines);
+  let truncated = raw.length > 1600 || lines.length > maxLines;
+  let text = slicedLines.join('\n');
+  if (text.length > maxChars) {
+    const tail = text.slice(-maxChars);
+    const breakAt = tail.search(/\s/);
+    text = (breakAt > 0 && breakAt < 40 ? tail.slice(breakAt + 1) : tail).trimStart();
+    truncated = true;
+  }
+  return truncated ? `…${text}` : text;
+};
+
 // What a step did, for its icon and the group summary ("Ran 3 commands and
 // read 2 files"), as in T3 Code's work log.
 export type ActivityAction = 'command' | 'edit' | 'read' | 'search' | 'web' | 'agent' | 'thought' | 'update' | 'other';
@@ -377,7 +404,25 @@ export const activityLabel = (activity: AgentActivity): { text: string; code?: b
     return { text: detail || firstLine(activity.input ?? '') || activity.title.replace(/^Command - /, ''), code: true };
   }
   const name = toolNameOf(activity);
-  if (!name) return { text: detail && detail !== activity.title ? `${activity.title} · ${detail}` : activity.title };
+  if (!name) {
+    if (activity.kind === 'read' && detail) {
+      const verb = /^List\b/i.test(activity.title) ? 'Listed' : 'Read';
+      return { text: `${verb} ${shortPath(detail)}` };
+    }
+    if (activity.kind === 'edit' && detail) {
+      const verb = /^Write\b/i.test(activity.title) ? 'Wrote' : 'Edited';
+      return { text: `${verb} ${shortPath(detail)}` };
+    }
+    if (detail && detail !== activity.title) {
+      const sep = activity.title.indexOf(' - ');
+      const titleTail = sep >= 0 ? activity.title.slice(sep + 3) : '';
+      if (titleTail && detail.startsWith(titleTail)) {
+        return { text: `${activity.title.slice(0, sep)} · ${detail}` };
+      }
+      return { text: `${activity.title} · ${detail}` };
+    }
+    return { text: activity.title };
+  }
   switch (name) {
     case 'Read':
       return { text: detail ? `Read ${shortPath(detail)}` : 'Read a file' };
@@ -500,8 +545,63 @@ export const summarizeActivities = (activities: AgentActivity[]) => {
 };
 
 const groupAction = (activities: AgentActivity[]): ActivityAction | 'mixed' => {
-  const actions = new Set(activities.map(activityAction));
+  const steps = activities.filter((activity) => activity.type !== 'thought');
+  const source = steps.length > 0 ? steps : activities;
+  const actions = new Set(source.map(activityAction));
   return actions.size === 1 ? [...actions][0] : 'mixed';
+};
+
+export const LIVE_RECENT_STEPS = 4;
+
+export type LiveActivityPartition = {
+  /** Earlier steps folded into the summary row above the live trail. */
+  older: AgentActivity[];
+  /** Whether `older` has at least one non-thought action worth summarizing. */
+  hasOlderSteps: boolean;
+  /** Recent non-thought actions shown directly while the turn runs (plus any awaiting approval). */
+  recentTools: AgentActivity[];
+  /** The currently streaming thought step, if one is running right now. */
+  activeThought: AgentActivity | null;
+};
+
+/**
+ * Split a live work-log group into: older steps (collapsed into one summary
+ * row), up to `limit` recent non-thought actions (kept visible so long
+ * tool-only runs show concrete progress), and the active streaming thought.
+ */
+export const partitionLiveActivities = (
+  activities: AgentActivity[],
+  limit = LIVE_RECENT_STEPS
+): LiveActivityPartition => {
+  const activeThought =
+    activities.findLast((activity) => activity.type === 'thought' && activity.status === 'running') ?? null;
+
+  const toolIndices: number[] = [];
+  for (let index = 0; index < activities.length; index += 1) {
+    if (activities[index].type !== 'thought') toolIndices.push(index);
+  }
+
+  const picked = new Set<number>();
+  // Never hide a step awaiting user approval.
+  for (const index of toolIndices) {
+    if (activities[index].status === 'waiting') picked.add(index);
+  }
+  const budget = Math.max(limit, picked.size);
+  // Prioritize currently running steps (newest first), then the most recent
+  // completed steps, then restore chronological order.
+  for (let i = toolIndices.length - 1; i >= 0 && picked.size < budget; i -= 1) {
+    const index = toolIndices[i];
+    if (activities[index].status === 'running') picked.add(index);
+  }
+  for (let i = toolIndices.length - 1; i >= 0 && picked.size < budget; i -= 1) {
+    picked.add(toolIndices[i]);
+  }
+
+  const recentTools = toolIndices.filter((index) => picked.has(index)).map((index) => activities[index]);
+  const older = activities.filter((activity, index) => activity !== activeThought && !picked.has(index));
+  const hasOlderSteps = older.some((activity) => activity.type !== 'thought');
+
+  return { older, hasOlderSteps, recentTools, activeThought };
 };
 
 const effectiveStatus = (activity: AgentActivity, runRunning: boolean) =>
@@ -591,6 +691,9 @@ const AgentActivityRow: React.FC<{
     );
   }
 
+  const isLiveThought = activity.type === 'thought' && live && status === 'running';
+  const livePreview = isLiveThought ? liveThoughtPreview(activity.detail) : '';
+
   return (
     <div className={`work-row ${status}${failed ? ' failed' : ''}${open ? ' open' : ''}`}>
       <button
@@ -599,14 +702,15 @@ const AgentActivityRow: React.FC<{
         onClick={expandable ? () => onToggle(activity.id) : undefined}
         disabled={!expandable}
         aria-expanded={expandable ? open : undefined}
-        title={label.text}
+        title={isLiveThought ? (open ? 'Collapse thinking' : 'Expand full thinking') : label.text}
       >
         <span className="work-row-icon">
           <ActivityActionIcon action={activityAction(activity)} />
         </span>
         <span className={`work-row-label${label.code ? ' code' : ''}${live && status === 'running' ? ' live' : ''}`}>
-          {label.text}
+          {isLiveThought ? 'Thinking' : label.text}
         </span>
+        {isLiveThought && expandable && <ChevronRight size={12} className="work-row-thought-chevron" />}
         {activity.diff && (
           <span className="work-row-diff" title={activity.diff.path}>
             <span className="diff-add">+{activity.diff.additions}</span>
@@ -619,6 +723,7 @@ const AgentActivityRow: React.FC<{
         {status === 'waiting' && <span className="agent-tool-chip waiting">needs approval</span>}
         {failed && typeof activity.exitCode !== 'number' && <X size={12} className="work-row-failed" />}
       </button>
+      {isLiveThought && !open && livePreview && <div className="work-row-thought-live">{livePreview}</div>}
       {open && hasActivityDetails(activity) && <ActivityDetails activity={activity} label={label.text} />}
     </div>
   );
@@ -664,6 +769,8 @@ const ActivityGroup: React.FC<{
 }> = ({ activities, runRunning, live }) => {
   const [openRows, toggleRow] = useToggleSet();
   const [expanded, setExpanded] = useState(false);
+  const [thoughtExpanded, setThoughtExpanded] = useState(false);
+  const toggleLiveThought = useCallback(() => setThoughtExpanded((value) => !value), []);
   const rows = (
     <div className="work-group-rows">
       {activities.map((activity) => (
@@ -671,6 +778,7 @@ const ActivityGroup: React.FC<{
           key={activity.id}
           activity={activity}
           runRunning={runRunning}
+          live={live && (activity.status === 'running' || activity.status === 'waiting')}
           open={openRows.has(activity.id)}
           onToggle={toggleRow}
         />
@@ -678,56 +786,75 @@ const ActivityGroup: React.FC<{
     </div>
   );
 
-  // Live: the steps before it stay as they were (their summary line, or the
-  // one step), and the step happening now (one awaiting approval first) takes
-  // the Thinking line's place beneath them, so nothing above it jumps when a
-  // step starts or ends.
+  // Live: older steps collapse into one summary row, the latest few real
+  // actions stay visible beneath it so long tool-only runs show concrete
+  // progress, and an active streaming thought renders its live peek at the
+  // bottom (expandable on its own without opening the full history).
   if (live) {
-    const current =
-      activities.findLast((activity) => activity.status === 'waiting') ??
-      activities.findLast((activity) => activity.status === 'running') ??
-      activities[activities.length - 1];
     if (expanded) {
       return (
         <div className="work-group">
-          <WorkGroupSummary label={summarizeActivities(activities)} action={groupAction(activities)} expanded onToggle={() => setExpanded(false)} />
+          <WorkGroupSummary
+            label={summarizeActivities(activities)}
+            action={groupAction(activities)}
+            failed={activities.some(activityFailed)}
+            expanded
+            onToggle={() => setExpanded(false)}
+          />
           {rows}
         </div>
       );
     }
-    const earlier = activities.filter((activity) => activity !== current);
+    const { older, hasOlderSteps, recentTools, activeThought } = partitionLiveActivities(activities);
+    const showOlder = hasOlderSteps || (recentTools.length === 0 && !activeThought && older.length > 0);
     return (
       <>
-        {earlier.length === 1 && (
+        {showOlder && older.length === 1 && (
           <div className="work-group">
             <AgentActivityRow
-              activity={earlier[0]}
+              activity={older[0]}
               runRunning={runRunning}
-              open={openRows.has(earlier[0].id)}
+              open={openRows.has(older[0].id)}
               onToggle={toggleRow}
             />
           </div>
         )}
-        {earlier.length > 1 && (
+        {showOlder && older.length > 1 && (
           <div className="work-group">
             <WorkGroupSummary
-              label={summarizeActivities(earlier)}
-              action={groupAction(earlier)}
-              failed={earlier.some(activityFailed)}
+              label={summarizeActivities(older)}
+              action={groupAction(older)}
+              failed={older.some(activityFailed)}
               expanded={false}
               onToggle={() => setExpanded(true)}
             />
           </div>
         )}
-        <div className="work-group live">
-          <AgentActivityRow
-            activity={current}
-            runRunning={runRunning}
-            live
-            open={openRows.has(current.id)}
-            onToggle={toggleRow}
-          />
-        </div>
+        {recentTools.length > 0 && (
+          <div className="work-group live">
+            {recentTools.map((activity) => (
+              <AgentActivityRow
+                key={activity.id}
+                activity={activity}
+                runRunning={runRunning}
+                live={activity.status === 'running' || activity.status === 'waiting'}
+                open={openRows.has(activity.id)}
+                onToggle={toggleRow}
+              />
+            ))}
+          </div>
+        )}
+        {activeThought && (
+          <div className="work-group live">
+            <AgentActivityRow
+              activity={activeThought}
+              runRunning={runRunning}
+              live
+              open={thoughtExpanded}
+              onToggle={toggleLiveThought}
+            />
+          </div>
+        )}
       </>
     );
   }
@@ -807,11 +934,7 @@ export const AgentActivityCard: React.FC<{
             key={chunk.activities[0].id}
             activities={chunk.activities}
             runRunning={runRunning}
-            live={
-              live &&
-              index === chunks.length - 1 &&
-              chunk.activities.some((activity) => activity.status === 'running' || activity.status === 'waiting')
-            }
+            live={live && index === chunks.length - 1}
           />
         )
       )}

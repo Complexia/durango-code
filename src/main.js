@@ -78,6 +78,7 @@ import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteera
 import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
 import { antigravityChildTranscriptPath, handleAntigravitySubagentLine, resolveAntigravityChild } from './main/antigravity-child-work.js';
 import { antigravityReadOnlyOneShot, antigravityRunDrivers, antigravityStatsFromPromptResult, createAntigravityAcpDriver, steerAntigravityRun } from './main/antigravity-driver.js';
+import { createReasoningStream } from './main/reasoning-stream.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { guardVisualFrames } from './main/visual-tools.js';
 import { attachTextContextMenu } from './main/text-context-menu.js';
@@ -6726,7 +6727,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         : orchestrationSnapshot;
     const jsonMode = sendsJsonEvents(model.providerId);
     const adapter = jsonAdapterForProvider(model.providerId);
-    const reasoningActivityKey = `${runId}:reasoning`;
     const REASONING_EMIT_INTERVAL_MS = 150;
 
     // A branched thread's first turn must not resume the parent's session in
@@ -7151,10 +7151,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         subagentTracker.finish(agentId, { status: result.success ? 'done' : 'error' });
       }
     };
-    let pendingReasoning = '';
-    let reasoningEmitted = false;
-    let reasoningEmitTimer = null;
-    let lastReasoningEmitAt = 0;
+    const seenActivityKeys = new Set();
     let sessionIdReported = false;
     let finalized = false;
     let exitFallbackTimer = null;
@@ -7270,52 +7267,27 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       });
     };
 
-    const sendReasoningActivity = (status = 'running') => {
-      const detailDelta = pendingReasoning;
-      pendingReasoning = '';
-      if (!detailDelta && !reasoningEmitted) return;
-      reasoningEmitted = true;
-
-      emitAgentEvent(event.sender, {
-        runId,
-        threadId: input.threadId,
-        type: 'activity',
-        activity: {
-          key: reasoningActivityKey,
-          type: 'thought',
-          title: 'Reasoning',
-          detailDelta,
-          status,
-        },
-      });
-    };
-
-    // Thinking deltas arrive per token; cap reasoning updates so each one
-    // doesn't turn into an IPC message and a renderer store write.
-    const queueReasoningActivity = () => {
-      const elapsed = Date.now() - lastReasoningEmitAt;
-      if (elapsed >= REASONING_EMIT_INTERVAL_MS) {
-        lastReasoningEmitAt = Date.now();
-        sendReasoningActivity();
-        return;
-      }
-      if (reasoningEmitTimer) return;
-      reasoningEmitTimer = setTimeout(() => {
-        reasoningEmitTimer = null;
-        lastReasoningEmitAt = Date.now();
-        sendReasoningActivity();
-      }, REASONING_EMIT_INTERVAL_MS - elapsed);
-    };
-
-    const finishReasoningActivity = () => {
-      if (reasoningEmitTimer) {
-        clearTimeout(reasoningEmitTimer);
-        reasoningEmitTimer = null;
-      }
-      sendReasoningActivity('done');
-    };
+    const reasoningStream = createReasoningStream({
+      runId,
+      intervalMs: REASONING_EMIT_INTERVAL_MS,
+      emit: (activity) => {
+        emitAgentEvent(event.sender, {
+          runId,
+          threadId: input.threadId,
+          type: 'activity',
+          activity,
+        });
+      },
+    });
+    const finishReasoningActivity = () => reasoningStream.finishStep();
 
     const emitActivity = (activity) => {
+      const isNewStep =
+        activity.type !== 'thought' &&
+        activity.type !== 'plan' &&
+        (!activity.key || !seenActivityKeys.has(activity.key));
+      if (activity.key) seenActivityKeys.add(activity.key);
+      if (isNewStep) reasoningStream.finishStep();
       emitAgentEvent(event.sender, {
         runId,
         threadId: input.threadId,
@@ -7329,10 +7301,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       inspectForSubagents(parsed);
 
       const reasoningDelta = adapter.reasoning(parsed, streamContext);
-      if (reasoningDelta) {
-        pendingReasoning = `${pendingReasoning}${reasoningDelta}`;
-        queueReasoningActivity();
-      }
+      if (reasoningDelta) reasoningStream.push(reasoningDelta);
 
       for (const { updateForKey, ...activity } of adapter.activities(parsed)) {
         if (updateForKey) {
@@ -7360,6 +7329,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
       const text = adapter.text(parsed, streamContext);
       if (text) {
+        reasoningStream.finishStep();
         stdoutSeen = true;
         streamContext.textSeen = true;
         emitAgentEvent(event.sender, {
@@ -7399,11 +7369,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           sessionId,
         });
       },
-      onReasoning: (delta) => {
-        pendingReasoning = `${pendingReasoning}${delta}`;
-        queueReasoningActivity();
-      },
+      onReasoning: (delta) => reasoningStream.push(delta),
       onText: (text) => {
+        reasoningStream.finishStep();
         stdoutSeen = true;
         emitAgentEvent(event.sender, {
           runId,

@@ -9459,6 +9459,25 @@ html.theme-light .setting-row .release-notes-list {
   white-space: pre-wrap;
   user-select: text;
 }
+.work-row-thought-live {
+  margin: 1px 0 4px 22px;
+  max-height: 4.8em;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+.work-row-thought-chevron {
+  flex-shrink: 0;
+  opacity: 0.65;
+  transition: transform var(--transition-base);
+}
+.work-row.open .work-row-thought-chevron {
+  transform: rotate(90deg);
+}
 .work-row-label.live {
   background: linear-gradient(90deg, var(--text-muted) 0%, var(--text-primary) 50%, var(--text-muted) 100%);
   background-size: 200% 100%;
