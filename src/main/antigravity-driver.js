@@ -150,6 +150,9 @@ export const createAntigravityAcpDriver = ({
   let settling = false;
   let settleStartedAt = 0;
   let replyOpen = false;
+  // A command was still running when a prompt ended (agy moved it to the
+  // background): when it finishes, agy wakes the model to carry on by itself.
+  let commandOutlivedPrompt = false;
   let lastUpdateAt = Date.now();
   // Native questions waiting on the user (elicitation/create), by request id.
   const pendingUserInputs = new Map();
@@ -750,9 +753,12 @@ export const createAntigravityAcpDriver = ({
 
   // The prompt has ended, but agy may not be done: subagents keep working
   // and report back, and the parent then replies by itself (its own text,
-  // closed by a usage_update); a command it started can outlive the prompt
-  // too. The turn (and the agy process) stays open until every child has
-  // reported, the parent has replied, nothing runs, and nothing arrived for 3s.
+  // closed by a usage_update). A command that outlives its WaitMsBeforeAsync
+  // moves to the background (it stays in_progress over ACP) and the model
+  // often ends its prompt to wait for it; when it finishes, agy wakes the
+  // model the same way (verified on agy 1.5.14). The turn (and the agy
+  // process) stays open until every child has reported, nothing runs, the
+  // woken reply has finished, and nothing arrived for 3s.
   const SETTLE_POLL_MS = 1000;
   const SETTLE_QUIET_MS = 3000;
   // A launch whose child never appears on disk (it failed to spawn) isn't
@@ -820,12 +826,18 @@ export const createAntigravityAcpDriver = ({
       // A steer (or the end of the run) during the reads above owns the turn now.
       if (!current()) return;
       const waitingOnChildren = [...children.values()].some((child) => !child.done);
-      // A child reported but the parent hasn't started its reply yet (it is
-      // woken by an inbox message, and a slow model can take a while).
+      const commandsRunning = runningCommands();
+      // A child reported (or a background command finished) and agy woke
+      // the model, but its reply hasn't streamed yet or is between steps: a
+      // thinking model can be silent for well over the quiet period.
       const replyPending =
-        !waitingOnChildren && !replyOpen && children.size > 0 && (await antigravityPendingReply(activeSessionId));
+        !waitingOnChildren &&
+        !commandsRunning &&
+        !replyOpen &&
+        (children.size > 0 || commandOutlivedPrompt) &&
+        (await antigravityPendingReply(activeSessionId));
       if (!current()) return;
-      const busy = waitingOnChildren || replyOpen || replyPending || runningCommands() || pendingUserInputs.size > 0;
+      const busy = waitingOnChildren || replyOpen || replyPending || commandsRunning || pendingUserInputs.size > 0;
       const quietFor = Date.now() - lastUpdateAt;
       if (!busy && quietFor >= SETTLE_QUIET_MS) return finishTurn();
       if (Date.now() - settleStartedAt > SETTLE_MAX_MS) {
@@ -840,10 +852,11 @@ export const createAntigravityAcpDriver = ({
       }
       settleTimer = setTimeout(() => void tick(), SETTLE_POLL_MS);
     };
+    if (runningCommands()) commandOutlivedPrompt = true;
     // Plain turns (no children, nothing running, nobody asked) end right
     // away. A /goal turn always waits out the quiet period: agy can keep
     // pursuing the goal after the prompt's response.
-    if (!goalTurn && !children.size && !runningCommands() && !replyOpen && pendingUserInputs.size === 0) {
+    if (!goalTurn && !children.size && !commandOutlivedPrompt && !replyOpen && pendingUserInputs.size === 0) {
       return finishTurn();
     }
     settleTimer = setTimeout(() => void tick(), SETTLE_POLL_MS);

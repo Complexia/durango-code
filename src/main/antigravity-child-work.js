@@ -69,10 +69,38 @@ export const antigravityChildReport = async (parentSessionId, childId) => {
   return null;
 };
 
+// The last complete step of a conversation's transcript.jsonl, or null.
+const lastTranscriptStep = async (conversationId) => {
+  let handle;
+  try {
+    handle = await fs.open(generated(conversationId, 'logs', 'transcript.jsonl'), 'r');
+    const { size } = await handle.stat();
+    // Steps are usually a few KB; a large tool output can make one longer.
+    for (const window of [65536, 4 * 1024 * 1024]) {
+      const length = Math.min(size, window);
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, size - length);
+      const text = buffer.toString('utf8').trimEnd();
+      const start = text.lastIndexOf('\n');
+      if (start === -1 && length < size) continue;
+      return JSON.parse(text.slice(start + 1));
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+};
+
 /**
- * The parent has been woken (a child's report sits unread in its inbox, or
- * its transcript ends on the delivered system message) but hasn't replied
- * yet. T3 Code's readAntigravityPendingReply makes the same check.
+ * agy is working on the conversation by itself, outside any prompt: it was
+ * woken (a child's report, or a background command's "task finished" notice,
+ * sits unread in its inbox, or its transcript ends on the delivered system
+ * message) or it is between the steps of that reply (the transcript ends on a
+ * tool call or its result, so another model step follows). The model can
+ * think for a while before its first chunk streams. T3 Code's
+ * readAntigravityPendingReply makes the inbox and system-message checks.
  */
 export const antigravityPendingReply = async (parentSessionId) => {
   if (!UUID.test(String(parentSessionId))) return false;
@@ -81,23 +109,9 @@ export const antigravityPendingReply = async (parentSessionId) => {
     const message = await readJson(generated(parentSessionId, 'messages', name));
     if (message?.id && message.sender !== parentSessionId && read[message.id] !== true) return true;
   }
-  try {
-    const file = generated(parentSessionId, 'logs', 'transcript.jsonl');
-    const handle = await fs.open(file, 'r');
-    try {
-      const { size } = await handle.stat();
-      const length = Math.min(size, 65536);
-      const buffer = Buffer.alloc(length);
-      await handle.read(buffer, 0, length, size - length);
-      const lines = buffer.toString('utf8').trim().split('\n');
-      const last = JSON.parse(lines[lines.length - 1]);
-      return last?.type === 'SYSTEM_MESSAGE';
-    } finally {
-      await handle.close();
-    }
-  } catch {
-    return false;
-  }
+  const last = await lastTranscriptStep(parentSessionId);
+  if (last?.type === 'SYSTEM_MESSAGE' || last?.type === 'GENERIC') return true;
+  return last?.type === 'PLANNER_RESPONSE' && Array.isArray(last.tool_calls) && last.tool_calls.length > 0;
 };
 
 /** `ALIVE`, `KILLED`, … from the parent's child list; null when unknown. */

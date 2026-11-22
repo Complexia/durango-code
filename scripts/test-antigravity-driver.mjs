@@ -314,6 +314,73 @@ await check('fake: a failed subagent launch does not hold the turn open', async 
   assert.equal(agent.events.turnEnds.length, 1);
 });
 
+await check('fake: a backgrounded command keeps the turn open until the woken reply ends', async () => {
+  // agy's on-disk session under a throwaway HOME (antigravityBrainDir reads it per call).
+  const realHome = process.env.HOME;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fake-home-'));
+  const sessionId = '11111111-2222-4333-8444-555555555555';
+  const generatedDir = path.join(home, '.gemini', 'antigravity-cli', 'brain', sessionId, '.system_generated');
+  fs.mkdirSync(path.join(generatedDir, 'logs'), { recursive: true });
+  const transcript = path.join(generatedDir, 'logs', 'transcript.jsonl');
+  const step = (entry) => fs.appendFileSync(transcript, `${JSON.stringify(entry)}\n`);
+  process.env.HOME = home;
+  try {
+    const prompt = deferred();
+    const respond = baseRespond([prompt]);
+    const agent = fakeAgent({ respond: (method, params) => (method === 'session/new' ? { sessionId } : respond(method, params)) });
+    void agent.driver.start();
+    await tick(20);
+    const command = { toolCallId: 'cmd-1', name: 'run_command', kind: 'execute', rawInput: { CommandLine: 'durango-code ws new x', WaitMsBeforeAsync: 10000 } };
+    agent.notify({ sessionUpdate: 'tool_call', ...command, status: 'in_progress' });
+    step({ step_index: 1, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'run_command', args: {} }] });
+    step({ step_index: 2, type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task with task id: x/task-2' });
+    step({ step_index: 3, type: 'PLANNER_RESPONSE', content: "I'll continue once it finishes." });
+    agent.notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: "I'll continue once it finishes." } });
+    prompt.resolve({ stopReason: 'end_turn' });
+    await tick(4000);
+    assert.equal(agent.events.turnEnds.length, 0, 'waits while the background command runs');
+
+    // The command finishes; agy delivers the notice and the model thinks silently.
+    agent.notify({ sessionUpdate: 'tool_call_update', ...command, status: 'completed', rawOutput: { output: 'ready', exit_code: 0 } });
+    step({ step_index: 4, type: 'SYSTEM_MESSAGE', content: 'Task finished' });
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 0, 'waits for the woken reply past the quiet period');
+
+    // Its reply runs a tool, then is silent again before the next model step.
+    agent.notify({ sessionUpdate: 'tool_call', toolCallId: 'edit-1', name: 'write_file', kind: 'edit', status: 'in_progress' });
+    agent.notify({ sessionUpdate: 'tool_call_update', toolCallId: 'edit-1', name: 'write_file', kind: 'edit', status: 'completed' });
+    agent.notify({ sessionUpdate: 'usage_update', used: 1, size: 2 });
+    step({ step_index: 5, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'write_file', args: {} }] });
+    step({ step_index: 6, type: 'GENERIC', status: 'DONE', content: 'edited' });
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 0, 'waits between the steps of the woken reply');
+
+    agent.notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Edits done.' } });
+    agent.notify({ sessionUpdate: 'usage_update', used: 2, size: 2 });
+    step({ step_index: 7, type: 'PLANNER_RESPONSE', content: 'Edits done.' });
+    await tick(4500);
+    assert.equal(agent.events.turnEnds.length, 1, 'ends once the reply has finished');
+    assert.match(agent.events.text, /Edits done\.$/);
+  } finally {
+    process.env.HOME = realHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+await check('fake: a finished background command with no reply ends the turn', async () => {
+  const prompt = deferred();
+  const agent = fakeAgent({ respond: baseRespond([prompt]) });
+  void agent.driver.start();
+  await tick(20);
+  const command = { toolCallId: 'cmd-1', name: 'run_command', kind: 'execute', rawInput: { CommandLine: 'sleep 1' } };
+  agent.notify({ sessionUpdate: 'tool_call', ...command, status: 'in_progress' });
+  prompt.resolve({ stopReason: 'end_turn' });
+  await tick(1500);
+  agent.notify({ sessionUpdate: 'tool_call_update', ...command, status: 'completed' });
+  await tick(4500);
+  assert.equal(agent.events.turnEnds.length, 1);
+});
+
 await check('fake: dispose stops a pending settle wait', async () => {
   const prompt = deferred();
   const agent = fakeAgent({ respond: baseRespond([prompt]), promptText: '/goal x' });
@@ -497,6 +564,18 @@ if (process.env.AGY_LIVE === '1') {
     assert.ok(seen.spawned.length >= 1, 'subagent spawn reported');
     assert.ok(seen.done.some(([, info]) => info.status === 'done'), 'subagent finished');
     assert.match(seen.text, /child-ran/);
+  });
+
+  await check('live: the turn stays open for the reply to a background command', async () => {
+    const seen = await runTurn({
+      cwd: workspace,
+      accessMode: 'full-access',
+      promptText:
+        'Run exactly this shell command with run_command and WaitMsBeforeAsync set to 2000: `sleep 15 && echo BG_DONE`. It will move to the background. Do not wait for it or poll it: end your turn right away by saying "waiting for the task". When you later learn it finished, reply with the single word FINISHED.',
+    });
+    assert.equal(seen.fatal, null);
+    assert.equal(seen.turnEnds, 1);
+    assert.match(seen.text, /FINISHED/);
   });
 
   await check('live: /goal runs natively', async () => {
