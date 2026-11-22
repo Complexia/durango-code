@@ -14,6 +14,7 @@ import {
   antigravityPendingReply,
   resolveAntigravityChild,
 } from './antigravity-child-work.js';
+import { antigravityReasoningEffortForModel, antigravityWireModelId } from './models.js';
 
 // ---------------------------------------------------------------------------
 // Antigravity ACP driver. Every turn runs Google's Antigravity CLI as
@@ -119,6 +120,7 @@ export const createAntigravityAcpDriver = ({
   child,
   cwd,
   model,
+  reasoningEffort,
   promptText,
   attachments = [],
   resumeSessionId,
@@ -660,10 +662,13 @@ export const createAntigravityAcpDriver = ({
     }
     callbacks.onSessionId(sessionId);
 
-    // Pin the thread's model. Sessions (including resumed ones) open on the
-    // CLI's default; the flat ids from `agy models` also carry the thinking
-    // level. Fall back to the model config option for family ids.
-    const setModel = await request('session/set_model', { sessionId, modelId: model.slug });
+    // Pin the thread's model and thinking level. Sessions (including resumed
+    // ones) open on the CLI's default; flat `<model>-<effort>` ids set both in
+    // one call, and `session/set_config_option` (`model` + `thought_level`) is
+    // the fallback for family ids.
+    const effectiveEffort = antigravityReasoningEffortForModel(model, reasoningEffort);
+    const wireModelId = antigravityWireModelId(model, effectiveEffort);
+    const setModel = await request('session/set_model', { sessionId, modelId: wireModelId });
     if (setModel.error) {
       const setOption = await request('session/set_config_option', {
         sessionId,
@@ -671,7 +676,17 @@ export const createAntigravityAcpDriver = ({
         value: model.slug,
       });
       if (setOption.error) {
-        return fail(setModel.error, `Antigravity rejected model "${model.slug}".`);
+        return fail(setModel.error, `Antigravity rejected model "${wireModelId}".`);
+      }
+      if (effectiveEffort) {
+        const setEffort = await request('session/set_config_option', {
+          sessionId,
+          configId: 'thought_level',
+          value: effectiveEffort,
+        });
+        if (setEffort.error) {
+          return fail(setEffort.error, `Antigravity rejected thinking level "${effectiveEffort}".`);
+        }
       }
     }
 
@@ -957,7 +972,12 @@ export const createAntigravityAcpDriver = ({
 // (titles, commit messages): Read only policy denies every non-read tool.
 // Resolves with the reply text, or '' on failure. Cancellation waits for the
 // ACP child to exit so callers may safely tear down its cwd.
-export const antigravityReadOnlyOneShot = (model, promptText, cwd, { signal, threadId } = {}) => {
+export const antigravityReadOnlyOneShot = (
+  model,
+  promptText,
+  cwd,
+  { signal, threadId, reasoningEffort } = {}
+) => {
   if (signal?.aborted) return Promise.resolve('');
   return new Promise((resolve) => {
     const child = spawn(loginShell, ['-lc', 'agy acp'], {
@@ -991,6 +1011,7 @@ export const antigravityReadOnlyOneShot = (model, promptText, cwd, { signal, thr
       child,
       cwd,
       model,
+      reasoningEffort,
       promptText,
       resumeSessionId: null,
       accessMode: 'read-only',

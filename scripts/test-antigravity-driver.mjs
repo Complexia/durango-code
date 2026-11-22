@@ -14,7 +14,10 @@ import {
   antigravityToolLabel,
   createAntigravityAcpDriver,
 } from '../src/main/antigravity-driver.js';
-import { parseAntigravityModelsOutput } from '../src/main/models.js';
+import {
+  antigravityWireModelId,
+  parseAntigravityModelsOutput,
+} from '../src/main/models.js';
 import { parseAntigravityLoginUrl, parseAntigravityModelRows } from '../src/main/provider-updates.js';
 import { commandForModel } from '../src/main/command-for-model.js';
 import { createProviderSignInWatch } from '../src/main/provider-sign-in-watch.js';
@@ -43,17 +46,48 @@ const check = async (name, fn) => {
   }
 };
 
-await check('parses `agy models` output', () => {
+await check('parses and groups `agy models` output by reasoning effort', () => {
   const models = parseAntigravityModelsOutput(
-    'Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)\n'
+    [
+      'Fetching available models...',
+      'gemini-4-neon-high\tGemini 4 Neon (High)',
+      'gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)',
+      'gemini-4-neon-medium\tGemini 4 Neon (Medium)',
+      'gemini-4-neon-low\tGemini 4 Neon (Low)',
+      'gemini-pro-orchestrator-neon\tOrchestrator (Neon)',
+      'gemini-3.8-flash-high\tGemini 3.8 Flash (High)',
+      'gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)',
+      'gemini-3.8-flash-low\tGemini 3.8 Flash (Low)',
+      'claude-opus-5-5-low\tClaude Opus 5.5 (Low)',
+      'claude-opus-5-5-medium\tClaude Opus 5.5 (Medium)',
+      'claude-opus-5-5-high\tClaude Opus 5.5 (High)',
+      'claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)',
+      'gpt-oss-120b-medium\tGPT-OSS 120B (Medium)',
+    ].join('\n')
   );
   assert.deepEqual(
-    models.map((model) => [model.id, model.label, model.command, model.providerId]),
+    models.map((model) => [
+      model.id,
+      model.label,
+      model.reasoningEfforts ?? null,
+      model.defaultReasoningEffort ?? null,
+      model.command,
+      model.providerId,
+    ]),
     [
-      ['antigravity:gemini-3.8-flash-high', 'Gemini 3.8 Flash (High)', 'agy', 'antigravity'],
-      ['antigravity:claude-opus-4-6-thinking', 'Claude Opus 4.6 (Thinking)', 'agy', 'antigravity'],
+      ['antigravity:gemini-4-neon', 'Gemini 4 Neon', ['low', 'medium', 'high', 'xhigh'], 'high', 'agy', 'antigravity'],
+      ['antigravity:gemini-pro-orchestrator-neon', 'Orchestrator (Neon)', null, null, 'agy', 'antigravity'],
+      ['antigravity:gemini-3.8-flash', 'Gemini 3.8 Flash', ['low', 'medium', 'high'], 'high', 'agy', 'antigravity'],
+      ['antigravity:claude-opus-5-5', 'Claude Opus 5.5', ['low', 'medium', 'high'], 'high', 'agy', 'antigravity'],
+      ['antigravity:claude-opus-4-6-thinking', 'Claude Opus 4.6 (Thinking)', null, null, 'agy', 'antigravity'],
+      ['antigravity:gpt-oss-120b-medium', 'GPT-OSS 120B (Medium)', null, null, 'agy', 'antigravity'],
     ]
   );
+  assert.equal(antigravityWireModelId(models[0], 'xhigh'), 'gemini-4-neon-xhigh');
+  assert.equal(antigravityWireModelId(models[0], undefined), 'gemini-4-neon-high');
+  assert.equal(antigravityWireModelId(models[2], 'xhigh'), 'gemini-3.8-flash-high');
+  assert.equal(antigravityWireModelId(models[1], 'xhigh'), 'gemini-pro-orchestrator-neon');
+  assert.equal(antigravityWireModelId(models[5], 'high'), 'gpt-oss-120b-medium');
   assert.equal(parseAntigravityModelsOutput('Error: authentication required').length, 0);
   assert.equal(parseAntigravityModelRows('Fetching available models...\na\tA\n').length, 1);
 });
@@ -170,7 +204,15 @@ await check('sign-in watch reports only providers whose files changed', async ()
 // `respond(method, params)` returns a result (or a promise of one); requests
 // the driver answers (permissions, elicitations) are collected in `answers`.
 const fakeWorkspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agy-fake-ws-')));
-const fakeAgent = ({ respond, accessMode = 'full-access', promptText = 'hi', mcpServers = [], onUserInput }) => {
+const fakeAgent = ({
+  respond,
+  accessMode = 'full-access',
+  promptText = 'hi',
+  mcpServers = [],
+  onUserInput,
+  model = { providerId: 'antigravity', slug: 'gemini-3.8-flash-low' },
+  reasoningEffort,
+}) => {
   const sent = [];
   const answers = [];
   const events = { text: '', turnEnds: [], fatal: null, done: [], spawned: [], activities: new Map() };
@@ -194,7 +236,8 @@ const fakeAgent = ({ respond, accessMode = 'full-access', promptText = 'hi', mcp
   driver = createAntigravityAcpDriver({
     child,
     cwd: fakeWorkspace,
-    model: { providerId: 'antigravity', slug: 'gemini-3.8-flash-low' },
+    model,
+    reasoningEffort,
     promptText,
     accessMode,
     mcpServers,
@@ -403,6 +446,52 @@ await check('fake: a finished background command with no reply ends the turn', a
   agent.notify({ sessionUpdate: 'tool_call_update', ...command, status: 'completed' });
   await tick(4500);
   assert.equal(agent.events.turnEnds.length, 1);
+});
+
+await check('fake: grouped model sends resolved flat id and falls back to model + thought_level config options', async () => {
+  const groupedModel = {
+    providerId: 'antigravity',
+    slug: 'gemini-4-neon',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+    defaultReasoningEffort: 'high',
+  };
+  const firstPrompt = deferred();
+  const direct = fakeAgent({
+    respond: baseRespond([firstPrompt]),
+    model: groupedModel,
+    reasoningEffort: 'xhigh',
+  });
+  void direct.driver.start();
+  await tick(20);
+  assert.deepEqual(
+    direct.sent.find((message) => message.method === 'session/set_model')?.params,
+    { sessionId: 'sess-1', modelId: 'gemini-4-neon-xhigh' }
+  );
+  firstPrompt.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  const fallbackPrompt = deferred();
+  const fallback = fakeAgent({
+    model: groupedModel,
+    reasoningEffort: 'low',
+    respond: (method, params) => {
+      if (method === 'session/set_model') return { error: { code: -32602, message: 'unknown flat id' } };
+      return baseRespond([fallbackPrompt])(method, params);
+    },
+  });
+  void fallback.driver.start();
+  await tick(20);
+  assert.deepEqual(
+    fallback.sent
+      .filter((message) => message.method === 'session/set_config_option')
+      .map((message) => [message.params.configId, message.params.value]),
+    [
+      ['model', 'gemini-4-neon'],
+      ['thought_level', 'low'],
+    ]
+  );
+  fallbackPrompt.resolve({ stopReason: 'end_turn' });
+  await tick(20);
 });
 
 await check('fake: dispose stops a pending settle wait', async () => {

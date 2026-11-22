@@ -1750,6 +1750,7 @@ type OrionCodexBrowserIntegrationStatus = {
         claudeContextWindow?: '200k' | '1m';
         grokReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
         museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+        antigravityReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
         openCodeReasoningEffort?: string;
         resumeSessionId?: string;
         /** Fork resumeSessionId into a new session instead of resuming it in place (branched threads). */

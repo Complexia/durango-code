@@ -7,6 +7,11 @@ import { fxFallbackModels, listFxModels } from './fx-provider.js';
 // Canonical low→high order of every reasoning tier any harness advertises.
 export const reasoningEffortTiers = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 
+const effortRank = (effort) => {
+  const rank = reasoningEffortTiers.indexOf(effort);
+  return rank === -1 ? reasoningEffortTiers.length : rank;
+};
+
 // Keep an effort the model supports; otherwise step down to the nearest tier
 // it does support (Ultra → Max → Extra High), or use the model's default.
 export const clampReasoningEffort = (effort, efforts, fallback) => {
@@ -48,6 +53,7 @@ export const codexReasoningEffortForModel = (model, effort) =>
   clampReasoningEffort(effort, codexReasoningEffortsForModel(model), codexDefaultReasoningEffortForModel(model));
 export const defaultCodexServiceTier = 'default';
 export const defaultClaudeReasoningEffort = 'high';
+export const defaultAntigravityReasoningEffort = 'high';
 // Matches the muse CLI's own --reasoning-effort default.
 export const defaultMuseReasoningEffort = 'high';
 export const defaultClaudeContextWindow = '200k';
@@ -217,7 +223,121 @@ export const cursorFallbackModels = [
 
 // Antigravity's model list for a Google sign-in (agy 1.5.14, 2026-11-21).
 // The live list comes from `agy models` and replaces this block; it depends
-// on the account's plan. Gemini ids carry the thinking level.
+// on the account's plan. `agy models` prints flat `<model>-<effort>` rows
+// (`gemini-4-neon-high`, `gemini-4-neon-xhigh`, …) which we group into one
+// model entry with `reasoningEfforts` so the picker shows the model family
+// and the prompt box picks the thinking level like Claude/Codex/Grok/Muse.
+const antigravityEffortLabelPatterns = {
+  none: /\s*\(none\)$/i,
+  minimal: /\s*\(minimal\)$/i,
+  low: /\s*\(low\)$/i,
+  medium: /\s*\(medium\)$/i,
+  high: /\s*\(high\)$/i,
+  xhigh: /\s*\((?:xhigh|extra\s*high|extra)\)$/i,
+  max: /\s*\(max\)$/i,
+  ultra: /\s*\(ultra\)$/i,
+};
+
+export const parseAntigravityEffortVariant = (slug, label) => {
+  const cleanSlug = String(slug || '').trim();
+  const cleanLabel = String(label || '').trim();
+  const match = /^(.+)-(none|minimal|low|medium|high|xhigh|max|ultra)$/i.exec(cleanSlug);
+  if (!match) return null;
+  const effort = match[2].toLowerCase();
+  const pattern = antigravityEffortLabelPatterns[effort];
+  if (!pattern || !pattern.test(cleanLabel)) return null;
+  const baseSlug = match[1];
+  const baseLabel = cleanLabel.replace(pattern, '').trim();
+  if (!baseSlug || !baseLabel) return null;
+  return { baseSlug, baseLabel, effort };
+};
+
+export const antigravityFavoriteModelSlugs = new Set(['gemini-4-neon', 'gemini-3.8-flash']);
+
+const groupAntigravityModelRows = (rows) => {
+  const entries = [];
+  const groups = new Map();
+  for (const [rawSlug, rawLabel] of rows) {
+    const variant = parseAntigravityEffortVariant(rawSlug, rawLabel);
+    if (variant) {
+      let group = groups.get(variant.baseSlug);
+      if (!group) {
+        group = { kind: 'group', baseSlug: variant.baseSlug, baseLabel: variant.baseLabel, variants: [] };
+        groups.set(variant.baseSlug, group);
+        entries.push(group);
+      }
+      if (!group.variants.some((candidate) => candidate.effort === variant.effort)) {
+        group.variants.push({ slug: rawSlug, label: rawLabel, effort: variant.effort });
+      }
+    } else {
+      entries.push({ kind: 'single', slug: rawSlug, label: rawLabel });
+    }
+  }
+
+  return entries.map((entry, index) => {
+    if (entry.kind === 'group' && entry.variants.length > 1) {
+      const reasoningEfforts = entry.variants
+        .map((variant) => variant.effort)
+        .sort((a, b) => effortRank(a) - effortRank(b));
+      const defaultReasoningEffort = reasoningEfforts.includes(defaultAntigravityReasoningEffort)
+        ? defaultAntigravityReasoningEffort
+        : entry.variants[0].effort;
+      return {
+        id: `antigravity:${entry.baseSlug}`,
+        providerId: 'antigravity',
+        providerLabel: 'Antigravity',
+        label: entry.baseLabel,
+        slug: entry.baseSlug,
+        command: 'agy',
+        reasoningEfforts,
+        defaultReasoningEffort,
+        ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+        favorite: antigravityFavoriteModelSlugs.has(entry.baseSlug),
+      };
+    }
+    const single = entry.kind === 'group' ? entry.variants[0] : entry;
+    return {
+      id: `antigravity:${single.slug}`,
+      providerId: 'antigravity',
+      providerLabel: 'Antigravity',
+      label: single.label,
+      slug: single.slug,
+      command: 'agy',
+      ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
+      favorite: antigravityFavoriteModelSlugs.has(single.slug),
+    };
+  });
+};
+
+export const antigravityReasoningEffortForModel = (model, effort) => {
+  const efforts = discoveredReasoningEfforts(model);
+  if (!efforts) return undefined;
+  const fallback =
+    model.defaultReasoningEffort && efforts.includes(model.defaultReasoningEffort)
+      ? model.defaultReasoningEffort
+      : efforts.includes(defaultAntigravityReasoningEffort)
+        ? defaultAntigravityReasoningEffort
+        : efforts[0];
+  return clampReasoningEffort(effort, efforts, fallback);
+};
+
+export const antigravityWireModelId = (model, effort) => {
+  const effective = antigravityReasoningEffortForModel(model, effort);
+  return effective ? `${model.slug}-${effective}` : model.slug;
+};
+
+export const resolveLegacyAntigravityModelId = (models, modelId) => {
+  if (typeof modelId !== 'string' || !modelId.startsWith('antigravity:')) return null;
+  const rawSlug = modelId.slice('antigravity:'.length);
+  const match = /^(.+)-(none|minimal|low|medium|high|xhigh|max|ultra)$/i.exec(rawSlug);
+  if (!match) return null;
+  const baseId = `antigravity:${match[1]}`;
+  const effort = match[2].toLowerCase();
+  const model = models.find((candidate) => candidate.id === baseId);
+  if (!model) return null;
+  return { model, effort };
+};
+
 const antigravityFallbackRows = [
   ['gemini-3.8-flash-high', 'Gemini 3.8 Flash (High)'],
   ['gemini-3.8-flash-medium', 'Gemini 3.8 Flash (Medium)'],
@@ -226,18 +346,7 @@ const antigravityFallbackRows = [
   ['claude-opus-4-6-thinking', 'Claude Opus 4.6 (Thinking)'],
   ['gpt-oss-120b-medium', 'GPT-OSS 120B (Medium)'],
 ];
-export const antigravityFavoriteModelSlugs = new Set(['gemini-3.8-flash-high']);
-const antigravityModel = ([slug, label], index) => ({
-  id: `antigravity:${slug}`,
-  providerId: 'antigravity',
-  providerLabel: 'Antigravity',
-  label,
-  slug,
-  command: 'agy',
-  ...(index < 9 ? { shortcut: `⌘${index + 1}` } : {}),
-  favorite: antigravityFavoriteModelSlugs.has(slug),
-});
-export const antigravityFallbackModels = antigravityFallbackRows.map(antigravityModel);
+export const antigravityFallbackModels = groupAntigravityModelRows(antigravityFallbackRows);
 
 // Kimi Code's managed models (K3.1 Pro shipped 2026-10-23), in the order
 // listKimiModels pins them; the live list (including any user-added
@@ -733,7 +842,7 @@ export const parseAntigravityModelsOutput = (output) => {
     seen.add(match[1]);
     rows.push([match[1], match[2].trim()]);
   }
-  return rows.map(antigravityModel);
+  return groupAntigravityModelRows(rows);
 };
 
 export const listAntigravityModels = async () => {
@@ -757,11 +866,6 @@ const effortValues = (list, key) =>
       .map((entry) => (typeof entry === 'string' ? entry : entry?.[key]))
       .filter((value) => typeof value === 'string' && value)
   )].sort((a, b) => effortRank(a) - effortRank(b));
-
-const effortRank = (effort) => {
-  const rank = reasoningEffortTiers.indexOf(effort);
-  return rank === -1 ? reasoningEffortTiers.length : rank;
-};
 
 const readJsonFile = async (filePath) => JSON.parse(await fs.readFile(filePath, 'utf8'));
 
@@ -1187,6 +1291,17 @@ export const onAgentModelsChanged = (listener) => {
   return () => agentModelsListeners.delete(listener);
 };
 
+// Upgrade cached flat Antigravity rows (`gemini-4-neon-high`, …) written by
+// earlier builds into grouped family entries immediately on load.
+const normalizeCachedProviderBlock = (providerId, block) => {
+  if (providerId !== 'antigravity') return block;
+  if (block.some((model) => Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length > 0)) {
+    return block;
+  }
+  const grouped = groupAntigravityModelRows(block.map((model) => [model.slug, model.label]));
+  return grouped.length < block.length ? grouped : block;
+};
+
 // Only well-formed rows for the provider survive a reload, and the spawn
 // command always comes from this module rather than the file.
 const sanitizeProviderBlocks = (providers) =>
@@ -1195,16 +1310,19 @@ const sanitizeProviderBlocks = (providers) =>
       .filter(([providerId, block]) => providerCommands[providerId] && Array.isArray(block))
       .map(([providerId, block]) => [
         providerId,
-        block
-          .filter(
-            (model) =>
-              model &&
-              model.providerId === providerId &&
-              typeof model.id === 'string' &&
-              typeof model.slug === 'string' &&
-              typeof model.label === 'string'
-          )
-          .map((model) => ({ ...model, command: providerCommands[providerId] })),
+        normalizeCachedProviderBlock(
+          providerId,
+          block
+            .filter(
+              (model) =>
+                model &&
+                model.providerId === providerId &&
+                typeof model.id === 'string' &&
+                typeof model.slug === 'string' &&
+                typeof model.label === 'string'
+            )
+            .map((model) => ({ ...model, command: providerCommands[providerId] }))
+        ),
       ])
       .filter(([, block]) => block.length > 0)
   );

@@ -6,7 +6,7 @@ import { isDefaultTitle } from './titles';
 // machine (Thread.remote) and its transcript mirrors that machine's copy
 // (useRemoteThreadSync). The pure parts live here so they can be tested.
 
-type ProviderId = 'claude' | 'codex' | 'grok' | 'muse' | 'opencode' | string;
+type ProviderId = 'claude' | 'codex' | 'grok' | 'muse' | 'antigravity' | 'opencode' | string;
 
 /** The thread's reasoning effort for its model's provider, as remote runTurn takes it. */
 export const remoteReasoningEffort = (thread: Thread, providerId: ProviderId | null | undefined) => {
@@ -19,6 +19,8 @@ export const remoteReasoningEffort = (thread: Thread, providerId: ProviderId | n
       return thread.grokReasoningEffort;
     case 'muse':
       return thread.museReasoningEffort;
+    case 'antigravity':
+      return thread.antigravityReasoningEffort;
     case 'opencode':
       return thread.openCodeReasoningEffort;
     default:
@@ -238,6 +240,7 @@ export const REMOTE_SETTING_FIELDS = [
   'claudeContextWindow',
   'grokReasoningEffort',
   'museReasoningEffort',
+  'antigravityReasoningEffort',
   'openCodeReasoningEffort',
 ] as const;
 export type RemoteSettingField = (typeof REMOTE_SETTING_FIELDS)[number];
@@ -282,9 +285,11 @@ const effortFieldOf = (providerId: ProviderId | null | undefined): RemoteSetting
         ? 'grokReasoningEffort'
         : providerId === 'muse'
           ? 'museReasoningEffort'
-          : providerId === 'opencode'
-            ? 'openCodeReasoningEffort'
-            : null;
+          : providerId === 'antigravity'
+            ? 'antigravityReasoningEffort'
+            : providerId === 'opencode'
+              ? 'openCodeReasoningEffort'
+              : null;
 
 /**
  * The settings a remote turn sends: all of them when it starts the thread

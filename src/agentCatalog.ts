@@ -68,6 +68,15 @@ export type MuseReasoningEffort =
   | 'xhigh'
   | 'max'
   | 'ultra';
+export type AntigravityReasoningEffort =
+  | 'none'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+  | 'ultra';
 
 type ReasoningEffortOption = {
   value: string;
@@ -347,6 +356,55 @@ export const getEffectiveMuseReasoningEffort = (
   model: AgentModel | undefined,
   effort: MuseReasoningEffort | undefined
 ): MuseReasoningEffort => clampEffort(museReasoningOptionsForModel(model), effort, defaultMuseReasoningEffort);
+
+// Antigravity (`agy models`) publishes flat `<model>-<effort>` variants that
+// models.js groups into one model row with `reasoningEfforts`. Models without
+// grouped effort variants (e.g. Orchestrator, single-tier models) return no
+// options so the composer omits the reasoning selector for them.
+export const defaultAntigravityReasoningEffort: AntigravityReasoningEffort = 'high';
+
+export const antigravityReasoningOptions: Array<{
+  value: AntigravityReasoningEffort;
+  label: string;
+  default?: boolean;
+}> = [
+  { value: 'none', label: 'None' },
+  { value: 'minimal', label: 'Minimal' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High', default: true },
+  { value: 'xhigh', label: 'Extra High' },
+  { value: 'max', label: 'Max' },
+  { value: 'ultra', label: 'Ultra' },
+];
+
+export const antigravityReasoningOptionsForModel = (model: AgentModel | undefined) => {
+  const efforts = liveEfforts(model);
+  if (!efforts) return [];
+  return effortMenu(antigravityReasoningOptions, efforts, model?.defaultReasoningEffort);
+};
+
+export const getEffectiveAntigravityReasoningEffort = (
+  model: AgentModel | undefined,
+  effort: AntigravityReasoningEffort | undefined
+): AntigravityReasoningEffort | undefined => {
+  const options = antigravityReasoningOptionsForModel(model);
+  if (options.length === 0) return undefined;
+  return clampEffort(options, effort, defaultAntigravityReasoningEffort);
+};
+
+export const splitLegacyAntigravityModelId = (
+  id: string | null | undefined
+): { baseId: string; effort: AntigravityReasoningEffort } | null => {
+  if (!id || !id.startsWith('antigravity:')) return null;
+  const slug = id.slice('antigravity:'.length);
+  const match = /^(.+)-(none|minimal|low|medium|high|xhigh|max|ultra)$/i.exec(slug);
+  if (!match) return null;
+  return {
+    baseId: `antigravity:${match[1]}`,
+    effort: match[2].toLowerCase() as AntigravityReasoningEffort,
+  };
+};
 
 export type OpenCodeReasoningOption = {
   value: string;
@@ -803,29 +861,15 @@ export const fallbackAgentModels: AgentModel[] = [
     shortcut: '⌘6',
   },
   {
-    id: 'antigravity:gemini-3.8-flash-high',
+    id: 'antigravity:gemini-3.8-flash',
     providerId: 'antigravity',
     providerLabel: 'Antigravity',
-    label: 'Gemini 3.8 Flash (High)',
-    slug: 'gemini-3.8-flash-high',
+    label: 'Gemini 3.8 Flash',
+    slug: 'gemini-3.8-flash',
+    reasoningEfforts: ['low', 'medium', 'high'],
+    defaultReasoningEffort: 'high',
     shortcut: '⌘1',
     favorite: true,
-  },
-  {
-    id: 'antigravity:gemini-3.8-flash-medium',
-    providerId: 'antigravity',
-    providerLabel: 'Antigravity',
-    label: 'Gemini 3.8 Flash (Medium)',
-    slug: 'gemini-3.8-flash-medium',
-    shortcut: '⌘2',
-  },
-  {
-    id: 'antigravity:gemini-3.8-flash-low',
-    providerId: 'antigravity',
-    providerLabel: 'Antigravity',
-    label: 'Gemini 3.8 Flash (Low)',
-    slug: 'gemini-3.8-flash-low',
-    shortcut: '⌘3',
   },
   {
     id: 'antigravity:claude-sonnet-4-6',
@@ -833,7 +877,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Antigravity',
     label: 'Claude Sonnet 4.6 (Thinking)',
     slug: 'claude-sonnet-4-6',
-    shortcut: '⌘4',
+    shortcut: '⌘2',
   },
   {
     id: 'antigravity:claude-opus-4-6-thinking',
@@ -841,7 +885,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Antigravity',
     label: 'Claude Opus 4.6 (Thinking)',
     slug: 'claude-opus-4-6-thinking',
-    shortcut: '⌘5',
+    shortcut: '⌘3',
   },
   {
     id: 'antigravity:gpt-oss-120b-medium',
@@ -849,7 +893,7 @@ export const fallbackAgentModels: AgentModel[] = [
     providerLabel: 'Antigravity',
     label: 'GPT-OSS 120B (Medium)',
     slug: 'gpt-oss-120b-medium',
-    shortcut: '⌘6',
+    shortcut: '⌘4',
   },
   // fx models are Durango catalog ids; each turn routes to a connected
   // subscription first, then Durango credits or Vercel AI Gateway. Mirrors
@@ -1053,14 +1097,23 @@ export const agentModelSuccessors: Record<string, string> = {
 const providerIdOfModelId = (id: string | null | undefined) =>
   id && id.includes(':') ? id.slice(0, id.indexOf(':')) : '';
 
-export const findAgentModel = (models: AgentModel[], id: string | null | undefined) =>
-  models.find((model) => model.id === id) ??
-  (id && agentModelSuccessors[id] ? models.find((model) => model.id === agentModelSuccessors[id]) : undefined) ??
+export const findAgentModel = (models: AgentModel[], id: string | null | undefined) => {
+  const exact = models.find((model) => model.id === id);
+  if (exact) return exact;
+  if (id && agentModelSuccessors[id]) {
+    const successor = models.find((model) => model.id === agentModelSuccessors[id]);
+    if (successor) return successor;
+  }
+  const legacyAntigravity = splitLegacyAntigravityModelId(id);
+  if (legacyAntigravity) {
+    const grouped = models.find((model) => model.id === legacyAntigravity.baseId);
+    if (grouped) return grouped;
+  }
   // Threads saved on a model the provider no longer lists (live discovery
   // dropped it, or it was retired) stay on that provider rather than
   // dropping to another provider's default.
-  (providerIdOfModelId(id)
+  const sameProvider = providerIdOfModelId(id)
     ? models.find((model) => model.providerId === providerIdOfModelId(id))
-    : undefined) ??
-  models.find((model) => model.id === defaultAgentModelId) ??
-  models[0];
+    : undefined;
+  return sameProvider ?? models.find((model) => model.id === defaultAgentModelId) ?? models[0];
+};

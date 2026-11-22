@@ -94,6 +94,7 @@ import { setSourceAttachmentAccount } from './app/sourceAttachments';
 import { Toaster, toast } from 'sonner';
 import {
   agentProviders,
+  antigravityReasoningOptionsForModel,
   claudeCodeCliModelId,
   claudeContextWindowOptions,
   claudeReasoningOptionsForModel,
@@ -103,6 +104,7 @@ import {
   defaultClaudeContextWindow,
   defaultClaudeReasoningEffort,
   defaultCodexServiceTier,
+  getEffectiveAntigravityReasoningEffort,
   getEffectiveClaudeReasoningEffort,
   getEffectiveCodexReasoningEffort,
   getEffectiveGrokReasoningEffort,
@@ -116,8 +118,10 @@ import {
   isClaudeCodeCliModelId,
   isOrionModelId,
   providerFollowUpSupport,
+  splitLegacyAntigravityModelId,
   type AgentModel,
   type AgentProviderId,
+  type AntigravityReasoningEffort,
   type ClaudeContextWindow,
   type ClaudeReasoningEffort,
   type CodexReasoningEffort,
@@ -380,6 +384,7 @@ const reasoningOptionsForModel = (model: AgentModel | null | undefined): Reasoni
   if (model.providerId === 'claude') return toOptions(claudeReasoningOptionsForModel(model));
   if (model.providerId === 'grok') return toOptions(grokReasoningOptionsForModel(model));
   if (model.providerId === 'muse') return toOptions(museReasoningOptionsForModel(model));
+  if (model.providerId === 'antigravity') return toOptions(antigravityReasoningOptionsForModel(model));
   if (model.providerId === 'opencode') return toOptions(openCodeReasoningOptionsForModel(model));
   return [];
 };
@@ -390,6 +395,7 @@ const defaultReasoningEffortForModel = (model: AgentModel | null | undefined): s
   if (model.providerId === 'claude') return getEffectiveClaudeReasoningEffort(model, undefined);
   if (model.providerId === 'grok') return getEffectiveGrokReasoningEffort(model, undefined);
   if (model.providerId === 'muse') return getEffectiveMuseReasoningEffort(model, undefined);
+  if (model.providerId === 'antigravity') return getEffectiveAntigravityReasoningEffort(model, undefined) ?? null;
   if (model.providerId === 'opencode') return getEffectiveOpenCodeReasoningEffort(model, undefined);
   return null;
 };
@@ -401,6 +407,7 @@ type ThreadReasoningPatch = Partial<
     | 'claudeReasoningEffort'
     | 'grokReasoningEffort'
     | 'museReasoningEffort'
+    | 'antigravityReasoningEffort'
     | 'openCodeReasoningEffort'
   >
 >;
@@ -414,8 +421,21 @@ const threadReasoningPatchForModel = (
   if (model.providerId === 'claude') return { claudeReasoningEffort: effort as ClaudeReasoningEffort };
   if (model.providerId === 'grok') return { grokReasoningEffort: effort as GrokReasoningEffort };
   if (model.providerId === 'muse') return { museReasoningEffort: effort as MuseReasoningEffort };
+  if (model.providerId === 'antigravity') {
+    return { antigravityReasoningEffort: effort as AntigravityReasoningEffort };
+  }
   if (model.providerId === 'opencode') return { openCodeReasoningEffort: effort };
   return {};
+};
+
+const legacyAntigravityEffortForThread = (
+  thread: Pick<Thread, 'modelId' | 'antigravityReasoningEffort'> | null | undefined,
+  model: AgentModel | undefined
+): AntigravityReasoningEffort | undefined => {
+  if (thread?.antigravityReasoningEffort) return thread.antigravityReasoningEffort;
+  if (!thread || !model || model.providerId !== 'antigravity' || thread.modelId === model.id) return undefined;
+  const legacy = splitLegacyAntigravityModelId(thread.modelId);
+  return legacy && legacy.baseId === model.id ? legacy.effort : undefined;
 };
 
 // Orion Cloud builds on Railway, which takes minutes; poll until the app row
@@ -614,6 +634,7 @@ const threadShellSignature = (thread: Thread): string => {
     thread.claudeContextWindow,
     thread.grokReasoningEffort,
     thread.museReasoningEffort,
+    thread.antigravityReasoningEffort,
     thread.openCodeReasoningEffort,
     thread.createdAt,
     thread.hiddenFromRecent ? '1' : '0',
@@ -1574,6 +1595,14 @@ const App: React.FC = () => {
   );
   const selectedMuseReasoningLabel =
     selectedMuseReasoningOptions.find((option) => option.value === selectedMuseReasoning)?.label ?? 'High';
+  const selectedAntigravityReasoningOptions = antigravityReasoningOptionsForModel(selectedAgentModel);
+  const selectedAntigravityReasoning = getEffectiveAntigravityReasoningEffort(
+    selectedAgentModel,
+    legacyAntigravityEffortForThread(selectedThread, selectedAgentModel)
+  );
+  const selectedAntigravityReasoningLabel =
+    selectedAntigravityReasoningOptions.find((option) => option.value === selectedAntigravityReasoning)?.label ??
+    'High';
   const selectedOpenCodeReasoningOptions = openCodeReasoningOptionsForModel(selectedAgentModel);
   const selectedOpenCodeReasoning = getEffectiveOpenCodeReasoningEffort(
     selectedAgentModel,
@@ -1591,6 +1620,7 @@ const App: React.FC = () => {
       selectedAgentModel?.providerId === 'claude' ||
       selectedAgentModel?.providerId === 'grok' ||
       selectedAgentModel?.providerId === 'muse' ||
+      (selectedAgentModel?.providerId === 'antigravity' && selectedAntigravityReasoningOptions.length > 0) ||
       (selectedAgentModel?.providerId === 'opencode' && selectedOpenCodeReasoningOptions.length > 1));
   const normalizedProviderSettings = useMemo(
     () => ({
@@ -6057,6 +6087,15 @@ const App: React.FC = () => {
               museReasoningEffort: getEffectiveMuseReasoningEffort(model, thread.museReasoningEffort),
             }
           : {}),
+        ...(model.providerId === 'antigravity'
+          ? (() => {
+              const antigravityReasoningEffort = getEffectiveAntigravityReasoningEffort(
+                model,
+                legacyAntigravityEffortForThread(thread, model)
+              );
+              return antigravityReasoningEffort ? { antigravityReasoningEffort } : {};
+            })()
+          : {}),
         ...(model.providerId === 'opencode'
           ? {
               openCodeReasoningEffort: getEffectiveOpenCodeReasoningEffort(
@@ -8816,6 +8855,7 @@ const App: React.FC = () => {
               | 'claudeContextWindow'
               | 'grokReasoningEffort'
               | 'museReasoningEffort'
+              | 'antigravityReasoningEffort'
               | 'openCodeReasoningEffort'
             >
           > = {};
@@ -9851,7 +9891,9 @@ const App: React.FC = () => {
             ? selectedGrokReasoningLabel
             : selectedAgentModel?.providerId === 'muse'
               ? selectedMuseReasoningLabel
-              : selectedAgentModel?.providerId === 'claude'
+              : selectedAgentModel?.providerId === 'antigravity'
+                ? selectedAntigravityReasoningLabel
+                : selectedAgentModel?.providerId === 'claude'
                 ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
                 : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`,
           7.4,
@@ -9999,6 +10041,32 @@ const App: React.FC = () => {
                 onClick={() =>
                   updateThread(selectedThread.id, {
                     museReasoningEffort: option.value as MuseReasoningEffort,
+                  })
+                }
+              >
+                <span className="settings-check">{selected && <Check size={17} />}</span>
+                <span>
+                  {option.label}
+                  {option.default ? ' (default)' : ''}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    ) : selectedAgentModel?.providerId === 'antigravity' ? (
+      <div className="codex-settings-section">
+        <div className="codex-settings-heading">Reasoning</div>
+        <div className="codex-settings-options">
+          {selectedAntigravityReasoningOptions.map((option) => {
+            const selected = selectedAntigravityReasoning === option.value;
+            return (
+              <button
+                key={option.value}
+                className={`codex-settings-row ${selected ? 'selected' : ''}`}
+                onClick={() =>
+                  updateThread(selectedThread.id, {
+                    antigravityReasoningEffort: option.value as AntigravityReasoningEffort,
                   })
                 }
               >
@@ -10201,7 +10269,9 @@ const App: React.FC = () => {
       ? selectedGrokReasoningLabel
       : selectedAgentModel?.providerId === 'muse'
         ? selectedMuseReasoningLabel
-        : selectedAgentModel?.providerId === 'claude'
+        : selectedAgentModel?.providerId === 'antigravity'
+          ? selectedAntigravityReasoningLabel
+          : selectedAgentModel?.providerId === 'claude'
           ? `${selectedClaudeReasoningLabel} · ${selectedClaudeContextWindowLabel}`
           : `${selectedCodexReasoningLabel} · ${selectedCodexServiceTierLabel}`;
 
@@ -10583,7 +10653,7 @@ const App: React.FC = () => {
                 onActiveProviderChange={setActiveProviderTab}
                 search={modelSearch}
                 onSearchChange={setModelSearch}
-                selectedModelId={selectedThread.modelId}
+                selectedModelId={selectedAgentModel?.id ?? selectedThread.modelId}
                 onSelect={async (model) => {
                   if (
                     selectedThread.modelId === claudeCodeCliModelId &&
@@ -10607,7 +10677,9 @@ const App: React.FC = () => {
                   if (
                     model.providerId !== 'codex' &&
                     model.providerId !== 'claude' &&
-                    model.providerId !== 'grok'
+                    model.providerId !== 'grok' &&
+                    model.providerId !== 'muse' &&
+                    !(model.providerId === 'antigravity' && antigravityReasoningOptionsForModel(model).length > 0)
                   ) {
                     setCodexSettingsOpen(false);
                   }
@@ -10689,6 +10761,8 @@ const App: React.FC = () => {
                             {selectedAgentModel?.providerId === 'claude'
                               ? 'Reasoning & context'
                               : selectedAgentModel?.providerId === 'grok' ||
+                                  selectedAgentModel?.providerId === 'muse' ||
+                                  selectedAgentModel?.providerId === 'antigravity' ||
                                   selectedAgentModel?.providerId === 'opencode'
                                 ? 'Reasoning'
                                 : 'Reasoning & tier'}
@@ -10788,9 +10862,11 @@ const App: React.FC = () => {
                           ? 'Grok reasoning effort'
                         : selectedAgentModel?.providerId === 'muse'
                           ? 'Muse reasoning effort'
-                          : selectedAgentModel?.providerId === 'opencode'
-                            ? 'OpenCode model variant'
-                          : 'Codex reasoning and service tier'
+                          : selectedAgentModel?.providerId === 'antigravity'
+                            ? 'Antigravity reasoning effort'
+                            : selectedAgentModel?.providerId === 'opencode'
+                              ? 'OpenCode model variant'
+                              : 'Codex reasoning and service tier'
                     }
                   >
                     <span>
@@ -10800,12 +10876,15 @@ const App: React.FC = () => {
                           ? selectedGrokReasoningLabel
                           : selectedAgentModel?.providerId === 'muse'
                             ? selectedMuseReasoningLabel
-                            : selectedAgentModel?.providerId === 'opencode'
-                              ? selectedOpenCodeReasoningLabel
-                            : selectedCodexReasoningLabel}
+                            : selectedAgentModel?.providerId === 'antigravity'
+                              ? selectedAntigravityReasoningLabel
+                              : selectedAgentModel?.providerId === 'opencode'
+                                ? selectedOpenCodeReasoningLabel
+                                : selectedCodexReasoningLabel}
                     </span>
                     {selectedAgentModel?.providerId !== 'grok' &&
                       selectedAgentModel?.providerId !== 'muse' &&
+                      selectedAgentModel?.providerId !== 'antigravity' &&
                       selectedAgentModel?.providerId !== 'opencode' && (
                       <>
                         <span className="control-dot">·</span>

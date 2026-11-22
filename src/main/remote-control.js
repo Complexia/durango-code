@@ -1887,6 +1887,7 @@ const buildSnapshot = async () => {
               'claudeContextWindow',
               'grokReasoningEffort',
               'museReasoningEffort',
+              'antigravityReasoningEffort',
               'openCodeReasoningEffort',
             ]
               .filter((key) => typeof shell[key] === 'string')

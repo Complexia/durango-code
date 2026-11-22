@@ -697,6 +697,7 @@ export type Thread = {
   claudeContextWindow?: '200k' | '1m';
   grokReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   museReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  antigravityReasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   openCodeReasoningEffort?: string;
   createdAt: string;
   /** Removed from the sidebar Recent agents list (still listed under its project). */
@@ -990,6 +991,7 @@ const REMOTE_SETTING_KEYS = [
   'claudeContextWindow',
   'grokReasoningEffort',
   'museReasoningEffort',
+  'antigravityReasoningEffort',
   'openCodeReasoningEffort',
 ] as const;
 
@@ -3068,6 +3070,7 @@ export const useOrionStore = create<OrionState>()(
           claudeContextWindow: lastProjectThread?.claudeContextWindow,
           grokReasoningEffort: lastProjectThread?.grokReasoningEffort,
           museReasoningEffort: lastProjectThread?.museReasoningEffort,
+          antigravityReasoningEffort: lastProjectThread?.antigravityReasoningEffort,
           openCodeReasoningEffort: lastProjectThread?.openCodeReasoningEffort,
           createdAt: new Date().toISOString(),
           parentThreadId: options?.parentThreadId,

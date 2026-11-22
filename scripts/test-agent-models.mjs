@@ -7,6 +7,9 @@ import path from 'node:path';
 
 import {
   agentModels,
+  antigravityFallbackModels,
+  antigravityReasoningEffortForModel,
+  antigravityWireModelId,
   claudeModelsFromCatalog,
   claudeOneMillionContextModels,
   codexModelsFromCache,
@@ -21,8 +24,10 @@ import {
   museFallbackModels,
   museModelsFromCatalogRows,
   openCodeFallbackModels,
+  parseAntigravityModelsOutput,
   parseCursorModelsOutput,
   parseOpenCodeModelsOutput,
+  resolveLegacyAntigravityModelId,
 } from '../src/main/models.js';
 import { validateAgentWorkspace } from '../src/main/agent-run-preflight.js';
 
@@ -690,5 +695,100 @@ assert.deepEqual(
   assert.equal(discoveries, beforeInvalidate + 1, 'a fresh request after invalidation should await one new discovery');
   await rm(dir, { recursive: true, force: true });
 }
+
+// Antigravity: flat `<model>-<effort>` rows group into one model with
+// `reasoningEfforts`, singletons stay ungrouped, and legacy flat ids still
+// resolve to their grouped model + effort.
+assert.deepEqual(
+  antigravityFallbackModels.map(({ id, label, reasoningEfforts, defaultReasoningEffort, shortcut, favorite }) => ({
+    id,
+    label,
+    reasoningEfforts,
+    defaultReasoningEffort,
+    shortcut,
+    favorite,
+  })),
+  [
+    {
+      id: 'antigravity:gemini-3.8-flash',
+      label: 'Gemini 3.8 Flash',
+      reasoningEfforts: ['low', 'medium', 'high'],
+      defaultReasoningEffort: 'high',
+      shortcut: '⌘1',
+      favorite: true,
+    },
+    {
+      id: 'antigravity:claude-sonnet-4-6',
+      label: 'Claude Sonnet 4.6 (Thinking)',
+      reasoningEfforts: undefined,
+      defaultReasoningEffort: undefined,
+      shortcut: '⌘2',
+      favorite: false,
+    },
+    {
+      id: 'antigravity:claude-opus-4-6-thinking',
+      label: 'Claude Opus 4.6 (Thinking)',
+      reasoningEfforts: undefined,
+      defaultReasoningEffort: undefined,
+      shortcut: '⌘3',
+      favorite: false,
+    },
+    {
+      id: 'antigravity:gpt-oss-120b-medium',
+      label: 'GPT-OSS 120B (Medium)',
+      reasoningEfforts: undefined,
+      defaultReasoningEffort: undefined,
+      shortcut: '⌘4',
+      favorite: false,
+    },
+  ],
+  'the Antigravity fallback should group Gemini 3.8 Flash tiers and leave single-tier models ungrouped'
+);
+const parsedAntigravity = parseAntigravityModelsOutput(`
+Fetching available models...
+gemini-4-neon-high\tGemini 4 Neon (High)
+gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)
+gemini-4-neon-medium\tGemini 4 Neon (Medium)
+gemini-4-neon-low\tGemini 4 Neon (Low)
+gemini-4-carbon-medium\tGemini 4 Carbon (Medium)
+gemini-4-carbon-high\tGemini 4 Carbon (High)
+gemini-4-carbon-low\tGemini 4 Carbon (Low)
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
+`);
+assert.deepEqual(
+  parsedAntigravity.map(({ id, label, reasoningEfforts, defaultReasoningEffort }) => ({
+    id,
+    label,
+    reasoningEfforts,
+    defaultReasoningEffort,
+  })),
+  [
+    {
+      id: 'antigravity:gemini-4-neon',
+      label: 'Gemini 4 Neon',
+      reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+      defaultReasoningEffort: 'high',
+    },
+    {
+      id: 'antigravity:gemini-4-carbon',
+      label: 'Gemini 4 Carbon',
+      reasoningEfforts: ['low', 'medium', 'high'],
+      defaultReasoningEffort: 'high',
+    },
+    {
+      id: 'antigravity:gpt-oss-120b-medium',
+      label: 'GPT-OSS 120B (Medium)',
+      reasoningEfforts: undefined,
+      defaultReasoningEffort: undefined,
+    },
+  ],
+  'Antigravity discovery should group effort tiers per model in low→high order'
+);
+assert.equal(antigravityReasoningEffortForModel(parsedAntigravity[1], 'xhigh'), 'high');
+assert.equal(antigravityWireModelId(parsedAntigravity[0], 'xhigh'), 'gemini-4-neon-xhigh');
+assert.deepEqual(
+  resolveLegacyAntigravityModelId(parsedAntigravity, 'antigravity:gemini-4-neon-xhigh'),
+  { model: parsedAntigravity[0], effort: 'xhigh' }
+);
 
 console.log('Agent model discovery and cache tests passed.');

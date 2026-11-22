@@ -121,6 +121,7 @@ import {
   invalidateAgentModelsCache,
   listAgentModelsWithAvailability,
   onAgentModelsChanged,
+  resolveLegacyAntigravityModelId,
 } from './main/models.js';
 import { appProtocol, attachmentProtocol, getAccountSessionFilePath, getAttachmentDirectoryPath, getNoProjectDirectoryPath, getStorageFilePath, getSyncLedgerFilePath, storageFileName, threadsDirectoryName, threadsFileName } from './main/paths.js';
 import { authenticateProviderTool, cancelAntigravityLogin, checkProviderUpdates, submitAntigravityLoginCode, getProcessErrorMessage, getProviderStatuses, normalizeEnabledProviderIds, providerAuthenticationGenerations, providerUpdaterConfigs, updateProviderTool, waitForProviderAuthentication } from './main/provider-updates.js';
@@ -6621,7 +6622,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     await legacyMcpCleanupPromise;
 
     const models = await getAgentModels();
-    const model = models.find((candidate) => candidate.id === input.modelId);
+    const legacyAntigravity = models.some((candidate) => candidate.id === input.modelId)
+      ? null
+      : resolveLegacyAntigravityModelId(models, input.modelId);
+    const model =
+      models.find((candidate) => candidate.id === input.modelId) ?? legacyAntigravity?.model;
     if (!model) {
       return { ok: false, error: `Unknown model: ${input.modelId}` };
     }
@@ -7479,6 +7484,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             child,
             cwd: input.projectPath,
             model,
+            reasoningEffort: input.antigravityReasoningEffort ?? legacyAntigravity?.effort,
             promptText: input.prompt,
             attachments: input.attachments,
             resumeSessionId,
@@ -8761,7 +8767,13 @@ const runOneShotAgentText = async (
   // Antigravity turns only run over ACP; Read only policy denies every
   // non-read tool, so the hidden turn cannot change anything.
   if (model.providerId === 'antigravity') {
-    return (await antigravityReadOnlyOneShot(model, prompt, cwd, { signal, threadId })) || '';
+    return (
+      (await antigravityReadOnlyOneShot(model, prompt, cwd, {
+        signal,
+        threadId,
+        reasoningEffort: reasoningEffort || 'low',
+      })) || ''
+    );
   }
   // fx turns only run over ACP; its ask mode with every permission denied
   // keeps the hidden turn read-only.
@@ -8912,11 +8924,17 @@ const runOneShotForModelId = async (modelId, prompt, projectPath, options) => {
   if (options?.signal?.aborted) return '';
   const models = await getAgentModels();
   if (options?.signal?.aborted) return '';
-  const model = models.find((candidate) => candidate.id === modelId);
+  const legacyAntigravity = models.some((candidate) => candidate.id === modelId)
+    ? null
+    : resolveLegacyAntigravityModelId(models, modelId);
+  const model = models.find((candidate) => candidate.id === modelId) ?? legacyAntigravity?.model;
   if (!model) return '';
   if (!(await checkCommandAvailable(model.command))) return '';
   if (options?.signal?.aborted) return '';
-  return runOneShotAgentText(model, prompt, projectPath, options);
+  return runOneShotAgentText(model, prompt, projectPath, {
+    ...options,
+    reasoningEffort: options?.reasoningEffort ?? legacyAntigravity?.effort,
+  });
 };
 
 // Generate a short, relevant title for a thread based on the first user prompt.

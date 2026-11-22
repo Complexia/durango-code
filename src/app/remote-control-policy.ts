@@ -57,6 +57,7 @@ type RemoteAgentSettingsThread = {
   claudeContextWindow?: string;
   grokReasoningEffort?: string;
   museReasoningEffort?: string;
+  antigravityReasoningEffort?: string;
   openCodeReasoningEffort?: string;
 };
 
@@ -72,12 +73,14 @@ const EFFORT_FIELD: Record<
   string,
   | 'grokReasoningEffort'
   | 'museReasoningEffort'
+  | 'antigravityReasoningEffort'
   | 'claudeReasoningEffort'
   | 'codexReasoningEffort'
   | 'openCodeReasoningEffort'
 > = {
   grok: 'grokReasoningEffort',
   muse: 'museReasoningEffort',
+  antigravity: 'antigravityReasoningEffort',
   claude: 'claudeReasoningEffort',
   codex: 'codexReasoningEffort',
   opencode: 'openCodeReasoningEffort',
@@ -96,6 +99,8 @@ export const remoteModelEfforts = (model: RemoteAgentSettingsModel | undefined):
       return live ?? [...(model.slug && GROK_XHIGH_SLUGS.has(model.slug) ? GROK_XHIGH_REASONING : GROK_REASONING)];
     case 'muse':
       return live ?? [...MUSE_REASONING];
+    case 'antigravity':
+      return live ?? [];
     case 'claude':
       return [...CLAUDE_REASONING].filter((effort) => !live || live.includes(CLAUDE_CLI_EFFORT[effort] ?? effort));
     case 'codex':
