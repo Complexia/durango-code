@@ -104,10 +104,16 @@ export const ORION_PROJECT_NOTES_TOOL_NAMES = Object.freeze(['project_notes']);
 // own approval. Claude pre-approves it in every mode too.
 export const ORION_LOADER_TOOL_NAME = 'load_tools';
 
+// Listed by the bridge shim only for providers that spawn subagents in the
+// background (--background-subagents).
+export const ORION_WAIT_SUBAGENTS_TOOL_NAME = 'wait_subagents';
+
 /** `name` is the unqualified orion tool name (e.g. `read_chat`). */
 export const isPreapprovedOrionTool = (name, accessMode) =>
   typeof name === 'string' &&
   (name === ORION_LOADER_TOOL_NAME ||
+    // Only waits for subagents the run already started (background-subagents.js).
+    name === ORION_WAIT_SUBAGENTS_TOOL_NAME ||
     orionBuiltinToolNamesForAccessMode(accessMode).includes(name) ||
     (name.startsWith('browser_') && (accessMode !== 'read-only' || BROWSER_READ_TOOL_NAMES.includes(name))) ||
     orionDeviceToolNamesForAccessMode(accessMode).includes(name) ||

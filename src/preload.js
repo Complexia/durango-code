@@ -270,6 +270,13 @@ contextBridge.exposeInMainWorld('orion', {
 
   // Orchestration (Orion pseudo-model subagent spawns)
   reportSubagentResult: (payload) => ipcRenderer.invoke('orchestration:subagentResult', payload),
+  reportSubagentStarted: (payload) => ipcRenderer.invoke('orchestration:subagentStarted', payload),
+  takeSubagentReports: (threadId) => ipcRenderer.invoke('orchestration:takeSubagentReports', threadId),
+  onSubagentReportsReady: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('orchestration:subagentReportsReady', listener);
+    return () => ipcRenderer.removeListener('orchestration:subagentReportsReady', listener);
+  },
   onSubagentSpawnRequest: (callback) => {
     const listener = (_event, request) => callback(request);
     ipcRenderer.on('orchestration:spawnRequest', listener);

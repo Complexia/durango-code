@@ -37,11 +37,79 @@ import {
   providerDefersMcpToolsNatively,
 } from './thread-reader-routing.js';
 
+import {
+  createBackgroundSubagents,
+  spawnsSubagentsInBackground,
+  subagentStartedText,
+  waitSubagentsText,
+  waitSubagentsTimeoutMs,
+} from './background-subagents.js';
+
 export let legacyMcpCleanupPromise = Promise.resolve();
 
 // Orchestration: spawn_subagent calls waiting on the renderer to run the
 // subthread and report back via the orchestration:subagentResult invoke.
-export const pendingSubagentSpawns = new Map(); // spawnId -> { resolve }
+export const pendingSubagentSpawns = new Map(); // spawnId -> { resolve, onOutcome, background, getSender, threadId }
+
+// Subagents spawned in the background (providers whose MCP calls time out;
+// see background-subagents.js): their reports wait here for wait_subagents.
+// One nobody collected tells the renderer, which delivers it to the driver
+// thread as a new message once that thread's turn has ended.
+export const backgroundSubagents = createBackgroundSubagents({
+  onUncollected: (entry) => {
+    const sender = entry.getSender?.();
+    if (!sender || sender.isDestroyed()) return;
+    try {
+      sender.send('orchestration:subagentReportsReady', { threadId: entry.driverThreadId });
+    } catch {}
+  },
+});
+
+const subagentOutcomeText = (payload) =>
+  payload.ok
+    ? payload.result || '(subagent returned no output)'
+    : `Subagent failed: ${payload.result || 'unknown error'}`;
+
+// The renderer created a spawn's subthread. A background spawn's call
+// returns here; the report comes later through backgroundSubagents.
+export const handleSubagentStarted = (payload) => {
+  const pending = pendingSubagentSpawns.get(payload?.spawnId);
+  if (!pending?.background) return { ok: false };
+  pendingSubagentSpawns.delete(payload.spawnId);
+  const entry = backgroundSubagents.start(payload.spawnId, {
+    driverThreadId: pending.threadId,
+    childThreadId: String(payload.childThreadId ?? ''),
+    title: typeof payload.title === 'string' ? payload.title : '',
+    model: typeof payload.model === 'string' ? payload.model : '',
+    getSender: pending.getSender,
+  });
+  pending.resolve(subagentStartedText(entry));
+  return { ok: true };
+};
+
+// The renderer reports a spawned subagent's outcome: it unblocks the
+// spawn_subagent call that asked for it, or waits for wait_subagents when
+// that call already returned (background spawns).
+export const handleSubagentResult = (payload) => {
+  const pending = pendingSubagentSpawns.get(payload?.spawnId);
+  if (pending) {
+    pendingSubagentSpawns.delete(payload.spawnId);
+    // Stopped or deleted by the user (not a failure of its own).
+    pending.onOutcome?.({ stopped: payload.stopped === true });
+    pending.resolve(subagentOutcomeText(payload));
+    return { ok: true };
+  }
+  const recorded = backgroundSubagents.finish(payload?.spawnId, {
+    ok: payload?.ok === true,
+    stopped: payload?.stopped === true,
+    result: payload ? subagentOutcomeText(payload) : '',
+  });
+  return { ok: recorded };
+};
+
+// A driver thread whose turn ended takes the reports nobody collected.
+export const takeSubagentReports = (threadId) =>
+  typeof threadId === 'string' && threadId ? backgroundSubagents.take(threadId) : [];
 
 // Orchestration: stop_subagent calls waiting on the renderer to halt the
 // subthread and report back via the orchestration:subagentStopResult invoke.
@@ -53,7 +121,10 @@ export const pendingSubagentStops = new Map(); // stopId -> { resolve }
 // outcome instead of a protocol error.
 // `onOutcome({ stopped })` hears, just before the report resolves, whether
 // the user stopped or deleted the subagent.
-export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessMode }, args, { onOutcome } = {}) =>
+// `background`: resolve once the subthread has started instead of when it
+// finishes (handleSubagentStarted); the report then waits in
+// backgroundSubagents.
+export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessMode }, args, { onOutcome, background = false } = {}) =>
   new Promise((resolve) => {
     // Read the sender at call time: sessions rebind it when the window
     // closes and reopens.
@@ -63,7 +134,7 @@ export const requestSubagentSpawn = ({ getSender, threadId, projectPath, accessM
       return;
     }
     const spawnId = crypto.randomUUID();
-    pendingSubagentSpawns.set(spawnId, { resolve, onOutcome });
+    pendingSubagentSpawns.set(spawnId, { resolve, onOutcome, background, getSender, threadId });
     try {
       sender.send('orchestration:spawnRequest', {
         spawnId,
@@ -252,7 +323,22 @@ export const handleMcpBridgeConnection = (socket) => {
           reply(false, 'spawn_subagent takes an optional string `effort` argument.');
           continue;
         }
-        void requestSubagentSpawn(session, args).then((text) => reply(true, text));
+        void requestSubagentSpawn(session, args, {
+          background: spawnsSubagentsInBackground(session.providerId),
+        }).then((text) => reply(true, text));
+        continue;
+      }
+      if (message.tool === 'wait_subagents') {
+        if (args.timeout_seconds !== undefined && typeof args.timeout_seconds !== 'number') {
+          reply(false, 'wait_subagents takes an optional number `timeout_seconds` argument.');
+          continue;
+        }
+        void backgroundSubagents
+          .wait(session.threadId, {
+            timeoutMs: waitSubagentsTimeoutMs(args.timeout_seconds),
+            signal: session.abortController?.signal,
+          })
+          .then((outcome) => reply(true, waitSubagentsText(outcome)));
         continue;
       }
       if (message.tool === 'stop_subagent') {
@@ -513,6 +599,9 @@ export const registerMcpBridgeForRun = async ({
       token,
       ...(devicesEnabled ? ['--devices'] : []),
       ...(providerDefersMcpToolsNatively(providerId) ? [] : ['--compact-tools']),
+      // spawn_subagent returns once the subthread starts and wait_subagents
+      // collects reports (background-subagents.js).
+      ...(spawnsSubagentsInBackground(providerId) ? ['--background-subagents'] : []),
       // Codex lists the server as a deferred namespace: give it a one-line
       // description of what the tools are for.
       ...(providerId === 'codex' ? ['--instructions'] : []),

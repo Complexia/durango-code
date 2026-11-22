@@ -534,6 +534,7 @@ const SELF_WAIT_TOOLS = new Set([
   'Agent',
   'Task',
   'spawn_subagent',
+  'wait_subagents',
   'machine_run_agent',
   'browser_wait_for',
   'ScheduleWakeup',

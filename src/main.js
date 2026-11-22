@@ -82,7 +82,8 @@ import { createReasoningStream } from './main/reasoning-stream.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { guardVisualFrames } from './main/visual-tools.js';
 import { attachTextContextMenu } from './main/text-context-menu.js';
-import { legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentSpawns, pendingSubagentStops, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
+import { subagentReportsMessage } from './main/background-subagents.js';
+import { handleSubagentResult, handleSubagentStarted, legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentStops, takeSubagentReports, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { DurangoError, accountKeyOf, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
 import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
@@ -6574,18 +6575,17 @@ ipcMain.handle('appUpdate:restart', async () => {
 
 // The renderer reports a spawned subagent's outcome here, unblocking the
 // spawn_subagent MCP tool call that requested it.
-ipcMain.handle('orchestration:subagentResult', (_event, payload) => {
-  const pending = pendingSubagentSpawns.get(payload?.spawnId);
-  if (!pending) return { ok: false };
-  pendingSubagentSpawns.delete(payload.spawnId);
-  // Stopped or deleted by the user (not a failure of its own).
-  pending.onOutcome?.({ stopped: payload.stopped === true });
-  pending.resolve(
-    payload.ok
-      ? payload.result || '(subagent returned no output)'
-      : `Subagent failed: ${payload.result || 'unknown error'}`
-  );
-  return { ok: true };
+ipcMain.handle('orchestration:subagentResult', (_event, payload) => handleSubagentResult(payload));
+
+// The renderer created a spawned subagent's subthread: a background spawn's
+// call returns now (background-subagents.js).
+ipcMain.handle('orchestration:subagentStarted', (_event, payload) => handleSubagentStarted(payload));
+
+// A driver thread whose turn ended takes the background subagent reports it
+// never collected, to receive them as a new message.
+ipcMain.handle('orchestration:takeSubagentReports', (_event, threadId) => {
+  const entries = takeSubagentReports(threadId);
+  return entries.length > 0 ? { text: subagentReportsMessage(entries) } : { text: '' };
 });
 
 // The renderer reports a subagent stop's outcome here, unblocking the

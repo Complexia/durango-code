@@ -2003,6 +2003,12 @@ type OrionCodexBrowserIntegrationStatus = {
       }) => Promise<{ ok: boolean; goal?: import('./store').ThreadGoal | null; error?: string }>;
       reportSubagentResult(payload: { spawnId: string; ok: boolean; result: string }): Promise<void>;
       onSubagentSpawnRequest(callback: (request: SubagentSpawnRequest) => void): () => void;
+      // Background spawns (main/background-subagents.js): the subthread
+      // started, so the driver's spawn_subagent call can return.
+      reportSubagentStarted?(payload: { spawnId: string; childThreadId: string; title: string; model: string }): Promise<{ ok: boolean }>;
+      // Reports a driver thread never collected, as the text of a message to it ('' when none).
+      takeSubagentReports?(threadId: string): Promise<{ text: string }>;
+      onSubagentReportsReady?(callback: (payload: { threadId: string }) => void): () => void;
       reportSubagentStopResult(payload: { stopId: string; ok: boolean; result: string }): Promise<void>;
       onSubagentStopRequest(callback: (request: SubagentStopRequest) => void): () => void;
       browser?: OrionBrowserApi;

@@ -74,6 +74,7 @@
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",
+    "test:background-subagents": "node --no-warnings scripts/test-background-subagents.mjs",
     "test:remote-crypto": "node scripts/test-remote-crypto.mjs",
     "test:remote-control": "node scripts/test-remote-control.mjs",
     "test:machine-tools": "node scripts/run-electron-test.mjs scripts/test-machine-tools.mjs",

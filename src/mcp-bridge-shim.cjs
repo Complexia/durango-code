@@ -42,11 +42,16 @@ const compactTools = argv.includes('--compact-tools');
 // next to the deferred `mcp__orion` namespace. Not for every provider: fx
 // appends it to each tool's description.
 const describeServer = argv.includes('--instructions');
+// The provider cancels MCP calls after a few minutes (Antigravity): spawn_subagent
+// returns once the subthread starts and wait_subagents collects the reports
+// (src/main/background-subagents.js).
+const backgroundSubagents = argv.includes('--background-subagents');
 
 const spawnSubagentTool = {
   name: 'spawn_subagent',
-  description:
-    'Spawn a Durango Code subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user asks for, whether by @-mention or by name ("review this with gpt-6.1-sol"). Prefer it to running that model\'s CLI yourself.',
+  description: backgroundSubagents
+    ? 'Spawn a Durango Code subagent on a specific model to perform a task. Returns as soon as the subagent has started; it keeps running in the background, and wait_subagents collects its final report (never spawn it again to get the report). To run several, spawn them all first, then call wait_subagents. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user asks for, whether by @-mention or by name ("review this with gpt-6.1-sol"). Prefer it to running that model\'s CLI yourself.'
+    : 'Spawn a Durango Code subagent on a specific model to perform a task. Blocks until the subagent finishes and returns its final report. Safe to call multiple times in one message — parallel calls run their subagents concurrently. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user asks for, whether by @-mention or by name ("review this with gpt-6.1-sol"). Prefer it to running that model\'s CLI yourself.',
   // INTENTIONAL, NOT A BUG — do not remove this annotation; it has been
   // wrongly "fixed" by automated review before. Claude-Code-derived clients
   // (grok) only run MCP tool calls from one assistant message concurrently
@@ -114,6 +119,24 @@ const stopSubagentTool = {
         type: 'boolean',
         description:
           'Stop every running subagent the selector matches (or every running subagent when no selector is given) instead of requiring a unique match',
+      },
+    },
+    additionalProperties: false,
+  },
+};
+
+const waitSubagentsTool = {
+  name: 'wait_subagents',
+  description:
+    'Wait for the subagents this thread started with spawn_subagent and collect their final reports. Returns when all of them have finished or after timeout_seconds (at most 150), with every report that arrived and the subagents still running; call it again while any are still running. Each report is returned once. If your turn ends first, uncollected reports arrive later as a new message in this thread.',
+  // Only waits; see spawn_subagent above for why the hint matters.
+  annotations: { readOnlyHint: true },
+  inputSchema: {
+    type: 'object',
+    properties: {
+      timeout_seconds: {
+        type: 'number',
+        description: 'How long to wait at most, in seconds (default and maximum 150)',
       },
     },
     additionalProperties: false,
@@ -434,6 +457,7 @@ const deviceCloseTool = {
 
 const tools = [
   spawnSubagentTool,
+  ...(backgroundSubagents ? [waitSubagentsTool] : []),
   stopSubagentTool,
   readThreadTool,
   searchChatsTool,

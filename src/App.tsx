@@ -6329,6 +6329,15 @@ const App: React.FC = () => {
         durangoWorkspace: driverThread.durangoWorkspace ?? null,
       });
       if (Object.keys(reasoningPatch).length > 0) state.updateThread(childThreadId, reasoningPatch);
+      // A background spawn (providers whose MCP calls time out) returns to
+      // its driver now; sent before the turn starts so a start failure's
+      // report always comes after it.
+      void window.orion?.reportSubagentStarted?.({
+        spawnId: request.spawnId,
+        childThreadId,
+        title,
+        model: model.label,
+      });
 
       // The spawnId was persisted at creation so the completion watcher can't
       // miss a fast run. Async start failures set the thread status to
@@ -7087,6 +7096,36 @@ const App: React.FC = () => {
         .finally(() => continuationTurnsRef.current.delete(thread.id));
     }
   }, [threads, activeRunsByThread, removeQueuedThreadMessage, startTurnForThread, updateThread, queueRetryTick]);
+
+  // Background subagent reports the driver never collected with
+  // wait_subagents (main/background-subagents.js) wake it once its turn has
+  // ended: they go out as a queued message, which the effect above sends.
+  const subagentReportThreadsRef = useRef(new Set<string>());
+  const [subagentReportsTick, setSubagentReportsTick] = useState(0);
+  useEffect(() => {
+    if (!window.orion?.onSubagentReportsReady) return undefined;
+    return window.orion.onSubagentReportsReady(({ threadId }) => {
+      subagentReportThreadsRef.current.add(threadId);
+      setSubagentReportsTick((tick) => tick + 1);
+    });
+  }, []);
+  useEffect(() => {
+    for (const threadId of [...subagentReportThreadsRef.current]) {
+      const thread = findThread(threads, threadId);
+      if (!thread) {
+        subagentReportThreadsRef.current.delete(threadId);
+        continue;
+      }
+      if (thread.status === 'running' || activeRunsByThread[threadId] || pendingTurnStartsRef.current.has(threadId)) {
+        continue;
+      }
+      subagentReportThreadsRef.current.delete(threadId);
+      void window.orion?.takeSubagentReports?.(threadId).then((result) => {
+        if (!result?.text || !findThread(useOrionStore.getState().threads, threadId)) return;
+        queueMessageToThread(threadId, { text: result.text });
+      });
+    }
+  }, [threads, activeRunsByThread, queueMessageToThread, subagentReportsTick]);
 
   // Goal pause/clear is an intentional cancellation, so detach the live run
   // before stopping its app-server. Otherwise the SIGTERM tail can race back
