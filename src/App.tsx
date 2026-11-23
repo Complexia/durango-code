@@ -92,6 +92,7 @@ import {
 import { createThreadSteeringCoordinator } from './app/thread-steering';
 import { setSourceAttachmentAccount } from './app/sourceAttachments';
 import { Toaster, toast } from 'sonner';
+import { pendingTurns, type PendingTurn } from './app/pendingTurns';
 import {
   agentProviders,
   antigravityReasoningOptionsForModel,
@@ -311,6 +312,50 @@ const loadThreadMessages = async (threadId: string): Promise<Message[] | null> =
     console.warn(`Could not load the transcript of thread ${threadId}`, error);
     return null;
   }
+};
+
+// The chat's placeholders for a composer send still in its preflight
+// (pendingTurns): what startTurnForThreadUnlocked will add, as far as the
+// composer knows it. None when there is nothing to show yet.
+const pendingTurnPlaceholders = (
+  thread: Thread,
+  promptText: string,
+  attachments: FileAttachment[],
+  linkedTasks: LinkedBoardTask[]
+): PendingTurn | null => {
+  const content = promptText || (attachments.length > 0 ? 'Attached file' : '');
+  if (!content && linkedTasks.length === 0) return null;
+  const sentAt = new Date().toISOString();
+  return {
+    userMessage: {
+      id: crypto.randomUUID(),
+      ts: sentAt,
+      role: 'user',
+      content,
+      attachments: [...linkedTaskAttachments(linkedTasks), ...attachments],
+      ...(linkedTasks.length > 0
+        ? {
+            linkedTasks: linkedTasks.map((task) => ({
+              id: task.id,
+              title: task.title,
+              description: task.description,
+            })),
+          }
+        : {}),
+    },
+    runMessage: {
+      id: crypto.randomUUID(),
+      ts: sentAt,
+      role: 'agent',
+      content: '',
+      kind: 'agent-run',
+      status: 'running',
+      statusText: "I'm working on this now.",
+      startedAt: sentAt,
+      activities: [],
+      ...(thread.modelId ? { modelId: thread.modelId } : {}),
+    },
+  };
 };
 
 const dispatchedModelIdForProvider = (
@@ -6028,7 +6073,11 @@ const App: React.FC = () => {
       }
 
       pinThreadToBottom(threadId);
+      // The composer already shows this turn's prompt and run (pendingTurns):
+      // they become these messages, with the same ids and start time.
+      const shownTurn = pendingTurns.take(threadId);
       addMessageToThread(threadId, {
+        ...(shownTurn ? { id: shownTurn.userMessage.id } : {}),
         role: 'user',
         content: userContent,
         attachments: turnAttachments,
@@ -6046,12 +6095,13 @@ const App: React.FC = () => {
       pushLinkedTaskStatus(threadId, 'running');
 
       const messageId = addMessageToThread(threadId, {
+        ...(shownTurn ? { id: shownTurn.runMessage.id } : {}),
         role: 'agent',
         content: '',
         kind: 'agent-run',
         status: 'running',
         statusText: "I'm working on this now.",
-        startedAt: new Date().toISOString(),
+        startedAt: shownTurn?.runMessage.startedAt ?? new Date().toISOString(),
         activities: [],
         modelId: model.id,
         // A queued answer to the agent's own request (continuationTurnsRef).
@@ -8031,6 +8081,18 @@ const App: React.FC = () => {
     // A failed start restores the draft below.
     composerDraft.clear();
     composerDraft.setStarting(submittedThreadId, true);
+    // The prompt and a working run show in the chat at once; the turn start
+    // turns them into the real messages (or they go if it fails).
+    const shownTurn = pendingTurnPlaceholders(
+      selectedThread,
+      promptText,
+      submittedAttachments,
+      pendingLinkedTasks
+    );
+    if (shownTurn) {
+      pinThreadToBottom(submittedThreadId);
+      pendingTurns.set(submittedThreadId, shownTurn);
+    }
     let result: { ok: boolean; error?: string };
     try {
       const turnStart = startTurnForThread(submittedThreadId, promptText, submittedAttachments);
@@ -8039,11 +8101,13 @@ const App: React.FC = () => {
       composerDraft.flush();
       result = await turnStart;
     } catch (error) {
+      if (shownTurn) pendingTurns.clear(submittedThreadId, shownTurn);
       composerDraft.setStarting(submittedThreadId, false);
       restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);
       toast.error(error instanceof Error ? error.message : 'The agent turn could not start');
       return;
     }
+    if (shownTurn) pendingTurns.clear(submittedThreadId, shownTurn);
     composerDraft.setStarting(submittedThreadId, false);
     if (!result.ok) {
       restoreComposerDraft(submittedThreadId, submittedInput, submittedAttachments);

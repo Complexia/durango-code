@@ -17,6 +17,7 @@ import {
   ThreadReferenceText,
 } from './markdown';
 import { linkedTaskStatusLabel } from './promptContext';
+import { usePendingTurn } from './pendingTurns';
 import { isSteer, workStartedAt } from './threadLists';
 
 export const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ text, className }) => {
@@ -1113,8 +1114,19 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     () => (shell && transcript ? threadRecordOf(shell, transcript) : undefined),
     [shell, transcript]
   );
+  // A turn sent from the composer shows its prompt and a working run at once,
+  // while its start is still preparing (they become the real messages).
+  const pendingTurn = usePendingTurn(threadId);
+  const storedMessages = thread?.messages ?? NO_MESSAGES;
+  const hasThread = Boolean(thread);
   // The thread's transcript. Everything below reads messages from here only.
-  const messages = thread?.messages ?? NO_MESSAGES;
+  const messages = useMemo(
+    () =>
+      pendingTurn && hasThread
+        ? [...storedMessages, pendingTurn.userMessage, pendingTurn.runMessage]
+        : storedMessages,
+    [pendingTurn, hasThread, storedMessages]
+  );
   // A thread on another machine whose copy hasn't been read here yet (a
   // subagent there opened for the first time, say): it fills in once that
   // machine answers (useRemoteThreadSync). Until then it shows a skeleton,
@@ -1390,7 +1402,12 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   // provider sessions, which a live run still writes to. A thread that runs
   // on another machine keeps its sessions there.
   const canEditMessages =
-    Boolean(onEditMessage) && !isSending && thread?.status !== 'running' && !thread?.remote && !thread?.subagent;
+    Boolean(onEditMessage) &&
+    !isSending &&
+    !pendingTurn &&
+    thread?.status !== 'running' &&
+    !thread?.remote &&
+    !thread?.subagent;
   const handleUnlinkTask = useCallback(
     (taskId: string) => onUnlinkTask(threadId, taskId),
     [onUnlinkTask, threadId]

@@ -1494,7 +1494,8 @@ interface OrionState {
   /** Remember (or, when empty, forget) an unsent bot prompt. */
   setBotDraft: (key: string, draft: BotDraft) => void;
   deleteThread: (id: string) => void;
-  addMessageToThread: (threadId: string, message: Omit<Message, 'id' | 'ts'>) => string;
+  /** `id` keeps a placeholder's id (a composer send shown before it started). */
+  addMessageToThread: (threadId: string, message: Omit<Message, 'id' | 'ts'> & { id?: string }) => string;
   appendToThreadMessage: (threadId: string, messageId: string, chunk: string) => void;
   updateThreadMessage: (
     threadId: string,
@@ -3394,7 +3395,7 @@ export const useOrionStore = create<OrionState>()(
       addMessageToThread: (threadId, message) => {
         const msg: Message = {
           ...message,
-          id: crypto.randomUUID(),
+          id: message.id ?? crypto.randomUUID(),
           ts: new Date().toISOString(),
         };
         set((state) =>

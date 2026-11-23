@@ -282,26 +282,44 @@ export const buildDurangoMemoryBlock = (facts, maxChars = PROFILE_MEMORY_MAX_CHA
   return [open, intro, ...lines, close].join('\n');
 };
 
+// Stale-while-revalidate: once a recall has succeeded for the account, every
+// later call answers at once with the last block (the recall takes seconds,
+// and a new thread's first message waits on it); past the TTL that call also
+// starts one background refresh. Only the very first recall (or one after an
+// account switch or a failure with nothing cached) is waited for.
 export const createProfileMemoryCache = ({ getClient = () => client, now = () => Date.now(), ttlMs = PROFILE_MEMORY_TTL_MS } = {}) => {
   let entry = null; // { accountKey, at, promise }
+  let lastGood = null; // { accountKey, value }: the newest successful result
+  const recall = (current, accountKey) => {
+    const promise = current
+      .recallMemory(PROFILE_MEMORY_QUERY)
+      .then((result) => {
+        const value = { ok: true, block: buildDurangoMemoryBlock(result.facts) };
+        if (entry?.promise === promise) lastGood = { accountKey, value };
+        return value;
+      })
+      .catch((error) => {
+        // Failures are not cached: the next thread start tries again.
+        if (entry?.promise === promise) entry = null;
+        return { ok: false, code: error?.code ?? 'network', error: durangoErrorText(error), block: '' };
+      });
+    entry = { accountKey, at: now(), promise };
+    return promise;
+  };
   return {
     get(accountKey) {
       const current = getClient();
       if (!current) return Promise.resolve({ ok: false, code: 'not_connected', block: '' });
-      if (entry && entry.accountKey === accountKey && now() - entry.at < ttlMs) return entry.promise;
-      const promise = current
-        .recallMemory(PROFILE_MEMORY_QUERY)
-        .then((result) => ({ ok: true, block: buildDurangoMemoryBlock(result.facts) }))
-        .catch((error) => {
-          // Failures are not cached: the next thread start tries again.
-          if (entry?.promise === promise) entry = null;
-          return { ok: false, code: error?.code ?? 'network', error: durangoErrorText(error), block: '' };
-        });
-      entry = { accountKey, at: now(), promise };
-      return promise;
+      const stale = lastGood?.accountKey === accountKey ? lastGood.value : null;
+      if (entry && entry.accountKey === accountKey) {
+        if (now() - entry.at < ttlMs) return stale ? Promise.resolve(stale) : entry.promise;
+      }
+      const promise = recall(current, accountKey);
+      return stale ? Promise.resolve(stale) : promise;
     },
     clear() {
       entry = null;
+      lastGood = null;
     },
   };
 };

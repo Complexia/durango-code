@@ -294,6 +294,63 @@ try {
   await cache.get('user_2');
   assert.equal(recalls, 3, 'cached per account');
 
+  // Stale-while-revalidate: past the TTL the last block answers at once while
+  // one background refresh runs; a failed refresh keeps the last block.
+  {
+    let fact = 'Old fact.';
+    let release = null;
+    let fail = false;
+    let calls = 0;
+    let t = 0;
+    const swr = createProfileMemoryCache({
+      getClient: () => ({
+        recallMemory: async () => {
+          calls += 1;
+          if (release) await new Promise((resolve) => { const done = release; release = () => { done(); resolve(); }; });
+          if (fail) throw Object.assign(new Error('down'), { code: 'network' });
+          return { facts: [{ text: fact }] };
+        },
+      }),
+      now: () => t,
+    });
+    assert.match((await swr.get('u')).block, /Old fact\./, 'first recall is waited for');
+    t += 10 * 60 * 1000;
+    fact = 'New fact.';
+    let refreshed;
+    release = () => {};
+    const quick = await Promise.race([
+      swr.get('u'),
+      new Promise((resolve) => setTimeout(() => resolve('timed out'), 50)),
+    ]);
+    assert.match(quick.block, /Old fact\./, 'stale block returned without waiting for the refresh');
+    assert.equal(calls, 2, 'expired entry starts one refresh');
+    assert.match((await swr.get('u')).block, /Old fact\./, 'in-flight refresh is not repeated');
+    assert.equal(calls, 2);
+    refreshed = release;
+    release = null;
+    refreshed();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.match((await swr.get('u')).block, /New fact\./, 'refreshed block is served once it lands');
+    t += 10 * 60 * 1000;
+    fail = true;
+    assert.match((await swr.get('u')).block, /New fact\./, 'failed refresh keeps serving the last block');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.match((await swr.get('u')).block, /New fact\./);
+    assert.equal(calls, 4, 'a failed refresh is retried on the next call');
+    fail = false;
+    swr.clear();
+    let waited = false;
+    release = () => {};
+    const afterClear = swr.get('u').then((result) => { waited = true; return result; });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(waited, false, 'after clear (sign-out) nothing stale is served');
+    release();
+    release = null;
+    assert.match((await afterClear).block, /New fact\./);
+    assert.equal((await swr.get('other')).ok, true);
+    assert.equal(calls, 6, 'another account never gets this one\'s block');
+  }
+
   // --- Routing / approvals -------------------------------------------------------------------
   for (const name of DURANGO_TOOL_NAMES) assert.ok(ORION_BUILTIN_TOOL_NAMES.includes(name));
   for (const mode of ['read-only', 'workspace-write', 'full-access']) {
