@@ -1,4 +1,13 @@
-import { type FileAttachment, type LinkedBoardTask, type Message, type OrchestrationRoleId, type Thread, type ThreadDurangoWorkspace } from '../store';
+import {
+  type FileAttachment,
+  type LinkedBoardTask,
+  type Message,
+  type OrchestrationRoleId,
+  type OrchestrationSettings,
+  type ProviderId,
+  type Thread,
+  type ThreadDurangoWorkspace,
+} from '../store';
 import { type AgentModel } from '../agentCatalog';
 import { getThreadActivityTime } from './time';
 
@@ -283,21 +292,102 @@ export const buildOrchestrationContext = (
   return lines.join('\n');
 };
 
+export type ScopedInstructionsTarget = {
+  id?: string | null;
+  label?: string | null;
+  providerId?: string | null;
+  providerLabel?: string | null;
+};
+
+export type ResolvedScopedInstructions = {
+  global: string;
+  provider: string;
+  providerLabel: string | null;
+  model: string;
+  modelLabel: string | null;
+};
+
+/**
+ * Resolves the standing instructions that apply to a given model run:
+ * global (all models) → provider (all models of this provider) → model (this model only).
+ */
+export const resolveScopedInstructions = (
+  settings:
+    | Pick<OrchestrationSettings, 'generalInstructions' | 'providerInstructions' | 'modelInstructions'>
+    | undefined,
+  target?: ScopedInstructionsTarget | null
+): ResolvedScopedInstructions => {
+  const global = (settings?.generalInstructions ?? '').trim();
+  const providerId = target?.providerId ?? null;
+  const provider =
+    providerId && settings?.providerInstructions
+      ? (settings.providerInstructions[providerId as ProviderId] ?? '').trim()
+      : '';
+  const modelId = target?.id ?? null;
+  const model =
+    modelId && settings?.modelInstructions
+      ? (settings.modelInstructions[modelId] ?? '').trim()
+      : '';
+  return {
+    global,
+    provider,
+    providerLabel: target?.providerLabel || providerId || null,
+    model,
+    modelLabel: target?.label || modelId || null,
+  };
+};
+
+/**
+ * Formats resolved global + provider + model instructions into a single body
+ * string. When only global instructions are set, returns them verbatim.
+ */
+export const formatScopedInstructionsBody = (resolved: ResolvedScopedInstructions): string => {
+  const sections: string[] = [];
+  if (resolved.global) sections.push(resolved.global);
+  if (resolved.provider) {
+    const header = resolved.providerLabel
+      ? `[Provider instructions — ${resolved.providerLabel}]`
+      : '[Provider instructions]';
+    sections.push(`${header}\n${resolved.provider}`);
+  }
+  if (resolved.model) {
+    const header = resolved.modelLabel
+      ? `[Model instructions — ${resolved.modelLabel}]`
+      : '[Model instructions]';
+    sections.push(`${header}\n${resolved.model}`);
+  }
+  return sections.join('\n\n');
+};
+
 // Context block prepended to every agent turn started from Orion, whatever
-// model the thread runs on — the user's general instructions act like a
-// global CLAUDE.md/AGENTS.md scoped to Orion, without touching on-disk files
-// that the same CLIs would read when launched outside Orion. Orchestrated
-// turns skip this block: the [Orion orchestration] block already carries the
-// same instructions.
-export const buildGeneralInstructionsContext = (generalInstructions: string) => {
-  const trimmed = generalInstructions.trim();
-  if (!trimmed) return '';
-  return [
-    '[Orion general instructions]',
-    'The user configured these standing instructions in Durango Code. They apply to every agent session run through Durango Code, alongside any project instructions:',
-    trimmed,
-    '[/Orion general instructions]',
-  ].join('\n');
+// model the thread runs on — the user's standing instructions act like a
+// global/per-provider/per-model CLAUDE.md scoped to Orion, without touching
+// on-disk files that the same CLIs would read when launched outside Orion.
+// Orchestrated turns skip this block: the [Orion orchestration] block already
+// carries the same resolved instructions.
+export const buildGeneralInstructionsContext = (
+  instructions: string | ResolvedScopedInstructions
+) => {
+  if (typeof instructions === 'string') {
+    const trimmed = instructions.trim();
+    if (!trimmed) return '';
+    return [
+      '[Orion general instructions]',
+      'The user configured these standing instructions in Durango Code. They apply to every agent session run through Durango Code, alongside any project instructions:',
+      trimmed,
+      '[/Orion general instructions]',
+    ].join('\n');
+  }
+
+  const body = formatScopedInstructionsBody(instructions);
+  if (!body) return '';
+
+  const hasScoped = Boolean(instructions.provider || instructions.model);
+  const lead = hasScoped
+    ? 'The user configured these standing instructions in Durango Code. They apply to this session alongside any project instructions (provider- and model-specific sections layer on top of general ones):'
+    : 'The user configured these standing instructions in Durango Code. They apply to every agent session run through Durango Code, alongside any project instructions:';
+
+  return ['[Orion general instructions]', lead, body, '[/Orion general instructions]'].join('\n');
 };
 
 export type ModelMention = {

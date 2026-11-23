@@ -47,6 +47,8 @@ import {
 } from '../store';
 import {
   agentProviders,
+  claudeCodeCliModelId,
+  defaultAgentModelId,
   providerOptionDefs,
   type AgentModel,
   type AgentProvider,
@@ -54,6 +56,9 @@ import {
 } from '../agentCatalog';
 import { ModelPickerPopover } from './ModelPickerPopover';
 import { SelectMenu } from './SelectMenu';
+import { InstructionsSetting } from './InstructionsSetting';
+import { RoleModelPicker } from './RoleModelPicker';
+import { resolveOrionMainDriverModel } from './orionDriver';
 import { BuiltinBrowserSettings } from './BrowserSettings';
 import { FxConnectionsPanel } from './FxConnectionsPanel';
 import { DurangoDispatchSettings } from './DurangoDispatchSettings';
@@ -110,6 +115,8 @@ export type SettingsPageProps = {
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
   setOrchestrationGeneralInstructions: (text: string) => void;
+  setOrchestrationProviderInstructions: (providerId: ProviderId, text: string) => void;
+  setOrchestrationModelInstructions: (modelId: string, text: string) => void;
   workspaceSyncSettings: WorkspaceSyncSettings;
   setWorkspaceSyncSettings: (updates: Partial<WorkspaceSyncSettings>) => void;
   remoteControlSettings: RemoteControlSettingsValue;
@@ -162,6 +169,7 @@ export type SettingsPageProps = {
   normalizedProviderSettings: ProviderSettings;
   normalizedOrchestrationSettings: OrchestrationSettings;
   orchestrationModelGroups: Array<{ provider: AgentProvider; models: AgentModel[] }>;
+  instructionModelGroups: Array<{ provider: AgentProvider; models: AgentModel[] }>;
   providerStatusById: Map<string, ProviderUpdateItem>;
   accountName: string;
   accountEmail: string | null;
@@ -204,6 +212,8 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     setProviderOptions,
     setOrchestrationRoleModel,
     setOrchestrationGeneralInstructions,
+    setOrchestrationProviderInstructions,
+    setOrchestrationModelInstructions,
     workspaceSyncSettings,
     setWorkspaceSyncSettings,
     remoteControlSettings,
@@ -253,6 +263,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     normalizedProviderSettings,
     normalizedOrchestrationSettings,
     orchestrationModelGroups,
+    instructionModelGroups,
     providerStatusById,
     accountName,
     accountEmail,
@@ -278,6 +289,16 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
     formatCheckedTime,
     formatBytes,
   } = props;
+  const orchestrationRoleModels = React.useMemo(
+    () => orchestrationModelGroups.flatMap((group) => group.models),
+    [orchestrationModelGroups]
+  );
+  const effectiveMainDriver = resolveOrionMainDriverModel(
+    orchestrationRoleModels,
+    normalizedOrchestrationSettings.models.mainDriver,
+    defaultAgentModelId,
+    claudeCodeCliModelId
+  );
   const [computerUseSubtab, setComputerUseSubtab] = React.useState<'permissions' | 'browser-use' | 'snapshot'>(
     'permissions'
   );
@@ -1322,46 +1343,38 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 </div>
               </div>
 
-              {orchestrationRoleMeta.map((role) => (
-                <div className="setting-row" key={role.id}>
-                  <div className="setting-label">
-                    <div className="setting-label-title">{role.label}</div>
-                    <div className="setting-label-desc">{role.desc}</div>
+              {orchestrationRoleMeta.map((role) => {
+                // Show the model each role actually runs on: a saved model
+                // that is no longer listed falls back the same way turns do
+                // (main driver → default model; other roles → main driver).
+                const configuredId = normalizedOrchestrationSettings.models[role.id];
+                const effectiveId =
+                  role.id !== 'mainDriver' && orchestrationRoleModels.some((model) => model.id === configuredId)
+                    ? configuredId
+                    : (effectiveMainDriver?.id ?? configuredId);
+                return (
+                  <div className="setting-row" key={role.id}>
+                    <div className="setting-label">
+                      <div className="setting-label-title">{role.label}</div>
+                      <div className="setting-label-desc">{role.desc}</div>
+                    </div>
+                    <RoleModelPicker
+                      label={role.label}
+                      modelGroups={orchestrationModelGroups}
+                      value={effectiveId}
+                      onChange={(modelId) => setOrchestrationRoleModel(role.id, modelId)}
+                    />
                   </div>
-                  <select
-                    className="setting-select"
-                    value={normalizedOrchestrationSettings.models[role.id]}
-                    onChange={(e) => setOrchestrationRoleModel(role.id, e.target.value)}
-                  >
-                    {orchestrationModelGroups.map((group) => (
-                      <optgroup key={group.provider.id} label={group.provider.label}>
-                        {group.models.map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.label}
-                          </option>
-                        ))}
-                      </optgroup>
-                    ))}
-                  </select>
-                </div>
-              ))}
+                );
+              })}
 
-              <div className="setting-row setting-row-stacked">
-                <div className="setting-label">
-                  <div className="setting-label-title">General instructions</div>
-                  <div className="setting-label-desc">
-                    Free-form guidance every model follows when run through Durango Code — like a global
-                    CLAUDE.md that never affects these models outside Durango Code
-                  </div>
-                </div>
-                <textarea
-                  className="setting-textarea"
-                  rows={6}
-                  value={normalizedOrchestrationSettings.generalInstructions}
-                  onChange={(e) => setOrchestrationGeneralInstructions(e.target.value)}
-                  placeholder="e.g. Always run the test suite before reporting a task as done."
-                />
-              </div>
+              <InstructionsSetting
+                settings={normalizedOrchestrationSettings}
+                modelGroups={instructionModelGroups}
+                onChangeGlobal={setOrchestrationGeneralInstructions}
+                onChangeProvider={setOrchestrationProviderInstructions}
+                onChangeModel={setOrchestrationModelInstructions}
+              />
             </>
           )}
 

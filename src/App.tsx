@@ -210,12 +210,14 @@ import {
   buildEditedThreadContext,
   buildRemoteThreadMentionsContext,
   buildThreadMentionsContext,
+  formatScopedInstructionsBody,
   linkedTaskFromBoardTask,
   linkedTaskAttachments,
   linkedTaskStatusLabel,
   orchestrationRoleMeta,
   parseModelMentions,
   parseThreadMentions,
+  resolveScopedInstructions,
   retargetThreadMention,
 } from './app/promptContext';
 import { durangoWorkspaceName } from './app/durangoWorkspace';
@@ -870,6 +872,8 @@ const App: React.FC = () => {
     orchestrationSettings,
     setOrchestrationRoleModel,
     setOrchestrationGeneralInstructions,
+    setOrchestrationProviderInstructions,
+    setOrchestrationModelInstructions,
     notificationSettings,
     setNotificationSettings,
     textGenerationSettings,
@@ -934,6 +938,8 @@ const App: React.FC = () => {
       orchestrationSettings: state.orchestrationSettings,
       setOrchestrationRoleModel: state.setOrchestrationRoleModel,
       setOrchestrationGeneralInstructions: state.setOrchestrationGeneralInstructions,
+      setOrchestrationProviderInstructions: state.setOrchestrationProviderInstructions,
+      setOrchestrationModelInstructions: state.setOrchestrationModelInstructions,
       notificationSettings: state.notificationSettings,
       setNotificationSettings: state.setNotificationSettings,
       textGenerationSettings: state.textGenerationSettings,
@@ -1638,6 +1644,12 @@ const App: React.FC = () => {
         ...defaultOrchestrationSettings.models,
         ...orchestrationSettings?.models,
       },
+      providerInstructions: {
+        ...orchestrationSettings?.providerInstructions,
+      },
+      modelInstructions: {
+        ...orchestrationSettings?.modelInstructions,
+      },
     }),
     [orchestrationSettings]
   );
@@ -1724,6 +1736,19 @@ const App: React.FC = () => {
         .map((provider) => ({
           provider,
           models: agentModels.filter((model) => model.providerId === provider.id && model.id !== claudeCodeCliModelId),
+        }))
+        .filter((group) => group.models.length > 0),
+    [agentModels]
+  );
+  // Settings → Orchestration → Instructions can also target the Claude Code
+  // CLI terminal, which the role pickers leave out.
+  const instructionModelGroups = useMemo(
+    () =>
+      agentProviders
+        .filter((provider) => provider.id !== 'orion')
+        .map((provider) => ({
+          provider,
+          models: agentModels.filter((model) => model.providerId === provider.id),
         }))
         .filter((group) => group.models.length > 0),
     [agentModels]
@@ -5962,26 +5987,22 @@ const App: React.FC = () => {
       }
       // Sits just below the general/orchestration instructions block.
       addAgentContext(durangoMemoryBlock);
+      const scopedInstructions = resolveScopedInstructions(state.orchestrationSettings, model);
       if (orchestration) {
         // Added last: ordinary prompts retain orchestration-first ordering;
         // slash commands retain the command at byte zero and put context after it.
         const orchestrationContext = buildOrchestrationContext(
           orchestration.roles,
-          orchestration.generalInstructions,
+          formatScopedInstructionsBody(scopedInstructions),
           thread.accessMode ?? 'full-access'
         );
         addAgentContext(orchestrationContext);
       } else {
-        // The user's general instructions bind every model run through Orion,
-        // not just the orchestrator — a global CLAUDE.md scoped to the app.
+        // The user's standing instructions bind every model run through Orion,
+        // layering global, provider-specific, and model-specific guidance.
         // Orchestrated turns already carry them in the block above. Added last
         // so the block sits topmost on ordinary prompts.
-        addAgentContext(
-          buildGeneralInstructionsContext(
-            state.orchestrationSettings?.generalInstructions ??
-              defaultOrchestrationSettings.generalInstructions
-          )
-        );
+        addAgentContext(buildGeneralInstructionsContext(scopedInstructions));
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
@@ -9644,6 +9665,8 @@ const App: React.FC = () => {
     setProviderOptions,
     setOrchestrationRoleModel,
     setOrchestrationGeneralInstructions,
+    setOrchestrationProviderInstructions,
+    setOrchestrationModelInstructions,
     workspaceSyncSettings,
     setWorkspaceSyncSettings,
     remoteControlSettings,
@@ -9691,6 +9714,7 @@ const App: React.FC = () => {
     normalizedProviderSettings,
     normalizedOrchestrationSettings,
     orchestrationModelGroups,
+    instructionModelGroups,
     providerStatusById,
     accountName,
     accountEmail,
@@ -11116,7 +11140,14 @@ const App: React.FC = () => {
                             resumeSessionId={pane.thread.agentSessionIds?.claude}
                             forkSession={pane.thread.pendingForkProviders?.includes('claude')}
                             generalInstructions={[
-                              normalizedOrchestrationSettings.generalInstructions.trim(),
+                              formatScopedInstructionsBody(
+                                resolveScopedInstructions(normalizedOrchestrationSettings, {
+                                  id: claudeCodeCliModelId,
+                                  providerId: 'claude',
+                                  providerLabel: 'Claude',
+                                  label: 'Claude Code CLI',
+                                })
+                              ),
                               terminalDurangoMemoryBlock,
                             ]
                               .filter(Boolean)

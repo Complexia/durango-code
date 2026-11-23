@@ -1226,6 +1226,10 @@ export type OrchestrationSettings = {
   models: Record<OrchestrationRoleId, string>;
   /** Standing instructions injected into every agent run started from Orion. */
   generalInstructions: string;
+  /** Standing instructions layered onto every model of a provider (keyed by ProviderId). */
+  providerInstructions?: Partial<Record<ProviderId, string>>;
+  /** Standing instructions layered onto a specific model (keyed by AgentModel['id']). */
+  modelInstructions?: Record<string, string>;
 };
 
 export const defaultOrchestrationSettings: OrchestrationSettings = {
@@ -1237,6 +1241,8 @@ export const defaultOrchestrationSettings: OrchestrationSettings = {
     imageVideoGen: 'grok:grok-4.7',
   },
   generalInstructions: '',
+  providerInstructions: {},
+  modelInstructions: {},
 };
 
 export type NotificationSettings = {
@@ -1406,6 +1412,8 @@ interface OrionState {
   setProviderOptions: (id: ProviderId, options: Partial<ProviderRuntimeOptions>) => void;
   setOrchestrationRoleModel: (role: OrchestrationRoleId, modelId: string) => void;
   setOrchestrationGeneralInstructions: (text: string) => void;
+  setOrchestrationProviderInstructions: (providerId: ProviderId, text: string) => void;
+  setOrchestrationModelInstructions: (modelId: string, text: string) => void;
   setNotificationSettings: (updates: Partial<NotificationSettings>) => void;
   setTextGenerationSettings: (updates: Partial<TextGenerationSettings>) => void;
   setThreadAgentSession: (threadId: string, providerId: ProviderId, sessionId: string) => void;
@@ -2458,6 +2466,12 @@ const buildPersistedSettings = (state: OrionState) => ({
             ...defaultOrchestrationSettings.models,
             ...state.orchestrationSettings?.models,
           },
+          providerInstructions: {
+            ...state.orchestrationSettings?.providerInstructions,
+          },
+          modelInstructions: {
+            ...state.orchestrationSettings?.modelInstructions,
+          },
         },
         notificationSettings: {
           ...defaultNotificationSettings,
@@ -2571,9 +2585,55 @@ export const useOrionStore = create<OrionState>()(
               ...defaultOrchestrationSettings.models,
               ...state.orchestrationSettings?.models,
             },
+            providerInstructions: {
+              ...state.orchestrationSettings?.providerInstructions,
+            },
+            modelInstructions: {
+              ...state.orchestrationSettings?.modelInstructions,
+            },
             generalInstructions: text,
           },
         })),
+      setOrchestrationProviderInstructions: (providerId, text) =>
+        set((state) => {
+          const next = { ...state.orchestrationSettings?.providerInstructions };
+          if (text) next[providerId] = text;
+          else delete next[providerId];
+          return {
+            orchestrationSettings: {
+              ...defaultOrchestrationSettings,
+              ...state.orchestrationSettings,
+              models: {
+                ...defaultOrchestrationSettings.models,
+                ...state.orchestrationSettings?.models,
+              },
+              providerInstructions: next,
+              modelInstructions: {
+                ...state.orchestrationSettings?.modelInstructions,
+              },
+            },
+          };
+        }),
+      setOrchestrationModelInstructions: (modelId, text) =>
+        set((state) => {
+          const next = { ...state.orchestrationSettings?.modelInstructions };
+          if (text) next[modelId] = text;
+          else delete next[modelId];
+          return {
+            orchestrationSettings: {
+              ...defaultOrchestrationSettings,
+              ...state.orchestrationSettings,
+              models: {
+                ...defaultOrchestrationSettings.models,
+                ...state.orchestrationSettings?.models,
+              },
+              providerInstructions: {
+                ...state.orchestrationSettings?.providerInstructions,
+              },
+              modelInstructions: next,
+            },
+          };
+        }),
       setNotificationSettings: (updates) =>
         set((state) => ({
           notificationSettings: {
@@ -3756,6 +3816,26 @@ export const useOrionStore = create<OrionState>()(
         // store saves the full role map, so the old Haiku 4.5 exploring
         // default is on disk for everyone) move to that model's successor.
         const upgradeModelId = (id: string) => agentModelSuccessors[id] ?? id;
+        const rawProviderInstructions = merged.orchestrationSettings?.providerInstructions;
+        const providerInstructions: Partial<Record<ProviderId, string>> = {};
+        if (rawProviderInstructions && typeof rawProviderInstructions === 'object') {
+          for (const [providerId, text] of Object.entries(rawProviderInstructions)) {
+            if (typeof text === 'string' && text) {
+              providerInstructions[providerId as ProviderId] = text;
+            }
+          }
+        }
+        const rawModelInstructions = merged.orchestrationSettings?.modelInstructions;
+        const modelInstructions: Record<string, string> = {};
+        if (rawModelInstructions && typeof rawModelInstructions === 'object') {
+          for (const [id, text] of Object.entries(rawModelInstructions)) {
+            if (typeof text !== 'string' || !text) continue;
+            const targetId = upgradeModelId(id);
+            if (!(targetId in modelInstructions) || id === targetId) {
+              modelInstructions[targetId] = text;
+            }
+          }
+        }
         merged.orchestrationSettings = {
           ...defaultOrchestrationSettings,
           ...merged.orchestrationSettings,
@@ -3765,6 +3845,8 @@ export const useOrionStore = create<OrionState>()(
               ...merged.orchestrationSettings?.models,
             }).map(([role, id]) => [role, upgradeModelId(id)])
           ) as OrchestrationSettings['models'],
+          providerInstructions,
+          modelInstructions,
         };
         if (merged.textGenerationSettings.modelId) {
           merged.textGenerationSettings.modelId = upgradeModelId(merged.textGenerationSettings.modelId);

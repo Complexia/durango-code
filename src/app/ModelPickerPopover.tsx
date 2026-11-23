@@ -23,7 +23,18 @@ type ModelPickerPopoverProps = {
   placement?: 'above' | 'below';
   /** Extra class on the popover, e.g. to widen or narrow a specific mount. */
   className?: string;
+  /** Rows drawn above the model rows, e.g. "All models" / "All <provider>" scopes. */
+  leadingRows?: ReactNode;
+  /** Models and provider tabs that get a small dot (e.g. "has saved instructions"). */
+  markedModelIds?: ReadonlySet<string>;
+  markedProviderIds?: ReadonlySet<string>;
+  markTitle?: string;
+  searchPlaceholder?: string;
 };
+
+const MarkDot = ({ title }: { title?: string }) => (
+  <span className="ml-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent)] align-middle" title={title} />
+);
 
 /**
  * The provider-rail model picker shared by the composer and Settings. Both
@@ -42,6 +53,11 @@ export const ModelPickerPopover = ({
   overlay,
   placement = 'above',
   className,
+  leadingRows,
+  markedModelIds,
+  markedProviderIds,
+  markTitle,
+  searchPlaceholder = 'Search models...',
 }: ModelPickerPopoverProps) => {
   const visibleModels = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -266,11 +282,14 @@ export const ModelPickerPopover = ({
           return (
             <button
               key={provider.id}
-              className={`provider-rail-button ${activeProviderId === provider.id ? 'active' : ''}`}
+              className={`provider-rail-button relative ${activeProviderId === provider.id ? 'active' : ''}`}
               onClick={() => onActiveProviderChange(provider.id)}
               title={provider.label}
             >
               <Icon size={19} />
+              {markedProviderIds?.has(provider.id) && (
+                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-[var(--accent)]" title={markTitle} />
+              )}
             </button>
           );
         })}
@@ -283,7 +302,7 @@ export const ModelPickerPopover = ({
             autoFocus
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
-            placeholder="Search models..."
+            placeholder={searchPlaceholder}
           />
         </div>
         <div className="model-list" ref={listRef}>
@@ -310,6 +329,7 @@ export const ModelPickerPopover = ({
               </button>
             </div>
           )}
+          {leadingRows}
           {visibleModels.map((model) => {
             const ProviderIcon =
               providers.find((provider) => provider.id === model.providerId)?.icon ?? Play;
@@ -326,7 +346,10 @@ export const ModelPickerPopover = ({
               >
                 <ProviderIcon size={18} />
                 <span className="model-row-text">
-                  <span className="model-row-label">{model.label}</span>
+                  <span className="model-row-label">
+                    {model.label}
+                    {markedModelIds?.has(model.id) && <MarkDot title={markTitle} />}
+                  </span>
                   <span className="model-row-provider">{model.providerLabel}</span>
                 </span>
                 {model.shortcut && <span className="model-shortcut">{model.shortcut}</span>}
@@ -334,7 +357,7 @@ export const ModelPickerPopover = ({
               </button>
             );
           })}
-          {visibleModels.length === 0 && <div className="model-empty">No models</div>}
+          {visibleModels.length === 0 && !leadingRows && <div className="model-empty">No models</div>}
         </div>
       </div>
     </div>
