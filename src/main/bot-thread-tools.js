@@ -105,7 +105,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'list_threads',
     description:
-      "List Durango Code threads on this computer, newest first: the person's own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), sidebar flags (settled, snoozed, pinned) and last activity.",
+      "List Durango Code threads on this computer, newest first: the threads in the person's sidebar, their own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), sidebar flags (settled, snoozed, pinned) and last activity. Subagent threads (ones a thread spawned, e.g. reviews) aren't in the sidebar and aren't listed: their parent shows how many it has (`subagents`); they come and go with it, so there's nothing to settle there. Pass include_subagents to list them too (each with its parentThreadId).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -116,6 +116,10 @@ export const BOT_THREAD_TOOLS = [
           description: 'Filter by sidebar state (default "all"). "active" excludes settled and snoozed threads.',
         },
         limit: { type: 'integer', minimum: 1, maximum: MAX_LISTED, description: `How many (default 15, at most ${MAX_LISTED}).` },
+        include_subagents: {
+          type: 'boolean',
+          description: 'Also list subagent threads (default false), each with its parentThreadId; they follow their parent\'s sidebar state.',
+        },
       },
     },
   },
@@ -197,6 +201,49 @@ const entrySidebarFlags = (entry) => {
 };
 
 /**
+ * Which index entries the sidebar lists, the same rule as the renderer's
+ * (App.tsx childThreadIds and sidebarV2ThreadLists): a thread whose parent
+ * thread is here (a spawn_subagent child, a provider's own subagent) is
+ * hidden under it, and a blank draft (no messages, not running, never filed)
+ * isn't shown until it is used. A child whose parent is gone shows on its own.
+ * Returns `root(entry)`: the listed thread an entry sits under (itself when
+ * it is listed), or null for a blank draft.
+ */
+// A provider's own subagent (a Claude Task/Explore run, a Codex subagent): its
+// transcript is read-only inside its parent's session. The index's top-level
+// `subagent` is only `true` for an old shape; its shell has the details object.
+export const isProviderSubagent = (entry) => entry?.subagent === true || Boolean(entry?.shell?.subagent);
+
+export const sidebarThreadRoots = (entries) => {
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const parentOf = (entry) => entry?.parentThreadId ?? entry?.shell?.parentThreadId ?? null;
+  const rootOf = (entry) => {
+    let root = entry;
+    const seen = new Set([root.id]);
+    for (let parent = byId.get(parentOf(root)); parent && !seen.has(parent.id); parent = byId.get(parentOf(root))) {
+      seen.add(parent.id);
+      root = parent;
+    }
+    return root;
+  };
+  const isBlankDraft = (entry) => {
+    if (entry.messageCount !== 0 || entry.status === 'running') return false;
+    const flags = entrySidebarFlags(entry);
+    return !flags.settled && !flags.snoozed && !flags.pinned && entry.modelId !== CLAUDE_CODE_CLI_MODEL_ID;
+  };
+  return (entry) => {
+    const root = rootOf(entry);
+    // Its own parent (a self-cycle): the sidebar hides it like any child.
+    if (root === entry && byId.has(parentOf(entry))) return null;
+    return isBlankDraft(root) ? null : root;
+  };
+};
+
+// agentCatalog.ts claudeCodeCliModelId: a CLI thread keeps its conversation
+// in the terminal, so the sidebar always shows it.
+const CLAUDE_CODE_CLI_MODEL_ID = 'claude:claude-code-cli';
+
+/**
  * deps:
  * - readIndex(): { entries } (thread-storage.js readThreadsIndex)
  * - readThread(args): transcript page text (thread-reader.js readThreadForAgent)
@@ -217,7 +264,7 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
     const id = String(rawId ?? '').trim();
     if (!id) throw new Error('thread_id is required.');
     const [{ entries }, projects] = await Promise.all([readIndex(), projectsById()]);
-    const visible = entries.filter((entry) => !entry.subagent && projects.has(entry.projectId));
+    const visible = entries.filter((entry) => !isProviderSubagent(entry) && projects.has(entry.projectId));
     const matches = visible.filter((entry) => entry.id === id);
     const found = matches.length || exact ? matches : visible.filter((entry) => entry.id.startsWith(id));
     if (found.length !== 1) {
@@ -284,11 +331,27 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
       }
       const stateFilter = String(input.state ?? 'all').trim().toLowerCase();
       const limit = Math.min(MAX_LISTED, Math.max(1, Number.isInteger(input.limit) ? input.limit : 15));
+      const withSubagents = input.include_subagents === true;
+      // Only what the sidebar shows (sidebarThreadRoots); a subagent thread
+      // is counted on the thread it sits under, or listed with
+      // include_subagents. A provider's own subagent (isProviderSubagent) runs
+      // inside its parent's session and can't be read or messaged: never listed.
+      const rootFor = sidebarThreadRoots(entries);
+      const roots = new Map();
+      const subagentCounts = new Map();
+      for (const entry of entries) {
+        const root = rootFor(entry);
+        if (!root) continue;
+        roots.set(entry.id, root);
+        if (root !== entry && !isProviderSubagent(entry)) subagentCounts.set(root.id, (subagentCounts.get(root.id) ?? 0) + 1);
+      }
       const threads = entries
         .filter((entry) => {
-          if (entry.subagent || !projects.has(entry.projectId)) return false;
+          if (isProviderSubagent(entry) || !projects.has(entry.projectId)) return false;
           if (project && entry.projectId !== project.id) return false;
-          const flags = entrySidebarFlags(entry);
+          const root = roots.get(entry.id);
+          if (!root || (root !== entry && !withSubagents)) return false;
+          const flags = entrySidebarFlags(root);
           if (stateFilter === 'active') return !flags.settled && !flags.snoozed;
           if (stateFilter === 'settled') return flags.settled;
           if (stateFilter === 'snoozed') return flags.snoozed;
@@ -298,15 +361,20 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
         .sort((a, b) => (b.activityAt ?? b.updatedAt ?? 0) - (a.activityAt ?? a.updatedAt ?? 0))
         .slice(0, limit)
         .map((entry) => {
-          const flags = entrySidebarFlags(entry);
+          const root = roots.get(entry.id);
+          // A subagent thread is filed with its parent: its parent's flags.
+          const flags = entrySidebarFlags(root);
+          const subagents = subagentCounts.get(entry.id) ?? 0;
           return {
             id: entry.id,
             title: entry.title || '(untitled)',
             project: projects.get(entry.projectId)?.name ?? null,
             status: liveStatus(entry.id) ?? entry.status ?? 'idle',
+            ...(root !== entry ? { subagent: true, parentThreadId: entry.parentThreadId ?? entry.shell?.parentThreadId ?? null } : {}),
             ...(flags.settled ? { settled: true } : {}),
             ...(flags.snoozed ? { snoozed: true } : {}),
             ...(flags.pinned ? { pinned: true } : {}),
+            ...(subagents ? { subagents } : {}),
             messages: entry.messageCount ?? null,
             lastActivity: iso(entry.activityAt ?? entry.updatedAt),
           };

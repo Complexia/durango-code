@@ -1270,6 +1270,60 @@ try {
     assert.equal(withThreadReportFooter('Done.', {}), 'Done.');
   });
 
+  await test('list_threads shows what the sidebar shows: subagent threads count on their parent', async () => {
+    const parent = 'fbe30b4a-f4e7-429c-babc-4599aa660565';
+    const entries = [
+      { id: parent, projectId: 'p1', parentThreadId: null, title: 'Land chg_y6jdzkv2', status: 'idle', activityAt: 5, messageCount: 8 },
+      // spawn_subagent children (reviews): parentThreadId set and hidden from the
+      // sidebar, but not provider subagents (entry.subagent false).
+      { id: 'fb1b6e7f-71d5-4572-b781-ea5bdde1d5a4', projectId: 'p1', parentThreadId: parent, title: 'Review chg_y6jdzkv2 (GPT-6.2 Sol)', status: 'idle', activityAt: 9, messageCount: 3, shell: { hiddenFromRecent: true } },
+      { id: 'review2', projectId: 'p1', parentThreadId: parent, title: 'Review 2', status: 'running', activityAt: 8, messageCount: 2, shell: { hiddenFromRecent: true } },
+      // A subagent of a subagent counts on the thread the sidebar lists.
+      { id: 'nested', projectId: 'p1', parentThreadId: 'review2', title: 'Nested', status: 'idle', activityAt: 7, messageCount: 1 },
+      // A provider's own subagent, as thread-storage.js indexes it (entry.subagent
+      // false, the details object in its shell): hidden, never listed or counted.
+      { id: 'native', projectId: 'p1', parentThreadId: parent, subagent: false, title: 'Explore', activityAt: 10, messageCount: 1, shell: { subagent: { id: 'task_1', providerId: 'claude', kind: 'Explore' } } },
+      // Its own parent: hidden like any child (as the sidebar does).
+      { id: 'self', projectId: 'p1', parentThreadId: 'self', title: 'Self', status: 'idle', activityAt: 13, messageCount: 1 },
+      // Its parent is gone: the sidebar shows it on its own.
+      { id: 'orphan', projectId: 'p1', parentThreadId: 'deleted-thread', title: 'Orphan', status: 'idle', activityAt: 4, messageCount: 2 },
+      // A blank draft isn't in the sidebar; a pinned one, a running one or a Claude Code CLI one is.
+      { id: 'blank', projectId: 'p1', title: '', status: 'idle', activityAt: 11, messageCount: 0 },
+      { id: 'blank-pinned', projectId: 'p1', title: '', status: 'idle', activityAt: 3, messageCount: 0, pinnedAt: '2026-11-20T00:00:00.000Z' },
+      { id: 'cli', projectId: 'p1', title: 'CLI', status: 'idle', modelId: 'claude:claude-code-cli', activityAt: 2, messageCount: 0 },
+      { id: 'settled', projectId: 'p1', title: 'Settled', status: 'idle', activityAt: 1, messageCount: 4, shell: { settledAt: '2026-11-21T00:00:00.000Z' } },
+      { id: 'settled-child', projectId: 'p1', parentThreadId: 'settled', title: 'Settled review', status: 'idle', activityAt: 12, messageCount: 2 },
+    ];
+    const tools = createBotThreadTools({
+      readIndex: async () => ({ entries }),
+      readThread: async (args) => `page of ${args.thread_id}`,
+      getProjects: () => [{ id: 'p1', name: 'durango', path: '/x/durango' }],
+    });
+    const listed = await tools.list({ project: 'durango' });
+    assert.deepEqual(listed.threads.map((thread) => thread.id), [parent, 'orphan', 'blank-pinned', 'cli', 'settled']);
+    assert.equal(listed.threads[0].subagents, 3, 'both reviews and the nested one; not the provider subagent');
+    assert.equal(listed.threads[4].subagents, 1);
+    assert.equal('subagents' in listed.threads[1], false);
+    assert.equal(listed.threads.some((thread) => thread.subagent), false);
+    // Still reachable: listed on request (following their parent's sidebar state) and readable by id.
+    const withSubagents = await tools.list({ project: 'durango', include_subagents: true, limit: 40 });
+    assert.deepEqual(withSubagents.threads.map((thread) => thread.id), [
+      'settled-child', 'fb1b6e7f-71d5-4572-b781-ea5bdde1d5a4', 'review2', 'nested', parent, 'orphan', 'blank-pinned', 'cli', 'settled',
+    ]);
+    assert.deepEqual(
+      { subagent: withSubagents.threads[1].subagent, parentThreadId: withSubagents.threads[1].parentThreadId },
+      { subagent: true, parentThreadId: parent }
+    );
+    assert.equal(withSubagents.threads[3].parentThreadId, 'review2');
+    const active = await tools.list({ state: 'active', include_subagents: true });
+    assert.equal(active.threads.some((thread) => thread.id === 'settled-child'), false, "a settled parent's subagents aren't active");
+    const settled = await tools.list({ state: 'settled', include_subagents: true });
+    assert.deepEqual(settled.threads.map((thread) => thread.id), ['settled-child', 'settled']);
+    assert.equal(settled.threads[0].settled, true, 'a subagent thread reports its parent\'s sidebar state');
+    await assert.rejects(tools.read({ thread_id: 'native' }), /No thread/, "a provider subagent's transcript isn't a thread of its own");
+    assert.equal((await tools.read({ thread_id: 'fb1b6e7f-71d5-4572-b781-ea5bdde1d5a4' })).transcript, 'page of fb1b6e7f-71d5-4572-b781-ea5bdde1d5a4');
+  });
+
   await test('thread tools: only allowed projects, newest first, by project name; reads resolve unique ids', async () => {
     const entries = [
       { id: 'aaa111', projectId: 'p1', title: 'Old', status: 'idle', activityAt: 1, messageCount: 4 },
