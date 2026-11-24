@@ -22,6 +22,7 @@ import {
   createBotSessionStore,
   botProjectsNote,
   botToolLabel,
+  claudeEffortForBot,
   createBotReplyWorker,
   createClaudeLaneRunner,
   durangoModelIdForClaude,
@@ -2062,6 +2063,51 @@ try {
     const otherAfter = await sessions.begin('other__claude-opus-5-5');
     assert.equal(otherAfter.state?.sessionId, 's-other', 'other bots untouched');
     await sessions.end('other__claude-opus-5-5', null);
+  });
+
+  await test('reasoningEffort is preserved by normalizeBotLane and forwarded as effort to Claude SDK', async () => {
+    assert.equal(claudeEffortForBot('xhigh'), 'xhigh');
+    assert.equal(claudeEffortForBot('none'), 'low');
+    assert.equal(claudeEffortForBot('bogus'), null);
+    const normalized = normalizeBotLane({ laneId: 'l-eff', botId: 'b1', model: 'claude-opus-5-5', reasoningEffort: 'max' });
+    assert.equal(normalized.reasoningEffort, 'max');
+
+    const sdk = createFakeSdk(async function* ({ next }) {
+      await next();
+      yield init('claude-opus-5-5');
+      yield assistant('a1', [{ type: 'text', text: 'Deep answer.' }]);
+      yield success();
+    });
+    const run = createClaudeLaneRunner({
+      loadSdk: async () => sdk,
+      loadZod: async () => zod,
+      createInputQueue,
+      botsDir: path.join(testRoot, 'bots-effort'),
+    });
+    const result = await run(
+      {
+        laneId: 'l-eff',
+        botId: 'b1',
+        botName: 'Durango',
+        threadId: 't1',
+        replyMessageId: 'r1',
+        model: 'claude-opus-5-5',
+        reasoningEffort: 'xhigh',
+        systemPrompt: 'sys',
+        prompt: 'hi',
+        tools: [],
+        attachments: [],
+      },
+      {
+        signal: new AbortController().signal,
+        accessMode: 'full-access',
+        update: () => {},
+        takeInbox: async () => [],
+        callTool: async () => ({ result: null }),
+      }
+    );
+    assert.equal(result.text, 'Deep answer.');
+    assert.equal(sdk.runs[0].options.effort, 'xhigh');
   });
 } finally {
   await fs.rm(testRoot, { recursive: true, force: true });

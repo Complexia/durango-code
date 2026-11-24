@@ -6054,23 +6054,34 @@ ipcMain.handle('bots:list', async () => {
   }
 });
 
-// The person picks a bot's reply model (Bots view header). Only the setting
-// changes: a reply already running finishes on its model, the next one runs on
-// the new one (chat/docs/bots.md → "Switching a bot's model").
+// The person picks a bot's reply model and/or reasoning effort (Bots view header).
+// Only the setting changes: a reply already running finishes on its model, the next
+// one runs on the new one (chat/docs/bots.md → "Switching a bot's model").
 ipcMain.handle('bots:setModel', async (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId : '';
-  const model = typeof input?.model === 'string' ? input.model : '';
-  if (!botId || !model) return { ok: false, error: 'Pick a model.' };
+  const model = typeof input?.model === 'string' && input.model.trim() ? input.model.trim() : '';
+  const reasoningEffort =
+    input?.reasoningEffort === null
+      ? null
+      : typeof input?.reasoningEffort === 'string' && input.reasoningEffort.trim()
+        ? input.reasoningEffort.trim()
+        : undefined;
+  if (!botId || (!model && reasoningEffort === undefined)) return { ok: false, error: 'Pick a model or reasoning level.' };
   if (await localBotsMode()) {
     try {
-      return { ok: true, bot: await localBots.setModel(botId, model) };
+      return { ok: true, bot: await localBots.setModel(botId, model || null, reasoningEffort) };
     } catch (error) {
       return localBotsIpcError(error);
     }
   }
   try {
-    const result = await durangoClient.setBotModel(botId, model);
-    return { ok: true, model: result.model };
+    const result = await durangoClient.setBotModel(botId, model || undefined, reasoningEffort);
+    return {
+      ok: true,
+      ...(result.model ? { model: result.model } : {}),
+      ...(result.reasoningEffort !== undefined ? { reasoningEffort: result.reasoningEffort } : {}),
+      ...(result.bot ? { bot: result.bot } : {}),
+    };
   } catch (error) {
     return durangoIpcError(error);
   }

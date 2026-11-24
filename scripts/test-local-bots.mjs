@@ -513,11 +513,22 @@ test('models: bots on the old default move to Opus, chosen ones stay; switching 
   await assert.rejects(engine.setModel('lbolddefault', 'gpt-9'), /Pick one of the bot models/);
 
   // Chosen survives a restart (it doesn't fall back to the default), and goes to Durango as a choice.
+  const withEffort = await engine.setModel('lbolddefault', null, 'xhigh');
+  assert.equal(withEffort.reasoningEffort, 'xhigh');
+  await engine.send('lbolddefault', { messageId: 'm3', content: 'Think deeper' });
+  await waitFor(() => runner.lanes.length === 3);
+  assert.equal(runner.lanes[2].lane.reasoningEffort, 'xhigh');
+  runner.lanes[2].finish({ text: 'Done.' });
+  await engine.idle();
+
   await engine.stop();
   const again = makeEngine({ dir });
-  assert.equal((await again.engine.list()).bots.find((bot) => bot.id === 'lbolddefault').model, 'claude-sonnet-5-5');
+  const reloaded = (await again.engine.list()).bots.find((bot) => bot.id === 'lbolddefault');
+  assert.equal(reloaded.model, 'claude-sonnet-5-5');
+  assert.equal(reloaded.reasoningEffort, 'xhigh');
   const exported = (await again.engine.exportForSync()).bots;
   assert.equal(exported.find((bot) => bot.localId === 'lbolddefault').modelChosen, true);
+  assert.equal(exported.find((bot) => bot.localId === 'lbolddefault').reasoningEffort, 'xhigh');
   assert.equal(exported.find((bot) => bot.localId === 'lbhaiku').modelChosen, false);
   await again.engine.stop();
 });

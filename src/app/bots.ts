@@ -10,6 +10,8 @@ export type DesktopBot = {
   role: 'primary' | 'bot';
   job: string;
   model: string;
+  /** Optional reasoning effort override ("none", "low", "medium", "high", "xhigh", "max"); null/absent = model default. */
+  reasoningEffort?: string | null;
   /** The bot's current conversation id (rotates when cleared so cached threads reset). */
   threadId?: string;
   status: 'idle' | 'waking' | 'running';
@@ -189,15 +191,109 @@ export type BotsListResult = {
 };
 
 /** A model a bot can be set to. `claude`: it can also reply on a machine's Claude Code (others reply from Durango's cloud). */
-export type BotModelChoice = { id: string; label: string; note: string; claude: boolean };
-export type SetBotModelResult = { ok: boolean; model?: string; bot?: DesktopBot; error?: string; code?: string };
+export type BotModelChoice = {
+  id: string;
+  label: string;
+  note: string;
+  claude: boolean;
+  efforts?: readonly string[];
+  defaultEffort?: string;
+};
+export type SetBotModelResult = {
+  ok: boolean;
+  model?: string;
+  reasoningEffort?: string | null;
+  bot?: DesktopBot;
+  error?: string;
+  code?: string;
+};
 export type RenameBotResult = { ok: boolean; name?: string; bot?: DesktopBot; error?: string; code?: string };
 export type DeleteBotResult = { ok: boolean; error?: string; code?: string };
 export type ClearBotResult = { ok: boolean; bot?: DesktopBot; error?: string; code?: string };
 
+const BOT_EFFORT_ORDER = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+const DEFAULT_BOT_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+
 /** A bot's model as a short name: its choice's label, else the id's last part ("anthropic/claude-opus-5.5" → "claude-opus-5.5"). */
 export const botModelLabel = (model: string, choices: readonly BotModelChoice[] | null | undefined) =>
   choices?.find((choice) => choice.id === model)?.label ?? model.split('/').pop() ?? model;
+
+/** Supported reasoning efforts for a bot model. */
+export const botModelEfforts = (model: string, choices: readonly BotModelChoice[] | null | undefined): readonly string[] => {
+  const choice = choices?.find((item) => item.id === model);
+  if (choice?.efforts?.length) return choice.efforts;
+  if (/gemini/i.test(model)) return ['low', 'medium', 'high'];
+  if (/gpt-6-luna/i.test(model)) return ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
+  return DEFAULT_BOT_EFFORTS;
+};
+
+/** Default reasoning effort for a bot model when none is explicitly set. */
+export const defaultBotReasoningEffort = (model: string, choices: readonly BotModelChoice[] | null | undefined): string => {
+  const choice = choices?.find((item) => item.id === model);
+  if (choice?.defaultEffort) return choice.defaultEffort;
+  if (/haiku/i.test(model)) return 'medium';
+  if (choice?.claude || /claude/i.test(model)) return 'high';
+  return 'medium';
+};
+
+/** Effective reasoning effort a bot runs on for `model`, clamping unsupported tiers. */
+export const effectiveBotReasoningEffort = (
+  model: string,
+  effort: string | null | undefined,
+  choices: readonly BotModelChoice[] | null | undefined
+): string => {
+  const supported = botModelEfforts(model, choices);
+  const clean = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+  if (!clean) return defaultBotReasoningEffort(model, choices);
+  if (supported.includes(clean)) return clean;
+  const rank = BOT_EFFORT_ORDER.indexOf(clean as (typeof BOT_EFFORT_ORDER)[number]);
+  if (rank >= 0) {
+    for (let index = rank - 1; index >= 0; index -= 1) {
+      const candidate = BOT_EFFORT_ORDER[index];
+      if (supported.includes(candidate)) return candidate;
+    }
+    return supported[0] ?? defaultBotReasoningEffort(model, choices);
+  }
+  return defaultBotReasoningEffort(model, choices);
+};
+
+export const botReasoningEffortLabel = (effort: string | null | undefined): string => {
+  switch ((effort ?? '').trim().toLowerCase()) {
+    case 'none':
+      return 'Off';
+    case 'low':
+      return 'Low';
+    case 'medium':
+      return 'Medium';
+    case 'high':
+      return 'High';
+    case 'xhigh':
+      return 'Extra high';
+    case 'max':
+      return 'Max';
+    default:
+      return '';
+  }
+};
+
+export const botReasoningEffortShortLabel = (effort: string | null | undefined): string => {
+  switch ((effort ?? '').trim().toLowerCase()) {
+    case 'none':
+      return 'Off';
+    case 'low':
+      return 'Low';
+    case 'medium':
+      return 'Med';
+    case 'high':
+      return 'High';
+    case 'xhigh':
+      return 'XHigh';
+    case 'max':
+      return 'Max';
+    default:
+      return '';
+  }
+};
 
 /** The bot of a project (by the project's key), if it exists yet. */
 export const projectBotFor = (bots: DesktopBot[], key: string | undefined) =>

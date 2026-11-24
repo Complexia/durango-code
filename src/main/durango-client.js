@@ -371,7 +371,16 @@ const normalizeBotModelChoices = (value) => {
   const choices = value
     .filter((choice) => choice && typeof choice.id === 'string' && choice.id && typeof choice.label === 'string')
     .slice(0, 30)
-    .map((choice) => ({ id: choice.id, label: choice.label, note: typeof choice.note === 'string' ? choice.note : '', claude: choice.claude === true }));
+    .map((choice) => ({
+      id: choice.id,
+      label: choice.label,
+      note: typeof choice.note === 'string' ? choice.note : '',
+      claude: choice.claude === true,
+      ...(Array.isArray(choice.efforts)
+        ? { efforts: choice.efforts.filter((effort) => typeof effort === 'string' && effort).slice(0, 10) }
+        : {}),
+      ...(typeof choice.defaultEffort === 'string' && choice.defaultEffort ? { defaultEffort: choice.defaultEffort } : {}),
+    }));
   return choices.length ? choices : null;
 };
 
@@ -443,6 +452,8 @@ export const normalizeBotLane = (lane) => {
     replyMessageId: str(lane.replyMessageId),
     /** Claude Code model id ("claude-opus-5-5"); null = Claude Code's default. */
     model: str(lane.model).trim() || null,
+    /** Reasoning effort for Claude Code ("low" … "max"); null = CLI default. */
+    reasoningEffort: str(lane.reasoningEffort).trim() || null,
     /** Appended to Claude Code's system prompt. */
     systemPrompt: str(lane.systemPrompt),
     prompt: str(lane.prompt),
@@ -829,10 +840,22 @@ export const createDurangoClient = ({
         modelChoices: normalizeBotModelChoices(data.modelChoices),
       };
     },
-    /** Sets a bot's reply model (one of `modelChoices`) → `{ model }`. */
-    async setBotModel(botId, model) {
-      const data = await request('PATCH', `/bots/${encodeURIComponent(str(botId))}`, { body: { model: str(model) } });
-      return { model: typeof data.model === 'string' ? data.model : str(model) };
+    /** Sets a bot's reply model and/or reasoning effort → `{ model?, reasoningEffort?, bot? }`. */
+    async setBotModel(botId, model, reasoningEffort) {
+      const body = {
+        ...(model ? { model: str(model) } : {}),
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+      };
+      const data = await request('PATCH', `/bots/${encodeURIComponent(str(botId))}`, { body });
+      return {
+        model: typeof data.model === 'string' ? data.model : str(model),
+        ...(data.reasoningEffort === null || typeof data.reasoningEffort === 'string'
+          ? { reasoningEffort: data.reasoningEffort }
+          : reasoningEffort !== undefined
+            ? { reasoningEffort }
+            : {}),
+        ...(data.bot && typeof data.bot === 'object' ? { bot: data.bot } : {}),
+      };
     },
     /** Renames a bot → `{ name, bot? }`. */
     async renameBot(botId, name) {
@@ -1356,8 +1379,11 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     async listBots() {
       return { allowed: true, bots: [], modelChoices: null };
     },
-    async setBotModel(_botId, model) {
-      return { model: str(model) };
+    async setBotModel(_botId, model, reasoningEffort) {
+      return {
+        ...(model ? { model: str(model) } : {}),
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+      };
     },
     async renameBot(_botId, name) {
       return { name: str(name) };

@@ -123,6 +123,16 @@ export const formatBotInbox = (items) =>
     ),
   ].join('\n\n');
 
+const CLAUDE_BOT_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/** A bot lane's reasoning effort mapped to Claude Code's CLI/SDK `effort` option, or null. */
+export const claudeEffortForBot = (value) => {
+  const clean = String(value ?? '').trim().toLowerCase();
+  if (!clean) return null;
+  if (clean === 'none') return 'low';
+  return CLAUDE_BOT_EFFORTS.has(clean) ? clean : null;
+};
+
 /** "claude-opus-5-5" (or "claude-opus-5-5[1m]", "claude-haiku-5-5-20261001") → "anthropic/claude-opus-5.5". */
 export const durangoModelIdForClaude = (model) => {
   const match = String(model ?? '')
@@ -741,6 +751,7 @@ export const createClaudeLaneRunner = ({
     };
     ctx.signal?.addEventListener('abort', onAbort, { once: true });
     const baseEnv = env();
+    const effort = claudeEffortForBot(lane.reasoningEffort);
     try {
       inputQueue.push(userMessage(withAttachments(attemptPlan.prompt)));
       query = sdk.query({
@@ -748,6 +759,7 @@ export const createClaudeLaneRunner = ({
         options: {
           cwd,
           ...(lane.model ? { model: lane.model } : {}),
+          ...(effort ? { effort } : {}),
           systemPrompt: { type: 'preset', preset: 'claude_code', append: attempt.systemAppend },
           settingSources: ['user', 'project', 'local'],
           includePartialMessages: true,

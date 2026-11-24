@@ -30,13 +30,24 @@ const LOCAL_BOT_PREVIOUS_DEFAULT_MODEL = 'claude-sonnet-5-5';
  * they ran on before replies moved to Opus (localLaneModel).
  */
 export const LOCAL_BOT_BACKGROUND_MODEL = 'claude-sonnet-5-5';
+export const LOCAL_BOT_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const LOCAL_BOT_EFFORT_SET = new Set(LOCAL_BOT_REASONING_EFFORTS);
 /** Models a local bot can be set to (its Claude Code on this machine). */
 export const LOCAL_BOT_MODEL_CHOICES = [
-  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', note: 'Smartest (the default)', claude: true },
-  { id: 'claude-fable-5-2', label: 'Claude Fable 5.2', note: 'Deep reasoning', claude: true },
-  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', note: 'Fast and capable', claude: true },
-  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', note: 'Cheapest', claude: true },
+  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', note: 'Smartest (the default)', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-fable-5-2', label: 'Claude Fable 5.2', note: 'Deep reasoning', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', note: 'Fast and capable', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', note: 'Cheapest', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'medium' },
 ];
+
+export const defaultLocalBotReasoningEffort = (model) =>
+  LOCAL_BOT_MODEL_CHOICES.find((choice) => choice.id === model)?.defaultEffort ?? 'high';
+
+export const effectiveLocalBotReasoningEffort = (model, effort) => {
+  const clean = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
+  if (clean === 'none') return 'low';
+  return LOCAL_BOT_EFFORT_SET.has(clean) ? clean : defaultLocalBotReasoningEffort(model);
+};
 export const LOCAL_BOT_COMPACTION_MODEL = 'claude-haiku-5-5';
 export const LOCAL_BOT_PARALLEL_AFTER_MS = 5_000;
 export const LOCAL_BOT_MAX_REPLIES = 2;
@@ -179,6 +190,21 @@ const applyModel = (bot, value) => {
   bot.modelChosen = true;
   if (bot.model === model) return false;
   bot.model = model;
+  return true;
+};
+
+const applyReasoningEffort = (bot, value) => {
+  if (value === null) {
+    if (bot.reasoningEffort === undefined) return false;
+    delete bot.reasoningEffort;
+    return true;
+  }
+  const clean = oneLine(value).toLowerCase();
+  if (!LOCAL_BOT_EFFORT_SET.has(clean)) {
+    throw new Error(`Use a reasoning effort: ${LOCAL_BOT_REASONING_EFFORTS.join(', ')}.`);
+  }
+  if (bot.reasoningEffort === clean) return false;
+  bot.reasoningEffort = clean;
   return true;
 };
 
@@ -412,7 +438,7 @@ export const LOCAL_BOT_TOOLS = [
   },
   {
     name: 'update_bot',
-    description: `Change a bot (yourself by default): its name, job, emoji, Claude model (${LOCAL_BOT_MODEL_CHOICES.map((choice) => `"${choice.id}"`).join(', ')}; the next reply runs on it), or pause/resume it. A paused bot keeps its messages and answers them when resumed.`,
+    description: `Change a bot (yourself by default): its name, job, emoji, Claude model (${LOCAL_BOT_MODEL_CHOICES.map((choice) => `"${choice.id}"`).join(', ')}; the next reply runs on it), reasoning effort (${LOCAL_BOT_REASONING_EFFORTS.map((effort) => `"${effort}"`).join(', ')}), or pause/resume it. A paused bot keeps its messages and answers them when resumed.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -421,6 +447,7 @@ export const LOCAL_BOT_TOOLS = [
         job: { type: 'string', maxLength: 8_000 },
         emoji: { type: 'string', maxLength: 8 },
         model: { type: 'string', maxLength: 80 },
+        reasoning_effort: { type: 'string', enum: LOCAL_BOT_REASONING_EFFORTS },
         paused: { type: 'boolean' },
       },
     },
@@ -528,6 +555,9 @@ const normalizeBot = (raw, now) => {
     model: storedModel(raw, role),
     // Set when the person (or the bot, asked to) chose its model; unset: it follows the default.
     ...(raw?.modelChosen === true ? { modelChosen: true } : {}),
+    ...(typeof raw?.reasoningEffort === 'string' && LOCAL_BOT_EFFORT_SET.has(raw.reasoningEffort.trim().toLowerCase())
+      ? { reasoningEffort: raw.reasoningEffort.trim().toLowerCase() }
+      : {}),
     createdAt: finite(raw?.createdAt, now),
     lastActivityAt: finite(raw?.lastActivityAt, now),
     lastPreview: typeof raw?.lastPreview === 'string' ? raw.lastPreview : null,
@@ -994,6 +1024,7 @@ export const createLocalBotEngine = ({
       role: bot.role,
       job: bot.job,
       model: bot.model,
+      reasoningEffort: bot.reasoningEffort ?? null,
       status: replies.length ? 'running' : waking ? 'waking' : 'idle',
       paused: bot.paused,
       replies,
@@ -1246,6 +1277,12 @@ export const createLocalBotEngine = ({
     };
     // The whole conversation as one prompt (a runner without kept sessions).
     const prompt = planBotPrompt({ botName: bot.name, session, basis: '', busy: true }).prompt;
+    const person = claims.some((message) => message.role === 'user' && inboxSourceOf(message.authorLabel) === 'person');
+    const model = localLaneModel(bot, { person });
+    const reasoningEffort =
+      person || bot.role === 'primary' || bot.modelChosen === true
+        ? effectiveLocalBotReasoningEffort(model, bot.reasoningEffort)
+        : defaultLocalBotReasoningEffort(model);
     return {
       laneId: reply.id,
       botId: bot.id,
@@ -1253,7 +1290,8 @@ export const createLocalBotEngine = ({
       threadId: bot.threadId,
       // The reply's message id in the thread (a kept session knows it has seen it).
       replyMessageId: reply.id,
-      model: localLaneModel(bot, { person: claims.some((message) => message.role === 'user' && inboxSourceOf(message.authorLabel) === 'person') }),
+      model,
+      reasoningEffort,
       systemPrompt: botSystemPrompt(bot),
       prompt,
       session,
@@ -1905,6 +1943,7 @@ export const createLocalBotEngine = ({
           const target = input.bot_id ? entryFor(input.bot_id) : self;
           const { bot } = target;
           if (input.model !== undefined) applyModel(bot, input.model);
+          if (input.reasoning_effort !== undefined) applyReasoningEffort(bot, input.reasoning_effort);
           if (input.name !== undefined && oneLine(input.name)) bot.name = clip(oneLine(input.name), 40);
           if (input.job !== undefined) bot.job = str(input.job).trim();
           if (input.emoji !== undefined) bot.emoji = clip(oneLine(input.emoji), 8) || null;
@@ -1913,7 +1952,7 @@ export const createLocalBotEngine = ({
           changed();
           // Paused: no new replies (one in progress finishes). Resumed: answer what waited.
           if (!bot.paused) wake(target);
-          return { ok: true, bot: { id: bot.id, name: bot.name, model: bot.model, paused: bot.paused } };
+          return { ok: true, bot: { id: bot.id, name: bot.name, model: bot.model, reasoningEffort: bot.reasoningEffort ?? null, paused: bot.paused } };
         }
         case 'message_bot': {
           const target = entryFor(input.bot_id);
@@ -2094,6 +2133,7 @@ export const createLocalBotEngine = ({
         model: durangoModelForLocalBot(bot.model),
         // Picked by the person (or the bot): Durango keeps it; else the bot follows Durango's default.
         modelChosen: bot.modelChosen === true,
+        ...(bot.reasoningEffort ? { reasoningEffort: bot.reasoningEffort } : {}),
         summary: bot.summary,
         ...(bot.earlierSummary ? { earlierSummary: bot.earlierSummary } : {}),
         messages: messages.map((message) => ({
@@ -2149,18 +2189,22 @@ export const createLocalBotEngine = ({
       await ensurePrimary();
       return { allowed: true, bots: sortedEntries().map(toDesktopBot), modelChoices: LOCAL_BOT_MODEL_CHOICES };
     },
-    /** The person picks a bot's model (one of LOCAL_BOT_MODEL_CHOICES); the next reply runs on it. → the bot. */
-    async setModel(botId, model) {
+    /** The person picks a bot's model and/or reasoning effort; the next reply runs on it. → the bot. */
+    async setModel(botId, model, reasoningEffort) {
       await ensureLoaded();
       const entry = entryFor(botId);
-      if (!LOCAL_BOT_MODEL_CHOICES.some((choice) => choice.id === model)) throw new Error('Pick one of the bot models.');
-      const before = { model: entry.bot.model, modelChosen: entry.bot.modelChosen };
-      applyModel(entry.bot, model);
-      // Saved before it is reported: a failed write puts the old model back.
+      if (model && !LOCAL_BOT_MODEL_CHOICES.some((choice) => choice.id === model)) throw new Error('Pick one of the bot models.');
+      if (!model && reasoningEffort === undefined) throw new Error('Pick a model or reasoning level.');
+      const before = { model: entry.bot.model, modelChosen: entry.bot.modelChosen, reasoningEffort: entry.bot.reasoningEffort };
+      if (model) applyModel(entry.bot, model);
+      if (reasoningEffort !== undefined) applyReasoningEffort(entry.bot, reasoningEffort);
+      // Saved before it is reported: a failed write puts the old settings back.
       if (!(await persistBot(entry, { messages: false }))) {
         entry.bot.model = before.model;
         if (before.modelChosen) entry.bot.modelChosen = true;
         else delete entry.bot.modelChosen;
+        if (before.reasoningEffort !== undefined) entry.bot.reasoningEffort = before.reasoningEffort;
+        else delete entry.bot.reasoningEffort;
         throw new Error('Couldn’t save the model on this computer. Try again.');
       }
       changed();

@@ -1641,13 +1641,24 @@ const BotPane: React.FC<{
     return answeredRef.current.map;
   }, [thread?.messages]);
 
-  /** The person picks the bot's reply model: saved, then shown at once (the next poll confirms it). → an error, or null. */
+  /** The person picks the bot's reply model and/or reasoning effort: saved, then shown at once (the next poll confirms it). → an error, or null. */
   const pickModel = useCallback(
-    async (model: string) => {
-      const result = await window.orion?.setBotModel?.({ botId, model });
-      if (!result?.ok) return result?.error ?? 'Couldn’t change the model. Try again.';
-      const saved = result.bot?.model ?? result.model ?? model;
-      setThread((current) => (current ? { ...current, bot: { ...current.bot, model: saved } } : current));
+    async ({ model, reasoningEffort }: { model?: string; reasoningEffort?: string | null }) => {
+      const result = await window.orion?.setBotModel?.({ botId, ...(model ? { model } : {}), ...(reasoningEffort !== undefined ? { reasoningEffort } : {}) });
+      if (!result?.ok) return result?.error ?? 'Couldn’t update the bot. Try again.';
+      setThread((current) => {
+        if (!current) return current;
+        const nextModel = result.bot?.model ?? (model ? result.model ?? model : current.bot.model);
+        const nextEffort =
+          result.bot?.reasoningEffort !== undefined
+            ? result.bot.reasoningEffort
+            : result.reasoningEffort !== undefined
+              ? result.reasoningEffort
+              : reasoningEffort !== undefined
+                ? reasoningEffort
+                : current.bot.reasoningEffort;
+        return { ...current, bot: { ...current.bot, model: nextModel, reasoningEffort: nextEffort } };
+      });
       onChanged();
       return null;
     },
@@ -1722,7 +1733,15 @@ const BotPane: React.FC<{
           <FolderOpen size={13} /> {bot.project.name}
         </button>
       )}
-      {modelChoices?.length ? <BotModelMenu model={bot.model} choices={modelChoices} local={local} onPick={pickModel} /> : null}
+      {modelChoices?.length ? (
+        <BotModelMenu
+          model={bot.model}
+          reasoningEffort={bot.reasoningEffort}
+          choices={modelChoices}
+          local={local}
+          onPick={pickModel}
+        />
+      ) : null}
     </>
   );
   return (
