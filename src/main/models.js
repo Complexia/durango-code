@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { checkCommandAvailable, execFileAsync, shellPathSyncPromise } from './shell-env.js';
 import { fxFallbackModels, listFxModels } from './fx-provider.js';
+import { probeAntigravityModelsOverAcp } from './antigravity-models-probe.js';
 
 // Canonical low→high order of every reasoning tier any harness advertises.
 export const reasoningEffortTiers = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
@@ -254,7 +255,7 @@ export const parseAntigravityEffortVariant = (slug, label) => {
 
 export const antigravityFavoriteModelSlugs = new Set(['gemini-4-neon', 'gemini-3.8-flash']);
 
-const groupAntigravityModelRows = (rows) => {
+export const groupAntigravityModelRows = (rows) => {
   const entries = [];
   const groups = new Map();
   for (const [rawSlug, rawLabel] of rows) {
@@ -847,6 +848,15 @@ export const parseAntigravityModelsOutput = (output) => {
 
 export const listAntigravityModels = async () => {
   if (!(await checkCommandAvailable('agy'))) return [];
+  // Prefer live ACP `configOptions` probing so each model gets its exact
+  // `thought_level` tiers directly from `agy acp`; fall back to `agy models`
+  // text parsing if probing returns nothing (older CLI or transient failure).
+  try {
+    const probed = await probeAntigravityModelsOverAcp({
+      fallbackGroupRows: groupAntigravityModelRows,
+    });
+    if (probed.length > 0) return probed;
+  } catch {}
   try {
     const { stdout } = await execFileAsync('agy', ['models'], {
       timeout: 20000,

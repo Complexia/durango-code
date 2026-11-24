@@ -15,7 +15,7 @@ const ERROR_STEP_TYPE = 17; // CORTEX_STEP_TYPE_ERROR_MESSAGE
 const PLANNER_RESPONSE_STEP_TYPE = 15; // the model answered within this turn
 const PAYLOAD_BYTES = 16384;
 
-const API_ERROR = /Error (\d{3}), Message: (.+?), Status: ([A-Z_]+)/s;
+const API_ERROR = /Error (\d{3}), Message: ((?:(?!, Status: |Error \d{3}, Message: ).)+), Status: ([A-Z_]+|\d{3}[^,\n]*)/s;
 const STATUS_ERROR = /(?<![A-Z_])([A-Z_]+) \(code (\d{3})\): (\P{Cc}+)/u;
 const QUOTA_EXHAUSTED = /\breason:QUOTA_EXHAUSTED\b/;
 const INVALID_THINKING_SIGNATURE =
@@ -25,19 +25,78 @@ const RESET_DELAY = /\bquotaResetDelay:((?:\d+(?:\.\d+)?(?:ns|us|µs|μs|ms|h|m|
 const RETRY_DELAY = /\bretryDelay:((?:\d+(?:\.\d+)?(?:ns|us|µs|μs|ms|h|m|s))+)(?=[\s\]])/;
 const GO_DURATION_PART = /(\d+(?:\.\d+)?)(ns|us|µs|μs|ms|h|m|s)/g;
 const DURATION_UNIT_MS = { ns: 1e-6, us: 1e-3, 'µs': 1e-3, 'μs': 1e-3, ms: 1, s: 1000, m: 60000, h: 3600000 };
+const TRANSIENT_STATUSES = new Set(['UNAVAILABLE', 'INTERNAL', 'DEADLINE_EXCEEDED', 'ABORTED']);
 
 const SESSION_ID = /^[\w-]+$/;
 
 export const antigravityConversationsDir = () =>
   path.join(os.homedir(), '.gemini', 'antigravity-cli', 'conversations');
 
-const sessionDatabasePath = (sessionId) =>
-  typeof sessionId === 'string' && SESSION_ID.test(sessionId)
-    ? path.join(antigravityConversationsDir(), `${sessionId}.db`)
-    : null;
+const isSafeSegment = (segment) =>
+  typeof segment === 'string' &&
+  segment.length > 0 &&
+  segment !== '.' &&
+  segment !== '..' &&
+  !segment.includes('/') &&
+  !segment.includes('\\') &&
+  !segment.includes('\0');
+
+// Walks every managed component under `os.homedir()` using lstat + realpath so
+// a symlinked `.gemini`, `antigravity-cli`, `conversations`, or `<id>.db` is
+// never followed. `os.homedir()` itself is canonicalized first so temp homes
+// under macOS `/var/folders` (`/var` -> `/private/var`) remain valid.
+const resolveSafeSessionDb = (sessionId) => {
+  if (typeof sessionId !== 'string' || !SESSION_ID.test(sessionId)) return null;
+  let realHome;
+  try {
+    realHome = fs.realpathSync(os.homedir());
+  } catch {
+    return null;
+  }
+  const segments = ['.gemini', 'antigravity-cli', 'conversations', `${sessionId}.db`];
+  let current = realHome;
+  let stat = null;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (!isSafeSegment(segment)) return null;
+    current = path.join(current, segment);
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      return null;
+    }
+    if (stat.isSymbolicLink()) return null;
+    const isLeaf = index === segments.length - 1;
+    if (isLeaf ? !stat.isFile() : !stat.isDirectory()) return null;
+  }
+  let realTarget;
+  try {
+    realTarget = fs.realpathSync(current);
+  } catch {
+    return null;
+  }
+  if (realTarget !== current) return null;
+  return { path: realTarget, stat };
+};
+
+const matchesDbIdentity = (stat, identity) => {
+  if (!identity) return true;
+  if (typeof identity !== 'object') return false;
+  return stat.dev === identity.dev && stat.ino === identity.ino;
+};
+
+/**
+ * Snapshots the session DB's filesystem identity (`dev`, `ino`) after
+ * symlink-safe validation, or null if the DB does not exist or fails checks.
+ */
+export const antigravitySnapshotDbIdentity = (sessionId) => {
+  const resolved = resolveSafeSessionDb(sessionId);
+  if (!resolved) return null;
+  return { dev: resolved.stat.dev, ino: resolved.stat.ino };
+};
 
 let sqliteModule;
-const openReadOnly = async (file) => {
+const openReadOnly = async (sessionId, identity = null) => {
   if (sqliteModule === undefined) {
     try {
       sqliteModule = await import('node:sqlite');
@@ -45,10 +104,24 @@ const openReadOnly = async (file) => {
       sqliteModule = null;
     }
   }
-  if (!sqliteModule || !file || !fs.existsSync(file)) return null;
+  if (!sqliteModule) return null;
+  const resolved = resolveSafeSessionDb(sessionId);
+  if (!resolved || !matchesDbIdentity(resolved.stat, identity)) return null;
   let database = null;
   try {
-    database = new sqliteModule.DatabaseSync(file, { readOnly: true });
+    database = new sqliteModule.DatabaseSync(resolved.path, { readOnly: true });
+    // Re-verify after opening to narrow TOCTOU replacement windows.
+    const afterStat = fs.lstatSync(resolved.path);
+    if (
+      afterStat.isSymbolicLink() ||
+      !afterStat.isFile() ||
+      afterStat.dev !== resolved.stat.dev ||
+      afterStat.ino !== resolved.stat.ino ||
+      !matchesDbIdentity(afterStat, identity)
+    ) {
+      database.close();
+      return null;
+    }
     database.exec('PRAGMA busy_timeout = 100');
     const hasSteps = database
       .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'steps'")
@@ -68,7 +141,7 @@ const openReadOnly = async (file) => {
 
 /** The session's last step index before a prompt (-1: none yet, or no database). */
 export const antigravityStepCursor = async (sessionId) => {
-  const database = await openReadOnly(sessionDatabasePath(sessionId));
+  const database = await openReadOnly(sessionId);
   if (!database) return -1;
   try {
     const row = database.prepare('SELECT max(idx) AS idx FROM steps').get();
@@ -99,8 +172,8 @@ const WAITING_STEP_STATUS = 9;
  * database can't be read. A cursor taken when the process started leaves out
  * steps an earlier, killed process left RUNNING.
  */
-export const antigravityConversationWork = async (sessionId, cursor = -1) => {
-  const database = await openReadOnly(sessionDatabasePath(sessionId));
+export const antigravityConversationWork = async (sessionId, cursor = -1, identity = null) => {
+  const database = await openReadOnly(sessionId, identity);
   if (!database) return null;
   try {
     const row = database
@@ -142,10 +215,13 @@ const resetSuffix = (resetAt) =>
     ? ` It resets ${new Date(resetAt).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })}.`
     : '';
 
+const cleanStatus = (rawStatus) => String(rawStatus || '').replace(/[\x00-\x1f].*$/, '').trim();
+
 /**
- * The turn's failure from its error step's text: `{ message, brokenSession }`,
- * or null when the text shows no error. `brokenSession` means every later
- * prompt to this native session would fail the same way.
+ * The turn's failure from its error step's text:
+ * `{ message, brokenSession, retryable, resumeWith? }`, or null when the text
+ * shows no error. `brokenSession` means every later prompt to this native
+ * session would fail the same way.
  */
 export const antigravityFailureFromErrorText = (text, { stopReason, reachedModel = false, now = Date.now() } = {}) => {
   const value = String(text ?? '');
@@ -158,6 +234,7 @@ export const antigravityFailureFromErrorText = (text, { stopReason, reachedModel
     return {
       message: `You have reached your Antigravity quota for this period.${resetSuffix(resetAtFrom(value, now))} Check Settings → Usage.`,
       brokenSession: false,
+      retryable: false,
     };
   }
   if (INVALID_THINKING_SIGNATURE.test(value)) {
@@ -165,27 +242,57 @@ export const antigravityFailureFromErrorText = (text, { stopReason, reachedModel
       message:
         "Antigravity's saved conversation can no longer be sent to the model. Send your message again: Durango Code starts a fresh Antigravity session for it.",
       brokenSession: true,
+      retryable: false,
     };
   }
-  if (!apiError) return { message: 'Antigravity stopped this turn because of an error.', brokenSession: false };
-  const [, httpStatus, rawMessage, status] = apiError;
+  if (!apiError) {
+    return {
+      message: 'Antigravity stopped this turn because of an error.',
+      brokenSession: false,
+      retryable: false,
+    };
+  }
+  const [, httpStatus, rawMessage, rawStatus] = apiError;
   const message = String(rawMessage || '').trim();
+  const status = cleanStatus(rawStatus);
   const rateLimited = httpStatus === '429' || status === 'RESOURCE_EXHAUSTED';
   if (rateLimited) {
     return {
       message: `Antigravity is rate limited: ${message || status}.${resetSuffix(resetAtFrom(value, now))}`,
       brokenSession: false,
+      retryable: false,
     };
   }
   if (httpStatus === '404' && !reachedModel) {
-    return { message: `Antigravity can't use this model: ${message || status}. Pick another Antigravity model.`, brokenSession: false };
+    return {
+      message: `Antigravity can't use this model: ${message || status}. Pick another Antigravity model.`,
+      brokenSession: false,
+      retryable: false,
+    };
   }
-  return { message: `Antigravity: ${message || status} (${status}, HTTP ${httpStatus}).`, brokenSession: false };
+  if (httpStatus === '404' && reachedModel) {
+    return {
+      message: `Antigravity: ${message || status} (${status}, HTTP 404).`,
+      brokenSession: false,
+      retryable: true,
+      resumeWith: 'continue',
+    };
+  }
+  const numericStatus = Number(httpStatus);
+  const retryable =
+    numericStatus === 408 ||
+    (numericStatus >= 500 && numericStatus < 600) ||
+    TRANSIENT_STATUSES.has(status);
+  return {
+    message: `Antigravity: ${message || status} (${status}, HTTP ${httpStatus}).`,
+    brokenSession: false,
+    retryable,
+  };
 };
 
 /** Reads the steps after `cursor`; null when the turn ended cleanly. */
-export const antigravityTurnFailure = async (sessionId, cursor, stopReason) => {
-  const database = await openReadOnly(sessionDatabasePath(sessionId));
+export const antigravityTurnFailure = async (sessionId, cursor, stopReason, identity = null) => {
+  const database = await openReadOnly(sessionId, identity);
   if (!database) return stopReason === 'refusal' ? antigravityFailureFromErrorText('', { stopReason }) : null;
   try {
     const last = database

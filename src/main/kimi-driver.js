@@ -3,7 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { getMimeTypeForMediaPath } from './media.js';
+import { buildAcpPromptBlocks } from './acp-prompt-blocks.js';
 import { killAgentChild } from './run-registry.js';
 import { isPreapprovedOrionTool } from './thread-reader-routing.js';
 import { findKimiSessionIndexEntry } from './session-fork.js';
@@ -323,31 +323,8 @@ export const handleKimiSubagentLine = (value, api, ctx) => {
   }
 };
 
-export const buildKimiPromptBlocks = async (promptText, attachments = []) => {
-  const blocks = [{ type: 'text', text: promptText }];
-  for (const attachment of Array.isArray(attachments) ? attachments : []) {
-    const filePath = typeof attachment?.path === 'string' ? attachment.path : '';
-    if (!filePath) continue;
-
-    const declaredMimeType = String(attachment?.mimeType || '').trim().toLowerCase();
-    const inferredMimeType = getMimeTypeForMediaPath(filePath);
-    const mimeType =
-      declaredMimeType.startsWith('image/') && declaredMimeType !== 'image/*'
-        ? declaredMimeType
-        : inferredMimeType;
-    if (!mimeType.startsWith('image/')) continue;
-
-    try {
-      const data = await fs.readFile(filePath);
-      blocks.push({ type: 'image', data: data.toString('base64'), mimeType });
-    } catch (error) {
-      // The text prompt still contains the local path, so a failed inline read
-      // can fall back to Kimi's ReadMediaFile tool instead of failing the turn.
-      console.warn(`Kimi could not inline attachment "${filePath}".`, error);
-    }
-  }
-  return blocks;
-};
+export const buildKimiPromptBlocks = (promptText, attachments = [], capabilities = { image: true }) =>
+  buildAcpPromptBlocks(promptText, attachments, capabilities);
 
 export const createKimiAcpDriver = ({
   child,
@@ -698,6 +675,9 @@ export const createKimiAcpDriver = ({
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     });
     if (init.error) return fail(init.error);
+    const rawPromptCaps = init.result?.agentCapabilities?.promptCapabilities;
+    const promptCapabilities =
+      rawPromptCaps && typeof rawPromptCaps === 'object' ? rawPromptCaps : { image: true };
     // ACP agents opt in to HTTP MCP transports; stdio is always supported.
     const unsupported = mcpServers.filter((server) => server?.type === 'http');
     if (init.result?.agentCapabilities?.mcpCapabilities?.http !== true && unsupported.length) {
@@ -757,7 +737,7 @@ export const createKimiAcpDriver = ({
     }
 
     const failureLogCursor = await kimiTurnFailureLogCursor(sessionId);
-    const prompt = await buildKimiPromptBlocks(promptText, attachments);
+    const prompt = await buildAcpPromptBlocks(promptText, attachments, promptCapabilities);
     const response = await request('session/prompt', {
       sessionId,
       prompt,

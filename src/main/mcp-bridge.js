@@ -1,11 +1,13 @@
 import { app } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import http from 'node:http';
 import os from 'node:os';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import mcpBridgeShimSource from '../mcp-bridge-shim.cjs?raw';
+import mcpBridgeShimModule from '../mcp-bridge-shim.cjs';
 import { runShellCommand, shellPathSyncPromise } from './shell-env.js';
 import { readThreadForAgent } from './thread-reader.js';
 import { DURANGO_TOOL_NAMES, runDurangoTool } from './durango-tools.js';
@@ -204,6 +206,225 @@ export const mcpBridgeSocketPath = () =>
     ? `\\\\.\\pipe\\orion-mcp-${mcpBridgeInstanceId()}`
     : path.join(app.getPath('userData'), `orion-mcp-${mcpBridgeInstanceId()}.sock`);
 
+const { createOrionMcpBridgeHandler } = mcpBridgeShimModule;
+
+// Shared tool dispatcher used by both the Unix socket bridge (stdio shim) and
+// the direct loopback HTTP MCP endpoint. Always returns a secret-scrubbed
+// `{ ok, text, ... }` result and never rejects.
+export const dispatchBridgeToolCall = async (session, tool, rawArgs) => {
+  const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
+  // `alsoValues`: secrets this call was handed through refs, scrubbed
+  // whatever their length.
+  let alsoValues = [];
+  const finish = (ok, text, extra) =>
+    redactSecrets({ ok, text, ...(extra ?? {}) }, { alsoValues });
+
+  // The shim's tools/list (and the HTTP handler) asks which tools this run
+  // gets beyond its fixed set, so the browser_* schemas live only in
+  // browser-tools.js.
+  if (tool === '__tools') {
+    return finish(true, '', {
+      tools: [
+        ...(hasBuiltinBrowser(session.browserMode) ? browserMcpToolDefinitions(session.accessMode) : []),
+        // The user's other machines, while remote control can reach one.
+        ...(session.machinesEnabled ? machineMcpToolDefinitions(session.accessMode) : []),
+        // The run's MCP servers load on demand (mcp-on-demand.js).
+        ...onDemandMcpToolDefinitions(session.onDemandMcps?.names() ?? []),
+        // Restyling Durango Code itself (theme-tools.js).
+        ...themeMcpToolDefinitions(session.accessMode),
+        // Using Durango Code's own window (app-tools.js).
+        ...appBridgeToolDefinitions(session.accessMode),
+        // The thread's project notes (project-notes-tool.js).
+        ...projectNotesToolDefinitions(),
+      ],
+    });
+  }
+  if (tool === LOAD_TOOLS_TOOL_NAME || tool === CALL_APP_TOOL_NAME) {
+    if (!session.onDemandMcps || session.onDemandMcps.names().length === 0) {
+      return finish(false, 'No connected apps are available in this run.');
+    }
+    // A connected app's tool takes secrets: refs in its arguments become
+    // the values (secret-requests.js).
+    let appArgs = args;
+    if (tool === CALL_APP_TOOL_NAME) {
+      const resolved = resolveSecretRefs(args, { threadId: session.threadId });
+      if (!resolved.ok) return finish(false, resolved.text);
+      appArgs = resolved.value;
+      alsoValues = resolved.values;
+    }
+    try {
+      const { ok, text, content } =
+        tool === LOAD_TOOLS_TOOL_NAME
+          ? await session.onDemandMcps.load(args)
+          : await session.onDemandMcps.call(appArgs, { accessMode: session.accessMode });
+      return finish(ok, text, Array.isArray(content) && content.length ? { content } : undefined);
+    } catch (error) {
+      return finish(false, `${tool} failed: ${error?.message ?? error}`);
+    }
+  }
+  if (BROWSER_TOOL_NAMES.includes(tool)) {
+    if (!hasBuiltinBrowser(session.browserMode)) {
+      return finish(false, 'The built-in browser is turned off for this provider in Durango Code settings.');
+    }
+    try {
+      const { ok, text, images } = await runBrowserTool(tool, args, {
+        ...session,
+        signedInBrowser: signedInBrowserFor(session.browserMode),
+      });
+      return finish(
+        ok,
+        text,
+        images?.length
+          ? {
+              content: [
+                { type: 'text', text },
+                ...images.map((image) => ({ type: 'image', data: image.data, mimeType: image.mimeType })),
+              ],
+            }
+          : undefined
+      );
+    } catch (error) {
+      return finish(false, `Browser tool failed: ${error?.message ?? error}`);
+    }
+  }
+  if (tool === 'spawn_subagent') {
+    if (
+      typeof args.model !== 'string' ||
+      !args.model.trim() ||
+      typeof args.prompt !== 'string' ||
+      !args.prompt.trim()
+    ) {
+      return finish(false, 'spawn_subagent requires string `model` and `prompt` arguments.');
+    }
+    if (args.effort !== undefined && typeof args.effort !== 'string') {
+      return finish(false, 'spawn_subagent takes an optional string `effort` argument.');
+    }
+    const text = await requestSubagentSpawn(session, args, {
+      background: spawnsSubagentsInBackground(session.providerId),
+    });
+    return finish(true, text);
+  }
+  if (tool === 'wait_subagents') {
+    if (args.timeout_seconds !== undefined && typeof args.timeout_seconds !== 'number') {
+      return finish(false, 'wait_subagents takes an optional number `timeout_seconds` argument.');
+    }
+    const outcome = await backgroundSubagents.wait(session.threadId, {
+      timeoutMs: waitSubagentsTimeoutMs(args.timeout_seconds),
+      signal: session.abortController?.signal,
+    });
+    return finish(true, waitSubagentsText(outcome));
+  }
+  if (tool === 'stop_subagent') {
+    if (
+      (args.model !== undefined && typeof args.model !== 'string') ||
+      (args.title !== undefined && typeof args.title !== 'string') ||
+      (args.all !== undefined && typeof args.all !== 'boolean')
+    ) {
+      return finish(
+        false,
+        'stop_subagent takes optional string `model`/`title` and boolean `all` arguments.'
+      );
+    }
+    const text = await requestSubagentStop(session, args);
+    return finish(true, text);
+  }
+  if (tool === 'read_thread') {
+    if (typeof args.thread_id !== 'string' || !args.thread_id.trim()) {
+      return finish(false, 'read_thread requires a string `thread_id` argument.');
+    }
+    try {
+      const text = await readThreadForAgent(args);
+      return finish(true, text);
+    } catch (error) {
+      return finish(false, `Could not read the thread: ${error?.message ?? error}`);
+    }
+  }
+  if (DURANGO_TOOL_NAMES.includes(tool)) {
+    // Resolves (never rejects) with readable text, including when the
+    // user is signed out or Durango is unreachable.
+    try {
+      const { ok, text } = await runDurangoTool(tool, args, { accessMode: session.accessMode });
+      return finish(ok, text);
+    } catch (error) {
+      return finish(false, `Durango request failed: ${error?.message ?? error}`);
+    }
+  }
+  if (USER_ACTION_TOOL_NAMES.includes(tool)) {
+    const { ok, text } = await runUserActionTool(tool, args, session);
+    return finish(ok, text);
+  }
+  if (SECRET_TOOL_NAMES.includes(tool)) {
+    // Blocks until the user answers; the run's release cancels it.
+    const { ok, text } = await runSecretTool(tool, args, { ...session, owner: session });
+    return finish(ok, text);
+  }
+  if (THEME_TOOL_NAMES.includes(tool)) {
+    // Resolves, never rejects; screenshots come back as image blocks.
+    const { ok, text, content } = await runThemeTool(tool, args, {
+      getSender: session.getSender,
+      threadId: session.threadId,
+      runId: session.runId,
+      accessMode: session.accessMode,
+      signal: session.abortController?.signal,
+    });
+    return finish(ok, text, Array.isArray(content) && content.length ? { content } : undefined);
+  }
+  if (APP_TOOL_NAMES.includes(tool)) {
+    // Re-checks the run's access mode; resolves, never rejects. These
+    // providers can't be relied on to ask before an action (Codex approves
+    // every orion tool), so actions need Full access here.
+    const { ok, text, content } = await runAppTool(tool, args, {
+      getSender: session.getSender,
+      threadId: session.threadId,
+      accessMode: session.accessMode,
+      requireFullAccess: true,
+    });
+    return finish(ok, text, Array.isArray(content) && content.length ? { content } : undefined);
+  }
+  if (PROJECT_NOTES_TOOL_NAMES.includes(tool)) {
+    const { ok, text } = await runProjectNotesTool(tool, args, {
+      projectId: session.projectId,
+      projectPath: session.projectPath,
+    });
+    return finish(ok, text);
+  }
+  if (VISUAL_TOOL_NAMES.includes(tool)) {
+    const { ok, text } = await runVisualTool(tool, args, session);
+    return finish(ok, text);
+  }
+  if (DEVICE_TOOL_NAMES.includes(tool)) {
+    // Re-checks the user's device settings and the run's access mode
+    // itself; resolves, never rejects.
+    const { ok, text, content } = await runDeviceTool(tool, args, {
+      threadId: session.threadId,
+      getSender: session.getSender,
+      accessMode: session.accessMode,
+    });
+    return finish(ok, text, Array.isArray(content) && content.length ? { content } : undefined);
+  }
+  if (MACHINE_TOOL_NAMES.includes(tool)) {
+    if (!session.machinesEnabled) {
+      return finish(false, 'No other machine was reachable when this run started.');
+    }
+    // Re-checks remote control and the run's access mode; resolves,
+    // never rejects.
+    const { ok, text } = await runMachineTool(tool, args, {
+      accessMode: session.accessMode,
+      projectPath: session.projectPath,
+      threadId: session.threadId,
+      providerId: session.providerId,
+      modelId: session.modelId,
+      // These providers can't be relied on to ask before a command
+      // (Codex approves every orion tool): Full access only.
+      requireFullAccess: true,
+      // Stopping the run cancels a command there and ends a wait.
+      signal: session.abortController?.signal,
+    });
+    return finish(ok, text);
+  }
+  return finish(false, `Unknown tool: ${tool}`);
+};
+
 export const handleMcpBridgeConnection = (socket) => {
   let buffer = '';
   socket.on('data', (chunk) => {
@@ -218,248 +439,294 @@ export const handleMcpBridgeConnection = (socket) => {
         message = JSON.parse(line);
       } catch {}
       if (!message || message.id === undefined) continue;
-      // `content` (optional) carries MCP content blocks, e.g. images, that
-      // the shim returns as-is; `text` alone becomes one text block.
-      // Scrubbed of saved secrets (request_secret): a tool that was handed one
-      // through a ref may echo it.
-      // `alsoValues`: secrets this call was handed through refs, scrubbed
-      // whatever their length.
-      let alsoValues = [];
-      const reply = (ok, text, extra) => {
+      const sendReply = (payload) => {
         try {
-          socket.write(`${JSON.stringify(redactSecrets({ id: message.id, ok, text, ...(extra ?? {}) }, { alsoValues }))}\n`);
+          socket.write(`${JSON.stringify({ id: message.id, ...payload })}\n`);
         } catch {}
       };
       const session =
         typeof message.token === 'string' && message.token
           ? mcpBridgeSessions.get(message.token)
           : undefined;
-      if (!session) {
-        reply(false, 'This Durango Code agent session token is missing, invalid, or expired.');
-        continue;
-      }
-      const args = message.args && typeof message.args === 'object' ? message.args : {};
-      // The shim's tools/list asks which tools this run gets beyond its fixed
-      // set, so the browser_* schemas live only in browser-tools.js.
-      if (message.tool === '__tools') {
-        reply(true, '', {
-          tools: [
-            ...(hasBuiltinBrowser(session.browserMode) ? browserMcpToolDefinitions(session.accessMode) : []),
-            // The user's other machines, while remote control can reach one.
-            ...(session.machinesEnabled ? machineMcpToolDefinitions(session.accessMode) : []),
-            // The run's MCP servers load on demand (mcp-on-demand.js).
-            ...onDemandMcpToolDefinitions(session.onDemandMcps?.names() ?? []),
-            // Restyling Durango Code itself (theme-tools.js).
-            ...themeMcpToolDefinitions(session.accessMode),
-            // Using Durango Code's own window (app-tools.js).
-            ...appBridgeToolDefinitions(session.accessMode),
-            // The thread's project notes (project-notes-tool.js).
-            ...projectNotesToolDefinitions(),
-          ],
+      if (!session || session.released || session.abortController?.signal?.aborted) {
+        sendReply({
+          ok: false,
+          text: 'This Durango Code agent session token is missing, invalid, or expired.',
         });
         continue;
       }
-      if (message.tool === LOAD_TOOLS_TOOL_NAME || message.tool === CALL_APP_TOOL_NAME) {
-        if (!session.onDemandMcps || session.onDemandMcps.names().length === 0) {
-          reply(false, 'No connected apps are available in this run.');
-          continue;
-        }
-        // A connected app's tool takes secrets: refs in its arguments become
-        // the values (secret-requests.js).
-        let appArgs = args;
-        if (message.tool === CALL_APP_TOOL_NAME) {
-          const resolved = resolveSecretRefs(args, { threadId: session.threadId });
-          if (!resolved.ok) {
-            reply(false, resolved.text);
-            continue;
-          }
-          appArgs = resolved.value;
-          alsoValues = resolved.values;
-        }
-        const pending =
-          message.tool === LOAD_TOOLS_TOOL_NAME
-            ? session.onDemandMcps.load(args)
-            : session.onDemandMcps.call(appArgs, { accessMode: session.accessMode });
-        void pending.then(
-          ({ ok, text, content }) => reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined),
-          (error) => reply(false, `${message.tool} failed: ${error?.message ?? error}`)
-        );
-        continue;
-      }
-      if (BROWSER_TOOL_NAMES.includes(message.tool)) {
-        if (!hasBuiltinBrowser(session.browserMode)) {
-          reply(false, 'The built-in browser is turned off for this provider in Durango Code settings.');
-          continue;
-        }
-        void runBrowserTool(message.tool, args, { ...session, signedInBrowser: signedInBrowserFor(session.browserMode) }).then(
-          ({ ok, text, images }) =>
-            reply(
-              ok,
-              text,
-              images?.length
-                ? {
-                    content: [
-                      { type: 'text', text },
-                      ...images.map((image) => ({ type: 'image', data: image.data, mimeType: image.mimeType })),
-                    ],
-                  }
-                : undefined
-            ),
-          (error) => reply(false, `Browser tool failed: ${error?.message ?? error}`)
-        );
-        continue;
-      }
-      if (message.tool === 'spawn_subagent') {
-        if (
-          typeof args.model !== 'string' ||
-          !args.model.trim() ||
-          typeof args.prompt !== 'string' ||
-          !args.prompt.trim()
-        ) {
-          reply(false, 'spawn_subagent requires string `model` and `prompt` arguments.');
-          continue;
-        }
-        if (args.effort !== undefined && typeof args.effort !== 'string') {
-          reply(false, 'spawn_subagent takes an optional string `effort` argument.');
-          continue;
-        }
-        void requestSubagentSpawn(session, args, {
-          background: spawnsSubagentsInBackground(session.providerId),
-        }).then((text) => reply(true, text));
-        continue;
-      }
-      if (message.tool === 'wait_subagents') {
-        if (args.timeout_seconds !== undefined && typeof args.timeout_seconds !== 'number') {
-          reply(false, 'wait_subagents takes an optional number `timeout_seconds` argument.');
-          continue;
-        }
-        void backgroundSubagents
-          .wait(session.threadId, {
-            timeoutMs: waitSubagentsTimeoutMs(args.timeout_seconds),
-            signal: session.abortController?.signal,
-          })
-          .then((outcome) => reply(true, waitSubagentsText(outcome)));
-        continue;
-      }
-      if (message.tool === 'stop_subagent') {
-        if (
-          (args.model !== undefined && typeof args.model !== 'string') ||
-          (args.title !== undefined && typeof args.title !== 'string') ||
-          (args.all !== undefined && typeof args.all !== 'boolean')
-        ) {
-          reply(
-            false,
-            'stop_subagent takes optional string `model`/`title` and boolean `all` arguments.'
-          );
-          continue;
-        }
-        void requestSubagentStop(session, args).then((text) => reply(true, text));
-        continue;
-      }
-      if (message.tool === 'read_thread') {
-        if (typeof args.thread_id !== 'string' || !args.thread_id.trim()) {
-          reply(false, 'read_thread requires a string `thread_id` argument.');
-          continue;
-        }
-        void readThreadForAgent(args).then(
-          (text) => reply(true, text),
-          (error) => reply(false, `Could not read the thread: ${error?.message ?? error}`)
-        );
-        continue;
-      }
-      if (DURANGO_TOOL_NAMES.includes(message.tool)) {
-        // Resolves (never rejects) with readable text, including when the
-        // user is signed out or Durango is unreachable.
-        void runDurangoTool(message.tool, args, { accessMode: session.accessMode }).then(
-          ({ ok, text }) => reply(ok, text),
-          (error) => reply(false, `Durango request failed: ${error?.message ?? error}`)
-        );
-        continue;
-      }
-      if (USER_ACTION_TOOL_NAMES.includes(message.tool)) {
-        void runUserActionTool(message.tool, args, session).then(({ ok, text }) => reply(ok, text));
-        continue;
-      }
-      if (SECRET_TOOL_NAMES.includes(message.tool)) {
-        // Blocks until the user answers; the run's release cancels it.
-        void runSecretTool(message.tool, args, { ...session, owner: session }).then(({ ok, text }) => reply(ok, text));
-        continue;
-      }
-      if (THEME_TOOL_NAMES.includes(message.tool)) {
-        // Resolves, never rejects; screenshots come back as image blocks.
-        void runThemeTool(message.tool, args, {
-          getSender: session.getSender,
-          threadId: session.threadId,
-          runId: session.runId,
-          accessMode: session.accessMode,
-          signal: session.abortController?.signal,
-        }).then(({ ok, text, content }) =>
-          reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
-        );
-        continue;
-      }
-      if (APP_TOOL_NAMES.includes(message.tool)) {
-        // Re-checks the run's access mode; resolves, never rejects. These
-        // providers can't be relied on to ask before an action (Codex approves
-        // every orion tool), so actions need Full access here.
-        void runAppTool(message.tool, args, {
-          getSender: session.getSender,
-          threadId: session.threadId,
-          accessMode: session.accessMode,
-          requireFullAccess: true,
-        }).then(({ ok, text, content }) =>
-          reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
-        );
-        continue;
-      }
-      if (PROJECT_NOTES_TOOL_NAMES.includes(message.tool)) {
-        void runProjectNotesTool(message.tool, args, { projectId: session.projectId, projectPath: session.projectPath }).then(({ ok, text }) =>
-          reply(ok, text)
-        );
-        continue;
-      }
-      if (VISUAL_TOOL_NAMES.includes(message.tool)) {
-        void runVisualTool(message.tool, args, session).then(({ ok, text }) => reply(ok, text));
-        continue;
-      }
-      if (DEVICE_TOOL_NAMES.includes(message.tool)) {
-        // Re-checks the user's device settings and the run's access mode
-        // itself; resolves, never rejects.
-        void runDeviceTool(message.tool, args, {
-          threadId: session.threadId,
-          getSender: session.getSender,
-          accessMode: session.accessMode,
-        }).then(({ ok, text, content }) =>
-          reply(ok, text, Array.isArray(content) && content.length ? { content } : undefined)
-        );
-        continue;
-      }
-      if (MACHINE_TOOL_NAMES.includes(message.tool)) {
-        if (!session.machinesEnabled) {
-          reply(false, 'No other machine was reachable when this run started.');
-          continue;
-        }
-        // Re-checks remote control and the run's access mode; resolves,
-        // never rejects.
-        void runMachineTool(message.tool, args, {
-          accessMode: session.accessMode,
-          projectPath: session.projectPath,
-          threadId: session.threadId,
-          providerId: session.providerId,
-          modelId: session.modelId,
-          // These providers can't be relied on to ask before a command
-          // (Codex approves every orion tool): Full access only.
-          requireFullAccess: true,
-          // Stopping the run cancels a command there and ends a wait.
-          signal: session.abortController.signal,
-        }).then(({ ok, text }) => reply(ok, text));
-        continue;
-      }
-      reply(false, `Unknown tool: ${message.tool}`);
+      void dispatchBridgeToolCall(session, message.tool, message.args).then(sendReply);
     }
   });
   socket.on('error', () => {});
 };
+
+// -------------------- Direct HTTP MCP bridge (Streamable HTTP) --------------------
+// ACP providers that advertise `mcpCapabilities.http === true` (e.g. Antigravity)
+// connect directly to this loopback HTTP endpoint with a per-run bearer token
+// instead of spawning an ELECTRON_RUN_AS_NODE stdio shim child process.
+const MCP_HTTP_MAX_BODY_BYTES = 10 * 1024 * 1024;
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+const isAllowedLoopbackHost = (hostHeader, expectedPort) => {
+  if (typeof hostHeader !== 'string' || !hostHeader.trim()) return false;
+  try {
+    const parsed = new URL(`http://${hostHeader.trim()}`);
+    if (parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+      return false;
+    }
+    if (!LOOPBACK_HOSTNAMES.has(parsed.hostname.toLowerCase())) return false;
+    if (expectedPort && (!parsed.port || Number(parsed.port) !== expectedPort)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const isAllowedOrigin = (originHeader) => {
+  if (originHeader === undefined) return true;
+  if (typeof originHeader !== 'string' || !originHeader.trim()) return false;
+  try {
+    const parsed = new URL(originHeader.trim());
+    return LOOPBACK_HOSTNAMES.has(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+};
+
+const constantTimeTokenEqual = (presented, candidate) => {
+  const presentedBuf = Buffer.from(presented, 'utf8');
+  const candidateBuf = Buffer.from(candidate, 'utf8');
+  if (presentedBuf.length !== candidateBuf.length) return false;
+  return crypto.timingSafeEqual(presentedBuf, candidateBuf);
+};
+
+const authenticateMcpHttpSession = (authHeader) => {
+  if (typeof authHeader !== 'string') return null;
+  const match = /^Bearer\s+(\S+)$/i.exec(authHeader.trim());
+  if (!match) return null;
+  const presented = match[1];
+  let matchedSession = null;
+  for (const [candidateToken, candidateSession] of mcpBridgeSessions.entries()) {
+    if (constantTimeTokenEqual(presented, candidateToken)) {
+      matchedSession = candidateSession;
+    }
+  }
+  return matchedSession;
+};
+
+const getHttpMcpHandler = (session) => {
+  if (!session.httpMcpHandler) {
+    session.httpMcpHandler = createOrionMcpBridgeHandler({
+      devicesEnabled: session.devicesEnabled === true,
+      compactTools:
+        session.compactTools !== undefined
+          ? session.compactTools === true
+          : !providerDefersMcpToolsNatively(session.providerId),
+      describeServer:
+        session.describeServer !== undefined
+          ? session.describeServer === true
+          : session.providerId === 'codex',
+      backgroundSubagents:
+        session.backgroundSubagents !== undefined
+          ? session.backgroundSubagents === true
+          : spawnsSubagentsInBackground(session.providerId),
+      cacheExtraTools: false,
+      callOrion: (tool, args) => {
+        if (session.released || session.abortController?.signal?.aborted) {
+          return Promise.resolve({ ok: false, text: 'This agent turn has already ended.' });
+        }
+        return dispatchBridgeToolCall(session, tool, args);
+      },
+    });
+  }
+  return session.httpMcpHandler;
+};
+
+const sendHttpJson = (res, status, payload, extraHeaders = {}) => {
+  if (res.writableEnded || res.destroyed) return;
+  res.writeHead(status, { 'Content-Type': 'application/json', ...extraHeaders });
+  res.end(JSON.stringify(payload));
+};
+
+const readHttpRequestBody = (req, maxBytes = MCP_HTTP_MAX_BODY_BYTES) =>
+  new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    req.on('data', (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) {
+        const error = new Error('Request body too large');
+        error.code = 'PAYLOAD_TOO_LARGE';
+        fail(error);
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', fail);
+  });
+
+const handleMcpHttpJsonRpcMessage = async (handler, message) => {
+  if (!isPlainRecord(message)) {
+    return {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32600, message: 'Invalid Request' },
+    };
+  }
+  if (typeof message.method !== 'string') {
+    const hasId = Object.prototype.hasOwnProperty.call(message, 'id') && message.id !== undefined;
+    // A JSON-RPC response sent by the client has no method; accept silently.
+    if (!hasId || Object.prototype.hasOwnProperty.call(message, 'result') || Object.prototype.hasOwnProperty.call(message, 'error')) {
+      return null;
+    }
+    return {
+      jsonrpc: '2.0',
+      id: message.id,
+      error: { code: -32600, message: 'Invalid Request' },
+    };
+  }
+  return handler.handleMessage(message);
+};
+
+const handleMcpHttpRequest = async (req, res, expectedPort) => {
+  try {
+    if (!isAllowedLoopbackHost(req.headers.host, expectedPort) || !isAllowedOrigin(req.headers.origin)) {
+      sendHttpJson(res, 403, { error: 'Forbidden' });
+      return;
+    }
+    let pathname = '/';
+    try {
+      pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+    } catch {
+      sendHttpJson(res, 400, { error: 'Invalid URL' });
+      return;
+    }
+    if (pathname !== '/mcp') {
+      sendHttpJson(res, 404, { error: 'Not found' });
+      return;
+    }
+    const session = authenticateMcpHttpSession(req.headers.authorization);
+    if (!session || session.released || session.abortController?.signal?.aborted) {
+      sendHttpJson(res, 401, { error: 'Unauthorized' }, { 'WWW-Authenticate': 'Bearer' });
+      return;
+    }
+    const expectedGeneration = session.turnGeneration ?? 0;
+    const isSessionStillValid = () =>
+      !session.released &&
+      authenticateMcpHttpSession(req.headers.authorization) === session &&
+      (session.turnGeneration ?? 0) === expectedGeneration &&
+      !session.abortController?.signal?.aborted;
+    const method = (req.method || '').toUpperCase();
+    if (method === 'GET') {
+      sendHttpJson(res, 405, { error: 'Method not allowed' }, { Allow: 'POST, DELETE' });
+      return;
+    }
+    if (method === 'DELETE') {
+      session.httpMcpHandler = null;
+      if (!res.writableEnded && !res.destroyed) res.writeHead(204).end();
+      return;
+    }
+    if (method !== 'POST') {
+      sendHttpJson(res, 405, { error: 'Method not allowed' }, { Allow: 'POST, DELETE' });
+      return;
+    }
+    let rawBody;
+    try {
+      rawBody = await readHttpRequestBody(req);
+    } catch (error) {
+      if (error?.code === 'PAYLOAD_TOO_LARGE') {
+        sendHttpJson(res, 413, { error: 'Request body too large' });
+        return;
+      }
+      throw error;
+    }
+    // Revalidate token registration, turn generation, and abort state after
+    // awaiting the request body so a late-arriving body cannot execute after
+    // the turn stopped, rebound, or released its bridge token.
+    if (!isSessionStillValid()) {
+      sendHttpJson(res, 401, { error: 'Unauthorized' }, { 'WWW-Authenticate': 'Bearer' });
+      return;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      sendHttpJson(res, 400, {
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32700, message: 'Parse error' },
+      });
+      return;
+    }
+    const handler = getHttpMcpHandler(session);
+    const dispatchGuarded = (entry) => {
+      if (!isSessionStillValid()) {
+        return Promise.resolve({
+          jsonrpc: '2.0',
+          id: isPlainRecord(entry) && entry.id !== undefined ? entry.id : null,
+          error: { code: -32001, message: 'Session ended.' },
+        });
+      }
+      return handleMcpHttpJsonRpcMessage(handler, entry);
+    };
+    if (Array.isArray(payload)) {
+      if (payload.length === 0) {
+        sendHttpJson(res, 400, {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'Invalid Request' },
+        });
+        return;
+      }
+      const replies = (
+        await Promise.all(payload.map((entry) => dispatchGuarded(entry)))
+      ).filter((reply) => reply !== null);
+      if (replies.length === 0) {
+        if (!res.writableEnded && !res.destroyed) res.writeHead(202).end();
+        return;
+      }
+      sendHttpJson(res, 200, replies);
+      return;
+    }
+    if (!isPlainRecord(payload)) {
+      sendHttpJson(res, 400, {
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32600, message: 'Invalid Request' },
+      });
+      return;
+    }
+    const reply = await dispatchGuarded(payload);
+    if (reply === null) {
+      if (!res.writableEnded && !res.destroyed) res.writeHead(202).end();
+      return;
+    }
+    sendHttpJson(res, 200, reply);
+  } catch (error) {
+    console.error('Orion HTTP MCP bridge request error:', error);
+    sendHttpJson(res, 500, {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32603, message: 'Internal error' },
+    });
+  }
+};
+
+let mcpBridgeServer = null;
+let mcpHttpServer = null;
 
 export let mcpBridgePromise = null;
 export const ensureMcpBridge = () => {
@@ -487,6 +754,7 @@ export const ensureMcpBridge = () => {
           resolve();
         });
       });
+      mcpBridgeServer = server;
       return { shimPath, socketPath };
     })().catch((error) => {
       // Allow a later run to retry a failed setup instead of caching the error.
@@ -495,6 +763,91 @@ export const ensureMcpBridge = () => {
     });
   }
   return mcpBridgePromise;
+};
+
+export let mcpHttpBridgePromise = null;
+export const ensureMcpHttpBridge = () => {
+  if (!mcpHttpBridgePromise) {
+    mcpHttpBridgePromise = (async () => {
+      let port = 0;
+      const server = http.createServer((req, res) => {
+        void handleMcpHttpRequest(req, res, port);
+      });
+      await new Promise((resolve, reject) => {
+        const onStartupError = (error) => reject(error);
+        server.once('error', onStartupError);
+        server.listen(0, '127.0.0.1', () => {
+          server.off('error', onStartupError);
+          server.on('error', (error) => console.error('Orion HTTP MCP bridge server error:', error));
+          const address = server.address();
+          port = typeof address === 'object' && address ? address.port : 0;
+          resolve();
+        });
+      });
+      mcpHttpServer = server;
+      return { port, httpUrl: `http://127.0.0.1:${port}/mcp` };
+    })().catch((error) => {
+      mcpHttpBridgePromise = null;
+      throw error;
+    });
+  }
+  return mcpHttpBridgePromise;
+};
+
+export const closeMcpBridge = async () => {
+  const socketServer = mcpBridgeServer;
+  const httpServer = mcpHttpServer;
+  const pendingSocket = mcpBridgePromise;
+  const pendingHttp = mcpHttpBridgePromise;
+  mcpBridgeServer = null;
+  mcpHttpServer = null;
+  mcpBridgePromise = null;
+  mcpHttpBridgePromise = null;
+
+  const closeServer = (server) =>
+    new Promise((resolve) => {
+      if (!server) {
+        resolve();
+        return;
+      }
+      try {
+        server.closeAllConnections?.();
+      } catch {}
+      try {
+        server.close(() => resolve());
+      } catch {
+        resolve();
+      }
+    });
+
+  await Promise.all([
+    closeServer(socketServer),
+    closeServer(httpServer),
+    pendingSocket
+      ?.then(() => {
+        if (mcpBridgeServer && mcpBridgeServer !== socketServer) {
+          const late = mcpBridgeServer;
+          mcpBridgeServer = null;
+          return closeServer(late);
+        }
+      })
+      .catch(() => {}),
+    pendingHttp
+      ?.then(() => {
+        if (mcpHttpServer && mcpHttpServer !== httpServer) {
+          const late = mcpHttpServer;
+          mcpHttpServer = null;
+          return closeServer(late);
+        }
+      })
+      .catch(() => {}),
+  ]);
+
+  if (process.platform !== 'win32') {
+    try {
+      await fs.unlink(mcpBridgeSocketPath());
+    } catch {}
+  }
 };
 
 // Registers a run with the bridge and returns everything the provider needs
@@ -580,7 +933,13 @@ export const registerMcpBridgeForRun = async ({
 }) => {
   try {
     await legacyMcpCleanupPromise;
-    const { shimPath, socketPath } = await ensureMcpBridge();
+    const [{ shimPath, socketPath }, httpBridge] = await Promise.all([
+      ensureMcpBridge(),
+      ensureMcpHttpBridge().catch((error) => {
+        console.error('Orion HTTP MCP bridge unavailable:', error);
+        return null;
+      }),
+    ]);
     const token = crypto.randomUUID();
     // ELECTRON_RUN_AS_NODE turns Orion's own binary into a plain Node runtime;
     // forge.config.js deliberately keeps that fuse enabled for this shim.
@@ -591,6 +950,13 @@ export const registerMcpBridgeForRun = async ({
     // --compact-tools: the provider would put every tool's full definition
     // in each request, so the shim lists summaries and load_tools serves the
     // rest. Providers that defer MCP tools themselves get the full list.
+    const compactTools = !providerDefersMcpToolsNatively(providerId);
+    // spawn_subagent returns once the subthread starts and wait_subagents
+    // collects reports (background-subagents.js).
+    const backgroundSubagents = spawnsSubagentsInBackground(providerId);
+    // Codex lists the server as a deferred namespace: give it a one-line
+    // description of what the tools are for.
+    const describeServer = providerId === 'codex';
     const args = [
       shimPath,
       '--socket',
@@ -598,13 +964,9 @@ export const registerMcpBridgeForRun = async ({
       '--token',
       token,
       ...(devicesEnabled ? ['--devices'] : []),
-      ...(providerDefersMcpToolsNatively(providerId) ? [] : ['--compact-tools']),
-      // spawn_subagent returns once the subthread starts and wait_subagents
-      // collects reports (background-subagents.js).
-      ...(spawnsSubagentsInBackground(providerId) ? ['--background-subagents'] : []),
-      // Codex lists the server as a deferred namespace: give it a one-line
-      // description of what the tools are for.
-      ...(providerId === 'codex' ? ['--instructions'] : []),
+      ...(compactTools ? ['--compact-tools'] : []),
+      ...(backgroundSubagents ? ['--background-subagents'] : []),
+      ...(describeServer ? ['--instructions'] : []),
     ];
     // The run's MCP servers stay out of the provider's config: the bridge
     // connects them only when the agent loads them (mcp-on-demand.js).
@@ -626,11 +988,17 @@ export const registerMcpBridgeForRun = async ({
       modelId,
       accessMode,
       browserMode,
+      devicesEnabled,
+      compactTools,
+      backgroundSubagents,
+      describeServer,
       onDemandMcps,
       // Fixed for the run, like the device tools (each call re-checks).
       machinesEnabled: machineToolsAvailable(),
       // Aborted when the run ends: tool calls still in flight stop.
       abortController: new AbortController(),
+      released: false,
+      turnGeneration: 1,
     };
     mcpBridgeSessions.set(token, session);
     return {
@@ -641,6 +1009,12 @@ export const registerMcpBridgeForRun = async ({
       args,
       pluginDir,
       tokenRoot,
+      ...(httpBridge
+        ? {
+            httpUrl: httpBridge.httpUrl,
+            httpHeaders: [{ name: 'Authorization', value: `Bearer ${token}` }],
+          }
+        : {}),
       // Provider-specific MCP intakes (ACP session params, OpenCode inline
       // config, Muse root) get only the bridge: the run's own servers load
       // on demand through it.
@@ -650,8 +1024,37 @@ export const registerMcpBridgeForRun = async ({
       setBrowserMode: (mode) => {
         session.browserMode = mode;
       },
+      // Persistent ACP sessions (Antigravity) reuse one MCP bridge lease across
+      // turns so the registered server stays connected; each turn refreshes the
+      // mutable per-turn metadata and gets a fresh AbortController.
+      rebindTurn: ({
+        runId: nextRunId,
+        modelId: nextModelId,
+        accessMode: nextAccessMode,
+        browserMode: nextBrowserMode,
+        getSender: nextGetSender,
+      } = {}) => {
+        if (nextRunId) session.runId = nextRunId;
+        if (nextModelId) session.modelId = nextModelId;
+        if (nextAccessMode) session.accessMode = nextAccessMode;
+        if (nextBrowserMode !== undefined) session.browserMode = nextBrowserMode;
+        if (typeof nextGetSender === 'function') session.getSender = nextGetSender;
+        session.turnGeneration = (session.turnGeneration ?? 0) + 1;
+        session.abortController = new AbortController();
+      },
+      abortTurn: () => {
+        session.turnGeneration = (session.turnGeneration ?? 0) + 1;
+        // Leave `abortController` aborted while the warm session sits idle so
+        // no out-of-turn MCP call can execute until `rebindTurn()` starts the
+        // next turn with a fresh controller.
+        session.abortController.abort();
+        cancelSecretRequests({ owner: session });
+      },
       release: () => {
+        session.released = true;
+        session.turnGeneration = (session.turnGeneration ?? 0) + 1;
         mcpBridgeSessions.delete(token);
+        session.httpMcpHandler = null;
         session.abortController.abort();
         cancelSecretRequests({ owner: session });
         void onDemandMcps.close();
@@ -754,6 +1157,21 @@ export const orionAcpMcpServers = (orionMcp) =>
         },
       ]
     : [];
+
+// Direct HTTP ACP wire shape for providers advertising `mcpCapabilities.http === true`.
+// Falls back to the stdio shim when the HTTP endpoint is unavailable.
+export const orionAcpHttpMcpServers = (orionMcp) =>
+  orionMcp?.httpUrl
+    ? [
+        ...acpOrionMcpServers(orionMcp.userServers),
+        {
+          type: 'http',
+          name: 'orion',
+          url: orionMcp.httpUrl,
+          headers: Array.isArray(orionMcp.httpHeaders) ? orionMcp.httpHeaders : [],
+        },
+      ]
+    : orionAcpMcpServers(orionMcp);
 
 export const openCodeMcpConfigContent = (orionMcp, existingContent) => {
   if (!orionMcp) return null;

@@ -202,6 +202,7 @@ import {
 import { resolveOrionMainDriverModel } from './app/orionDriver';
 import {
   accessModeOptions,
+  antigravityAccessModeOptions,
   buildDurangoWorkspaceContext,
   buildGeneralInstructionsContext,
   buildLinkedTaskContext,
@@ -1067,6 +1068,9 @@ const App: React.FC = () => {
   const [slashCommandsByProject, setSlashCommandsByProject] = useState<
     Record<string, SlashCommandInfo[]>
   >({});
+  const [antigravitySlashCommandsByProject, setAntigravitySlashCommandsByProject] = useState<
+    Record<string, SlashCommandInfo[]>
+  >({});
   const [activeProviderTab, setActiveProviderTab] = useState<AgentProviderId>('grok');
   const [codexSettingsOpen, setCodexSettingsOpen] = useState(false);
   const [accessModeOpen, setAccessModeOpen] = useState(false);
@@ -1662,8 +1666,12 @@ const App: React.FC = () => {
     selectedOpenCodeReasoningOptions.find((option) => option.value === selectedOpenCodeReasoning)?.label ??
     'Default';
   const selectedAccessMode = selectedThread?.accessMode ?? 'full-access';
+  const selectedAccessModeOptions =
+    selectedAgentModel?.providerId === 'antigravity' ? antigravityAccessModeOptions : accessModeOptions;
   const selectedAccessModeLabel =
-    accessModeOptions.find((option) => option.value === selectedAccessMode)?.label ?? 'Full access';
+    selectedAccessModeOptions.find((option) => option.value === selectedAccessMode)?.label ??
+    antigravityAccessModeOptions.find((option) => option.value === selectedAccessMode)?.label ??
+    'Full access';
   const shouldShowAgentSettings =
     !isTerminalThread &&
     (selectedAgentModel?.providerId === 'codex' ||
@@ -1767,11 +1775,14 @@ const App: React.FC = () => {
     ((selectedAgentModel?.providerId === 'orion' || isOrionModelId(selectedThread?.modelId ?? '')) &&
       findAgentModel(agentModels, normalizedOrchestrationSettings.models.mainDriver)?.providerId ===
         'claude');
-  // The selected project's live Claude command list for the Composer's
-  // slash menu (null until reported; the menu falls back to a static list).
-  const selectedThreadSlashCommands = selectedThreadProjectPath
-    ? (slashCommandsByProject[selectedThreadProjectPath] ?? null)
-    : null;
+  const selectedThreadAntigravity = selectedAgentModel?.providerId === 'antigravity';
+  // The selected project's live command list for the Composer's slash menu
+  // (null until reported; the menu falls back to a static list).
+  const selectedThreadSlashCommands = !selectedThreadProjectPath
+    ? null
+    : selectedThreadAntigravity
+      ? (antigravitySlashCommandsByProject[selectedThreadProjectPath] ?? null)
+      : (slashCommandsByProject[selectedThreadProjectPath] ?? null);
   // Role-model options for Settings → Orchestration: every real model grouped
   // by provider. The Orion pseudo-model can't delegate to itself.
   const orchestrationModelGroups = useMemo(
@@ -3009,37 +3020,52 @@ const App: React.FC = () => {
     });
   }, [setThreadAgentSession]);
 
-  // Live slash-command lists pushed by Claude sessions (on init and on
-  // mid-session commands_changed). Full replacement per project.
+  // Live slash-command lists pushed by Claude or Antigravity sessions.
+  // Full replacement per project (kept separate per provider).
   useEffect(() => {
     if (!window.orion?.onSlashCommands) return undefined;
-    return window.orion.onSlashCommands(({ projectPath, commands }) => {
-      setSlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+    return window.orion.onSlashCommands(({ projectPath, providerId, commands }) => {
+      if (providerId === 'antigravity') {
+        setAntigravitySlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+      } else {
+        setSlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+      }
     });
   }, []);
 
-  // Prefetch the project's command list when a Claude-backed thread is
-  // selected, so the first "/" keystroke shows real commands instead of the
-  // static fallback. Main answers from a live session or its cache; for a
-  // cold project it boots a short-lived promptless CLI to harvest the list
-  // (a couple of seconds — the fallback covers the gap).
+  // Prefetch the project's command list when a Claude-backed or Antigravity
+  // thread is selected, so the first "/" keystroke shows real commands and
+  // discovered skills instead of only the static fallback.
   useEffect(() => {
-    if (!selectedThreadClaudeBacked || !selectedThreadProjectPath || !selectedThreadId) return;
-    if (slashCommandsByProject[selectedThreadProjectPath]) return;
+    if ((!selectedThreadClaudeBacked && !selectedThreadAntigravity) || !selectedThreadProjectPath || !selectedThreadId) {
+      return;
+    }
+    const providerKey = selectedThreadAntigravity ? 'antigravity' : 'claude';
+    const existing =
+      providerKey === 'antigravity'
+        ? antigravitySlashCommandsByProject[selectedThreadProjectPath]
+        : slashCommandsByProject[selectedThreadProjectPath];
+    if (existing) return;
     let cancelled = false;
     const projectPath = selectedThreadProjectPath;
     void window.orion
-      ?.listSlashCommands?.({ threadId: selectedThreadId, projectPath })
+      ?.listSlashCommands?.({ threadId: selectedThreadId, projectPath, providerId: providerKey })
       .then((result) => {
         if (cancelled || !result?.ok || !result.commands) return;
         const commands = result.commands;
-        setSlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+        if (providerKey === 'antigravity') {
+          setAntigravitySlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+        } else {
+          setSlashCommandsByProject((prev) => ({ ...prev, [projectPath]: commands }));
+        }
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [
+    antigravitySlashCommandsByProject,
+    selectedThreadAntigravity,
     selectedThreadClaudeBacked,
     selectedThreadId,
     selectedThreadProjectPath,
@@ -4882,6 +4908,8 @@ const App: React.FC = () => {
           completedAt: new Date().toISOString(),
           statusText: authProviderId ? 'The agent is logged out.' : 'The agent stopped with an error.',
           error: event.error,
+          retryable: !authProviderId && event.retryable ? true : undefined,
+          resumeWith: !authProviderId && event.retryable ? (event.resumeWith ?? 'continue') : undefined,
           authProviderId,
           changedFiles: event.changedFiles ?? [],
         });
@@ -6030,24 +6058,38 @@ const App: React.FC = () => {
       if (thread.durangoWorkspace && !thread.agentSessionIds?.[model.providerId]) {
         addAgentContext(buildDurangoWorkspaceContext(thread.durangoWorkspace));
       }
-      // Sits just below the general/orchestration instructions block.
-      addAgentContext(durangoMemoryBlock);
       const scopedInstructions = resolveScopedInstructions(state.orchestrationSettings, model);
-      if (orchestration) {
-        // Added last: ordinary prompts retain orchestration-first ordering;
-        // slash commands retain the command at byte zero and put context after it.
-        const orchestrationContext = buildOrchestrationContext(
-          orchestration.roles,
-          formatScopedInstructionsBody(scopedInstructions),
-          thread.accessMode ?? 'full-access'
-        );
-        addAgentContext(orchestrationContext);
+      // For Antigravity, send standing instructions + fresh-session Durango
+      // memory via native `_meta.antigravity.systemPrompt.append` (with automatic
+      // fallback to prompt prepending inside the driver if the runtime is older
+      // or the session is resumed).
+      const useAntigravitySystemPromptAppend = model.providerId === 'antigravity' && !orchestration;
+      let antigravitySystemPromptAppend = '';
+      if (useAntigravitySystemPromptAppend) {
+        const parts = [
+          buildGeneralInstructionsContext(scopedInstructions),
+          durangoMemoryBlock,
+        ].filter((part): part is string => Boolean(part && part.trim()));
+        antigravitySystemPromptAppend = parts.join('\n\n');
       } else {
-        // The user's standing instructions bind every model run through Orion,
-        // layering global, provider-specific, and model-specific guidance.
-        // Orchestrated turns already carry them in the block above. Added last
-        // so the block sits topmost on ordinary prompts.
-        addAgentContext(buildGeneralInstructionsContext(scopedInstructions));
+        // Sits just below the general/orchestration instructions block.
+        addAgentContext(durangoMemoryBlock);
+        if (orchestration) {
+          // Added last: ordinary prompts retain orchestration-first ordering;
+          // slash commands retain the command at byte zero and put context after it.
+          const orchestrationContext = buildOrchestrationContext(
+            orchestration.roles,
+            formatScopedInstructionsBody(scopedInstructions),
+            thread.accessMode ?? 'full-access'
+          );
+          addAgentContext(orchestrationContext);
+        } else {
+          // The user's standing instructions bind every model run through Orion,
+          // layering global, provider-specific, and model-specific guidance.
+          // Orchestrated turns already carry them in the block above. Added last
+          // so the block sits topmost on ordinary prompts.
+          addAgentContext(buildGeneralInstructionsContext(scopedInstructions));
+        }
       }
 
       // Auto-generate a relevant thread title from the first user message (like Codex / T3 Code)
@@ -6119,8 +6161,14 @@ const App: React.FC = () => {
         // The thread's project (project_notes reads its notes by it, wherever the run's folder is).
         projectId: project.id,
         prompt: agentPrompt,
+        ...(antigravitySystemPromptAppend ? { systemPromptAppend: antigravitySystemPromptAppend } : {}),
         modelId: model.id,
-        accessMode: thread.accessMode ?? 'full-access',
+        accessMode:
+          model.providerId === 'antigravity'
+            ? (thread.accessMode ?? 'full-access')
+            : thread.accessMode === 'auto'
+              ? 'workspace-write'
+              : (thread.accessMode ?? 'full-access'),
         resumeSessionId: thread.agentSessionIds?.[model.providerId],
         // Branched thread's first turn per provider: fork the inherited
         // session instead of resuming the parent's in place.
@@ -6130,7 +6178,7 @@ const App: React.FC = () => {
         providerOptions: normalizedProviderSettings[model.providerId]?.options,
         // These native providers consume attachments directly as well as
         // retaining the text/path context for later file and crop tools.
-        ...(['kimi', 'antigravity', 'fx', 'claude', 'codex'].includes(model.providerId) && turnAttachments.length > 0
+        ...(['kimi', 'antigravity', 'fx', 'claude', 'codex', 'grok'].includes(model.providerId) && turnAttachments.length > 0
           ? { attachments: turnAttachments } : {}),
         ...(model.providerId === 'codex'
           ? {
@@ -6290,6 +6338,36 @@ const App: React.FC = () => {
   useEffect(() => {
     startTurnForThreadRef.current = startTurnForThread;
   }, [startTurnForThread]);
+
+  const handleContinueRetryableError = useCallback(
+    async (threadId: string, messageId: string, mode: 'continue' | 'retry') => {
+      const state = useOrionStore.getState();
+      const thread = state.threads.find((candidate) => candidate.id === threadId);
+      if (!thread || thread.status === 'running' || activeRunsByThreadRef.current[threadId]) return;
+      updateThreadMessage(threadId, messageId, { retryable: undefined, resumeWith: undefined });
+      let promptText = 'Continue.';
+      let attachments: FileAttachment[] = [];
+      if (mode === 'retry') {
+        const transcript = loadedMessages(threadId) ?? [];
+        const failedIndex = transcript.findIndex((candidate) => candidate.id === messageId);
+        const searchEnd = failedIndex === -1 ? transcript.length - 1 : failedIndex - 1;
+        for (let index = searchEnd; index >= 0; index -= 1) {
+          const candidate = transcript[index];
+          if (candidate?.role === 'user' && (candidate.content.trim() || (candidate.attachments?.length ?? 0) > 0)) {
+            promptText = candidate.content;
+            attachments = candidate.attachments ?? [];
+            break;
+          }
+        }
+      }
+      const result = await startTurnForThread(threadId, promptText, attachments);
+      if (!result.ok) {
+        updateThreadMessage(threadId, messageId, { retryable: true, resumeWith: mode });
+        if ('error' in result && result.error) toast.error(result.error);
+      }
+    },
+    [startTurnForThread, updateThreadMessage]
+  );
 
   // Orchestrator spawn_subagent requests from main: create a hidden child
   // thread in the driver's project, run the prompt on the requested model,
@@ -6881,7 +6959,10 @@ const App: React.FC = () => {
           projectId: project.id,
           prompt: goalAction.objective || 'Resume the goal.',
           modelId: model.id,
-          accessMode: thread.accessMode ?? 'full-access',
+          accessMode:
+            thread.accessMode === 'auto'
+              ? 'workspace-write'
+              : (thread.accessMode ?? 'full-access'),
           ...(thread.mcpServerIds?.length ? { mcpServerIds: thread.mcpServerIds } : {}),
           resumeSessionId: thread.agentSessionIds?.codex,
           forkSession: Boolean(thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')),
@@ -7039,7 +7120,10 @@ const App: React.FC = () => {
           projectId: project.id,
           prompt: review.instructions || reviewLabel,
           modelId: model.id,
-          accessMode: thread.accessMode ?? 'full-access',
+          accessMode:
+            thread.accessMode === 'auto'
+              ? 'workspace-write'
+              : (thread.accessMode ?? 'full-access'),
           resumeSessionId: thread.agentSessionIds?.codex,
           forkSession: Boolean(thread.agentSessionIds?.codex && thread.pendingForkProviders?.includes('codex')),
           providerOptions: normalizedProviderSettings.codex?.options,
@@ -8038,10 +8122,13 @@ const App: React.FC = () => {
       setEditingMessages(({ [editedThreadId]: _done, ...rest }) => rest);
       if (index !== -1) {
         const kept = messages.slice(0, index);
-        // Claude keeps a live session per thread in main and would carry on
-        // the old conversation whatever the renderer drops (same as /clear).
+        // Claude and Antigravity keep live sessions per thread in main and
+        // would carry on the old conversation whatever the renderer drops.
         try {
           await window.orion?.clearClaudeSession?.(editedThreadId);
+        } catch {}
+        try {
+          await window.orion?.disposeAgentThread?.(editedThreadId);
         } catch {}
         useOrionStore.getState().updateThreadTranscript(editedThreadId, (transcript) => ({
           ...transcript,
@@ -10391,7 +10478,7 @@ const App: React.FC = () => {
 
   const accessModeList = selectedThread ? (
     <div className="codex-settings-options">
-      {accessModeOptions.map((option) => {
+      {selectedAccessModeOptions.map((option) => {
         const selected = selectedAccessMode === option.value;
         return (
           <button
@@ -11199,7 +11286,11 @@ const App: React.FC = () => {
                             key={pane.thread.id}
                             threadId={pane.thread.id}
                             projectPath={pane.projectPath ?? ''}
-                            accessMode={pane.thread.accessMode ?? 'full-access'}
+                            accessMode={
+                              pane.thread.accessMode === 'auto'
+                                ? 'workspace-write'
+                                : (pane.thread.accessMode ?? 'full-access')
+                            }
                             focused={pane.focused}
                             resumeSessionId={pane.thread.agentSessionIds?.claude}
                             forkSession={pane.thread.pendingForkProviders?.includes('claude')}
@@ -11248,6 +11339,7 @@ const App: React.FC = () => {
                         onUnlinkTask={unlinkTaskFromThread}
                         onDismissBtwExchange={dismissBtwExchange}
                         onAuthenticateProvider={handleAuthenticateProvider}
+                        onContinueRetryableError={handleContinueRetryableError}
                         onDiscardClaudeBackgroundTasks={discardClaudeBackgroundTasks}
                         onSteerQueuedMessage={steerQueuedMessage}
                         onEditMessage={beginEditMessage}

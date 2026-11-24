@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { killAgentChild } from './run-registry.js';
 import { isPreapprovedOrionTool } from './thread-reader-routing.js';
-import { buildKimiPromptBlocks } from './kimi-driver.js';
+import { buildAcpPromptBlocks } from './acp-prompt-blocks.js';
 import { loginShell } from './shell-env.js';
 import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 import { createWorkspaceBoundary } from './workspace-boundary.js';
@@ -122,6 +122,7 @@ export const createFxAcpDriver = ({
   let lastMessageText = '';
   // Steering needs the live session and fx's advertised capability.
   let steeringSupported = false;
+  let promptCapabilities = { image: true };
   let activeSessionId = null;
   let turnActive = false;
 
@@ -387,6 +388,9 @@ export const createFxAcpDriver = ({
     });
     if (init.error) return fail(init.error);
     steeringSupported = init.result?.agentCapabilities?._meta?.fx?.steering === true;
+    const rawPromptCaps = init.result?.agentCapabilities?.promptCapabilities;
+    promptCapabilities =
+      rawPromptCaps && typeof rawPromptCaps === 'object' ? rawPromptCaps : { image: true };
 
     let sessionId = null;
     let resumed = false;
@@ -433,7 +437,7 @@ export const createFxAcpDriver = ({
       return fail(setMode.error.message ?? `fx could not enable ${accessMode} permission mode.`);
     }
 
-    const prompt = await buildKimiPromptBlocks(promptText, attachments);
+    const prompt = await buildAcpPromptBlocks(promptText, attachments, promptCapabilities);
     activeSessionId = sessionId;
     turnActive = true;
     const response = await request('session/prompt', { sessionId, prompt });
@@ -518,7 +522,7 @@ export const createFxAcpDriver = ({
   const steer = async (text, steerAttachments = []) => {
     if (!steeringSupported || !turnActive || !activeSessionId) return false;
     if (typeof text !== 'string' || !text) return false;
-    const prompt = await buildKimiPromptBlocks(text, steerAttachments);
+    const prompt = await buildAcpPromptBlocks(text, steerAttachments, promptCapabilities);
     if (!turnActive) return false;
     const absorbed = (reply) => !reply.error && reply.result?._meta?.fx?.steering === 'absorbed';
     const response = request('session/prompt', {

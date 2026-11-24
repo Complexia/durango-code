@@ -11,7 +11,7 @@ import {
   SquareTerminal,
   Wrench,
 } from 'lucide-react';
-import type { ApprovalExplanation, ToolApproval } from './CodexQuestions';
+import type { ApprovalAnswer, ApprovalExplanation, ToolApproval } from './CodexQuestions';
 
 /**
  * Line breaks after the top-level `&&`, `||` and `;` of a one-line shell
@@ -85,13 +85,16 @@ const ToolIcon = ({ approval }: { approval: ToolApproval }) => {
   if (approval.command) return <SquareTerminal size={size} />;
   if (approval.url) return <Globe size={size} />;
   if (approval.path) return <FileText size={size} />;
-  if (approval.toolName.startsWith('mcp__')) return <Plug size={size} />;
+  if (approval.toolName.startsWith('mcp__') || approval.toolName.startsWith('mcp_')) return <Plug size={size} />;
   return <Wrench size={size} />;
 };
 
 const toolLabel = (toolName: string) => {
-  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
-  return mcp ? `${mcp[1].replace(/^claude_ai_/, '')} · ${mcp[2]}` : toolName;
+  const claudeMcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+  if (claudeMcp) return `${claudeMcp[1].replace(/^claude_ai_/, '')} · ${claudeMcp[2]}`;
+  const agyMcp = /^mcp_([^_]+)_(.+)$/.exec(toolName);
+  if (agyMcp) return `${agyMcp[1]} · ${agyMcp[2].replace(/_/g, ' ')}`;
+  return toolName;
 };
 
 const COLLAPSED_LINES = 6;
@@ -151,9 +154,9 @@ export const ApprovalCard = ({
   approval: ToolApproval;
   explainKey: string;
   explain?: ExplainApproval;
-  sending: 'Allow once' | 'Deny' | null;
+  sending: ApprovalAnswer | null;
   error: string;
-  onAnswer: (answer: 'Allow once' | 'Deny') => void;
+  onAnswer: (answer: ApprovalAnswer) => void;
 }) => {
   const [explanation, setExplanation] = useState<ApprovalExplanation | null>(null);
   const [explaining, setExplaining] = useState(Boolean(explain));
@@ -234,6 +237,15 @@ export const ApprovalCard = ({
             </div>
           </div>
         )}
+        {approval.warning && (
+          <div className="approval-reason">
+            <ShieldAlert size={14} aria-hidden="true" />
+            <div>
+              <strong>Security note</strong>
+              <span>{approval.warning}</span>
+            </div>
+          </div>
+        )}
         {approval.command && <CodeBlock label="Command" text={approval.command} />}
         {approval.path && <CodeBlock label="File" text={approval.path} />}
         {approval.url && <CodeBlock label="URL" text={approval.url} />}
@@ -243,10 +255,26 @@ export const ApprovalCard = ({
         {approval.input && <CodeBlock label="Details" text={approval.input} />}
       </div>
       <div className="codex-question-footer approval-footer">
-        {error ? <p role="alert">{error}</p> : <span className="approval-footnote">Applies to this call only</span>}
+        {error ? (
+          <p role="alert">{error}</p>
+        ) : (
+          <span className="approval-footnote">
+            {approval.allowForThread ? 'Allow once or for this thread' : 'Applies to this call only'}
+          </span>
+        )}
         <button type="button" className="approval-deny" disabled={sending !== null} onClick={() => onAnswer('Deny')}>
           {sending === 'Deny' ? 'Denying…' : 'Deny'}
         </button>
+        {approval.allowForThread && (
+          <button
+            type="button"
+            className="approval-deny"
+            disabled={sending !== null}
+            onClick={() => onAnswer('Allow for this thread')}
+          >
+            {sending === 'Allow for this thread' ? 'Allowing…' : 'Allow for this thread'}
+          </button>
+        )}
         <button
           type="button"
           className="codex-question-submit approval-allow"

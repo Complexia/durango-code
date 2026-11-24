@@ -21,6 +21,21 @@ try {
   ]);
   assert.deepEqual(content.map((part) => part.type), ['text', 'image', 'document']);
   assert.equal(content[1].source.data, Buffer.from([137, 80, 78, 71]).toString('base64'));
+  // Parameterized, generic, and missing MIME types are normalized/inferred rather than dropped.
+  const normalizedContent = await claudeUserContent('Inspect normalized', [
+    { path: image, mimeType: 'image/png; charset=binary' },
+    { path: pdf, mimeType: 'application/octet-stream' },
+  ]);
+  assert.deepEqual(normalizedContent.map((part) => part.type), ['text', 'image', 'document']);
+  assert.equal(normalizedContent[1].source.media_type, 'image/png');
+  assert.equal(normalizedContent[2].source.media_type, 'application/pdf');
+  const inferredContent = await claudeUserContent('Inspect inferred', [
+    { path: image, mimeType: 'image/*' },
+    { path: pdf },
+  ]);
+  assert.deepEqual(inferredContent.map((part) => part.type), ['text', 'image', 'document']);
+  assert.equal(inferredContent[1].source.media_type, 'image/png');
+  assert.equal(inferredContent[2].source.media_type, 'application/pdf');
   await assert.rejects(claudeUserContent('missing', [{ path: path.join(dir, 'missing.png'), mimeType: 'image/png' }]));
 
   // A SnapShot's accessibility outline is inlined as framed, untrusted text;
@@ -118,7 +133,7 @@ try {
   sdkSession.dispose();
   claudeSdkSessions.delete('native');
   const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
-  assert.match(appSource, /\['kimi', 'fx', 'claude', 'codex'\]\.includes\(model\.providerId\)[\s\S]{0,100}attachments: turnAttachments/, 'ordinary composer turns must forward attachment metadata to native providers');
+  assert.match(appSource, /\[[^\]]*'claude'[^\]]*\]\.includes\(model\.providerId\)[\s\S]{0,100}attachments: turnAttachments/, 'ordinary composer turns must forward attachment metadata to native providers');
   for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
     assert.equal(claudeSdkOptionsForInput(model, { claudeReasoningEffort: effort }).effort, effort);
   }

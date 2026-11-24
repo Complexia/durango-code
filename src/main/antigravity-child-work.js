@@ -24,18 +24,71 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const antigravityBrainDir = () => path.join(os.homedir(), '.gemini', 'antigravity-cli', 'brain');
 const generated = (conversationId, ...parts) =>
   path.join(antigravityBrainDir(), conversationId, '.system_generated', ...parts);
+const generatedParts = (conversationId, ...parts) => [conversationId, '.system_generated', ...parts];
 
-const readJson = async (file) => {
+const isSafeSegment = (segment) =>
+  typeof segment === 'string' &&
+  segment.length > 0 &&
+  segment !== '.' &&
+  segment !== '..' &&
+  !segment.includes('/') &&
+  !segment.includes('\\') &&
+  !segment.includes('\0');
+
+// Walks every managed component under `os.homedir()` with lstat + realpath so
+// symlinks anywhere under `.gemini/antigravity-cli/brain` are rejected while
+// allowing symlinked OS ancestors above `os.homedir()` (e.g. macOS `/var`).
+const resolveSafeBrainPath = async (parts, expectedType) => {
+  let realHome;
   try {
-    return JSON.parse(await fs.readFile(file, 'utf8'));
+    realHome = await fs.realpath(os.homedir());
+  } catch {
+    return null;
+  }
+  const segments = ['.gemini', 'antigravity-cli', 'brain', ...parts];
+  let current = realHome;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index];
+    if (!isSafeSegment(segment)) return null;
+    current = path.join(current, segment);
+    let stat;
+    try {
+      stat = await fs.lstat(current);
+    } catch {
+      return null;
+    }
+    if (stat.isSymbolicLink()) return null;
+    const isLeaf = index === segments.length - 1;
+    if (isLeaf) {
+      if (expectedType === 'file' && !stat.isFile()) return null;
+      if (expectedType === 'dir' && !stat.isDirectory()) return null;
+    } else if (!stat.isDirectory()) {
+      return null;
+    }
+  }
+  try {
+    const realTarget = await fs.realpath(current);
+    return realTarget === current ? realTarget : null;
   } catch {
     return null;
   }
 };
 
-const listJson = async (dir) => {
+const readJson = async (parts) => {
+  const safePath = await resolveSafeBrainPath(parts, 'file');
+  if (!safePath) return null;
   try {
-    return (await fs.readdir(dir)).filter((name) => name.endsWith('.json') && name !== 'read.json');
+    return JSON.parse(await fs.readFile(safePath, 'utf8'));
+  } catch {
+    return null;
+  }
+};
+
+const listJson = async (parts) => {
+  const safeDir = await resolveSafeBrainPath(parts, 'dir');
+  if (!safeDir) return [];
+  try {
+    return (await fs.readdir(safeDir)).filter((name) => name.endsWith('.json') && name !== 'read.json');
   } catch {
     return [];
   }
@@ -44,11 +97,11 @@ const listJson = async (dir) => {
 /** The child conversation id a launch tool call started, or null while it isn't on disk yet. */
 export const resolveAntigravityChild = async (parentSessionId, toolCallId) => {
   if (!UUID.test(String(parentSessionId)) || !toolCallId) return null;
-  for (const name of await listJson(generated(parentSessionId, 'subagents'))) {
+  for (const name of await listJson(generatedParts(parentSessionId, 'subagents'))) {
     const childId = name.slice(0, -'.json'.length);
     if (!UUID.test(childId)) continue;
-    for (const messageName of await listJson(generated(childId, 'messages'))) {
-      const message = await readJson(generated(childId, 'messages', messageName));
+    for (const messageName of await listJson(generatedParts(childId, 'messages'))) {
+      const message = await readJson(generatedParts(childId, 'messages', messageName));
       const call = message?.sourceMetadata?.tool?.toolCall;
       if (message?.sender === parentSessionId && call?.id === toolCallId) return childId;
     }
@@ -62,8 +115,8 @@ export const antigravityChildTranscriptPath = (childId) =>
 /** The child's report to the parent (its send_message), or null while it works. */
 export const antigravityChildReport = async (parentSessionId, childId) => {
   if (!UUID.test(String(parentSessionId)) || !UUID.test(String(childId))) return null;
-  for (const name of await listJson(generated(parentSessionId, 'messages'))) {
-    const message = await readJson(generated(parentSessionId, 'messages', name));
+  for (const name of await listJson(generatedParts(parentSessionId, 'messages'))) {
+    const message = await readJson(generatedParts(parentSessionId, 'messages', name));
     if (message?.sender === childId) return typeof message.content === 'string' ? message.content : '';
   }
   return null;
@@ -71,10 +124,14 @@ export const antigravityChildReport = async (parentSessionId, childId) => {
 
 // The last complete step of a conversation's transcript.jsonl, or null.
 const lastTranscriptStep = async (conversationId) => {
+  const safePath = await resolveSafeBrainPath(generatedParts(conversationId, 'logs', 'transcript.jsonl'), 'file');
+  if (!safePath) return null;
   let handle;
   try {
-    handle = await fs.open(generated(conversationId, 'logs', 'transcript.jsonl'), 'r');
-    const { size } = await handle.stat();
+    handle = await fs.open(safePath, 'r');
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    const { size } = stat;
     // Steps are usually a few KB; a large tool output can make one longer.
     for (const window of [65536, 4 * 1024 * 1024]) {
       const length = Math.min(size, window);
@@ -93,6 +150,13 @@ const lastTranscriptStep = async (conversationId) => {
   }
 };
 
+const isWakingInboxMessage = (message) => {
+  if (!message || typeof message !== 'object') return false;
+  if (message.priority === 'MESSAGE_PRIORITY_LOW') return false;
+  if (message.priority === undefined || message.priority === null || message.priority === '') return true;
+  return message.priority === 'MESSAGE_PRIORITY_HIGH';
+};
+
 /**
  * agy is working on the conversation by itself, outside any prompt: it was
  * woken (a child's report, or a background command's "task finished" notice,
@@ -104,19 +168,28 @@ const lastTranscriptStep = async (conversationId) => {
  */
 export const antigravityPendingReply = async (parentSessionId) => {
   if (!UUID.test(String(parentSessionId))) return false;
-  const read = (await readJson(generated(parentSessionId, 'messages', 'read.json'))) ?? {};
-  for (const name of await listJson(generated(parentSessionId, 'messages'))) {
-    const message = await readJson(generated(parentSessionId, 'messages', name));
-    if (message?.id && message.sender !== parentSessionId && read[message.id] !== true) return true;
+  const read = (await readJson(generatedParts(parentSessionId, 'messages', 'read.json'))) ?? {};
+  for (const name of await listJson(generatedParts(parentSessionId, 'messages'))) {
+    const stem = name.slice(0, -'.json'.length);
+    const message = await readJson(generatedParts(parentSessionId, 'messages', name));
+    if (!message || typeof message !== 'object') continue;
+    const messageId = typeof message.id === 'string' && message.id ? message.id : null;
+    if (message.sender === parentSessionId) continue;
+    if (read[stem] === true || (messageId && read[messageId] === true)) continue;
+    if (isWakingInboxMessage(message)) return true;
   }
   const last = await lastTranscriptStep(parentSessionId);
-  if (last?.type === 'SYSTEM_MESSAGE' || last?.type === 'GENERIC') return true;
+  if (last?.type === 'SYSTEM_MESSAGE') {
+    return !(typeof last.content === 'string' && last.content.includes('priority=MESSAGE_PRIORITY_LOW'));
+  }
+  if (last?.type === 'GENERIC') return true;
   return last?.type === 'PLANNER_RESPONSE' && Array.isArray(last.tool_calls) && last.tool_calls.length > 0;
 };
 
 /** `ALIVE`, `KILLED`, … from the parent's child list; null when unknown. */
 export const antigravityChildState = async (parentSessionId, childId) => {
-  const entry = await readJson(generated(parentSessionId, 'subagents', `${childId}.json`));
+  if (!UUID.test(String(parentSessionId)) || !UUID.test(String(childId))) return null;
+  const entry = await readJson(generatedParts(parentSessionId, 'subagents', `${childId}.json`));
   return typeof entry?.state === 'string' ? entry.state.replace(/^SUBAGENT_STATE_/, '') : null;
 };
 

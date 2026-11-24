@@ -611,9 +611,33 @@ const activityFailed = (activity: AgentActivity) =>
   activity.status === 'error' || activity.type === 'error' || (typeof activity.exitCode === 'number' && activity.exitCode !== 0);
 
 // What an opened step shows: the full call and what it returned.
+const DiffPatchView: React.FC<{ patch: string }> = ({ patch }) => (
+  <pre className="agent-tool-output font-mono text-xs leading-relaxed overflow-x-auto">
+    {patch.split('\n').map((line, index) => {
+      const cls =
+        line.startsWith('+++') || line.startsWith('---')
+          ? 'text-zinc-400 font-semibold'
+          : line.startsWith('@@')
+            ? 'text-sky-400'
+            : line.startsWith('+')
+              ? 'text-emerald-400 bg-emerald-500/10 block'
+              : line.startsWith('-')
+                ? 'text-rose-400 bg-rose-500/10 block'
+                : 'text-zinc-300';
+      return (
+        <span key={index} className={cls}>
+          {line}
+          {'\n'}
+        </span>
+      );
+    })}
+  </pre>
+);
+
 const ActivityDetails: React.FC<{ activity: AgentActivity; label: string }> = ({ activity, label }) => {
   const detail = activity.detail?.trim();
   const showDetail = !!detail && detail !== label && activity.type !== 'command' && detail !== activity.input?.trim();
+  const patch = activity.diff?.patch?.trim();
   return (
     <div className="work-row-details" onClick={(event) => event.stopPropagation()}>
       {activity.type === 'thought' ? (
@@ -621,6 +645,12 @@ const ActivityDetails: React.FC<{ activity: AgentActivity; label: string }> = ({
       ) : (
         <>
           {showDetail && <pre className="agent-tool-output input">{activity.detail}</pre>}
+          {patch && (
+            <div className="agent-tool-io">
+              <span className="agent-tool-io-label">Diff</span>
+              <DiffPatchView patch={patch} />
+            </div>
+          )}
           {activity.input && (
             <div className="agent-tool-io">
               <span className="agent-tool-io-label">Called with</span>
@@ -659,7 +689,13 @@ const ActivityDetails: React.FC<{ activity: AgentActivity; label: string }> = ({
 const hasActivityDetails = (activity: AgentActivity) =>
   activity.type === 'thought'
     ? !!activity.detail?.trim()
-    : !!(activity.output || activity.input || activity.sources?.length || isExpandableDetail(activity.detail));
+    : !!(
+        activity.output ||
+        activity.input ||
+        activity.diff?.patch?.trim() ||
+        activity.sources?.length ||
+        isExpandableDetail(activity.detail)
+      );
 
 // One step as a single muted line (T3 Code's work log row): icon, what it did,
 // a +N −N or exit chip. Clicking a step with a call or output opens it in place.

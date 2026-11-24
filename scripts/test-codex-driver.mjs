@@ -710,6 +710,24 @@ assert.deepEqual(codexUserInput('inspect', [screenshot, screenshot, { path: '/tm
   { type: 'text', text: 'inspect' },
   { type: 'localImage', path: screenshot.path, detail: 'original' },
 ]);
+assert.deepEqual(
+  codexUserInput(
+    'inspect normalized',
+    [
+      { path: '/tmp/param.png', mimeType: 'image/png; charset=binary' },
+      { path: '/tmp/generic.webp', mimeType: 'image/*' },
+      { path: '/tmp/inferred.jpg' },
+      { path: '/tmp/doc.pdf', mimeType: 'application/octet-stream' },
+    ],
+    astra
+  ),
+  [
+    { type: 'text', text: 'inspect normalized' },
+    { type: 'localImage', path: '/tmp/param.png', detail: 'original' },
+    { type: 'localImage', path: '/tmp/generic.webp', detail: 'original' },
+    { type: 'localImage', path: '/tmp/inferred.jpg', detail: 'original' },
+  ]
+);
 {
   const outlineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-snapshot-'));
   const outlinePath = path.join(outlineDir, 'Finder - Desktop.snapshot.md');

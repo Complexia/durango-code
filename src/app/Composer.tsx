@@ -1069,7 +1069,9 @@ export const Composer = ({
           <span>
             {providerId === 'codex'
               ? 'Goal — Codex pursues it autonomously across turns until it’s achieved, blocked, or the budget runs out. “/goal <objective> [budget:500k]”, or pause / resume / clear / status.'
-              : '/goal is only available on Codex agents.'}
+              : providerId === 'antigravity'
+                ? 'Goal — Antigravity pursues it natively until the objective is complete or you press Stop.'
+                : '/goal is only available on Codex and Antigravity agents.'}
           </span>
         </div>
       )}

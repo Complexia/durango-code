@@ -1742,6 +1742,8 @@ type OrionCodexBrowserIntegrationStatus = {
         /** The thread's Durango Code project (its working directory may be a workspace outside it). */
         projectId?: string;
         prompt: string;
+        /** Optional system-prompt appendix sent natively via ACP `_meta.antigravity.systemPrompt.append` when supported. */
+        systemPromptAppend?: string;
         modelId: string;
         /** Image metadata used to build native ACP image blocks for Kimi turns. */
         attachments?: Array<{
@@ -1751,7 +1753,7 @@ type OrionCodexBrowserIntegrationStatus = {
           mimeType: string;
           size: number;
         }>;
-        accessMode: 'read-only' | 'workspace-write' | 'full-access';
+        accessMode: 'read-only' | 'workspace-write' | 'auto' | 'full-access';
         codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
         codexServiceTier?: 'default' | 'priority';
         claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';
@@ -1840,14 +1842,20 @@ type OrionCodexBrowserIntegrationStatus = {
         /** terminateBackground: also dispose the thread's persistent claude session (kills background subagents). */
         options?: { terminateBackground?: boolean }
       ) => Promise<boolean>;
-      /** Claude slash commands (built-ins + .claude/commands + skills + plugins) known for a thread/project. */
-      listSlashCommands: (input: { threadId?: string | null; projectPath?: string | null }) => Promise<{
+      /** Provider slash commands (Claude built-ins + skills/plugins, or Antigravity advertised commands + skills) known for a thread/project. */
+      listSlashCommands: (input: {
+        threadId?: string | null;
+        projectPath?: string | null;
+        providerId?: string | null;
+      }) => Promise<{
         ok: boolean;
         commands?: SlashCommandInfo[];
         source?: 'live' | 'cache' | 'harvest';
       }>;
-      /** Push of the latest slash-command list whenever a Claude session reports one. Replace, don't merge. */
-      onSlashCommands: (cb: (event: { projectPath: string; commands: SlashCommandInfo[] }) => void) => () => void;
+      /** Push of the latest slash-command list whenever a Claude or Antigravity session reports one. Replace, don't merge. */
+      onSlashCommands: (
+        cb: (event: { projectPath: string; providerId?: string; commands: SlashCommandInfo[] }) => void
+      ) => () => void;
       /** `/clear`: dispose only the thread's persistent Claude SDK session so the next turn starts fresh. */
       clearClaudeSession: (threadId: string) => Promise<boolean>;
       /** True while a forgotten run's terminal event is still being prepared. */
@@ -1858,7 +1866,7 @@ type OrionCodexBrowserIntegrationStatus = {
       terminalEnsure: (input: {
         threadId: string;
         projectPath: string;
-        accessMode: 'read-only' | 'workspace-write' | 'full-access';
+        accessMode: 'read-only' | 'workspace-write' | 'auto' | 'full-access';
         /** Resume this CLI session instead of starting fresh (--resume). */
         resumeSessionId?: string;
         cols?: number;
@@ -1956,6 +1964,10 @@ type OrionCodexBrowserIntegrationStatus = {
         chunk?: string;
         exitCode?: number | null;
         error?: string;
+        /** error events only: true when the failure is transient and can be resumed/retried cleanly. */
+        retryable?: boolean;
+        /** error events only: whether a one-click resume should send 'Continue.' or resend the prompt. */
+        resumeWith?: 'continue' | 'retry';
         command?: string;
         providerId?: string;
         sessionId?: string;
@@ -1986,7 +1998,7 @@ type OrionCodexBrowserIntegrationStatus = {
           input?: string;
           output?: string;
           exitCode?: number;
-          diff?: { path: string; additions: number; deletions: number };
+          diff?: { path: string; additions: number; deletions: number; patch?: string };
           sources?: Array<{ url: string; title?: string }>;
           plan?: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>;
           status?: 'running' | 'done' | 'error' | 'waiting';

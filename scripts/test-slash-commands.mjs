@@ -86,8 +86,35 @@ const startTurn = section(
 );
 assert.match(
   startTurn,
-  /model\.providerId === 'claude' && promptText\.trimStart\(\)\.startsWith\('\/'\)/,
-  'SDK prompt assembly must preserve Claude slash commands'
+  /\(model\.providerId === 'claude' \|\| model\.providerId === 'antigravity'\)\s*&&\s*promptText\.trimStart\(\)\.startsWith\('\/'\)/,
+  'SDK prompt assembly must preserve Claude and Antigravity slash commands'
+);
+
+const agyCommands = buildSlashCommandCandidates(
+  { providerId: 'antigravity', claudeBacked: false, isTerminal: false },
+  null
+);
+assert.ok(
+  agyCommands.some((candidate) => candidate.command.name === 'goal' && candidate.source === 'antigravity'),
+  'Antigravity threads should list native fallback slash commands'
+);
+const agyLive = buildSlashCommandCandidates(
+  { providerId: 'antigravity', claudeBacked: false, isTerminal: false },
+  [
+    { name: 'plan', description: 'Plan work', argumentHint: '<task>' },
+    { name: 'my-skill', description: 'Custom project skill', argumentHint: '' },
+    { name: 'logout', description: 'Hidden in composer', argumentHint: '' },
+  ]
+);
+assert.equal(
+  agyLive.some((candidate) => candidate.command.name === 'my-skill'),
+  true,
+  'Antigravity live commands and discovered skills should appear in the slash menu'
+);
+assert.equal(
+  agyLive.some((candidate) => candidate.command.name === 'logout'),
+  false,
+  'Overridden Antigravity commands must be filtered out'
 );
 for (const contextCall of [
   /addAgentContext\(buildLinkedTaskContext/,

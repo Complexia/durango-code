@@ -14,10 +14,21 @@ import {
   antigravityToolLabel,
   createAntigravityAcpDriver,
 } from '../src/main/antigravity-driver.js';
+import { createAntigravitySessionManager } from '../src/main/antigravity-session-manager.js';
+import { EventEmitter } from 'node:events';
 import {
   antigravityWireModelId,
+  groupAntigravityModelRows,
   parseAntigravityModelsOutput,
 } from '../src/main/models.js';
+import {
+  buildAntigravityModelsFromAcpProbe,
+  probeAntigravityModelsOverAcp,
+} from '../src/main/antigravity-models-probe.js';
+import {
+  antigravityCliHome,
+  sweepOrphanAntigravityTempSessions,
+} from '../src/main/antigravity-session-files.js';
 import { parseAntigravityLoginUrl, parseAntigravityModelRows } from '../src/main/provider-updates.js';
 import { commandForModel } from '../src/main/command-for-model.js';
 import { createProviderSignInWatch } from '../src/main/provider-sign-in-watch.js';
@@ -208,14 +219,25 @@ const fakeAgent = ({
   respond,
   accessMode = 'full-access',
   promptText = 'hi',
+  systemPromptAppend = '',
+  attachments = [],
+  resumeSessionId = null,
   mcpServers = [],
+  httpMcpServers = [],
+  sessionState = null,
+  nextRequestId = null,
+  handshakeTimeoutMs,
+  promptInactivityTimeoutMs,
+  postSettleCommandHoldMs,
+  maxTransientRetries,
+  transientRetryDelayMs,
   onUserInput,
   model = { providerId: 'antigravity', slug: 'gemini-3.8-flash-low' },
   reasoningEffort,
 }) => {
   const sent = [];
   const answers = [];
-  const events = { text: '', turnEnds: [], fatal: null, done: [], spawned: [], activities: new Map() };
+  const events = { text: '', turnEnds: [], fatal: null, fatalMeta: null, done: [], spawned: [], slashCommands: [], activities: new Map() };
   let driver;
   const child = {
     stdin: {
@@ -239,8 +261,19 @@ const fakeAgent = ({
     model,
     reasoningEffort,
     promptText,
+    systemPromptAppend,
+    attachments,
+    resumeSessionId,
     accessMode,
     mcpServers,
+    httpMcpServers,
+    sessionState,
+    nextRequestId,
+    ...(handshakeTimeoutMs !== undefined ? { handshakeTimeoutMs } : {}),
+    ...(promptInactivityTimeoutMs !== undefined ? { promptInactivityTimeoutMs } : {}),
+    ...(postSettleCommandHoldMs !== undefined ? { postSettleCommandHoldMs } : {}),
+    ...(maxTransientRetries !== undefined ? { maxTransientRetries } : {}),
+    ...(transientRetryDelayMs !== undefined ? { transientRetryDelayMs } : {}),
     threadId: 'thread-1',
     callbacks: {
       onSessionId: () => {},
@@ -250,11 +283,13 @@ const fakeAgent = ({
       },
       onActivity: (activity) => events.activities.set(activity.key, activity),
       onTurnEnd: (result) => events.turnEnds.push(result),
-      onFatal: (message) => {
+      onFatal: (message, meta) => {
         events.fatal = message;
+        events.fatalMeta = meta ?? null;
       },
       onSubagentSpawn: (meta) => events.spawned.push(meta),
       onSubagentDone: (id, info) => events.done.push([id, info]),
+      onSlashCommands: (commands) => events.slashCommands.push(commands),
       ...(onUserInput ? { onUserInput: () => onUserInput(driver) } : {}),
     },
   });
@@ -625,6 +660,834 @@ await check('fake: dispose stops a pending settle wait', async () => {
   assert.equal(agent.events.fatal, null);
 });
 
+await check('fake: 502 Bad Gateway and mid-turn 404 error classification', () => {
+  const badGateway = antigravityFailureFromErrorText('Error 502, Message: bad gateway, Status: 502 Bad Gateway');
+  assert.match(badGateway.message, /bad gateway \(502 Bad Gateway, HTTP 502\)/);
+  assert.equal(badGateway.retryable, true);
+  const midTurn404 = antigravityFailureFromErrorText('Error 404, Message: edge blip, Status: NOT_FOUND', { reachedModel: true });
+  assert.equal(midTurn404.retryable, true);
+  assert.equal(midTurn404.resumeWith, 'continue');
+  assert.doesNotMatch(midTurn404.message, /can't use this model/);
+});
+
+await check('fake: native systemPrompt.append via session/new _meta, warm dedup, and fallback', async () => {
+  const sessionState = {
+    initialized: null,
+    sessionId: null,
+    currentModelKey: null,
+    currentModeId: null,
+    availableModes: [],
+    systemPromptAppendApplied: null,
+  };
+  let reqId = 1;
+  const prompt1 = deferred();
+  const withAppend = fakeAgent({
+    promptText: 'do work',
+    systemPromptAppend: '[Orion general instructions]\nuse bun\n[/Orion general instructions]',
+    sessionState,
+    nextRequestId: () => reqId++,
+    respond: (method) => {
+      if (method === 'initialize') {
+        return {
+          agentInfo: { name: 'agy', version: '1.5.15' },
+          agentCapabilities: { _meta: { antigravity: { systemPrompt: { append: true } } } },
+        };
+      }
+      return baseRespond([prompt1])(method);
+    },
+  });
+  void withAppend.driver.start();
+  await tick(20);
+  const newReq = withAppend.sent.find((m) => m.method === 'session/new');
+  assert.equal(newReq?.params?._meta?.antigravity?.systemPrompt?.append, '[Orion general instructions]\nuse bun\n[/Orion general instructions]');
+  const promptReq = withAppend.sent.find((m) => m.method === 'session/prompt');
+  assert.equal(promptReq?.params?.prompt?.[0]?.text, 'do work');
+  prompt1.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  // Turn 2 on the same warm session with unchanged standing instructions stays clean (no duplication).
+  const promptWarmSame = deferred();
+  const warmSame = fakeAgent({
+    promptText: 'follow up',
+    resumeSessionId: sessionState.sessionId,
+    systemPromptAppend: '[Orion general instructions]\nuse bun\n[/Orion general instructions]',
+    sessionState,
+    nextRequestId: () => reqId++,
+    respond: (method) => (method === 'session/prompt' ? promptWarmSame.promise : {}),
+  });
+  void warmSame.driver.start();
+  await tick(20);
+  assert.equal(
+    warmSame.sent.find((m) => m.method === 'session/prompt')?.params?.prompt?.[0]?.text,
+    'follow up',
+    'warm follow-up with unchanged systemPromptAppend does not duplicate instructions into user prompt'
+  );
+  promptWarmSame.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  // Turn 3 on the same warm session with changed standing instructions folds the new instructions in.
+  const promptWarmChanged = deferred();
+  const warmChanged = fakeAgent({
+    promptText: 'follow up 2',
+    resumeSessionId: sessionState.sessionId,
+    systemPromptAppend: '[Orion general instructions]\nuse pnpm\n[/Orion general instructions]',
+    sessionState,
+    nextRequestId: () => reqId++,
+    respond: (method) => (method === 'session/prompt' ? promptWarmChanged.promise : {}),
+  });
+  void warmChanged.driver.start();
+  await tick(20);
+  assert.match(
+    warmChanged.sent.find((m) => m.method === 'session/prompt')?.params?.prompt?.[0]?.text ?? '',
+    /use pnpm[\s\S]*follow up 2/,
+    'warm follow-up with updated systemPromptAppend delivers the updated instructions'
+  );
+  promptWarmChanged.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  const prompt2 = deferred();
+  const fallback = fakeAgent({
+    promptText: '/plan build it',
+    systemPromptAppend: '[Orion general instructions]\nuse bun',
+    respond: baseRespond([prompt2]),
+  });
+  void fallback.driver.start();
+  await tick(20);
+  const fallbackPrompt = fallback.sent.find((m) => m.method === 'session/prompt')?.params?.prompt?.[0]?.text;
+  assert.ok(fallbackPrompt.startsWith('/plan build it\n\n[Orion general instructions]'), 'slash command stays at byte 0 on fallback');
+  prompt2.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+});
+
+await check('fake: interactive interaction_* question and generalized elicitation', async () => {
+  const prompt = deferred();
+  const seenRequests = [];
+  const agent = fakeAgent({
+    respond: baseRespond([prompt]),
+    onUserInput: (driver) => {
+      for (const req of driver.getUserInputs()) {
+        seenRequests.push(req);
+        if (req.requestId === 'iq1') driver.answerUserInput('iq1', { interaction_1: ['Option B'] });
+        if (req.requestId === 'el2') driver.answerUserInput('el2', { confirm: ['Yes'], count: ['42'], choice: ['beta'] });
+      }
+    },
+  });
+  void agent.driver.start();
+  await tick(20);
+  agent.ask('iq1', 'session/request_permission', {
+    toolCall: { toolCallId: 'interaction_1', title: 'Pick one' },
+    options: [
+      { optionId: 'opt_a', name: 'Option A', kind: 'allow_once' },
+      { optionId: 'opt_b', name: 'Option B', kind: 'allow_once' },
+    ],
+  });
+  agent.ask('el2', 'elicitation/create', {
+    mode: 'form',
+    message: 'Details',
+    requestedSchema: {
+      type: 'object',
+      required: ['confirm', 'count', 'choice'],
+      properties: {
+        confirm: { type: 'boolean', title: 'Proceed?' },
+        count: { type: 'integer', title: 'Count' },
+        choice: { type: 'string', title: 'Mode', enum: ['alpha', 'beta'] },
+      },
+    },
+  });
+  await tick(20);
+  assert.deepEqual(agent.answers.find((a) => a.id === 'iq1')?.result, {
+    outcome: { outcome: 'selected', optionId: 'opt_b' },
+  });
+  assert.deepEqual(agent.answers.find((a) => a.id === 'el2')?.result, {
+    action: 'accept',
+    content: { confirm: true, count: 42, choice: 'beta' },
+  });
+  prompt.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+});
+
+await check('fake: native auto mode and interactive approval card with agy.security.warning', async () => {
+  const prompt = deferred();
+  const capturedApprovals = [];
+  const agent = fakeAgent({
+    accessMode: 'auto',
+    respond: (method) => {
+      if (method === 'initialize') return { agentInfo: { name: 'agy', version: '1.5.15' }, agentCapabilities: {} };
+      if (method === 'session/new') {
+        return { sessionId: 'sess-auto', modes: { availableModes: [{ id: 'default' }, { id: 'auto' }] } };
+      }
+      if (method === 'session/set_model' || method === 'session/set_mode') return {};
+      if (method === 'session/prompt') return prompt.promise;
+      return {};
+    },
+    onUserInput: (driver) => {
+      for (const req of driver.getUserInputs()) {
+        capturedApprovals.push(req);
+        if (req.requestId === 'ap1') driver.answerUserInput('ap1', { permission: ['Allow for this thread'] });
+        if (req.requestId === 'ap2') driver.answerUserInput('ap2', { permission: ['Deny'] });
+      }
+    },
+  });
+  void agent.driver.start();
+  await tick(20);
+  assert.equal(agent.sent.find((m) => m.method === 'session/set_mode')?.params?.modeId, 'auto');
+  // Orion MCP tools pre-approve even in auto mode.
+  agent.ask('ap_orion', 'session/request_permission', {
+    toolCall: { toolCallId: 't0', name: 'mcp_orion_read_thread', kind: 'other' },
+    options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }, { optionId: 'deny', name: 'Deny', kind: 'reject_once' }],
+  });
+  // Escalated shell command raises ApprovalCard with agy.security.warning.
+  agent.ask('ap1', 'session/request_permission', {
+    toolCall: { toolCallId: 't1', name: 'run_command', kind: 'execute', rawInput: { CommandLine: 'rm -rf ./dist' } },
+    options: [
+      { optionId: 'allow_1', name: 'Allow once', kind: 'allow_once' },
+      { optionId: 'allow_all', name: 'Allow always', kind: 'allow_always', _meta: { 'agy.security.warning': { message: 'Allows shell commands for this thread.' } } },
+      { optionId: 'deny_1', name: 'Deny', kind: 'reject_once' },
+    ],
+  });
+  agent.ask('ap2', 'session/request_permission', {
+    toolCall: { toolCallId: 't2', name: 'run_command', kind: 'execute', rawInput: { CommandLine: 'curl evil.test' } },
+    options: [
+      { optionId: 'allow_1', name: 'Allow once', kind: 'allow_once' },
+      { optionId: 'deny_1', name: 'Deny', kind: 'reject_once' },
+    ],
+  });
+  await tick(20);
+  assert.equal(agent.answers.find((a) => a.id === 'ap_orion')?.result?.outcome?.optionId, 'allow');
+  assert.equal(agent.answers.find((a) => a.id === 'ap1')?.result?.outcome?.optionId, 'allow_all');
+  assert.equal(agent.answers.find((a) => a.id === 'ap2')?.result?.outcome?.optionId, 'deny_1');
+  const card = capturedApprovals.find((r) => r.requestId === 'ap1')?.approval;
+  assert.equal(card?.allowForThread, true);
+  assert.match(card?.warning ?? '', /Allows shell commands/);
+  prompt.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+});
+
+await check('fake: HTTP MCP selection, session/resume preference, and warm session reuse', async () => {
+  const stdioServers = [{ name: 'orion', command: 'node', args: ['shim.cjs'], env: [] }];
+  const httpServers = [{ type: 'http', name: 'orion', url: 'http://127.0.0.1:12345/mcp', headers: [{ name: 'Authorization', value: 'Bearer tok' }] }];
+  const sessionState = { initialized: null, sessionId: null, currentModelKey: null, currentModeId: null, availableModes: [] };
+  let reqId = 1;
+  const prompt1 = deferred();
+  const cold = fakeAgent({
+    resumeSessionId: 'sess-prev',
+    mcpServers: stdioServers,
+    httpMcpServers: httpServers,
+    sessionState,
+    nextRequestId: () => reqId++,
+    respond: (method) => {
+      if (method === 'initialize') {
+        return {
+          agentInfo: { name: 'agy', version: '1.5.15' },
+          agentCapabilities: { mcpCapabilities: { http: true }, sessionCapabilities: { resume: {} } },
+        };
+      }
+      if (method === 'session/resume') return { sessionId: 'sess-prev' };
+      if (method === 'session/set_model' || method === 'session/set_mode') return {};
+      if (method === 'session/prompt') return prompt1.promise;
+      return {};
+    },
+  });
+  void cold.driver.start();
+  await tick(20);
+  const resumeReq = cold.sent.find((m) => m.method === 'session/resume');
+  assert.ok(resumeReq, 'uses session/resume when advertised');
+  assert.equal(resumeReq.params.mcpServers[0].type, 'http', 'selects HTTP MCP when advertised');
+  prompt1.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  // Second turn on the same warm sessionState skips initialize, session/resume, set_model, set_mode!
+  const prompt2 = deferred();
+  const warm = fakeAgent({
+    resumeSessionId: 'sess-prev',
+    mcpServers: stdioServers,
+    httpMcpServers: httpServers,
+    sessionState,
+    nextRequestId: () => reqId++,
+    respond: (method) => (method === 'session/prompt' ? prompt2.promise : {}),
+  });
+  void warm.driver.start();
+  await tick(20);
+  assert.deepEqual(warm.sent.map((m) => m.method), ['session/prompt'], 'warm turn sends only session/prompt');
+  assert.ok(warm.sent[0].id > cold.sent.at(-1).id, 'request ids stay monotonic across turns');
+  prompt2.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+});
+
+await check('fake: IsDaemon does not hold turn open; schedule does; cancel sends session/cancel', async () => {
+  const promptDaemon = deferred();
+  const daemonAgent = fakeAgent({ respond: baseRespond([promptDaemon]) });
+  void daemonAgent.driver.start();
+  await tick(20);
+  daemonAgent.notify({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'd1',
+    name: 'run_command',
+    kind: 'execute',
+    status: 'in_progress',
+    rawInput: { CommandLine: 'bun dev', IsDaemon: true },
+  });
+  promptDaemon.resolve({ stopReason: 'end_turn' });
+  await tick(50);
+  assert.equal(daemonAgent.events.turnEnds.length, 1, 'daemon command finishes immediately after prompt');
+
+  const promptCancel = deferred();
+  const cancelAgent = fakeAgent({ respond: baseRespond([promptCancel]) });
+  void cancelAgent.driver.start();
+  await tick(20);
+  const cancelling = cancelAgent.driver.cancel();
+  await tick(20);
+  assert.ok(cancelAgent.sent.some((m) => m.method === 'session/cancel'), 'cancel sends session/cancel notification');
+  promptCancel.resolve({ stopReason: 'cancelled' });
+  assert.equal(await cancelling, true);
+});
+
+await check('fake: handshake timeout, inactivity timeout, slash commands, pre-edit unified diff & sanitization', async () => {
+  // Handshake timeout
+  const hung = fakeAgent({
+    handshakeTimeoutMs: 50,
+    respond: () => new Promise(() => {}),
+  });
+  void hung.driver.start();
+  await tick(100);
+  assert.match(hung.events.fatal ?? '', /Timed out waiting for Antigravity \(initialize\)/);
+
+  // Inactivity timeout
+  const silent = fakeAgent({
+    promptInactivityTimeoutMs: 120,
+    respond: baseRespond([deferred()]),
+  });
+  void silent.driver.start();
+  await tick(350);
+  assert.match(silent.events.fatal ?? '', /stopped responding/);
+
+  // Slash commands + pre-edit diff + payload sanitization
+  const sampleFile = path.join(fakeWorkspace, 'diff-target.txt');
+  fs.writeFileSync(sampleFile, Array.from({ length: 12 }, (_, i) => `line${i + 1}`).join('\n') + '\n');
+  const p = deferred();
+  const agent = fakeAgent({ respond: baseRespond([p]) });
+  void agent.driver.start();
+  await tick(20);
+  agent.notify({
+    sessionUpdate: 'available_commands_update',
+    availableCommands: [{ name: 'compact', description: 'Summarize', input: { hint: '[focus]' } }],
+  });
+  assert.deepEqual(agent.events.slashCommands[0], [{ name: 'compact', description: 'Summarize', argumentHint: '[focus]' }]);
+
+  agent.notify({
+    sessionUpdate: 'tool_call',
+    toolCallId: 'ed1',
+    name: 'replace_file_content',
+    kind: 'edit',
+    status: 'pending',
+    rawInput: {
+      TargetFile: sampleFile,
+      StartLine: 7,
+      EndLine: 9,
+      TargetContent: 'line8\nline9',
+      ReplacementContent: 'line8-edited\nline9',
+      Preview: 'data:image/png;base64,AAAA',
+    },
+  });
+  await tick(20);
+  const edActivity = agent.events.activities.get('ed1');
+  assert.match(edActivity?.diff?.patch ?? '', /@@ -5,7 \+5,7 @@/);
+  assert.match(edActivity?.diff?.patch ?? '', /-line8\n\+line8-edited/);
+  assert.doesNotMatch(edActivity?.input ?? '', /data:image\/png/);
+  p.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+});
+
+await check('session manager: reuses warm process and rebinds MCP across turns, disposes cleanly', async () => {
+  let spawns = 0;
+  let mcpCreates = 0;
+  let mcpRebinds = 0;
+  let mcpReleases = 0;
+  let kills = 0;
+  const makeChild = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { write: () => true };
+    child.exitCode = null;
+    child.signalCode = null;
+    child.killed = false;
+    return child;
+  };
+  const manager = createAntigravitySessionManager({
+    spawnProcess: () => {
+      spawns += 1;
+      return makeChild();
+    },
+    terminateProcess: async (child) => {
+      kills += 1;
+      child.killed = true;
+      child.emit('close', 0, null);
+    },
+    idleTimeoutMs: 5000,
+  });
+  const createMcp = async () => {
+    mcpCreates += 1;
+    return {
+      rebindTurn: () => {
+        mcpRebinds += 1;
+      },
+      release: () => {
+        mcpReleases += 1;
+      },
+    };
+  };
+  const lease1 = await manager.acquire({
+    threadId: 't-warm',
+    cwd: fakeWorkspace,
+    accessMode: 'full-access',
+    commandArgs: ['agy', 'acp', '--dangerously-skip-permissions'],
+    createMcp,
+    rebindMcp: (m) => m.rebindTurn(),
+  });
+  assert.equal(lease1.reused, false);
+  lease1.entry.initialized = { agentVersion: '1.5.15', agentCapabilities: {} };
+  lease1.entry.sessionId = 's-1';
+  await lease1.release({ keepAlive: true });
+  assert.equal(kills, 0);
+  assert.equal(mcpReleases, 0);
+
+  const lease2 = await manager.acquire({
+    threadId: 't-warm',
+    cwd: fakeWorkspace,
+    accessMode: 'full-access',
+    commandArgs: ['agy', 'acp', '--dangerously-skip-permissions'],
+    resumeSessionId: 's-1',
+    createMcp,
+    rebindMcp: (m) => m.rebindTurn(),
+  });
+  assert.equal(lease2.reused, true);
+  assert.equal(spawns, 1);
+  assert.equal(mcpCreates, 1);
+  assert.equal(mcpRebinds, 1);
+  await lease2.release({ keepAlive: true });
+
+  assert.equal(await manager.disposeThread('t-warm'), true);
+  assert.equal(kills, 1);
+  assert.equal(mcpReleases, 1);
+});
+
+await check('ACP model probe: discovers per-model thought_level options and cleans up session files', async () => {
+  const removed = [];
+  let terminated = 0;
+  const modelOptions = [
+    { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+    { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+    { value: 'gemini-pro-orchestrator', name: 'Orchestrator' },
+    { value: 'gemini-pro-orchestrator-alt', name: 'Orchestrator' },
+  ];
+  const makeConfig = (currentModel, thoughtLevels, currentThought) => [
+    { id: 'model', category: 'model', type: 'select', currentValue: currentModel, options: modelOptions },
+    ...(thoughtLevels
+      ? [{
+          id: 'thought_level',
+          category: 'thought_level',
+          type: 'select',
+          currentValue: currentThought,
+          options: thoughtLevels.map((v) => ({ value: v, name: v })),
+        }]
+      : []),
+  ];
+
+  const models = await probeAntigravityModelsOverAcp({
+    spawnProcess: () => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stderr.resume = () => {};
+      child.stdin = {
+        write: (line) => {
+          const msg = JSON.parse(line);
+          queueMicrotask(() => {
+            if (msg.method === 'initialize') {
+              child.stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { agentInfo: { version: '1.5.15' } } })}\n`);
+            } else if (msg.method === 'session/new') {
+              child.stdout.emit(
+                'data',
+                `${JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: msg.id,
+                  result: {
+                    sessionId: 'probe-sess-1',
+                    configOptions: makeConfig('gemini-4-neon', ['low', 'medium', 'high', 'xhigh'], 'high'),
+                  },
+                })}\n`
+              );
+            } else if (msg.method === 'session/set_config_option') {
+              const value = msg.params?.value;
+              const configOptions =
+                value === 'gemini-4-carbon'
+                  ? makeConfig('gemini-4-carbon', ['low', 'medium', 'high'], 'medium')
+                  : makeConfig(value, null, null);
+              child.stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { configOptions } })}\n`);
+            }
+          });
+          return true;
+        },
+      };
+      return child;
+    },
+    terminateProcess: async () => {
+      terminated += 1;
+    },
+    removeSessionFiles: async (info) => {
+      removed.push(info);
+    },
+    fallbackGroupRows: groupAntigravityModelRows,
+  });
+
+  assert.equal(models.length, 4);
+  assert.deepEqual(models[0].reasoningEfforts, ['low', 'medium', 'high', 'xhigh']);
+  assert.equal(models[0].defaultReasoningEffort, 'high');
+  assert.equal(models[0].favorite, true);
+  assert.deepEqual(models[1].reasoningEfforts, ['low', 'medium', 'high']);
+  assert.equal(models[1].defaultReasoningEffort, 'medium');
+  assert.equal(models[2].reasoningEfforts, undefined, 'non-thinking model has no reasoningEfforts');
+  assert.equal(models[3].label, 'Orchestrator (gemini-pro-orchestrator-alt)', 'disambiguates duplicate model labels');
+  assert.equal(terminated, 1);
+  assert.equal(removed.length, 1);
+  assert.equal(removed[0].sessionId, 'probe-sess-1');
+
+  // Legacy fallback when configOptions lacks a model selector
+  const legacy = buildAntigravityModelsFromAcpProbe(
+    {
+      models: {
+        availableModels: [
+          { modelId: 'gemini-3.8-flash-low', name: 'Gemini 3.8 Flash (Low)' },
+          { modelId: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)' },
+        ],
+      },
+    },
+    new Map(),
+    { fallbackGroupRows: groupAntigravityModelRows }
+  );
+  assert.equal(legacy.length, 1);
+  assert.deepEqual(legacy[0].reasoningEfforts, ['low', 'high']);
+});
+
+await check('fake: transient error auto-retries once with Continue and surfaces retryable metadata when exhausted', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const convDir = path.join(antigravityCliHome(), 'conversations');
+  fs.mkdirSync(convDir, { recursive: true });
+  const sid1 = `agy-retry-ok-${process.pid}-${Date.now()}`;
+  const dbPath1 = path.join(convDir, `${sid1}.db`);
+  const db1 = new DatabaseSync(dbPath1);
+  db1.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)');
+  let promptCalls1 = 0;
+  try {
+    const agent1 = fakeAgent({
+      promptText: 'finish task',
+      maxTransientRetries: 1,
+      transientRetryDelayMs: 10,
+      respond: (method) => {
+        if (method === 'initialize') return { agentInfo: { version: '1.5.15' }, agentCapabilities: {} };
+        if (method === 'session/new') return { sessionId: sid1 };
+        if (method === 'session/set_model' || method === 'session/set_mode') return {};
+        if (method === 'session/prompt') {
+          promptCalls1 += 1;
+          if (promptCalls1 === 1) {
+            agent1.notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Part 1.' } });
+            db1
+              .prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)')
+              .run(1, 15, 3, Buffer.from('partial'));
+            db1
+              .prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)')
+              .run(2, 17, 3, Buffer.from('Error 502, Message: bad gateway, Status: 502 Bad Gateway'));
+            return { stopReason: 'end_turn' };
+          }
+          agent1.notify({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Part 2 done.' } });
+          db1
+            .prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)')
+            .run(3, 15, 3, Buffer.from('done'));
+          return { stopReason: 'end_turn' };
+        }
+        return {};
+      },
+    });
+    await agent1.driver.start();
+    await tick(60);
+    assert.equal(promptCalls1, 2, 'auto-retried transient 502 once');
+    assert.equal(agent1.events.fatal, null, 'recovered cleanly without fatal');
+    assert.equal(agent1.events.turnEnds.length, 1);
+    assert.match(agent1.events.text, /Part 1\.[\s\S]*Part 2 done\./);
+    const promptReqs = agent1.sent.filter((m) => m.method === 'session/prompt');
+    assert.equal(promptReqs[1]?.params?.prompt?.[0]?.text, 'Continue.', 'auto-retry sends Continue. after partial progress');
+  } finally {
+    db1.close();
+    fs.rmSync(dbPath1, { force: true });
+  }
+
+  // When retries are exhausted, onFatal receives retryable + resumeWith metadata for the UI button.
+  const sid2 = `agy-retry-fail-${process.pid}-${Date.now()}`;
+  const dbPath2 = path.join(convDir, `${sid2}.db`);
+  const db2 = new DatabaseSync(dbPath2);
+  db2.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)');
+  let promptCalls2 = 0;
+  try {
+    const agent2 = fakeAgent({
+      promptText: 'do work',
+      maxTransientRetries: 1,
+      transientRetryDelayMs: 10,
+      respond: (method) => {
+        if (method === 'initialize') return { agentInfo: { version: '1.5.15' }, agentCapabilities: {} };
+        if (method === 'session/new') return { sessionId: sid2 };
+        if (method === 'session/set_model' || method === 'session/set_mode') return {};
+        if (method === 'session/prompt') {
+          promptCalls2 += 1;
+          const base = promptCalls2 * 2;
+          db2
+            .prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)')
+            .run(base - 1, 15, 3, Buffer.from('step'));
+          db2
+            .prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)')
+            .run(base, 17, 3, Buffer.from('Error 404, Message: not found, Status: NOT_FOUND'));
+          return { stopReason: 'end_turn' };
+        }
+        return {};
+      },
+    });
+    await agent2.driver.start();
+    await tick(60);
+    assert.equal(promptCalls2, 2, 'tried initial prompt + 1 auto-retry');
+    assert.match(agent2.events.fatal ?? '', /HTTP 404/);
+    assert.deepEqual(agent2.events.fatalMeta, { retryable: true, resumeWith: 'continue' });
+  } finally {
+    db2.close();
+    fs.rmSync(dbPath2, { force: true });
+  }
+});
+
+await check('fake: review regressions (elicitation typing/bounds/optional, ordinary tool vs daemon, keep-warm finishDriverRun)', async () => {
+  // 1. Elicitation preserves numeric enum types, enforces scalar anyOf & numeric bounds, and propagates optional required flag.
+  const p1 = deferred();
+  let capturedReq = null;
+  const elAgent = fakeAgent({
+    respond: baseRespond([p1]),
+    onUserInput: (driver) => {
+      const list = driver.getUserInputs();
+      if (list.length) capturedReq = list[0];
+    },
+  });
+  void elAgent.driver.start();
+  await tick(20);
+  elAgent.ask('el-typed', 'elicitation/create', {
+    message: 'Configure',
+    requestedSchema: {
+      type: 'object',
+      required: ['nums', 'mode', 'retries'],
+      properties: {
+        nums: { type: 'array', minItems: 1, items: { enum: [1, 2, 3] } },
+        mode: { type: 'string', anyOf: [{ const: 'fast', title: 'Fast' }, { const: 'safe', title: 'Safe' }] },
+        retries: { type: 'integer', minimum: 1, maximum: 5 },
+        note: { type: 'string', title: 'Optional note' },
+      },
+    },
+  });
+  await tick(20);
+  assert.ok(capturedReq, 'elicitation raised');
+  const noteQ = capturedReq.questions.find((q) => q.id === 'note');
+  const modeQ = capturedReq.questions.find((q) => q.id === 'mode');
+  assert.equal(noteQ?.required, false, 'optional field exposes required: false');
+  assert.equal(modeQ?.required, true, 'required field exposes required: true');
+  assert.equal(modeQ?.options?.length, 2, 'scalar string anyOf parsed as choice options');
+
+  // Out-of-range number must be rejected without clearing pending question.
+  assert.equal(
+    elAgent.driver.answerUserInput('el-typed', { nums: ['1'], mode: ['Fast'], retries: ['99'], note: [] }),
+    false,
+    'rejects number above maximum'
+  );
+  // Invalid value for scalar anyOf must be rejected without clearing pending question.
+  assert.equal(
+    elAgent.driver.answerUserInput('el-typed', { nums: ['1'], mode: ['unlisted'], retries: ['3'], note: [] }),
+    false,
+    'rejects unlisted scalar anyOf value'
+  );
+  assert.equal(elAgent.driver.getUserInputs().length, 1, 'invalid answers keep question pending');
+
+  // Valid answer with omitted optional field succeeds and preserves numeric type in array.
+  assert.equal(
+    elAgent.driver.answerUserInput('el-typed', { nums: ['2'], mode: ['Safe'], retries: ['3'], note: [] }),
+    true,
+    'accepts valid answer with omitted optional field'
+  );
+  const elReply = elAgent.answers.find((m) => m.id === 'el-typed');
+  assert.deepEqual(elReply?.result?.content, { nums: [2], mode: 'safe', retries: 3 });
+  p1.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  // 2. An ordinary running read_file tool must NOT suppress DB running: 1 (only explicit IsDaemon tools do).
+  const { DatabaseSync } = await import('node:sqlite');
+  const convDir = path.join(antigravityCliHome(), 'conversations');
+  fs.mkdirSync(convDir, { recursive: true });
+  const sid = `agy-ordinary-tool-${process.pid}-${Date.now()}`;
+  const dbPath = path.join(convDir, `${sid}.db`);
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, step_payload BLOB)');
+  try {
+    const p2 = deferred();
+    const agent = fakeAgent({
+      respond: (method) => {
+        if (method === 'initialize') return { agentInfo: { version: '1.5.15' }, agentCapabilities: {} };
+        if (method === 'session/new') return { sessionId: sid };
+        if (method === 'session/set_model' || method === 'session/set_mode') return {};
+        if (method === 'session/prompt') return p2.promise;
+        return {};
+      },
+    });
+    void agent.driver.start();
+    await tick(20);
+    // Ordinary non-daemon read tool still marked running in ACP while DB shows a running background command (idx=1, status=2 RUNNING).
+    agent.notify({ sessionUpdate: 'tool_call', toolCallId: 'r1', name: 'read_file', kind: 'read', status: 'in_progress' });
+    db.prepare('INSERT INTO steps (idx, step_type, status, step_payload) VALUES (?, ?, ?, ?)').run(1, 5, 2, Buffer.from('bg'));
+    p2.resolve({ stopReason: 'end_turn' });
+    await tick(50);
+    assert.equal(agent.events.turnEnds.length, 0, 'ordinary read tool does not mask DB running background work');
+    agent.driver.dispose();
+  } finally {
+    db.close();
+    fs.rmSync(dbPath, { force: true });
+  }
+
+  // 3. main.js finishDriverRun must not kill persistent Antigravity child before finalizeRun keeps it warm.
+  const mainSrc = fs.readFileSync(path.join(process.cwd(), 'src/main.js'), 'utf8');
+  const finishMatch = /const finishDriverRun = \(\) => \{[\s\S]*?\n    \};/.exec(mainSrc);
+  assert.ok(finishMatch, 'found finishDriverRun in src/main.js');
+  assert.match(finishMatch[0], /if \(!persistentAntigravity\) killAgentChild\(child\)/, 'finishDriverRun preserves persistent Antigravity process');
+
+  // 4. Round-2 regressions: fresh turn (resumeSessionId: null) never reuses a warm session; LRU cap evicts oldest idle; idle request gets cancelled.
+  const makeChild = () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.writes = [];
+    child.stdin = { write: (line) => { child.writes.push(line); return true; } };
+    child.exitCode = null;
+    child.signalCode = null;
+    child.killed = false;
+    return child;
+  };
+  const killedChildren = [];
+  const mgr = createAntigravitySessionManager({
+    spawnProcess: () => makeChild(),
+    terminateProcess: async (child) => {
+      killedChildren.push(child);
+      child.killed = true;
+      child.emit('close', 0, null);
+    },
+    idleTimeoutMs: 60_000,
+    maxIdleSessions: 2,
+  });
+  const l1 = await mgr.acquire({ threadId: 'edit-t', cwd: fakeWorkspace, accessMode: 'full-access', commandArgs: ['agy', 'acp'] });
+  l1.entry.initialized = { agentVersion: '1.5.15', agentCapabilities: {} };
+  l1.entry.sessionId = 'sess-old';
+  await l1.release({ keepAlive: true });
+  // Message edit clears resumeSessionId -> must NOT reuse sess-old!
+  const l2 = await mgr.acquire({ threadId: 'edit-t', cwd: fakeWorkspace, accessMode: 'full-access', commandArgs: ['agy', 'acp'], resumeSessionId: null });
+  assert.equal(l2.reused, false, 'resumeSessionId: null never reuses a warm session');
+  assert.notEqual(l2.child, l1.child, 'fresh child spawned for edited thread');
+  l2.entry.initialized = { agentVersion: '1.5.15', agentCapabilities: {} };
+  l2.entry.sessionId = 'sess-new';
+  await l2.release({ keepAlive: true });
+  // Idle agent->client permission request gets cancelled and destroys idle entry.
+  l2.child.stdout.emit('data', `${JSON.stringify({ jsonrpc: '2.0', id: 77, method: 'session/request_permission', params: {} })}\n`);
+  await tick(20);
+  assert.ok(l2.child.writes.some((w) => w.includes('"cancelled"') && w.includes('77')), 'idle permission request answered cancelled');
+  assert.equal(l2.child.killed, true, 'idle process destroyed after unexpected idle traffic');
+
+  // LRU cap (maxIdleSessions: 2) evicts oldest idle session when 3rd becomes idle.
+  for (const tid of ['lru-1', 'lru-2', 'lru-3']) {
+    const lx = await mgr.acquire({ threadId: tid, cwd: fakeWorkspace, accessMode: 'full-access', commandArgs: ['agy', 'acp'] });
+    lx.entry.initialized = { agentVersion: '1.5.15', agentCapabilities: {} };
+    lx.entry.sessionId = `s-${tid}`;
+    await lx.release({ keepAlive: true });
+    await tick(5);
+  }
+  assert.equal(mgr.snapshot().count, 2, 'LRU cap bounds idle warm sessions');
+  await mgr.shutdown();
+
+  // 5. Warm systemPrompt.append dedup with Turn-1 instructions + memory vs Turn-2 instructions-only.
+  const memState = { initialized: null, sessionId: null, currentModelKey: null, currentModeId: null, availableModes: [], systemPromptAppendApplied: null };
+  let memReqId = 1;
+  const mp1 = deferred();
+  const mem1 = fakeAgent({
+    promptText: 'turn 1',
+    systemPromptAppend: '[Orion general instructions]\nuse bun\n[/Orion general instructions]\n\n[Durango memory]\nlikes cats\n[/Durango memory]',
+    sessionState: memState,
+    nextRequestId: () => memReqId++,
+    respond: (method) => {
+      if (method === 'initialize') return { agentInfo: { version: '1.5.15' }, agentCapabilities: { _meta: { antigravity: { systemPrompt: { append: true } } } } };
+      return baseRespond([mp1])(method);
+    },
+  });
+  void mem1.driver.start();
+  await tick(20);
+  mp1.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+  const mp2 = deferred();
+  const mem2 = fakeAgent({
+    promptText: 'turn 2',
+    resumeSessionId: memState.sessionId,
+    systemPromptAppend: '[Orion general instructions]\nuse bun\n[/Orion general instructions]',
+    sessionState: memState,
+    nextRequestId: () => memReqId++,
+    respond: (method) => (method === 'session/prompt' ? mp2.promise : {}),
+  });
+  void mem2.driver.start();
+  await tick(20);
+  assert.equal(
+    mem2.sent.find((m) => m.method === 'session/prompt')?.params?.prompt?.[0]?.text,
+    'turn 2',
+    'warm Turn 2 with instructions-only stays deduplicated when Turn 1 appended instructions + memory'
+  );
+  mp2.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  // 6. Auto mode fallback to default auto-allows read-only tools instead of prompting.
+  const ap = deferred();
+  let autoAsked = 0;
+  const autoFallback = fakeAgent({
+    accessMode: 'auto',
+    respond: baseRespond([ap]), // no availableModes -> falls back to default
+    onUserInput: () => { autoAsked += 1; },
+  });
+  void autoFallback.driver.start();
+  await tick(20);
+  autoFallback.ask(55, 'session/request_permission', {
+    toolCall: { toolCallId: 'ro-1', name: 'read_file', kind: 'read' },
+    options: [{ optionId: 'a1', kind: 'allow_once', name: 'Allow' }, { optionId: 'r1', kind: 'reject_once', name: 'Deny' }],
+  });
+  await tick(20);
+  assert.equal(autoAsked, 0, 'auto fallback to default auto-allows read-only tools');
+  assert.equal(autoFallback.answers.find((m) => m.id === 55)?.result?.outcome?.optionId, 'a1');
+  ap.resolve({ stopReason: 'end_turn' });
+  await tick(20);
+
+  // 7. Startup orphan sweep ONLY removes Durango-owned temp prefixes, never arbitrary user /tmp sessions.
+  const sweepRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'agy-sweep-test-')));
+  try {
+    const fakeCliHome = path.join(sweepRoot, 'cli-home');
+    const fakeConvDir = path.join(fakeCliHome, 'conversations');
+    fs.mkdirSync(fakeConvDir, { recursive: true });
+    const ownedWs = path.join(os.tmpdir(), `durango-agy-oneshot-gone-${Date.now()}`);
+    const userWs = path.join(os.tmpdir(), `user-scratch-gone-${Date.now()}`);
+    fs.writeFileSync(path.join(fakeConvDir, 'sess-owned.db'), 'x');
+    fs.writeFileSync(path.join(fakeConvDir, 'sess-owned.meta'), JSON.stringify({ workspaces: [ownedWs] }));
+    fs.writeFileSync(path.join(fakeConvDir, 'sess-user.db'), 'x');
+    fs.writeFileSync(path.join(fakeConvDir, 'sess-user.meta'), JSON.stringify({ workspaces: [userWs] }));
+    const res = await sweepOrphanAntigravityTempSessions({ cliHome: fakeCliHome });
+    assert.deepEqual(res.removed, ['sess-owned'], 'sweeps only Durango-owned temp sessions');
+    assert.equal(fs.existsSync(path.join(fakeConvDir, 'sess-user.db')), true, 'preserves user /tmp sessions');
+  } finally {
+    fs.rmSync(sweepRoot, { recursive: true, force: true });
+  }
+});
+
 // Drives one real turn and records what the driver reported.
 const runTurn = ({ cwd, accessMode, promptText, resumeSessionId = null, answer = null, steerAfterMs = null, steerText = '' }) =>
   new Promise((resolve) => {
@@ -718,6 +1581,20 @@ if (process.env.AGY_LIVE === '1') {
     const limits = await readAntigravityLimits();
     assert.equal(limits.status, 'ok', limits.detail);
     assert.ok(limits.windows.length > 0);
+  });
+
+  await check('live: ACP model probe discovers real thought_level options and leaves zero session files', async () => {
+    const convDir = path.join(antigravityCliHome(), 'conversations');
+    const before = new Set(fs.existsSync(convDir) ? fs.readdirSync(convDir) : []);
+    const models = await probeAntigravityModelsOverAcp({ fallbackGroupRows: groupAntigravityModelRows });
+    const after = new Set(fs.existsSync(convDir) ? fs.readdirSync(convDir) : []);
+    const leftover = [...after].filter((f) => !before.has(f));
+    assert.ok(models.length > 0, 'probed at least one live Antigravity model');
+    assert.ok(
+      models.some((m) => Array.isArray(m.reasoningEfforts) && m.reasoningEfforts.length >= 3),
+      'at least one model reported dynamic thought_level options'
+    );
+    assert.deepEqual(leftover, [], `probe leaked session files: ${leftover.join(', ')}`);
   });
 
   await check('live: workspace write allows edits inside, denies commands and outside writes', async () => {

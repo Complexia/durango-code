@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { resolveAttachmentMimeType } from './acp-prompt-blocks.js';
 import { emitAgentEvent } from './events.js';
 import { snapShotOutlinePromptText } from './snapshot-format.js';
 import { approvalView } from './approval-explainer.js';
@@ -12,7 +13,6 @@ export const claudeUserContent = async (text, attachments = []) => {
   const seen = new Set();
   for (const attachment of Array.isArray(attachments) ? attachments : []) {
     const file = attachment?.path;
-    const mime = attachment?.mimeType;
     if (typeof file !== 'string' || !path.isAbsolute(file) || seen.has(file)) continue;
     // A SnapShot's accessibility outline goes inline as framed, untrusted
     // text; the path in the prompt still points at the full file.
@@ -22,6 +22,7 @@ export const claudeUserContent = async (text, attachments = []) => {
       if (outline !== null) content.push({ type: 'text', text: snapShotOutlinePromptText(attachment, outline) });
       continue;
     }
+    const mime = resolveAttachmentMimeType(attachment, file);
     if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif', 'application/pdf'].includes(mime)) continue;
     seen.add(file);
     // Do not silently lose an attachment when a file disappeared after upload.

@@ -301,6 +301,26 @@ export const ProviderAuthPrompt: React.FC<{
   );
 };
 
+/** Inline recovery action shown when a turn stopped due to a transient error. */
+export const RetryableErrorPrompt: React.FC<{
+  error: string;
+  resumeWith?: 'continue' | 'retry';
+  onContinue: () => void;
+  busy?: boolean;
+}> = ({ error, resumeWith = 'continue', onContinue, busy }) => (
+  <div className="agent-error agent-auth-error">
+    <span>{error}</span>
+    <button
+      type="button"
+      className="provider-auth-button compact"
+      onClick={onContinue}
+      disabled={busy}
+    >
+      {busy ? 'Continuing…' : resumeWith === 'retry' ? 'Retry' : 'Continue'}
+    </button>
+  </div>
+);
+
 const workSinceIso = (messages: Message[], message: Message) => {
   const since = workStartedAt(messages, message);
   return Number.isFinite(since) ? new Date(since).toISOString() : undefined;
@@ -394,6 +414,8 @@ type AgentRunPartProps = {
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
+  onContinueRetryableError?: (messageId: string, mode: 'continue' | 'retry') => void;
+  retryBusy?: boolean;
   /**
    * The run's header, on its first part. Plain values rather than an element,
    * so a part re-renders only when what it shows changed (the run streams
@@ -419,6 +441,8 @@ const AgentRunPart = React.memo(function AgentRunPart({
   renderBtwAside,
   onAuthenticateProvider,
   authenticatingProviderId,
+  onContinueRetryableError,
+  retryBusy,
   header,
   headerRunning = false,
   headerStartedAt,
@@ -527,6 +551,13 @@ const AgentRunPart = React.memo(function AgentRunPart({
             onAuthenticate={onAuthenticateProvider}
             busy={authenticatingProviderId === message.authProviderId}
           />
+        ) : message.retryable && onContinueRetryableError ? (
+          <RetryableErrorPrompt
+            error={message.error}
+            resumeWith={message.resumeWith}
+            busy={retryBusy}
+            onContinue={() => onContinueRetryableError(message.id, message.resumeWith ?? 'continue')}
+          />
         ) : (
           <div className="agent-error">{message.error}</div>
         ))}
@@ -578,6 +609,8 @@ export type ChatMessageProps = {
   renderBtwAside?: (exchange: BtwExchange) => React.ReactNode;
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
+  onContinueRetryableError?: (messageId: string, mode: 'continue' | 'retry') => void;
+  retryBusy?: boolean;
   onDiscardClaudeBackgroundTasks?: (messageId: string, runId: string) => void;
   /** Set on the user's own messages while the thread is idle: edit it and continue from there. */
   onEdit?: (messageId: string) => void;
@@ -595,6 +628,8 @@ export const ChatMessage = React.memo(function ChatMessage({
   renderBtwAside,
   onAuthenticateProvider,
   authenticatingProviderId,
+  onContinueRetryableError,
+  retryBusy,
   onDiscardClaudeBackgroundTasks,
   onEdit,
 }: ChatMessageProps) {
@@ -643,6 +678,8 @@ export const ChatMessage = React.memo(function ChatMessage({
         renderBtwAside={renderBtwAside}
         onAuthenticateProvider={onAuthenticateProvider}
         authenticatingProviderId={authenticatingProviderId}
+        onContinueRetryableError={onContinueRetryableError}
+        retryBusy={retryBusy}
       />
     );
   }
@@ -755,6 +792,8 @@ export type AgentRunGroupProps = {
   onUnlinkTask?: (taskId: string) => void;
   onAuthenticateProvider?: (providerId: string) => void;
   authenticatingProviderId?: string | null;
+  onContinueRetryableError?: (messageId: string, mode: 'continue' | 'retry') => void;
+  retryBusy?: boolean;
 };
 
 const sameItems = <T,>(a: readonly T[], b: readonly T[]) =>
@@ -788,6 +827,8 @@ export const AgentRunGroup = React.memo(
     onUnlinkTask,
     onAuthenticateProvider,
     authenticatingProviderId,
+    onContinueRetryableError,
+    retryBusy,
   }: AgentRunGroupProps) {
     const [stepsOpen, setStepsOpen] = useState(false);
     const toggleSteps = useCallback(() => setStepsOpen((open) => !open), []);
@@ -821,6 +862,8 @@ export const AgentRunGroup = React.memo(
                 renderBtwAside={renderBtwAside}
                 onAuthenticateProvider={onAuthenticateProvider}
                 authenticatingProviderId={part.authProviderId ? authenticatingProviderId : undefined}
+                onContinueRetryableError={part.retryable ? onContinueRetryableError : undefined}
+                retryBusy={part.retryable ? retryBusy : undefined}
                 {...(first && header
                   ? {
                       header: true,
@@ -983,6 +1026,7 @@ export type ChatTranscriptProps = {
   onUnlinkTask: (threadId: string, taskId: string) => void;
   onDismissBtwExchange: (threadId: string, exchangeId: string) => void;
   onAuthenticateProvider: (providerId: string) => void;
+  onContinueRetryableError?: (threadId: string, messageId: string, mode: 'continue' | 'retry') => void;
   onDiscardClaudeBackgroundTasks: (threadId: string, messageId: string, runId: string) => void;
   onSteerQueuedMessage: (threadId: string, queuedId: string) => void;
   /** Edit an earlier user message: the transcript is cut there and the text goes back to the composer. */
@@ -1097,6 +1141,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
   onUnlinkTask,
   onDismissBtwExchange,
   onAuthenticateProvider,
+  onContinueRetryableError,
   onDiscardClaudeBackgroundTasks,
   onSteerQueuedMessage,
   onEditMessage,
@@ -1417,6 +1462,11 @@ export const ChatTranscript = React.memo(function ChatTranscript({
       onDiscardClaudeBackgroundTasks(threadId, messageId, runId),
     [onDiscardClaudeBackgroundTasks, threadId]
   );
+  const handleContinueRetryableError = useCallback(
+    (messageId: string, mode: 'continue' | 'retry') =>
+      onContinueRetryableError?.(threadId, messageId, mode),
+    [onContinueRetryableError, threadId]
+  );
   const handleMoveTasksCard = useCallback(
     (position: { x: number; y: number }) => onMoveTasksCard(threadId, position),
     [onMoveTasksCard, threadId]
@@ -1573,6 +1623,16 @@ export const ChatTranscript = React.memo(function ChatTranscript({
                     onAuthenticateProvider={onAuthenticateProvider}
                     authenticatingProviderId={
                       parts.some((part) => part.authProviderId) ? authenticatingProviderId : undefined
+                    }
+                    onContinueRetryableError={
+                      onContinueRetryableError && parts.some((part) => part.retryable)
+                        ? handleContinueRetryableError
+                        : undefined
+                    }
+                    retryBusy={
+                      parts.some((part) => part.retryable)
+                        ? isSending || Boolean(pendingTurn) || thread.status === 'running'
+                        : undefined
                     }
                   />
                 );

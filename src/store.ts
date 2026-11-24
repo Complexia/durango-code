@@ -292,7 +292,7 @@ export type DurangoDispatchSettings = {
    * Access for dispatched runs, and the ceiling: a run never gets more even
    * if Durango Chat asks for it. Read only by default.
    */
-  accessMode: Thread['accessMode'];
+  accessMode: 'read-only' | 'workspace-write' | 'full-access';
   /** Model for dispatched runs when Durango Chat names none; null = the project's usual model. */
   modelId: string | null;
   /** Dispatched runs at a time on this Mac; null = no limit. */
@@ -421,8 +421,8 @@ export type AgentActivity = {
   /** Live tool output (streaming terminal stdout, tool result text). */
   output?: string;
   exitCode?: number;
-  /** Line counts for a file edit, rendered as a +N −N chip. */
-  diff?: { path: string; additions: number; deletions: number };
+  /** Line counts (and optional unified diff patch) for a file edit, rendered as a +N −N chip. */
+  diff?: { path: string; additions: number; deletions: number; patch?: string };
   /** Web search / fetch result links. */
   sources?: AgentToolSource[];
   /** Live task checklist (agent plan / todo-list updates). */
@@ -509,6 +509,10 @@ export type Message = {
   startedAt?: string;
   completedAt?: string;
   error?: string;
+  /** Set when a turn ended with a transient/retryable error so the transcript offers a one-click Continue/Retry button. */
+  retryable?: boolean;
+  /** Preferred recovery action for a retryable turn error ('continue' resumes the session, 'retry' resends the prompt). */
+  resumeWith?: 'continue' | 'retry';
   /**
    * Set when the turn's error text reads as a logged-out provider CLI: the
    * transcript offers an Authenticate button for this provider instead of a
@@ -690,7 +694,7 @@ export type Thread = {
   title: string;
   status: 'idle' | 'running' | 'done' | 'error';
   modelId: string;
-  accessMode: 'read-only' | 'workspace-write' | 'full-access';
+  accessMode: 'read-only' | 'workspace-write' | 'auto' | 'full-access';
   codexReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   codexServiceTier?: 'default' | 'priority';
   claudeReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultracode' | 'ultrathink';

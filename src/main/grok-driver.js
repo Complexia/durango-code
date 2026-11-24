@@ -2,6 +2,7 @@ import { protocol } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import os from 'node:os';
+import { buildAcpPromptBlocks } from './acp-prompt-blocks.js';
 import { countDiffLines, formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 import { grokSessionModeForAccessMode } from './grok-access-mode.js';
 import { isPreapprovedOrionTool } from './thread-reader-routing.js';
@@ -213,7 +214,7 @@ export const grokStatsFromPromptMeta = (meta) => {
   return Object.keys(stats).length ? stats : null;
 };
 
-export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, accessMode, callbacks }) => {
+export const createGrokAcpDriver = ({ child, cwd, promptText, attachments = [], resumeSessionId, accessMode, callbacks }) => {
   let nextRequestId = 1;
   const pendingRequests = new Map();
   const toolCalls = new Map();
@@ -569,6 +570,9 @@ export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, a
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     });
     if (init.error) return fail(init.error);
+    const rawPromptCaps = init.result?.agentCapabilities?.promptCapabilities;
+    const promptCapabilities =
+      rawPromptCaps && typeof rawPromptCaps === 'object' ? rawPromptCaps : { image: true };
 
     let sessionId = null;
     if (resumeSessionId) {
@@ -604,9 +608,10 @@ export const createGrokAcpDriver = ({ child, cwd, promptText, resumeSessionId, a
       });
     }
 
+    const prompt = await buildAcpPromptBlocks(promptText, attachments, promptCapabilities);
     const response = await request('session/prompt', {
       sessionId,
-      prompt: [{ type: 'text', text: promptText }],
+      prompt,
     });
     flushToolEmits();
     if (response.error) return fail(response.error);

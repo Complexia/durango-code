@@ -10,6 +10,10 @@ export type ToolApproval = {
   purpose?: string;
   /** Why the agent's harness asked instead of running it. */
   reason?: string;
+  /** Security warning attached to session-scoped approval (e.g. agy.security.warning). */
+  warning?: string;
+  /** Whether the agent offers a thread/session-scoped approval option ("Allow for this thread"). */
+  allowForThread?: boolean;
   blockedPath?: string;
   command?: string;
   path?: string;
@@ -17,6 +21,8 @@ export type ToolApproval = {
   /** The rest of the tool input, as JSON. */
   input?: string;
 };
+
+export type ApprovalAnswer = 'Allow once' | 'Allow for this thread' | 'Deny';
 
 export type ApprovalExplanation = {
   summary: string;
@@ -27,7 +33,7 @@ export type ApprovalExplanation = {
 };
 
 export type CodexQuestionRequest = {
-  providerId?: 'codex' | 'claude';
+  providerId?: 'codex' | 'claude' | 'antigravity';
   /** Astra's request_user_input_async: answered with an ordinary steered user message. */
   async?: boolean;
   detail?: string;
@@ -43,6 +49,7 @@ export type CodexQuestionRequest = {
     isSecret?: boolean;
     multiSelect?: boolean;
     allowCustom?: boolean;
+    required?: boolean;
     options?: Array<{ label: string; description: string }> | null;
   }>;
 };
@@ -142,9 +149,11 @@ const QuestionCard = ({
   const answerFor = (id: string) => [...(answers[id] ?? []), ...(customAnswers[id]?.trim() ? [customAnswers[id]] : [])];
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
-  const complete = request.questions.every((question) => answerFor(question.id).length > 0);
+  const complete = request.questions.every(
+    (question) => question.required === false || answerFor(question.id).length > 0
+  );
 
-  const [approvalAnswer, setApprovalAnswer] = useState<'Allow once' | 'Deny' | null>(null);
+  const [approvalAnswer, setApprovalAnswer] = useState<ApprovalAnswer | null>(null);
   const submit = async (override?: Record<string, string[]>) => {
     if (sending || (!override && !complete)) return;
     setSending(true);

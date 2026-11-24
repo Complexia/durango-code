@@ -77,13 +77,16 @@ import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, get
 import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteerableRunDrivers, steerFxRun } from './main/fx-driver.js';
 import { configureFxProvider, installFx, prepareFxLaunch, readFxConnections } from './main/fx-provider.js';
 import { antigravityChildTranscriptPath, handleAntigravitySubagentLine, resolveAntigravityChild } from './main/antigravity-child-work.js';
-import { antigravityReadOnlyOneShot, antigravityRunDrivers, antigravityStatsFromPromptResult, createAntigravityAcpDriver, steerAntigravityRun } from './main/antigravity-driver.js';
+import { antigravityReadOnlyOneShot, antigravityRunDrivers, antigravityStatsFromPromptResult, cancelAntigravityRun, createAntigravityAcpDriver, steerAntigravityRun } from './main/antigravity-driver.js';
+import { antigravitySessionManager } from './main/antigravity-session-manager.js';
+import { sweepOrphanAntigravityTempSessions } from './main/antigravity-session-files.js';
+import { discoverAntigravitySkills, mergeAntigravitySlashCommands } from './main/antigravity-skills.js';
 import { createReasoningStream } from './main/reasoning-stream.js';
 import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiStatsFromSessionDisk, watchKimiSubagentSpawns } from './main/kimi-driver.js';
 import { guardVisualFrames } from './main/visual-tools.js';
 import { attachTextContextMenu } from './main/text-context-menu.js';
 import { subagentReportsMessage } from './main/background-subagents.js';
-import { handleSubagentResult, handleSubagentStarted, legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpMcpServers, pendingSubagentStops, takeSubagentReports, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
+import { closeMcpBridge, handleSubagentResult, handleSubagentStarted, legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpHttpMcpServers, orionAcpMcpServers, pendingSubagentStops, takeSubagentReports, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { DurangoError, accountKeyOf, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
 import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
@@ -1426,6 +1429,9 @@ app.whenReady().then(async () => {
   // only the prerequisite they actually need.
   startShellPathSync();
   startLegacyMcpCleanup();
+  setTimeout(() => {
+    void sweepOrphanAntigravityTempSessions().catch(() => {});
+  }, 4000).unref?.();
   void initDevices().catch((error) => console.error('Device setup failed:', error));
   void installBundledCli();
   void installDurangoGitCredentials();
@@ -1879,6 +1885,8 @@ const disposeForQuit = (reason = 'quit') => {
   // Idempotent and bounded; waitForPendingQuitWork awaits the same promise.
   void shutdownDevices();
   reapActiveAgentRuns();
+  void antigravitySessionManager.shutdown();
+  void closeMcpBridge();
   if (!codexAppServerShutdownPromise) {
     // Goal runs must record their pause through the shared server before it
     // exits. Once all per-run connections are reaped, stop the server itself.
@@ -5605,13 +5613,32 @@ ipcMain.handle('agent:readThreadsForMention', async (_event, input) => {
   );
 });
 
-ipcMain.handle('agent:listSlashCommands', async (event, input) =>
-  listClaudeSlashCommands({
+const antigravityLiveSlashCommandsByProject = new Map(); // projectPath -> SlashCommandInfo[]
+const ANTIGRAVITY_FALLBACK_SLASH_COMMANDS = [
+  { name: 'compact', description: 'Compact conversation history to free context window', argumentHint: '' },
+  { name: 'goal', description: 'Run a long-horizon goal autonomously', argumentHint: '<objective>' },
+  { name: 'plan', description: 'Plan carefully before executing', argumentHint: '' },
+];
+
+ipcMain.handle('agent:listSlashCommands', async (event, input) => {
+  const projectPath = typeof input?.projectPath === 'string' ? input.projectPath : null;
+  if (input?.providerId === 'antigravity') {
+    const live = projectPath ? antigravityLiveSlashCommandsByProject.get(projectPath) ?? [] : [];
+    const skills = await discoverAntigravitySkills({ cwd: projectPath }).catch(() => []);
+    const base = live.length > 0 ? live : ANTIGRAVITY_FALLBACK_SLASH_COMMANDS;
+    const commands = mergeAntigravitySlashCommands(base, skills);
+    return {
+      ok: true,
+      commands,
+      source: live.length > 0 ? 'live' : 'cache',
+    };
+  }
+  return listClaudeSlashCommands({
     sender: event.sender,
     threadId: typeof input?.threadId === 'string' ? input.threadId : null,
-    projectPath: typeof input?.projectPath === 'string' ? input.projectPath : null,
-  })
-);
+    projectPath,
+  });
+});
 
 // `/clear` in the composer: tear down only the thread's persistent Claude SDK
 // session (not the terminal PTY / goal ops that full thread disposal reaps),
@@ -6860,10 +6887,12 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         error: `This ${model.providerId} installation cannot load Durango Code MCP servers: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Update the provider CLI or switch providers.`,
       };
     }
-    const orionMcp =
+    const usePersistentAntigravity =
+      model.providerId === 'antigravity' && !input.aside && !input.spawnedSubagent;
+    const createRunOrionMcp = async () =>
       input.aside || input.codexReview || !bridgeProvider || !supportsRunPlugin
         ? null
-        : await registerMcpBridgeForRun({
+        : registerMcpBridgeForRun({
             getSender: () => event.sender,
             threadId: input.threadId,
             runId,
@@ -6881,6 +6910,48 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
                 ? await codexMcpServers()
                 : [...orionMcps.servers, ...accountMcps],
           });
+    let antigravityLease = usePersistentAntigravity
+      ? await antigravitySessionManager.acquire({
+          threadId: input.threadId,
+          cwd: input.projectPath,
+          accessMode: input.accessMode || 'full-access',
+          commandArgs: commandForModel(model, {
+            ...runtimeInput,
+            acp: true,
+            resumeSessionId: input.resumeSessionId,
+          }),
+          env: withClaudeEnv({
+            ...process.env,
+            FORCE_COLOR: '0',
+            NO_COLOR: '1',
+          }),
+          mcpKey: JSON.stringify({
+            servers: [...orionMcps.servers, ...accountMcps],
+            projectId: typeof input.projectId === 'string' ? input.projectId : null,
+            interactive: !input.spawnedSubagent,
+          }),
+          resumeSessionId: input.resumeSessionId || null,
+          createMcp: createRunOrionMcp,
+          rebindMcp: (mcp) =>
+            mcp.rebindTurn?.({
+              runId,
+              modelId: model.id,
+              accessMode: input.accessMode || 'full-access',
+              browserMode: browserModeFor(model.providerId, input.providerOptions, input.accessMode || 'full-access'),
+              getSender: () => event.sender,
+            }),
+        })
+      : null;
+    const releaseRunStartupResources = async () => {
+      if (antigravityLease) {
+        const lease = antigravityLease;
+        antigravityLease = null;
+        await lease.release({ keepAlive: false });
+      } else {
+        orionMcp?.release();
+      }
+    };
+    const orionMcp = antigravityLease ? antigravityLease.orionMcp : await createRunOrionMcp();
     const openCodeConfig =
       model.providerId === 'opencode'
         ? openCodeMcpConfigContent(orionMcp, process.env.OPENCODE_CONFIG_CONTENT)
@@ -6902,7 +6973,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       Boolean(museConfigRoot)
     );
     if (orionMcps.servers.length > 0 && !effectiveThreadReaderBridgeReady) {
-      orionMcp?.release();
+      await releaseRunStartupResources();
       return {
         ok: false,
         error: `Durango Code could not load MCP servers for this run: ${orionMcps.servers.map((server) => `@${server.name}`).join(', ')}. Try again or switch providers.`,
@@ -6916,7 +6987,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         effectiveThreadReaderBridgeReady
       )
     ) {
-      orionMcp?.release();
+      await releaseRunStartupResources();
       return {
         ok: false,
         error: input.hasThreadMentions
@@ -6961,6 +7032,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         codexAppServerLease?.persistent &&
         codexAppServerLease.child
     );
+    const persistentAntigravity = Boolean(
+      usePersistentAntigravity && antigravityLease?.child
+    );
     const args = commandForModel(model, {
       ...runtimeInput,
       acp: useAcp,
@@ -6972,6 +7046,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     const commandString = args.map(shellQuote).join(' ');
     const child = persistentCodexAppServer
       ? codexAppServerLease.child
+      : persistentAntigravity
+      ? antigravityLease.child
       : (useCodexAppServer ? spawnCodexServerProcess : spawn)(loginShell, ['-lc', commandString], {
           // Shared-server startup/connection failures retry directly. Keep
           // the shell context used by MCP discovery on every attempt; the
@@ -6992,6 +7068,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     let stderr = '';
     let stdoutSeen = false;
+    let fatalMeta = null;
     let acceptedCodexSessionId = resumeSessionId;
     let codexActionAccepted = false;
     let jsonBuffer = '';
@@ -7173,6 +7250,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     let exitFallbackTimer = null;
     let terminalEventTimer = null;
     let runStats = null;
+    let antigravitySessionBroken = false;
     // Set once the stream signals a completed turn — a nonzero exit after
     // that (e.g. from the SIGTERM that reaps a lingering agent process) must
     // not trigger the resume-failed retry.
@@ -7214,10 +7292,20 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       // compaction is still active. Let the driver restore that prompt before
       // closing its app-server transport.
       await acpDriver?.dispose?.();
-      // The run owns its CLI process; whatever path finalized the run, the
-      // process must not outlive it (ACP servers idle forever on their own).
-      // No-op when the process already exited.
-      killAgentChild(child, input.threadId);
+      // Persistent Antigravity sessions stay warm across clean turns and own
+      // their MCP bridge lease; error/stop/broken turns tear the process down.
+      if (persistentAntigravity && antigravityLease) {
+        const keepWarm = finalExitCode === 0 && !wasStopped && !antigravitySessionBroken;
+        if (keepWarm) orionMcp?.abortTurn?.();
+        await antigravityLease.release({ keepAlive: keepWarm });
+        antigravityLease = null;
+      } else {
+        // The run owns its CLI process; whatever path finalized the run, the
+        // process must not outlive it (ACP servers idle forever on their own).
+        // No-op when the process already exited.
+        killAgentChild(child, input.threadId);
+        orionMcp?.release();
+      }
       activeAgentRuns.delete(runId);
       stoppedAgentRuns.delete(runId);
       codexGoalRunDrivers.delete(runId);
@@ -7226,7 +7314,6 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       antigravityRunDrivers.delete(runId);
       codexAppServerLease?.release();
       codexAppServerLease = null;
-      orionMcp?.release();
       codexSpawnWatcher?.stop();
       kimiSpawnWatcher?.stop();
       subagentTracker.dispose(
@@ -7265,6 +7352,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
               // Lets the renderer offer the right provider's Authenticate
               // button when the failure text reads as a logged-out CLI.
               providerId: model.providerId,
+              ...(fatalMeta?.retryable ? { retryable: true } : {}),
+              ...(fatalMeta?.resumeWith ? { resumeWith: fatalMeta.resumeWith } : {}),
             }),
       });
     };
@@ -7408,8 +7497,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           chunk: '_Could not resume the previous session; starting a fresh one._\n\n',
         });
       },
-      onFatal: (message) => {
+      onFatal: (message, meta) => {
         if (finalized) return;
+        fatalMeta = meta && typeof meta === 'object' ? meta : null;
         stdoutSeen = true;
         emitAgentEvent(event.sender, {
           runId,
@@ -7417,18 +7507,20 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           type: 'chunk',
           chunk: `${message}\n`,
         });
-        killAgentChild(child);
+        if (!persistentAntigravity) killAgentChild(child);
         finalizeRun(1);
       },
     };
     // The driver's completion signal: its per-run protocol connection idles
     // once the work resolves, so close it shortly after and finalize as done.
+    // Persistent Antigravity runs keep their warm process alive via the lease
+    // released inside `finalizeRun` rather than killing the child here.
     const finishDriverRun = () => {
       turnCompleted = true;
       if (!terminalEventTimer && !finalized) {
         terminalEventTimer = setTimeout(() => {
           terminalEventTimer = null;
-          killAgentChild(child);
+          if (!persistentAntigravity) killAgentChild(child);
           finalizeRun(0);
         }, 400);
       }
@@ -7470,11 +7562,15 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             model,
             reasoningEffort: input.antigravityReasoningEffort ?? legacyAntigravity?.effort,
             promptText: input.prompt,
+            systemPromptAppend: input.systemPromptAppend,
             attachments: input.attachments,
             resumeSessionId,
             accessMode: input.accessMode || 'full-access',
             mcpServers: orionAcpMcpServers(orionMcp),
+            httpMcpServers: orionAcpHttpMcpServers(orionMcp),
             threadId: input.threadId,
+            sessionState: persistentAntigravity ? antigravityLease.entry : null,
+            nextRequestId: persistentAntigravity ? antigravityLease.nextRequestId : null,
             callbacks: {
               ...sharedDriverCallbacks,
               // Each invoke_subagent child shows as a live subagent thread
@@ -7495,12 +7591,27 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
               },
               onSubagentDone: (id, info) => subagentTracker.finish(id, info),
               onSessionBroken: () => {
+                antigravitySessionBroken = true;
                 emitAgentEvent(event.sender, {
                   runId,
                   threadId: input.threadId,
                   type: 'session-broken',
                   providerId: 'antigravity',
                 });
+              },
+              onSlashCommands: (commands) => {
+                if (typeof input.projectPath !== 'string' || !input.projectPath) return;
+                antigravityLiveSlashCommandsByProject.set(input.projectPath, commands);
+                void discoverAntigravitySkills({ cwd: input.projectPath })
+                  .catch(() => [])
+                  .then((skills) => {
+                    if (event.sender.isDestroyed()) return;
+                    event.sender.send('agent:slashCommands', {
+                      projectPath: input.projectPath,
+                      providerId: 'antigravity',
+                      commands: mergeAntigravitySlashCommands(commands, skills),
+                    });
+                  });
               },
               // A spawn_subagent child asks whoever spawned it: its question
               // stays in its reply text (agy prints the choices) instead of a
@@ -7555,6 +7666,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
           child,
           cwd: input.projectPath,
           promptText: input.prompt,
+          attachments: input.attachments,
           resumeSessionId,
           accessMode: input.accessMode || 'full-access',
           callbacks: {
@@ -7650,11 +7762,31 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       // App-server runs have no trailing prompt to strip.
       command: persistentCodexAppServer
         ? `${model.command} app-server (persistent)`
+        : persistentAntigravity
+        ? `${model.command} acp (persistent)`
         : `${model.command} ${(
             useCodexAppServer ? args.slice(1) : args.slice(1, -1)
           ).join(' ')}`,
     });
 
+    if (persistentAntigravity && antigravityLease) {
+      antigravityLease.attachHandlers({
+        onMessage: (parsed) => {
+          if (finalized) return;
+          stdoutSeen = true;
+          acpDriver?.handleMessage(parsed);
+        },
+        onStderr: (chunk) => {
+          stderr += chunk;
+        },
+        onClose: (exitCode) => {
+          activeAgentRuns.delete(runId);
+          const wasStopped = stoppedAgentRuns.delete(runId);
+          if (finalized) return;
+          void finalizeRun(exitCode ?? 1, { wasStopped });
+        },
+      });
+    } else {
     child.stdout.on('data', (data) => {
       if (finalized) return;
       const raw = data.toString();
@@ -7802,6 +7934,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
       await finalizeRun(exitCode, { wasStopped });
     });
+    }
 
     acpDriver?.start();
     };
@@ -7813,7 +7946,12 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     if (abortedStartup?.aborted) {
       codexAppServerLease?.release();
       codexAppServerLease = null;
-      orionMcp?.release();
+      if (antigravityLease) {
+        await antigravityLease.release({ keepAlive: antigravityLease.reused });
+        antigravityLease = null;
+      } else {
+        orionMcp?.release();
+      }
       // A normal stop is already settled by the renderer and retains the
       // historical successful-startup result. Runtime disposal can also come
       // directly from workspace removal, though, so report that distinct
@@ -7830,7 +7968,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     } catch (error) {
       codexAppServerLease?.release();
       codexAppServerLease = null;
-      orionMcp?.release();
+      await releaseRunStartupResources();
       throw error;
     }
 
@@ -7971,7 +8109,12 @@ ipcMain.handle('agent:stopTurn', async (_event, runId, options) => {
   await codexSteerableRunDrivers.get(runId)?.dispose?.();
   codexSteerableRunDrivers.delete(runId);
   fxSteerableRunDrivers.delete(runId);
-  antigravityRunDrivers.delete(runId);
+  if (antigravityRunDrivers.has(runId)) {
+    try {
+      await cancelAntigravityRun(runId);
+    } catch {}
+    antigravityRunDrivers.delete(runId);
+  }
   // Stopping a goal run = pausing the goal: ask the app-server to record the
   // pause (so the stored goal matches reality and /goal resume works) before
   // the process goes down.
@@ -8082,10 +8225,11 @@ async function disposeAgentThreadRuntime(threadId) {
     runShutdowns.push(killAgentChild(run.child, threadId));
     activeAgentRuns.delete(runId);
   }
-  const [disposedTerminal, disposedClaude, disposedGoals, disposedTitles, disposedAgent] =
+  const [disposedTerminal, disposedClaude, disposedAntigravity, disposedGoals, disposedTitles, disposedAgent] =
     await Promise.all([
       terminalShutdown,
       disposeClaudeSdkSessionAndWait(threadId),
+      antigravitySessionManager.disposeThread(threadId),
       goalShutdown,
       titleShutdown,
       waitForAgentThreadShutdowns(threadId),
@@ -8110,6 +8254,7 @@ async function disposeAgentThreadRuntime(threadId) {
   return (
     disposedClaude ||
     disposedLateClaude ||
+    disposedAntigravity ||
     disposedTerminal ||
     disposedGoals ||
     disposedTitles ||
@@ -8441,11 +8586,12 @@ ipcMain.handle('terminal:ensure', async (_event, input) => {
     }
     const threadId = typeof input?.threadId === 'string' ? input.threadId : '';
     const projectPath = typeof input?.projectPath === 'string' ? input.projectPath : '';
-    const accessMode = ['read-only', 'workspace-write', 'full-access'].includes(
-      input?.accessMode
-    )
-      ? input.accessMode
-      : 'full-access';
+    const accessMode =
+      input?.accessMode === 'read-only' ||
+      input?.accessMode === 'workspace-write' ||
+      input?.accessMode === 'full-access'
+        ? input.accessMode
+        : 'workspace-write';
     if (!threadId || !projectPath) {
       return { ok: false, error: 'threadId and projectPath are required' };
     }

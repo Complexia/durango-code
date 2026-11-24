@@ -7,8 +7,8 @@ import type { SlashCommandInfo } from '../types';
 
 export type SlashCommandCandidate = {
   command: SlashCommandInfo;
-  /** orion: handled by Orion itself; claude: expanded CLI-side as prompt text. */
-  source: 'orion' | 'claude';
+  /** orion: handled by Orion itself; claude/antigravity: expanded CLI-side as prompt text. */
+  source: 'orion' | 'claude' | 'antigravity';
 };
 
 type OrionSlashCommand = SlashCommandInfo & {
@@ -195,10 +195,19 @@ export const TERMINAL_EXTRA_COMMANDS: SlashCommandInfo[] = [
   { name: 'terminal-setup', description: 'Install Shift+Enter key binding', argumentHint: '' },
 ];
 
+// Seed list shown before an Antigravity session reports its live available_commands_update
+// and disk-discovered skills. Replaced once live data lands.
+export const ANTIGRAVITY_BUILTIN_FALLBACK: SlashCommandInfo[] = [
+  { name: 'compact', description: 'Summarize this conversation to free up context window', argumentHint: '' },
+  { name: 'goal', description: 'Run a native Antigravity goal until the objective is achieved', argumentHint: '<objective>' },
+  { name: 'plan', description: 'Plan the approach step-by-step before editing', argumentHint: '<task>' },
+];
+
 // Claude commands hidden on SDK threads because Orion overrides them with its
 // own handler (/clear, /model) or has no equivalent surface yet (/resume,
 // /rewind — session picking is Orion's thread list).
 export const OVERRIDDEN_CLAUDE_COMMANDS = new Set(['clear', 'model', 'resume', 'rewind']);
+export const OVERRIDDEN_ANTIGRAVITY_COMMANDS = new Set(['model', 'logout']);
 
 /**
  * The slash menu is active only while the whole draft is a single
@@ -269,8 +278,18 @@ export const buildSlashCommandCandidates = (
   const orion: SlashCommandCandidate[] = ORION_SLASH_COMMANDS.filter((command) =>
     command.appliesTo(context)
   ).map(({ appliesTo: _appliesTo, ...command }) => ({ command, source: 'orion' as const }));
-  if (!context.claudeBacked) return orion;
   const orionNames = new Set(orion.map((candidate) => candidate.command.name));
+  if (context.providerId === 'antigravity') {
+    const antigravity = mergeCommandLists(liveCommands ?? ANTIGRAVITY_BUILTIN_FALLBACK)
+      .filter(
+        (command) =>
+          !OVERRIDDEN_ANTIGRAVITY_COMMANDS.has(command.name) && !orionNames.has(command.name)
+      )
+      .sort(byName)
+      .map((command) => ({ command, source: 'antigravity' as const }));
+    return [...orion, ...antigravity];
+  }
+  if (!context.claudeBacked) return orion;
   // mergeCommandLists dedupes by name — lists from older caches may predate
   // main-side normalization.
   const claude = mergeCommandLists(liveCommands ?? CLAUDE_BUILTIN_FALLBACK)

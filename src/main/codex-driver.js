@@ -8,6 +8,7 @@ import { spawnCodexServerProcess } from './codex-server-process.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
 import { validQuestionAnswers } from './codex-questions.js';
+import { resolveAttachmentMimeType } from './acp-prompt-blocks.js';
 import { snapShotOutlinePromptText } from './snapshot-format.js';
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,8 @@ export const codexUserInput = (text, attachments, model) => {
       if (outline !== null) items.push({ type: 'text', text: snapShotOutlinePromptText(attachment, outline) });
       continue;
     }
-    if (!/^image\/(png|jpe?g|webp|gif)$/i.test(attachment?.mimeType || '')) continue;
+    const mimeType = resolveAttachmentMimeType(attachment, filePath);
+    if (!/^image\/(png|jpe?g|webp|gif)$/i.test(mimeType)) continue;
     seen.add(filePath);
     items.push({
       type: 'localImage',

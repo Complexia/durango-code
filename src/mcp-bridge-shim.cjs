@@ -25,29 +25,8 @@
 // Claude's deferred tools do. Codex, Grok and Cursor defer MCP tools
 // themselves, so they get the full list (thread-reader-routing.js).
 'use strict';
-const net = require('net');
 
-const argv = process.argv.slice(2);
-const argValue = (flag) => {
-  const index = argv.indexOf(flag);
-  return index !== -1 && index + 1 < argv.length ? argv[index + 1] : undefined;
-};
-const socketPath = argValue('--socket') || process.env.ORION_MCP_SOCKET || '';
-const token = argValue('--token') || process.env.ORION_MCP_TOKEN || '';
-// The user let agents use simulators (Settings → Devices); lists device_*.
-const devicesEnabled = argv.includes('--devices');
-// List summaries; full definitions load through load_tools (see above).
-const compactTools = argv.includes('--compact-tools');
-// Send a one-line server description (MCP `instructions`): Codex shows it
-// next to the deferred `mcp__orion` namespace. Not for every provider: fx
-// appends it to each tool's description.
-const describeServer = argv.includes('--instructions');
-// The provider cancels MCP calls after a few minutes (Antigravity): spawn_subagent
-// returns once the subthread starts and wait_subagents collects the reports
-// (src/main/background-subagents.js).
-const backgroundSubagents = argv.includes('--background-subagents');
-
-const spawnSubagentTool = {
+const buildSpawnSubagentTool = (backgroundSubagents) => ({
   name: 'spawn_subagent',
   description: backgroundSubagents
     ? 'Spawn a Durango Code subagent on a specific model to perform a task. Returns as soon as the subagent has started; it keeps running in the background, and wait_subagents collects its final report (never spawn it again to get the report). To run several, spawn them all first, then call wait_subagents. Use for delegating work to specialized models (computer use, exploration, implementation, image/video generation) or to a model the user asks for, whether by @-mention or by name ("review this with gpt-6.1-sol"). Prefer it to running that model\'s CLI yourself.'
@@ -91,7 +70,7 @@ const spawnSubagentTool = {
     required: ['model', 'prompt'],
     additionalProperties: false,
   },
-};
+});
 
 const stopSubagentTool = {
   name: 'stop_subagent',
@@ -455,8 +434,8 @@ const deviceCloseTool = {
   },
 };
 
-const tools = [
-  spawnSubagentTool,
+const buildStaticBridgeTools = ({ devicesEnabled = false, backgroundSubagents = false } = {}) => [
+  buildSpawnSubagentTool(backgroundSubagents),
   ...(backgroundSubagents ? [waitSubagentsTool] : []),
   stopSubagentTool,
   readThreadTool,
@@ -470,82 +449,6 @@ const tools = [
   showHtmlTool,
   ...(devicesEnabled ? [deviceListTool, deviceOpenTool, deviceScreenshotTool, deviceCloseTool] : []),
 ];
-const toolNames = new Set(tools.map((tool) => tool.name));
-// Run-specific tools from the app, fetched once per shim process.
-let extraTools = null;
-
-const write = (message) => {
-  try {
-    process.stdout.write(`${JSON.stringify(message)}\n`);
-  } catch {}
-};
-const respond = (id, result) => write({ jsonrpc: '2.0', id, result });
-const respondError = (id, code, message) => write({ jsonrpc: '2.0', id, error: { code, message } });
-
-// One socket connection per call; a spawned subagent can run for a long time,
-// so there is deliberately no client-side timeout.
-const callOrion = (tool, args) =>
-  new Promise((resolve) => {
-    if (!socketPath) {
-      resolve({ ok: false, text: 'The Durango Code bridge socket path is not configured.' });
-      return;
-    }
-    let settled = false;
-    let buffer = '';
-    const socket = net.connect(socketPath);
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      resolve(value);
-      try {
-        socket.destroy();
-      } catch {}
-    };
-    socket.on('connect', () => {
-      socket.write(`${JSON.stringify({ id: 1, token, tool, args })}\n`);
-    });
-    socket.on('data', (chunk) => {
-      buffer += chunk.toString();
-      const newline = buffer.indexOf('\n');
-      if (newline === -1) return;
-      try {
-        const reply = JSON.parse(buffer.slice(0, newline));
-        finish({
-          ok: reply.ok !== false,
-          text: String(reply.text ?? ''),
-          // Optional MCP content blocks (e.g. images), passed through as-is.
-          ...(Array.isArray(reply.content) && reply.content.length > 0 ? { content: reply.content } : {}),
-          ...(Array.isArray(reply.tools) ? { tools: reply.tools } : {}),
-        });
-      } catch {
-        finish({ ok: false, text: 'Received an invalid response from Durango Code.' });
-      }
-    });
-    socket.on('error', (error) => {
-      finish({
-        ok: false,
-        text: `Could not reach the Durango Code desktop app (${error.message}). Is Durango Code running?`,
-      });
-    });
-    socket.on('close', () => {
-      finish({ ok: false, text: 'The connection to Durango Code closed before a result arrived.' });
-    });
-  });
-
-const loadExtraTools = async () => {
-  if (extraTools) return extraTools;
-  const result = await callOrion('__tools', {});
-  if (!result.ok || !Array.isArray(result.tools)) return [];
-  extraTools = result.tools.filter(
-    (tool) =>
-      tool &&
-      typeof tool.name === 'string' &&
-      !toolNames.has(tool.name) &&
-      tool.inputSchema &&
-      typeof tool.inputSchema === 'object'
-  );
-  return extraTools;
-};
 
 // ----- Compact listing (--compact-tools) -----------------------------------
 const LOAD_TOOLS = 'load_tools';
@@ -553,9 +456,6 @@ const CALL_APP_TOOL = 'call_app_tool';
 // The loaders are short and lead to everything else: always listed in full.
 const FULL_IN_COMPACT = new Set([LOAD_TOOLS, CALL_APP_TOOL]);
 const SUMMARY_MAX_CHARS = 120;
-// Tools whose full definition this run has been given (load_tools, or a
-// call refused for its arguments).
-const loadedTools = new Set();
 
 // The description's first sentence, cut to SUMMARY_MAX_CHARS.
 const summarize = (description) => {
@@ -614,7 +514,7 @@ const loadToolsTool = (appLoader) => ({
   annotations: { readOnlyHint: true },
 });
 
-const listedTools = (all) => {
+const listedToolsFor = (all, compactTools) => {
   if (!compactTools) return all;
   const listed = [loadToolsTool(all.find((tool) => tool.name === LOAD_TOOLS))];
   for (const tool of all) {
@@ -747,7 +647,7 @@ const bareToolName = (value) =>
 
 const asNameList = (value) => (Array.isArray(value) ? value : typeof value === 'string' ? [value] : []);
 
-const runLoadTools = async (args, all) => {
+const runLoadTools = async (args, all, { loadedTools, callOrion }) => {
   const loadable = new Map(all.filter((tool) => !FULL_IN_COMPACT.has(tool.name)).map((tool) => [tool.name, tool]));
   const hasApps = all.some((tool) => tool.name === LOAD_TOOLS);
   const requestedApps = asNameList(args.apps).map((name) => String(name ?? '').trim()).filter(Boolean);
@@ -825,99 +725,235 @@ const serverInstructions = (all) => {
   return `Durango Code, the app running you: ${areas.join(', ')}.`;
 };
 
-const handleMessage = async (message) => {
-  const method = message.method;
-  if (method === 'initialize') {
-    const requested = message.params?.protocolVersion;
-    respond(message.id, {
-      protocolVersion: typeof requested === 'string' && requested ? requested : '2024-11-05',
-      capabilities: { tools: {} },
-      serverInfo: { name: 'orion', version: '1.0.0' },
-      ...(describeServer ? { instructions: serverInstructions([...tools, ...(await loadExtraTools())]) } : {}),
-    });
-    return;
-  }
-  if (typeof method === 'string' && method.startsWith('notifications/')) return;
-  if (method === 'tools/list') {
-    respond(message.id, { tools: listedTools([...tools, ...(await loadExtraTools())]) });
-    return;
-  }
-  if (method === 'tools/call') {
-    const name = message.params?.name;
-    const rawArgs = message.params?.arguments;
-    const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
-    const all = [...tools, ...(await loadExtraTools())];
-    if (compactTools && name === LOAD_TOOLS) {
-      const result = await runLoadTools(Array.isArray(args) ? {} : args, all);
-      respond(message.id, { content: [{ type: 'text', text: result.text }], isError: !result.ok });
-      return;
+// Shared MCP JSON-RPC handler used by both the standalone stdio shim and the
+// in-process HTTP MCP endpoint (src/main/mcp-bridge.js) so tool schemas,
+// compact listing, schema validation, and server instructions never diverge.
+const createOrionMcpBridgeHandler = ({
+  devicesEnabled = false,
+  compactTools = false,
+  describeServer = false,
+  backgroundSubagents = false,
+  cacheExtraTools = true,
+  callOrion,
+} = {}) => {
+  const tools = buildStaticBridgeTools({ devicesEnabled, backgroundSubagents });
+  const toolNames = new Set(tools.map((tool) => tool.name));
+  // Tools whose full definition this run has been given (load_tools, or a
+  // call refused for its arguments).
+  const loadedTools = new Set();
+  // Run-specific tools from the app, cached once per shim process when enabled.
+  let extraTools = null;
+
+  const loadExtraTools = async () => {
+    if (cacheExtraTools && extraTools) return extraTools;
+    const result = await callOrion('__tools', {});
+    if (!result.ok || !Array.isArray(result.tools)) return [];
+    const filtered = result.tools.filter(
+      (tool) =>
+        tool &&
+        typeof tool.name === 'string' &&
+        !toolNames.has(tool.name) &&
+        tool.inputSchema &&
+        typeof tool.inputSchema === 'object'
+    );
+    if (cacheExtraTools) extraTools = filtered;
+    return filtered;
+  };
+
+  const reply = (id, result) => ({ jsonrpc: '2.0', id, result });
+  const replyError = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
+
+  const handleMessage = async (message) => {
+    if (!message || typeof message !== 'object') return null;
+    const method = message.method;
+    const hasId = Object.prototype.hasOwnProperty.call(message, 'id') && message.id !== undefined;
+    if (typeof method === 'string' && method.startsWith('notifications/')) return null;
+    if (!hasId) return null;
+    if (method === 'initialize') {
+      const requested = message.params?.protocolVersion;
+      return reply(message.id, {
+        protocolVersion: typeof requested === 'string' && requested ? requested : '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'orion', version: '1.0.0' },
+        ...(describeServer ? { instructions: serverInstructions([...tools, ...(await loadExtraTools())]) } : {}),
+      });
     }
-    const tool = all.find((candidate) => candidate.name === name);
-    if (!tool) {
-      respondError(message.id, -32602, `Unknown tool: ${name}`);
-      return;
+    if (method === 'tools/list') {
+      return reply(message.id, { tools: listedToolsFor([...tools, ...(await loadExtraTools())], compactTools) });
     }
-    if (compactTools && !FULL_IN_COMPACT.has(name)) {
-      const problems = argumentProblems(tool.inputSchema, args);
-      if (problems.length > 0) {
-        // The first time, hand over the definition the summary left out.
-        const firstSight = !loadedTools.has(name);
-        loadedTools.add(name);
-        respond(message.id, {
-          content: [
-            {
-              type: 'text',
-              text:
-                `${name} did not run: ${problems.join('; ')}.` +
-                (firstSight
-                  ? ` Its full definition (the tool list shows a summary only):\n\n${JSON.stringify(fullDefinition(tool), null, 2)}`
-                  : ''),
-            },
-          ],
-          isError: true,
-        });
-        return;
+    if (method === 'tools/call') {
+      const name = message.params?.name;
+      const rawArgs = message.params?.arguments;
+      const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
+      const all = [...tools, ...(await loadExtraTools())];
+      if (compactTools && name === LOAD_TOOLS) {
+        const result = await runLoadTools(Array.isArray(args) ? {} : args, all, { loadedTools, callOrion });
+        return reply(message.id, { content: [{ type: 'text', text: result.text }], isError: !result.ok });
       }
+      const tool = all.find((candidate) => candidate.name === name);
+      if (!tool) return replyError(message.id, -32602, `Unknown tool: ${name}`);
+      if (compactTools && !FULL_IN_COMPACT.has(name)) {
+        const problems = argumentProblems(tool.inputSchema, args);
+        if (problems.length > 0) {
+          // The first time, hand over the definition the summary left out.
+          const firstSight = !loadedTools.has(name);
+          loadedTools.add(name);
+          return reply(message.id, {
+            content: [
+              {
+                type: 'text',
+                text:
+                  `${name} did not run: ${problems.join('; ')}.` +
+                  (firstSight
+                    ? ` Its full definition (the tool list shows a summary only):\n\n${JSON.stringify(fullDefinition(tool), null, 2)}`
+                    : ''),
+              },
+            ],
+            isError: true,
+          });
+        }
+      }
+      const result = await callOrion(name, args);
+      return reply(message.id, {
+        content: result.content ?? [{ type: 'text', text: result.text }],
+        isError: !result.ok,
+      });
     }
-    const result = await callOrion(name, args);
-    respond(message.id, {
-      content: result.content ?? [{ type: 'text', text: result.text }],
-      isError: !result.ok,
-    });
-    return;
-  }
-  if (method === 'ping') {
-    respond(message.id, {});
-    return;
-  }
-  // Some clients probe these even when the capability isn't advertised.
-  if (method === 'resources/list') {
-    respond(message.id, { resources: [] });
-    return;
-  }
-  if (method === 'prompts/list') {
-    respond(message.id, { prompts: [] });
-    return;
-  }
-  if (message.id !== undefined) respondError(message.id, -32601, `Method not found: ${method}`);
+    if (method === 'ping') return reply(message.id, {});
+    // Some clients probe these even when the capability isn't advertised.
+    if (method === 'resources/list') return reply(message.id, { resources: [] });
+    if (method === 'prompts/list') return reply(message.id, { prompts: [] });
+    return replyError(message.id, -32601, `Method not found: ${method}`);
+  };
+
+  return { handleMessage };
 };
 
-let inputBuffer = '';
-process.stdin.on('data', (chunk) => {
-  inputBuffer += chunk.toString();
-  let newline;
-  while ((newline = inputBuffer.indexOf('\n')) !== -1) {
-    const line = inputBuffer.slice(0, newline).trim();
-    inputBuffer = inputBuffer.slice(newline + 1);
-    if (!line) continue;
-    let message = null;
+const startStdioShim = () => {
+  const net = require('net');
+  const argv = process.argv.slice(2);
+  const argValue = (flag) => {
+    const index = argv.indexOf(flag);
+    return index !== -1 && index + 1 < argv.length ? argv[index + 1] : undefined;
+  };
+  const socketPath = argValue('--socket') || process.env.ORION_MCP_SOCKET || '';
+  const token = argValue('--token') || process.env.ORION_MCP_TOKEN || '';
+  // The user let agents use simulators (Settings → Devices); lists device_*.
+  const devicesEnabled = argv.includes('--devices');
+  // List summaries; full definitions load through load_tools (see above).
+  const compactTools = argv.includes('--compact-tools');
+  // Send a one-line server description (MCP `instructions`): Codex shows it
+  // next to the deferred `mcp__orion` namespace. Not for every provider: fx
+  // appends it to each tool's description.
+  const describeServer = argv.includes('--instructions');
+  // The provider cancels MCP calls after a few minutes (Antigravity): spawn_subagent
+  // returns once the subthread starts and wait_subagents collects the reports
+  // (src/main/background-subagents.js).
+  const backgroundSubagents = argv.includes('--background-subagents');
+
+  const write = (message) => {
     try {
-      message = JSON.parse(line);
-    } catch {
-      continue;
+      process.stdout.write(`${JSON.stringify(message)}\n`);
+    } catch {}
+  };
+
+  // One socket connection per call; a spawned subagent can run for a long time,
+  // so there is deliberately no client-side timeout.
+  const callOrion = (tool, args) =>
+    new Promise((resolve) => {
+      if (!socketPath) {
+        resolve({ ok: false, text: 'The Durango Code bridge socket path is not configured.' });
+        return;
+      }
+      let settled = false;
+      let buffer = '';
+      const socket = net.connect(socketPath);
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+        try {
+          socket.destroy();
+        } catch {}
+      };
+      socket.on('connect', () => {
+        socket.write(`${JSON.stringify({ id: 1, token, tool, args })}\n`);
+      });
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const newline = buffer.indexOf('\n');
+        if (newline === -1) return;
+        try {
+          const reply = JSON.parse(buffer.slice(0, newline));
+          finish({
+            ok: reply.ok !== false,
+            text: String(reply.text ?? ''),
+            // Optional MCP content blocks (e.g. images), passed through as-is.
+            ...(Array.isArray(reply.content) && reply.content.length > 0 ? { content: reply.content } : {}),
+            ...(Array.isArray(reply.tools) ? { tools: reply.tools } : {}),
+          });
+        } catch {
+          finish({ ok: false, text: 'Received an invalid response from Durango Code.' });
+        }
+      });
+      socket.on('error', (error) => {
+        finish({
+          ok: false,
+          text: `Could not reach the Durango Code desktop app (${error.message}). Is Durango Code running?`,
+        });
+      });
+      socket.on('close', () => {
+        finish({ ok: false, text: 'The connection to Durango Code closed before a result arrived.' });
+      });
+    });
+
+  const handler = createOrionMcpBridgeHandler({
+    devicesEnabled,
+    compactTools,
+    describeServer,
+    backgroundSubagents,
+    cacheExtraTools: true,
+    callOrion,
+  });
+
+  let inputBuffer = '';
+  process.stdin.on('data', (chunk) => {
+    inputBuffer += chunk.toString();
+    let newline;
+    while ((newline = inputBuffer.indexOf('\n')) !== -1) {
+      const line = inputBuffer.slice(0, newline).trim();
+      inputBuffer = inputBuffer.slice(newline + 1);
+      if (!line) continue;
+      let message = null;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (message && typeof message === 'object') {
+        void handler.handleMessage(message).then((response) => {
+          if (response) write(response);
+        });
+      }
     }
-    if (message && typeof message === 'object') void handleMessage(message);
-  }
-});
-process.stdin.on('end', () => process.exit(0));
-process.stdin.resume();
+  });
+  process.stdin.on('end', () => process.exit(0));
+  process.stdin.resume();
+};
+
+if (typeof module === 'object' && module.exports) {
+  module.exports = {
+    buildStaticBridgeTools,
+    createOrionMcpBridgeHandler,
+  };
+}
+
+if (
+  typeof require === 'function' &&
+  typeof module === 'object' &&
+  require.main === module &&
+  process.type !== 'browser' &&
+  process.type !== 'renderer'
+) {
+  startStdioShim();
+}

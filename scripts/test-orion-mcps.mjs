@@ -1145,6 +1145,8 @@ await server.connect(new StdioServerTransport());
     const openCodeConfig = null;
     const museConfigRoot = null;
     const fxLaunch = null;
+    const usePersistentAntigravity = false;
+    const antigravityLease = null;
     const loginShell = '/bin/zsh';
     const process = { env: {} };
     const commandForModel = () => ['codex', 'app-server'];

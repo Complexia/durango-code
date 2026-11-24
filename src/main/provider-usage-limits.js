@@ -229,7 +229,8 @@ export const readClaudeLimits = async () => {
 
 // agy stores its Google sign-in with go-keyring: service "gemini", account
 // "antigravity" (macOS keychain via /usr/bin/security, which the item trusts;
-// libsecret on Linux). The value is `go-keyring-base64:<base64 JSON>`.
+// libsecret on Linux; Windows Credential Manager target "gemini:antigravity").
+// The value is `go-keyring-base64:<base64 JSON>`.
 export const decodeGoKeyringValue = (value) => {
   const text = String(value || '').trim();
   if (text.startsWith('go-keyring-base64:')) return Buffer.from(text.slice(18), 'base64').toString('utf8');
@@ -237,17 +238,100 @@ export const decodeGoKeyringValue = (value) => {
   return text;
 };
 
-const readAntigravityToken = async () => {
+const buildWindowsCredReadCommand = (target) => {
+  const escaped = String(target).replace(/'/g, "''");
+  return [
+    'try {',
+    "  $code = @'",
+    'using System;',
+    'using System.Runtime.InteropServices;',
+    'using System.Runtime.InteropServices.ComTypes;',
+    'public class DurangoWinCredReader {',
+    '  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]',
+    '  private struct CREDENTIAL {',
+    '    public uint Flags;',
+    '    public uint Type;',
+    '    public IntPtr TargetName;',
+    '    public IntPtr Comment;',
+    '    public FILETIME LastWritten;',
+    '    public uint CredentialBlobSize;',
+    '    public IntPtr CredentialBlob;',
+    '    public uint Persist;',
+    '    public uint AttributeCount;',
+    '    public IntPtr Attributes;',
+    '    public IntPtr TargetAlias;',
+    '    public IntPtr UserName;',
+    '  }',
+    '  [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]',
+    '  private static extern bool CredRead(string target, uint type, uint flags, out IntPtr credPtr);',
+    '  [DllImport("advapi32.dll", SetLastError = true)]',
+    '  private static extern void CredFree(IntPtr credPtr);',
+    '  public static string Read(string target) {',
+    '    IntPtr ptr;',
+    '    if (!CredRead(target, 1, 0, out ptr)) {',
+    '      int err = Marshal.GetLastWin32Error();',
+    '      if (err == 1168) return "";',
+    '      return "";',
+    '    }',
+    '    try {',
+    '      CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(ptr, typeof(CREDENTIAL));',
+    '      if (cred.CredentialBlob == IntPtr.Zero || cred.CredentialBlobSize == 0) return "";',
+    '      byte[] bytes = new byte[cred.CredentialBlobSize];',
+    '      Marshal.Copy(cred.CredentialBlob, bytes, 0, (int)cred.CredentialBlobSize);',
+    '      return Convert.ToBase64String(bytes);',
+    '    } finally {',
+    '      CredFree(ptr);',
+    '    }',
+    '  }',
+    '}',
+    "'@",
+    '  Add-Type -TypeDefinition $code -ErrorAction Stop',
+    `  [Console]::Write([DurangoWinCredReader]::Read('${escaped}'))`,
+    '} catch {}',
+  ].join('\n');
+};
+
+const decodeWindowsCredentialBlob = (base64Text) => {
+  const text = String(base64Text || '').trim();
+  if (!text) return null;
+  try {
+    const bytes = Buffer.from(text, 'base64');
+    if (!bytes.length) return null;
+    const looksUtf16Le = bytes.length >= 2 && bytes.length % 2 === 0 && bytes[1] === 0 && bytes[0] !== 0;
+    const decoded = (looksUtf16Le ? bytes.toString('utf16le') : bytes.toString('utf8')).replace(/\0+$/g, '').trim();
+    return decoded || null;
+  } catch {
+    return null;
+  }
+};
+
+const readWindowsGenericCredential = async (target, exec = execText) => {
+  try {
+    const raw = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', buildWindowsCredReadCommand(target)]);
+    return decodeWindowsCredentialBlob(raw);
+  } catch {
+    return null;
+  }
+};
+
+export const readAntigravityToken = async ({
+  platform = process.platform,
+  homeDir = os.homedir(),
+  exec = execText,
+  readFile = fs.readFile,
+} = {}) => {
   // agy 1.5 keeps the sign-in in a file under its data dir when it can (and
   // falls back to the OS keyring), the same JSON either way.
   let raw = null;
   try {
-    raw = (await fs.readFile(path.join(os.homedir(), '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'utf8')).trim() || null;
+    raw = (await readFile(path.join(homeDir, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), 'utf8')).trim() || null;
   } catch {}
-  if (!raw && process.platform === 'darwin') {
-    raw = await execText('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w']);
-  } else if (!raw && process.platform === 'linux') {
-    raw = await execText('secret-tool', ['lookup', 'service', 'gemini', 'username', 'antigravity']);
+  if (!raw && platform === 'darwin') {
+    raw = await exec('security', ['find-generic-password', '-s', 'gemini', '-a', 'antigravity', '-w']);
+  } else if (!raw && platform === 'linux') {
+    raw = await exec('secret-tool', ['lookup', 'service', 'gemini', 'username', 'antigravity']);
+  } else if (!raw && platform === 'win32') {
+    raw = await readWindowsGenericCredential('gemini:antigravity', exec);
   }
   if (!raw) return null;
   try {
@@ -265,14 +349,33 @@ const antigravityUserAgent = () =>
   `antigravity/hub/2.24.0 (aidev_client; os_type=${process.platform}; arch=${process.arch}; cl=963137146)`;
 
 const antigravityFamily = (bucketId, groupName) => {
-  if (groupName) return groupName;
-  if (bucketId.startsWith('3p-')) return 'Claude & GPT';
-  if (bucketId.startsWith('gemini-')) return 'Gemini';
-  return bucketId;
+  if (bucketId.startsWith('gemini-argon-')) return groupName || 'Gemini Argon';
+  if (bucketId.startsWith('gemini-carbon-')) return groupName || 'Gemini Carbon';
+  if (bucketId.startsWith('gemini-')) return groupName || 'Gemini';
+  if (bucketId.startsWith('3p-')) return groupName || 'Claude & GPT';
+  return groupName || bucketId;
+};
+
+const sortAntigravityWindows = (windows) =>
+  windows.sort(
+    (a, b) => a.label.split(' · ')[0].localeCompare(b.label.split(' · ')[0]) || (a.windowMinutes ?? 1e9) - (b.windowMinutes ?? 1e9)
+  );
+
+const suppressUntouchedRollingReset = ({ remainingFraction, description, windowMinutes, resetsAt, now }) => {
+  if (
+    remainingFraction === 1 &&
+    !description &&
+    windowMinutes !== null &&
+    resetsAt !== null &&
+    Math.abs(resetsAt - now - windowMinutes * 60_000) <= 60_000
+  ) {
+    return null;
+  }
+  return resetsAt;
 };
 
 /** retrieveUserQuotaSummary → windows: `remainingFraction` per bucket, grouped by model family. */
-export const antigravityWindowsFromQuotaSummary = (summary) => {
+export const antigravityWindowsFromQuotaSummary = (summary, now = Date.now()) => {
   const groups = Array.isArray(summary?.groups) && summary.groups.some((group) => group?.buckets?.length)
     ? summary.groups
     : [{ buckets: summary?.buckets }];
@@ -284,18 +387,107 @@ export const antigravityWindowsFromQuotaSummary = (summary) => {
       const family = antigravityFamily(bucket.bucketId, typeof group?.displayName === 'string' ? group.displayName.trim() : '');
       const windowMinutes = bucket.window === '5h' ? 300 : bucket.window === 'weekly' ? 10080 : null;
       const period = windowMinutes === 300 ? '5-hour' : windowMinutes === 10080 ? 'Weekly' : bucket.displayName || 'Quota';
+      const resetsAt = suppressUntouchedRollingReset({
+        remainingFraction: bucket.remainingFraction,
+        description: bucket.description,
+        windowMinutes,
+        resetsAt: isoTime(bucket.resetTime),
+        now,
+      });
       windows.push({
         id: bucket.bucketId,
         label: `${family} · ${period}`,
         usedPercent: clampPercent((1 - Math.min(1, Math.max(0, bucket.remainingFraction))) * 100),
-        resetsAt: isoTime(bucket.resetTime),
+        resetsAt,
         windowMinutes,
         ...(typeof bucket.description === 'string' && bucket.description ? { detail: bucket.description } : {}),
       });
     }
   }
   // 5-hour windows before weekly ones within a family.
-  return windows.sort((a, b) => a.label.split(' · ')[0].localeCompare(b.label.split(' · ')[0]) || (a.windowMinutes ?? 1e9) - (b.windowMinutes ?? 1e9));
+  return sortAntigravityWindows(windows);
+};
+
+const availableModelFamily = (modelId, info) => {
+  const id = String(modelId || '').toLowerCase();
+  const provider = String(info?.modelProvider || '').toUpperCase();
+  if (id.startsWith('gemini-argon-')) return { key: 'gemini-argon', family: 'Gemini Argon' };
+  if (id.startsWith('gemini-carbon-')) return { key: 'gemini-carbon', family: 'Gemini Carbon' };
+  if (provider.includes('ANTHROPIC') || provider.includes('OPENAI') || id.startsWith('claude-') || id.startsWith('gpt-')) {
+    return { key: '3p', family: 'Claude & GPT' };
+  }
+  if (provider.includes('GOOGLE') || provider.includes('GEMINI') || id.startsWith('gemini-')) {
+    return { key: 'gemini', family: 'Gemini' };
+  }
+  return null;
+};
+
+/** v1internal:fetchAvailableModels fallback → max usedPercent per family/window. */
+export const antigravityWindowsFromAvailableModels = (body, now = Date.now()) => {
+  const rawModels = body?.models;
+  if (!rawModels || typeof rawModels !== 'object') return [];
+  const entries = Array.isArray(rawModels)
+    ? rawModels.map((item) => [item?.model ?? item?.id ?? item?.name ?? '', item])
+    : Object.entries(rawModels);
+  const byId = new Map();
+  const quotaSpecs = [
+    ['quotaInfo', '5h', '5-hour', 300],
+    ['weeklyQuotaInfo', 'weekly', 'Weekly', 10080],
+  ];
+  for (const [modelId, info] of entries) {
+    if (!info || typeof info !== 'object') continue;
+    const familyInfo = availableModelFamily(modelId, info);
+    if (!familyInfo) continue;
+    for (const [field, suffix, period, windowMinutes] of quotaSpecs) {
+      const quota = info[field];
+      if (!quota || typeof quota !== 'object') continue;
+      const remaining =
+        typeof quota.remainingFraction === 'number' && Number.isFinite(quota.remainingFraction)
+          ? quota.remainingFraction
+          : quota.isExhausted === true
+            ? 0
+            : null;
+      if (remaining === null) continue;
+      const usedPercent = clampPercent((1 - Math.min(1, Math.max(0, remaining))) * 100);
+      const resetsAt = suppressUntouchedRollingReset({
+        remainingFraction: remaining,
+        description: '',
+        windowMinutes,
+        resetsAt: isoTime(quota.resetTime),
+        now,
+      });
+      const id = `${familyInfo.key}-${suffix}`;
+      const existing = byId.get(id);
+      if (!existing) {
+        byId.set(id, {
+          id,
+          label: `${familyInfo.family} · ${period}`,
+          usedPercent,
+          resetsAt,
+          windowMinutes,
+        });
+      } else if (usedPercent > existing.usedPercent) {
+        existing.usedPercent = usedPercent;
+        existing.resetsAt = resetsAt ?? existing.resetsAt;
+      } else if (usedPercent === existing.usedPercent && resetsAt !== null) {
+        existing.resetsAt = existing.resetsAt === null ? resetsAt : Math.min(existing.resetsAt, resetsAt);
+      }
+    }
+  }
+  return sortAntigravityWindows([...byId.values()]);
+};
+
+const mergeAntigravityWindows = (windowLists) => {
+  const merged = [];
+  const seen = new Set();
+  for (const list of windowLists) {
+    for (const win of Array.isArray(list) ? list : []) {
+      if (!win?.id || seen.has(win.id)) continue;
+      seen.add(win.id);
+      merged.push(win);
+    }
+  }
+  return sortAntigravityWindows(merged);
 };
 
 const antigravityPlanLabel = (tier) => {
@@ -304,12 +496,16 @@ const antigravityPlanLabel = (tier) => {
   return name && name !== 'Antigravity' ? name : null;
 };
 
-export const readAntigravityLimits = async () => {
-  const token = await readAntigravityToken();
+export const readAntigravityLimits = async ({
+  readToken = readAntigravityToken,
+  fetchJsonFn = fetchJson,
+  now = Date.now(),
+} = {}) => {
+  const token = await readToken();
   if (!token) {
     return { status: 'signed-out', detail: 'Sign in to Antigravity to see its limits.' };
   }
-  if (token.expiresAt && token.expiresAt <= Date.now() + 60_000) {
+  if (token.expiresAt && token.expiresAt <= now + 60_000) {
     return { status: 'expired', detail: "Antigravity's sign-in token has expired. Run an Antigravity turn to renew it, then refresh." };
   }
   const headers = {
@@ -317,38 +513,97 @@ export const readAntigravityLimits = async () => {
     'Content-Type': 'application/json',
     'User-Agent': antigravityUserAgent(),
   };
-  let lastError = null;
-  for (const host of ANTIGRAVITY_HOSTS) {
-    try {
-      // The quota belongs to the account's Code Assist project, which
-      // loadCodeAssist reports; without it the summary is refused.
-      const loaded = await fetchJson(`${host}/v1internal:loadCodeAssist`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' } }),
-      });
-      const project = loaded.body?.cloudaicompanionProject?.id ?? loaded.body?.cloudaicompanionProject;
-      const summary = await fetchJson(`${host}/v1internal:retrieveUserQuotaSummary`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(typeof project === 'string' && project ? { project } : {}),
-      });
-      if (!summary.ok) {
-        lastError = summary.body?.error?.message || `HTTP ${summary.status}`;
-        continue;
+  const hostResults = await Promise.all(
+    ANTIGRAVITY_HOSTS.map(async (host) => {
+      try {
+        // The quota belongs to the account's Code Assist project, which
+        // loadCodeAssist reports; without it the summary is refused.
+        const loaded = await fetchJsonFn(`${host}/v1internal:loadCodeAssist`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ metadata: { ideType: 'ANTIGRAVITY', platform: 'PLATFORM_UNSPECIFIED', pluginType: 'GEMINI' } }),
+        });
+        const rawProject = loaded.body?.cloudaicompanionProject?.id ?? loaded.body?.cloudaicompanionProject;
+        const project = typeof rawProject === 'string' && rawProject ? rawProject : null;
+        const plan = antigravityPlanLabel(loaded.body?.currentTier);
+        const summary = await fetchJsonFn(`${host}/v1internal:retrieveUserQuotaSummary`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(project ? { project } : {}),
+        });
+        if (!summary.ok) {
+          return {
+            host,
+            project,
+            plan,
+            detail: null,
+            windows: [],
+            ok: false,
+            error: summary.body?.error?.message || `HTTP ${summary.status}`,
+          };
+        }
+        const detail = typeof summary.body?.description === 'string' && summary.body.description ? summary.body.description : null;
+        return {
+          host,
+          project,
+          plan,
+          detail,
+          windows: antigravityWindowsFromQuotaSummary(summary.body, now),
+          ok: true,
+          error: null,
+        };
+      } catch (error) {
+        return {
+          host,
+          project: null,
+          plan: null,
+          detail: null,
+          windows: [],
+          ok: false,
+          error: error?.message || String(error),
+        };
       }
-      const windows = antigravityWindowsFromQuotaSummary(summary.body);
-      return {
-        status: 'ok',
-        windows,
-        plan: antigravityPlanLabel(loaded.body?.currentTier),
-        ...(typeof summary.body?.description === 'string' ? { detail: summary.body.description } : {}),
-      };
-    } catch (error) {
-      lastError = error?.message || String(error);
-    }
+    })
+  );
+
+  let windows = mergeAntigravityWindows(hostResults.map((result) => result.windows));
+  let anyOk = hostResults.some((result) => result.ok);
+  let lastError = hostResults.find((result) => result.error)?.error || null;
+
+  if (windows.length === 0) {
+    const fallbackResults = await Promise.all(
+      hostResults.map(async (entry) => {
+        try {
+          const response = await fetchJsonFn(`${entry.host}/v1internal:fetchAvailableModels`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(entry.project ? { project: entry.project } : {}),
+          });
+          if (!response.ok) {
+            return { ok: false, windows: [], error: response.body?.error?.message || `HTTP ${response.status}` };
+          }
+          return { ok: true, windows: antigravityWindowsFromAvailableModels(response.body, now), error: null };
+        } catch (error) {
+          return { ok: false, windows: [], error: error?.message || String(error) };
+        }
+      })
+    );
+    windows = mergeAntigravityWindows(fallbackResults.map((result) => result.windows));
+    anyOk = anyOk || fallbackResults.some((result) => result.ok);
+    if (!lastError) lastError = fallbackResults.find((result) => result.error)?.error || null;
   }
-  return { status: 'error', detail: lastError || 'Antigravity limits are unavailable.' };
+
+  if (!anyOk) {
+    return { status: 'error', detail: lastError || 'Antigravity limits are unavailable.' };
+  }
+  const plan = hostResults.find((result) => result.plan !== null)?.plan ?? null;
+  const detail = hostResults.find((result) => result.detail !== null)?.detail ?? null;
+  return {
+    status: 'ok',
+    windows,
+    plan,
+    ...(detail ? { detail } : {}),
+  };
 };
 
 // --- Grok --------------------------------------------------------------------

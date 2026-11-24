@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { app } from 'electron';
 import {
   grokPermissionModeForAccessMode,
@@ -15,7 +18,7 @@ assert.equal(grokPermissionModeForAccessMode('full-access'), null);
 const { createGrokAcpDriver } = await import('../src/main/grok-driver.js');
 const { commandForModel } = await import('../src/main/command-for-model.js');
 
-const runDriver = async (accessMode) => {
+const runDriver = async (accessMode, { attachments = [], promptCapabilities } = {}) => {
   const requests = [];
   let driver;
   const child = {
@@ -24,6 +27,17 @@ const runDriver = async (accessMode) => {
         const request = JSON.parse(raw);
         requests.push(request);
         queueMicrotask(() => {
+          if (request.method === 'initialize') {
+            driver.handleMessage({
+              jsonrpc: '2.0',
+              id: request.id,
+              result: {
+                protocolVersion: 1,
+                agentCapabilities: promptCapabilities ? { promptCapabilities } : {},
+              },
+            });
+            return;
+          }
           if (request.method === 'session/new') {
             driver.handleMessage({
               jsonrpc: '2.0',
@@ -54,6 +68,7 @@ const runDriver = async (accessMode) => {
     child,
     cwd: '/tmp/orion-grok-driver-test',
     promptText: 'Inspect only.',
+    attachments,
     resumeSessionId: null,
     accessMode,
     callbacks: {
@@ -97,6 +112,30 @@ assert.equal(
   fullAccessRequests.some((request) => request.method === 'session/set_mode'),
   false
 );
+
+// Attachments respect initialize promptCapabilities (images by default, PDFs when embeddedContext is advertised).
+const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-grok-attach-'));
+try {
+  const imgPath = path.join(tmpDir, 'shot.png');
+  const pdfPath = path.join(tmpDir, 'spec.pdf');
+  await fs.writeFile(imgPath, Buffer.from([137, 80, 78, 71]));
+  await fs.writeFile(pdfPath, '%PDF-1.7');
+  const attachedRequests = await runDriver('read-only', {
+    attachments: [
+      { path: imgPath, mimeType: 'image/png; charset=binary' },
+      { path: pdfPath, mimeType: 'application/pdf' },
+    ],
+    promptCapabilities: { image: true, embeddedContext: true },
+  });
+  const promptReq = attachedRequests.find((request) => request.method === 'session/prompt');
+  assert.deepEqual(
+    promptReq.params.prompt.map((block) => block.type),
+    ['text', 'image', 'resource_link']
+  );
+  assert.equal(promptReq.params.prompt[1].mimeType, 'image/png');
+} finally {
+  await fs.rm(tmpDir, { recursive: true, force: true });
+}
 
 const grokModel = { providerId: 'grok', slug: 'grok-4.6' };
 const grokCommand = (accessMode) =>
