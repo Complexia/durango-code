@@ -1476,7 +1476,7 @@ interface OrionState {
    * Copies a thread (and its settled subagents) into a new one. Loads the
    * transcripts it copies first; resolves to the new thread id.
    */
-  branchThread: (sourceThreadId: string) => Promise<string | null>;
+  branchThread: (sourceThreadId: string, options?: { select?: boolean }) => Promise<string | null>;
   selectProject: (id: string | null) => void;
   selectThread: (id: string | null) => void;
   /** Add a thread as an extra pane beside the ones already open, and focus it. */
@@ -3167,7 +3167,7 @@ export const useOrionStore = create<OrionState>()(
         return newThread.id;
       },
 
-      branchThread: async (sourceThreadId) => {
+      branchThread: async (sourceThreadId, options) => {
         // A thread on another machine has its context there (its agent
         // sessions); a copy here would start without it. Not yet.
         const source = get().threads.find((thread) => thread.id === sourceThreadId);
@@ -3207,8 +3207,12 @@ export const useOrionStore = create<OrionState>()(
           return {
             threads,
             transcripts,
-            selectedProjectId: newThread.projectId,
-            ...syncSavedView(state, panesForSelection(state, newThread.id), { threads }),
+            ...(options?.select === false
+              ? {}
+              : {
+                  selectedProjectId: newThread.projectId,
+                  ...syncSavedView(state, panesForSelection(state, newThread.id), { threads }),
+                }),
           };
         });
         return family.rootId;

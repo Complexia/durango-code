@@ -2,7 +2,17 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { BOT_REPLY_MESSAGES_MAX, botReplyMessageId, durangoModelIdForClaude } from './bot-replies.js';
-import { BOT_BRIEF_RULE, BOT_SETTLE_RULE, BOT_SHIPPING_RULE, BOT_THREAD_TOOLS, threadNoticeText, threadReportText, withThreadReportFooter } from './bot-thread-tools.js';
+import {
+  BOT_BRIEF_RULE,
+  BOT_SETTLE_RULE,
+  BOT_SHIPPING_RULE,
+  BOT_THREAD_ACCESS_MODES,
+  BOT_THREAD_TOOLS,
+  resolveThreadModelChoice,
+  threadNoticeText,
+  threadReportText,
+  withThreadReportFooter,
+} from './bot-thread-tools.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -402,6 +412,25 @@ export const LOCAL_BOT_TOOLS = [
           description:
             "A Durango Code project on this computer (by name, as listed in your instructions): the task runs as a Durango Code thread in it, with every tool a thread has, and the person can watch and continue it in the app. It can read the project's notes itself (project_notes). Omit for work that isn't about a project.",
         },
+        model: {
+          type: 'string',
+          maxLength: 120,
+          description:
+            'Optional Durango Code model id, slug or label (from list_thread_models) when starting a thread in a project, e.g. "antigravity:gemini-4-neon", "codex:gpt-5.6-sol", "claude:claude-opus-5-5".',
+        },
+        effort: {
+          type: 'string',
+          maxLength: 40,
+          description:
+            'Optional reasoning effort level supported by the chosen model (from list_thread_models, e.g. "low", "medium", "high", "xhigh", "max").',
+        },
+        access_mode: {
+          type: 'string',
+          enum: BOT_THREAD_ACCESS_MODES,
+          description: 'Optional access mode for the thread ("read-only", "workspace-write", "full-access"; default "full-access").',
+        },
+        codex_service_tier: { type: 'string', enum: ['default', 'priority'], description: 'Optional Codex service tier for Codex threads.' },
+        claude_context_window: { type: 'string', enum: ['200k', '1m'], description: 'Optional Claude context window for Claude threads.' },
       },
       required: ['title', 'instructions'],
     },
@@ -677,6 +706,7 @@ export const createLocalBotEngine = ({
   summarize = null,
   getAccessMode = () => 'read-only',
   listProjects = async () => [],
+  listModels = null,
   startProjectThread = null,
   startThreadFollowUp = null,
   threadTools = null,
@@ -1637,13 +1667,32 @@ export const createLocalBotEngine = ({
     return match;
   };
 
-  const startThreadTask = async (entry, { title, instructions, project: projectName }) => {
+  const loadModels = async () => {
+    if (typeof listModels !== 'function') return [];
+    const list = (await Promise.resolve(listModels()).catch(() => [])) ?? [];
+    return Array.isArray(list) ? list : [];
+  };
+
+  const startThreadTask = async (
+    entry,
+    { title, instructions, project: projectName, model, effort, accessMode, codexServiceTier, claudeContextWindow }
+  ) => {
     if (!startProjectThread) throw new Error('Durango Code threads are not available here.');
     const runtime = runtimeFor(entry.bot.id);
     if (runtime.threads.size >= LOCAL_BOT_MAX_TASKS) {
       throw new Error(`You already have ${runtime.threads.size} Durango Code threads running: wait for a report first.`);
     }
     const project = await resolveProject(projectName);
+    const choice = resolveThreadModelChoice({
+      model,
+      effort,
+      models: await loadModels(),
+      accessMode,
+      codexServiceTier,
+      claudeContextWindow,
+    });
+    if (!choice.ok) throw new Error(choice.error);
+    const effectiveAccessMode = choice.accessMode ?? (getAccessMode() || 'read-only');
     const task = { id: newId('lt'), title: clip(oneLine(title), 80) || 'Task', project: project.name, startedAt: now() };
     const key = `${entry.bot.id}:${task.id}`;
     runtime.threads.set(key, task);
@@ -1655,7 +1704,11 @@ export const createLocalBotEngine = ({
         key,
         botName: entry.bot.name,
         title: task.title,
-        accessMode: getAccessMode() || 'read-only',
+        accessMode: effectiveAccessMode,
+        ...(choice.modelId ? { modelId: choice.modelId } : {}),
+        ...(choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}),
+        ...(choice.codexServiceTier ? { codexServiceTier: choice.codexServiceTier } : {}),
+        ...(choice.claudeContextWindow ? { claudeContextWindow: choice.claudeContextWindow } : {}),
       })
     ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
     if (!started?.ok) {
@@ -1663,6 +1716,9 @@ export const createLocalBotEngine = ({
       throw new Error(started?.error || 'The Durango Code thread could not start.');
     }
     task.threadId = started.threadId ?? null;
+    task.model = started.modelId ?? choice.modelId ?? null;
+    task.effort = started.reasoningEffort ?? choice.reasoningEffort ?? null;
+    task.accessMode = started.accessMode ?? effectiveAccessMode ?? null;
     changed();
     return task;
   };
@@ -1940,13 +1996,25 @@ export const createLocalBotEngine = ({
           const instructions = str(input.instructions).trim();
           if (!title || !instructions) throw new Error('delegate_task needs a title and instructions.');
           if (str(input.project).trim()) {
-            const task = await startThreadTask(self, { title, instructions, project: str(input.project).trim() });
+            const task = await startThreadTask(self, {
+              title,
+              instructions,
+              project: str(input.project).trim(),
+              model: input.model,
+              effort: input.effort ?? input.reasoning_effort,
+              accessMode: input.access_mode,
+              codexServiceTier: input.codex_service_tier,
+              claudeContextWindow: input.claude_context_window,
+            });
             return {
               ok: true,
               taskId: task.id,
               title: task.title,
               project: task.project,
               ...(task.threadId ? { threadId: task.threadId } : {}),
+              ...(task.model ? { model: task.model } : {}),
+              ...(task.effort ? { effort: task.effort } : {}),
+              ...(task.accessMode ? { accessMode: task.accessMode } : {}),
               status: 'running',
               note: 'A Durango Code thread is working on it in that project; the person can watch it in the app. Its report will arrive in your inbox.',
             };
@@ -2083,6 +2151,10 @@ export const createLocalBotEngine = ({
         }
         case 'save_project_file':
           return await saveFile((await resolveHomeProject(self, input.project)), input.name, str(input.content), { author: self.bot.name });
+        case 'list_thread_models': {
+          if (!threadTools || typeof threadTools.listModels !== 'function') throw new Error('Model catalog is not available here.');
+          return await threadTools.listModels(input);
+        }
         case 'list_threads':
         case 'read_thread': {
           if (!threadTools) throw new Error('Threads are not available here.');
@@ -2101,6 +2173,41 @@ export const createLocalBotEngine = ({
           const { entry: thread } = await threadTools.findThread(input.thread_id);
           const message = str(input.message).trim();
           if (!message) throw new Error('message_thread needs a message.');
+          if (input.steer === true) {
+            const hasSettings =
+              Boolean(str(input.model).trim()) ||
+              Boolean(str(input.effort ?? input.reasoning_effort).trim()) ||
+              Boolean(str(input.access_mode).trim()) ||
+              Boolean(str(input.codex_service_tier).trim()) ||
+              Boolean(str(input.claude_context_window).trim());
+            if (hasSettings) {
+              throw new Error('Cannot change model, effort, or access_mode while steering a running turn; stop the turn or wait for it to finish first.');
+            }
+            const steered = await Promise.resolve(
+              startThreadFollowUp({
+                threadId: thread.id,
+                prompt: `${message}\n\n(Steered by your bot "${self.bot.name}")`,
+                botName: self.bot.name,
+                steer: true,
+              })
+            ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+            if (!steered?.ok) throw new Error(steered?.error || 'That turn could not be steered.');
+            return { ok: true, threadId: thread.id, steered: true, note: 'Steered the running turn in that thread.' };
+          }
+          if (threadTools.isRunning?.(thread.id)) {
+            throw new Error('That thread is currently running a turn. Pass `steer: true` to steer it mid-turn, or wait until it finishes.');
+          }
+          const choice = resolveThreadModelChoice({
+            model: input.model,
+            effort: input.effort ?? input.reasoning_effort,
+            currentModelId: thread.modelId ?? thread.shell?.modelId ?? null,
+            models: await loadModels(),
+            accessMode: input.access_mode,
+            codexServiceTier: input.codex_service_tier,
+            claudeContextWindow: input.claude_context_window,
+          });
+          if (!choice.ok) throw new Error(choice.error);
+          const effectiveAccessMode = choice.accessMode ?? (getAccessMode() || 'read-only');
           const runtime = runtimeFor(self.bot.id);
           const task = { id: newId('lt'), title: clip(oneLine(input.title) || `Follow-up: ${thread.title || 'thread'}`, 80), project: null, threadId: thread.id, startedAt: now() };
           const key = `${self.bot.id}:${task.id}`;
@@ -2111,7 +2218,11 @@ export const createLocalBotEngine = ({
               prompt: `${message}\n\n(From the bot "${self.bot.name}": end with a concise report of the outcome; it goes back to the bot. ${BOT_REPORT_GUIDE})`,
               key,
               botName: self.bot.name,
-              accessMode: getAccessMode() || 'read-only',
+              accessMode: effectiveAccessMode,
+              ...(choice.modelId ? { modelId: choice.modelId } : {}),
+              ...(choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}),
+              ...(choice.codexServiceTier ? { codexServiceTier: choice.codexServiceTier } : {}),
+              ...(choice.claudeContextWindow ? { claudeContextWindow: choice.claudeContextWindow } : {}),
             })
           ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
           if (!started?.ok) {
@@ -2119,7 +2230,19 @@ export const createLocalBotEngine = ({
             throw new Error(started?.error || 'The follow-up could not start.');
           }
           changed();
-          return { ok: true, taskId: task.id, threadId: thread.id, status: 'running', note: 'The thread is working on it; the outcome will arrive in your inbox.' };
+          const effectiveModel = started.modelId ?? choice.modelId ?? null;
+          const effectiveEffort = started.reasoningEffort ?? choice.reasoningEffort ?? null;
+          const effectiveAccess = started.accessMode ?? effectiveAccessMode ?? null;
+          return {
+            ok: true,
+            taskId: task.id,
+            threadId: thread.id,
+            ...(effectiveModel ? { model: effectiveModel } : {}),
+            ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+            ...(effectiveAccess ? { accessMode: effectiveAccess } : {}),
+            status: 'running',
+            note: 'The thread is working on it; the outcome will arrive in your inbox.',
+          };
         }
         case 'notify_user': {
           const title = oneLine(input.title);

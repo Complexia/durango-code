@@ -6,7 +6,7 @@ import { DurangoError } from './durango-client.js';
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
 import { recordClaudeRateLimit } from './usage-limits.js';
-import { SHIP_VIA_THREAD_MESSAGE } from './bot-thread-tools.js';
+import { BOT_THREAD_ACCESS_MODES, SHIP_VIA_THREAD_MESSAGE, resolveThreadModelChoice } from './bot-thread-tools.js';
 
 // What a thread action from Durango (the claim's threadActions / legacy
 // settleThreads) can't ever do here: acknowledged at once. Anything else (no
@@ -14,7 +14,7 @@ import { SHIP_VIA_THREAD_MESSAGE } from './bot-thread-tools.js';
 // THREAD_ACTION_ATTEMPTS times. (`a bot started|can only settle` stays for
 // backwards compatibility with older desktop error messages.)
 const THREAD_ACTION_FINAL_ERROR =
-  /^No thread |matches several threads|a bot started|can only settle|running a turn|still running|no running turn|title is required|unsupported thread action|runs on another machine|not found on this machine|not available here/i;
+  /^No thread |matches several threads|matches several models|a bot started|can only settle|running a turn|still running|no running turn|title is required|requires at least one of|has no model|takes effort|has no effort setting|isn't available on|cannot be selected remotely|could not be branched|branching a thread that runs on|unsupported (?:thread action|access[_ ]mode|codex_service_tier|claude_context_window)|runs on another machine|not found on this machine|not available here/i;
 const THREAD_ACTION_ATTEMPTS = 5;
 
 // A Durango bot's manage_thread on a machine: as on Durango, it can name the
@@ -32,6 +32,48 @@ const withRunOn = (definition) =>
         },
       }
     : definition;
+
+// Ensure delegate_task exposes the full desktop thread controls (model/effort/
+// access_mode/tier/context window) when running on this machine, even if the
+// server's cloud-oriented schema omits desktop-only options.
+const enrichDelegateTaskTool = (definition) => {
+  if (definition?.name !== 'delegate_task' || !definition?.inputSchema?.properties) return definition;
+  const props = definition.inputSchema.properties;
+  return {
+    ...definition,
+    inputSchema: {
+      ...definition.inputSchema,
+      properties: {
+        ...props,
+        ...(props.effort
+          ? {}
+          : {
+              effort: {
+                type: 'string',
+                maxLength: 40,
+                description:
+                  'Reasoning effort level for a Durango Code thread (from list_thread_models, e.g. "low", "medium", "high", "xhigh", "max").',
+              },
+            }),
+        access_mode: {
+          type: 'string',
+          enum: BOT_THREAD_ACCESS_MODES,
+          description: 'Access mode for a Durango Code thread on this computer ("read-only", "workspace-write", or "full-access"; default "full-access").',
+        },
+        codex_service_tier: {
+          type: 'string',
+          enum: ['default', 'priority'],
+          description: 'Codex service tier when starting a Codex thread on this computer.',
+        },
+        claude_context_window: {
+          type: 'string',
+          enum: ['200k', '1m'],
+          description: 'Claude context window when starting a Claude thread on this computer.',
+        },
+      },
+    },
+  };
+};
 import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles, messageMediaOf } from './bot-reply-extras.js';
 import {
   BOT_SESSION_COLD_MS,
@@ -95,6 +137,8 @@ export const BOT_SESSIONS_FEATURE = 'bot-sessions';
 export const BOT_REPLY_MESSAGES_FEATURE = 'reply-messages';
 /** Claim feature: this machine drains queued threadActions and runs manage_thread locally. */
 export const BOT_THREAD_ACTIONS_FEATURE = 'thread-actions';
+/** Claim feature: this machine supports manage_thread action "configure" (model/effort/access). */
+export const BOT_THREAD_CONFIGURE_FEATURE = 'thread-configure';
 // A reply's messages before its final answer, at most (Durango's
 // BOT_REPLY_MESSAGES_MAX): past it, the text goes into the final answer.
 export const BOT_REPLY_MESSAGES_MAX = 30;
@@ -224,7 +268,7 @@ export const botProjectsNote = ({ projects, accessMode, threads }) => {
   ];
   if (threads) {
     lines.push(
-      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), steer a thread with message_thread (a follow-up turn there, reported back like a task), and manage any thread (bot-started or the person\'s own) with manage_thread: settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, stop, or delete when explicitly asked.',
+      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. You can pick any available model (`model`), reasoning effort (`effort`), and `access_mode` — call list_thread_models to see the exact model ids and supported effort levels on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), steer or follow up in a thread with message_thread (switching `model`/`effort` if needed, or `steer: true` to steer a running turn), and manage any thread (bot-started or the person\'s own) with manage_thread: settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, configure (change model/effort/access_mode), branch (fork a copy), stop, or delete when explicitly asked.',
       `To ship a change (land, deploy, merge, release), message the thread that made it (message_thread; its id is in the task report) with something like "${SHIP_VIA_THREAD_MESSAGE}": it knows how its project ships. A thread on another of the person's machines: delegate_task with \`thread_id\` (and no \`project\`). Land or deploy yourself only when the person explicitly tells you to.`
     );
   }
@@ -1088,6 +1132,7 @@ export const createBotReplyWorker = ({
   isAvailable = async () => true,
   runLane,
   getMachineInfo = async () => null,
+  listModels = null,
   startProjectThread = null,
   startThreadFollowUp = null,
   threadTools = null,
@@ -1181,7 +1226,17 @@ export const createBotReplyWorker = ({
       }
       const invoke = () =>
         typeof threadTools.manage === 'function'
-          ? threadTools.manage({ thread_id: threadId, action, ...(item.title ? { title: item.title } : {}) }, { exact: true })
+          ? threadTools.manage(
+              {
+                thread_id: threadId,
+                action,
+                ...(item.title ? { title: item.title } : {}),
+                ...(item.modelId ? { modelId: item.modelId } : {}),
+                ...(item.reasoningEffort ? { reasoningEffort: item.reasoningEffort } : {}),
+                ...(item.accessMode ? { accessMode: item.accessMode } : {}),
+              },
+              { exact: true }
+            )
           : action === 'settle' && typeof threadTools.settle === 'function'
             ? threadTools.settle({ thread_id: threadId }, { exact: true })
             : { ok: false, error: `Managing threads (${action}) is not available here.` };
@@ -1456,6 +1511,12 @@ export const createBotReplyWorker = ({
       return next;
     };
 
+    const loadModels = async () => {
+      if (typeof listModels !== 'function') return [];
+      const list = (await Promise.resolve(listModels()).catch(() => [])) ?? [];
+      return Array.isArray(list) ? list : [];
+    };
+
     // delegate_task in one of this machine's projects: a Durango Code thread
     // here, started by this app (no agent dispatch needed); Durango records
     // the task and gets the thread's outcome when it ends.
@@ -1466,6 +1527,17 @@ export const createBotReplyWorker = ({
       const title = String(input?.title ?? '').trim();
       const instructions = String(input?.instructions ?? '').trim();
       if (!title || !instructions) return { ok: false, error: 'delegate_task needs a title and instructions.' };
+      const choice = resolveThreadModelChoice({
+        model: input?.model,
+        effort: input?.effort ?? input?.reasoning_effort,
+        models: await loadModels(),
+        machineName: target.machineName || 'this computer',
+        accessMode: input?.access_mode,
+        codexServiceTier: input?.codex_service_tier,
+        claudeContextWindow: input?.claude_context_window,
+      });
+      if (!choice.ok) return { ok: false, error: choice.error };
+      const accessMode = choice.accessMode ?? settings.accessMode;
       const created = await withRetries(() =>
         client.createBotLaneTask({
           laneId: lane.laneId,
@@ -1490,7 +1562,11 @@ export const createBotReplyWorker = ({
           key: created.taskId,
           botName: lane.botName,
           title: created.title || title,
-          accessMode: settings.accessMode,
+          accessMode,
+          ...(choice.modelId ? { modelId: choice.modelId } : {}),
+          ...(choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}),
+          ...(choice.codexServiceTier ? { codexServiceTier: choice.codexServiceTier } : {}),
+          ...(choice.claudeContextWindow ? { claudeContextWindow: choice.claudeContextWindow } : {}),
         })
       ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
       if (!started?.ok) {
@@ -1499,22 +1575,71 @@ export const createBotReplyWorker = ({
         return { ok: false, error };
       }
       rememberTaskThread(created.taskId, started.threadId);
+      const effectiveModel = started.modelId ?? choice.modelId ?? null;
+      const effectiveEffort = started.reasoningEffort ?? choice.reasoningEffort ?? null;
+      const effectiveAccess = started.accessMode ?? accessMode ?? null;
       return {
         ok: true,
         taskId: created.taskId,
         title: created.title || title,
         project: target.project.name,
         ...(started.threadId ? { threadId: started.threadId } : {}),
+        ...(effectiveModel ? { model: effectiveModel } : {}),
+        ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+        ...(effectiveAccess ? { accessMode: effectiveAccess } : {}),
         status: 'running',
         note: 'A Durango Code thread is working on it in that project on this computer; the person can watch it in the app. Its report will arrive in your inbox.',
       };
     };
 
-    // message_thread: a follow-up turn in a thread here, recorded as a task.
+    // message_thread: a follow-up turn (or live steer) in a thread here, recorded as a task.
     const messageThreadHere = async (input, toolCallId) => {
       const { entry } = await threadTools.findThread(input?.thread_id);
       const message = String(input?.message ?? '').trim();
       if (!message) return { ok: false, error: 'message_thread needs a message.' };
+      if (input?.steer === true) {
+        const hasSettings =
+          Boolean(String(input?.model ?? '').trim()) ||
+          Boolean(String(input?.effort ?? input?.reasoning_effort ?? '').trim()) ||
+          Boolean(String(input?.access_mode ?? '').trim()) ||
+          Boolean(String(input?.codex_service_tier ?? '').trim()) ||
+          Boolean(String(input?.claude_context_window ?? '').trim());
+        if (hasSettings) {
+          return {
+            ok: false,
+            error: 'Cannot change model, effort, or access_mode while steering a running turn; stop the turn or wait for it to finish first.',
+          };
+        }
+        const steered = await Promise.resolve(
+          startThreadFollowUp({
+            threadId: entry.id,
+            prompt: `${message}\n\n(Steered by your bot "${lane.botName}")`,
+            botName: lane.botName,
+            steer: true,
+          })
+        ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+        if (!steered?.ok) {
+          return { ok: false, error: steered?.error || 'That turn could not be steered.' };
+        }
+        return { ok: true, threadId: entry.id, steered: true, note: 'Steered the running turn in that thread.' };
+      }
+      if (threadTools.isRunning?.(entry.id)) {
+        return {
+          ok: false,
+          error: 'That thread is currently running a turn. Pass `steer: true` to steer it mid-turn, or wait until it finishes.',
+        };
+      }
+      const choice = resolveThreadModelChoice({
+        model: input?.model,
+        effort: input?.effort ?? input?.reasoning_effort,
+        currentModelId: entry.modelId ?? entry.shell?.modelId ?? null,
+        models: await loadModels(),
+        accessMode: input?.access_mode,
+        codexServiceTier: input?.codex_service_tier,
+        claudeContextWindow: input?.claude_context_window,
+      });
+      if (!choice.ok) return { ok: false, error: choice.error };
+      const accessMode = choice.accessMode ?? settings.accessMode;
       const title = String(input?.title ?? '').trim() || `Follow-up: ${entry.title || 'thread'}`.slice(0, 80);
       const created = await withRetries(() =>
         client.createBotLaneTask({
@@ -1533,7 +1658,11 @@ export const createBotReplyWorker = ({
           prompt: `${message}\n\n(From the bot "${lane.botName}": end with a concise report of the outcome; it goes back to the bot. ${BOT_REPORT_GUIDE})`,
           key: created.taskId,
           botName: lane.botName,
-          accessMode: settings.accessMode,
+          accessMode,
+          ...(choice.modelId ? { modelId: choice.modelId } : {}),
+          ...(choice.reasoningEffort ? { reasoningEffort: choice.reasoningEffort } : {}),
+          ...(choice.codexServiceTier ? { codexServiceTier: choice.codexServiceTier } : {}),
+          ...(choice.claudeContextWindow ? { claudeContextWindow: choice.claudeContextWindow } : {}),
         })
       ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
       if (!started?.ok) {
@@ -1542,7 +1671,19 @@ export const createBotReplyWorker = ({
         return { ok: false, error };
       }
       rememberTaskThread(created.taskId, entry.id);
-      return { ok: true, taskId: created.taskId, threadId: entry.id, status: 'running', note: 'The thread is working on it; the outcome will arrive in your inbox.' };
+      const effectiveModel = started.modelId ?? choice.modelId ?? null;
+      const effectiveEffort = started.reasoningEffort ?? choice.reasoningEffort ?? null;
+      const effectiveAccess = started.accessMode ?? accessMode ?? null;
+      return {
+        ok: true,
+        taskId: created.taskId,
+        threadId: entry.id,
+        ...(effectiveModel ? { model: effectiveModel } : {}),
+        ...(effectiveEffort ? { effort: effectiveEffort } : {}),
+        ...(effectiveAccess ? { accessMode: effectiveAccess } : {}),
+        status: 'running',
+        note: 'The thread is working on it; the outcome will arrive in your inbox.',
+      };
     };
 
     const callTool = async ({ name, input, toolCallId, message }) => {
@@ -1563,8 +1704,16 @@ export const createBotReplyWorker = ({
           return { result: { ok: false, error: error?.message ?? String(error) } };
         }
       }
-      if (threadTools && (name === 'list_threads' || name === 'read_thread' || name === 'message_thread')) {
+      if (threadTools && (name === 'list_thread_models' || name === 'list_threads' || name === 'read_thread' || name === 'message_thread')) {
         try {
+          if (name === 'list_thread_models') {
+            return {
+              result:
+                typeof threadTools.listModels === 'function'
+                  ? await threadTools.listModels(input ?? {})
+                  : { ok: false, error: 'Model catalog is not available here.' },
+            };
+          }
           if (name === 'list_threads') return { result: await threadTools.list(input ?? {}) };
           if (name === 'read_thread') return { result: await threadTools.read(input ?? {}) };
           if (!startThreadFollowUp) return { result: { ok: false, error: 'Follow-ups are not available here.' } };
@@ -1581,7 +1730,19 @@ export const createBotReplyWorker = ({
         if (!here) return callServerTool({ name, input, toolCallId });
         try {
           return {
-            result: await messageThreadHere({ thread_id: here.entry.id, message: input.instructions, title: input.title }, toolCallId),
+            result: await messageThreadHere(
+              {
+                thread_id: here.entry.id,
+                message: input.instructions,
+                title: input.title,
+                model: input.model,
+                effort: input.effort ?? input.reasoning_effort,
+                access_mode: input.access_mode,
+                codex_service_tier: input.codex_service_tier,
+                claude_context_window: input.claude_context_window,
+              },
+              toolCallId
+            ),
           };
         } catch (error) {
           return { result: { ok: false, error: error?.message ?? String(error) } };
@@ -1603,12 +1764,15 @@ export const createBotReplyWorker = ({
       void send(false); // started: the first heartbeat
       try {
         // Threads in a project start here (delegate_task `project`); the
-        // thread tools read, follow up and manage this machine's threads.
+        // thread tools list models, read, follow up and manage this machine's threads.
         // This machine's thread tools replace Durango's (manage_thread / legacy settle_thread).
         const replacedNames = threadTools ? new Set([...threadTools.names, 'settle_thread']) : null;
         const tools = threadTools
-          ? [...lane.tools.filter((tool) => !replacedNames.has(tool?.name)), ...threadTools.definitions.map(withRunOn)]
-          : lane.tools;
+          ? [
+              ...lane.tools.filter((tool) => !replacedNames.has(tool?.name)).map(enrichDelegateTaskTool),
+              ...threadTools.definitions.map(withRunOn),
+            ]
+          : lane.tools.map(enrichDelegateTaskTool);
         outcome = await runLane({ ...lane, threads: 'machine', tools }, {
           signal: abort.signal,
           accessMode: settings.accessMode,
@@ -1736,8 +1900,8 @@ export const createBotReplyWorker = ({
           ...(settled.length ? { ackSettleThreads: settled } : {}),
           ...(actionAcks.length ? { ackThreadActions: actionAcks } : {}),
           // Replies come as a structured conversation (lane.session): kept sessions;
-          // go out as messages (lane.messages); and drain queued threadActions.
-          features: [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE],
+          // go out as messages (lane.messages); drain queued threadActions; and support configure.
+          features: [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE, BOT_THREAD_CONFIGURE_FEATURE],
           waitMs: claimWaitMs,
           signal,
         });
@@ -1822,7 +1986,7 @@ export const createBotReplyWorker = ({
       (name && (runOn === name || name.includes(runOn)));
     if (!here) return null;
     const project = findProject(info.projects, projectName);
-    if (project) return { project };
+    if (project) return { project, machineName: info.name || 'this computer' };
     // Asked for here by name, or nothing else could have it: say what exists.
     if (runOn) {
       const names = botProjectsForLane(info.projects).map((item) => item.name);

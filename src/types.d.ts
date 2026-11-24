@@ -604,7 +604,18 @@ export type RemoteCommandRequest = {
      * cloned, main/source-checkout.js) as a project named `projectName`, or
      * find the project that already has that path; reports `projectId`.
      */
-    kind: 'runTurn' | 'stopTurn' | 'steerTurn' | 'addProject' | 'answerQuestion' | 'userAction' | 'threadState' | 'renameThread' | 'deleteThread';
+    kind:
+      | 'runTurn'
+      | 'stopTurn'
+      | 'steerTurn'
+      | 'addProject'
+      | 'answerQuestion'
+      | 'userAction'
+      | 'threadState'
+      | 'renameThread'
+      | 'configureThread'
+      | 'branchThread'
+      | 'deleteThread';
     /** threadState: settle, snooze or pin the thread (null = undo); absent keys stay. */
     sidebarState?: import('./store').ThreadSidebarState;
     /** renameThread: new title for the thread. */
@@ -636,19 +647,10 @@ export type RemoteCommandRequest = {
     modelId?: string;
     accessMode?: 'read-only' | 'workspace-write' | 'full-access';
     /**
-     * Provider-agnostic reasoning effort. Main drops unknown values; the
-     * renderer maps the rest onto codex/claude/grok thread fields for the
-     * turn's model.
+     * Provider-agnostic reasoning effort (or OpenCode variant name). Main drops
+     * unknown values; the renderer maps the rest onto the turn model's field.
      */
-    reasoningEffort?:
-      | 'low'
-      | 'medium'
-      | 'high'
-      | 'xhigh'
-      | 'ultra'
-      | 'max'
-      | 'ultracode'
-      | 'ultrathink';
+    reasoningEffort?: string;
     /** Codex-only service tier. Ignored for other providers. */
     codexServiceTier?: 'default' | 'priority';
     /** Claude-only context window. Ignored for other providers. */
@@ -2357,6 +2359,9 @@ type OrionCodexBrowserIntegrationStatus = {
         threadId?: string;
         threadTitle?: string;
         projectId?: string;
+        modelId?: string;
+        reasoningEffort?: string;
+        accessMode?: 'read-only' | 'workspace-write' | 'full-access';
         mirrored?: boolean;
         error?: string;
       }) => Promise<{ ok: boolean }>;

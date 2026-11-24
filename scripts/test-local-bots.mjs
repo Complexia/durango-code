@@ -97,6 +97,7 @@ const makeEngine = (overrides = {}) => {
     log: () => {},
     timeZone: () => 'Australia/Sydney',
     ...(overrides.listProjects ? { listProjects: overrides.listProjects } : {}),
+    ...(overrides.listModels ? { listModels: overrides.listModels } : {}),
     ...(overrides.startProjectThread ? { startProjectThread: overrides.startProjectThread } : {}),
     ...(overrides.startThreadFollowUp ? { startThreadFollowUp: overrides.startThreadFollowUp } : {}),
     ...(overrides.threadTools ? { threadTools: overrides.threadTools } : {}),
@@ -1238,6 +1239,60 @@ test('manage_thread: the bot manages any thread (settle, snooze, rename, …), w
     { thread_id: 'thread_3', action: 'settle' },
   ]);
   lane.finish({ text: 'Done.' });
+  await engine.idle();
+});
+
+test('local bots: delegate_task and message_thread support model, effort, access_mode, steer, and list_thread_models', async () => {
+  const models = [
+    { id: 'antigravity:gemini-4-neon', label: 'Gemini 4 Neon', slug: 'gemini-4-neon', providerId: 'antigravity', provider: 'Antigravity', efforts: ['low', 'medium', 'high'], available: true },
+  ];
+  const started = [];
+  const followUps = [];
+  const threadTools = {
+    definitions: [],
+    listModels: async () => ({ ok: true, total: 1, models: [{ id: 'antigravity:gemini-4-neon', label: 'Gemini 4 Neon', provider: 'Antigravity', efforts: ['low', 'medium', 'high'] }] }),
+    list: async () => ({ ok: true, threads: [] }),
+    read: async () => ({ ok: true, transcript: '' }),
+    findThread: async () => ({ entry: { id: 'thread_1', title: 'Fix', modelId: 'antigravity:gemini-4-neon' } }),
+    manage: async () => ({ ok: true }),
+  };
+  const { engine, runner } = makeEngine({
+    listProjects: async () => [{ id: 'p1', name: 'Durango', path: '/x/durango' }],
+    listModels: async () => models,
+    threadTools,
+    startProjectThread: async (input) => {
+      started.push(input);
+      return { ok: true, threadId: 't_gem', modelId: input.modelId, reasoningEffort: input.reasoningEffort, accessMode: input.accessMode };
+    },
+    startThreadFollowUp: async (input) => {
+      followUps.push(input);
+      return { ok: true, threadId: input.threadId, modelId: input.modelId, reasoningEffort: input.reasoningEffort };
+    },
+  });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'Start on Gemini Neon high' });
+  await waitFor(() => runner.lanes.length === 1);
+  const call = (name, input) => runner.lanes[0].ctx.callTool({ name, input, toolCallId: 't' }).then((out) => out.result);
+  assert.equal((await call('list_thread_models', {})).models[0].id, 'antigravity:gemini-4-neon');
+  const bad = await call('delegate_task', { title: 'Bad', instructions: 'x', project: 'Durango', model: 'antigravity:gemini-4-neon', effort: 'ultra' });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /takes effort low, medium, high/);
+  const ok = await call('delegate_task', { title: 'Good', instructions: 'Fix it.', project: 'Durango', model: 'Gemini 4 Neon', effort: 'high', access_mode: 'workspace-write' });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.model, 'antigravity:gemini-4-neon');
+  assert.equal(ok.effort, 'high');
+  assert.equal(started[0].modelId, 'antigravity:gemini-4-neon');
+  assert.equal(started[0].reasoningEffort, 'high');
+  assert.equal(started[0].accessMode, 'workspace-write');
+  const steered = await call('message_thread', { thread_id: 'thread_1', message: 'Check tests.', steer: true });
+  assert.equal(steered.ok, true);
+  assert.equal(steered.steered, true);
+  assert.equal(followUps[0].steer, true);
+  const switched = await call('message_thread', { thread_id: 'thread_1', message: 'Now ship.', model: 'antigravity:gemini-4-neon', effort: 'medium' });
+  assert.equal(switched.ok, true);
+  assert.equal(followUps[1].modelId, 'antigravity:gemini-4-neon');
+  assert.equal(followUps[1].reasoningEffort, 'medium');
+  runner.lanes[0].finish({ text: 'Done.' });
   await engine.idle();
 });
 

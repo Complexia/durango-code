@@ -4399,6 +4399,9 @@ const resolveDispatchRendererCommand = (payload) => ({
     threadId: typeof payload?.threadId === 'string' ? payload.threadId : undefined,
     threadTitle: typeof payload?.threadTitle === 'string' ? payload.threadTitle : undefined,
     projectId: typeof payload?.projectId === 'string' ? payload.projectId : undefined,
+    modelId: typeof payload?.modelId === 'string' ? payload.modelId : undefined,
+    reasoningEffort: typeof payload?.reasoningEffort === 'string' ? payload.reasoningEffort : undefined,
+    accessMode: typeof payload?.accessMode === 'string' ? payload.accessMode : undefined,
     mirrored: payload?.mirrored === true ? true : undefined,
     error: typeof payload?.error === 'string' ? payload.error : undefined,
   }),
@@ -4623,60 +4626,82 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
 // `<prefix><key>` (durango:dispatchSettled below).
 const LOCAL_BOT_DISPATCH_PREFIX = 'localbot:';
 const BOT_TASK_DISPATCH_PREFIX = 'bottask:';
-const startBotProjectThread = (prefix) => ({ projectId, prompt, key, botName, title, accessMode }) => {
-  // A plain thread title, without a "Bots:" style prefix (bot-thread-title.js).
-  const threadTitle = botThreadTitle(title, botName).slice(0, 80);
-  return requestDispatchRendererCommand({
-    kind: 'runTurn',
-    projectId,
-    prompt: prompt.slice(0, 200_000),
-    accessMode,
-    source: { machineId: 'durango-bot', machineName: botName },
-    durangoDispatch: {
-      id: `${prefix}${key}`,
-      origin: 'bot',
-      sourceLabel: `your bot ${botName}`,
-      ...(threadTitle ? { title: threadTitle } : {}),
-      followUp: false,
-      sourceUrl: null,
-      requestedAccessMode: accessMode,
-    },
-  });
-};
+const startBotProjectThread =
+  (prefix) =>
+  ({ projectId, prompt, key, botName, title, accessMode, modelId, reasoningEffort, codexServiceTier, claudeContextWindow }) => {
+    // A plain thread title, without a "Bots:" style prefix (bot-thread-title.js).
+    const threadTitle = botThreadTitle(title, botName).slice(0, 80);
+    return requestDispatchRendererCommand({
+      kind: 'runTurn',
+      projectId,
+      prompt: prompt.slice(0, 200_000),
+      ...(modelId ? { modelId } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(codexServiceTier ? { codexServiceTier } : {}),
+      ...(claudeContextWindow ? { claudeContextWindow } : {}),
+      accessMode,
+      source: { machineId: 'durango-bot', machineName: botName },
+      durangoDispatch: {
+        id: `${prefix}${key}`,
+        origin: 'bot',
+        sourceLabel: `your bot ${botName}`,
+        ...(threadTitle ? { title: threadTitle } : {}),
+        followUp: false,
+        sourceUrl: null,
+        requestedAccessMode: accessMode,
+      },
+    });
+  };
 
-// A bot's follow-up turn in an existing thread here (message_thread), reported
-// like a thread it started.
-// The turn runs with the stricter of the thread's own access and the bot's,
-// so a bot never widens what a thread may do (a Read only thread stays Read
-// only), as for follow-ups dispatched from Durango Chat.
-const startBotThreadFollowUp = (prefix) => async ({ threadId, prompt, key, botName, accessMode }) => {
-  // Bots work with Full access, in their follow-ups too (bot-replies.js normalizeBotSettings).
-  const turnAccessMode = accessMode;
-  return requestDispatchRendererCommand({
-    kind: 'runTurn',
-    threadId,
-    prompt: prompt.slice(0, 200_000),
-    accessMode: turnAccessMode,
-    source: { machineId: 'durango-bot', machineName: botName },
-    durangoDispatch: {
-      id: `${prefix}${key}`,
-      origin: 'bot',
-      sourceLabel: `your bot ${botName}`,
-      followUp: true,
-      sourceUrl: null,
-      requestedAccessMode: turnAccessMode,
-    },
-  });
-};
+// A bot's follow-up turn (or live steer) in an existing thread here
+// (message_thread), reported like a thread it started.
+const startBotThreadFollowUp =
+  (prefix) =>
+  async ({ threadId, prompt, key, botName, accessMode, modelId, reasoningEffort, codexServiceTier, claudeContextWindow, steer }) => {
+    if (steer) {
+      return requestDispatchRendererCommand(
+        {
+          kind: 'steerTurn',
+          threadId,
+          prompt: prompt.slice(0, 200_000),
+          source: { machineId: 'durango-bot', machineName: botName },
+        },
+        30_000
+      );
+    }
+    // Bots work with Full access, in their follow-ups too (bot-replies.js normalizeBotSettings).
+    const turnAccessMode = accessMode;
+    return requestDispatchRendererCommand({
+      kind: 'runTurn',
+      threadId,
+      prompt: prompt.slice(0, 200_000),
+      ...(modelId ? { modelId } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(codexServiceTier ? { codexServiceTier } : {}),
+      ...(claudeContextWindow ? { claudeContextWindow } : {}),
+      accessMode: turnAccessMode,
+      source: { machineId: 'durango-bot', machineName: botName },
+      durangoDispatch: {
+        id: `${prefix}${key}`,
+        origin: 'bot',
+        sourceLabel: `your bot ${botName}`,
+        followUp: true,
+        sourceUrl: null,
+        requestedAccessMode: turnAccessMode,
+      },
+    });
+  };
 
-// list_threads / read_thread / manage_thread over this machine's threads in the
-// projects bots may use. manage_thread works on any thread (whether started by
-// a bot or by the person); the renderer still refuses settling a running turn.
+// list_thread_models / list_threads / read_thread / manage_thread over this
+// machine's threads in the projects bots may use. manage_thread works on any
+// thread (whether started by a bot or by the person); the renderer still
+// refuses settling or configuring a running turn.
 const botThreadTools = createBotThreadTools({
   readIndex: () => readThreadsIndex(),
   readThread: (args) => readThreadForAgent(args),
   getProjects: () => botProjects(),
-  manageThread: ({ threadId, action, title }) => {
+  listModels: listDispatchModels,
+  manageThread: ({ threadId, action, title, modelId, reasoningEffort, accessMode, codexServiceTier, claudeContextWindow }) => {
     const source = { machineId: 'durango-bot', machineName: 'your bot' };
     const now = new Date().toISOString();
     switch (action) {
@@ -4694,6 +4719,22 @@ const botThreadTools = createBotThreadTools({
         return requestDispatchRendererCommand({ kind: 'threadState', threadId, sidebarState: { pinnedAt: null }, source }, 30_000);
       case 'rename':
         return requestDispatchRendererCommand({ kind: 'renameThread', threadId, title, source }, 30_000);
+      case 'configure':
+        return requestDispatchRendererCommand(
+          {
+            kind: 'configureThread',
+            threadId,
+            ...(modelId ? { modelId } : {}),
+            ...(reasoningEffort ? { reasoningEffort } : {}),
+            ...(accessMode ? { accessMode } : {}),
+            ...(codexServiceTier ? { codexServiceTier } : {}),
+            ...(claudeContextWindow ? { claudeContextWindow } : {}),
+            source,
+          },
+          30_000
+        );
+      case 'branch':
+        return requestDispatchRendererCommand({ kind: 'branchThread', threadId, source }, 30_000);
       case 'stop':
         return requestDispatchRendererCommand({ kind: 'stopTurn', threadId, source }, 30_000);
       case 'delete':
@@ -4735,6 +4776,7 @@ const botReplyWorker = createBotReplyWorker({
   isAvailable: botRepliesAvailable,
   runLane: claudeBotLaneRunner,
   getMachineInfo: () => botMachineInfo(),
+  listModels: listDispatchModels,
   startProjectThread: startBotProjectThread(BOT_TASK_DISPATCH_PREFIX),
   startThreadFollowUp: startBotThreadFollowUp(BOT_TASK_DISPATCH_PREFIX),
   threadTools: botThreadTools,
@@ -4833,6 +4875,7 @@ const localBots = createLocalBotEngine({
   getAccessMode: () => localBotsAccessMode,
   notify: notifyLocalBot,
   listProjects: async () => botProjectsWithKeys({ local: true }),
+  listModels: listDispatchModels,
   startProjectThread: startBotProjectThread(LOCAL_BOT_DISPATCH_PREFIX),
   startThreadFollowUp: startBotThreadFollowUp(LOCAL_BOT_DISPATCH_PREFIX),
   threadTools: botThreadTools,

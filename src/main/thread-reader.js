@@ -224,6 +224,23 @@ export const readThreadForAgent = async (args = {}) => {
   return formatThreadForAgent(thread, { project, offset: args.offset, limit: args.limit });
 };
 
+const EFFORT_FIELD_BY_PROVIDER = {
+  claude: 'claudeReasoningEffort',
+  codex: 'codexReasoningEffort',
+  antigravity: 'antigravityReasoningEffort',
+  grok: 'grokReasoningEffort',
+  muse: 'museReasoningEffort',
+  opencode: 'openCodeReasoningEffort',
+};
+
+const activeReasoningEffortOf = (thread) => {
+  const modelId = typeof thread?.modelId === 'string' ? thread.modelId : '';
+  const provider = modelId.includes(':') ? modelId.slice(0, modelId.indexOf(':')) : '';
+  const field = EFFORT_FIELD_BY_PROVIDER[provider];
+  const value = field ? thread?.[field] : null;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+};
+
 /**
  * One page of a thread's transcript for an agent (read_thread, and
  * machine_read_thread for a thread on another machine). `toolCall` names how
@@ -244,6 +261,8 @@ export const formatThreadForAgent = (
     ? Math.max(args.offset - 1, 0)
     : Math.max(0, total - limit);
 
+  const effort = activeReasoningEffortOf(thread);
+  const access = typeof thread.accessMode === 'string' && thread.accessMode ? thread.accessMode : null;
   const header = [
     `# Durango Code thread "${thread.title}"`,
     `thread_id: ${thread.id}`,
@@ -251,7 +270,7 @@ export const formatThreadForAgent = (
     ...(link
       ? [`link: @thread:${thread.id} (write this in your reply to give the user a clickable link to the thread)`]
       : []),
-    `status: ${thread.status}; model: ${thread.modelId}; created: ${thread.createdAt}`,
+    `status: ${thread.status}; model: ${thread.modelId}${effort ? `; effort: ${effort}` : ''}${access ? `; access: ${access}` : ''}; created: ${thread.createdAt}`,
     ...(project ? [`project: ${project.name} (${project.path})`] : []),
     ...(thread.status === 'running'
       ? ['Note: this thread is currently running; its transcript may lag behind by a few seconds.']

@@ -86,6 +86,17 @@ const EFFORT_FIELD: Record<
   opencode: 'openCodeReasoningEffort',
 };
 
+/** The active reasoning effort stored on `thread` for its current model's provider, or undefined. */
+export const activeThreadReasoningEffort = (
+  thread: RemoteAgentSettingsThread | undefined
+): string | undefined => {
+  const modelId = thread?.modelId ?? '';
+  const provider = modelId.includes(':') ? modelId.slice(0, modelId.indexOf(':')) : '';
+  const field = EFFORT_FIELD[provider];
+  const value = field ? thread?.[field] : undefined;
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+};
+
 /**
  * The provider-agnostic effort values a model accepts from a controller or a
  * Durango dispatch, in picker order; empty when the model has no effort

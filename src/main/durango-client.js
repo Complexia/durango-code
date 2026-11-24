@@ -779,6 +779,9 @@ export const createDurangoClient = ({
                 threadId: item.threadId,
                 action: item.action,
                 ...(typeof item.title === 'string' && item.title ? { title: item.title } : {}),
+                ...(typeof item.modelId === 'string' && item.modelId ? { modelId: item.modelId } : {}),
+                ...(typeof item.reasoningEffort === 'string' && item.reasoningEffort ? { reasoningEffort: item.reasoningEffort } : {}),
+                ...(typeof item.accessMode === 'string' && item.accessMode ? { accessMode: item.accessMode } : {}),
               }))
           : [],
         // The account has no bots: ask again only after this long.

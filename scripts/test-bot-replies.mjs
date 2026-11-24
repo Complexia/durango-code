@@ -19,6 +19,7 @@ import {
   BOT_REPLY_MESSAGES_FEATURE,
   BOT_SESSIONS_FEATURE,
   BOT_THREAD_ACTIONS_FEATURE,
+  BOT_THREAD_CONFIGURE_FEATURE,
   createBotSessionStore,
   botProjectsNote,
   botToolLabel,
@@ -802,7 +803,12 @@ try {
     const client = createFakeClient({ claim: laneClaims([actionsLane({ messages: true })]) });
     startWorker({ client, runLane: sdkRunner(createFakeSdk(ackProgressAnswer(answer))) });
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
-    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE]);
+    assert.deepEqual(client.calls.claim[0].features, [
+      BOT_SESSIONS_FEATURE,
+      BOT_REPLY_MESSAGES_FEATURE,
+      BOT_THREAD_ACTIONS_FEATURE,
+      BOT_THREAD_CONFIGURE_FEATURE,
+    ]);
     assert.deepEqual(
       client.calls.message.map(({ index, text }) => [index, text]),
       [
@@ -1013,6 +1019,292 @@ try {
     assert.equal(results.fails.ok, false);
     assert.equal(results.fails.error, 'No window.');
     assert.deepEqual(reports, [{ taskId: 'task_3', machineId: 'machine-1', outcome: 'failed', error: 'No window.' }], 'a thread that never started is reported failed');
+  });
+
+  await test('delegate_task, list_thread_models, message_thread (model/effort/steer), and manage_thread (configure/branch) honor full thread controls', async () => {
+    const modelsCatalog = [
+      { id: 'antigravity:gemini-4-neon', label: 'Gemini 4 Neon', slug: 'gemini-4-neon', providerId: 'antigravity', provider: 'Antigravity', efforts: ['low', 'medium', 'high', 'xhigh'], available: true },
+      { id: 'claude:claude-opus-5-5', label: 'Claude Opus 5.5', slug: 'claude-opus-5-5', providerId: 'claude', provider: 'Claude', efforts: ['low', 'medium', 'high', 'max', 'ultracode'], available: true },
+      { id: 'codex:gpt-5.6-sol', label: 'GPT-5.6 Sol', slug: 'gpt-5.6-sol', providerId: 'codex', provider: 'Codex', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], available: true },
+      { id: 'grok:grok-4.7-no-effort', label: 'Grok Plain', slug: 'grok-4.7-no-effort', providerId: 'grok', provider: 'Grok', efforts: [], available: true },
+      { id: 'codex:offline-model', label: 'Offline Model', slug: 'offline-model', providerId: 'codex', provider: 'Codex', efforts: ['high'], available: false, unavailableReason: 'Sign in to Codex.' },
+    ];
+    const client = createFakeClient({
+      claim: laneClaims([
+        makeLane({
+          tools: [
+            // Older server schema without effort/access_mode: enriched locally.
+            { name: 'delegate_task', description: 'delegate', inputSchema: { type: 'object', properties: { title: { type: 'string' }, instructions: { type: 'string' }, model: { type: 'string' }, project: { type: 'string' } } } },
+          ],
+        }),
+      ]),
+    });
+    const tasks = [];
+    client.createBotLaneTask = async (input) => {
+      tasks.push(input);
+      return { taskId: `task_${tasks.length}`, title: input.title };
+    };
+    const started = [];
+    const followUps = [];
+    const managed = [];
+    const threadTools = createBotThreadTools({
+      readIndex: async () => ({
+        entries: [
+          {
+            id: 'thread_1',
+            projectId: 'p1',
+            title: 'Existing',
+            status: 'idle',
+            modelId: 'claude:claude-opus-5-5',
+            shell: { modelId: 'claude:claude-opus-5-5', claudeReasoningEffort: 'high', accessMode: 'full-access' },
+            activityAt: 10,
+          },
+          {
+            id: 'subagent_obj',
+            projectId: 'p1',
+            title: 'Hidden subagent object',
+            status: 'idle',
+            shell: { subagent: { id: 'sub1', providerId: 'claude' } },
+            activityAt: 20,
+          },
+          {
+            id: 'subagent_child',
+            projectId: 'p1',
+            title: 'Hidden child thread',
+            status: 'idle',
+            parentThreadId: 'thread_1',
+            activityAt: 30,
+          },
+        ],
+      }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }],
+      listModels: async () => modelsCatalog,
+      manageThread: async (req) => {
+        managed.push(req);
+        if (req.action === 'branch') {
+          return { ok: true, threadId: 'thread_branch_1', threadTitle: 'Existing (branch)', modelId: 'claude:claude-opus-5-5', reasoningEffort: 'high', accessMode: 'full-access' };
+        }
+        return { ok: true, modelId: req.modelId, reasoningEffort: req.reasoningEffort, accessMode: req.accessMode };
+      },
+    });
+    let results;
+    let delegateSchema;
+    startWorker({
+      client,
+      getMachineInfo: async () => ({ name: 'Roma MacBook', projects: [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }], models: [] }),
+      listModels: async () => modelsCatalog,
+      threadTools,
+      startProjectThread: async (input) => {
+        started.push(input);
+        return {
+          ok: true,
+          threadId: `thread_new_${started.length}`,
+          modelId: input.modelId,
+          reasoningEffort: input.reasoningEffort,
+          accessMode: input.accessMode,
+        };
+      },
+      startThreadFollowUp: async (input) => {
+        followUps.push(input);
+        return {
+          ok: true,
+          threadId: input.threadId,
+          modelId: input.modelId,
+          reasoningEffort: input.reasoningEffort,
+          accessMode: input.accessMode,
+        };
+      },
+      runLane: async (lane, ctx) => {
+        delegateSchema = lane.tools.find((t) => t.name === 'delegate_task')?.inputSchema;
+        const call = (name, input) => ctx.callTool({ name, input, toolCallId: 't' }).then((out) => out.result);
+        results = {
+          modelsAll: await call('list_thread_models', {}),
+          modelsGemini: await call('list_thread_models', { search: 'neon' }),
+          listed: await call('list_threads', {}),
+          startGemini: await call('delegate_task', {
+            title: 'Fix thread list',
+            instructions: 'Skip subagents.',
+            project: 'Durango',
+            model: 'antigravity:gemini-4-neon',
+            effort: 'HIGH',
+          }),
+          startCloudAlias: await call('delegate_task', {
+            title: 'Cloud alias',
+            instructions: 'Use Opus.',
+            project: 'Durango',
+            model: 'anthropic/claude-opus-5.5',
+            effort: 'max',
+            access_mode: 'workspace-write',
+            claude_context_window: '1m',
+          }),
+          startBadModel: await call('delegate_task', {
+            title: 'Bad model',
+            instructions: 'Nope.',
+            project: 'Durango',
+            model: 'antigravity:does-not-exist',
+          }),
+          startBadEffort: await call('delegate_task', {
+            title: 'Bad effort',
+            instructions: 'Nope.',
+            project: 'Durango',
+            model: 'antigravity:gemini-4-neon',
+            effort: 'ultra',
+          }),
+          startNoEffortModel: await call('delegate_task', {
+            title: 'No effort',
+            instructions: 'Nope.',
+            project: 'Durango',
+            model: 'grok:grok-4.7-no-effort',
+            effort: 'high',
+          }),
+          followUpSwitch: await call('message_thread', {
+            thread_id: 'thread_1',
+            message: 'Continue with Gemini.',
+            model: 'Gemini 4 Neon',
+            effort: 'xhigh',
+          }),
+          steerRunning: await call('message_thread', {
+            thread_id: 'thread_1',
+            message: 'Actually focus on tests first.',
+            steer: true,
+          }),
+          steerWithModel: await call('message_thread', {
+            thread_id: 'thread_1',
+            message: 'Try switching during steer.',
+            steer: true,
+            model: 'antigravity:gemini-4-neon',
+          }),
+          readSpawnChild: await call('read_thread', { thread_id: 'subagent_child' }),
+          configure: await call('manage_thread', {
+            thread_id: 'thread_1',
+            action: 'configure',
+            model: 'codex:gpt-5.6-sol',
+            effort: 'max',
+            access_mode: 'read-only',
+            codex_service_tier: 'priority',
+          }),
+          configureBad: await call('manage_thread', {
+            thread_id: 'thread_1',
+            action: 'configure',
+          }),
+          branch: await call('manage_thread', {
+            thread_id: 'thread_1',
+            action: 'branch',
+          }),
+        };
+        return { text: 'Done.' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.ok(delegateSchema.properties.effort, 'delegate_task schema enriched with effort');
+    assert.ok(delegateSchema.properties.access_mode, 'delegate_task schema enriched with access_mode');
+    assert.equal(results.modelsAll.ok, true);
+    assert.equal(results.modelsAll.models.some((m) => m.id === 'codex:offline-model'), false, 'unavailable models omitted');
+    assert.deepEqual(results.modelsGemini.models, [
+      { id: 'antigravity:gemini-4-neon', label: 'Gemini 4 Neon', provider: 'Antigravity', efforts: ['low', 'medium', 'high', 'xhigh'] },
+    ]);
+    // list_threads includes model/effort/accessMode, counts spawn children on parent, and skips provider subagents
+    assert.deepEqual(
+      results.listed.threads.map((t) => ({ id: t.id, model: t.model, effort: t.effort, accessMode: t.accessMode, subagents: t.subagents })),
+      [{ id: 'thread_1', model: 'claude:claude-opus-5-5', effort: 'high', accessMode: 'full-access', subagents: 1 }]
+    );
+    // Spawn children stay reachable by id (matching sidebarThreadRoots / main)
+    assert.equal(results.readSpawnChild.ok, true);
+    // Starting with model + effort passes exact modelId + normalized effort
+    assert.equal(results.startGemini.ok, true);
+    assert.equal(results.startGemini.model, 'antigravity:gemini-4-neon');
+    assert.equal(results.startGemini.effort, 'high');
+    assert.equal(started[0].modelId, 'antigravity:gemini-4-neon');
+    assert.equal(started[0].reasoningEffort, 'high');
+    // Cloud-style anthropic/ id resolves to claude:claude-opus-5-5
+    assert.equal(results.startCloudAlias.ok, true);
+    assert.equal(started[1].modelId, 'claude:claude-opus-5-5');
+    assert.equal(started[1].reasoningEffort, 'max');
+    assert.equal(started[1].accessMode, 'workspace-write');
+    assert.equal(started[1].claudeContextWindow, '1m');
+    // Validation errors fail BEFORE creating a bot task
+    assert.equal(results.startBadModel.ok, false);
+    assert.match(results.startBadModel.error, /has no model/);
+    assert.equal(results.startBadEffort.ok, false);
+    assert.match(results.startBadEffort.error, /takes effort low, medium, high, xhigh, not "ultra"/);
+    assert.equal(results.startNoEffortModel.ok, false);
+    assert.match(results.startNoEffortModel.error, /has no effort setting/);
+    assert.equal(tasks.length, 3, 'invalid starts never create stray tasks (2 valid starts + 1 valid follow-up)');
+    // message_thread switches model + effort on follow-up, and steers with bot attribution (rejecting setting overrides)
+    assert.equal(results.followUpSwitch.ok, true);
+    assert.equal(followUps[0].modelId, 'antigravity:gemini-4-neon');
+    assert.equal(followUps[0].reasoningEffort, 'xhigh');
+    assert.equal(results.steerRunning.ok, true);
+    assert.equal(results.steerRunning.steered, true);
+    assert.equal(followUps[1].steer, true);
+    assert.match(followUps[1].prompt, /\(Steered by your bot "Scout"\)/);
+    assert.equal(results.steerWithModel.ok, false);
+    assert.match(results.steerWithModel.error, /Cannot change model/);
+    // manage_thread configure + branch
+    assert.equal(results.configure.ok, true);
+    assert.equal(results.configure.model, 'codex:gpt-5.6-sol');
+    assert.equal(results.configure.effort, 'max');
+    assert.equal(results.configure.accessMode, 'read-only');
+    assert.deepEqual(managed[0], {
+      threadId: 'thread_1',
+      action: 'configure',
+      modelId: 'codex:gpt-5.6-sol',
+      reasoningEffort: 'max',
+      accessMode: 'read-only',
+      codexServiceTier: 'priority',
+    });
+    assert.equal(results.configureBad.ok, false);
+    assert.match(results.configureBad.error, /requires at least one of/);
+    assert.equal(results.branch.ok, true);
+    assert.equal(results.branch.threadId, 'thread_branch_1');
+    assert.equal(results.branch.branchedFrom, 'thread_1');
+    // branch fails cleanly if the renderer returns no new threadId (never falls back to the source thread)
+    const brokenBranch = createBotThreadTools({
+      readIndex: async () => ({ entries: [{ id: 'thread_1', projectId: 'p1', title: 'T', status: 'idle' }] }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/x' }],
+      manageThread: async () => ({ ok: true }),
+    });
+    const branchErr = await brokenBranch.manage({ thread_id: 'thread_1', action: 'branch' });
+    assert.equal(branchErr.ok, false);
+    assert.match(branchErr.error, /could not be branched/);
+    // Claims advertise thread-configure alongside thread-actions
+    assert.ok(client.calls.claim.some((c) => c.features?.includes('thread-configure')), 'claims advertise thread-configure');
+  });
+
+  await test('queued configure threadAction from Durango forwards modelId, reasoningEffort, and accessMode and acknowledges final errors once', async () => {
+    let pendingActions = [
+      { id: 'ta_cfg', threadId: 'thread_1', action: 'configure', modelId: 'antigravity:gemini-4-neon', reasoningEffort: 'high', accessMode: 'workspace-write' },
+      { id: 'ta_bad', threadId: 'thread_1', action: 'configure', modelId: 'ambiguous' },
+    ];
+    const client = createFakeClient({
+      claim: async (input) => {
+        pendingActions = pendingActions.filter((item) => !(input.ackThreadActions ?? []).includes(item.id));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { lane: null, threadActions: [...pendingActions] };
+      },
+    });
+    const calls = [];
+    const threadTools = createBotThreadTools({
+      readIndex: async () => ({ entries: [{ id: 'thread_1', projectId: 'p1', title: 'T', status: 'idle' }] }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/x' }],
+      listModels: async () => [
+        { id: 'antigravity:gemini-4-neon', label: 'Gemini 4 Neon', slug: 'gemini-4-neon', providerId: 'antigravity', provider: 'Antigravity', efforts: ['low', 'medium', 'high'], available: true },
+        { id: 'a:ambiguous', label: 'ambiguous', slug: 'ambiguous', providerId: 'a', provider: 'A', efforts: [], available: true },
+        { id: 'b:ambiguous', label: 'ambiguous', slug: 'ambiguous', providerId: 'b', provider: 'B', efforts: [], available: true },
+      ],
+      manageThread: async (req) => {
+        calls.push(req);
+        return { ok: true, modelId: req.modelId, reasoningEffort: req.reasoningEffort, accessMode: req.accessMode };
+      },
+    });
+    startWorker({ client, threadTools });
+    await waitFor(() => pendingActions.length === 0, { label: 'all configure actions acked' });
+    assert.deepEqual(calls, [
+      { threadId: 'thread_1', action: 'configure', modelId: 'antigravity:gemini-4-neon', reasoningEffort: 'high', accessMode: 'workspace-write' },
+    ]);
   });
 
   await test('delegate_task with thread_id: a thread here gets a follow-up (e.g. to ship it); one elsewhere goes to Durango', async () => {
@@ -2019,7 +2311,12 @@ try {
       runLane: async () => ({ text: 'hi', usage: { mode: 'resume', input: 5, cacheRead: 100 }, compact: true }),
     });
     await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
-    assert.deepEqual(client.calls.claim[0].features, [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE]);
+    assert.deepEqual(client.calls.claim[0].features, [
+      BOT_SESSIONS_FEATURE,
+      BOT_REPLY_MESSAGES_FEATURE,
+      BOT_THREAD_ACTIONS_FEATURE,
+      BOT_THREAD_CONFIGURE_FEATURE,
+    ]);
     assert.deepEqual(client.calls.finish[0].usage, { mode: 'resume', input: 5, cacheRead: 100 });
     assert.equal(client.calls.finish[0].compact, true);
     const normalized = normalizeBotLane({ laneId: 'l', botId: 'b', session: { history: [], answering: [1], context: [] } });

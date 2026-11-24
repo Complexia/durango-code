@@ -169,6 +169,7 @@ import { createComposerDraftController } from './app/composerDraft';
 import { ModelPickerPopover } from './app/ModelPickerPopover';
 import { goalStatusLabels, goalSummaryLine, goalUsageSummary } from './app/activity';
 import {
+  activeThreadReasoningEffort,
   claimRemoteSideEffect,
   claimRemoteThreadStart,
   mergeSynchronouslyTrackedRuns,
@@ -9355,13 +9356,16 @@ const App: React.FC = () => {
             },
           });
         }
+        const startedThread = useOrionStore.getState().threads.find((t) => t.id === threadId);
+        const startedEffort = activeThreadReasoningEffort(startedThread);
         return result.ok
           ? {
               ok: true,
               threadId,
-              ...(dispatch
-                ? { threadTitle: useOrionStore.getState().threads.find((t) => t.id === threadId)?.title }
-                : {}),
+              ...(dispatch ? { threadTitle: startedThread?.title } : {}),
+              ...(startedThread?.modelId ? { modelId: startedThread.modelId } : {}),
+              ...(startedEffort ? { reasoningEffort: startedEffort } : {}),
+              ...(startedThread?.accessMode ? { accessMode: startedThread.accessMode } : {}),
             }
           : { ok: false, ...(createdThread ? {} : { threadId }), error: result.error };
       }
@@ -9603,6 +9607,148 @@ const App: React.FC = () => {
         updateThread(threadId, { title });
         return { ok: true, threadId, threadTitle: title, ...(mirrored ? { mirrored: true } : {}) };
       }
+      if (command.kind === 'configureThread') {
+        const threadId = command.threadId ?? '';
+        const existing = state.threads.find((candidate) => candidate.id === threadId);
+        if (!existing) return { ok: false, error: 'Thread not found on this machine.' };
+        if (
+          existing.status === 'running' ||
+          pendingTurnStartsRef.current.has(threadId) ||
+          Boolean(activeRunsByThreadRef.current[threadId])
+        ) {
+          return {
+            ok: false,
+            threadId,
+            error: 'That thread is running a turn: stop it first or wait for it to finish before changing its settings.',
+          };
+        }
+        const requestedAccessMode =
+          command.accessMode && accessModeOptions.some((option) => option.value === command.accessMode)
+            ? command.accessMode
+            : undefined;
+        if (command.accessMode && !requestedAccessMode) {
+          return { ok: false, threadId, error: `Unsupported access mode "${command.accessMode}".` };
+        }
+        const requestedCodexServiceTier =
+          command.codexServiceTier === 'default' || command.codexServiceTier === 'priority'
+            ? command.codexServiceTier
+            : undefined;
+        const requestedClaudeContextWindow =
+          command.claudeContextWindow === '200k' || command.claudeContextWindow === '1m'
+            ? command.claudeContextWindow
+            : undefined;
+        if (command.modelId) {
+          if (command.modelId === claudeCodeCliModelId) {
+            return { ok: false, threadId, error: 'Claude Code CLI terminal threads cannot be selected remotely.' };
+          }
+          const matchedModel = findAgentModel(agentModelsRef.current, command.modelId);
+          if (!matchedModel || matchedModel.id !== command.modelId) {
+            return { ok: false, threadId, error: `Durango Code on this machine has no model "${command.modelId}".` };
+          }
+        }
+        const targetModelId = command.modelId ?? existing.modelId;
+        const targetModel = findAgentModel(agentModelsRef.current, targetModelId);
+        if (command.codexServiceTier && targetModel?.providerId !== 'codex') {
+          return {
+            ok: false,
+            threadId,
+            error: `codex_service_tier only applies to Codex models (this thread uses ${targetModel?.label ?? targetModelId}).`,
+          };
+        }
+        if (command.claudeContextWindow && targetModel?.providerId !== 'claude') {
+          return {
+            ok: false,
+            threadId,
+            error: `claude_context_window only applies to Claude models (this thread uses ${targetModel?.label ?? targetModelId}).`,
+          };
+        }
+        if (command.reasoningEffort) {
+          const efforts = remoteModelEfforts(targetModel);
+          const label = targetModel?.label ?? targetModelId;
+          if (!efforts.includes(command.reasoningEffort)) {
+            return {
+              ok: false,
+              threadId,
+              error:
+                efforts.length > 0
+                  ? `${label} takes effort ${efforts.join(', ')}, not "${command.reasoningEffort}".`
+                  : `${label} has no effort setting; leave effort out.`,
+            };
+          }
+        }
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The command expired or was cancelled.' };
+        }
+        const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+        if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+        if (
+          thread.status === 'running' ||
+          pendingTurnStartsRef.current.has(threadId) ||
+          Boolean(activeRunsByThreadRef.current[threadId])
+        ) {
+          return {
+            ok: false,
+            threadId,
+            error: 'That thread is running a turn: stop it first or wait for it to finish before changing its settings.',
+          };
+        }
+        const patch: Partial<
+          Pick<
+            Thread,
+            | 'modelId'
+            | 'accessMode'
+            | 'codexReasoningEffort'
+            | 'codexServiceTier'
+            | 'claudeReasoningEffort'
+            | 'claudeContextWindow'
+            | 'grokReasoningEffort'
+            | 'museReasoningEffort'
+            | 'antigravityReasoningEffort'
+            | 'openCodeReasoningEffort'
+          >
+        > = {};
+        if (command.modelId && command.modelId !== thread.modelId) patch.modelId = command.modelId;
+        if (requestedAccessMode && requestedAccessMode !== thread.accessMode) patch.accessMode = requestedAccessMode;
+        Object.assign(
+          patch,
+          remoteAgentSettingsPatch(thread, targetModel, {
+            reasoningEffort: command.reasoningEffort,
+            codexServiceTier: requestedCodexServiceTier,
+            claudeContextWindow: requestedClaudeContextWindow,
+          }) as Partial<Thread>
+        );
+        if (Object.keys(patch).length > 0) updateThread(threadId, patch);
+        const updated = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId) ?? thread;
+        const activeEffort = activeThreadReasoningEffort(updated);
+        return {
+          ok: true,
+          threadId,
+          modelId: updated.modelId,
+          ...(activeEffort ? { reasoningEffort: activeEffort } : {}),
+          accessMode: updated.accessMode,
+        };
+      }
+      if (command.kind === 'branchThread') {
+        const threadId = command.threadId ?? '';
+        if (!state.threads.some((candidate) => candidate.id === threadId)) {
+          return { ok: false, error: 'Thread not found on this machine.' };
+        }
+        if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+          return { ok: false, error: 'The command expired or was cancelled.' };
+        }
+        const branchedId = await useOrionStore.getState().branchThread(threadId, { select: false });
+        if (!branchedId) return { ok: false, threadId, error: 'The thread could not be branched.' };
+        const branched = useOrionStore.getState().threads.find((candidate) => candidate.id === branchedId);
+        const activeEffort = activeThreadReasoningEffort(branched);
+        return {
+          ok: true,
+          threadId: branchedId,
+          ...(branched?.title ? { threadTitle: branched.title } : {}),
+          ...(branched?.modelId ? { modelId: branched.modelId } : {}),
+          ...(activeEffort ? { reasoningEffort: activeEffort } : {}),
+          ...(branched?.accessMode ? { accessMode: branched.accessMode } : {}),
+        };
+      }
       if (command.kind === 'deleteThread') {
         const threadId = command.threadId ?? '';
         if (!state.threads.some((candidate) => candidate.id === threadId)) {
@@ -9624,7 +9770,17 @@ const App: React.FC = () => {
     if (!window.orion?.onRemoteCommandRequest) return undefined;
     const unsubscribe = window.orion.onRemoteCommandRequest((request) => {
       void (async () => {
-        let outcome: { ok: boolean; threadId?: string; threadTitle?: string; projectId?: string; mirrored?: boolean; error?: string };
+        let outcome: {
+          ok: boolean;
+          threadId?: string;
+          threadTitle?: string;
+          projectId?: string;
+          modelId?: string;
+          reasoningEffort?: string;
+          accessMode?: 'read-only' | 'workspace-write' | 'full-access';
+          mirrored?: boolean;
+          error?: string;
+        };
         const canPrepare = () => Date.now() < request.expiresAt;
         let claimPromise: Promise<boolean> | null = null;
         // `threadId`: the turn's thread, told to the controller with the claim.

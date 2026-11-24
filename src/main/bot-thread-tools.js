@@ -1,24 +1,168 @@
 import path from 'node:path';
+import { dispatchEffort, resolveDispatchModel } from './durango-dispatch.js';
 
 // A bot's Durango Code thread tools, run on this machine (bot-replies.js for
-// a Durango bot's reply here, local-bots.js signed out): list the threads of
-// this machine's projects, read one, send a follow-up into one, and manage any
-// thread (settle/archive, unsettle/restore, snooze, unsnooze/wake, pin, unpin,
-// rename, stop, delete). A follow-up is an ordinary turn in that thread (it
-// runs like a message the person sends), and its outcome comes back to the
-// bot's inbox like a task's. Starting new threads is delegate_task with `project`.
+// a Durango bot's reply here, local-bots.js signed out): list available models
+// and reasoning efforts, list the threads of this machine's projects, read one,
+// send a follow-up (or steer a running turn), and manage any thread
+// (settle/archive, unsettle/restore, snooze, unsnooze/wake, pin, unpin, rename,
+// configure model/effort/access, branch, stop, delete). A follow-up is an
+// ordinary turn in that thread (it runs like a message the person sends), and
+// its outcome comes back to the bot's inbox like a task's. Starting new threads
+// is delegate_task with `project` (with optional `model`, `effort`, `access_mode`).
 
-export const BOT_THREAD_ACTIONS = ['settle', 'unsettle', 'snooze', 'unsnooze', 'pin', 'unpin', 'rename', 'stop', 'delete'];
-export const BOT_THREAD_TOOL_NAMES = ['list_threads', 'read_thread', 'message_thread', 'manage_thread'];
+export const BOT_THREAD_ACTIONS = [
+  'settle',
+  'unsettle',
+  'snooze',
+  'unsnooze',
+  'pin',
+  'unpin',
+  'rename',
+  'configure',
+  'branch',
+  'stop',
+  'delete',
+];
+export const BOT_THREAD_TOOL_NAMES = ['list_thread_models', 'list_threads', 'read_thread', 'message_thread', 'manage_thread'];
+export const BOT_THREAD_ACCESS_MODES = ['read-only', 'workspace-write', 'full-access'];
+
+const EFFORT_FIELD_BY_PROVIDER = {
+  claude: 'claudeReasoningEffort',
+  codex: 'codexReasoningEffort',
+  antigravity: 'antigravityReasoningEffort',
+  grok: 'grokReasoningEffort',
+  muse: 'museReasoningEffort',
+  opencode: 'openCodeReasoningEffort',
+};
+
+/** The active reasoning effort stored on a thread/shell for its current model's provider, or null. */
+export const threadActiveEffort = (thread) => {
+  const modelId = typeof thread?.modelId === 'string' ? thread.modelId : '';
+  const provider = modelId.includes(':') ? modelId.slice(0, modelId.indexOf(':')) : '';
+  const field = EFFORT_FIELD_BY_PROVIDER[provider];
+  const value = field ? thread?.[field] : null;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+};
+
+/** Cloud-style Anthropic model id ("anthropic/claude-opus-5.5") → Claude Code slug ("claude-opus-5-5"). */
+const cloudClaudeSlug = (value) => {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (!raw.startsWith('anthropic/')) return null;
+  const slug = raw.slice('anthropic/'.length).replace(/\./g, '-');
+  return /^claude-[a-z0-9-]{2,60}$/.test(slug) ? slug : null;
+};
+
+/**
+ * Resolve and validate thread settings (model, reasoning effort, access mode,
+ * provider-specific options) against this machine's available agent models.
+ * Returns `{ ok: true, modelId, reasoningEffort, accessMode, codexServiceTier,
+ * claudeContextWindow, model }` or `{ ok: false, error }`.
+ */
+export const resolveThreadModelChoice = ({
+  model,
+  effort,
+  currentModelId = null,
+  models = [],
+  machineName = 'this computer',
+  accessMode,
+  codexServiceTier,
+  claudeContextWindow,
+} = {}) => {
+  const catalog = Array.isArray(models) ? models : [];
+  const wantedModel = String(model ?? '').trim();
+  const rawEffort = String(effort ?? '').trim();
+  let resolvedModel = null;
+  let modelId = null;
+
+  if (wantedModel) {
+    if (catalog.length > 0) {
+      let resolved = resolveDispatchModel(wantedModel, catalog, machineName);
+      if (!resolved.ok) {
+        const alias = cloudClaudeSlug(wantedModel);
+        if (alias) resolved = resolveDispatchModel(alias, catalog, machineName);
+      }
+      if (!resolved.ok) return { ok: false, error: resolved.error };
+      resolvedModel = resolved.model;
+      modelId = resolved.model?.id ?? null;
+    } else {
+      modelId = wantedModel;
+    }
+  }
+
+  let reasoningEffort = null;
+  if (rawEffort) {
+    const targetModel =
+      resolvedModel ??
+      (currentModelId && catalog.length > 0
+        ? catalog.find((candidate) => candidate.id === currentModelId) ?? null
+        : null);
+    const normalized = dispatchEffort(rawEffort, targetModel);
+    if (targetModel) {
+      const efforts = Array.isArray(targetModel.efforts) ? targetModel.efforts : [];
+      if (!normalized || !efforts.includes(normalized)) {
+        const label = targetModel.label || targetModel.id;
+        return {
+          ok: false,
+          error:
+            efforts.length > 0
+              ? `${label} takes effort ${efforts.join(', ')}, not "${rawEffort}".`
+              : `${label} has no effort setting; leave effort out.`,
+        };
+      }
+    }
+    reasoningEffort = normalized;
+  }
+
+  let normalizedAccessMode = null;
+  if (accessMode !== undefined && accessMode !== null && String(accessMode).trim() !== '') {
+    const candidate = String(accessMode).trim().toLowerCase();
+    if (!BOT_THREAD_ACCESS_MODES.includes(candidate)) {
+      return {
+        ok: false,
+        error: `Unsupported access_mode "${accessMode}". Use one of: ${BOT_THREAD_ACCESS_MODES.join(', ')}.`,
+      };
+    }
+    normalizedAccessMode = candidate;
+  }
+
+  let normalizedTier = null;
+  if (codexServiceTier !== undefined && codexServiceTier !== null && String(codexServiceTier).trim() !== '') {
+    const candidate = String(codexServiceTier).trim().toLowerCase();
+    if (candidate !== 'default' && candidate !== 'priority') {
+      return { ok: false, error: `Unsupported codex_service_tier "${codexServiceTier}". Use "default" or "priority".` };
+    }
+    normalizedTier = candidate;
+  }
+
+  let normalizedContext = null;
+  if (claudeContextWindow !== undefined && claudeContextWindow !== null && String(claudeContextWindow).trim() !== '') {
+    const candidate = String(claudeContextWindow).trim().toLowerCase();
+    if (candidate !== '200k' && candidate !== '1m') {
+      return { ok: false, error: `Unsupported claude_context_window "${claudeContextWindow}". Use "200k" or "1m".` };
+    }
+    normalizedContext = candidate;
+  }
+
+  return {
+    ok: true,
+    modelId,
+    reasoningEffort,
+    accessMode: normalizedAccessMode,
+    codexServiceTier: normalizedTier,
+    claudeContextWindow: normalizedContext,
+    model: resolvedModel,
+  };
+};
 
 /**
  * How a bot manages and settles Durango Code threads (manage_thread): in every
  * bot's instructions (local-bots.js, bot-replies.js); Durango's copy is in
  * chat/andromedus/lib/bots/prompt.ts ("Managing and settling threads").
  */
-export const BOT_SETTLE_RULE = `Managing and settling threads (manage_thread): you can manage any Durango Code thread — ones you started, ones other bots started, or the person's own — to settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, stop a running turn, or delete it.
+export const BOT_SETTLE_RULE = `Managing and settling threads (manage_thread): you can manage any Durango Code thread — ones you started, ones other bots started, or the person's own — to settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, configure (change model, reasoning effort, or access mode), branch (fork a copy to try another direction), stop a running turn, or delete it. You can also steer a running thread mid-turn with message_thread (\`steer: true\`), or switch its model/effort on a follow-up, and check available models and effort levels with list_thread_models.
 - Settling on your own: a Durango Code thread stays in the person's sidebar until it is settled. Settle a thread you started yourself (manage_thread with action "settle") only when you judge its work truly finished from what it reports: the change landed or merged, the release went out, the question was answered and nothing is left to do. Leave it unsettled while it is still running or waiting on something (a watcher, a deploy, a long run), while a change is open for review, when it asks the person something or needs their input, or when you aren't sure: "done" in a report alone doesn't mean finished.
-- Any thread and other actions: you may settle, unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename or stop any thread — including threads you didn't start — when the person asks or when it clearly follows from what they asked. Settling only files a thread away (a new message brings it back); it never stops or deletes anything.
+- Any thread and other actions: you may settle, unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, configure, branch or stop any thread — including threads you didn't start — when the person asks or when it clearly follows from what they asked. Settling only files a thread away (a new message brings it back); it never stops or deletes anything.
 - Deleting: deleting a thread is permanent and cannot be undone. Only use action "delete" when the person explicitly asks you to delete a thread — never on your own.`;
 
 // What a bot sends the thread that made a change when the person asks to
@@ -100,12 +244,26 @@ export const threadNoticeText = (title, kind, detail) => {
 };
 
 const MAX_LISTED = 40;
+const MAX_MODELS_LISTED = 200;
 
 export const BOT_THREAD_TOOLS = [
   {
+    name: 'list_thread_models',
+    description:
+      'List the Durango Code agent models available on this computer (Claude, Codex, Antigravity/Gemini, Grok, Muse, OpenCode…) with each model\'s exact `id`, `label`, `provider`, and supported reasoning `efforts`. Use these ids and efforts with delegate_task (`project`), message_thread, or manage_thread (`action: "configure"`).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        provider: { type: 'string', maxLength: 60, description: 'Filter by provider (e.g. "claude", "codex", "antigravity", "grok", "muse", "opencode").' },
+        search: { type: 'string', maxLength: 120, description: 'Filter by substring in model id, label or provider (e.g. "gemini", "neon", "opus").' },
+        limit: { type: 'integer', minimum: 1, maximum: MAX_MODELS_LISTED, description: `How many (default 60, at most ${MAX_MODELS_LISTED}).` },
+      },
+    },
+  },
+  {
     name: 'list_threads',
     description:
-      "List Durango Code threads on this computer, newest first: the threads in the person's sidebar, their own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), sidebar flags (settled, snoozed, pinned) and last activity. Subagent threads (ones a thread spawned, e.g. reviews) aren't in the sidebar and aren't listed: their parent shows how many it has (`subagents`); they come and go with it, so there's nothing to settle there. Pass include_subagents to list them too (each with its parentThreadId).",
+      "List Durango Code threads on this computer, newest first: the threads in the person's sidebar, their own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), model, reasoning effort, accessMode, sidebar flags (settled, snoozed, pinned) and last activity. Subagent threads (ones a thread spawned, e.g. reviews) aren't in the sidebar and aren't listed: their parent shows how many it has (`subagents`); they come and go with it, so there's nothing to settle there. Pass include_subagents to list them too (each with its parentThreadId).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -140,13 +298,17 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'message_thread',
     description:
-      "Send a follow-up message into an existing Durango Code thread on this computer (by id, from list_threads or a task report), as the person would: e.g. answer its question, ask for a fix, tell it to continue or wrap up. Also how you ship a change (land, deploy, merge, release): message the thread that made it and let it ship the change the way its project ships, rather than landing or deploying it yourself. Its agent runs a new turn there; the outcome comes back to your inbox like a task's report. Don't message a thread that is running right now unless it's waiting on an answer.",
+      "Send a follow-up message into an existing Durango Code thread on this computer (by id, from list_threads or a task report), as the person would: e.g. answer its question, ask for a fix, tell it to continue or wrap up. Also how you ship a change (land, deploy, merge, release): message the thread that made it and let it ship the change the way its project ships, rather than landing or deploying it yourself. Optionally pass `model`, `effort`, or `access_mode` to switch the thread's settings before running the turn (ids and efforts from list_thread_models). Don't send a normal follow-up to a thread that is running right now — pass `steer: true` to steer a running turn mid-flight instead (without changing model/effort/access_mode).",
     inputSchema: {
       type: 'object',
       properties: {
         thread_id: { type: 'string', minLength: 1, maxLength: 200 },
         message: { type: 'string', minLength: 1, maxLength: 16_000, description: 'What you need and why, plus anything the thread can\'t see (what the person said). It has its own context: don\'t repeat it or spell out steps.' },
         title: { type: 'string', maxLength: 80, description: 'Short title for the follow-up as a task, e.g. "Fix the failing test".' },
+        model: { type: 'string', maxLength: 120, description: 'Optional Durango Code model id, slug or label (from list_thread_models) to switch this thread to before running the turn.' },
+        effort: { type: 'string', maxLength: 40, description: 'Optional reasoning effort level supported by the model (from list_thread_models, e.g. "low", "medium", "high", "xhigh", "max").' },
+        access_mode: { type: 'string', enum: BOT_THREAD_ACCESS_MODES, description: 'Optional access mode for this turn ("read-only", "workspace-write", "full-access").' },
+        steer: { type: 'boolean', description: 'Set true to steer a currently running turn in this thread mid-flight instead of starting a new turn.' },
       },
       required: ['thread_id', 'message'],
     },
@@ -154,7 +316,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'manage_thread',
     description:
-      "Manage any Durango Code thread on this computer (by id, from list_threads or a task report) — whether started by a bot or by the person: settle (archive), unsettle (restore/unarchive), snooze, unsnooze (wake), pin, unpin, rename (with `title`), stop (stop a running turn), or delete (permanent — requires the full thread_id, and only when the person explicitly asks). Cannot settle a thread while a turn is running.",
+      "Manage any Durango Code thread on this computer (by id, from list_threads or a task report) — whether started by a bot or by the person: settle (archive), unsettle (restore/unarchive), snooze, unsnooze (wake), pin, unpin, rename (with `title`), configure (change `model`, `effort`, `access_mode`, `codex_service_tier`, or `claude_context_window` without sending a message), branch (fork a copy of the thread and return the new thread's id), stop (stop a running turn), or delete (permanent — requires the full thread_id, and only when the person explicitly asks). Cannot settle or configure a thread while a turn is running.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -163,9 +325,14 @@ export const BOT_THREAD_TOOLS = [
           type: 'string',
           enum: BOT_THREAD_ACTIONS,
           description:
-            'What to do: "settle" (archive to Settled), "unsettle" (restore to sidebar), "snooze", "unsnooze" (wake), "pin", "unpin", "rename" (requires `title`), "stop" (stop a running turn), or "delete" (permanent; requires the full thread_id, and only when explicitly asked).',
+            'What to do: "settle" (archive to Settled), "unsettle" (restore to sidebar), "snooze", "unsnooze" (wake), "pin", "unpin", "rename" (requires `title`), "configure" (change `model`, `effort`, `access_mode`, `codex_service_tier` or `claude_context_window`), "branch" (fork the thread into a new thread), "stop" (stop a running turn), or "delete" (permanent; requires the full thread_id, and only when explicitly asked).',
         },
         title: { type: 'string', minLength: 1, maxLength: 200, description: 'New thread title (required for action "rename").' },
+        model: { type: 'string', maxLength: 120, description: 'New Durango Code model id, slug or label from list_thread_models (for action "configure").' },
+        effort: { type: 'string', maxLength: 40, description: 'New reasoning effort level supported by the model (for action "configure").' },
+        access_mode: { type: 'string', enum: BOT_THREAD_ACCESS_MODES, description: 'New access mode (for action "configure").' },
+        codex_service_tier: { type: 'string', enum: ['default', 'priority'], description: 'Codex service tier (for action "configure" on a Codex thread).' },
+        claude_context_window: { type: 'string', enum: ['200k', '1m'], description: 'Claude context window (for action "configure" on a Claude thread).' },
         reason: { type: 'string', maxLength: 300, description: 'Optional short note on why (e.g. "change landed and deployed").' },
       },
       required: ['thread_id', 'action'],
@@ -185,6 +352,8 @@ const ACTION_NOTES = {
   pin: 'Pinned to the top of the sidebar.',
   unpin: 'Unpinned from the sidebar.',
   rename: 'Renamed the thread.',
+  configure: 'Updated the thread settings.',
+  branch: 'Branched the thread into a new copy.',
   stop: 'Stopped the running turn on that thread.',
   delete: 'Deleted the thread.',
 };
@@ -248,15 +417,30 @@ const CLAUDE_CODE_CLI_MODEL_ID = 'claude:claude-code-cli';
  * - readIndex(): { entries } (thread-storage.js readThreadsIndex)
  * - readThread(args): transcript page text (thread-reader.js readThreadForAgent)
  * - getProjects(): this machine's projects the bot may use ([{ id, name, path }])
+ * - listModels(): available agent models on this computer ([{ id, label, slug?, providerId?, provider, efforts, available }])
  * - liveStatus(threadId): the renderer's status for a thread now, or null (optional)
- * - manageThread({ threadId, action, title? }): runs a thread action (settle, unsettle,
- *   snooze, unsnooze, pin, unpin, rename, stop, delete) on any thread here → { ok, error? }
+ * - manageThread({ threadId, action, title?, modelId?, reasoningEffort?, accessMode?, codexServiceTier?, claudeContextWindow? }):
+ *   runs a thread action on any thread here → { ok, threadId?, threadTitle?, modelId?, reasoningEffort?, accessMode?, mirrored?, error? }
  * - settleThread(threadId): legacy fallback for settle only when manageThread is omitted
  */
-export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveStatus = () => null, manageThread = null, settleThread = null }) => {
+export const createBotThreadTools = ({
+  readIndex,
+  readThread,
+  getProjects,
+  listModels = null,
+  liveStatus = () => null,
+  manageThread = null,
+  settleThread = null,
+}) => {
   const projectsById = async () => {
     const list = (await Promise.resolve(getProjects()).catch(() => [])) ?? [];
     return new Map(list.filter((project) => project && typeof project.id === 'string').map((project) => [project.id, project]));
+  };
+
+  const loadModels = async () => {
+    if (typeof listModels !== 'function') return [];
+    const list = (await Promise.resolve(listModels()).catch(() => [])) ?? [];
+    return Array.isArray(list) ? list : [];
   };
 
   /** The thread (by exact id, or a unique prefix unless `exact`) if it belongs to an allowed project. */
@@ -292,8 +476,45 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
     if (action === 'settle' && liveStatus(entry.id) === 'running') {
       return { ok: false, error: 'That thread is running a turn: settle it only once its work is finished.' };
     }
+    let configureArgs = null;
+    if (action === 'configure') {
+      if (liveStatus(entry.id) === 'running') {
+        return { ok: false, error: 'That thread is running a turn: stop it first or wait for it to finish before changing its settings.' };
+      }
+      const rawModel = input.model ?? input.modelId;
+      const rawEffort = input.effort ?? input.reasoning_effort ?? input.reasoningEffort;
+      const rawAccessMode = input.access_mode ?? input.accessMode;
+      const rawCodexTier = input.codex_service_tier ?? input.codexServiceTier;
+      const rawClaudeWindow = input.claude_context_window ?? input.claudeContextWindow;
+      const hasAny =
+        Boolean(String(rawModel ?? '').trim()) ||
+        Boolean(String(rawEffort ?? '').trim()) ||
+        Boolean(String(rawAccessMode ?? '').trim()) ||
+        Boolean(String(rawCodexTier ?? '').trim()) ||
+        Boolean(String(rawClaudeWindow ?? '').trim());
+      if (!hasAny) {
+        return { ok: false, error: 'action "configure" requires at least one of: model, effort, access_mode, codex_service_tier, claude_context_window.' };
+      }
+      const resolved = resolveThreadModelChoice({
+        model: rawModel,
+        effort: rawEffort,
+        currentModelId: entry.modelId ?? entry.shell?.modelId ?? null,
+        models: await loadModels(),
+        accessMode: rawAccessMode,
+        codexServiceTier: rawCodexTier,
+        claudeContextWindow: rawClaudeWindow,
+      });
+      if (!resolved.ok) return { ok: false, error: resolved.error };
+      configureArgs = {
+        ...(resolved.modelId ? { modelId: resolved.modelId } : {}),
+        ...(resolved.reasoningEffort ? { reasoningEffort: resolved.reasoningEffort } : {}),
+        ...(resolved.accessMode ? { accessMode: resolved.accessMode } : {}),
+        ...(resolved.codexServiceTier ? { codexServiceTier: resolved.codexServiceTier } : {}),
+        ...(resolved.claudeContextWindow ? { claudeContextWindow: resolved.claudeContextWindow } : {}),
+      };
+    }
     const result = await Promise.resolve(
-      runner({ threadId: entry.id, action, ...(title ? { title } : {}) })
+      runner({ threadId: entry.id, action, ...(title ? { title } : {}), ...(configureArgs ?? {}) })
     ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
     if (!result?.ok) return { ok: false, error: result?.error || `The thread could not be updated (${action}).` };
     const note =
@@ -302,12 +523,36 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
         : result?.mirrored && action === 'rename'
           ? 'Renamed the mirrored copy on this computer (the thread runs on another machine).'
           : ACTION_NOTES[action];
+    if (action === 'branch') {
+      const branchedId = typeof result.threadId === 'string' && result.threadId.trim() ? result.threadId.trim() : '';
+      if (!branchedId || branchedId === entry.id) {
+        return { ok: false, error: 'The thread could not be branched.' };
+      }
+      return {
+        ok: true,
+        threadId: branchedId,
+        branchedFrom: entry.id,
+        action,
+        ...(result.threadTitle ? { title: result.threadTitle } : {}),
+        ...(result.modelId ? { model: result.modelId } : {}),
+        ...(result.reasoningEffort ? { effort: result.reasoningEffort } : {}),
+        ...(result.accessMode ? { accessMode: result.accessMode } : {}),
+        note,
+      };
+    }
     return {
       ok: true,
       threadId: entry.id,
       action,
       ...(action === 'settle' ? { settled: true } : {}),
       ...(title ? { title } : {}),
+      ...(action === 'configure'
+        ? {
+            ...(result.modelId ?? configureArgs?.modelId ? { model: result.modelId ?? configureArgs?.modelId } : {}),
+            ...(result.reasoningEffort ?? configureArgs?.reasoningEffort ? { effort: result.reasoningEffort ?? configureArgs?.reasoningEffort } : {}),
+            ...(result.accessMode ?? configureArgs?.accessMode ? { accessMode: result.accessMode ?? configureArgs?.accessMode } : {}),
+          }
+        : {}),
       ...(result?.mirrored ? { mirrored: true } : {}),
       note,
     };
@@ -317,6 +562,41 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
     names: BOT_THREAD_TOOL_NAMES,
     definitions: BOT_THREAD_TOOLS,
     findThread,
+    isRunning: (threadId) => liveStatus(threadId) === 'running',
+    async listModels(input = {}) {
+      if (typeof listModels !== 'function') {
+        return { ok: false, error: 'Model catalog is not available here.' };
+      }
+      const raw = await loadModels();
+      const providerFilter = projectKey(input.provider);
+      const searchFilter = projectKey(input.search);
+      const limit = Math.min(MAX_MODELS_LISTED, Math.max(1, Number.isInteger(input.limit) ? input.limit : 60));
+      const available = raw.filter((model) => model && typeof model.id === 'string' && model.id && model.available !== false);
+      const filtered = available.filter((model) => {
+        if (providerFilter) {
+          const pId = projectKey(model.providerId);
+          const pLabel = projectKey(model.provider);
+          if (pId !== providerFilter && pLabel !== providerFilter && !pLabel.includes(providerFilter)) return false;
+        }
+        if (searchFilter) {
+          const hay = [model.id, model.label, model.slug, model.provider, model.providerId].filter(Boolean).join(' ').toLowerCase();
+          if (!hay.includes(searchFilter)) return false;
+        }
+        return true;
+      });
+      const models = filtered.slice(0, limit).map((model) => ({
+        id: model.id,
+        label: String(model.label || model.id),
+        provider: String(model.provider || model.providerId || ''),
+        efforts: Array.isArray(model.efforts) ? model.efforts : [],
+      }));
+      return {
+        ok: true,
+        total: filtered.length,
+        models,
+        ...(filtered.length > models.length ? { truncated: true } : {}),
+      };
+    },
     async list(input = {}) {
       const [{ entries }, projects] = await Promise.all([readIndex(), projectsById()]);
       const wanted = projectKey(input.project);
@@ -365,11 +645,18 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
           // A subagent thread is filed with its parent: its parent's flags.
           const flags = entrySidebarFlags(root);
           const subagents = subagentCounts.get(entry.id) ?? 0;
+          const shell = entry.shell ?? entry;
+          const model = entry.modelId ?? shell?.modelId ?? null;
+          const effort = threadActiveEffort({ ...shell, ...(model ? { modelId: model } : {}) });
+          const accessMode = typeof shell?.accessMode === 'string' && shell.accessMode ? shell.accessMode : null;
           return {
             id: entry.id,
             title: entry.title || '(untitled)',
             project: projects.get(entry.projectId)?.name ?? null,
             status: liveStatus(entry.id) ?? entry.status ?? 'idle',
+            ...(model ? { model } : {}),
+            ...(effort ? { effort } : {}),
+            ...(accessMode ? { accessMode } : {}),
             ...(root !== entry ? { subagent: true, parentThreadId: entry.parentThreadId ?? entry.shell?.parentThreadId ?? null } : {}),
             ...(flags.settled ? { settled: true } : {}),
             ...(flags.snoozed ? { snoozed: true } : {}),
@@ -392,8 +679,8 @@ export const createBotThreadTools = ({ readIndex, readThread, getProjects, liveS
     },
     /**
      * manage_thread: settle, unsettle, snooze, unsnooze, pin, unpin, rename,
-     * stop or delete any thread here. `exact`: the full id only (a request
-     * from Durango, which every machine of the person may get).
+     * configure, branch, stop or delete any thread here. `exact`: the full id
+     * only (a request from Durango, which every machine of the person may get).
      */
     manage,
     /** Legacy helper for queued settleThreads from Durango. */
