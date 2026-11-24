@@ -6076,6 +6076,94 @@ ipcMain.handle('bots:ensureProjectBot', async (_event, input) => {
   }
 });
 
+// Creates an additional bot in a project (a project open here, or a remote project by key/repoId).
+ipcMain.handle('bots:createProjectBot', async (_event, input) => {
+  const projectId = typeof input?.projectId === 'string' ? input.projectId : '';
+  const remoteProject = input?.project && typeof input.project === 'object' ? input.project : null;
+  const botName = typeof input?.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 40) : undefined;
+  const job = typeof input?.job === 'string' && input.job.trim() ? input.job.trim().slice(0, 8_000) : undefined;
+  const emoji = typeof input?.emoji === 'string' && input.emoji.trim() ? input.emoji.trim().slice(0, 8) : undefined;
+  const model = typeof input?.model === 'string' && input.model.trim() ? input.model.trim().slice(0, 80) : undefined;
+  const project = projectId ? configuredProjects.find((candidate) => candidate?.id === projectId) : null;
+  if (!project && !remoteProject) return { ok: false, error: 'That project is not available.' };
+  const local = await localBotsMode();
+  try {
+    if (project) {
+      const identity = await botProjectIdentity(project, { local });
+      if (local) {
+        return {
+          ok: true,
+          bot: await localBots.createProjectBot({
+            name: project.name,
+            projectId: project.id,
+            repoId: identity.repoId,
+            machineId: LOCAL_BOTS_MACHINE,
+            botName,
+            job,
+            emoji,
+            model,
+          }),
+        };
+      }
+      const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const bot = await durangoClient.createProjectBot({
+        name: project.name,
+        ...(identity.repoId ? { repoId: identity.repoId } : { machineId: identity.machineId, projectId: project.id }),
+        ...(botName ? { botName } : {}),
+        ...(job ? { job } : {}),
+        ...(emoji ? { emoji } : {}),
+        ...(model ? { model } : {}),
+        ...(timeZone ? { timeZone } : {}),
+      });
+      botReplyWorker.wake();
+      return { ok: true, bot };
+    }
+    const remoteName = typeof remoteProject?.name === 'string' ? remoteProject.name.trim() : '';
+    const remoteKey = typeof remoteProject?.key === 'string' ? remoteProject.key.trim() : '';
+    const remoteRepoId = typeof remoteProject?.repoId === 'string' && remoteProject.repoId.trim() ? remoteProject.repoId.trim() : null;
+    if (!remoteName || (!remoteKey && !remoteRepoId)) return { ok: false, error: 'Missing project details.' };
+    if (local) {
+      let localProjectId = null;
+      let machineId = LOCAL_BOTS_MACHINE;
+      if (remoteKey.startsWith('local:')) {
+        const rest = remoteKey.slice(6);
+        const colon = rest.indexOf(':');
+        if (colon > 0 && colon < rest.length - 1) {
+          machineId = rest.slice(0, colon);
+          localProjectId = rest.slice(colon + 1);
+        }
+      }
+      return {
+        ok: true,
+        bot: await localBots.createProjectBot({
+          name: remoteName,
+          projectId: localProjectId,
+          repoId: remoteRepoId,
+          machineId,
+          botName,
+          job,
+          emoji,
+          model,
+        }),
+      };
+    }
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const bot = await durangoClient.createProjectBot({
+      name: remoteName,
+      ...(remoteRepoId ? { repoId: remoteRepoId } : { projectKey: remoteKey }),
+      ...(botName ? { botName } : {}),
+      ...(job ? { job } : {}),
+      ...(emoji ? { emoji } : {}),
+      ...(model ? { model } : {}),
+      ...(timeZone ? { timeZone } : {}),
+    });
+    botReplyWorker.wake();
+    return { ok: true, bot };
+  } catch (error) {
+    return local ? localBotsIpcError(error) : durangoIpcError(error);
+  }
+});
+
 // A project's notes and files: by its bot (`botId`), or by the project open
 // here (`projectId`), which needs no bot.
 const botProjectTarget = async (input, local) => {

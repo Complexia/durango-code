@@ -42,6 +42,14 @@ export type BotProjectResult = { ok: boolean; project?: BotProject | null; error
 /** Whose notes and files: a project bot's, or a project open here (it needs no bot). */
 export type BotProjectTarget = { botId: string; projectId?: never } | { projectId: string; botId?: never };
 export type EnsureProjectBotResult = { ok: boolean; bot?: DesktopBot; error?: string; code?: string };
+export type CreateProjectBotInput = {
+  projectId?: string;
+  project?: { key: string; name: string; repoId?: string | null };
+  name?: string;
+  job?: string;
+  emoji?: string;
+  model?: string;
+};
 
 export type DesktopBotMessage = {
   id: string;
@@ -295,9 +303,13 @@ export const botReasoningEffortShortLabel = (effort: string | null | undefined):
   }
 };
 
-/** The bot of a project (by the project's key), if it exists yet. */
+/** All bots of a project (by the project's key), most recently active first. */
+export const projectBotsFor = (bots: DesktopBot[], key: string | undefined): DesktopBot[] =>
+  key ? bots.filter((bot) => bot.project?.key === key).sort((a, b) => b.lastActivityAt - a.lastActivityAt) : [];
+
+/** A project's primary/most-recent bot (by the project's key), if any exists yet. */
 export const projectBotFor = (bots: DesktopBot[], key: string | undefined) =>
-  key ? bots.find((bot) => bot.project?.key === key) ?? null : null;
+  projectBotsFor(bots, key)[0] ?? null;
 
 export const formatFileSize = (bytes: number) =>
   bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;

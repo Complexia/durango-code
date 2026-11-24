@@ -46,6 +46,7 @@ import { defaultDurangoBotsSettings, defaultDurangoSettings, useOrionStore, type
 import { formatShortTime, getThreadActivityTime } from './time';
 import { botFaceDataUrl, botFaceSeed } from './botFace';
 import { ProjectIcon } from './ProjectIcon';
+import { ProjectBadge, ProjectMonogram } from './ProjectBadge';
 import { ThreadRow, type SidebarV2Actions } from './SidebarV2';
 import { InlineRenameInput } from './fileTree';
 import { compareSidebarV2Recent, sidebarV2ThreadLists, threadSidebarTone } from './threadLists';
@@ -77,7 +78,7 @@ import {
   LOCAL_BOT_PLACE,
   formatFileSize,
   newBotMessageId,
-  projectBotFor,
+  projectBotsFor,
   relativeBotTime,
   taskReportActions,
   taskReportBody,
@@ -231,17 +232,56 @@ type WorkspaceProps = {
   paneThreadIds: string[];
 };
 
-/** A row of the projects window: a Durango Code project here, or a project bot's project elsewhere. */
+/** A row of the projects window: a Durango Code project here, or a remote project with bots elsewhere. */
 type ProjectEntry = {
-  /** Store project id, or `bot:<botId>`. */
+  /** Store project id, or `project:<projectKey>`. */
   id: string;
   name: string;
   path: string | null;
+  /** All bots belonging to this project, most recently active first. */
+  bots: DesktopBot[];
+  /** Convenience: the project's most recently active bot, if any. */
   bot: DesktopBot | null;
-  /** The project's key (its bot's icon is picked by it). */
+  /** The project's key (Durango repo or machine project key). */
   key: string | null;
-
+  repoId: string | null;
   threads: Thread[];
+};
+
+/** A project group in the Bots sidebar (expandable menu of bots under a project). */
+type SidebarProjectGroup = {
+  /** Unique collapse key (the project key, or "other" for standalone bots). */
+  groupKey: string;
+  name: string;
+  /** Store project id when open on this computer, else null. */
+  projectId: string | null;
+  path: string | null;
+  repoId: string | null;
+  /** True for a real project group; false for standalone non-project bots. */
+  isProject: boolean;
+  bots: DesktopBot[];
+  latestActivityAt: number;
+};
+
+/** Target passed to the "New bot in <project>" modal. */
+type NewProjectBotTarget = {
+  projectId: string | null;
+  key: string | null;
+  name: string;
+  repoId: string | null;
+  existingNames: string[];
+};
+
+const suggestProjectBotName = (projectName: string, existingNames: readonly string[]): string => {
+  const base = projectName.replace(/\s+/g, ' ').trim().slice(0, 40) || 'Project';
+  const taken = new Set(existingNames.map((name) => name.replace(/\s+/g, ' ').trim().toLowerCase()));
+  if (!taken.has(base.toLowerCase())) return base;
+  for (let index = 2; index < 1_000; index += 1) {
+    const suffix = ` ${index}`;
+    const candidate = `${base.slice(0, Math.max(1, 40 - suffix.length)).trimEnd()}${suffix}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  return base;
 };
 
 export const BotsWorkspace = React.memo(function BotsWorkspace({
@@ -265,7 +305,26 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const [listError, setListError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [renamingBotId, setRenamingBotId] = useState<string | null>(null);
+  const [creatingForProject, setCreatingForProject] = useState<NewProjectBotTarget | null>(null);
   const [clearedEpochs, setClearedEpochs] = useState<Record<string, number>>({});
+  const collapsedBotProjects = v3?.collapsedBotProjects ?? [];
+  const collapsedSet = useMemo(() => new Set(collapsedBotProjects), [collapsedBotProjects]);
+  const toggleProjectGroup = useCallback(
+    (groupKey: string) => {
+      const current = useOrionStore.getState().sidebarV3Settings?.collapsedBotProjects ?? [];
+      const next = current.includes(groupKey) ? current.filter((key) => key !== groupKey) : [...current, groupKey];
+      setSidebarV3Settings({ collapsedBotProjects: next });
+    },
+    [setSidebarV3Settings]
+  );
+  const expandProjectGroup = useCallback(
+    (groupKey: string) => {
+      const current = useOrionStore.getState().sidebarV3Settings?.collapsedBotProjects ?? [];
+      if (!current.includes(groupKey)) return;
+      setSidebarV3Settings({ collapsedBotProjects: current.filter((key) => key !== groupKey) });
+    },
+    [setSidebarV3Settings]
+  );
   const [allowed, setAllowed] = useState(() => botListCache?.allowed ?? true);
   const [mode, setMode] = useState<'local' | 'durango' | null>(() => botListCache?.mode ?? null);
   // Signed in with Claude Code here, but bot replies on this machine are
@@ -346,14 +405,70 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     setSidebarV3Settings({ selectedBotId: bots[0].id, view: 'bot' });
   }, [bots, selectedBotId, setSidebarV3Settings, view]);
 
-  // The sidebar is bots only: the primary (all projects) first, then the
-  // rest by latest activity, project bots and others alike.
-  const sidebarBots = useMemo(() => {
+  // Primary bot(s) stay pinned at the top; project bots are grouped into
+  // expandable menus by project; standalone bots (no project) sit in an
+  // expandable "Other" group below if any exist.
+  const { primaryBots, sidebarProjectGroups } = useMemo(() => {
     const list = bots ?? [];
     const primary = list.filter((bot) => bot.role === 'primary');
-    const rest = list.filter((bot) => bot.role !== 'primary').sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-    return [...primary, ...rest];
-  }, [bots]);
+    const rest = list.filter((bot) => bot.role !== 'primary');
+
+    // Map projectKey -> local store project (when open on this machine).
+    const localByKey = new Map<string, { id: string; name: string; path: string }>();
+    for (const project of projects) {
+      const key = projectKeys[project.id];
+      if (key && !localByKey.has(key)) localByKey.set(key, project);
+    }
+
+    const byProject = new Map<string, SidebarProjectGroup>();
+    const standalone: DesktopBot[] = [];
+    for (const bot of rest) {
+      if (bot.project?.key) {
+        const key = bot.project.key;
+        const local = localByKey.get(key) ?? null;
+        let group = byProject.get(key);
+        if (!group) {
+          group = {
+            groupKey: key,
+            name: local?.name ?? bot.project.name,
+            projectId: local?.id ?? null,
+            path: local?.path ?? null,
+            repoId: bot.project.repoId ?? null,
+            isProject: true,
+            bots: [],
+            latestActivityAt: 0,
+          };
+          byProject.set(key, group);
+        }
+        group.bots.push(bot);
+        if (bot.lastActivityAt > group.latestActivityAt) group.latestActivityAt = bot.lastActivityAt;
+      } else {
+        standalone.push(bot);
+      }
+    }
+
+    const groups = [...byProject.values()];
+    for (const group of groups) {
+      group.bots.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+    }
+    groups.sort((a, b) => b.latestActivityAt - a.latestActivityAt || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+
+    if (standalone.length > 0) {
+      standalone.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      groups.push({
+        groupKey: 'other',
+        name: 'Other',
+        projectId: null,
+        path: null,
+        repoId: null,
+        isProject: false,
+        bots: standalone,
+        latestActivityAt: standalone[0]?.lastActivityAt ?? 0,
+      });
+    }
+
+    return { primaryBots: primary, sidebarProjectGroups: groups };
+  }, [bots, projectKeys, projects]);
 
   const threadsByProject = useMemo(() => {
     const map = new Map<string, Thread[]>();
@@ -382,19 +497,52 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     [projectPathByKey]
   );
 
-  // The projects window: projects open here (each with its bot once it
-  // exists), the one where a thread was most recently started first, then
-  // project bots of projects open elsewhere.
+  // The projects window: projects open here (each with all its bots), the one
+  // where a thread was most recently started first, then remote projects
+  // grouped by project key.
   const projectEntries = useMemo<ProjectEntry[]>(() => {
     const list = bots ?? [];
-    const here = sortProjectsByLatestThreadStart(projects, threads).map((project) => {
+    const here: ProjectEntry[] = sortProjectsByLatestThreadStart(projects, threads).map((project) => {
       const key = projectKeys[project.id] ?? null;
-      return { id: project.id, name: project.name, path: project.path, bot: projectBotFor(list, key ?? undefined), key, threads: threadsByProject.get(project.id) ?? [] };
+      const projectBots = projectBotsFor(list, key ?? undefined);
+      const repoId = projectBots.find((candidate) => candidate.project?.repoId)?.project?.repoId ?? null;
+      return {
+        id: project.id,
+        name: project.name,
+        path: project.path,
+        bots: projectBots,
+        bot: projectBots[0] ?? null,
+        key,
+        repoId,
+        threads: threadsByProject.get(project.id) ?? [],
+      };
     });
-    const shown = new Set(here.map((entry) => entry.bot?.id).filter(Boolean));
-    const elsewhere = list
-      .filter((bot) => bot.project && !shown.has(bot.id))
-      .map((bot) => ({ id: `bot:${bot.id}`, name: bot.project!.name, path: null, bot, key: bot.project!.key, threads: [] }));
+    const shownKeys = new Set(here.map((entry) => entry.key).filter((key): key is string => Boolean(key)));
+    const remoteByKey = new Map<string, ProjectEntry>();
+    for (const bot of list) {
+      if (!bot.project || shownKeys.has(bot.project.key)) continue;
+      const key = bot.project.key;
+      let entry = remoteByKey.get(key);
+      if (!entry) {
+        entry = {
+          id: `project:${key}`,
+          name: bot.project.name,
+          path: null,
+          bots: [],
+          bot: null,
+          key,
+          repoId: bot.project.repoId ?? null,
+          threads: [],
+        };
+        remoteByKey.set(key, entry);
+      }
+      entry.bots.push(bot);
+    }
+    const elsewhere = [...remoteByKey.values()].map((entry) => {
+      entry.bots.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      entry.bot = entry.bots[0] ?? null;
+      return entry;
+    });
     return [...here, ...elsewhere];
   }, [bots, projectKeys, projects, threads, threadsByProject]);
 
@@ -432,15 +580,23 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const openProject = (projectId: string) => setSidebarV3Settings({ view: 'project', selectedProjectId: projectId });
   // From a project bot's header: its project's page.
   const openProjectOfBot = (bot: DesktopBot) => {
-    const entry = projectEntries.find((candidate) => candidate.bot?.id === bot.id);
-    openProject(entry?.id ?? `bot:${bot.id}`);
+    const entry = projectEntries.find((candidate) => (bot.project?.key && candidate.key === bot.project.key) || candidate.bots.some((item) => item.id === bot.id));
+    openProject(entry?.id ?? (bot.project ? `project:${bot.project.key}` : `bot:${bot.id}`));
   };
   const botAdded = useCallback(
     (bot: DesktopBot) => {
-      setBots((current) => (current && !current.some((item) => item.id === bot.id) ? [...current, bot] : current));
+      setBots((current) => {
+        if (!current) return [bot];
+        if (current.some((item) => item.id === bot.id)) return current;
+        const next = [...current, bot];
+        if (botListCache) botListCache = { ...botListCache, bots: next };
+        noteBotList(next);
+        return next;
+      });
+      if (bot.project?.key) expandProjectGroup(bot.project.key);
       void loadBots();
     },
-    [loadBots]
+    [expandProjectGroup, loadBots]
   );
 
   const botsRef = useRef(bots);
@@ -532,7 +688,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       if (selectedBotId === bot.id) {
         setSidebarV3Settings({ selectedBotId: fallbackId });
       }
-      if (view === 'project' && selectedProjectId === `bot:${bot.id}`) {
+      if (view === 'project' && (selectedProjectId === `bot:${bot.id}` || (bot.project?.key && selectedProjectId === `project:${bot.project.key}` && !next.some((item) => item.project?.key === bot.project?.key)))) {
         setSidebarV3Settings({ view: 'projects', selectedProjectId: null });
       }
       void loadBots();
@@ -590,25 +746,122 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               <Loader2 size={13} className="animate-spin" /> Loading bots…
             </div>
           ) : (
-            <ul className="px-1.5 pb-3">
-              {sidebarBots.map((bot) => (
-                <li key={bot.id}>
-                  <BotRow
-                    bot={bot}
-                    projectPath={projectPathOfBot(bot)}
-                    title={bot.role === 'primary' ? `${bot.name}: your main bot, across all projects` : bot.project ? `${bot.name}: ${bot.project.name} project` : bot.name}
-                    active={view === 'bot' && selectedBotId === bot.id}
-                    renaming={renamingBotId === bot.id}
-                    onClick={() => openBot(bot.id)}
-                    onStartRename={() => setRenamingBotId(bot.id)}
-                    onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
-                    onRename={(name) => void handleRenameBot(bot, name)}
-                    onClear={() => void handleClearBot(bot)}
-                    onDelete={bot.role !== 'primary' ? () => void handleDeleteBot(bot) : undefined}
-                  />
-                </li>
-              ))}
-            </ul>
+            <div className="px-1.5 pb-3">
+              {primaryBots.length > 0 && (
+                <ul className="space-y-px">
+                  {primaryBots.map((bot) => (
+                    <li key={bot.id}>
+                      <BotRow
+                        bot={bot}
+                        projectPath={projectPathOfBot(bot)}
+                        title={`${bot.name}: your main bot, across all projects`}
+                        active={view === 'bot' && selectedBotId === bot.id}
+                        renaming={renamingBotId === bot.id}
+                        onClick={() => openBot(bot.id)}
+                        onStartRename={() => setRenamingBotId(bot.id)}
+                        onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
+                        onRename={(name) => void handleRenameBot(bot, name)}
+                        onClear={() => void handleClearBot(bot)}
+                      />
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {sidebarProjectGroups.map((group, index) => {
+                const expanded = !collapsedSet.has(group.groupKey);
+                const groupUnread = group.bots.reduce((sum, bot) => sum + bot.unread, 0);
+                const groupWorking = group.bots.some((bot) => botIsWorking(bot));
+                const groupNeedsYou = group.bots.some((bot) => bot.needsYou);
+                return (
+                  <section
+                    key={group.groupKey}
+                    className={index === 0 && primaryBots.length === 0 ? '' : 'mt-2.5'}
+                    aria-label={group.name}
+                  >
+                    <div className="group/proj flex h-7 items-center gap-1 rounded-md pr-1">
+                      <button
+                        type="button"
+                        onClick={() => toggleProjectGroup(group.groupKey)}
+                        aria-expanded={expanded}
+                        className="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left transition-colors duration-75 hover:bg-white/[0.04]"
+                      >
+                        <ChevronRight
+                          size={11}
+                          className={`shrink-0 text-neutral-500 transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`}
+                          aria-hidden
+                        />
+                        {group.isProject ? (
+                          group.path ? (
+                            <ProjectBadge project={{ name: group.name, path: group.path }} size={13} />
+                          ) : (
+                            <ProjectMonogram name={group.name} size={13} />
+                          )
+                        ) : (
+                          <Bot size={11} className="shrink-0 text-neutral-500" aria-hidden />
+                        )}
+                        <span className="min-w-0 flex-1 truncate text-[11px] font-medium tracking-[0.01em] text-neutral-500 transition-colors duration-75 group-hover/proj:text-neutral-300">
+                          {group.name}
+                        </span>
+                        {!expanded && (
+                          <span className="flex shrink-0 items-center">
+                            {groupUnread > 0 ? (
+                              <span className="rounded-full bg-sky-500 px-1.5 text-[10px] font-semibold leading-[16px] text-white">{groupUnread}</span>
+                            ) : groupWorking ? (
+                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
+                            ) : groupNeedsYou ? (
+                              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                            ) : (
+                              <span className="text-[10px] tabular-nums text-neutral-600">{group.bots.length}</span>
+                            )}
+                          </span>
+                        )}
+                      </button>
+                      {group.isProject && (
+                        <button
+                          type="button"
+                          title={`New bot in ${group.name}`}
+                          aria-label={`New bot in ${group.name}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setCreatingForProject({
+                              projectId: group.projectId,
+                              key: group.groupKey,
+                              name: group.name,
+                              repoId: group.repoId,
+                              existingNames: group.bots.map((bot) => bot.name),
+                            });
+                          }}
+                          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity duration-75 hover:bg-white/[0.08] hover:text-neutral-200 focus-visible:opacity-100 group-hover/proj:opacity-100"
+                        >
+                          <Plus size={12} />
+                        </button>
+                      )}
+                    </div>
+                    {expanded && (
+                      <ul className="ml-[13px] mt-0.5 space-y-px border-l border-white/[0.06] pl-1.5">
+                        {group.bots.map((bot) => (
+                          <li key={bot.id}>
+                            <BotRow
+                              bot={bot}
+                              projectPath={group.bots.length === 1 ? projectPathOfBot(bot) : null}
+                              title={bot.project ? `${bot.name}: ${bot.project.name} project` : bot.name}
+                              active={view === 'bot' && selectedBotId === bot.id}
+                              renaming={renamingBotId === bot.id}
+                              onClick={() => openBot(bot.id)}
+                              onStartRename={() => setRenamingBotId(bot.id)}
+                              onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
+                              onRename={(name) => void handleRenameBot(bot, name)}
+                              onClear={() => void handleClearBot(bot)}
+                              onDelete={() => void handleDeleteBot(bot)}
+                            />
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </section>
+                );
+              })}
+            </div>
           )}
         </div>
         <SidebarFooter {...sidebarFooterProps} />
@@ -631,6 +884,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               onNewThread={newProjectThread}
               onOpenThread={openProjectThread}
               onBotAdded={botAdded}
+              onRequestNewBot={(target) => setCreatingForProject(target)}
               threadActions={threadActions}
               attentionThreadIds={attentionThreadIds}
               account={account}
@@ -666,9 +920,158 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
           )}
         </div>
       )}
+      {creatingForProject && (
+        <NewProjectBotModal
+          target={creatingForProject}
+          onClose={() => setCreatingForProject(null)}
+          onCreated={(created) => {
+            setCreatingForProject(null);
+            botAdded(created);
+            openBot(created.id);
+          }}
+        />
+      )}
     </>
   );
 });
+
+const NewProjectBotModal: React.FC<{
+  target: NewProjectBotTarget;
+  onClose: () => void;
+  onCreated: (bot: DesktopBot) => void;
+}> = ({ target, onClose, onCreated }) => {
+  const suggestedName = useMemo(() => suggestProjectBotName(target.name, target.existingNames), [target.name, target.existingNames]);
+  const [name, setName] = useState('');
+  const [job, setJob] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    nameRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [busy, onClose]);
+
+  const submit = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    const trimmedName = name.trim().slice(0, 40);
+    const trimmedJob = job.trim().slice(0, 8_000);
+    const result = await window.orion?.createProjectBot?.({
+      ...(target.projectId ? { projectId: target.projectId } : {}),
+      ...(!target.projectId && target.key ? { project: { key: target.key, name: target.name, repoId: target.repoId } } : {}),
+      ...(trimmedName ? { name: trimmedName } : {}),
+      ...(trimmedJob ? { job: trimmedJob } : {}),
+    });
+    setBusy(false);
+    if (!result?.ok || !result.bot) {
+      setError(result?.error ?? 'Couldn’t create a bot for this project.');
+      return;
+    }
+    onCreated(result.bot);
+  };
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[1200] flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px] bots-font"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !busy) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={`New bot in ${target.name}`}
+        className="w-full max-w-[440px] rounded-2xl border border-white/10 bg-[#18181b] p-5 text-neutral-100 shadow-[0_24px_64px_rgb(0_0_0_/_0.65)]"
+      >
+        <div className="flex items-center gap-2.5">
+          <ProjectMonogram name={target.name} size={18} />
+          <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold">New bot in {target.name}</h2>
+          <button
+            type="button"
+            aria-label="Close"
+            disabled={busy}
+            onClick={onClose}
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-neutral-400 hover:bg-white/[0.07] hover:text-neutral-100 disabled:opacity-40"
+          >
+            <X size={15} />
+          </button>
+        </div>
+        <p className="mt-1.5 text-[12.5px] leading-relaxed text-neutral-400">
+          Shares {target.name}’s notes and files, with its own conversation and focus.
+        </p>
+        <div className="mt-4 space-y-3">
+          <div>
+            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-project-bot-name">
+              Name
+            </label>
+            <input
+              id="new-project-bot-name"
+              ref={nameRef}
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  void submit();
+                }
+              }}
+              maxLength={40}
+              placeholder={`e.g. Frontend, Reviewer (default: ${suggestedName})`}
+              className="h-9 w-full rounded-lg bg-white/[0.04] px-3 text-[13.5px] text-neutral-100 ring-1 ring-white/10 outline-none placeholder:text-neutral-500 focus:ring-white/25"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-project-bot-job">
+              Focus <span className="font-normal text-neutral-500">(optional)</span>
+            </label>
+            <textarea
+              id="new-project-bot-job"
+              value={job}
+              onChange={(event) => setJob(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  void submit();
+                }
+              }}
+              rows={3}
+              maxLength={8_000}
+              placeholder="What should this bot focus on? Leave blank for general project help."
+              className="w-full resize-none rounded-lg bg-white/[0.04] px-3 py-2 text-[13px] leading-relaxed text-neutral-100 ring-1 ring-white/10 outline-none placeholder:text-neutral-500 focus:ring-white/25"
+            />
+          </div>
+          {error && <div className="rounded-lg bg-red-500/10 px-3 py-2 text-[12px] text-red-300 ring-1 ring-red-400/20">{error}</div>}
+        </div>
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onClose}
+            className="h-8 rounded-lg px-3 text-[13px] text-neutral-400 hover:bg-white/[0.06] hover:text-neutral-100 disabled:opacity-40"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void submit()}
+            className="flex h-8 items-center gap-1.5 rounded-lg bg-neutral-100 px-3.5 text-[13px] font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
+          >
+            {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
+            {busy ? 'Creating…' : 'Create bot'}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+};
 
 const threadCount = (count: number) => `${count} thread${count === 1 ? '' : 's'}`;
 
@@ -682,7 +1085,7 @@ const ProjectsView: React.FC<{ entries: ProjectEntry[]; onOpen: (projectId: stri
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto w-full max-w-[860px] px-5 py-5">
         <p className="mb-4 text-[12.5px] leading-relaxed text-neutral-500">
-          Each project has a bot that leads it, its threads, and notes and files its bots and threads keep in mind.
+          Each project can have its own bots, threads, and notes and files its bots and threads keep in mind.
         </p>
         {entries.length === 0 ? (
           <div className="text-[13px] text-neutral-500">No projects yet. Add one from the Threads tab (Add project) or the Code tab.</div>
@@ -690,6 +1093,7 @@ const ProjectsView: React.FC<{ entries: ProjectEntry[]; onOpen: (projectId: stri
           <ul className="grid grid-cols-1 gap-2 md:grid-cols-2">
             {entries.map((entry) => {
               const latest = entry.threads[0];
+              const anyWorking = entry.bots.some((candidate) => botIsWorking(candidate));
               return (
                 <li key={entry.id}>
                   <button
@@ -714,13 +1118,17 @@ const ProjectsView: React.FC<{ entries: ProjectEntry[]; onOpen: (projectId: stri
                     <span className="min-w-0 flex-1">
                       <span className="flex items-baseline gap-2">
                         <span className="truncate text-[13.5px] font-medium text-neutral-100">{entry.name}</span>
-                        {entry.bot && botIsWorking(entry.bot) && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" />}
+                        {anyWorking && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" />}
                       </span>
                       <span className="block truncate text-[11.5px] text-neutral-500">{entry.path ?? 'On another machine'}</span>
                       <span className="mt-1.5 block truncate text-[11.5px] text-neutral-400">
-                        {entry.path ? threadCount(entry.threads.length) : 'Its bot'}
+                        {entry.path ? threadCount(entry.threads.length) : entry.bots.length === 1 ? '1 bot' : `${entry.bots.length} bots`}
                         {latest ? ` · ${formatShortTime(getThreadActivityTime(latest))} ago` : ''}
-                        {entry.bot ? ` · bot ${relativeBotTime(entry.bot.lastActivityAt)}` : ' · no bot yet'}
+                        {entry.bots.length > 1
+                          ? ` · ${entry.bots.length} bots · ${relativeBotTime(entry.bots[0].lastActivityAt)}`
+                          : entry.bot
+                            ? ` · bot ${relativeBotTime(entry.bot.lastActivityAt)}`
+                            : ' · no bots yet'}
                       </span>
                     </span>
                   </button>
@@ -778,16 +1186,26 @@ const ProjectPage: React.FC<{
   onNewThread: (projectId: string) => void;
   onOpenThread: (threadId: string) => void;
   onBotAdded: (bot: DesktopBot) => void;
+  onRequestNewBot: (target: NewProjectBotTarget) => void;
   threadActions: SidebarV2Actions;
   attentionThreadIds: ReadonlyMap<string, number>;
   /** The account the Bots view shows ('local' signed out): unsent prompts are kept per account. */
   account: string | null;
-}> = ({ entry, onBack, onOpenBot, onNewThread, onOpenThread, onBotAdded, threadActions, attentionThreadIds, account }) => {
-  const [bot, setBot] = useState<DesktopBot | null>(entry.bot);
+}> = ({ entry, onBack, onOpenBot, onNewThread, onOpenThread, onBotAdded, onRequestNewBot, threadActions, attentionThreadIds, account }) => {
+  const [selectedProjectBotId, setSelectedProjectBotId] = useState<string | null>(entry.bot?.id ?? null);
+  const [createdBot, setCreatedBot] = useState<DesktopBot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<ProjectTab>('threads');
   const [filter, setFilter] = useState<ThreadState | null>(null);
-  const local = !entry.id.startsWith('bot:');
+  const local = !entry.id.startsWith('bot:') && !entry.id.startsWith('project:');
+  const projectBots = useMemo(() => {
+    if (!createdBot || entry.bots.some((item) => item.id === createdBot.id)) return entry.bots;
+    return [createdBot, ...entry.bots];
+  }, [createdBot, entry.bots]);
+  const bot = useMemo(
+    () => (selectedProjectBotId ? projectBots.find((item) => item.id === selectedProjectBotId) ?? projectBots[0] ?? null : projectBots[0] ?? null),
+    [projectBots, selectedProjectBotId]
+  );
   const threadLists = useMemo(
     () => sidebarV2ThreadLists(entry.threads, (thread) => Boolean(thread.parentThreadId), compareSidebarV2Recent(attentionThreadIds)),
     [entry.threads, attentionThreadIds]
@@ -807,8 +1225,21 @@ const ProjectPage: React.FC<{
   }, [filter, threadLists, stateOf]);
 
   useEffect(() => {
-    setBot(entry.bot);
-  }, [entry.bot]);
+    if (selectedProjectBotId && !projectBots.some((item) => item.id === selectedProjectBotId)) {
+      setSelectedProjectBotId(projectBots[0]?.id ?? null);
+    } else if (!selectedProjectBotId && projectBots[0]) {
+      setSelectedProjectBotId(projectBots[0].id);
+    }
+  }, [projectBots, selectedProjectBotId]);
+
+  const requestNewBot = () =>
+    onRequestNewBot({
+      projectId: local ? entry.id : null,
+      key: entry.key,
+      name: entry.name,
+      repoId: entry.repoId,
+      existingNames: projectBots.map((item) => item.name),
+    });
 
   const tabs: { id: ProjectTab; label: string; icon: React.ReactNode; count?: number }[] = [
     { id: 'threads', label: 'Threads', icon: <MessagesSquare size={16} />, count: local ? threadLists.recent.length + threadLists.snoozed.length + threadLists.settled.length : undefined },
@@ -825,6 +1256,15 @@ const ProjectPage: React.FC<{
         <span className="truncate text-[14.5px] font-semibold text-neutral-100">{entry.name}</span>
         {entry.path && <span className="ml-1 hidden truncate rounded-md bg-white/[0.05] px-1.5 py-0.5 font-mono text-[11px] text-neutral-400 md:inline">{entry.path.replace(/^\/Users\/[^/]+/, '~')}</span>}
         <span className="ml-auto flex items-center gap-1.5">
+          {(local || entry.key) && (
+            <button
+              type="button"
+              onClick={requestNewBot}
+              className="flex h-8 items-center gap-1.5 rounded-lg px-3 text-[13px] text-neutral-300 ring-1 ring-white/[0.08] hover:bg-white/[0.06]"
+            >
+              <Plus size={14} /> New bot
+            </button>
+          )}
           {local && (
             <button
               type="button"
@@ -842,11 +1282,15 @@ const ProjectPage: React.FC<{
           <ProjectBotBox
             entry={entry}
             account={account}
+            bots={projectBots}
             bot={bot}
             local={local}
+            onSelectBot={setSelectedProjectBotId}
             onOpenBot={onOpenBot}
+            onRequestNewBot={requestNewBot}
             onBotCreated={(created) => {
-              setBot(created);
+              setCreatedBot(created);
+              setSelectedProjectBotId(created.id);
               onBotAdded(created);
             }}
             onError={setError}
@@ -938,7 +1382,7 @@ const ProjectPage: React.FC<{
                 target={local ? { projectId: entry.id } : { botId: bot!.id }}
                 name={entry.name}
                 path={entry.path}
-                bot={bot}
+                bots={projectBots}
                 onOpenBot={onOpenBot}
               />
             </div>
@@ -950,18 +1394,21 @@ const ProjectPage: React.FC<{
 };
 
 /**
- * The project's bot and a box to ask it something, above both tabs. With no
- * bot yet, sending creates it first (projects get one only when asked).
+ * The project's bots and a box to ask one of them something, above both tabs.
+ * With no bots yet, sending creates the first one (projects get bots only when asked).
  */
 const ProjectBotBox: React.FC<{
   entry: ProjectEntry;
   account: string | null;
+  bots: DesktopBot[];
   bot: DesktopBot | null;
   local: boolean;
+  onSelectBot: (botId: string) => void;
   onOpenBot: (botId: string) => void;
+  onRequestNewBot: () => void;
   onBotCreated: (bot: DesktopBot) => void;
   onError: (error: string | null) => void;
-}> = ({ entry, account, bot, local, onOpenBot, onBotCreated, onError }) => {
+}> = ({ entry, account, bots, bot, local, onSelectBot, onOpenBot, onRequestNewBot, onBotCreated, onError }) => {
   const draftKey = projectBotDraftKey(account, entry.id);
   const [draft, setDraft] = useState(() => loadBotDraft(draftKey).text);
   const draftSaver = useBotDraftSaver(draftKey);
@@ -1066,12 +1513,55 @@ const ProjectBotBox: React.FC<{
             <div className="text-[22px] font-semibold text-neutral-50">{entry.name}</div>
           )}
           <div className="truncate text-[14px] text-neutral-400">
-            {bot ? 'The project bot' : 'No bot yet: send a message and one is made for this project'}
+            {bot ? (bots.length > 1 ? `One of ${bots.length} bots in ${entry.name}` : 'Project bot') : 'No bots yet: send a message and one is made for this project'}
             {library && (library.notes || library.files) ? ` · knows ${library.notes} note${library.notes === 1 ? '' : 's'} and ${library.files} file${library.files === 1 ? '' : 's'}` : ''}
             {status && <> · {status}</>}
           </div>
         </div>
       </div>
+      {bots.length > 1 && (
+        <div className="mt-3.5 flex flex-wrap items-center gap-1.5">
+          {bots.map((candidate) => {
+            const active = candidate.id === bot?.id;
+            const candidateWorking = botIsWorking(candidate);
+            return (
+              <button
+                key={candidate.id}
+                type="button"
+                onClick={() => onSelectBot(candidate.id)}
+                onDoubleClick={() => onOpenBot(candidate.id)}
+                title={`Message ${candidate.name} (double-click to open conversation)`}
+                className={`flex h-7 items-center gap-1.5 rounded-lg px-2 text-[12.5px] transition-colors duration-75 ${
+                  active
+                    ? 'bg-white/[0.1] font-medium text-neutral-100 ring-1 ring-white/[0.16]'
+                    : 'bg-white/[0.03] text-neutral-400 ring-1 ring-white/[0.06] hover:bg-white/[0.06] hover:text-neutral-200'
+                }`}
+              >
+                <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[11px]" aria-hidden>
+                  <BotIcon bot={candidate} px={16} />
+                </span>
+                <span className="max-w-[160px] truncate">{candidate.name}</span>
+                {candidate.unread > 0 ? (
+                  <span className="rounded-full bg-sky-500 px-1 text-[10px] font-semibold leading-[15px] text-white">{candidate.unread}</span>
+                ) : candidateWorking ? (
+                  <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" />
+                ) : candidate.needsYou ? (
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
+                ) : null}
+              </button>
+            );
+          })}
+          {(local || entry.key) && (
+            <button
+              type="button"
+              onClick={onRequestNewBot}
+              className="flex h-7 items-center gap-1 rounded-lg px-2 text-[12px] text-neutral-500 ring-1 ring-dashed ring-white/[0.1] transition-colors duration-75 hover:bg-white/[0.04] hover:text-neutral-200"
+            >
+              <Plus size={12} /> Add bot
+            </button>
+          )}
+        </div>
+      )}
       {(bot || local) && (
         <div className="mt-5 rounded-2xl bg-white/[0.035] p-3.5 ring-1 ring-white/[0.08] focus-within:ring-white/[0.16]">
           <textarea
@@ -1983,13 +2473,15 @@ const LibraryPanel: React.FC<{
 );
 
 /** The strip above the panels: where the project lives, and who reads its library. */
-const LibraryAbout: React.FC<{ path: string | null; bot: DesktopBot | null; onOpenBot: (botId: string) => void }> = ({ path, bot, onOpenBot }) => {
+const LibraryAbout: React.FC<{ path: string | null; bots: DesktopBot[]; onOpenBot: (botId: string) => void }> = ({ path, bots, onOpenBot }) => {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
     const timer = window.setTimeout(() => setCopied(false), 1_500);
     return () => window.clearTimeout(timer);
   }, [copied]);
+  const primaryProjectBot = bots[0] ?? null;
+  const anyWorking = bots.some((item) => botIsWorking(item));
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl bg-white/[0.02] px-2 py-1.5 ring-1 ring-white/[0.06]">
       <div className="flex min-w-0 flex-1 basis-[280px] items-center gap-2.5">
@@ -2014,49 +2506,59 @@ const LibraryAbout: React.FC<{ path: string | null; bot: DesktopBot | null; onOp
           <span className="min-w-0 truncate text-[12px] text-neutral-400">On another machine: its folder and threads are there.</span>
         )}
       </div>
-      {bot ? (
+      {primaryProjectBot ? (
         <button
           type="button"
-          onClick={() => onOpenBot(bot.id)}
-          title={`Open ${bot.name}`}
+          onClick={() => onOpenBot(primaryProjectBot.id)}
+          title={`Open ${primaryProjectBot.name}`}
           className="flex min-w-0 items-center gap-2 rounded-lg py-1 pl-1.5 pr-2.5 text-[12px] text-neutral-400 transition-colors duration-75 hover:bg-white/[0.05] hover:text-neutral-200"
         >
           <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-[13px]" aria-hidden>
-            <BotIcon bot={bot} px={18} projectPath={path} />
+            <BotIcon bot={primaryProjectBot} px={18} projectPath={path} />
           </span>
           <span className="truncate">
-            Read by <span className="font-medium text-neutral-200">{bot.name}</span> and the threads it starts
+            {bots.length === 1 ? (
+              <>
+                Read by <span className="font-medium text-neutral-200">{primaryProjectBot.name}</span> and the threads it starts
+              </>
+            ) : (
+              <>
+                Read by <span className="font-medium text-neutral-200">{bots.length} bots</span> and the threads they start
+              </>
+            )}
           </span>
-          {botIsWorking(bot) && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" />}
+          {anyWorking && <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" />}
         </button>
       ) : (
         <span className="flex min-w-0 items-center gap-2 px-2.5 py-1 text-[12px] text-neutral-500">
           <Bot size={14} className="shrink-0" />
-          <span className="truncate">No bot yet. A project bot keeps this library in mind.</span>
+          <span className="truncate">No bots yet. Project bots keep this library in mind.</span>
         </span>
       )}
     </div>
   );
 };
 
-const NoteAuthor: React.FC<{ author: string; bot: DesktopBot | null; projectPath?: string | null }> = ({
+const NoteAuthor: React.FC<{ author: string; bots: DesktopBot[]; projectPath?: string | null }> = ({
   author,
-  bot,
+  bots,
   projectPath,
-}) =>
-  bot && author === bot.name ? (
+}) => {
+  const matched = bots.find((candidate) => candidate.name === author) ?? null;
+  return matched ? (
     <span className="flex h-3.5 w-3.5 items-center justify-center text-[10px]" aria-hidden>
-      <BotIcon bot={bot} px={14} projectPath={projectPath} />
+      <BotIcon bot={matched} px={14} projectPath={bots.length === 1 ? projectPath : null} />
     </span>
   ) : (
     <span className="flex h-3.5 w-3.5 items-center justify-center rounded-full bg-white/[0.08] text-neutral-400" aria-hidden>
       <UserRound size={9} />
     </span>
   );
+};
 
-const NoteCard: React.FC<{ note: BotProjectNote; bot: DesktopBot | null; projectPath?: string | null; onDelete: () => void }> = ({
+const NoteCard: React.FC<{ note: BotProjectNote; bots: DesktopBot[]; projectPath?: string | null; onDelete: () => void }> = ({
   note,
-  bot,
+  bots,
   projectPath,
   onDelete,
 }) => {
@@ -2078,7 +2580,7 @@ const NoteCard: React.FC<{ note: BotProjectNote; bot: DesktopBot | null; project
         {note.content}
       </div>
       <div className="mt-1.5 flex h-6 items-center gap-1.5 text-[11px] text-neutral-500">
-        <NoteAuthor author={note.author} bot={bot} projectPath={projectPath} />
+        <NoteAuthor author={note.author} bots={bots} projectPath={projectPath} />
         <span className="truncate">{note.author}</span>
         <span className="text-neutral-700">·</span>
         <span className="shrink-0" title={new Date(note.createdAt).toLocaleString()}>
@@ -2181,13 +2683,13 @@ const NoteComposer: React.FC<{ full: boolean; onAdd: (content: string) => Promis
 /** Context: the notes every bot on the project keeps in mind. Deleting waits a moment, so it can be undone. */
 const ContextPanel: React.FC<{
   notes: BotProjectNote[] | null;
-  bot: DesktopBot | null;
+  bots: DesktopBot[];
   projectPath?: string | null;
   onAdd: (content: string) => Promise<boolean>;
   onDelete: (noteId: string) => void;
   /** One column: fold long lists. */
   fold: boolean;
-}> = ({ notes, bot, projectPath, onAdd, onDelete, fold }) => {
+}> = ({ notes, bots, projectPath, onAdd, onDelete, fold }) => {
   const [removed, setRemoved] = useState<Map<string, 'undo' | 'gone'>>(new Map());
   const timers = useRef(new Map<string, number>());
   const onDeleteRef = useRef(onDelete);
@@ -2313,7 +2815,7 @@ const ContextPanel: React.FC<{
                 </button>
               </li>
             ) : (
-              <NoteCard key={note.id} note={note} bot={bot} projectPath={projectPath} onDelete={() => remove(note.id)} />
+              <NoteCard key={note.id} note={note} bots={bots} projectPath={projectPath} onDelete={() => remove(note.id)} />
             )
           )}
         </ul>
@@ -2495,9 +2997,9 @@ const ProjectLibrary: React.FC<{
   target: BotProjectTarget;
   name: string;
   path: string | null;
-  bot: DesktopBot | null;
+  bots: DesktopBot[];
   onOpenBot: (botId: string) => void;
-}> = ({ target, name, path, bot, onOpenBot }) => {
+}> = ({ target, name, path, bots, onOpenBot }) => {
   const targetKey = projectCacheKey(target);
   const [project, setProject] = useState<BotProject | null>(() => botProjectCache.get(targetKey) ?? null);
   const [error, setError] = useState<string | null>(null);
@@ -2609,11 +3111,11 @@ const ProjectLibrary: React.FC<{
           </button>
         </div>
       )}
-      <LibraryAbout path={path} bot={bot} onOpenBot={onOpenBot} />
+      <LibraryAbout path={path} bots={bots} onOpenBot={onOpenBot} />
       <div className={`mt-3 ${wide ? 'grid grid-cols-[minmax(0,7fr)_minmax(0,5fr)] items-start gap-3' : 'flex flex-col gap-3'}`}>
         <ContextPanel
           notes={project?.notes ?? (error ? [] : null)}
-          bot={bot}
+          bots={bots}
           projectPath={path}
           onAdd={addNote}
           onDelete={(noteId) => void act({ ...target, action: 'delete_note', noteId })}
@@ -2621,7 +3123,7 @@ const ProjectLibrary: React.FC<{
         />
         <FilesPanel
           files={project?.files ?? (error ? [] : null)}
-          bot={bot}
+          bot={bots[0] ?? null}
           projectName={name}
           uploading={uploading}
           dragging={dragging}

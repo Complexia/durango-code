@@ -491,6 +491,7 @@ contextBridge.exposeInMainWorld('orion', {
   pickBotAttachments: () => ipcRenderer.invoke('bots:pickAttachments'),
   saveBotAttachment: (input) => ipcRenderer.invoke('bots:saveAttachment', input),
   ensureProjectBot: (input) => ipcRenderer.invoke('bots:ensureProjectBot', input),
+  createProjectBot: (input) => ipcRenderer.invoke('bots:createProjectBot', input),
   getBotProject: (input) => ipcRenderer.invoke('bots:project', input),
   botProjectAction: (input) => ipcRenderer.invoke('bots:projectAction', input),
   botFileLinks: (input) => ipcRenderer.invoke('bots:fileLinks', input),

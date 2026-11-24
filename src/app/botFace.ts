@@ -29,9 +29,9 @@ function hashOf(seed: string): number {
   return hash >>> 0;
 }
 
-/** The seed a bot's face is drawn from: its project's key (stable across machines) or its id. */
+/** The seed a bot's face is drawn from: its id (distinct per bot, even within the same project), else its project's key. */
 export function botFaceSeed(bot: { id: string; project?: { key: string } | null }): string {
-  return bot.project?.key ?? bot.id;
+  return bot.id || bot.project?.key || "bot";
 }
 
 /** A robot face (viewBox 0 0 32 32) for `seed`. */

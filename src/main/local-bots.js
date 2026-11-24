@@ -129,7 +129,7 @@ ${BOT_SETTLE_RULE}
 
 Acting for the person: draft first and confirm before anything irreversible or public (sending email or messages, posting, buying, applying, deleting), unless they told you to go ahead for that kind of thing.`;
 
-export const LOCAL_PRIMARY_BOT_PROMPT = `You are the person's primary bot: their main point of contact, across all their projects. You see their other bots (listed each turn) and answer for all of them: "what are my bots up to?", "is anything waiting on me?". Create, adjust, pause or retire bots when the person asks, and suggest a new bot when a job clearly deserves one. Projects don't get bots on their own: create a project's bot only when the person asks (create_bot with \`project\`). You coordinate; you don't redo other bots' work.`;
+export const LOCAL_PRIMARY_BOT_PROMPT = `You are the person's primary bot: their main point of contact, across all their projects. You see their other bots (listed each turn) and answer for all of them: "what are my bots up to?", "is anything waiting on me?". Create, adjust, pause or retire bots when the person asks, and suggest a new bot when a job clearly deserves one. Projects don't get bots on their own, and a project can have multiple bots: create one when the person asks (create_bot with \`project\`). You coordinate; you don't redo other bots' work.`;
 
 export const LOCAL_TASK_PROMPT = `## You are running a task for a Durango bot
 
@@ -409,13 +409,13 @@ export const LOCAL_BOT_TOOLS = [
   {
     name: 'create_bot',
     description:
-      "Create a new bot for the person: a standing helper with its own job, thread and schedules (e.g. a job hunter, a news digest). Give it a clear name and a precise job (what to do, how, what to report, what never to do without asking), its routines, and optionally a first message to get it started. It sees its routines in its own context, so it won't set them again. With `project`, it is that Durango Code project's bot (only when the person asks for one; projects don't get bots on their own): it leads the project and threads it starts default there. A project has at most one bot: if it already has one, that bot is returned.",
+      "Create a new bot for the person: a standing helper with its own job, thread and schedules (e.g. a job hunter, a news digest). Give it a clear name and a precise job (what to do, how, what to report, what never to do without asking), its routines, and optionally a first message to get it started. It sees its routines in its own context, so it won't set them again. With `project`, it belongs to that Durango Code project (only when the person asks for one; projects don't get bots on their own): its notes and files are the project's, and threads it starts default there. A project can have multiple bots, each with its own name, job, thread and schedules.",
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', minLength: 1, maxLength: 40, description: "Its name (a project bot defaults to the project's name)." },
+        name: { type: 'string', minLength: 1, maxLength: 40, description: "Its name (a project bot defaults to the project's name, or a numbered name if the project already has bots)." },
         job: { type: 'string', minLength: 1, maxLength: 8_000, description: "Its standing instructions, in second person ('You find…'). Required unless it's a project bot." },
-        project: { type: 'string', maxLength: 200, description: 'A Durango Code project on this computer (by name): makes this the project\'s bot.' },
+        project: { type: 'string', maxLength: 200, description: 'A Durango Code project on this computer (by name): files this bot under that project.' },
         emoji: { type: 'string', maxLength: 8 },
         routines: {
           type: 'array',
@@ -600,6 +600,18 @@ const LEGACY_PROJECT_BOT_EMOJI = '🗂️';
 
 export const localProjectBotJob = (name) =>
   `You lead the ${name} project: you know where it stands, keep its notes and files organized, and get work done in it by starting Durango Code threads there (several at once when the work splits), following them up and reporting what matters. Work outside the project too when asked.`;
+
+const nextLocalProjectBotName = (projectName, existingNames) => {
+  const base = clip(oneLine(projectName), 40) || 'Project';
+  const taken = new Set(existingNames.map((name) => oneLine(name).toLowerCase()));
+  if (!taken.has(base.toLowerCase())) return base;
+  for (let index = 2; index < 1_000; index += 1) {
+    const suffix = ` ${index}`;
+    const candidate = `${clip(base, Math.max(1, 40 - suffix.length))}${suffix}`;
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  return base;
+};
 
 const CONTENT_TYPES = { md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain', json: 'application/json', csv: 'text/csv', html: 'text/html', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', pdf: 'application/pdf', svg: 'image/svg+xml' };
 const guessContentType = (name) => CONTENT_TYPES[path.extname(name).slice(1).toLowerCase()] ?? 'application/octet-stream';
@@ -1218,7 +1230,8 @@ export const createLocalBotEngine = ({
           .filter(Boolean)
           .join(', ');
         const last = other.bot.lastPreview ? ` Last: "${clip(other.bot.lastPreview, 90)}" (${ago(other.bot.lastActivityAt, at)}).` : '';
-        return `- ${other.bot.name} (${other.bot.id}; ${state}). Job: ${other.bot.job || 'general'}.${last}`;
+        const home = other.bot.project ? ` Bot of the ${other.bot.project.name} project.` : '';
+        return `- ${other.bot.name} (${other.bot.id}; ${state}).${home} Job: ${other.bot.job || 'general'}.${last}`;
       });
     if (roster.length) {
       lines.push({
@@ -1688,8 +1701,10 @@ export const createLocalBotEngine = ({
       if (self?.bot.project) return self.bot.project;
       throw new Error('Name the project.');
     }
-    const match = projectBotEntries().find((entry) => entry.bot.project.name.toLowerCase() === wanted || entry.bot.name.toLowerCase() === wanted);
-    if (match) return match.bot.project;
+    const byProject = projectBotEntries().find((entry) => entry.bot.project.name.toLowerCase() === wanted);
+    if (byProject) return byProject.bot.project;
+    const byBot = projectBotEntries().find((entry) => entry.bot.name.toLowerCase() === wanted);
+    if (byBot) return byBot.bot.project;
     const project = await resolveProject(name);
     return { key: projectKeyOf(project), name: project.name };
   };
@@ -1713,7 +1728,7 @@ export const createLocalBotEngine = ({
     const files = (record.files ?? []).map((file) => file.name);
     return [
       `## Your project: ${project.name}`,
-      `You are this project's bot: its Durango Code project on this computer. Work in it by starting Durango Code threads there (delegate_task with \`project: "${project.name}"\`), several at once when the work splits; see where it stands with list_threads and read_thread, steer threads with message_thread, and report what matters. Keep what should be remembered about the project in its notes (remember_project) and its documents in its files (save_project_file): every bot sees them, and threads there read them with their project_notes tool. You aren't limited to this project.`,
+      `You are a bot for this project: its Durango Code project on this computer. Work in it by starting Durango Code threads there (delegate_task with \`project: "${project.name}"\`), several at once when the work splits; see where it stands with list_threads and read_thread, steer threads with message_thread, and report what matters. Keep what should be remembered about the project in its notes (remember_project) and its documents in its files (save_project_file): every bot sees them, and threads there read them with their project_notes tool. You aren't limited to this project.`,
       notes ? `Project notes (oldest first):\n${notes}` : 'No project notes yet.',
       files.length ? `Project files (read_project_file): ${files.join(', ')}` : null,
     ]
@@ -1798,32 +1813,57 @@ export const createLocalBotEngine = ({
     };
   };
 
+  const createProjectBot = async ({ name, projectId, repoId, machineId, botName, job, emoji, model }) => {
+    await ensurePrimary();
+    await loadProjects();
+    const key = localProjectKey({ repoId, machineId: machineId || 'this-device', projectId });
+    if (!key) throw new LocalBotError('invalid', 'A project needs its id.');
+    const projectName = clip(oneLine(name), 120) || 'Project';
+    const existingNames = projectBotEntries()
+      .filter((entry) => entry.bot.project.key === key)
+      .map((entry) => entry.bot.name);
+    const cleanName = oneLine(botName) ? clip(oneLine(botName), 40) : nextLocalProjectBotName(projectName, existingNames);
+    const cleanJob = str(job).trim() || localProjectBotJob(projectName);
+    const entry = createBotEntry({
+      name: cleanName,
+      job: cleanJob,
+      emoji: clip(oneLine(emoji), 8) || null,
+      model: model ?? null,
+      project: { key, name: projectName, projectId: projectId || null, repoId: repoId || null },
+    });
+    if (model && claudeModelFrom(model)) {
+      entry.bot.modelChosen = true;
+      persistBot(entry, { messages: false });
+    }
+    return entry;
+  };
+
   const ensureProjectBot = async ({ name, projectId, repoId, machineId }) => {
     await ensurePrimary();
     await loadProjects();
     const key = localProjectKey({ repoId, machineId: machineId || 'this-device', projectId });
     if (!key) throw new LocalBotError('invalid', 'A project needs its id.');
     const projectName = clip(oneLine(name), 120) || 'Project';
-    const existing = projectBotEntries().find((entry) => entry.bot.project.key === key);
+    const existingList = projectBotEntries().filter((entry) => entry.bot.project.key === key);
+    const existing = existingList[0];
     if (existing) {
-      if (existing.bot.emoji === LEGACY_PROJECT_BOT_EMOJI) {
-        existing.bot.emoji = null;
-        persistBot(existing, { messages: false });
-        changed();
+      for (const entry of existingList) {
+        let dirty = false;
+        if (entry.bot.emoji === LEGACY_PROJECT_BOT_EMOJI) {
+          entry.bot.emoji = null;
+          dirty = true;
+        }
+        if (entry.bot.project.name !== projectName) {
+          if (entry.bot.name === clip(entry.bot.project.name, 40)) entry.bot.name = clip(projectName, 40);
+          entry.bot.project = { ...entry.bot.project, name: projectName };
+          dirty = true;
+        }
+        if (dirty) persistBot(entry, { messages: false });
       }
-      if (existing.bot.project.name !== projectName) {
-        if (existing.bot.name === clip(existing.bot.project.name, 40)) existing.bot.name = clip(projectName, 40);
-        existing.bot.project = { ...existing.bot.project, name: projectName };
-        persistBot(existing, { messages: false });
-        changed();
-      }
+      changed();
       return existing;
     }
-    return createBotEntry({
-      name: clip(projectName, 40),
-      job: localProjectBotJob(projectName),
-      project: { key, name: projectName, projectId: projectId || null, repoId: repoId || null },
-    });
+    return createProjectBot({ name: projectName, projectId, repoId, machineId });
   };
 
   // --- routines -----------------------------------------------------------------------
@@ -1922,13 +1962,15 @@ export const createLocalBotEngine = ({
           let created;
           if (oneLine(input.project)) {
             const project = await resolveProject(input.project);
-            const key = projectKeyOf(project);
-            const existed = projectBotEntries().find((entry) => entry.bot.project.key === key);
-            if (existed) return { ok: true, botId: existed.bot.id, name: existed.bot.name, project: existed.bot.project.name, note: 'That project already has this bot.' };
-            created = await ensureProjectBot({ name: project.name, projectId: project.id, repoId: project.repoId ?? null, machineId: LOCAL_MACHINE });
-            if (botName) created.bot.name = clip(botName, 40);
-            if (job) created.bot.job = job;
-            if (botName || job) persistBot(created, { messages: false });
+            created = await createProjectBot({
+              name: project.name,
+              projectId: project.id,
+              repoId: project.repoId ?? null,
+              machineId: LOCAL_MACHINE,
+              botName: botName || undefined,
+              job: job || undefined,
+              emoji: clip(oneLine(input.emoji), 8) || undefined,
+            });
           } else {
             if (!botName || !job) throw new Error('create_bot needs a name and a job.');
             created = createBotEntry({ name: clip(botName, 40), job, emoji: clip(oneLine(input.emoji), 8) || null });
@@ -1937,7 +1979,13 @@ export const createLocalBotEngine = ({
           if (str(input.first_message).trim()) {
             appendInbox(created, { content: str(input.first_message).trim(), authorLabel: inboxLabel('bot', self.bot.name) });
           }
-          return { ok: true, botId: created.bot.id, name: created.bot.name, routines: titles };
+          return {
+            ok: true,
+            botId: created.bot.id,
+            name: created.bot.name,
+            ...(created.bot.project ? { project: created.bot.project.name } : {}),
+            routines: titles,
+          };
         }
         case 'update_bot': {
           const target = input.bot_id ? entryFor(input.bot_id) : self;
@@ -2509,6 +2557,10 @@ export const createLocalBotEngine = ({
     /** The project's bot on this device, created the first time: `{ name, projectId, repoId?, machineId? }`. */
     async ensureProjectBot(input = {}) {
       return toDesktopBot(await ensureProjectBot(input));
+    },
+    /** Creates a new bot in a project on this device (projects can have multiple bots). */
+    async createProjectBot(input = {}) {
+      return toDesktopBot(await createProjectBot(input));
     },
     /** A project's notes and files by its key (`{ key, name }`), whether or not it has a bot. */
     async projectByKey({ key, name }) {

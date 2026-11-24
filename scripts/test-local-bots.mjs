@@ -1136,14 +1136,32 @@ test('projects get no bot on their own: create_bot with a project makes it; note
   const made = await call('create_bot', { project: 'shop' });
   assert.equal(made.ok, true);
   assert.equal(made.name, 'Shop');
-  const again = await call('create_bot', { project: 'Shop' });
-  assert.equal(again.botId, made.botId, 'one bot per project');
-  assert.match(again.note, /already has this bot/);
+  // Projects can have multiple bots: creating another for the same project creates a distinct bot.
+  const second = await call('create_bot', { project: 'Shop', name: 'Checkout QA', job: 'You test checkout flows.' });
+  assert.equal(second.ok, true);
+  assert.notEqual(second.botId, made.botId, 'multiple bots per project');
+  assert.equal(second.name, 'Checkout QA');
+  const third = await call('create_bot', { project: 'Shop' });
+  assert.equal(third.ok, true);
+  assert.notEqual(third.botId, made.botId);
+  assert.notEqual(third.botId, second.botId);
+  assert.equal(third.name, 'Shop 2', 'default numbered name when project already has a bot');
   const bot = (await engine.list()).bots.find((item) => item.id === made.botId);
+  const secondBot = (await engine.list()).bots.find((item) => item.id === second.botId);
   assert.deepEqual(bot.project, { key: 'repo:repo_shop', name: 'Shop', repoId: 'repo_shop' });
+  assert.deepEqual(secondBot.project, { key: 'repo:repo_shop', name: 'Shop', repoId: 'repo_shop' });
   assert.equal(bot.emoji, null, 'a robot face, no emoji');
   assert.equal((await engine.projectByKey(project)).botId, made.botId, 'the notes are now its project\'s');
   assert.equal((await call('remember_project', { note: 'Ships on Fridays.', project: 'Shop' })).ok, true);
+  // Both project bots see the shared project notes.
+  assert.deepEqual(
+    (await engine.project(secondBot.id)).notes.map((note) => note.content).sort(),
+    ['Prices are in AUD.', 'Ships on Fridays.']
+  );
+  // Direct createProjectBot API also creates additional bots for a project.
+  const fourth = await engine.createProjectBot({ name: 'Shop', projectId: 'proj_7', repoId: 'repo_shop', botName: 'Release' });
+  assert.equal(fourth.name, 'Release');
+  assert.equal(fourth.project.key, 'repo:repo_shop');
   assert.equal((await call('create_bot', { name: 'X' })).ok, false, 'a plain bot still needs a job');
   runner.lanes[0].finish({ text: 'Done.' });
   await engine.idle();

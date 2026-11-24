@@ -146,6 +146,8 @@ export type SidebarV3Settings = {
   selectedProjectId?: string | null;
   /** The thread open in the thread view came from this project's page (Esc goes back to it). */
   threadFromProjectId?: string | null;
+  /** Project keys (or "other") currently collapsed in the Bots sidebar. */
+  collapsedBotProjects?: string[];
 };
 
 export const defaultSidebarV3Settings: SidebarV3Settings = { selectedBotId: null };
