@@ -13,6 +13,7 @@ export const ProjectIcon: React.FC<{
   const [iconUrl, setIconUrl] = useState<string | null | undefined>(
     () => projectIconCache.get(projectPath)
   );
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
   useEffect(() => {
     if (!projectPath) {
@@ -59,7 +60,7 @@ export const ProjectIcon: React.FC<{
     };
   }, [projectPath]);
 
-  if (iconUrl) {
+  if (iconUrl && failedUrl !== iconUrl) {
     return (
       <img
         src={iconUrl}
@@ -67,7 +68,9 @@ export const ProjectIcon: React.FC<{
         className={`project-icon ${className ?? ''}`}
         width={size}
         height={size}
+        style={{ width: size, height: size }}
         draggable={false}
+        onError={() => setFailedUrl(iconUrl)}
       />
     );
   }

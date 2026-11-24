@@ -45,6 +45,7 @@ import {
 import { defaultDurangoBotsSettings, defaultDurangoSettings, useOrionStore, type Thread } from '../store';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { botFaceDataUrl, botFaceSeed } from './botFace';
+import { ProjectIcon } from './ProjectIcon';
 import { ThreadRow, type SidebarV2Actions } from './SidebarV2';
 import { InlineRenameInput } from './fileTree';
 import { compareSidebarV2Recent, sidebarV2ThreadLists, threadSidebarTone } from './threadLists';
@@ -186,21 +187,34 @@ const visible = () => typeof document === 'undefined' || document.visibilityStat
 
 type FaceBot = Pick<DesktopBot, 'emoji' | 'name' | 'role'> & { id?: string; project?: { key: string } | null; faceSeed?: string };
 
-/** A bot's emoji, or its robot face (botFace.ts) when it has none. */
-const BotIcon: React.FC<{ bot: FaceBot; px: number }> = ({ bot, px }) => {
+/** A bot's emoji, its project's icon when available, or its robot face (botFace.ts). */
+const BotIcon: React.FC<{ bot: FaceBot; px: number; projectPath?: string | null }> = ({ bot, px, projectPath }) => {
   if (bot.emoji) return <>{bot.emoji}</>;
   const seed = bot.faceSeed ?? (bot.id ? botFaceSeed({ id: bot.id, project: bot.project }) : bot.name);
-  return <img src={botFaceDataUrl(seed)} width={px} height={px} alt="" draggable={false} className="block" />;
+  const face = <img src={botFaceDataUrl(seed)} width={px} height={px} alt="" draggable={false} className="block" />;
+  if (!projectPath) return face;
+  return (
+    <ProjectIcon
+      projectPath={projectPath}
+      size={px}
+      className="block rounded-[22%] !bg-transparent object-contain"
+      fallback={face}
+    />
+  );
 };
 
-const BotAvatar: React.FC<{ bot: FaceBot; size?: 'sm' | 'md' }> = ({ bot, size = 'sm' }) => (
+const BotAvatar: React.FC<{ bot: FaceBot; size?: 'sm' | 'md'; projectPath?: string | null }> = ({
+  bot,
+  size = 'sm',
+  projectPath,
+}) => (
   <span
     className={`relative inline-flex shrink-0 items-center justify-center rounded-[10px] bg-white/[0.06] ring-1 ring-white/10 ${
       size === 'md' ? 'h-8 w-8 text-[16px]' : 'h-6 w-6 text-[13px]'
     }`}
     aria-hidden
   >
-    <BotIcon bot={bot} px={size === 'md' ? 24 : 18} />
+    <BotIcon bot={bot} px={size === 'md' ? 24 : 18} projectPath={projectPath} />
     {bot.role === 'primary' && <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
   </span>
 );
@@ -352,6 +366,21 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     for (const list of map.values()) list.sort((a, b) => getThreadActivityTime(b).getTime() - getThreadActivityTime(a).getTime());
     return map;
   }, [threads]);
+
+  // Local project path by Durango project key, so project bots use their project's icon.
+  const projectPathByKey = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const project of projects) {
+      const key = projectKeys[project.id];
+      if (key && project.path) map.set(key, project.path);
+    }
+    return map;
+  }, [projects, projectKeys]);
+  const projectPathOfBot = useCallback(
+    (bot: Pick<DesktopBot, 'project'> | null | undefined) =>
+      bot?.project?.key ? projectPathByKey.get(bot.project.key) ?? null : null,
+    [projectPathByKey]
+  );
 
   // The projects window: projects open here (each with its bot once it
   // exists), the one where a thread was most recently started first, then
@@ -566,6 +595,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                 <li key={bot.id}>
                   <BotRow
                     bot={bot}
+                    projectPath={projectPathOfBot(bot)}
                     title={bot.role === 'primary' ? `${bot.name}: your main bot, across all projects` : bot.project ? `${bot.name}: ${bot.project.name} project` : bot.name}
                     active={view === 'bot' && selectedBotId === bot.id}
                     renaming={renamingBotId === bot.id}
@@ -618,6 +648,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               key={`${account ?? ''}:${selectedBotId}:${clearedEpochs[selectedBotId] ?? 0}`}
               botId={selectedBotId}
               botNameHint={selectedBot?.name}
+              projectPath={projectPathOfBot(selectedBot)}
               modelChoices={modelChoices}
               local={mode === 'local'}
               onChanged={loadBots}
@@ -668,12 +699,16 @@ const ProjectsView: React.FC<{ entries: ProjectEntry[]; onOpen: (projectId: stri
                   >
                     <span className="mt-0.5">
                       {entry.bot ? (
-                        <BotAvatar bot={entry.bot} size="md" />
+                        <BotAvatar bot={entry.bot} size="md" projectPath={entry.path} />
                       ) : entry.key ? (
-                        // The face its bot will have.
-                        <BotAvatar bot={{ emoji: null, name: entry.name, role: 'bot', faceSeed: entry.key }} size="md" />
+                        // The project's icon when available, else the face its bot will have.
+                        <BotAvatar
+                          bot={{ emoji: null, name: entry.name, role: 'bot', faceSeed: entry.key }}
+                          size="md"
+                          projectPath={entry.path}
+                        />
                       ) : (
-                        <ProjectGlyph size="md" />
+                        <ProjectGlyph size="md" projectPath={entry.path} />
                       )}
                     </span>
                     <span className="min-w-0 flex-1">
@@ -882,6 +917,7 @@ const ProjectPage: React.FC<{
                         thread={thread}
                         state={stateOf(thread)}
                         bot={bot}
+                        projectPath={entry.path}
                         actions={threadActions}
                         onOpen={() => onOpenThread(thread.id)}
                       />
@@ -1018,7 +1054,7 @@ const ProjectBotBox: React.FC<{
     <div>
       <div className="flex items-center gap-4">
         <span className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-white/[0.04] text-[28px] ring-1 ring-white/[0.07]">
-          <BotIcon bot={faceBot} px={38} />
+          <BotIcon bot={faceBot} px={38} projectPath={entry.path} />
         </span>
         <div className="min-w-0 flex-1">
           {bot ? (
@@ -1099,9 +1135,10 @@ const ProjectThreadRow: React.FC<{
   thread: Thread;
   state: ThreadState;
   bot: DesktopBot | null;
+  projectPath?: string | null;
   actions: SidebarV2Actions;
   onOpen: () => void;
-}> = ({ thread, state, bot, actions, onOpen }) => {
+}> = ({ thread, state, bot, projectPath, actions, onOpen }) => {
   const look = THREAD_STATES[state];
   const starter = threadStarter(thread);
   const model = actions.modelLabel(thread);
@@ -1164,7 +1201,7 @@ const ProjectThreadRow: React.FC<{
       <span className="flex w-28 shrink-0 items-center gap-1.5 truncate text-[12.5px] text-neutral-400">
         {starter === 'bot' ? (
           <>
-            {bot ? <BotIcon bot={bot} px={14} /> : <Bot size={13} />} {bot?.name ?? 'A bot'}
+            {bot ? <BotIcon bot={bot} px={14} projectPath={projectPath} /> : <Bot size={13} />} {bot?.name ?? 'A bot'}
           </>
         ) : starter === 'durango' ? (
           <>✨ Durango</>
@@ -1196,16 +1233,28 @@ const THREAD_VIEW_OPEN_MENUS = [
 ].join(', ');
 
 
-const ProjectGlyph: React.FC<{ size?: 'sm' | 'md' }> = ({ size = 'sm' }) => (
-  <span
-    className={`inline-flex shrink-0 items-center justify-center rounded-[10px] bg-white/[0.03] text-neutral-500 ring-1 ring-white/[0.06] ${
-      size === 'md' ? 'h-8 w-8' : 'h-6 w-6'
-    }`}
-    aria-hidden
-  >
-    <Folder size={size === 'md' ? 14 : 12} />
-  </span>
-);
+const ProjectGlyph: React.FC<{ size?: 'sm' | 'md'; projectPath?: string | null }> = ({ size = 'sm', projectPath }) => {
+  const folder = <Folder size={size === 'md' ? 14 : 12} />;
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center justify-center rounded-[10px] bg-white/[0.03] text-neutral-500 ring-1 ring-white/[0.06] ${
+        size === 'md' ? 'h-8 w-8' : 'h-6 w-6'
+      }`}
+      aria-hidden
+    >
+      {projectPath ? (
+        <ProjectIcon
+          projectPath={projectPath}
+          size={size === 'md' ? 24 : 18}
+          className="block rounded-[22%] !bg-transparent object-contain"
+          fallback={folder}
+        />
+      ) : (
+        folder
+      )}
+    </span>
+  );
+};
 
 type BotMenuAction = {
   key: string;
@@ -1339,6 +1388,7 @@ const BotRowMenu: React.FC<{
 /** A compact one-line sidebar row: icon, name, hover menu, and unread count or a working / waiting dot. */
 const BotRow: React.FC<{
   bot: DesktopBot;
+  projectPath?: string | null;
   title: string;
   active: boolean;
   renaming: boolean;
@@ -1348,7 +1398,7 @@ const BotRow: React.FC<{
   onRename: (name: string) => void;
   onClear: () => void;
   onDelete?: () => void;
-}> = ({ bot, title, active, renaming, onClick, onStartRename, onEndRename, onRename, onClear, onDelete }) => {
+}> = ({ bot, projectPath, title, active, renaming, onClick, onStartRename, onEndRename, onRename, onClear, onDelete }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const working = botIsWorking(bot);
   const actions: BotMenuAction[] = [
@@ -1378,7 +1428,7 @@ const BotRow: React.FC<{
       }`}
     >
       <span className="relative flex h-[22px] w-[22px] shrink-0 items-center justify-center text-[15px] leading-none" aria-hidden>
-        <BotIcon bot={bot} px={22} />
+        <BotIcon bot={bot} px={22} projectPath={projectPath} />
         {bot.role === 'primary' && <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
       </span>
       {renaming ? (
@@ -1422,6 +1472,8 @@ const BotPane: React.FC<{
   botId: string;
   /** Latest name from the sidebar list so renames show in the header at once. */
   botNameHint?: string;
+  /** Local project path for a project bot so its icon uses the project's icon when available. */
+  projectPath?: string | null;
   /** The models the bot can be set to (null: no picker). */
   modelChoices: BotModelChoice[] | null;
   /** The bots are this computer's own (signed out). */
@@ -1430,7 +1482,7 @@ const BotPane: React.FC<{
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
-}> = ({ botId, botNameHint, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
+}> = ({ botId, botNameHint, projectPath, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
   // `thread.messages`: every message loaded so far (the newest page, older
   // pages scrolled back to, and what polls brought), in seq order; unchanged
   // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
@@ -1695,7 +1747,7 @@ const BotPane: React.FC<{
   const olderAbove = range.start > 0 || thread.hasMore;
   const starting = !bot.paused && live.length === 0 && (working || pending.some((message) => message.sent));
   const liveRow = (reply: DesktopBotLive) => (
-    <AssistantRow key={`live-${reply.messageId}`} bot={bot}>
+    <AssistantRow key={`live-${reply.messageId}`} bot={bot} projectPath={projectPath}>
       {reply.content ? <MarkdownContent content={reply.content} refLinks /> : null}
       <div className="mt-1 flex items-center gap-1.5 text-[11.5px] text-neutral-500">
         <Loader2 size={11} className="animate-spin" />
@@ -1712,7 +1764,7 @@ const BotPane: React.FC<{
   // or as a row atop the pane when that spot isn't on screen.
   const header = (
     <>
-      <BotAvatar bot={bot} size="md" />
+      <BotAvatar bot={bot} size="md" projectPath={projectPath} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="truncate text-[14px] font-semibold text-[var(--text-primary)]">{bot.name}</span>
@@ -1777,7 +1829,13 @@ const BotPane: React.FC<{
           {timeline.map((row) =>
             row.kind === 'message' ? (
               <div key={row.message.id} data-bot-row={row.message.id} className="flex flex-col">
-                <BotMessage bot={rowBot} message={row.message} handlers={handlers} answeredQuestions={answeredQuestions} />
+                <BotMessage
+                  bot={rowBot}
+                  projectPath={projectPath}
+                  message={row.message}
+                  handlers={handlers}
+                  answeredQuestions={answeredQuestions}
+                />
               </div>
             ) : (
               liveRow(row.reply)
@@ -1802,7 +1860,7 @@ const BotPane: React.FC<{
           ))}
           {range.following && unplaced.map(liveRow)}
           {range.following && starting && (
-            <AssistantRow bot={bot}>
+            <AssistantRow bot={bot} projectPath={projectPath}>
               <div className="flex items-center gap-1.5 text-[11.5px] text-neutral-500">
                 <Loader2 size={11} className="animate-spin" /> Starting…
               </div>
@@ -1964,7 +2022,7 @@ const LibraryAbout: React.FC<{ path: string | null; bot: DesktopBot | null; onOp
           className="flex min-w-0 items-center gap-2 rounded-lg py-1 pl-1.5 pr-2.5 text-[12px] text-neutral-400 transition-colors duration-75 hover:bg-white/[0.05] hover:text-neutral-200"
         >
           <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center text-[13px]" aria-hidden>
-            <BotIcon bot={bot} px={18} />
+            <BotIcon bot={bot} px={18} projectPath={path} />
           </span>
           <span className="truncate">
             Read by <span className="font-medium text-neutral-200">{bot.name}</span> and the threads it starts
@@ -1981,10 +2039,14 @@ const LibraryAbout: React.FC<{ path: string | null; bot: DesktopBot | null; onOp
   );
 };
 
-const NoteAuthor: React.FC<{ author: string; bot: DesktopBot | null }> = ({ author, bot }) =>
+const NoteAuthor: React.FC<{ author: string; bot: DesktopBot | null; projectPath?: string | null }> = ({
+  author,
+  bot,
+  projectPath,
+}) =>
   bot && author === bot.name ? (
     <span className="flex h-3.5 w-3.5 items-center justify-center text-[10px]" aria-hidden>
-      <BotIcon bot={bot} px={14} />
+      <BotIcon bot={bot} px={14} projectPath={projectPath} />
     </span>
   ) : (
     <span className="flex h-3.5 w-3.5 items-center justify-center rounded-full bg-white/[0.08] text-neutral-400" aria-hidden>
@@ -1992,7 +2054,12 @@ const NoteAuthor: React.FC<{ author: string; bot: DesktopBot | null }> = ({ auth
     </span>
   );
 
-const NoteCard: React.FC<{ note: BotProjectNote; bot: DesktopBot | null; onDelete: () => void }> = ({ note, bot, onDelete }) => {
+const NoteCard: React.FC<{ note: BotProjectNote; bot: DesktopBot | null; projectPath?: string | null; onDelete: () => void }> = ({
+  note,
+  bot,
+  projectPath,
+  onDelete,
+}) => {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
   const long = note.content.length > 360 || note.content.split('\n').length > 6;
@@ -2011,7 +2078,7 @@ const NoteCard: React.FC<{ note: BotProjectNote; bot: DesktopBot | null; onDelet
         {note.content}
       </div>
       <div className="mt-1.5 flex h-6 items-center gap-1.5 text-[11px] text-neutral-500">
-        <NoteAuthor author={note.author} bot={bot} />
+        <NoteAuthor author={note.author} bot={bot} projectPath={projectPath} />
         <span className="truncate">{note.author}</span>
         <span className="text-neutral-700">·</span>
         <span className="shrink-0" title={new Date(note.createdAt).toLocaleString()}>
@@ -2115,11 +2182,12 @@ const NoteComposer: React.FC<{ full: boolean; onAdd: (content: string) => Promis
 const ContextPanel: React.FC<{
   notes: BotProjectNote[] | null;
   bot: DesktopBot | null;
+  projectPath?: string | null;
   onAdd: (content: string) => Promise<boolean>;
   onDelete: (noteId: string) => void;
   /** One column: fold long lists. */
   fold: boolean;
-}> = ({ notes, bot, onAdd, onDelete, fold }) => {
+}> = ({ notes, bot, projectPath, onAdd, onDelete, fold }) => {
   const [removed, setRemoved] = useState<Map<string, 'undo' | 'gone'>>(new Map());
   const timers = useRef(new Map<string, number>());
   const onDeleteRef = useRef(onDelete);
@@ -2245,7 +2313,7 @@ const ContextPanel: React.FC<{
                 </button>
               </li>
             ) : (
-              <NoteCard key={note.id} note={note} bot={bot} onDelete={() => remove(note.id)} />
+              <NoteCard key={note.id} note={note} bot={bot} projectPath={projectPath} onDelete={() => remove(note.id)} />
             )
           )}
         </ul>
@@ -2546,6 +2614,7 @@ const ProjectLibrary: React.FC<{
         <ContextPanel
           notes={project?.notes ?? (error ? [] : null)}
           bot={bot}
+          projectPath={path}
           onAdd={addNote}
           onDelete={(noteId) => void act({ ...target, action: 'delete_note', noteId })}
           fold={!wide}
@@ -2620,9 +2689,14 @@ const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: Rea
   );
 };
 
-const AssistantRow: React.FC<{ bot: DesktopBot; children: React.ReactNode; copy?: string }> = ({ bot, children, copy }) => (
+const AssistantRow: React.FC<{ bot: DesktopBot; projectPath?: string | null; children: React.ReactNode; copy?: string }> = ({
+  bot,
+  projectPath,
+  children,
+  copy,
+}) => (
   <div className={`flex items-start gap-2.5${copy ? ' bot-msg agent' : ''}`}>
-    <BotAvatar bot={bot} />
+    <BotAvatar bot={bot} projectPath={projectPath} />
     <div className="min-w-0 flex-1 text-[13.5px] leading-relaxed text-neutral-200">
       {children}
       {copy && (
@@ -2638,17 +2712,18 @@ const INBOX_ICON = { routine: CalendarClock, task: ListChecks, bot: Bot } as con
 
 const BotMessage: React.FC<{
   bot: DesktopBot;
+  projectPath?: string | null;
   message: DesktopBotMessage;
   handlers: BotActionHandlers;
   answeredQuestions: ReadonlyMap<string, string>;
-}> = React.memo(({ bot, message, handlers, answeredQuestions }) => {
+}> = React.memo(({ bot, projectPath, message, handlers, answeredQuestions }) => {
   const files = useMessageFiles(message.files);
   if (message.role === 'assistant') {
     const via = message.authorLabel?.startsWith('via ') ? message.authorLabel : null;
     // Files it attached show under the text (a path it names would show twice).
     const showsFiles = files.length > 0 || Boolean(message.cards?.some((card) => card.component === 'asset-gallery'));
     return (
-      <AssistantRow bot={bot} copy={copyText(message.content, message.files)}>
+      <AssistantRow bot={bot} projectPath={projectPath} copy={copyText(message.content, message.files)}>
         <MarkdownContent content={message.content} pathPreviews={!showsFiles} refLinks />
         <BotFileGallery files={files} />
         {message.cards?.length ? <BotCards cards={message.cards} handlers={handlers} answeredQuestions={answeredQuestions} /> : null}

@@ -54,6 +54,7 @@ import {
 import { getWhatsNew, markWhatsNewSeen } from './main/whats-new.js';
 import { relaunchApp } from './main/linux-relaunch.js';
 import { browseDirectories, resolveProjectDirectory } from './main/project-browse.js';
+import { findProjectIcon } from './main/project-icon.js';
 import { approvalExplainPrompt, approvalExplainTruncated, parseApprovalExplanation } from './main/approval-explainer.js';
 import { appUpdateDownloadedVersion, appUpdateState, checkForAppUpdate, getAppIconPath, initializeAppUpdater, installDownloadedLinuxUpdate, invalidateAppUpdateDownload, publishAppUpdateState, scheduleAppUpdateChecks, waitForAppUpdateStagedForInstall } from './main/app-updater.js';
 import { withClaudeEnv } from './main/claude-env.js';
@@ -2575,135 +2576,6 @@ ipcMain.handle('storage:clear', async () => {
     return false;
   }
 });
-
-const projectIconExtensions = new Set(['.png', '.jpg', '.jpeg', '.ico', '.webp', '.gif', '.svg']);
-
-const projectIconCandidates = [
-  'favicon.ico',
-  'favicon.png',
-  'favicon.svg',
-  'logo.png',
-  'logo.svg',
-  'icon.png',
-  'public/favicon.ico',
-  'public/favicon.png',
-  'public/favicon.svg',
-  'public/logo.png',
-  'public/logo.svg',
-  'public/icon.png',
-  'public/apple-touch-icon.png',
-  'app/favicon.ico',
-  'src/app/favicon.ico',
-  'src/app/icon.png',
-  'src/app/icon.svg',
-  'assets/logo.png',
-  'assets/icon.png',
-  'static/favicon.ico',
-];
-
-const pathExistsAsFile = async (filePath) => {
-  try {
-    const stat = await fs.stat(filePath);
-    return stat.isFile();
-  } catch {
-    return false;
-  }
-};
-
-const isProjectIconFile = async (filePath) => {
-  if (!(await pathExistsAsFile(filePath))) return false;
-  const ext = path.extname(filePath).toLowerCase();
-  return projectIconExtensions.has(ext);
-};
-
-const projectIconToDataUrl = async (filePath) => {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === '.svg') {
-    const content = await fs.readFile(filePath, 'utf-8');
-    const encoded = Buffer.from(content).toString('base64');
-    return `data:image/svg+xml;base64,${encoded}`;
-  }
-
-  const image = nativeImage.createFromPath(filePath);
-  if (image.isEmpty()) return null;
-
-  const { width, height } = image.getSize();
-  const resized =
-    width > 64 || height > 64 ? image.resize({ width: 32, height: 32 }) : image;
-  return resized.toDataURL();
-};
-
-const resolveProjectIconHref = (baseDir, href) => {
-  if (!href || typeof href !== 'string') return null;
-  if (/^(?:https?:|data:|\/\/)/i.test(href)) return null;
-  const cleanHref = href.split('?')[0].split('#')[0];
-  return path.resolve(baseDir, cleanHref);
-};
-
-const findProjectIconInHtml = async (projectPath) => {
-  const htmlPaths = ['index.html', 'public/index.html', 'src/index.html'];
-  for (const relativePath of htmlPaths) {
-    const htmlPath = path.join(projectPath, relativePath);
-    if (!(await pathExistsAsFile(htmlPath))) continue;
-
-    try {
-      const html = await fs.readFile(htmlPath, 'utf-8');
-      const iconLinks = html.match(/<link[^>]+rel=["'](?:shortcut\s+)?icon["'][^>]*>/gi) ?? [];
-      for (const linkTag of iconLinks) {
-        const hrefMatch = linkTag.match(/href=["']([^"']+)["']/i);
-        if (!hrefMatch) continue;
-        const iconPath = resolveProjectIconHref(path.dirname(htmlPath), hrefMatch[1]);
-        if (iconPath && (await isProjectIconFile(iconPath))) return iconPath;
-      }
-    } catch {
-      // ignore malformed html
-    }
-  }
-  return null;
-};
-
-const findProjectIconInPackageJson = async (projectPath) => {
-  const packagePath = path.join(projectPath, 'package.json');
-  if (!(await pathExistsAsFile(packagePath))) return null;
-
-  try {
-    const pkg = JSON.parse(await fs.readFile(packagePath, 'utf-8'));
-    const iconRef = pkg.icon || pkg.logo;
-    if (typeof iconRef !== 'string') return null;
-    const iconPath = path.resolve(projectPath, iconRef);
-    if (await isProjectIconFile(iconPath)) return iconPath;
-  } catch {
-    // ignore malformed package.json
-  }
-  return null;
-};
-
-const findProjectIcon = async (projectPath) => {
-  if (!projectPath || typeof projectPath !== 'string') return null;
-
-  const sources = [
-    findProjectIconInHtml(projectPath),
-    findProjectIconInPackageJson(projectPath),
-    ...projectIconCandidates.map(async (candidate) => {
-      const iconPath = path.join(projectPath, candidate);
-      if (await isProjectIconFile(iconPath)) return iconPath;
-      return null;
-    }),
-  ];
-
-  for (const source of sources) {
-    const iconPath = await source;
-    if (!iconPath) continue;
-    try {
-      const dataUrl = await projectIconToDataUrl(iconPath);
-      if (dataUrl) return dataUrl;
-    } catch {
-      // try next candidate
-    }
-  }
-
-  return null;
-};
 
 // Open directory picker
 ipcMain.handle('dialog:openDirectory', async () => {
@@ -9174,7 +9046,7 @@ ipcMain.handle('agent:explainApproval', async (_event, input) => {
 // Path helpers (so renderer doesn't need node path)
 ipcMain.handle('project:findIcon', async (_event, projectPath) => {
   try {
-    return await findProjectIcon(projectPath);
+    return await findProjectIcon(projectPath, { nativeImage });
   } catch (error) {
     console.error('project:findIcon error', error);
     return null;
