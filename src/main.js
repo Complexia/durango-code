@@ -107,6 +107,7 @@ import {
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
 import { botThreadTitle } from './main/bot-thread-title.js';
+import { titleFromResponseText, utilityReplyFromOutput } from './main/utility-reply.js';
 import {
   createDeployWatcher,
   createSourceConfigFetcher,
@@ -8896,41 +8897,6 @@ ipcMain.handle('terminal:kill', (_event, threadId) => {
   return disposeTerminalSession(threadId);
 });
 
-// Normalize a raw model response into a usable one-line thread title,
-// or '' when nothing title-shaped survives.
-const titleFromResponseText = (responseText) => {
-  let candidate = (responseText || '').split(/[\r\n]+/)[0] || '';
-  candidate = candidate.trim();
-  if (!candidate) return '';
-
-  // Clean model output
-  // Strip markdown formatting first (Kimi wraps titles in **bold** / headings)
-  // so the quote/prefix cleanups below see plain text.
-  candidate = candidate.replace(/^#{1,6}\s+/, '');
-  // Paired code/strike/bold delimiters unwrap safely anywhere (the content
-  // survives; bold requires non-space at the inner edges, per Markdown, so a
-  // literal `**kwargs and **args` stays intact). Single * and __ pairs only
-  // unwrap when they enclose the whole title — interior ones are likely
-  // literal (glob patterns like *.ts, identifiers like __init__).
-  candidate = candidate.replace(/`([^`]+)`/g, '$1');
-  candidate = candidate.replace(/~~([^~]+)~~/g, '$1');
-  candidate = candidate.replace(/\*\*(\S(?:[^*]*\S)?)\*\*/g, '$1');
-  candidate = candidate.replace(/^\*([^*]+)\*$/, '$1');
-  candidate = candidate.replace(/^__(.+)__$/, '$1');
-  candidate = candidate.replace(/(^|\s)_([^_]+)_(?=\s|$)/g, '$1$2');
-  candidate = candidate.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
-  candidate = candidate.replace(/^(title\s*[:：]\s*|here\s*(is|is a)\s*(a\s+)?(concise\s+)?title\s*[:：]?\s*|the title (is|should be)\s*[:：]?\s*)/i, '');
-  candidate = candidate.replace(/\s+/g, ' ').trim();
-  candidate = candidate.split(/[\.!?]\s/)[0].trim();
-  if (candidate.length > 70) candidate = candidate.slice(0, 67).trim() + '…';
-
-  // Hard guard: never accept raw protocol / JSON / thought lines as a title
-  if (!candidate || /^[\{\[]/.test(candidate) || /"type"\s*:/i.test(candidate) || /"data"\s*:/i.test(candidate) || /\btype["\s]*:["\s]*thought\b/i.test(candidate)) {
-    return '';
-  }
-  return candidate;
-};
-
 // Run a single non-streaming prompt through a provider CLI in read-only mode
 // and return the model's plain-text reply ('' on any failure). Backs the
 // hidden utility turns: thread titles and commit/PR messages.
@@ -9054,58 +9020,7 @@ const runOneShotAgentText = async (
         return;
       }
 
-      const jsonMode = sendsJsonEvents(model.providerId);
-      let responseText = '';
-
-      if (jsonMode) {
-        // Parse NDJSON / streaming-json output and extract only real text (ignore thoughts etc.)
-        const adapter = jsonAdapterForProvider(model.providerId);
-        const textContext = { textSeen: false };
-        const lines = stdout.split(/\r?\n/);
-        let partial = '';
-        for (const rawLine of lines) {
-          const line = partial ? partial + rawLine : rawLine;
-          const trimmed = line.trim();
-          if (!trimmed) {
-            partial = '';
-            continue;
-          }
-          try {
-            const parsed = JSON.parse(trimmed);
-            const t = adapter.text(parsed, textContext);
-            if (t) {
-              responseText += t;
-              textContext.textSeen = true;
-              partial = '';
-            } else {
-              // parsed but no text content (e.g. thought) — discard this line
-              partial = '';
-            }
-          } catch {
-            // Not (yet) valid JSON. If it doesn't look like start of JSON, treat as plain text.
-            if (!/^\s*[\{\[]/.test(trimmed)) {
-              responseText += rawLine + '\n';
-              partial = '';
-            } else {
-              partial = line; // keep for potential multi-line object (rare)
-            }
-          }
-        }
-        // flush last partial if it parses
-        if (partial.trim()) {
-          try {
-            const p = JSON.parse(partial.trim());
-            const t = adapter.text(p, textContext);
-            if (t) responseText += t;
-          } catch {
-            if (!/^\s*[\{\[]/.test(partial)) responseText += partial;
-          }
-        }
-      } else {
-        responseText = stdout;
-      }
-
-      finish(responseText);
+      finish(utilityReplyFromOutput(stdout, model.providerId));
     });
   });
 };
@@ -9155,17 +9070,28 @@ ipcMain.handle('agent:generateTitle', async (_event, input) => {
 
     const titleInstruction =
       'Reply with ONLY a concise, specific title (3-8 words) for the following user request. ' +
+      'Do not work on the request or use any tools; only name it. ' +
       'No quotes, no explanations, no trailing punctuation. Just the title.\n\n' +
       'Request:\n' +
       input.prompt;
 
-    return titleFromResponseText(
-      await runOneShotAgentText(model, titleInstruction, input.projectPath, {
-        signal: controller.signal,
-        threadId,
-        reasoningEffort: input.reasoningEffort,
-      })
-    );
+    // An empty folder, not the project: the request alone names the thread,
+    // and in the project the model loads its instructions, skills and tools
+    // and starts exploring the repository as if it were the task.
+    let scratch = '';
+    try {
+      scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-title-'));
+      if (controller.signal.aborted) return '';
+      return titleFromResponseText(
+        await runOneShotAgentText(model, titleInstruction, scratch, {
+          signal: controller.signal,
+          threadId,
+          reasoningEffort: input.reasoningEffort,
+        })
+      );
+    } finally {
+      if (scratch) void fs.rm(scratch, { recursive: true, force: true }).catch(() => {});
+    }
   })();
   generation.promise = operation;
   try {
