@@ -4728,6 +4728,12 @@ const botProjects = () =>
       existsSync(project.path)
   );
 
+// Each bot's Claude Code session, resumed by its next reply here (bot-sessions.js).
+const botSessions = createBotSessionStore({
+  dir: () => path.join(app.getPath('userData'), 'bots', '.sessions'),
+  log: (...args) => console.warn('[bot sessions]', ...args),
+});
+
 const claudeBotLaneRunner = createClaudeLaneRunner({
   loadSdk: loadClaudeSdk,
   loadZod,
@@ -4735,11 +4741,7 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
   createInputQueue: createClaudeInputQueue,
   botsDir: () => path.join(app.getPath('userData'), 'bots'),
   getProjects: botProjects,
-  // Each bot's Claude Code session, resumed by its next reply here (bot-sessions.js).
-  sessions: createBotSessionStore({
-    dir: () => path.join(app.getPath('userData'), 'bots', '.sessions'),
-    log: (...args) => console.warn('[bot sessions]', ...args),
-  }),
+  sessions: botSessions,
 });
 
 // A Durango Code thread a bot started in a project here (delegate_task
@@ -6068,6 +6070,67 @@ ipcMain.handle('bots:setModel', async (_event, input) => {
   try {
     const result = await durangoClient.setBotModel(botId, model);
     return { ok: true, model: result.model };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+ipcMain.handle('bots:rename', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId : '';
+  const name = typeof input?.name === 'string' ? input.name : '';
+  if (!botId || !name.trim()) return { ok: false, error: 'Enter a name for the bot.' };
+  if (await localBotsMode()) {
+    try {
+      return { ok: true, bot: await localBots.rename(botId, name) };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const result = await durangoClient.renameBot(botId, name);
+    return { ok: true, name: result.name, ...(result.bot ? { bot: result.bot } : {}) };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+ipcMain.handle('bots:delete', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId : '';
+  if (!botId) return { ok: false, error: 'Bot not found.' };
+  if (await localBotsMode()) {
+    try {
+      await localBots.deleteBot(botId);
+      await botSessions.forgetBot(botId).catch(() => {});
+      return { ok: true };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    await durangoClient.deleteBot(botId);
+    await botSessions.forgetBot(botId).catch(() => {});
+    return { ok: true };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+ipcMain.handle('bots:clear', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId : '';
+  if (!botId) return { ok: false, error: 'Bot not found.' };
+  if (await localBotsMode()) {
+    try {
+      const bot = await localBots.clear(botId);
+      await botSessions.forgetBot(botId).catch(() => {});
+      return { ok: true, bot };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const result = await durangoClient.clearBot(botId);
+    await botSessions.forgetBot(botId).catch(() => {});
+    return { ok: true, ...(result.bot ? { bot: result.bot } : {}) };
   } catch (error) {
     return durangoIpcError(error);
   }

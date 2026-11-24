@@ -834,6 +834,27 @@ export const createDurangoClient = ({
       const data = await request('PATCH', `/bots/${encodeURIComponent(str(botId))}`, { body: { model: str(model) } });
       return { model: typeof data.model === 'string' ? data.model : str(model) };
     },
+    /** Renames a bot → `{ name, bot? }`. */
+    async renameBot(botId, name) {
+      const data = await request('PATCH', `/bots/${encodeURIComponent(str(botId))}`, { body: { name: str(name) } });
+      return {
+        name: typeof data.name === 'string' ? data.name : str(name),
+        ...(data.bot && typeof data.bot === 'object' ? { bot: data.bot } : {}),
+      };
+    },
+    /** Deletes (archives) a non-primary bot → `{ ok: true }`. */
+    async deleteBot(botId) {
+      await request('DELETE', `/bots/${encodeURIComponent(str(botId))}`);
+      return { ok: true };
+    },
+    /** Clears all past conversation for a bot → `{ ok: true, bot? }`. */
+    async clearBot(botId) {
+      const data = await request('DELETE', `/bots/${encodeURIComponent(str(botId))}/messages`);
+      return {
+        ok: true,
+        ...(data.bot && typeof data.bot === 'object' ? { bot: data.bot } : {}),
+      };
+    },
     /**
      * → `{ bot, messages, live, hasMore, hasNewer? }`: the newest page, the page
      * before `beforeSeq`, or the new messages after `afterSeq`. `read` marks the bot read.
@@ -1337,6 +1358,15 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async setBotModel(_botId, model) {
       return { model: str(model) };
+    },
+    async renameBot(_botId, name) {
+      return { name: str(name) };
+    },
+    async deleteBot() {
+      return { ok: true };
+    },
+    async clearBot() {
+      return { ok: true };
     },
     async botFileLinks() {
       return [];

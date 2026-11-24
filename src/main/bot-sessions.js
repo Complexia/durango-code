@@ -310,6 +310,7 @@ export const planBotPrompt = ({
   session,
   state = null,
   basis,
+  threadId = '',
   busy = false,
   systemTokens = 0,
   maxPromptTokens = BOT_MAX_PROMPT_TOKENS,
@@ -330,6 +331,7 @@ export const planBotPrompt = ({
   let reason = busy ? 'busy' : !state ? 'new' : 'resume';
   if (!busy && state) {
     if (state.basis !== basis || !state.sessionId) reason = 'basis';
+    else if (str(state.threadId) && str(threadId) && state.threadId !== threadId) reason = 'cleared';
     else if ((state.contextTokens ?? 0) > sessionResetTokens) reason = 'size';
     else if (Number.isFinite(state.updatedAt) && now - state.updatedAt > coldAfterMs) reason = 'cold';
   }
@@ -399,17 +401,20 @@ export const planBotPrompt = ({
  */
 export const createBotSessionStore = ({ dir, log = () => {} }) => {
   const busy = new Set();
+  // Keys forgotten while a reply held them: end() drops their state instead of saving it.
+  const discarded = new Set();
   const baseDir = () => (typeof dir === 'function' ? dir() : dir);
-  const fileOf = (botId) => {
-    const id = str(botId);
-    const safe = /^[A-Za-z0-9_-]{1,160}$/.test(id) ? id : hash(id).slice(0, 32);
-    return path.join(baseDir(), `${safe}.json`);
+  const safeId = (value) => {
+    const id = str(value);
+    return /^[A-Za-z0-9_-]{1,160}$/.test(id) ? id : hash(id).slice(0, 32);
   };
+  const fileOf = (botId) => path.join(baseDir(), `${safeId(botId)}.json`);
   return {
     /** → { state, busy }: `state` is null when there's none or another reply holds it. */
     async begin(botId) {
       if (busy.has(botId)) return { state: null, busy: true };
       busy.add(botId);
+      discarded.delete(botId);
       const file = fileOf(botId);
       let state = null;
       try {
@@ -424,7 +429,7 @@ export const createBotSessionStore = ({ dir, log = () => {} }) => {
     /** Releases the bot's session; `state` (or null) is what the next reply resumes. */
     async end(botId, state) {
       try {
-        if (state?.sessionId) {
+        if (state?.sessionId && !discarded.has(botId)) {
           const file = fileOf(botId);
           await fs.mkdir(path.dirname(file), { recursive: true });
           const temp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
@@ -434,13 +439,34 @@ export const createBotSessionStore = ({ dir, log = () => {} }) => {
       } catch (error) {
         log(`couldn't keep a bot session: ${error?.message ?? error}`);
       } finally {
+        discarded.delete(botId);
         busy.delete(botId);
       }
     },
-    /** Forgets a bot's session (e.g. the bot was deleted). */
+    /** Forgets a single session key. */
     async forget(botId) {
-      if (busy.has(botId)) return;
+      if (busy.has(botId)) {
+        discarded.add(botId);
+        return;
+      }
       await fs.rm(fileOf(botId), { force: true }).catch(() => {});
+    },
+    /** Forgets every kept session for a bot across all models (e.g. cleared or deleted). */
+    async forgetBot(botId) {
+      const id = str(botId);
+      if (!id) return;
+      const prefix = `${id}__`;
+      for (const key of busy) {
+        if (key === id || key.startsWith(prefix)) discarded.add(key);
+      }
+      await fs.rm(fileOf(id), { force: true }).catch(() => {});
+      const safePrefix = `${safeId(id)}__`;
+      const names = await fs.readdir(baseDir()).catch(() => []);
+      await Promise.all(
+        names
+          .filter((name) => name.endsWith('.json') && name.startsWith(safePrefix))
+          .map((name) => fs.rm(path.join(baseDir(), name), { force: true }).catch(() => {}))
+      );
     },
   };
 };

@@ -10,6 +10,8 @@ export type DesktopBot = {
   role: 'primary' | 'bot';
   job: string;
   model: string;
+  /** The bot's current conversation id (rotates when cleared so cached threads reset). */
+  threadId?: string;
   status: 'idle' | 'waking' | 'running';
   paused: boolean;
   /** Replies being written right now, and where each runs ("cloud" or "machine:<id>"). */
@@ -189,6 +191,9 @@ export type BotsListResult = {
 /** A model a bot can be set to. `claude`: it can also reply on a machine's Claude Code (others reply from Durango's cloud). */
 export type BotModelChoice = { id: string; label: string; note: string; claude: boolean };
 export type SetBotModelResult = { ok: boolean; model?: string; bot?: DesktopBot; error?: string; code?: string };
+export type RenameBotResult = { ok: boolean; name?: string; bot?: DesktopBot; error?: string; code?: string };
+export type DeleteBotResult = { ok: boolean; error?: string; code?: string };
+export type ClearBotResult = { ok: boolean; bot?: DesktopBot; error?: string; code?: string };
 
 /** A bot's model as a short name: its choice's label, else the id's last part ("anthropic/claude-opus-5.5" → "claude-opus-5.5"). */
 export const botModelLabel = (model: string, choices: readonly BotModelChoice[] | null | undefined) =>

@@ -559,6 +559,7 @@ export const createClaudeLaneRunner = ({
           session,
           state,
           basis,
+          threadId: lane.threadId,
           // Without a store nothing is kept: a fresh, unkept session.
           busy: claimed.busy || !keptSessions,
           systemTokens: estimateTextTokens(systemAppend),
@@ -940,6 +941,7 @@ export const createClaudeLaneRunner = ({
           ? {
               sessionId: attempt.sessionId,
               basis,
+              ...(lane.threadId ? { threadId: lane.threadId } : {}),
               systemAppend: attempt.systemAppend,
               memoryKey: plan.memoryKey,
               model: lane.model ?? null,

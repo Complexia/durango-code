@@ -2024,6 +2024,45 @@ try {
     const normalized = normalizeBotLane({ laneId: 'l', botId: 'b', session: { history: [], answering: [1], context: [] } });
     assert.deepEqual(normalized.session, { history: [], answering: [1], context: [] });
   });
+
+  await test('planBotPrompt resets on threadId rotation without invalidating pre-upgrade sessions, and forgetBot drops all model sessions', async () => {
+    const basis = sessionBasis({ systemPrompt: 'a', model: 'm', tools: [] });
+    const sess = { history: [row(1, 'user', 'hi')], answering: [1], context: [] };
+    // Pre-upgrade session without threadId stays warm.
+    assert.equal(planBotPrompt({ botName: 'B', session: sess, state: { sessionId: 's1', basis }, basis, threadId: 't1' }).mode, 'resume');
+    // Same threadId resumes.
+    assert.equal(planBotPrompt({ botName: 'B', session: sess, state: { sessionId: 's1', basis, threadId: 't1' }, basis, threadId: 't1' }).mode, 'resume');
+    // Rotated threadId starts fresh with reason 'cleared'.
+    const rotated = planBotPrompt({ botName: 'B', session: sess, state: { sessionId: 's1', basis, threadId: 't1' }, basis, threadId: 't2' });
+    assert.equal(rotated.mode, 'fresh');
+    assert.equal(rotated.reason, 'cleared');
+
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-forget') });
+    await sessions.begin('bot1__claude-opus-5-5');
+    await sessions.end('bot1__claude-opus-5-5', { sessionId: 's-opus', basis: 'b' });
+    await sessions.begin('bot1__claude-haiku-5-5');
+    await sessions.end('bot1__claude-haiku-5-5', { sessionId: 's-haiku', basis: 'b' });
+    await sessions.begin('other__claude-opus-5-5');
+    await sessions.end('other__claude-opus-5-5', { sessionId: 's-other', basis: 'b' });
+
+    // Start an in-flight session for bot1 and forgetBot while it is busy.
+    const inFlight = await sessions.begin('bot1__claude-opus-5-5');
+    assert.equal(inFlight.state?.sessionId, 's-opus');
+    await sessions.forgetBot('bot1');
+    await sessions.end('bot1__claude-opus-5-5', { sessionId: 's-opus-stale', basis: 'b' });
+
+    const opusAfter = await sessions.begin('bot1__claude-opus-5-5');
+    assert.equal(opusAfter.state, null, 'in-flight session discarded on forgetBot');
+    await sessions.end('bot1__claude-opus-5-5', null);
+
+    const haikuAfter = await sessions.begin('bot1__claude-haiku-5-5');
+    assert.equal(haikuAfter.state, null, 'all model sessions for bot1 deleted');
+    await sessions.end('bot1__claude-haiku-5-5', null);
+
+    const otherAfter = await sessions.begin('other__claude-opus-5-5');
+    assert.equal(otherAfter.state?.sessionId, 's-other', 'other bots untouched');
+    await sessions.end('other__claude-opus-5-5', null);
+  });
 } finally {
   await fs.rm(testRoot, { recursive: true, force: true });
 }

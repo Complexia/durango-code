@@ -520,6 +520,7 @@ const normalizeBot = (raw, now) => {
   const role = raw?.role === 'primary' ? 'primary' : 'bot';
   return {
     id: str(raw?.id),
+    threadId: str(raw?.threadId) || `lbt_${str(raw?.id) || newId('t')}`,
     name: clip(str(raw?.name) || 'Bot', 40),
     emoji: str(raw?.emoji) || null,
     role,
@@ -987,6 +988,7 @@ export const createLocalBotEngine = ({
     const waking = !bot.paused && !replies.length && (runtime?.pendingChecks > 0 || hasUnclaimed(entry));
     return {
       id: bot.id,
+      threadId: bot.threadId,
       name: bot.name,
       emoji: bot.emoji === LEGACY_PROJECT_BOT_EMOJI ? null : bot.emoji,
       role: bot.role,
@@ -1248,6 +1250,7 @@ export const createLocalBotEngine = ({
       laneId: reply.id,
       botId: bot.id,
       botName: bot.name,
+      threadId: bot.threadId,
       // The reply's message id in the thread (a kept session knows it has seen it).
       replyMessageId: reply.id,
       model: localLaneModel(bot, { person: claims.some((message) => message.role === 'user' && inboxSourceOf(message.authorLabel) === 'person') }),
@@ -1319,7 +1322,7 @@ export const createLocalBotEngine = ({
   // the message they were made with (reply.cards holds those made before any
   // text of their own, for the next message).
   const sendReplyMessage = (entry, reply, { index, text }) => {
-    if (reply.abort.signal.aborted || index >= BOT_REPLY_MESSAGES_MAX) return false;
+    if (reply.cleared || reply.abort.signal.aborted || index >= BOT_REPLY_MESSAGES_MAX) return false;
     const content = str(text).trim();
     if (!content) return false;
     const { bot } = entry;
@@ -1383,7 +1386,7 @@ export const createLocalBotEngine = ({
         signal: reply.abort.signal,
         accessMode: getAccessMode() || 'read-only',
         update: ({ text, activeTool } = {}) => {
-          if (reply.abort.signal.aborted) return;
+          if (reply.cleared || reply.abort.signal.aborted) return;
           if (typeof text === 'string') reply.text = text;
           // The reply takes its place in the thread when it first shows text:
           // what the person sends after that comes below it.
@@ -1423,7 +1426,7 @@ export const createLocalBotEngine = ({
         : [];
     runtime.replies.delete(reply.id);
     const current = myGeneration === generation && entries.get(entry.bot.id) === entry;
-    if (!current) return;
+    if (!current || reply.cleared) return;
     const settleClaims = () => {
       entry.bot.inFlight = (entry.bot.inFlight ?? []).filter((seq) => !reply.claimSeqs.includes(seq));
     };
@@ -1484,6 +1487,7 @@ export const createLocalBotEngine = ({
     entry.compacting = true;
     const myGeneration = generation;
     const expected = bot.compactedThroughSeq;
+    const expectedThreadId = bot.threadId;
     try {
       const folded = rows.filter((row) => row.seq <= boundary);
       const transcript = folded
@@ -1498,7 +1502,7 @@ export const createLocalBotEngine = ({
         prompt: compactionInput({ earlier: bot.earlierSummary, summary: bot.summary, transcript }),
       });
       const memory = parseCompaction(summary, bot.earlierSummary);
-      if (!memory || myGeneration !== generation || entries.get(bot.id) !== entry || bot.compactedThroughSeq !== expected) return;
+      if (!memory || myGeneration !== generation || entries.get(bot.id) !== entry || bot.compactedThroughSeq !== expected || bot.threadId !== expectedThreadId) return;
       bot.summary = memory.summary;
       bot.earlierSummary = memory.earlier;
       bot.compactedThroughSeq = boundary;
@@ -2158,6 +2162,89 @@ export const createLocalBotEngine = ({
         if (before.modelChosen) entry.bot.modelChosen = true;
         else delete entry.bot.modelChosen;
         throw new Error('Couldn’t save the model on this computer. Try again.');
+      }
+      changed();
+      return toDesktopBot(entry);
+    },
+    /** Renames a local bot. → the bot. */
+    async rename(botId, name) {
+      await ensureLoaded();
+      const entry = entryFor(botId);
+      const clean = clip(oneLine(name), 40);
+      if (!clean) throw new LocalBotError('invalid', 'Enter a name for the bot.');
+      const before = entry.bot.name;
+      entry.bot.name = clean;
+      if (!(await persistBot(entry, { messages: false }))) {
+        entry.bot.name = before;
+        throw new Error('Couldn’t save the bot name on this computer. Try again.');
+      }
+      changed();
+      return toDesktopBot(entry);
+    },
+    /** Deletes a non-primary local bot and removes its transcript from disk. */
+    async deleteBot(botId) {
+      await ensureLoaded();
+      const entry = entryFor(botId);
+      if (entry.bot.role === 'primary') throw new LocalBotError('forbidden', 'Your primary bot can’t be deleted.');
+      const id = entry.bot.id;
+      const runtime = runtimes.get(id);
+      if (runtime) {
+        for (const reply of runtime.replies.values()) {
+          reply.cleared = true;
+          reply.abort.abort();
+        }
+        for (const task of runtime.tasks.values()) task.abort.abort();
+        runtimes.delete(id);
+      }
+      entries.delete(id);
+      if (!(await persistIndex())) {
+        entries.set(id, entry);
+        throw new Error('Couldn’t delete the bot on this computer. Try again.');
+      }
+      // Wait for any in-flight transcript write to settle before removing files.
+      const base = storageDir();
+      const file = path.join(base, `${id}.json`);
+      await (writes.get(file) ?? Promise.resolve()).catch(() => {});
+      await fs.rm(file, { force: true }).catch(() => {});
+      const names = await fs.readdir(base).catch(() => []);
+      await Promise.all(
+        names
+          .filter((name) => name.startsWith(`${id}.`) && TRANSCRIPT_LOG_NAME.test(name))
+          .map((name) => fs.rm(path.join(base, name), { force: true }).catch(() => {}))
+      );
+      changed();
+      return { ok: true };
+    },
+    /** Clears all past conversation and compacted memory for a local bot. → the bot. */
+    async clear(botId) {
+      await ensureLoaded();
+      const entry = entryFor(botId);
+      const id = entry.bot.id;
+      const runtime = runtimes.get(id);
+      if (runtime) {
+        for (const reply of runtime.replies.values()) {
+          reply.cleared = true;
+          reply.abort.abort();
+        }
+        runtime.replies.clear();
+      }
+      entry.messages = [];
+      // Force snapshotTranscript on the next save so old transcript logs are deleted too.
+      if (entry.disk) entry.disk.lines = TRANSCRIPT_LOG_MAX_LINES;
+      entry.bot.threadId = newId('lbt');
+      entry.bot.nextSeq = 1;
+      entry.bot.processedSeq = 0;
+      entry.bot.compactedThroughSeq = 0;
+      entry.bot.summary = null;
+      entry.bot.earlierSummary = null;
+      entry.bot.requeue = [];
+      entry.bot.inFlight = [];
+      entry.bot.lastPreview = null;
+      entry.bot.unread = 0;
+      entry.bot.needsYou = false;
+      entry.bot.lastActivityAt = now();
+      if (!(await persistBot(entry))) {
+        throw new Error('Couldn’t clear the conversation on this computer. Try again.');
       }
       changed();
       return toDesktopBot(entry);

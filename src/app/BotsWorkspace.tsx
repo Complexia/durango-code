@@ -11,6 +11,8 @@ import {
   Clock,
   Copy,
   CornerDownLeft,
+  Ellipsis,
+  Eraser,
   ExternalLink,
   File,
   FileArchive,
@@ -33,6 +35,7 @@ import {
   Pin,
   Plus,
   Search,
+  SquarePen,
   Trash2,
   Undo2,
   Upload,
@@ -43,6 +46,7 @@ import { defaultDurangoBotsSettings, defaultDurangoSettings, useOrionStore, type
 import { formatShortTime, getThreadActivityTime } from './time';
 import { botFaceDataUrl, botFaceSeed } from './botFace';
 import { ThreadRow, type SidebarV2Actions } from './SidebarV2';
+import { InlineRenameInput } from './fileTree';
 import { compareSidebarV2Recent, sidebarV2ThreadLists, threadSidebarTone } from './threadLists';
 import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
@@ -156,14 +160,21 @@ type BotListCache = {
 };
 let botListCache: BotListCache | null = null;
 const botThreadCache = new Map<string, DesktopBotThread>();
+const botThreadEpochs = new Map<string, number>();
 const botProjectCache = new Map<string, BotProject | null>();
 // Bumped whenever the caches are dropped: a response to a request made
 // before (for another account) is ignored.
 let botCacheGeneration = 0;
+const bumpBotThreadEpoch = (botId: string) => {
+  const next = (botThreadEpochs.get(botId) ?? 0) + 1;
+  botThreadEpochs.set(botId, next);
+  return next;
+};
 const clearBotCaches = () => {
   botCacheGeneration += 1;
   botListCache = null;
   botThreadCache.clear();
+  botThreadEpochs.clear();
   botProjectCache.clear();
 };
 const projectCacheKey = (target: BotProjectTarget) => target.botId ?? `project:${target.projectId}`;
@@ -238,6 +249,9 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const [projectKeys, setProjectKeys] = useState<Record<string, string>>(() => botListCache?.projectKeys ?? {});
   const [modelChoices, setModelChoices] = useState<BotModelChoice[] | null>(() => botListCache?.modelChoices ?? null);
   const [listError, setListError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [renamingBotId, setRenamingBotId] = useState<string | null>(null);
+  const [clearedEpochs, setClearedEpochs] = useState<Record<string, number>>({});
   const [allowed, setAllowed] = useState(() => botListCache?.allowed ?? true);
   const [mode, setMode] = useState<'local' | 'durango' | null>(() => botListCache?.mode ?? null);
   // Signed in with Claude Code here, but bot replies on this machine are
@@ -400,6 +414,104 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     [loadBots]
   );
 
+  const botsRef = useRef(bots);
+  botsRef.current = bots;
+
+  const handleRenameBot = useCallback(
+    async (bot: DesktopBot, nextName: string) => {
+      const trimmed = nextName.trim().slice(0, 40);
+      setRenamingBotId(null);
+      if (!trimmed || trimmed === bot.name) return;
+      setActionError(null);
+      const applyBot = (updated: DesktopBot) => {
+        const current = botsRef.current;
+        if (current) {
+          const next = current.map((item) => (item.id === bot.id ? updated : item));
+          if (botListCache) botListCache = { ...botListCache, bots: next };
+          noteBotList(next);
+          setBots(next);
+        }
+        const cached = botThreadCache.get(bot.id);
+        if (cached) botThreadCache.set(bot.id, { ...cached, bot: { ...cached.bot, ...updated } });
+      };
+      applyBot({ ...bot, name: trimmed });
+      const result = await window.orion?.renameBot?.({ botId: bot.id, name: trimmed });
+      if (!result?.ok) {
+        setActionError(result?.error ?? 'Couldn’t rename bot.');
+        void loadBots();
+        return;
+      }
+      applyBot(result.bot ?? { ...bot, name: result.name ?? trimmed });
+      void loadBots();
+    },
+    [loadBots]
+  );
+
+  const handleClearBot = useCallback(
+    async (bot: DesktopBot) => {
+      if (!confirm(`Clear all past conversation with ${bot.name}?`)) return;
+      setActionError(null);
+      const result = await window.orion?.clearBot?.({ botId: bot.id });
+      if (!result?.ok) {
+        setActionError(result?.error ?? 'Couldn’t clear conversation.');
+        return;
+      }
+      const clearedBot: DesktopBot = result.bot ?? {
+        ...bot,
+        status: 'idle',
+        replies: [],
+        lastPreview: null,
+        unread: 0,
+        needsYou: false,
+      };
+      bumpBotThreadEpoch(bot.id);
+      botThreadCache.set(bot.id, { bot: clearedBot, messages: [], live: [], hasMore: false });
+      const current = botsRef.current;
+      if (current) {
+        const next = current.map((item) => (item.id === bot.id ? clearedBot : item));
+        if (botListCache) botListCache = { ...botListCache, bots: next };
+        noteBotList(next);
+        setBots(next);
+      }
+      setClearedEpochs((epochs) => ({ ...epochs, [bot.id]: (epochs[bot.id] ?? 0) + 1 }));
+      void loadBots();
+    },
+    [loadBots]
+  );
+
+  const handleDeleteBot = useCallback(
+    async (bot: DesktopBot) => {
+      if (bot.role === 'primary') return;
+      if (!confirm(`Delete ${bot.name}? This removes the bot and its conversation.`)) return;
+      setActionError(null);
+      const result = await window.orion?.deleteBot?.({ botId: bot.id });
+      if (!result?.ok) {
+        setActionError(result?.error ?? 'Couldn’t delete bot.');
+        return;
+      }
+      bumpBotThreadEpoch(bot.id);
+      botThreadCache.delete(bot.id);
+      botProjectCache.delete(bot.id);
+      useOrionStore.getState().setBotDraft(botDraftKey(bot.id), { text: '', files: [] });
+      if (renamingBotId === bot.id) setRenamingBotId(null);
+      const current = botsRef.current ?? [];
+      const next = current.filter((item) => item.id !== bot.id);
+      const fallbackId = next.find((item) => item.role === 'primary')?.id ?? next[0]?.id ?? null;
+      if (botListCache) botListCache = { ...botListCache, bots: next };
+      noteBotList(next);
+      if (botsRef.current) setBots(next);
+      if (selectedBotId === bot.id) {
+        setSidebarV3Settings({ selectedBotId: fallbackId });
+      }
+      if (view === 'project' && selectedProjectId === `bot:${bot.id}`) {
+        setSidebarV3Settings({ view: 'projects', selectedProjectId: null });
+      }
+      void loadBots();
+    },
+    [loadBots, renamingBotId, selectedBotId, selectedProjectId, setSidebarV3Settings, view]
+  );
+
+  const selectedBot = useMemo(() => (selectedBotId ? bots?.find((bot) => bot.id === selectedBotId) ?? null : null), [bots, selectedBotId]);
   const ready = !listError && allowed && bots !== null;
   const selectedEntry = view === 'project' ? projectEntries.find((entry) => entry.id === selectedProjectId) ?? null : null;
   return (
@@ -427,6 +539,19 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
           </div>
         )}
         <div className="sidebar-content agents-sidebar-content !pt-0">
+          {actionError && (
+            <div className="mx-2 mb-2 flex items-start gap-1.5 rounded-lg bg-red-500/10 px-2.5 py-1.5 text-[11.5px] leading-snug text-red-300 ring-1 ring-red-400/20">
+              <span className="min-w-0 flex-1">{actionError}</span>
+              <button
+                type="button"
+                aria-label="Dismiss error"
+                onClick={() => setActionError(null)}
+                className="shrink-0 rounded p-0.5 text-red-300/70 hover:bg-red-500/15 hover:text-red-200"
+              >
+                <X size={11} />
+              </button>
+            </div>
+          )}
           {listError ? (
             <div className="px-3.5 py-2 text-[12.5px] leading-relaxed text-neutral-500">{listError}</div>
           ) : !allowed ? (
@@ -443,7 +568,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                     bot={bot}
                     title={bot.role === 'primary' ? `${bot.name}: your main bot, across all projects` : bot.project ? `${bot.name}: ${bot.project.name} project` : bot.name}
                     active={view === 'bot' && selectedBotId === bot.id}
+                    renaming={renamingBotId === bot.id}
                     onClick={() => openBot(bot.id)}
+                    onStartRename={() => setRenamingBotId(bot.id)}
+                    onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
+                    onRename={(name) => void handleRenameBot(bot, name)}
+                    onClear={() => void handleClearBot(bot)}
+                    onDelete={bot.role !== 'primary' ? () => void handleDeleteBot(bot) : undefined}
                   />
                 </li>
               ))}
@@ -484,8 +615,9 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             </div>
           ) : selectedBotId ? (
             <BotPane
-              key={`${account ?? ''}:${selectedBotId}`}
+              key={`${account ?? ''}:${selectedBotId}:${clearedEpochs[selectedBotId] ?? 0}`}
               botId={selectedBotId}
+              botNameHint={selectedBot?.name}
               modelChoices={modelChoices}
               local={mode === 'local'}
               onChanged={loadBots}
@@ -640,7 +772,7 @@ const ProjectPage: React.FC<{
   }, [filter, threadLists, stateOf]);
 
   useEffect(() => {
-    if (entry.bot) setBot(entry.bot);
+    setBot(entry.bot);
   }, [entry.bot]);
 
   const tabs: { id: ProjectTab; label: string; icon: React.ReactNode; count?: number }[] = [
@@ -1075,46 +1207,221 @@ const ProjectGlyph: React.FC<{ size?: 'sm' | 'md' }> = ({ size = 'sm' }) => (
   </span>
 );
 
-/** A compact one-line sidebar row: icon, name, and unread count or a working / waiting dot. */
+type BotMenuAction = {
+  key: string;
+  label: string;
+  icon: React.ReactNode;
+  danger?: boolean;
+  run: () => void;
+};
+
+/** Hover `...` button and portaled dropdown menu for a sidebar bot row. */
+const BotRowMenu: React.FC<{
+  botName: string;
+  actions: BotMenuAction[];
+  onOpenChange: (open: boolean) => void;
+}> = ({ botName, actions, onOpenChange }) => {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null);
+
+  const setMenuOpen = useCallback(
+    (value: boolean) => {
+      setOpen(value);
+      onOpenChange(value);
+    },
+    [onOpenChange]
+  );
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setPosition(null);
+      return;
+    }
+    const trigger = triggerRef.current;
+    if (!trigger) return;
+    const rect = trigger.getBoundingClientRect();
+    const width = menuRef.current?.offsetWidth ?? 168;
+    const height = menuRef.current?.offsetHeight ?? 112;
+    const margin = 8;
+    const left = Math.max(margin, Math.min(rect.right - width, window.innerWidth - width - margin));
+    const below = rect.bottom + 4 + height + margin <= window.innerHeight;
+    const top = below ? rect.bottom + 4 : Math.max(margin, rect.top - height - 4);
+    setPosition({ top, left });
+  }, [open, actions.length]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        setMenuOpen(false);
+      }
+    };
+    const onDismiss = () => setMenuOpen(false);
+    const onScroll = (event: Event) => {
+      const target = event.target as Node | null;
+      if (target && triggerRef.current && target.contains(triggerRef.current)) setMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    window.addEventListener('blur', onDismiss);
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('blur', onDismiss);
+      window.removeEventListener('scroll', onScroll, true);
+    };
+  }, [open, setMenuOpen]);
+
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        type="button"
+        title="Bot options"
+        aria-label={`Options for ${botName}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className={`inline-flex h-6 w-6 items-center justify-center rounded-md text-neutral-400 transition-colors duration-75 hover:bg-white/[0.08] hover:text-neutral-100 ${
+          open ? 'bg-white/[0.08] text-neutral-100' : ''
+        }`}
+        onClick={(event) => {
+          event.stopPropagation();
+          setMenuOpen(!open);
+        }}
+        onKeyDown={(event) => event.stopPropagation()}
+      >
+        <Ellipsis size={14} />
+      </button>
+      {open &&
+        createPortal(
+          <div
+            ref={menuRef}
+            role="menu"
+            aria-label={`Options for ${botName}`}
+            style={position ? { top: position.top, left: position.left } : { visibility: 'hidden', top: 0, left: 0 }}
+            className="fixed z-[1100] w-[168px] animate-[sidebar-menu-in_120ms_cubic-bezier(0.22,1,0.36,1)] rounded-xl border border-white/10 bg-[rgb(24_24_27_/_0.98)] p-1 shadow-[0_16px_48px_rgb(0_0_0_/_0.5)] backdrop-blur-md"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {actions.map((action) => (
+              <button
+                key={action.key}
+                type="button"
+                role="menuitem"
+                className={`flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors duration-75 ${
+                  action.danger ? 'text-red-300 hover:bg-red-500/10' : 'text-neutral-200 hover:bg-white/[0.07]'
+                }`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setMenuOpen(false);
+                  action.run();
+                }}
+              >
+                <span className={`flex w-3.5 justify-center ${action.danger ? 'text-red-300' : 'text-neutral-400'}`}>{action.icon}</span>
+                {action.label}
+              </button>
+            ))}
+          </div>,
+          document.body
+        )}
+    </>
+  );
+};
+
+/** A compact one-line sidebar row: icon, name, hover menu, and unread count or a working / waiting dot. */
 const BotRow: React.FC<{
   bot: DesktopBot;
   title: string;
   active: boolean;
+  renaming: boolean;
   onClick: () => void;
-}> = ({ bot, title, active, onClick }) => {
+  onStartRename: () => void;
+  onEndRename: () => void;
+  onRename: (name: string) => void;
+  onClear: () => void;
+  onDelete?: () => void;
+}> = ({ bot, title, active, renaming, onClick, onStartRename, onEndRename, onRename, onClear, onDelete }) => {
+  const [menuOpen, setMenuOpen] = useState(false);
   const working = botIsWorking(bot);
+  const actions: BotMenuAction[] = [
+    { key: 'rename', label: 'Rename', icon: <SquarePen size={13} />, run: onStartRename },
+    { key: 'clear', label: 'Clear', icon: <Eraser size={13} />, run: onClear },
+    ...(onDelete ? [{ key: 'delete', label: 'Delete', icon: <Trash2 size={13} />, danger: true, run: onDelete }] : []),
+  ];
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      title={title}
-      className={`flex h-9 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors duration-75 ${
-        active ? 'bg-white/[0.08]' : 'hover:bg-white/[0.045]'
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => {
+        if (renaming) return;
+        onClick();
+      }}
+      onKeyDown={(event) => {
+        if (renaming || event.target !== event.currentTarget) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onClick();
+        }
+      }}
+      title={renaming ? undefined : title}
+      aria-current={active ? 'true' : undefined}
+      className={`group relative flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 text-left transition-colors duration-75 ${
+        active ? 'bg-white/[0.08]' : menuOpen ? 'bg-white/[0.06]' : 'hover:bg-white/[0.045]'
       }`}
     >
       <span className="relative flex h-[22px] w-[22px] shrink-0 items-center justify-center text-[15px] leading-none" aria-hidden>
         <BotIcon bot={bot} px={22} />
         {bot.role === 'primary' && <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
       </span>
-      <span className={`min-w-0 flex-1 truncate text-[14.5px] ${bot.unread > 0 ? 'font-semibold text-neutral-100' : 'text-neutral-300'}`}>
-        {bot.name}
-      </span>
-      {bot.unread > 0 ? (
-        <span className="shrink-0 rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
-      ) : working ? (
-        <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" />
-      ) : bot.needsYou ? (
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
-      ) : bot.paused ? (
-        <Pause size={11} className="shrink-0 text-neutral-600" />
-      ) : null}
-    </button>
+      {renaming ? (
+        <InlineRenameInput
+          className="thread-rename-input text-[14px]"
+          initialValue={bot.name}
+          maxLength={40}
+          onSubmit={onRename}
+          onCancel={onEndRename}
+        />
+      ) : (
+        <>
+          <span className={`min-w-0 flex-1 truncate text-[14.5px] ${bot.unread > 0 ? 'font-semibold text-neutral-100' : 'text-neutral-300'}`}>
+            {bot.name}
+          </span>
+          <span className={`shrink-0 items-center ${menuOpen ? 'hidden' : 'flex group-hover:hidden group-focus-within:hidden'}`}>
+            {bot.unread > 0 ? (
+              <span className="rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
+            ) : working ? (
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
+            ) : bot.needsYou ? (
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+            ) : bot.paused ? (
+              <Pause size={11} className="text-neutral-600" />
+            ) : null}
+          </span>
+          <span
+            className={`-mr-0.5 shrink-0 items-center ${menuOpen ? 'flex' : 'hidden group-hover:flex group-focus-within:flex'}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <BotRowMenu botName={bot.name} actions={actions} onOpenChange={setMenuOpen} />
+          </span>
+        </>
+      )}
+    </div>
   );
 };
 
 /** One bot's conversation: messages, live replies at the bottom, and a composer that never blocks. */
 const BotPane: React.FC<{
   botId: string;
+  /** Latest name from the sidebar list so renames show in the header at once. */
+  botNameHint?: string;
   /** The models the bot can be set to (null: no picker). */
   modelChoices: BotModelChoice[] | null;
   /** The bots are this computer's own (signed out). */
@@ -1123,7 +1430,7 @@ const BotPane: React.FC<{
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
-}> = ({ botId, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
+}> = ({ botId, botNameHint, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
   // `thread.messages`: every message loaded so far (the newest page, older
   // pages scrolled back to, and what polls brought), in seq order; unchanged
   // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
@@ -1136,8 +1443,17 @@ const BotPane: React.FC<{
   const working = thread ? botIsWorking(thread.bot) : false;
   const sending = outgoing.some((message) => !message.failed);
   const threadRef = useRef(thread);
+  const mountedRef = useRef(true);
+  const mountEpochRef = useRef(botThreadEpochs.get(botId) ?? 0);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const setThread = useCallback(
     (update: (current: DesktopBotThread | null) => DesktopBotThread | null) => {
+      if (!mountedRef.current || (botThreadEpochs.get(botId) ?? 0) !== mountEpochRef.current) return;
       const next = update(threadRef.current);
       if (next === threadRef.current) return;
       threadRef.current = next;
@@ -1151,8 +1467,9 @@ const BotPane: React.FC<{
   const fetchPage = useCallback(
     async (page: { limit: number; beforeSeq?: number; afterSeq?: number }) => {
       const generation = botCacheGeneration;
+      const epoch = botThreadEpochs.get(botId) ?? 0;
       const result = await window.orion?.getBotThread?.({ botId, read: visible(), ...page });
-      if (!result || generation !== botCacheGeneration) return null;
+      if (!result || !mountedRef.current || generation !== botCacheGeneration || epoch !== (botThreadEpochs.get(botId) ?? 0)) return null;
       if (!result.ok || !result.bot) {
         setError(result.error ?? 'Couldn’t load this bot.');
         return null;
@@ -1162,6 +1479,11 @@ const BotPane: React.FC<{
     },
     [botId]
   );
+
+  useEffect(() => {
+    if (!botNameHint) return;
+    setThread((current) => (current && current.bot.name !== botNameHint ? { ...current, bot: { ...current.bot, name: botNameHint } } : current));
+  }, [botNameHint, setThread]);
 
   /** The newest page, replacing what was loaded (opening the thread, or catching up after a long gap). */
   const loadNewest = useCallback(async () => {
@@ -1183,6 +1505,11 @@ const BotPane: React.FC<{
     for (let round = 0; round < BOT_THREAD_POLL_ROUNDS; round += 1) {
       const result = await fetchPage({ limit: BOT_THREAD_POLL_PAGE, afterSeq: cursor });
       if (!result) return;
+      // Conversation was cleared elsewhere (threadId rotated): reload from scratch.
+      if (result.bot.threadId && shown?.bot.threadId && result.bot.threadId !== shown.bot.threadId) {
+        await loadNewest();
+        return;
+      }
       setThread((current) => {
         if (!current) return current;
         const messages = mergeBotMessages(current.messages, result.messages);

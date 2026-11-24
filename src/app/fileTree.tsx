@@ -68,9 +68,10 @@ export const getFileIconMeta = (name: string, isDirectory: boolean) => {
 export const InlineRenameInput: React.FC<{
   initialValue: string;
   className?: string;
+  maxLength?: number;
   onSubmit: (value: string) => void;
   onCancel: () => void;
-}> = ({ initialValue, className, onSubmit, onCancel }) => {
+}> = ({ initialValue, className, maxLength, onSubmit, onCancel }) => {
   const [value, setValue] = useState(initialValue);
   const doneRef = useRef(false);
 
@@ -87,6 +88,7 @@ export const InlineRenameInput: React.FC<{
       type="text"
       className={className}
       value={value}
+      maxLength={maxLength}
       autoFocus
       onFocus={(e) => e.currentTarget.select()}
       onChange={(e) => setValue(e.target.value)}

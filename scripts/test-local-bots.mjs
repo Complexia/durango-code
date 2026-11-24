@@ -1746,6 +1746,94 @@ test('lanes carry the structured conversation; a reply asking for compaction for
   assert.equal(calls.length, 1, 'forced');
 });
 
+// --- rename, delete, and clear ---------------------------------------------------------------
+
+test('rename updates a bot name and persists across reload; blank names are rejected', async () => {
+  const dir = path.join(testRoot, `rename-${(dirCount += 1)}`);
+  const { engine } = makeEngine({ dir });
+  const [primary] = (await engine.list()).bots;
+  const renamed = await engine.rename(primary.id, '  Captain Durango  ');
+  assert.equal(renamed.name, 'Captain Durango');
+  await assert.rejects(() => engine.rename(primary.id, '   '), /Enter a name/i);
+  await engine.flush();
+
+  const { engine: reloaded } = makeEngine({ dir });
+  const [after] = (await reloaded.list()).bots;
+  assert.equal(after.name, 'Captain Durango');
+});
+
+test('deleteBot deletes non-primary bots and their files, aborts active replies, and refuses primary', async () => {
+  const dir = path.join(testRoot, `delete-${(dirCount += 1)}`);
+  const { engine, runner } = makeEngine({ dir });
+  const [primary] = (await engine.list()).bots;
+  await assert.rejects(() => engine.deleteBot(primary.id), /primary/i);
+
+  const projectBot = await engine.ensureProjectBot({ name: 'alpha', projectId: 'p1', repoId: 'r1' });
+  await engine.send(projectBot.id, { messageId: 'd1', content: 'working on it' });
+  await waitFor(() => runner.lanes.length === 1);
+  assert.equal(runner.lanes[0].ctx.signal.aborted, false);
+
+  await engine.deleteBot(projectBot.id);
+  assert.equal(runner.lanes[0].ctx.signal.aborted, true, 'in-flight reply aborted on delete');
+  await engine.idle();
+  await engine.flush();
+
+  const listed = (await engine.list()).bots;
+  assert.deepEqual(listed.map((bot) => bot.id), [primary.id]);
+  const files = await fs.readdir(dir);
+  assert.equal(files.some((name) => name.startsWith(`${projectBot.id}.`)), false, 'transcript and logs removed');
+
+  const { engine: reloaded } = makeEngine({ dir });
+  assert.deepEqual((await reloaded.list()).bots.map((bot) => bot.id), [primary.id]);
+});
+
+test('clear wipes history and memory, rotates threadId, does not requeue aborted replies, and persists across reload', async () => {
+  const dir = path.join(testRoot, `clear-${(dirCount += 1)}`);
+  const { engine, runner } = makeEngine({ dir });
+  const [primary] = (await engine.list()).bots;
+  const originalThreadId = primary.threadId;
+  assert.ok(originalThreadId, 'local bot has a threadId');
+
+  await engine.send(primary.id, { messageId: 'c1', content: 'hello' });
+  await waitFor(() => runner.lanes.length === 1);
+  assert.equal(runner.lanes[0].lane.threadId, originalThreadId);
+  runner.lanes[0].finish({ text: 'hi there' });
+  await engine.idle();
+
+  // Start a second reply and clear while it is still running.
+  await engine.send(primary.id, { messageId: 'c2', content: 'in flight' });
+  await waitFor(() => runner.lanes.length === 2);
+
+  const cleared = await engine.clear(primary.id);
+  assert.equal(runner.lanes[1].ctx.signal.aborted, true, 'in-flight reply aborted on clear');
+  assert.notEqual(cleared.threadId, originalThreadId, 'threadId rotated');
+  assert.equal(cleared.unread, 0);
+  assert.equal(cleared.lastPreview, null);
+  await engine.idle();
+  await engine.flush();
+
+  const thread = await engine.thread(primary.id);
+  assert.equal(thread.messages.length, 0);
+  assert.equal(thread.live.length, 0);
+  assert.equal(runner.lanes.length, 2, 'aborted reply claims were not requeued');
+
+  // Reload from disk and verify nothing came back, then send a fresh message.
+  const { engine: reloaded, runner: runner2 } = makeEngine({ dir });
+  const reloadedThread = await reloaded.thread(primary.id);
+  assert.equal(reloadedThread.messages.length, 0);
+  assert.equal(reloadedThread.bot.threadId, cleared.threadId);
+
+  await reloaded.send(primary.id, { messageId: 'c3', content: 'fresh start' });
+  await waitFor(() => runner2.lanes.length === 1);
+  assert.equal(runner2.lanes[0].lane.threadId, cleared.threadId);
+  assert.deepEqual(
+    runner2.lanes[0].lane.session.history.map((item) => [item.seq, item.text]),
+    [[1, 'fresh start']]
+  );
+  runner2.lanes[0].finish({ text: 'ready!' });
+  await reloaded.idle();
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 let failed = 0;
