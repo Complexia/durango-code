@@ -11,6 +11,7 @@ import {
 import { toast } from 'sonner';
 import type { ThreadDurangoWorkspace } from '../store';
 import type { DurangoWorkspaceStatus } from '../types';
+import { confirmDialog } from './ConfirmDialog';
 
 // Thread header pill for the thread's Durango workspace (docs/workspaces.md):
 // where it is, the change it holds, its dev server, landing, and removal. The
@@ -105,14 +106,14 @@ const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ wo
 
   const land = async () => {
     if (!change || !window.orion?.landDurangoWorkspace) return;
-    if (
-      !confirm(
-        `Land ${change.changeId}?\n\nIt goes on the train, which runs the checks, deploys the affected targets, and only then moves main.`
-      )
-    ) {
-      return;
-    }
     setOpen(false);
+    const confirmed = await confirmDialog({
+      title: `Land ${change.changeId}?`,
+      description:
+        'It goes on the train, which runs the checks, deploys the affected targets, and only then moves main.',
+      confirmLabel: 'Land',
+    });
+    if (!confirmed) return;
     setBusy('land');
     toast.info(`Landing ${change.changeId} — it is on the train`);
     try {

@@ -33,6 +33,7 @@ import { THREAD_DRAG_MIME } from './SavedViewsSection';
 import { formatWorkedDuration, threadSidebarTone, threadWorkedMs, type SidebarV2Lists, type SidebarV2View, type SidebarV2ViewsSettings } from './threadLists';
 import ThemeSlot from './themes/ThemeSlot';
 import { AGENTS_SIDEBAR_STORAGE_KEY, SidebarModeHeader } from './SidebarModeHeader';
+import { confirmDialog } from './ConfirmDialog';
 
 // The Threads tab's sidebar ("sidebar v2"), after T3 Code's: one flat list of
 // threads. Under the shared Projects | Threads | Bots header
@@ -461,7 +462,14 @@ export const ThreadRow = React.memo(function ThreadRow({
       icon: <Trash2 size={13} />,
       danger: true,
       run: () => {
-        if (confirm('Delete this thread?')) void model.deleteThreadWithRuntime(thread.id);
+        void confirmDialog({
+          title: 'Delete this thread?',
+          description: 'This permanently removes the thread and its conversation.',
+          confirmLabel: 'Delete',
+          tone: 'danger',
+        }).then((confirmed) => {
+          if (confirmed) void model.deleteThreadWithRuntime(thread.id);
+        });
       },
     },
   ];

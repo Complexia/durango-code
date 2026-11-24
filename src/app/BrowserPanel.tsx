@@ -33,6 +33,7 @@ const OVERLAY_SELECTOR = [
   '.modal-backdrop',
   '.modal',
   '[role="dialog"]',
+  '[role="alertdialog"]',
   '[role="menu"]',
   '[role="listbox"]',
   '.review-popover',

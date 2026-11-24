@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm';
 import { Sparkles } from 'lucide-react';
 import { toast } from 'sonner';
 import type { AppUpdateState } from './appTypes';
+import { ConfirmModal } from './ConfirmDialog';
 
 // The app update's surfaces besides the sidebar button itself: the hover card
 // with what changed, the confirmation before restarting into the update, and
@@ -186,46 +187,23 @@ export const RestartToUpdateDialog: React.FC<{
   runningThreadCount: number;
   onCancel: () => void;
   onConfirm: () => void;
-}> = ({ version, runningThreadCount, onCancel, onConfirm }) => {
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onCancel();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [onCancel]);
-
-  return (
-    <div className="modal-backdrop" role="presentation" onClick={onCancel}>
-      <div
-        className="modal"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="restart-to-update-title"
-        aria-describedby="restart-to-update-description"
-        data-testid="restart-to-update-dialog"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <h2 id="restart-to-update-title" className="modal-title">
-          Install update{version ? ` ${version}` : ''} and restart Durango Code?
-        </h2>
-        <p id="restart-to-update-description" className="modal-subtitle">
-          Any running tasks will be interrupted. Make sure you&apos;re ready before continuing.
-          {runningThreadCount > 0 &&
-            ` ${runningThreadCount} ${runningThreadCount === 1 ? 'thread is' : 'threads are'} running right now.`}
-        </p>
-        <div className="modal-actions">
-          <button type="button" className="btn secondary" onClick={onCancel}>
-            Cancel
-          </button>
-          <button type="button" className="btn" onClick={onConfirm} autoFocus>
-            Confirm
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
+}> = ({ version, runningThreadCount, onCancel, onConfirm }) => (
+  <ConfirmModal
+    title={`Install update${version ? ` ${version}` : ''} and restart Durango Code?`}
+    description={
+      <>
+        Any running tasks will be interrupted. Make sure you&apos;re ready before continuing.
+        {runningThreadCount > 0 &&
+          ` ${runningThreadCount} ${runningThreadCount === 1 ? 'thread is' : 'threads are'} running right now.`}
+      </>
+    }
+    confirmLabel="Confirm"
+    cancelLabel="Cancel"
+    testId="restart-to-update-dialog"
+    onCancel={onCancel}
+    onConfirm={onConfirm}
+  />
+);
 
 // Shown once on the first launch of a new version, in the corner the update
 // button lives in, until the user clicks OK.

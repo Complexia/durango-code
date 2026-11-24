@@ -3,6 +3,7 @@ import { OctagonX, RefreshCw } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useOrionStore, type Thread } from '../store';
 import type { DevServerEntry } from '../types';
+import { confirmDialog } from './ConfirmDialog';
 
 // Dev servers are OS processes, not app state: every scan rebuilds the list
 // from lsof/ps in the main process, so this panel keeps its own state (like
@@ -194,7 +195,13 @@ const DevServersSettings = React.memo(function DevServersSettings({ formatBytes 
         .map((server) => `${server.command}${server.ports.length ? ` on port ${server.ports.join(', ')}` : ''}`)
         .join('\n');
       const label = targets.length === 1 ? 'this dev server' : `these ${targets.length} dev servers`;
-      if (!confirm(`Kill ${label}?\n\n${summary}`)) return;
+      const confirmed = await confirmDialog({
+        title: `Kill ${label}?`,
+        detail: summary,
+        confirmLabel: 'Kill',
+        tone: 'danger',
+      });
+      if (!confirmed) return;
       setKilling(new Set(targets.map((server) => server.pid)));
       try {
         const result = await window.orion.killDevServers({

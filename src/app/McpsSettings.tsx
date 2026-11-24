@@ -3,6 +3,7 @@ import { ExternalLink, Globe, LogIn, Plus, RefreshCw, Share2, TerminalSquare, Tr
 import { useOrionStore } from '../store';
 import type { AccountConnectorsListResult, OrionMcpEntry, ProviderMcpEntry, ProviderMcpSource, ProviderMcpsListResult } from '../types';
 import { parseKeyValueLines, splitCommandLine, suggestMcpNickname } from './orionMcps';
+import { confirmDialog } from './ConfirmDialog';
 
 // Settings and the composer's @-mention list share the connected-server list;
 // mutations here tell the composer to re-read it.
@@ -173,7 +174,13 @@ const OrionMcpsSection = React.memo(function OrionMcpsSection() {
 
   const handleRemove = async (server: OrionMcpEntry) => {
     if (!window.orion?.removeOrionMcp) return;
-    if (!window.confirm(`Disconnect @${server.nickname}? Threads that mention it will no longer load it.`)) return;
+    const confirmed = await confirmDialog({
+      title: `Disconnect @${server.nickname}?`,
+      description: 'Threads that mention it will no longer load it.',
+      confirmLabel: 'Disconnect',
+      tone: 'danger',
+    });
+    if (!confirmed) return;
     setBusyId(server.id);
     try {
       const result = await window.orion.removeOrionMcp({ id: server.id });

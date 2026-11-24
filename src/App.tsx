@@ -228,6 +228,7 @@ import { buildChatMentionsContext, knownDurangoChats, parseChatMentions } from '
 import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
 import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
 import { RestartToUpdateDialog, WhatsNewNotice } from './app/AppUpdateUi';
+import { ConfirmDialogHost, confirmDialog } from './app/ConfirmDialog';
 import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
 import { ProviderAuthCodePrompt } from './app/ProviderAuthCodePrompt';
 import { addPromptContext, parseCodexReviewCommand } from './app/slashCommands';
@@ -2842,14 +2843,16 @@ const App: React.FC = () => {
         toast.error('Stop the agents working in this workspace before removing it');
         return;
       }
-      if (
-        !confirm(
-          `Remove Durango workspace ${workspace.name}?\n\n` +
-            'Its directory is deleted. ' +
-            (sharing.length > 1 ? `${sharing.length} threads work in it; they ` : 'The thread ') +
-            'keep their transcripts, and the next message starts a fresh agent session in a new workspace.'
-        )
-      ) {
+      const confirmed = await confirmDialog({
+        title: `Remove Durango workspace ${workspace.name}?`,
+        description:
+          'Its directory is deleted. ' +
+          (sharing.length > 1 ? `${sharing.length} threads work in it; they ` : 'The thread ') +
+          'keep their transcripts, and the next message starts a fresh agent session in a new workspace.',
+        confirmLabel: 'Remove',
+        tone: 'danger',
+      });
+      if (!confirmed) {
         return;
       }
       markWorkspaceThreads('removal', sharingIds, true);
@@ -2861,11 +2864,14 @@ const App: React.FC = () => {
           path: workspace.path,
         });
         if (!result.ok && result.unlanded) {
-          if (
-            !confirm(
-              `${workspace.name} has work that has not landed:\n\n${result.error ?? ''}\n\nDiscard it and remove the workspace anyway?`
-            )
-          ) {
+          const discardConfirmed = await confirmDialog({
+            title: `${workspace.name} has unlanded work`,
+            description: 'Discard the unlanded work and remove the workspace anyway?',
+            detail: result.error?.trim() || undefined,
+            confirmLabel: 'Discard and remove',
+            tone: 'danger',
+          });
+          if (!discardConfirmed) {
             return;
           }
           result = await window.orion.removeDurangoWorkspace({
@@ -5087,13 +5093,14 @@ const App: React.FC = () => {
         return;
       }
       const dirtyFiles = useOrionStore.getState().openFiles.filter((file) => file.isDirty);
-      if (
-        dirtyFiles.length > 0 &&
-        !confirm(
-          `Open ${skill.name} and discard unsaved changes in ${dirtyFiles.length} file${dirtyFiles.length === 1 ? '' : 's'}?`
-        )
-      ) {
-        return;
+      if (dirtyFiles.length > 0) {
+        const confirmed = await confirmDialog({
+          title: 'Discard unsaved changes?',
+          description: `Open ${skill.name} and discard unsaved changes in ${dirtyFiles.length} file${dirtyFiles.length === 1 ? '' : 's'}?`,
+          confirmLabel: 'Discard and open',
+          tone: 'danger',
+        });
+        if (!confirmed) return;
       }
       setWorkspacePath(skill.path);
       closeAllFiles();
@@ -11374,13 +11381,19 @@ const App: React.FC = () => {
         onAddProjectPath={(path) => void handleAddProject({ path })}
         onAddProjectWithDialog={() => void handleAddProject()}
         onRemoveProject={(project) => {
-          if (confirm(`Remove "${project.name}" and its threads? Files on disk are not affected.`)) {
-            void removeProjectWithRuntimes(project.id);
-          }
+          void confirmDialog({
+            title: `Remove "${project.name}"?`,
+            description: 'This removes the project and its threads from Durango Code. Files on disk are not affected.',
+            confirmLabel: 'Remove',
+            tone: 'danger',
+          }).then((confirmed) => {
+            if (confirmed) void removeProjectWithRuntimes(project.id);
+          });
         }}
         onClose={closeProjectPicker}
       />
       <ImageLightbox />
+      <ConfirmDialogHost />
       {draggingFiles && (
         <div className="file-drop-overlay">
           <div className="file-drop-target">
@@ -11509,9 +11522,15 @@ const App: React.FC = () => {
                       role="menuitem"
                       onClick={() => {
                         setThreadMenuOpen(false);
-                        if (confirm('Delete this thread?')) {
-                          void deleteThreadWithRuntime(selectedThread.id);
-                        }
+                        const threadId = selectedThread.id;
+                        void confirmDialog({
+                          title: 'Delete this thread?',
+                          description: 'This permanently removes the thread and its conversation.',
+                          confirmLabel: 'Delete',
+                          tone: 'danger',
+                        }).then((confirmed) => {
+                          if (confirmed) void deleteThreadWithRuntime(threadId);
+                        });
                       }}
                     >
                       <Trash2 size={13} /> Delete

@@ -43,6 +43,7 @@ import {
   X,
 } from 'lucide-react';
 import { defaultDurangoBotsSettings, defaultDurangoSettings, useOrionStore, type Thread } from '../store';
+import { confirmDialog } from './ConfirmDialog';
 import { formatShortTime, getThreadActivityTime } from './time';
 import { botFaceDataUrl, botFaceSeed } from './botFace';
 import { ProjectIcon } from './ProjectIcon';
@@ -634,7 +635,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
 
   const handleClearBot = useCallback(
     async (bot: DesktopBot) => {
-      if (!confirm(`Clear all past conversation with ${bot.name}?`)) return;
+      const confirmed = await confirmDialog({
+        title: `Clear conversation with ${bot.name}?`,
+        description: 'This removes all past conversation with this bot.',
+        confirmLabel: 'Clear',
+        tone: 'danger',
+      });
+      if (!confirmed) return;
       setActionError(null);
       const result = await window.orion?.clearBot?.({ botId: bot.id });
       if (!result?.ok) {
@@ -667,7 +674,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const handleDeleteBot = useCallback(
     async (bot: DesktopBot) => {
       if (bot.role === 'primary') return;
-      if (!confirm(`Delete ${bot.name}? This removes the bot and its conversation.`)) return;
+      const confirmed = await confirmDialog({
+        title: `Delete ${bot.name}?`,
+        description: 'This removes the bot and its conversation.',
+        confirmLabel: 'Delete',
+        tone: 'danger',
+      });
+      if (!confirmed) return;
       setActionError(null);
       const result = await window.orion?.deleteBot?.({ botId: bot.id });
       if (!result?.ok) {
