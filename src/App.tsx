@@ -11930,7 +11930,7 @@ const App: React.FC = () => {
         />
       )}
 
-      {whatsNew?.unseen && (
+      {whatsNew?.unseen && !showWorkspaceSyncConsentPrompt && (
         <WhatsNewNotice version={whatsNew.version} notes={whatsNew.notes} onDismiss={dismissWhatsNew} />
       )}
 

@@ -596,9 +596,12 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     checked={workspaceSyncSettings.enabled}
                     disabled={!accountState.authenticated && !workspaceSyncSettings.enabled}
                     onChange={(e) =>
-                      // Any explicit choice also settles the one-time opt-in prompt.
+                      // Any explicit choice also settles the one-time opt-in prompt;
+                      // turning sharing off resets code sync so re-enabling sharing
+                      // never resumes code uploads without a separate opt-in.
                       setWorkspaceSyncSettings({
                         enabled: e.target.checked,
+                        ...(e.target.checked ? {} : { syncCode: false }),
                         consentVersion: WORKSPACE_SYNC_CONSENT_VERSION,
                         consentNoticeSeen: true,
                       })
@@ -618,10 +621,19 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     changes are never uploaded or deployed.
                   </div>
                 </div>
-                <label className="provider-toggle" title="Auto-publish and push git projects">
+                <label
+                  className="provider-toggle"
+                  title={
+                    !accountState.authenticated
+                      ? 'Sign in to your Durango account first'
+                      : !workspaceSyncSettings.enabled
+                        ? 'Turn on “Share coding work with Durango” first'
+                        : 'Auto-publish and push git projects as private Durango Cloud repos'
+                  }
+                >
                   <input
                     type="checkbox"
-                    checked={workspaceSyncSettings.syncCode}
+                    checked={workspaceSyncSettings.enabled && workspaceSyncSettings.syncCode}
                     disabled={!accountState.authenticated || !workspaceSyncSettings.enabled}
                     onChange={(e) => setWorkspaceSyncSettings({ syncCode: e.target.checked })}
                   />

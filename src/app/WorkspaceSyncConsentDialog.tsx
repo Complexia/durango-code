@@ -20,6 +20,7 @@ export const WorkspaceSyncConsentDialog: React.FC<WorkspaceSyncConsentDialogProp
   const codeSyncId = useId();
   const [syncCode, setSyncCode] = useState(false);
 
+  const dialogRef = useRef<HTMLDivElement>(null);
   const codeCheckboxRef = useRef<HTMLInputElement>(null);
   const declineRef = useRef<HTMLButtonElement>(null);
   const acceptRef = useRef<HTMLButtonElement>(null);
@@ -34,6 +35,11 @@ export const WorkspaceSyncConsentDialog: React.FC<WorkspaceSyncConsentDialogProp
     declineRef.current?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // Yield keyboard handling if a higher-layer modal (such as ConfirmModal
+      // or RestartToUpdateDialog) is currently open above this dialog.
+      const modals = document.querySelectorAll('[aria-modal="true"]');
+      if (modals.length > 0 && modals[modals.length - 1] !== dialogRef.current) return;
+
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
@@ -74,6 +80,7 @@ export const WorkspaceSyncConsentDialog: React.FC<WorkspaceSyncConsentDialogProp
       }}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

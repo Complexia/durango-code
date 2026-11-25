@@ -209,13 +209,13 @@ export const defaultDurangoWorkspaceSettings: DurangoWorkspaceSettings = {
 
 /**
  * Work sharing ("Share coding work with Durango") — workspace sync to Durango
- * Code web (docs in cloud/docs/workspace-sync.md): projects, threads (full
- * transcripts), token usage, and — when syncCode is also enabled — code as
- * private Durango Cloud repos with full git history. Durango Chat uses
- * summaries of synced threads for memory, and durango.sh shows Usage and Source
- * profile stats. Both sharing and code sync are opt-in and off by default
- * (consentVersion 2, see app/workspaceSyncConsent.ts); while off (or signed
- * out) the desktop makes no sync calls of any kind and captures nothing extra.
+ * Code web: projects, threads (full transcripts), token usage, and — when
+ * syncCode is also enabled — code as private Durango Cloud repos with full git
+ * history. Durango Chat uses summaries of synced threads for memory, and
+ * durango.sh shows Usage and Source profile stats. Both sharing and code sync
+ * are opt-in and off by default (consentVersion 2, see
+ * app/workspaceSyncConsent.ts); while off (or signed out) the desktop makes no
+ * sync calls of any kind and captures nothing extra.
  */
 export type WorkspaceSyncSettings = {
   /** Master switch; opt-in, off by default, requires a signed-in Durango account. */

@@ -1462,7 +1462,7 @@ app.whenReady().then(async () => {
     void providerSignInWatch.check();
   });
 
-  // Workspace sync (opt-in, contract in orion-web/docs/workspace-sync.md).
+  // Workspace sync (opt-in, off by default).
   // Seed the engine from the persisted store so an enabled sync resumes after
   // restart without waiting for the renderer to hydrate; the renderer re-pushes
   // the settings over sync:configure on hydration and every change.
@@ -1483,9 +1483,9 @@ app.whenReady().then(async () => {
   });
   void readPersistedStoreState().then((state) => {
     // Same consent reconciliation as the renderer store (both sharing and code
-    // sync are opt-in and off by default since consent v2). A store without
-    // settings yet is a fresh install and stays off until the user opts in.
-    if (state?.workspaceSyncSettings) {
+    // sync are opt-in and off by default since consent v2). Skip if the
+    // renderer already pushed live settings via sync:configure.
+    if (workspaceSyncConfigureSeq === 0 && state?.workspaceSyncSettings) {
       configureWorkspaceSync(migrateWorkspaceSyncSettings(state.workspaceSyncSettings));
     }
   });
@@ -2236,7 +2236,11 @@ ipcMain.handle('sessionImport:read', async (_event, input) => {
 
 // Workspace sync surface. Configure carries the renderer's persisted opt-in
 // settings; the engine itself no-ops while disabled or signed out.
-ipcMain.handle('sync:configure', (_event, value) => configureWorkspaceSync(value));
+let workspaceSyncConfigureSeq = 0;
+ipcMain.handle('sync:configure', (_event, value) => {
+  workspaceSyncConfigureSeq += 1;
+  return configureWorkspaceSync(value);
+});
 ipcMain.handle('sync:now', () => workspaceSyncNow());
 ipcMain.handle('sync:getState', () => getWorkspaceSyncStatus());
 
