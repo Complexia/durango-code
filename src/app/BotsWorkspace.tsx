@@ -336,6 +336,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const [actionError, setActionError] = useState<string | null>(null);
   const [renamingBotId, setRenamingBotId] = useState<string | null>(null);
   const [creatingBot, setCreatingBot] = useState<NewBotTarget | null>(null);
+  const closeNewBotModal = useCallback(() => setCreatingBot(null), []);
   const [clearedEpochs, setClearedEpochs] = useState<Record<string, number>>({});
   const collapsedBotProjects = v3?.collapsedBotProjects ?? [];
   const collapsedSet = useMemo(() => new Set(collapsedBotProjects), [collapsedBotProjects]);
@@ -994,7 +995,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
         <NewBotModal
           initialProject={creatingBot.project}
           projectOptions={newBotProjectOptions}
-          onClose={() => setCreatingBot(null)}
+          onClose={closeNewBotModal}
           onCreated={(created) => {
             setCreatingBot(null);
             botAdded(created);
@@ -1046,6 +1047,9 @@ const NewBotModal: React.FC<{
 
   useEffect(() => {
     nameRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || busy) return;
       if (projectMenuOpen) {
