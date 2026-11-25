@@ -674,6 +674,7 @@ export const createClaudeLaneRunner = ({
   const sendsMessages = typeof ctx.sendMessage === 'function';
   const blocks = []; // finished text blocks of the message being written (main loop)
   let finalStart = 0; // blocks index where text after the last tool call begins
+  const toolBoundaries = []; // blocks indices where tool calls happened (for finalMessageOnly)
   let partial = ''; // the text block streaming now
   const toolCalls = new Map(); // tool_use id -> tool name (main loop)
   let sentCount = 0; // messages sent before the final answer
@@ -701,6 +702,7 @@ export const createClaudeLaneRunner = ({
     sentCount += 1;
     blocks.length = 0;
     finalStart = 0;
+    toolBoundaries.length = 0;
     const modelId = durangoModelIdForClaude(modelOfReply);
     // Screenshots and files it names are attached (with its final answer, or
     // its last message); their local embeds leave the text.
@@ -930,6 +932,7 @@ export const createClaudeLaneRunner = ({
               // The step's text is a message of its own, sent as its first call starts.
               if (stepMessage === null) stepMessage = sendPending();
               finalStart = blocks.length;
+              toolBoundaries.push(blocks.length);
               noteToolCall(block.id);
             }
           }
@@ -969,6 +972,7 @@ export const createClaudeLaneRunner = ({
             // posting two separate replies (e.g. "He" then "Hey").
             const hadDraft = blocks.slice(finalStart).some((part) => String(part ?? '').trim());
             blocks.length = finalStart;
+            while (toolBoundaries.length && toolBoundaries[toolBoundaries.length - 1] > finalStart) toolBoundaries.pop();
             update();
             inputQueue.push(userMessage(formatBotFinalInbox(items, { replacedDraft: hadDraft })));
           } else {
@@ -976,6 +980,7 @@ export const createClaudeLaneRunner = ({
             // keep what was answered so far as its own message and go on.
             sendPending();
             finalStart = blocks.length;
+            toolBoundaries.push(blocks.length);
             update();
             inputQueue.push(userMessage(formatBotInbox(items)));
           }
@@ -1021,6 +1026,7 @@ export const createClaudeLaneRunner = ({
     plan = nextPlan;
     blocks.length = 0;
     finalStart = 0;
+    toolBoundaries.length = 0;
     finalInboxRounds = 0;
     partial = '';
     toolCalls.clear();
@@ -1099,7 +1105,27 @@ export const createClaudeLaneRunner = ({
   // The final answer: what it wrote after its last message, after any message that couldn't be sent.
   await sending;
   await Promise.all(fileLookups);
-  const written = [...unsent.filter(Boolean), currentText()].filter((text) => text.trim()).join('\n\n');
+  const finalMessageText = () => {
+    const tail = [...blocks.slice(finalStart), partial]
+      .map((part) => String(part ?? '').trim())
+      .filter(Boolean)
+      .join('\n\n');
+    if (tail) return tail;
+    const boundaries = [0, ...new Set(toolBoundaries.filter((n) => n > 0 && n < blocks.length).sort((a, b) => a - b)), blocks.length];
+    for (let index = boundaries.length - 1; index > 0; index -= 1) {
+      const segment = blocks
+        .slice(boundaries[index - 1], boundaries[index])
+        .map((part) => String(part ?? '').trim())
+        .filter(Boolean)
+        .join('\n\n');
+      if (segment) return segment;
+    }
+    return '';
+  };
+  const written =
+    lane.finalMessageOnly && !sendsMessages
+      ? finalMessageText()
+      : [...unsent.filter(Boolean), currentText()].filter((text) => text.trim()).join('\n\n');
   const modelId = durangoModelIdForClaude(attempt.model);
   const withModel = modelId ? { modelId } : {};
   // Messages it sent before its final answer.

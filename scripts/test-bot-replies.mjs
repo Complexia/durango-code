@@ -2474,6 +2474,58 @@ try {
     assert.equal(sdk.runs[0].options.effort, 'xhigh');
   });
 
+  await test('lane runner: finalMessageOnly drops earlier progress narration before tool calls and falls back if ending on a tool', async () => {
+    const runWith = async (messages) => {
+      const sdk = createFakeSdk(async function* ({ next }) {
+        await next();
+        for (const message of messages) yield message;
+      });
+      const run = createClaudeLaneRunner({
+        loadSdk: async () => sdk,
+        loadZod: async () => zod,
+        createInputQueue,
+        botsDir: path.join(testRoot, 'bots-final-only'),
+      });
+      return run(
+        {
+          laneId: 'lt-final',
+          botId: 'b1',
+          botName: 'Durango',
+          model: 'claude-sonnet-5-5',
+          systemPrompt: 'sys',
+          prompt: 'do task',
+          tools: [],
+          attachments: [],
+          finalMessageOnly: true,
+        },
+        {
+          signal: new AbortController().signal,
+          accessMode: 'read-only',
+          update: () => {},
+          takeInbox: async () => [],
+          callTool: async () => ({ result: null }),
+        }
+      );
+    };
+
+    const withFinal = await runWith([
+      init('claude-sonnet-5-5'),
+      assistant('a1', [{ type: 'text', text: 'Checking the repo first...' }, { type: 'tool_use', id: 'tu1', name: 'Read', input: {} }]),
+      assistant('a2', [{ type: 'text', text: 'Running tests now...' }, { type: 'tool_use', id: 'tu2', name: 'Bash', input: {} }]),
+      assistant('a3', [{ type: 'text', text: 'All tests passed. Opened chg_123.' }]),
+      success(),
+    ]);
+    assert.equal(withFinal.text, 'All tests passed. Opened chg_123.');
+
+    const endedOnTool = await runWith([
+      init('claude-sonnet-5-5'),
+      assistant('a1', [{ type: 'text', text: 'Starting...' }, { type: 'tool_use', id: 'tu1', name: 'Read', input: {} }]),
+      assistant('a2', [{ type: 'text', text: 'Final summary before cleanup.' }, { type: 'tool_use', id: 'tu2', name: 'Bash', input: {} }]),
+      success(),
+    ]);
+    assert.equal(endedOnTool.text, 'Final summary before cleanup.');
+  });
+
   await test('bot attachments: stage locally for instant handoff, upload in background, handle failure + retry, and never re-download local files', async () => {
     const srcFile = path.join(testRoot, 'retina-shot.png');
     const payload = Buffer.from('fake-png-bytes-5.9mb');

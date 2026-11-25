@@ -2095,6 +2095,53 @@ test('per-project primary bots: default first/oldest, switch primary, promote on
   await engine.stop();
 });
 
+test('local bots: delegated tasks request finalMessageOnly and middle-trim huge reports while keeping opening, closing and footer', async () => {
+  const started = [];
+  const { engine, runner } = makeEngine({
+    listProjects: async () => [{ id: 'proj_1', name: 'Durango', path: '/Users/me/durango' }],
+    startProjectThread: async (input) => {
+      started.push(input);
+      return { ok: true, threadId: 'thread_99' };
+    },
+  });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'm1', content: 'Run both tasks.' });
+  await waitFor(() => runner.lanes.length === 1);
+  // 1. Non-project task: requests finalMessageOnly and middle-trims > 12,000 chars.
+  await runner.lanes[0].ctx.callTool({ name: 'delegate_task', input: { title: 'Research', instructions: 'Look it up.' }, toolCallId: 't1' });
+  await waitFor(() => runner.lanes.length === 2);
+  assert.equal(runner.lanes[1].lane.finalMessageOnly, true);
+  // 2. Project thread task.
+  await runner.lanes[0].ctx.callTool({ name: 'delegate_task', input: { title: 'Ship', instructions: 'Ship it.', project: 'Durango' }, toolCallId: 't2' });
+  runner.lanes[0].finish({ text: 'Started both.' });
+  await waitFor(() => runner.lanes[0].done);
+
+  runner.lanes[1].finish({ text: 'RESEARCH START\n' + 'r'.repeat(14_000) + '\nRESEARCH END' });
+  await waitFor(() => runner.lanes.length === 3);
+  const researchPrompt = runner.lanes[2].lane.prompt;
+  assert.match(researchPrompt, /RESEARCH START/);
+  assert.match(researchPrompt, /RESEARCH END/);
+  assert.match(researchPrompt, /…\[middle trimmed\]…/);
+  runner.lanes[2].finish({ text: 'Reported research.' });
+  await waitFor(() => runner.running().length === 0);
+
+  // Project thread settled with > 12,000 chars: middle-trimmed, footer preserved.
+  await engine.threadSettled({
+    key: started[0].key,
+    threadId: 'thread_99',
+    outcome: 'finished',
+    summary: 'SHIP SUMMARY\n' + 's'.repeat(14_000) + '\nChange: chg_999',
+  });
+  await waitFor(() => runner.lanes.length === 4);
+  const shipPrompt = runner.lanes[3].lane.prompt;
+  assert.match(shipPrompt, /SHIP SUMMARY/);
+  assert.match(shipPrompt, /Change: chg_999/);
+  assert.match(shipPrompt, /Durango Code thread thread_99/);
+  assert.match(shipPrompt, /…\[middle trimmed\]…/);
+  runner.lanes[3].finish({ text: 'Done.' });
+  await engine.idle();
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 let failed = 0;

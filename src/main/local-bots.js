@@ -10,9 +10,11 @@ import {
   BOT_THREAD_TOOLS,
   resolveThreadModelChoice,
   threadNoticeText,
+  threadReportFooter,
   threadReportText,
   withThreadReportFooter,
 } from './bot-thread-tools.js';
+import { clipMiddle } from '../report-clip.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -62,6 +64,7 @@ export const LOCAL_BOT_COMPACTION_MODEL = 'claude-haiku-5-5';
 export const LOCAL_BOT_PARALLEL_AFTER_MS = 5_000;
 export const LOCAL_BOT_MAX_REPLIES = 2;
 export const LOCAL_BOT_MAX_TASKS = 3;
+export const LOCAL_BOT_TASK_RESULT_MAX_CHARS = 12_000;
 export const LOCAL_BOT_MESSAGE_CAP = 2_000;
 /** Cards (pages, buttons) one reply may show. */
 const LOCAL_REPLY_CARDS_MAX = 6;
@@ -1697,6 +1700,7 @@ export const createLocalBotEngine = ({
       tools: [],
       // Its report names files by full path; the bot attaches them in its reply.
       replyFiles: false,
+      finalMessageOnly: true,
       heartbeatMs: HEARTBEAT_MS,
     };
     track(
@@ -1715,7 +1719,7 @@ export const createLocalBotEngine = ({
         }
         runtime.tasks.delete(task.id);
         if (myGeneration !== generation || entries.get(entry.bot.id) !== entry || task.abort.signal.aborted || outcome?.aborted) return;
-        const text = str(outcome?.text).trim();
+        const text = clipMiddle(str(outcome?.text), LOCAL_BOT_TASK_RESULT_MAX_CHARS);
         const report = text || `The task couldn't finish: ${clip(oneLine(outcome?.failure) || 'it ended without a report.', 300)}`;
         appendInbox(entry, { content: report, authorLabel: inboxLabel('task', task.title) });
       })()
@@ -2768,14 +2772,19 @@ export const createLocalBotEngine = ({
       runtime.reportedThreads.delete(str(key));
       if (task) runtime.reportedThreads.set(str(key), { ...task, waiting: stillWaiting });
       while (runtime.reportedThreads.size > 50) runtime.reportedThreads.delete(runtime.reportedThreads.keys().next().value);
+      const footer = threadReportFooter(thread);
+      const bodyMax = Math.max(200, LOCAL_BOT_TASK_RESULT_MAX_CHARS - (footer ? footer.length + 2 : 0));
       const report =
         outcome === 'finished'
           ? withThreadReportFooter(
-              threadReportText({
-                summary: str(summary).trim() || 'The thread finished without a written summary.',
-                waiting: stillWaiting ? waiting : [],
-                later: !running && Boolean(task),
-              }),
+              clipMiddle(
+                threadReportText({
+                  summary: str(summary).trim() || 'The thread finished without a written summary.',
+                  waiting: stillWaiting ? waiting : [],
+                  later: !running && Boolean(task),
+                }),
+                bodyMax
+              ),
               thread
             )
           : withThreadReportFooter(`The task couldn't finish (${where}): ${clip(oneLine(error) || 'the thread stopped.', 300)}`, thread);
@@ -2806,7 +2815,7 @@ export const createLocalBotEngine = ({
       const thread = { threadId: str(threadId).trim() || task?.threadId || '', project: task?.project ?? null };
       const message = appendInbox(entry, {
         id: `notice_${str(key).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120)}_${id}`,
-        content: withThreadReportFooter(threadNoticeText(title, kind, clip(str(detail), 4_000)), thread),
+        content: withThreadReportFooter(threadNoticeText(title, kind, clipMiddle(str(detail), 4_000)), thread),
         authorLabel: inboxLabel('task', title),
       });
       // On disk: in the saved transcript, or (trimmed past the cap) no longer kept at all.

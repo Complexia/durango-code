@@ -33,8 +33,11 @@ import {
 import { checkoutFolderName, chooseCheckoutDir, cliSupportsClone, createSourceCheckout, sourceCheckoutRoot } from '../src/main/source-checkout.js';
 import { linuxPasswordStore } from '../src/main/linux-password-store-policy.js';
 import {
+  BOT_TASK_SUMMARY_MAX_CHARS,
   DISPATCH_STUCK_AFTER_MS,
+  DISPATCH_SUMMARY_MAX_CHARS as RENDERER_DISPATCH_SUMMARY_MAX_CHARS,
   activityToolName,
+  dispatchRunFinalText,
   durangoDispatchHasNewRuns,
   durangoDispatchLiveRun,
   durangoDispatchLiveRunAt,
@@ -47,6 +50,7 @@ import {
   startDurangoDispatchReporter,
   userActionText,
 } from '../src/app/durangoDispatch.ts';
+import { clipMiddle } from '../src/report-clip.js';
 // stream-adapters.js as a plain Node module (its one Electron import is a seam):
 // the Claude driver builds a run's steps with it.
 const { extractActivitiesFromJsonEvent } = await import(
@@ -487,15 +491,19 @@ try {
     assert.equal(claimsSoFar().length, claimsWhileBusy, 'at the concurrency limit the loop stops claiming');
     assert.equal(worker.getState().status, 'busy');
 
-    // The renderer reports the outcome; the summary is capped.
-    const long = 'x'.repeat(5_000);
+    // The renderer reports the outcome; the summary is capped by trimming only the middle.
+    const long = 'OPENING SUMMARY: ' + 'x'.repeat(5_000) + ' CLOSING RESULT';
     const settled = await worker.settle({ dispatchId: 'disp_1', threadId: 'thread-1', outcome: 'finished', summary: long });
     assert.equal(settled.ok, true);
     const finished = reports().at(-1);
     assert.equal(finished.status, 'finished');
     assert.equal(finished.codeThreadId, 'thread-1');
     assert.equal(finished.machineId, 'device-uuid-1');
-    assert.equal(finished.summary.length, DISPATCH_SUMMARY_MAX_CHARS);
+    assert.equal(DISPATCH_SUMMARY_MAX_CHARS, 4_000);
+    assert.ok(finished.summary.length <= DISPATCH_SUMMARY_MAX_CHARS);
+    assert.ok(finished.summary.startsWith('OPENING SUMMARY:'), 'keeps opening summary');
+    assert.ok(finished.summary.endsWith('CLOSING RESULT'), 'keeps closing result');
+    assert.match(finished.summary, /…\[middle trimmed\]…/);
     await waitUntil(() => claimsSoFar().length > claimsWhileBusy, 'claiming resumes after the run settles');
 
     // Sign-out stops the loop at once.
@@ -1042,9 +1050,94 @@ try {
       { outcome: 'finished', summary: 'Tests added.', seq: 4 }
     );
     assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done' })], durangoDispatch: { ...dispatch, reportedAt: 'x', reportedSeq: 2 } }), null, 'reported');
-    const summary = dispatchSummaryText('a'.repeat(100) + 'THE END', 20);
+    assert.equal(RENDERER_DISPATCH_SUMMARY_MAX_CHARS, 4_000);
+    assert.equal(BOT_TASK_SUMMARY_MAX_CHARS, 9_000);
+    const summary = dispatchSummaryText('START ' + 'a'.repeat(100) + ' THE END', 20);
     assert.equal(summary.length, 20);
-    assert.ok(summary.startsWith('…') && summary.endsWith('THE END'), 'keeps the conclusion at the end');
+    assert.ok(summary.startsWith('START ') && summary.endsWith('THE END') && summary.includes('…'), 'keeps opening and closing, trims middle');
+    const multiline = [
+      'Shipped chg_abc123 and deployed convex-prod + andromedus.',
+      ...Array.from({ length: 120 }, (_, i) => `Detail line ${i}: ${'x'.repeat(50)}`),
+      'Verified live on durango.sh.\nChange: chg_abc123 https://durango.sh/c/chg_abc123',
+    ].join('\n');
+    const trimmed = clipMiddle(multiline, 1_000);
+    assert.ok(trimmed.length <= 1_000);
+    assert.ok(trimmed.startsWith('Shipped chg_abc123 and deployed convex-prod + andromedus.'));
+    assert.ok(trimmed.endsWith('Verified live on durango.sh.\nChange: chg_abc123 https://durango.sh/c/chg_abc123'));
+    assert.ok(trimmed.includes('\n\n…[middle trimmed]…\n\n'));
+    assert.equal(clipMiddle('short', 100), 'short');
+    assert.equal(clipMiddle('abc', 1), '…');
+    assert.equal(clipMiddle('abc', 0), '');
+  });
+
+  await test('renderer outcome: prefers final message over earlier progress lines and uses server-aligned limits', () => {
+    const dispatch = { id: 'd1', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' };
+    const botDispatch = { id: 'bottask:t_123', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' };
+    const localDispatch = { id: 'localbot:b1:t1', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' };
+    const run = (fields) => ({ id: 'm', role: 'agent', kind: 'agent-run', content: '', ts: 'x', ...fields });
+    const progress1 = "I'll land the change now.\n\n";
+    const progress2 = "chg_123 is on the train and landing now. I'll follow the deploys…\n\n";
+    const finalAnswer = 'Shipped chg_123 and deployed convex-prod + andromedus.\n\nVerified live on durango.sh.';
+    const multiStep = run({
+      status: 'done',
+      content: `${progress1}${progress2}${finalAnswer}`,
+      activities: [
+        { id: 'a1', type: 'command', title: 'durango-code land', status: 'done', ts: 'x', contentOffset: progress1.length },
+        { id: 'a2', type: 'command', title: 'durango-code deploys', status: 'done', ts: 'x', contentOffset: progress1.length + progress2.length },
+      ],
+    });
+    assert.equal(dispatchRunFinalText(multiStep), finalAnswer);
+    assert.deepEqual(outcomeOf({ status: 'done', messages: [multiStep], durangoDispatch: botDispatch }), {
+      outcome: 'finished',
+      summary: finalAnswer,
+      seq: 2,
+    });
+
+    // When a turn ends on a tool call with no trailing text, keep the last non-empty text segment (not earlier progress).
+    const endedOnTool = run({
+      status: 'done',
+      content: `${progress1}${finalAnswer}`,
+      activities: [
+        { id: 'a1', type: 'command', title: 'check', status: 'done', ts: 'x', contentOffset: progress1.length },
+        { id: 'a2', type: 'tool', title: 'cleanup', status: 'done', ts: 'x', contentOffset: progress1.length + finalAnswer.length },
+      ],
+    });
+    assert.equal(dispatchRunFinalText(endedOnTool), finalAnswer);
+
+    // Inline visual/theme cards inside the final answer do not split it.
+    const partA = 'Summary before chart.\n\n';
+    const partB = 'Conclusion after chart.';
+    const withVisual = run({
+      status: 'done',
+      content: `${progress1}${partA}${partB}`,
+      activities: [
+        { id: 'a1', type: 'command', title: 'query', status: 'done', ts: 'x', contentOffset: progress1.length },
+        { id: 'a2', type: 'tool', title: 'show_html', status: 'done', ts: 'x', contentOffset: progress1.length + partA.length, visual: { id: 'v1', html: '<p>hi</p>', title: 'Chart' } },
+      ],
+    });
+    assert.equal(dispatchRunFinalText(withVisual), `${partA}${partB}`);
+
+    // Legacy activities without contentOffset keep the full content.
+    const legacy = run({
+      status: 'done',
+      content: 'Legacy summary text.',
+      activities: [{ id: 'a1', type: 'command', title: 'old', status: 'done', ts: 'x' }],
+    });
+    assert.equal(dispatchRunFinalText(legacy), 'Legacy summary text.');
+
+    // Agent dispatch arrives whole up to 4,000 chars; bot tasks (bottask:/localbot:) arrive whole up to 9,000 chars.
+    const medium = 'HEAD: ' + 'm'.repeat(3_500) + ' :TAIL';
+    assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: medium })], durangoDispatch: dispatch }).summary, medium);
+    const large = 'HEAD: ' + 'b'.repeat(7_500) + ' :TAIL';
+    assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: large })], durangoDispatch: botDispatch }).summary, large);
+    assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: large })], durangoDispatch: localDispatch }).summary, large);
+    // Over 9,000 chars on a bot task: middle-trimmed, keeping opening summary and closing outcome.
+    const huge = 'OPENING REPORT\n' + 'z'.repeat(11_000) + '\nCLOSING LINK';
+    const hugeOutcome = outcomeOf({ status: 'done', messages: [run({ status: 'done', content: huge })], durangoDispatch: botDispatch });
+    assert.ok(hugeOutcome.summary.length <= BOT_TASK_SUMMARY_MAX_CHARS);
+    assert.ok(hugeOutcome.summary.startsWith('OPENING REPORT'));
+    assert.ok(hugeOutcome.summary.endsWith('CLOSING LINK'));
+    assert.ok(hugeOutcome.summary.includes('…[middle trimmed]…'));
   });
   await test('renderer outcome: the turns a thread resumes by itself report, the latest run is the report', () => {
     const dispatch = { id: 'd1', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' };
@@ -1090,8 +1183,8 @@ try {
       assert.equal(ended.seq, 2);
       assert.match(ended.summary, /^The background work it was waiting on has ended .* Its last words:\n\nWatching for the amend\.$/s);
     }
-    const longEnd = outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'x'.repeat(5_000) + 'THE END' }), shells('settled')], durangoDispatch: reportedWaiting });
-    assert.ok(longEnd.summary.startsWith('The background work') && longEnd.summary.endsWith('THE END') && longEnd.summary.length <= 2_000, 'clips the words, not the note');
+    const longEnd = outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'OPENING ' + 'x'.repeat(5_000) + ' THE END' }), shells('settled')], durangoDispatch: reportedWaiting });
+    assert.ok(longEnd.summary.startsWith('The background work') && longEnd.summary.includes('OPENING') && longEnd.summary.endsWith('THE END') && longEnd.summary.length <= 4_000, 'clips the middle of the words, keeps note, opening and end');
     // ...or the thread resumed by itself, and that turn reports when it settles.
     const resumed = [early[0], shells('settled'), run({ status: 'running', continuation: true })];
     assert.equal(outcomeOf({ status: 'running', messages: resumed, durangoDispatch: reportedWaiting }), null, 'resumed turn still running');
@@ -1490,6 +1583,33 @@ try {
     assert.match(busy.sent[0].detail, /The step in progress: a shell command/);
     assert.doesNotMatch(busy.sent[0].detail, /tok_123456789|curl/);
     busy.stop();
+
+    // Stuck notice prefers the latest message after earlier tool calls and trims the middle if long.
+    const narrating = noticesWorld();
+    const earlier = 'Earlier progress line that should not appear.\n\n';
+    const latest = 'Latest status: ' + 'w'.repeat(500) + ' waiting on deploy.';
+    narrating.set({
+      threads: [botThread()],
+      transcripts: {
+        t1: {
+          messages: [
+            agentRun({
+              id: 'run-narr',
+              status: 'running',
+              startedAt: iso(1_000_000),
+              content: `${earlier}${latest}`,
+              activities: [{ id: 'a1', type: 'command', title: 'step', status: 'done', ts: iso(1_000_000), contentOffset: earlier.length }],
+            }),
+          ],
+        },
+      },
+    });
+    await narrating.tick(DISPATCH_STUCK_AFTER_MS + 60_000);
+    assert.doesNotMatch(narrating.sent[0].detail, /Earlier progress line/);
+    assert.match(narrating.sent[0].detail, /Its last words so far: Latest status:/);
+    assert.match(narrating.sent[0].detail, /waiting on deploy\.$/);
+    assert.match(narrating.sent[0].detail, /…\[middle trimmed\]…/);
+    narrating.stop();
   });
 
   await test('notices: no "looks stuck" while it waits on what it started itself (Claude and Codex step shapes)', async () => {
