@@ -442,5 +442,31 @@ console.log('ok  threads that machine deleted leave this list');
   console.log('ok  an out-of-date refresh never leaves a mirror filed differently for good');
 }
 
+// Bot-started threads on a paired machine carry their starter bot name and id
+// onto mirrors here (on create and when backfilled on update), without copying
+// durangoDispatch onto the controller.
+{
+  sync([
+    listing('h1'),
+    listing('h2'),
+    listing('bot-host-1', { startedByBot: 'durango-code', startedByBotId: 'bot_code_1' }),
+    listing('bot-host-2'),
+  ]);
+  const b1 = mirrors().find((thread) => thread.remote?.threadId === 'bot-host-1')!;
+  assert.equal(b1.startedByBot, 'durango-code');
+  assert.equal(b1.startedByBotId, 'bot_code_1');
+  assert.equal(b1.durangoDispatch, undefined);
+  sync([
+    listing('h1'),
+    listing('h2'),
+    listing('bot-host-1', { startedByBot: 'durango-code', startedByBotId: 'bot_code_1' }),
+    listing('bot-host-2', { startedByBot: 'durango-chat', startedByBotId: 'bot_chat_1' }),
+  ]);
+  const b2 = mirrors().find((thread) => thread.remote?.threadId === 'bot-host-2')!;
+  assert.equal(b2.startedByBot, 'durango-chat');
+  assert.equal(b2.startedByBotId, 'bot_chat_1');
+  console.log('ok  bot-started threads on a paired machine keep their starter bot on mirrors');
+}
+
 console.log('All remote thread listing tests passed.');
 process.exit(0);

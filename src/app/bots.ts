@@ -359,6 +359,68 @@ export const projectBotsFor = (bots: DesktopBot[], key: string | undefined): Des
 export const projectBotFor = (bots: DesktopBot[], key: string | undefined) =>
   projectBotsFor(bots, key)[0] ?? null;
 
+export type ThreadStarterInput = {
+  startedByBot?: string;
+  startedByBotId?: string;
+  durangoDispatch?: { id?: string; runOffset?: number; followUp?: boolean } | null;
+};
+
+export type ThreadStarter =
+  | { kind: 'bot'; bot: DesktopBot | null; name: string }
+  | { kind: 'durango' }
+  | { kind: 'you' };
+
+const localBotIdFromDispatchId = (dispatchId: string): string | null => {
+  if (!dispatchId.startsWith('localbot:')) return null;
+  const rest = dispatchId.slice('localbot:'.length);
+  const sep = rest.indexOf(':');
+  if (sep <= 0) return null;
+  const id = rest.slice(0, sep).trim();
+  return id || null;
+};
+
+/**
+ * Who started a Durango Code thread: the specific bot that dispatched it (local,
+ * machine-run, or cloud-dispatched), Durango (Chat, Tasks, or API), or the
+ * person. Never falls back to a project's primary bot when the starter isn't
+ * found — returns the recorded bot name (or "A bot") instead.
+ */
+export const resolveThreadStarter = (
+  thread: ThreadStarterInput,
+  allBots: readonly DesktopBot[],
+  projectBots: readonly DesktopBot[] = []
+): ThreadStarter => {
+  const recordedId = thread.startedByBotId?.trim() || null;
+  const recordedName = thread.startedByBot?.trim() || null;
+  const dispatchId = thread.durangoDispatch?.id ?? '';
+  const isFollowUpOnly = Boolean(thread.durangoDispatch?.followUp || thread.durangoDispatch?.runOffset);
+  const isBotDispatchId = dispatchId.startsWith('bottask:') || dispatchId.startsWith('localbot:');
+
+  if (recordedId || recordedName || (isBotDispatchId && !isFollowUpOnly)) {
+    const botId = recordedId ?? (isBotDispatchId && !isFollowUpOnly ? localBotIdFromDispatchId(dispatchId) : null);
+    let matched: DesktopBot | null = null;
+    if (botId) {
+      matched =
+        allBots.find((candidate) => candidate.id === botId) ??
+        projectBots.find((candidate) => candidate.id === botId) ??
+        null;
+    } else if (recordedName && recordedName !== 'bot') {
+      const lower = recordedName.toLowerCase();
+      matched =
+        projectBots.find((candidate) => candidate.name === recordedName) ??
+        allBots.find((candidate) => candidate.name === recordedName) ??
+        projectBots.find((candidate) => candidate.name.toLowerCase() === lower) ??
+        allBots.find((candidate) => candidate.name.toLowerCase() === lower) ??
+        null;
+    }
+    const name = matched?.name ?? (recordedName && recordedName !== 'bot' ? recordedName : 'A bot');
+    return { kind: 'bot', bot: matched, name };
+  }
+
+  if (dispatchId && !isFollowUpOnly) return { kind: 'durango' };
+  return { kind: 'you' };
+};
+
 export const formatFileSize = (bytes: number) =>
   bytes < 1024 ? `${bytes} B` : bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 /** Signed out ("local"): bots live on this device and reply through its Claude Code. */

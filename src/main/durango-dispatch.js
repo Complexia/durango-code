@@ -1,4 +1,5 @@
 import { DurangoError } from './durango-client.js';
+import { clipMiddle } from '../report-clip.js';
 
 // Dispatch worker: runs agents that the user started from Durango Chat
 // (merge plan Phase 5, contracts §7 "Dispatch").
@@ -69,7 +70,7 @@ export const canCheckoutDispatch = (dispatch, allowedProjectIds, checkoutAvailab
       dispatch.project.repoId
   );
 
-export const DISPATCH_SUMMARY_MAX_CHARS = 2_000;
+export const DISPATCH_SUMMARY_MAX_CHARS = 4_000;
 export const DISPATCH_ERROR_MAX_CHARS = 1_000;
 export const DISPATCH_HEARTBEAT_MS = 60_000;
 const MAX_BACKOFF_MS = 60_000;
@@ -305,6 +306,7 @@ export const buildMachinePayload = ({
 export const dispatchSourceLabel = (dispatch) => {
   // A bot's task from Durango (a reply in the cloud or on another machine).
   if (typeof dispatch?.bot === 'string' && dispatch.bot.trim()) return `your bot ${dispatch.bot.trim().slice(0, 80)}`;
+  if (typeof dispatch?.botId === 'string' && dispatch.botId.trim()) return 'your bot';
   if (dispatch?.origin === 'tasks') return 'Durango Tasks';
   if (dispatch?.origin === 'api') {
     const label = String(dispatch?.sourceLabel ?? '').trim().slice(0, 80);
@@ -906,7 +908,7 @@ export const createDispatchWorker = ({
           ? {
               status: 'finished',
               ...(threadId || entry.threadId ? { codeThreadId: threadId || entry.threadId } : {}),
-              summary: truncateText(summary, DISPATCH_SUMMARY_MAX_CHARS) || 'The agent finished.',
+              summary: clipMiddle(summary, DISPATCH_SUMMARY_MAX_CHARS) || 'The agent finished.',
               ...(Array.isArray(waiting) && waiting.length ? { waiting } : {}),
               ...(seq ? { reportSeq: seq } : {}),
             }
@@ -934,7 +936,7 @@ export const createDispatchWorker = ({
       if (!machineId) return { ok: false, retry: true };
       const body = {
         machineId,
-        notice: { kind, key, seq, detail: truncateText(detail, DISPATCH_SUMMARY_MAX_CHARS) },
+        notice: { kind, key, seq, detail: clipMiddle(detail, DISPATCH_SUMMARY_MAX_CHARS) },
         ...(threadId ? { codeThreadId: threadId } : {}),
       };
       try {

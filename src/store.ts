@@ -209,25 +209,26 @@ export const defaultDurangoWorkspaceSettings: DurangoWorkspaceSettings = {
 
 /**
  * Work sharing ("Share coding work with Durango") — workspace sync to Durango
- * Code web (docs in orion-web/docs/workspace-sync.md): projects,
- * threads (full transcripts), token usage, and — when syncCode is on — code
- * as Durango Cloud repos with full git history. Durango Chat builds its
- * memory from summaries of the synced threads. On by default since the
- * Durango merge (consentVersion 1, see app/workspaceSyncConsent.ts); while
- * off (or signed out) the desktop makes no sync calls of any kind and
- * captures nothing extra.
+ * Code web: projects, threads (full transcripts), token usage, and — when
+ * syncCode is also enabled — code as private Durango Cloud repos with full git
+ * history. Durango Chat uses summaries of synced threads for memory, and
+ * durango.sh shows Usage and Source profile stats. Both sharing and code sync
+ * are opt-in and off by default (consentVersion 2, see
+ * app/workspaceSyncConsent.ts); while off (or signed out) the desktop makes no
+ * sync calls of any kind and captures nothing extra.
  */
 export type WorkspaceSyncSettings = {
-  /** Master switch; requires a signed-in Durango account to take effect. */
+  /** Master switch; opt-in, off by default, requires a signed-in Durango account. */
   enabled: boolean;
   /**
    * Auto-publish git projects and auto-push branch save points (commits).
-   * Dirty working-tree files are never uploaded by workspace sync.
+   * Separate opt-in, off by default even when sharing is on. Dirty
+   * working-tree files are never uploaded by workspace sync.
    */
   syncCode: boolean;
-  /** Consent policy these settings were reconciled with (1 = default Full). */
+  /** Consent policy these settings were reconciled with (2 = opt-in). */
   consentVersion: number;
-  /** The one-time "your coding work now syncs" notice was acknowledged. */
+  /** The one-time opt-in consent prompt was answered (or settled in Settings). */
   consentNoticeSeen: boolean;
 };
 
@@ -729,6 +730,8 @@ export type Thread = {
   settledAt?: string;
   /** Started by one of the person's bots (its name). */
   startedByBot?: string;
+  /** Started by one of the person's bots (its id, stable across renames). */
+  startedByBotId?: string;
   /**
    * Set on threads imported from a Claude Code or Codex session the user ran
    * outside Orion. The session id doubles as the dedupe key for re-imports;
@@ -802,6 +805,8 @@ export type Thread = {
     startedAt: string;
     /** Follow-up: agent runs the thread had before this one (absent = its first run). */
     runOffset?: number;
+    /** True when this dispatch continued an existing thread rather than creating it. */
+    followUp?: boolean;
     /** Set once the outcome went back to Durango Chat. */
     reportedAt?: string;
     /**
@@ -952,6 +957,8 @@ export type RemoteThreadListing = {
   snoozedAt?: string | null;
   pinnedAt?: string | null;
   hiddenFromRecent?: boolean;
+  startedByBot?: string | null;
+  startedByBotId?: string | null;
   settings?: Record<string, string>;
   userActions?: UserAction[];
   waitingOnQuestion?: boolean;
@@ -2794,6 +2801,8 @@ export const useOrionStore = create<OrionState>()(
                 patch.parentThreadId = parentThreadId;
               }
               if (nativeSubagent && !current.subagent) patch.subagent = nativeSubagent;
+              if (entry.startedByBot && !current.startedByBot) patch.startedByBot = entry.startedByBot;
+              if (entry.startedByBotId && !current.startedByBotId) patch.startedByBotId = entry.startedByBotId;
               // A rename here stands until that machine renames it.
               if (
                 entry.title &&
@@ -2870,6 +2879,8 @@ export const useOrionStore = create<OrionState>()(
               ...(entry.snoozedAt && !entry.settledAt ? { snoozedAt: entry.snoozedAt } : {}),
               ...(entry.pinnedAt ? { pinnedAt: entry.pinnedAt } : {}),
               ...(entry.hiddenFromRecent || parentMirror ? { hiddenFromRecent: true } : {}),
+              ...(entry.startedByBot ? { startedByBot: entry.startedByBot } : {}),
+              ...(entry.startedByBotId ? { startedByBotId: entry.startedByBotId } : {}),
               ...(parentMirror
                 ? { parentThreadId: parentMirror.id }
                 : localParentOf(entry)
@@ -3791,9 +3802,9 @@ export const useOrionStore = create<OrionState>()(
           ...withoutSidebarSwitch(merged.sidebarV2Settings),
           views: { ...defaultSidebarV2Settings.views, ...merged.sidebarV2Settings?.views, pinned: false },
         };
-        // Durango merge: work sharing defaults to Full. Pre-Durango stores
-        // (no consentVersion) move to enabled once and show a one-time
-        // notice; a later "off" sticks (workspaceSyncConsent.ts).
+        // Consent v2: work sharing and code sync are both opt-in and off by
+        // default; stores switched on by the v1 merge migration go back to off
+        // and get a one-time opt-in dialog (workspaceSyncConsent.ts).
         merged.workspaceSyncSettings = migrateWorkspaceSyncSettings(
           (persisted as Partial<OrionState> | undefined)?.workspaceSyncSettings
         );

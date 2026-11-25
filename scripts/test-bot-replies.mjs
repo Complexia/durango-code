@@ -1010,6 +1010,7 @@ try {
       project: 'Durango', requestId: 't', readsProjectNotes: true, signal: tasks[0].signal,
     }, 'the tool call id makes a retried create return the same task; its threads read the notes themselves (no brief)');
     assert.equal(started[0].projectId, 'p1');
+    assert.equal(started[0].botId, 'bot_1', 'records which bot started the thread');
     assert.equal(started[0].key, 'task_1', 'the renderer reports it as bottask:<taskId>');
     assert.equal(started[0].accessMode, 'full-access', 'threads a bot starts run with Full access');
     assert.match(started[0].prompt, /^Fix the OpenCode updater spinner\.\n\nWhen you're done, end with a concise report/);
@@ -2066,6 +2067,26 @@ try {
     assert.match(prompt, /\(The rest of your context is as in your last message here\.\)/);
     assert.match(prompt, /\(Bot context, not from the person\.\)/, 'per-turn context still goes');
     assert.equal(second.usage.mode, 'resume');
+
+    // A steady context line that changes (1 note -> 2 notes) and later reverts (2 notes -> 1 note)
+    // must be re-sent on reversion instead of being suppressed by stale accumulated contextKeys.
+    const withHint = (seq, hint) => ({
+      ...sessionLane([...later, { id: 'r8', seq: 8, role: 'assistant', text: 'Done.' }, row(seq, 'user', `msg ${seq}`)], [seq], {
+        laneId: `lane_${seq}`,
+        replyMessageId: `r_${seq}`,
+      }),
+      session: {
+        history: [...later, { id: 'r8', seq: 8, role: 'assistant', text: 'Done.' }, row(seq, 'user', `msg ${seq}`)],
+        answering: [seq],
+        context: [{ text: '(Bot context, not from the person.)' }, { text: 'Roster: nobody.', steady: true }, { text: hint, steady: true }],
+      },
+    });
+    await runLane(withHint(9, 'Project library (Site): 1 note.'), sessionCtx());
+    assert.match(textOf(sdk.runs[2].inputs[0]), /Project library \(Site\): 1 note\./, 'initial library hint is sent');
+    await runLane(withHint(10, 'Project library (Site): 2 notes.'), sessionCtx());
+    assert.match(textOf(sdk.runs[3].inputs[0]), /Project library \(Site\): 2 notes\./, 'updated library hint is sent');
+    await runLane(withHint(11, 'Project library (Site): 1 note.'), sessionCtx());
+    assert.match(textOf(sdk.runs[4].inputs[0]), /Project library \(Site\): 1 note\./, 'reverted library hint is re-sent, not suppressed');
   });
 
   await test('kept session: a new summary (system prompt), a failure or a crash starts over', async () => {
@@ -2472,6 +2493,68 @@ try {
     );
     assert.equal(result.text, 'Deep answer.');
     assert.equal(sdk.runs[0].options.effort, 'xhigh');
+  });
+
+  await test('lane runner: finalMessageOnly drops earlier progress narration before tool calls and falls back if ending on a tool', async () => {
+    const runWith = async (messages) => {
+      const sdk = createFakeSdk(async function* ({ next }) {
+        await next();
+        for (const message of messages) yield message;
+      });
+      const run = createClaudeLaneRunner({
+        loadSdk: async () => sdk,
+        loadZod: async () => zod,
+        createInputQueue,
+        botsDir: path.join(testRoot, 'bots-final-only'),
+      });
+      return run(
+        {
+          laneId: 'lt-final',
+          botId: 'b1',
+          botName: 'Durango',
+          model: 'claude-sonnet-5-5',
+          systemPrompt: 'sys',
+          prompt: 'do task',
+          tools: [],
+          attachments: [],
+          finalMessageOnly: true,
+        },
+        {
+          signal: new AbortController().signal,
+          accessMode: 'read-only',
+          update: () => {},
+          takeInbox: async () => [],
+          callTool: async () => ({ result: null }),
+        }
+      );
+    };
+
+    const withFinal = await runWith([
+      init('claude-sonnet-5-5'),
+      assistant('a1', [{ type: 'text', text: 'Checking the repo first...' }, { type: 'tool_use', id: 'tu1', name: 'Read', input: {} }]),
+      assistant('a2', [{ type: 'text', text: 'Running tests now...' }, { type: 'tool_use', id: 'tu2', name: 'Bash', input: {} }]),
+      assistant('a3', [{ type: 'text', text: 'All tests passed. Opened chg_123.' }]),
+      success(),
+    ]);
+    assert.equal(withFinal.text, 'All tests passed. Opened chg_123.');
+
+    const endedOnTool = await runWith([
+      init('claude-sonnet-5-5'),
+      assistant('a1', [{ type: 'text', text: 'Starting...' }, { type: 'tool_use', id: 'tu1', name: 'Read', input: {} }]),
+      assistant('a2', [{ type: 'text', text: 'Final summary before cleanup.' }, { type: 'tool_use', id: 'tu2', name: 'Bash', input: {} }]),
+      success(),
+    ]);
+    assert.equal(endedOnTool.text, 'Final summary before cleanup.');
+
+    const substantial = 'Full report of everything found and changed across all services. ' + 'Details here. '.repeat(25);
+    const withPostscript = await runWith([
+      init('claude-sonnet-5-5'),
+      assistant('a1', [{ type: 'text', text: 'Checking...' }, { type: 'tool_use', id: 'tu1', name: 'Read', input: {} }]),
+      assistant('a2', [{ type: 'text', text: substantial }, { type: 'tool_use', id: 'tu2', name: 'Bash', input: {} }]),
+      assistant('a3', [{ type: 'text', text: 'Cleaned up temp files.' }]),
+      success(),
+    ]);
+    assert.equal(withPostscript.text, `${substantial.trim()}\n\nCleaned up temp files.`);
   });
 
   await test('bot attachments: stage locally for instant handoff, upload in background, handle failure + retry, and never re-download local files', async () => {

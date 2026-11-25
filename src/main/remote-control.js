@@ -1877,6 +1877,8 @@ const buildSnapshot = async () => {
           pinnedAt: optionalString(shell.pinnedAt),
           hiddenFromRecent: shell.hiddenFromRecent === true,
           workspaceName: optionalString(shell.durangoWorkspace?.name),
+          ...(optionalString(shell.startedByBot) ? { startedByBot: optionalString(shell.startedByBot) } : {}),
+          ...(optionalString(shell.startedByBotId) ? { startedByBotId: optionalString(shell.startedByBotId) } : {}),
           // What the controller's prompt box shows for the thread.
           settings: Object.fromEntries(
             [

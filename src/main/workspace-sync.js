@@ -11,20 +11,19 @@ import { isOrionRepoRemoteUrl } from './source-control.js';
 
 const execFileAsync = promisify(execFile);
 
-// Workspace sync engine (contract: orion-web/docs/workspace-sync.md). Mirrors
-// the local workspace — projects, threads with full transcripts, token
-// usage, and (optionally) code as Durango Cloud repos — to Durango Code web.
+// Workspace sync engine. Mirrors the local workspace — projects, threads with
+// full transcripts, token usage, and (optionally) code as Durango Cloud repos
+// — to Durango Code web.
 // The user-facing name is "Share coding work with Durango": Durango Code web
 // generates the work digests that Durango Chat's memory uses from each
 // completed thread sync, so a finished turn should reach it promptly.
 //
-// Everything here is gated twice: the setting (on by default since the
-// Durango merge — see app/workspaceSyncConsent.ts — pushed from the renderer
-// over sync:configure) AND a signed-in account. While either is missing the
-// engine is inert — no timers, no network, no capture — so users who turn
-// sharing off are entirely unaffected. All work happens on debounced timers
-// in this process; failures land in the status broadcast, never in the
-// agent-run path.
+// Everything here is gated twice: the setting (off by default — opt-in, see
+// app/workspaceSyncConsent.ts — pushed from the renderer over sync:configure)
+// AND a signed-in account. While either is missing the engine is inert — no
+// timers, no network, no capture — so users who keep sharing off are entirely
+// unaffected. All work happens on debounced timers in this process; failures
+// land in the status broadcast, never in the agent-run path.
 //
 // Timing: every threads/store save calls notifyWorkspaceChanged(). The pass
 // runs SYNC_DEBOUNCE_MS (15 s) after the last save, so a thread that just
@@ -53,7 +52,7 @@ const MAX_REMOVALS_PER_SNAPSHOT = 20_000;
 // readThreadsByIds, broadcast }.
 let deps = null;
 
-let settings = { enabled: false, syncCode: true };
+let settings = { enabled: false, syncCode: false };
 let status = {
   enabled: false,
   authenticated: false,
@@ -67,6 +66,8 @@ let status = {
 let syncTimer = null;
 let codePollTimer = null;
 let syncInFlight = null;
+let activeCodeSyncController = null;
+let lastErrorFromCodeSync = false;
 let syncQueuedOptions = null;
 let scheduledSyncOptions = null;
 // When the currently pending (debounced) pass was first requested.
@@ -205,6 +206,7 @@ const resetAccountScopedState = (ownerId) => {
   projectLinksDirty = false;
   pushedBranchStates.clear();
   publishFailures.clear();
+  lastErrorFromCodeSync = false;
   totals = { projects: 0, threads: 0, transcriptsUploaded: 0, codePushes: 0 };
   status = {
     ...status,
@@ -227,6 +229,7 @@ const invalidateActiveSync = () => {
   syncGeneration += 1;
   syncQueuedOptions = null;
   scheduledSyncOptions = null;
+  activeCodeSyncController?.abort();
   activeSyncController?.abort();
 };
 
@@ -914,12 +917,14 @@ const syncCode = async (
   const failures = [];
   for (const project of projects) {
     ensureCurrentSync(generation, signal);
+    if (!settings.syncCode) break;
     const gitRoot = await getGitRootSafe(project?.path);
     if (!gitRoot || seenRoots.has(gitRoot)) continue;
     seenRoots.add(gitRoot);
 
     const branchState = await gitBranchState(gitRoot);
     ensureCurrentSync(generation, signal);
+    if (!settings.syncCode) break;
     if (!branchState) continue; // empty repo — nothing to push yet
 
     const priorFailure = publishFailures.get(gitRoot);
@@ -1039,6 +1044,8 @@ const runSyncPass = async (
     const session = await deps.readSession();
     const authenticated = Boolean(session?.token);
     if (!settings.enabled || !authenticated) {
+      stopCodePoll();
+      lastErrorFromCodeSync = false;
       setStatus({ enabled: settings.enabled, authenticated, syncing: false });
       return;
     }
@@ -1048,6 +1055,8 @@ const runSyncPass = async (
       resetAccountScopedState(ownerId);
     }
     ensureCurrentSync(generation, signal);
+    if (settings.syncCode) startCodePoll();
+    lastErrorFromCodeSync = false;
     setStatus({ enabled: true, authenticated: true, syncing: true, lastError: null });
 
     await seedServerState(session.token, signal);
@@ -1070,25 +1079,50 @@ const runSyncPass = async (
     ensureCurrentSync(generation, signal);
     let codeFailures = [];
     if (settings.syncCode) {
-      codeFailures = await syncCode(session.token, storeState, {
-        retryFailedPublishes,
-        ownerId,
-        generation,
-        signal,
-      });
+      const codeController = new AbortController();
+      activeCodeSyncController = codeController;
+      const codeSignal = AbortSignal.any([signal, codeController.signal]);
+      try {
+        codeFailures = await syncCode(session.token, storeState, {
+          retryFailedPublishes,
+          ownerId,
+          generation,
+          signal: codeSignal,
+        });
+      } catch (error) {
+        if (
+          codeController.signal.aborted &&
+          !signal.aborted &&
+          generation === syncGeneration &&
+          settings.enabled &&
+          !settings.syncCode
+        ) {
+          // Code sync was turned off while sharing stayed on: stop code pushes
+          // cleanly and still finalize the completed thread/project sync.
+          codeFailures = [];
+        } else {
+          throw error;
+        }
+      } finally {
+        if (activeCodeSyncController === codeController) activeCodeSyncController = null;
+      }
     }
     ensureCurrentSync(generation, signal);
 
+    const hasCodeError = settings.syncCode && codeFailures.length > 0;
+    lastErrorFromCodeSync = hasCodeError;
     setStatus({
       syncing: false,
       lastSyncAt: new Date().toISOString(),
-      lastError: codeFailures.length > 0 ? codeFailures.join('\n') : null,
+      lastError: hasCodeError ? codeFailures.join('\n') : null,
       backfillDone: true,
       counts: { ...totals },
     });
   } catch (error) {
     if (isCancelledSync(error, generation, signal)) return;
+    lastErrorFromCodeSync = false;
     if (error?.status === 401) {
+      stopCodePoll();
       setStatus({ syncing: false, authenticated: false, lastError: 'Session expired — sign in again.' });
       return;
     }
@@ -1149,12 +1183,16 @@ const startCodePoll = () => {
   codePollTimer.unref?.();
 };
 
+const stopCodePoll = () => {
+  if (codePollTimer) clearInterval(codePollTimer);
+  codePollTimer = null;
+};
+
 const stopTimers = () => {
   if (syncTimer) clearTimeout(syncTimer);
   syncTimer = null;
   scheduledSyncOptions = null;
-  if (codePollTimer) clearInterval(codePollTimer);
-  codePollTimer = null;
+  stopCodePoll();
 };
 
 // --- Public surface (called from main.js) ------------------------------------
@@ -1166,21 +1204,40 @@ export const initWorkspaceSync = (injectedDeps) => {
 /** Renderer pushes the persisted settings on hydration and every change. */
 export const configureWorkspaceSync = (nextSettings) => {
   const wasEnabled = settings.enabled;
+  const wasSyncCode = settings.syncCode;
   settings = {
     enabled: nextSettings?.enabled === true,
-    syncCode: nextSettings?.syncCode !== false,
+    syncCode: nextSettings?.syncCode === true,
   };
   if (settings.enabled && !wasEnabled) {
     // First enable (or re-enable): backfill everything in the background.
+    lastErrorFromCodeSync = false;
     setStatus({ enabled: true, backfillDone: false });
-    startCodePoll();
+    if (settings.syncCode) startCodePoll();
     scheduleSync(1_000);
   } else if (!settings.enabled && wasEnabled) {
     invalidateActiveSync();
     stopTimers();
+    publishFailures.clear();
+    lastErrorFromCodeSync = false;
     setStatus({ enabled: false, syncing: false });
+  } else if (settings.enabled) {
+    if (settings.syncCode && !wasSyncCode) {
+      startCodePoll();
+      scheduleSync(1_000);
+      setStatus({ enabled: true });
+    } else if (!settings.syncCode && wasSyncCode) {
+      stopCodePoll();
+      publishFailures.clear();
+      activeCodeSyncController?.abort();
+      const clearCodeError = lastErrorFromCodeSync;
+      lastErrorFromCodeSync = false;
+      setStatus({ enabled: true, ...(clearCodeError ? { lastError: null } : {}) });
+    } else {
+      setStatus({ enabled: true });
+    }
   } else {
-    setStatus({ enabled: settings.enabled });
+    setStatus({ enabled: false });
   }
   return { ...status };
 };
@@ -1203,6 +1260,7 @@ export const getWorkspaceSyncStatus = () => ({ ...status });
 /** Account changes flip authentication without touching the setting. */
 export const notifyAccountChanged = () => {
   invalidateActiveSync();
+  stopCodePoll();
   serverStateSeeded = false;
   knownThreadStates = new Map();
   if (!settings.enabled) return;

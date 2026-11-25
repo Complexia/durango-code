@@ -1,15 +1,54 @@
+import { clipMiddle, selectFinalMessage } from '../report-clip.js';
 import type { AgentActivity, Message, Thread } from '../store';
 
 // Renderer side of Durango Chat dispatch (main: src/main/durango-dispatch.js).
 
-export const DISPATCH_SUMMARY_MAX_CHARS = 2_000;
+/** Lines up with DISPATCH_LIMITS.maxSummaryChars (4,000) for agent dispatches. */
+export const DISPATCH_SUMMARY_MAX_CHARS = 4_000;
+/**
+ * Budget for bot task threads (`bottask:` / `localbot:`) whose inbox ceiling
+ * is BOT_LIMITS.taskResultChars (12,000), leaving room for the refs block,
+ * thread footer and `NOT FINISHED YET` header so nothing gets cut off.
+ */
+export const BOT_TASK_SUMMARY_MAX_CHARS = 9_000;
 
-/** The end of a long final response is where agents put their conclusion. */
-export const dispatchSummaryText = (content: string, max = DISPATCH_SUMMARY_MAX_CHARS) => {
-  const text = content.trim();
-  if (text.length <= max) return text;
-  return `…${text.slice(-(max - 1)).trimStart()}`;
+const summaryMaxCharsFor = (dispatchId: string) =>
+  /^(bottask|localbot):/.test(dispatchId) ? BOT_TASK_SUMMARY_MAX_CHARS : DISPATCH_SUMMARY_MAX_CHARS;
+
+const isStepBoundaryActivity = (activity: AgentActivity) =>
+  !activity.visual &&
+  !activity.theme &&
+  (activity.type === 'command' || activity.type === 'tool' || activity.type === 'plan');
+
+/**
+ * Prefer the turn's actual final message (text after the last tool/command/plan
+ * step) over earlier progress narration from the same run. Reasoning entries,
+ * visuals (`show_html`) and theme cards do not split the final answer. If the
+ * turn ended on a tool call with no trailing text, falls back to the last
+ * non-empty text segment before it; if it ended with a brief closing line right
+ * after a substantial summary, keeps that summary too.
+ */
+export const dispatchRunFinalText = (run: Pick<Message, 'content' | 'activities'>): string => {
+  const content = run.content || '';
+  if (!content.trim()) return '';
+  const offsets: number[] = [];
+  for (const activity of run.activities ?? []) {
+    if (!isStepBoundaryActivity(activity)) continue;
+    const offset = Math.max(0, Math.min(activity.contentOffset ?? 0, content.length));
+    if (offset > 0) offsets.push(offset);
+  }
+  if (offsets.length === 0) return content.trim();
+  const boundaries = [0, ...new Set(offsets.sort((a, b) => a - b)), content.length];
+  const segments: string[] = [];
+  for (let index = 1; index < boundaries.length; index += 1) {
+    const segment = content.slice(boundaries[index - 1], boundaries[index]).trim();
+    if (segment) segments.push(segment);
+  }
+  return selectFinalMessage(segments) || content.trim();
 };
+
+/** Keep the opening summary and the closing outcome/links when a report exceeds `max`. */
+export const dispatchSummaryText = (content: string, max = DISPATCH_SUMMARY_MAX_CHARS) => clipMiddle(content, max);
 
 const WAIT_ENDED_PREFIX =
   'The background work it was waiting on has ended (it finished, was stopped, or Durango Code quit) without the thread taking another turn. Its last words:\n\n';
@@ -141,7 +180,9 @@ export const durangoDispatchOutcome = (
     };
   }
   if (run.status === 'done') {
-    const summary = dispatchSummaryText(run.content || '') || 'The agent finished without a written summary.';
+    const maxSummary = summaryMaxCharsFor(dispatch.id);
+    const finalText = dispatchRunFinalText(run);
+    const summary = dispatchSummaryText(finalText, maxSummary) || 'The agent finished without a written summary.';
     const waiting = dispatchWaitingOn(thread, messages, run);
     if (waiting.length) {
       const waitingSeq = dispatchReportSeq(position, true);
@@ -151,7 +192,7 @@ export const durangoDispatchOutcome = (
     if (reportedSeq === dispatchReportSeq(position, true)) {
       return {
         outcome: 'finished',
-        summary: `${WAIT_ENDED_PREFIX}${dispatchSummaryText(run.content || '', DISPATCH_SUMMARY_MAX_CHARS - WAIT_ENDED_PREFIX.length) || '(none)'}`,
+        summary: `${WAIT_ENDED_PREFIX}${dispatchSummaryText(finalText, maxSummary - WAIT_ENDED_PREFIX.length) || '(none)'}`,
         waitEnded: true,
         seq,
       };
@@ -454,10 +495,7 @@ export type DurangoDispatchNoticesDeps = {
   checkEveryMs?: number;
 };
 
-const clipNotice = (text: string, max: number) => {
-  const value = text.trim();
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-};
+const clipNotice = (text: string, max: number) => clipMiddle(text, max);
 
 const isApproval = (request: PendingInputRequest) =>
   Boolean(request.approval) || (request.questions.length === 1 && request.questions[0]?.id === 'permission');
@@ -580,13 +618,13 @@ const stepText = (activity: AgentActivity) => {
 const stuckText = (run: Message, quietMs: number) => {
   const minutes = Math.round(quietMs / 60_000);
   const step = [...(run.activities ?? [])].reverse().find((activity) => activity.status === 'running');
-  // Its own words so far, as its report would carry them.
-  const words = run.content.trim();
+  // Its latest words so far, preferring the current message over earlier progress lines.
+  const words = dispatchRunFinalText(run);
   return clipNotice(
     [
       `No progress for ${minutes} minutes.`,
       step ? `The step in progress: ${stepText(step)} (what it runs is in the thread).` : 'No step is running: it is waiting on the model.',
-      words ? `Its last words so far: ${words.length > 400 ? `…${words.slice(-400).trimStart()}` : words}` : '',
+      words ? `Its last words so far: ${dispatchSummaryText(words, 400)}` : '',
     ]
       .filter(Boolean)
       .join('\n'),

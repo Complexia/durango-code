@@ -13,7 +13,7 @@ import {
   botWindowStep,
   mergeBotMessages,
 } from '../src/app/botThreadWindow.ts';
-import { botShipRequestText, parseBotAction, taskReportActions, taskReportBody } from '../src/app/bots.ts';
+import { botShipRequestText, parseBotAction, resolveThreadStarter, taskReportActions, taskReportBody } from '../src/app/bots.ts';
 
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
@@ -172,6 +172,166 @@ test("Ship buttons keep the change's thread; the bot's fallback request names it
   assert.equal(parseBotAction({ kind: 'ship_change', change_id: 'chg_abcdefgh12', thread_id: 'bad id!' }).thread_id, undefined);
   assert.equal(parseBotAction({ kind: 'open_change', change_id: 'chg_abcdefgh12', thread_id: 't_42' }).thread_id, undefined);
   assert.match(botShipRequestText({ change_id: 'chg_abcdefgh12', thread_id: 't_42' }), /^Ship chg_abcdefgh12 now \(I confirmed\): send it to the thread that made it \(Durango Code thread t_42\)/);
+});
+
+test('resolveThreadStarter attributes each thread to the bot that actually started it (local, machine, cloud, legacy)', () => {
+  const makeBot = (overrides) => ({
+    id: 'b_default',
+    name: 'Bot',
+    emoji: null,
+    role: 'bot',
+    job: '',
+    model: 'anthropic/claude-opus-5.5',
+    status: 'idle',
+    paused: false,
+    replies: [],
+    lastActivityAt: 1,
+    lastPreview: null,
+    unread: 0,
+    needsYou: false,
+    project: null,
+    ...overrides,
+  });
+  const durangoProject = { key: 'repo:durango', name: 'durango', repoId: 'durango' };
+  const primary = makeBot({ id: 'y974primary', name: 'durango-primary', emoji: '🌐', projectPrimary: true, project: durangoProject });
+  const codeBot = makeBot({ id: 'y977code', name: 'durango-code', emoji: '🛠️', project: durangoProject });
+  const chatBot = makeBot({ id: 'y97fchat', name: 'durango-chat', emoji: '💬', project: durangoProject });
+  const globalPrimary = makeBot({ id: 'y97global', name: 'Durango', emoji: '✨', role: 'primary', project: null });
+  const otherSameName = makeBot({ id: 'y97other', name: 'durango-code', emoji: '🧪', project: { key: 'repo:other', name: 'other', repoId: 'other' } });
+  const projectBots = [primary, codeBot, chatBot];
+  const allBots = [globalPrimary, otherSameName, ...projectBots];
+
+  // Existing machine-dispatched thread with startedByBot name only (matches project bot, never primary).
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'durango-code', durangoDispatch: { id: 'bottask:y1750' } }, allBots, projectBots),
+    { kind: 'bot', bot: codeBot, name: 'durango-code' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'durango-chat', durangoDispatch: { id: 'bottask:y178e', runOffset: 1 } }, allBots, projectBots),
+    { kind: 'bot', bot: chatBot, name: 'durango-chat' }
+  );
+
+  // Thread with startedByBotId stays attributed even after the bot is renamed (or has a duplicate name).
+  const renamedCodeBot = { ...codeBot, name: 'code-renamed' };
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'durango-code', startedByBotId: 'y977code', durangoDispatch: { id: 'bottask:y1750' } },
+      [globalPrimary, otherSameName, primary, renamedCodeBot, chatBot],
+      [primary, renamedCodeBot, chatBot]
+    ),
+    { kind: 'bot', bot: renamedCodeBot, name: 'code-renamed' }
+  );
+
+  // Cloud-dispatched bot thread (Convex dispatch id, not bottask:/localbot:) resolves to the starter bot, not Durango.
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'durango-chat', startedByBotId: 'y97fchat', durangoDispatch: { id: 't57cloud123' } },
+      allBots,
+      projectBots
+    ),
+    { kind: 'bot', bot: chatBot, name: 'durango-chat' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'durango-code', durangoDispatch: { id: 't57cloud456' } },
+      allBots,
+      projectBots
+    ),
+    { kind: 'bot', bot: codeBot, name: 'durango-code' }
+  );
+
+  // Local bot thread resolves by id embedded in localbot:<botId>:<taskId> even without startedByBotId.
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'durango-code', durangoDispatch: { id: 'localbot:y977code:lt_1' } }, allBots, projectBots),
+    { kind: 'bot', bot: codeBot, name: 'durango-code' }
+  );
+  // A follow-up by another local bot must not overwrite the original starter bot.
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'durango-chat', durangoDispatch: { id: 'localbot:y977code:lt_2', runOffset: 1 } },
+      allBots,
+      projectBots
+    ),
+    { kind: 'bot', bot: chatBot, name: 'durango-chat' }
+  );
+
+  // Thread started by a bot outside the project (e.g. global primary bot) resolves from allBots.
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'Durango', durangoDispatch: { id: 'bottask:y1799' } }, allBots, projectBots),
+    { kind: 'bot', bot: globalPrimary, name: 'Durango' }
+  );
+
+  // Deleted or unknown bot keeps its recorded name and never falls back to durango-primary.
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'durango-bots', durangoDispatch: { id: 'bottask:y1734' } }, allBots, projectBots),
+    { kind: 'bot', bot: null, name: 'durango-bots' }
+  );
+
+  // Pre-startedByBot thread with bottask: prefix falls back to generic "A bot", never durango-primary.
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 'bottask:y17old' } }, allBots, projectBots),
+    { kind: 'bot', bot: null, name: 'A bot' }
+  );
+
+  // User-started thread that a bot later followed up on stays attributed to You.
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 'bottask:y17followup', runOffset: 2 } }, allBots, projectBots),
+    { kind: 'you' }
+  );
+  // Follow-up on a 0-run user thread (followUp: true, no runOffset) stays attributed to You.
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 'bottask:y17zero', followUp: true } }, allBots, projectBots),
+    { kind: 'you' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 'localbot:y977code:lt_zero', followUp: true } }, allBots, projectBots),
+    { kind: 'you' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 't57followup', followUp: true } }, allBots, projectBots),
+    { kind: 'you' }
+  );
+
+  // Known botId of a deleted bot never falls back to a different live bot sharing the same name.
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'durango-code', startedByBotId: 'deleted_code_bot', durangoDispatch: { id: 'bottask:y17del' } },
+      allBots,
+      projectBots
+    ),
+    { kind: 'bot', bot: null, name: 'durango-code' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'Durango', startedByBotId: 'deleted_cloud_bot', durangoDispatch: { id: 't57del' } },
+      allBots,
+      projectBots
+    ),
+    { kind: 'bot', bot: null, name: 'Durango' }
+  );
+
+  // Nameless 'bot' placeholder never matches a real bot named "Bot".
+  const literalBot = makeBot({ id: 'y97lit', name: 'Bot', emoji: '🤖', project: durangoProject });
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'bot', durangoDispatch: { id: 'bottask:y17noname' } }, [literalBot, ...allBots], [literalBot, ...projectBots]),
+    { kind: 'bot', bot: null, name: 'A bot' }
+  );
+
+  // Signed-out / unloaded bot list keeps the recorded bot name cleanly.
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'durango-code', startedByBotId: 'y977code', durangoDispatch: { id: 'bottask:y1750' } }, [], []),
+    { kind: 'bot', bot: null, name: 'durango-code' }
+  );
+
+  // Legacy name-only matching is case-insensitive when no botId was stored.
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'DURANGO-CHAT', durangoDispatch: { id: 'bottask:y17case' } }, allBots, projectBots),
+    { kind: 'bot', bot: chatBot, name: 'durango-chat' }
+  );
+
+  // Durango Chat/Tasks/API dispatches and user-started threads.
+  assert.deepEqual(resolveThreadStarter({ durangoDispatch: { id: 't57task1' } }, allBots, projectBots), { kind: 'durango' });
+  assert.deepEqual(resolveThreadStarter({}, allBots, projectBots), { kind: 'you' });
 });
 
 for (const { name, fn } of tests) {

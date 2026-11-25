@@ -87,9 +87,11 @@ import type {
 import { ReleaseNotesList } from './AppUpdateUi';
 import { SnapShotSettingsPanel } from './SnapShotSettings';
 import { CustomizationsSettings } from './themes/CustomizationsSettings';
+import { WORKSPACE_SYNC_CONSENT_VERSION } from './workspaceSyncConsent';
 
 const CODEX_BROWSER_EXTENSION_URL =
   'https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg';
+const TELEMETRY_DOCS_URL = 'https://durango.sh/telemetry';
 
 // Settings remains controlled by App because its asynchronous account and
 // update operations are shared with the shell. Keeping that integration in a
@@ -569,12 +571,11 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="setting-label-title">Share coding work with Durango</div>
                   <div className="setting-label-desc">
-                    On by default. Your projects, threads (full transcripts including every
-                    agent step and tool call), and token usage sync to your Durango account, and code
-                    syncs through Durango Cloud repos (below). Durango Chat uses summaries of this
-                    work for its memory, so it can answer questions like “what did I ship this
-                    week?”. Browse everything at Durango Code web → Usage. Turn this off to stop all
-                    syncing from this device.
+                    Off by default. When on, your projects, threads (full transcripts including
+                    every agent step and tool call), and token usage sync to your Durango account.
+                    This powers Durango Chat memory, Usage on durango.sh, and your Durango Source
+                    profile stats. Code stays local unless you also turn on code sync below. Turn
+                    this off to stop all syncing from this device immediately.
                     {!accountState.authenticated &&
                       (workspaceSyncSettings.enabled
                         ? ' Sharing is paused while signed out. You can turn it off now or sign in to resume.'
@@ -585,7 +586,7 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   className="provider-toggle"
                   title={
                     accountState.authenticated
-                      ? 'Share threads, transcripts, usage, and code with your Durango account'
+                      ? 'Share projects, threads, transcripts, and token usage with your Durango account'
                       : workspaceSyncSettings.enabled
                         ? 'Turn off sharing coding work with Durango'
                         : 'Sign in to your Durango account first'
@@ -596,8 +597,15 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                     checked={workspaceSyncSettings.enabled}
                     disabled={!accountState.authenticated && !workspaceSyncSettings.enabled}
                     onChange={(e) =>
-                      // Any explicit choice also settles the one-time notice.
-                      setWorkspaceSyncSettings({ enabled: e.target.checked, consentNoticeSeen: true })
+                      // Any explicit choice also settles the one-time opt-in prompt;
+                      // turning sharing off resets code sync so re-enabling sharing
+                      // never resumes code uploads without a separate opt-in.
+                      setWorkspaceSyncSettings({
+                        enabled: e.target.checked,
+                        ...(e.target.checked ? {} : { syncCode: false }),
+                        consentVersion: WORKSPACE_SYNC_CONSENT_VERSION,
+                        consentNoticeSeen: true,
+                      })
                     }
                   />
                   <span />
@@ -608,15 +616,25 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                 <div className="setting-label">
                   <div className="setting-label-title">Sync code to Durango Cloud</div>
                   <div className="setting-label-desc">
-                    Publish each git project as a private Durango Cloud repo. New commits sync as
-                    immutable save points with full history and diffs; uncommitted file changes are
-                    never uploaded or deployed.
+                    Off by default. Only applies when “Share coding work with Durango” is on.
+                    Auto-publishes each git project as a private Durango Cloud repo and pushes new
+                    commits as immutable save points with full history and diffs; uncommitted file
+                    changes are never uploaded or deployed.
                   </div>
                 </div>
-                <label className="provider-toggle" title="Auto-publish and push git projects">
+                <label
+                  className="provider-toggle"
+                  title={
+                    !accountState.authenticated
+                      ? 'Sign in to your Durango account first'
+                      : !workspaceSyncSettings.enabled
+                        ? 'Turn on “Share coding work with Durango” first'
+                        : 'Auto-publish and push git projects as private Durango Cloud repos'
+                  }
+                >
                   <input
                     type="checkbox"
-                    checked={workspaceSyncSettings.syncCode}
+                    checked={workspaceSyncSettings.enabled && workspaceSyncSettings.syncCode}
                     disabled={!accountState.authenticated || !workspaceSyncSettings.enabled}
                     onChange={(e) => setWorkspaceSyncSettings({ syncCode: e.target.checked })}
                   />
@@ -655,6 +673,26 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   </button>
                 </div>
               )}
+
+              <div className="setting-row">
+                <div className="setting-label">
+                  <div className="setting-label-title">What Durango Code sends</div>
+                  <div className="setting-label-desc">
+                    No analytics or crash-reporting SDKs. Read the full breakdown of sync, update
+                    checks, and third-party agent CLI telemetry.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="provider-auth-button"
+                  onClick={() => {
+                    void window.orion.openExternalUrl(TELEMETRY_DOCS_URL);
+                  }}
+                >
+                  <SquareArrowOutUpRight size={13} />
+                  Telemetry &amp; data
+                </button>
+              </div>
 
               <DurangoProfileMemorySetting authenticated={accountState.authenticated} />
               <DurangoDispatchSettings

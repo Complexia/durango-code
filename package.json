@@ -64,6 +64,7 @@
     "test:project-order": "bun scripts/test-project-order.ts",
     "test:sidebar-v2": "bun scripts/test-sidebar-v2.ts && bun scripts/test-sidebar-v2-update.ts && bun scripts/test-sidebar-v2-update.ts --failed-backfill",
     "test:thread-transcripts": "bun scripts/test-thread-transcripts.ts",
+    "test:workspace-sync-consent": "bun scripts/test-workspace-sync-consent.tsx",
     "test:workspace-sync-threads": "node --no-warnings scripts/test-workspace-sync-threads.mjs",
     "test:workspace-sync-removals": "node --no-warnings scripts/test-workspace-sync-removals.mjs",
     "test:bot-drafts": "bun scripts/test-bot-drafts.ts",

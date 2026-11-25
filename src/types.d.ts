@@ -546,6 +546,9 @@ export type RemoteThreadMeta = {
   settledAt?: string | null;
   hiddenFromRecent?: boolean;
   workspaceName?: string | null;
+  /** Started by one of the person's bots (its name and id), when dispatched by a bot there. */
+  startedByBot?: string | null;
+  startedByBotId?: string | null;
   /** Its access mode and effort settings (Thread fields of the same names). */
   settings?: Record<string, string>;
   /** Actions it waits on the user for (request_user_action). */
@@ -673,6 +676,10 @@ export type RemoteCommandRequest = {
       id: string;
       /** Started from a chat, with Run in Durango Code on a task, or through the API (Durango MCP). */
       origin?: 'chat' | 'tasks' | 'api' | 'bot';
+      /** When `origin === 'bot'`, the starter bot's id (stable across renames). */
+      botId?: string | null;
+      /** When `origin === 'bot'`, the starter bot's display name. */
+      botName?: string | null;
       /** Who sent it, for the thread's note ("Durango Chat", "Grok (MCP) via Durango"). */
       sourceLabel?: string;
       /** Continue `threadId` instead of starting a thread. */

@@ -226,8 +226,11 @@ import {
 import { durangoWorkspaceName } from './app/durangoWorkspace';
 import { hasThreadReaderSupport } from './app/chatMentions';
 import { buildChatMentionsContext, knownDurangoChats, parseChatMentions } from './app/durangoChats';
-import { shouldShowWorkspaceSyncNotice } from './app/workspaceSyncConsent';
-import { WorkspaceSyncNotice } from './app/WorkspaceSyncNotice';
+import {
+  WORKSPACE_SYNC_CONSENT_VERSION,
+  shouldShowWorkspaceSyncConsentPrompt,
+} from './app/workspaceSyncConsent';
+import { WorkspaceSyncConsentDialog } from './app/WorkspaceSyncConsentDialog';
 import { RestartToUpdateDialog, WhatsNewNotice } from './app/AppUpdateUi';
 import { ConfirmDialogHost, confirmDialog } from './app/ConfirmDialog';
 import { TextGenerationModelPrompt } from './app/TextGenerationModelPrompt';
@@ -3169,8 +3172,8 @@ const App: React.FC = () => {
     if (savedDraftIds.length > 0) setTypedDraftThreadIds((prev) => new Set([...prev, ...savedDraftIds]));
   }, [storeHydrated]);
   useEffect(() => {
-    // Never push pre-hydration defaults: work sharing defaults to on, and a
-    // user who turned it off must not get a single sync call at startup.
+    // Wait for hydration before pushing settings so main always receives the
+    // migrated persisted preferences rather than pre-hydration state.
     if (!storeHydrated) return;
     void window.orion?.workspaceSyncConfigure?.(useOrionStore.getState().workspaceSyncSettings);
   }, [storeHydrated, workspaceSyncSettings]);
@@ -3196,7 +3199,36 @@ const App: React.FC = () => {
       })
       .catch(() => {});
   }, [storeHydrated, durangoSettingsForMain, dispatchProjectsSignature]);
-  // One-time "your coding work now syncs" notice (workspaceSyncConsent.ts).
+  // One-time opt-in consent prompt once signed in (workspaceSyncConsent.ts).
+  const showWorkspaceSyncConsentPrompt =
+    storeHydrated &&
+    !accountLoading &&
+    shouldShowWorkspaceSyncConsentPrompt(workspaceSyncSettings, accountState.authenticated);
+  const declineWorkspaceSyncConsent = useCallback(() => {
+    setWorkspaceSyncSettings({
+      enabled: false,
+      syncCode: false,
+      consentVersion: WORKSPACE_SYNC_CONSENT_VERSION,
+      consentNoticeSeen: true,
+    });
+  }, [setWorkspaceSyncSettings]);
+  const acceptWorkspaceSyncConsent = useCallback(
+    ({ syncCode }: { syncCode: boolean }) => {
+      setWorkspaceSyncSettings({
+        enabled: true,
+        syncCode,
+        consentVersion: WORKSPACE_SYNC_CONSENT_VERSION,
+        consentNoticeSeen: true,
+      });
+      toast.success(
+        syncCode
+          ? 'Sharing coding work and code sync are on. Change anytime in Settings → Durango.'
+          : 'Sharing coding work with Durango is on. Change anytime in Settings → Durango.'
+      );
+    },
+    [setWorkspaceSyncSettings]
+  );
+
   // No default text-generation model and no usable pick: ask, once per launch,
   // as long as there is something installed to choose from.
   const showTextGenerationModelPrompt =
@@ -3205,19 +3237,10 @@ const App: React.FC = () => {
     !resolvedUtilityModelId &&
     !textGenerationPromptDismissed &&
     !settingsOpen &&
+    !showWorkspaceSyncConsentPrompt &&
     utilityCandidateModels.some(
       (model) => model.available !== false && enabledProviderIdSet.has(model.providerId)
     );
-
-  const showWorkspaceSyncNotice =
-    storeHydrated && shouldShowWorkspaceSyncNotice(workspaceSyncSettings, accountState.authenticated);
-  const acknowledgeWorkspaceSyncNotice = useCallback(() => {
-    setWorkspaceSyncSettings({ consentNoticeSeen: true });
-  }, [setWorkspaceSyncSettings]);
-  const turnOffWorkspaceSyncFromNotice = useCallback(() => {
-    setWorkspaceSyncSettings({ enabled: false, consentNoticeSeen: true });
-    toast.info('Sharing coding work with Durango is off. Turn it back on anytime in Settings → Durango.');
-  }, [setWorkspaceSyncSettings]);
   // Claude Code CLI terminals take instructions once, at launch: keep the
   // opted-in "[Durango memory]" block ready for them (main caches the recall).
   const includeDurangoProfileMemory = useOrionStore(
@@ -9230,7 +9253,8 @@ const App: React.FC = () => {
             ? command.durangoDispatch
             : null;
         const dispatchSource =
-          dispatch?.sourceLabel ?? (dispatch?.origin === 'tasks' ? 'Durango Tasks' : 'Durango Chat');
+          dispatch?.sourceLabel ??
+          (dispatch?.origin === 'bot' ? 'your bot' : dispatch?.origin === 'tasks' ? 'Durango Tasks' : 'Durango Chat');
         // A follow-up's outcome is its own run, not the thread's first one.
         const dispatchRunOffset =
           dispatch && !createdThread
@@ -9284,7 +9308,19 @@ const App: React.FC = () => {
           if (title) updateThread(threadId, { title });
           // A bot's thread: record which bot started it.
           if (dispatch.origin === 'bot') {
-            updateThread(threadId, { startedByBot: dispatchSource.replace(/^your bot /, '').slice(0, 80) || 'bot' });
+            const botId =
+              typeof dispatch.botId === 'string' && dispatch.botId.trim() ? dispatch.botId.trim().slice(0, 128) : undefined;
+            const rawBotName =
+              typeof dispatch.botName === 'string' && dispatch.botName.trim()
+                ? dispatch.botName.trim()
+                : typeof dispatch.sourceLabel === 'string'
+                  ? dispatch.sourceLabel.replace(/^your bot(?: |$)/, '').trim()
+                  : '';
+            const botName = rawBotName.slice(0, 80) || undefined;
+            updateThread(threadId, {
+              ...(botName ? { startedByBot: botName } : !botId ? { startedByBot: 'bot' } : {}),
+              ...(botId ? { startedByBotId: botId } : {}),
+            });
           }
           const accessLabel =
             accessModeOptions.find((option) => option.value === requestedAccessMode)?.label ?? 'Read only';
@@ -9353,6 +9389,7 @@ const App: React.FC = () => {
               sourceUrl: dispatch.sourceUrl,
               startedAt: new Date().toISOString(),
               ...(dispatchRunOffset ? { runOffset: dispatchRunOffset } : {}),
+              ...(!createdThread ? { followUp: true } : {}),
             },
           });
         }
@@ -11907,7 +11944,7 @@ const App: React.FC = () => {
         />
       )}
 
-      {whatsNew?.unseen && (
+      {whatsNew?.unseen && !showWorkspaceSyncConsentPrompt && (
         <WhatsNewNotice version={whatsNew.version} notes={whatsNew.notes} onDismiss={dismissWhatsNew} />
       )}
 
@@ -11920,10 +11957,10 @@ const App: React.FC = () => {
         />
       )}
 
-      {showWorkspaceSyncNotice && (
-        <WorkspaceSyncNotice
-          onTurnOff={turnOffWorkspaceSyncFromNotice}
-          onAcknowledge={acknowledgeWorkspaceSyncNotice}
+      {showWorkspaceSyncConsentPrompt && (
+        <WorkspaceSyncConsentDialog
+          onDecline={declineWorkspaceSyncConsent}
+          onAccept={acceptWorkspaceSyncConsent}
         />
       )}
 

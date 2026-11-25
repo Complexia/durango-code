@@ -85,6 +85,7 @@ import {
   newBotMessageId,
   projectBotsFor,
   relativeBotTime,
+  resolveThreadStarter,
   taskReportActions,
   taskReportBody,
   type BotProject,
@@ -98,6 +99,7 @@ import {
   type BotAttachmentFile,
   type BotAttachmentUploadStatus,
   type BotModelChoice,
+  type ThreadStarter,
 } from './bots';
 import { BotModelMenu } from './BotModelMenu';
 
@@ -522,6 +524,22 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     (bot: Pick<DesktopBot, 'project'> | null | undefined) =>
       bot?.project?.key ? projectPathByKey.get(bot.project.key) ?? null : null,
     [projectPathByKey]
+  );
+  const projectBotCountsByKey = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const candidate of bots ?? []) {
+      const key = candidate.project?.key;
+      if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  }, [bots]);
+  const soleProjectPathOfBot = useCallback(
+    (bot: Pick<DesktopBot, 'project'> | null | undefined) => {
+      const key = bot?.project?.key;
+      if (!key || projectBotCountsByKey.get(key) !== 1) return null;
+      return projectPathByKey.get(key) ?? null;
+    },
+    [projectBotCountsByKey, projectPathByKey]
   );
 
   // The projects window: projects open here (each with all its bots), the one
@@ -994,6 +1012,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             <ProjectPage
               key={`${account ?? ''}:${selectedEntry.id}`}
               entry={selectedEntry}
+              allBots={bots ?? []}
+              soleProjectPathOfBot={soleProjectPathOfBot}
               onBack={openProjects}
               onOpenBot={openBot}
               onNewThread={newProjectThread}
@@ -1548,7 +1568,7 @@ const ProjectsView: React.FC<{ entries: ProjectEntry[]; onOpen: (projectId: stri
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto w-full max-w-[860px] px-5 py-5">
         <p className="mb-4 text-[12.5px] leading-relaxed text-neutral-500">
-          Each project can have its own bots, threads, and notes and files its bots and threads keep in mind.
+          Each project can have its own bots, threads, and a library of notes and files they check on demand.
         </p>
         {entries.length === 0 ? (
           <div className="text-[13px] text-neutral-500">No projects yet. Add one from the Threads tab (Add project) or the Code tab.</div>
@@ -1627,13 +1647,6 @@ const threadStateOf = (thread: Thread, needsYou: boolean): ThreadState => {
   return 'done';
 };
 
-/** Who started a thread: a bot (it dispatched it here), Durango (Chat or the API), or the person. */
-const threadStarter = (thread: Thread): 'bot' | 'durango' | 'you' => {
-  const id = thread.durangoDispatch?.id ?? '';
-  if (id.startsWith('bottask:') || id.startsWith('localbot:')) return 'bot';
-  return id ? 'durango' : 'you';
-};
-
 const ASK_SUGGESTIONS = ['Start a thread to…', 'What changed today?', 'Settle what’s done', 'Fix the failing tests'];
 
 /**
@@ -1644,6 +1657,8 @@ const ASK_SUGGESTIONS = ['Start a thread to…', 'What changed today?', 'Settle 
  */
 const ProjectPage: React.FC<{
   entry: ProjectEntry;
+  allBots: DesktopBot[];
+  soleProjectPathOfBot: (bot: Pick<DesktopBot, 'project'> | null | undefined) => string | null;
   onBack: () => void;
   onOpenBot: (botId: string) => void;
   onNewThread: (projectId: string) => void;
@@ -1654,7 +1669,7 @@ const ProjectPage: React.FC<{
   attentionThreadIds: ReadonlyMap<string, number>;
   /** The account the Bots view shows ('local' signed out): unsent prompts are kept per account. */
   account: string | null;
-}> = ({ entry, onBack, onOpenBot, onNewThread, onOpenThread, onBotAdded, onRequestNewBot, threadActions, attentionThreadIds, account }) => {
+}> = ({ entry, allBots, soleProjectPathOfBot, onBack, onOpenBot, onNewThread, onOpenThread, onBotAdded, onRequestNewBot, threadActions, attentionThreadIds, account }) => {
   const [selectedProjectBotId, setSelectedProjectBotId] = useState<string | null>(entry.bot?.id ?? null);
   const [createdBot, setCreatedBot] = useState<DesktopBot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1665,6 +1680,10 @@ const ProjectPage: React.FC<{
     if (!createdBot || entry.bots.some((item) => item.id === createdBot.id)) return entry.bots;
     return [createdBot, ...entry.bots];
   }, [createdBot, entry.bots]);
+  const knownBots = useMemo(() => {
+    if (!createdBot || allBots.some((item) => item.id === createdBot.id)) return allBots;
+    return [createdBot, ...allBots];
+  }, [allBots, createdBot]);
   const bot = useMemo(
     () => (selectedProjectBotId ? projectBots.find((item) => item.id === selectedProjectBotId) ?? projectBots[0] ?? null : projectBots[0] ?? null),
     [projectBots, selectedProjectBotId]
@@ -1686,6 +1705,12 @@ const ProjectPage: React.FC<{
     if (filter === 'settled') return threadLists.settled;
     return threadLists.recent.filter((thread) => stateOf(thread) === filter);
   }, [filter, threadLists, stateOf]);
+
+  useEffect(() => {
+    if (createdBot && entry.bots.some((item) => item.id === createdBot.id)) {
+      setCreatedBot(null);
+    }
+  }, [createdBot, entry.bots]);
 
   useEffect(() => {
     if (selectedProjectBotId && !projectBots.some((item) => item.id === selectedProjectBotId)) {
@@ -1819,17 +1844,28 @@ const ProjectPage: React.FC<{
                       {filter ? `No threads ${THREAD_STATES[filter].label}.` : 'Nothing open: every thread is snoozed or settled.'}
                     </p>
                   ) : (
-                    shown.map((thread) => (
-                      <ProjectThreadRow
-                        key={thread.id}
-                        thread={thread}
-                        state={stateOf(thread)}
-                        bot={bot}
-                        projectPath={entry.path}
-                        actions={threadActions}
-                        onOpen={() => onOpenThread(thread.id)}
-                      />
-                    ))
+                    shown.map((thread) => {
+                      const starter = resolveThreadStarter(thread, knownBots, projectBots);
+                      const starterProjectPath =
+                        starter.kind === 'bot' && starter.bot
+                          ? starter.bot.project?.key && starter.bot.project.key === entry.key
+                            ? projectBots.length === 1
+                              ? entry.path
+                              : null
+                            : soleProjectPathOfBot(starter.bot)
+                          : null;
+                      return (
+                        <ProjectThreadRow
+                          key={thread.id}
+                          thread={thread}
+                          state={stateOf(thread)}
+                          starter={starter}
+                          starterProjectPath={starterProjectPath}
+                          actions={threadActions}
+                          onOpen={() => onOpenThread(thread.id)}
+                        />
+                      );
+                    })
                   )}
                   {!filter && counts.snoozed > 0 && (
                     <button type="button" onClick={() => setFilter('snoozed')} className="mt-1 px-1 py-2 text-[13px] text-neutral-500 hover:text-neutral-300">
@@ -1986,7 +2022,7 @@ const ProjectBotBox: React.FC<{
                   ? `One of ${bots.length} bots in ${entry.name}`
                   : 'Project bot'
               : 'No bots yet — create a custom bot or send a message below to start one'}
-            {library && (library.notes || library.files) ? ` · knows ${library.notes} note${library.notes === 1 ? '' : 's'} and ${library.files} file${library.files === 1 ? '' : 's'}` : ''}
+            {library && (library.notes || library.files) ? ` · ${library.notes} note${library.notes === 1 ? '' : 's'}, ${library.files} file${library.files === 1 ? '' : 's'} in library` : ''}
             {status && <> · {status}</>}
           </div>
         </div>
@@ -2110,13 +2146,12 @@ const ProjectBotBox: React.FC<{
 const ProjectThreadRow: React.FC<{
   thread: Thread;
   state: ThreadState;
-  bot: DesktopBot | null;
-  projectPath?: string | null;
+  starter: ThreadStarter;
+  starterProjectPath?: string | null;
   actions: SidebarV2Actions;
   onOpen: () => void;
-}> = ({ thread, state, bot, projectPath, actions, onOpen }) => {
+}> = ({ thread, state, starter, starterProjectPath, actions, onOpen }) => {
   const look = THREAD_STATES[state];
-  const starter = threadStarter(thread);
   const model = actions.modelLabel(thread);
   const unseen = Boolean(thread.finishedUnseenAt);
   const detail =
@@ -2174,12 +2209,18 @@ const ProjectThreadRow: React.FC<{
         {!thread.settledAt && (thread.snoozedAt ? quick('Wake', () => actions.unsnoozeThread(thread.id)) : quick('Snooze', () => actions.snoozeThread(thread.id)))}
         {thread.settledAt ? quick('Reopen', () => actions.unsettleThread(thread.id)) : quick('Settle', () => actions.settleThread(thread.id))}
       </div>
-      <span className="flex w-28 shrink-0 items-center gap-1.5 truncate text-[12.5px] text-neutral-400">
-        {starter === 'bot' ? (
+      <span
+        className="flex w-28 shrink-0 items-center gap-1.5 text-[12.5px] text-neutral-400"
+        title={starter.kind === 'bot' ? `Started by ${starter.name}` : undefined}
+      >
+        {starter.kind === 'bot' ? (
           <>
-            {bot ? <BotIcon bot={bot} px={14} projectPath={projectPath} /> : <Bot size={13} />} {bot?.name ?? 'A bot'}
+            <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[11px]" aria-hidden>
+              {starter.bot ? <BotIcon bot={starter.bot} px={14} projectPath={starterProjectPath} /> : <Bot size={13} />}
+            </span>
+            <span className="min-w-0 truncate">{starter.name}</span>
           </>
-        ) : starter === 'durango' ? (
+        ) : starter.kind === 'durango' ? (
           <>✨ Durango</>
         ) : (
           <>
@@ -3082,7 +3123,7 @@ const LibraryPanel: React.FC<{
   </section>
 );
 
-/** The strip above the panels: where the project lives, and who reads its library. */
+/** The strip above the panels: where the project lives, and who checks its library on demand. */
 const LibraryAbout: React.FC<{ path: string | null; bots: DesktopBot[]; onOpenBot: (botId: string) => void }> = ({ path, bots, onOpenBot }) => {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
@@ -3129,11 +3170,11 @@ const LibraryAbout: React.FC<{ path: string | null; bots: DesktopBot[]; onOpenBo
           <span className="truncate">
             {bots.length === 1 ? (
               <>
-                Read by <span className="font-medium text-neutral-200">{primaryProjectBot.name}</span> and the threads it starts
+                Checked on demand by <span className="font-medium text-neutral-200">{primaryProjectBot.name}</span> and project threads
               </>
             ) : (
               <>
-                Read by <span className="font-medium text-neutral-200">{bots.length} bots</span> and the threads they start
+                Checked on demand by <span className="font-medium text-neutral-200">{bots.length} bots</span> and project threads
               </>
             )}
           </span>
@@ -3142,7 +3183,7 @@ const LibraryAbout: React.FC<{ path: string | null; bots: DesktopBot[]; onOpenBo
       ) : (
         <span className="flex min-w-0 items-center gap-2 px-2.5 py-1 text-[12px] text-neutral-500">
           <Bot size={14} className="shrink-0" />
-          <span className="truncate">No bots yet. Project bots keep this library in mind.</span>
+          <span className="truncate">No bots yet. Project threads can check this library on demand.</span>
         </span>
       )}
     </div>
@@ -3290,7 +3331,7 @@ const NoteComposer: React.FC<{ full: boolean; onAdd: (content: string) => Promis
   );
 };
 
-/** Context: the notes every bot on the project keeps in mind. Deleting waits a moment, so it can be undone. */
+/** Context: project notes that bots and threads check on demand. Deleting waits a moment, so it can be undone. */
 const ContextPanel: React.FC<{
   notes: BotProjectNote[] | null;
   bots: DesktopBot[];
@@ -3356,7 +3397,7 @@ const ContextPanel: React.FC<{
       icon={<NotebookPen size={14} />}
       title="Context"
       count={count}
-      description="Facts, rules and decisions the bots keep in mind."
+      description="Facts, rules and decisions bots and threads pull when relevant."
       actions={
         filterable ? (
           <label className="flex h-7 w-40 items-center gap-1.5 rounded-md bg-white/[0.03] px-2 text-neutral-500 ring-1 ring-white/[0.07] focus-within:ring-white/[0.16]">
@@ -3390,7 +3431,7 @@ const ContextPanel: React.FC<{
         <div className="mt-2.5 rounded-lg border border-dashed border-white/[0.08] px-4 py-4">
           <div className="text-[12.5px] text-neutral-300">No context yet</div>
           <p className="mt-0.5 text-[12px] leading-relaxed text-neutral-500">
-            Short facts every bot on this project should know: goals, conventions, people to ask, things to avoid. For example:
+            Short facts bots and threads on this project can pull when relevant: goals, conventions, people to ask, things to avoid. For example:
           </p>
           <div className="mt-2.5 flex flex-wrap gap-1.5">
             {NOTE_EXAMPLES.map((example) => (

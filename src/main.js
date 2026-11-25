@@ -108,6 +108,7 @@ import {
 import { createBotAttachmentManager } from './main/bot-attachments.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
+import { clipMiddle } from './report-clip.js';
 import { botThreadTitle } from './main/bot-thread-title.js';
 import { titleFromResponseText, utilityReplyFromOutput } from './main/utility-reply.js';
 import {
@@ -1462,7 +1463,7 @@ app.whenReady().then(async () => {
     void providerSignInWatch.check();
   });
 
-  // Workspace sync (opt-in, contract in orion-web/docs/workspace-sync.md).
+  // Workspace sync (opt-in, off by default).
   // Seed the engine from the persisted store so an enabled sync resumes after
   // restart without waiting for the renderer to hydrate; the renderer re-pushes
   // the settings over sync:configure on hydration and every change.
@@ -1482,11 +1483,10 @@ app.whenReady().then(async () => {
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
   });
   void readPersistedStoreState().then((state) => {
-    // Same consent reconciliation as the renderer store (work sharing
-    // defaults to Full; a persisted "off" made after consent v1 sticks).
-    // A store without settings yet is a fresh install: the renderer pushes
-    // its defaults on hydration.
-    if (state?.workspaceSyncSettings) {
+    // Same consent reconciliation as the renderer store (both sharing and code
+    // sync are opt-in and off by default since consent v2). Skip if the
+    // renderer already pushed live settings via sync:configure.
+    if (workspaceSyncConfigureSeq === 0 && state?.workspaceSyncSettings) {
       configureWorkspaceSync(migrateWorkspaceSyncSettings(state.workspaceSyncSettings));
     }
   });
@@ -2237,7 +2237,11 @@ ipcMain.handle('sessionImport:read', async (_event, input) => {
 
 // Workspace sync surface. Configure carries the renderer's persisted opt-in
 // settings; the engine itself no-ops while disabled or signed out.
-ipcMain.handle('sync:configure', (_event, value) => configureWorkspaceSync(value));
+let workspaceSyncConfigureSeq = 0;
+ipcMain.handle('sync:configure', (_event, value) => {
+  workspaceSyncConfigureSeq += 1;
+  return configureWorkspaceSync(value);
+});
 ipcMain.handle('sync:now', () => workspaceSyncNow());
 ipcMain.handle('sync:getState', () => getWorkspaceSyncStatus());
 
@@ -4570,11 +4574,13 @@ const dispatchWorker = createDispatchWorker({
       durangoDispatch: {
         id: dispatch.id,
         origin:
-          typeof dispatch.bot === 'string' && dispatch.bot.trim()
+          (typeof dispatch.bot === 'string' && dispatch.bot.trim()) || (typeof dispatch.botId === 'string' && dispatch.botId.trim())
             ? 'bot'
             : dispatch.origin === 'tasks' || dispatch.origin === 'api'
               ? dispatch.origin
               : 'chat',
+        ...(dispatch.botId ? { botId: dispatch.botId } : {}),
+        ...(typeof dispatch.bot === 'string' && dispatch.bot.trim() ? { botName: dispatch.bot.trim().slice(0, 80) } : {}),
         sourceLabel: dispatchSourceLabel(dispatch),
         followUp: Boolean(threadId),
         taskId: dispatch.taskId,
@@ -4640,9 +4646,10 @@ const LOCAL_BOT_DISPATCH_PREFIX = 'localbot:';
 const BOT_TASK_DISPATCH_PREFIX = 'bottask:';
 const startBotProjectThread =
   (prefix) =>
-  ({ projectId, prompt, key, botName, title, accessMode, modelId, reasoningEffort, codexServiceTier, claudeContextWindow }) => {
+  ({ projectId, prompt, key, botId, botName, title, accessMode, modelId, reasoningEffort, codexServiceTier, claudeContextWindow }) => {
+    const cleanBotName = typeof botName === 'string' ? botName.trim().slice(0, 80) : '';
     // A plain thread title, without a "Bots:" style prefix (bot-thread-title.js).
-    const threadTitle = botThreadTitle(title, botName).slice(0, 80);
+    const threadTitle = botThreadTitle(title, cleanBotName).slice(0, 80);
     return requestDispatchRendererCommand({
       kind: 'runTurn',
       projectId,
@@ -4652,11 +4659,13 @@ const startBotProjectThread =
       ...(codexServiceTier ? { codexServiceTier } : {}),
       ...(claudeContextWindow ? { claudeContextWindow } : {}),
       accessMode,
-      source: { machineId: 'durango-bot', machineName: botName },
+      source: { machineId: 'durango-bot', machineName: cleanBotName || 'your bot' },
       durangoDispatch: {
         id: `${prefix}${key}`,
         origin: 'bot',
-        sourceLabel: `your bot ${botName}`,
+        ...(botId ? { botId } : {}),
+        ...(cleanBotName ? { botName: cleanBotName } : {}),
+        sourceLabel: cleanBotName ? `your bot ${cleanBotName}` : 'your bot',
         ...(threadTitle ? { title: threadTitle } : {}),
         followUp: false,
         sourceUrl: null,
@@ -4681,6 +4690,7 @@ const startBotThreadFollowUp =
         30_000
       );
     }
+    const cleanBotName = typeof botName === 'string' ? botName.trim().slice(0, 80) : '';
     // Bots work with Full access, in their follow-ups too (bot-replies.js normalizeBotSettings).
     const turnAccessMode = accessMode;
     return requestDispatchRendererCommand({
@@ -4692,11 +4702,11 @@ const startBotThreadFollowUp =
       ...(codexServiceTier ? { codexServiceTier } : {}),
       ...(claudeContextWindow ? { claudeContextWindow } : {}),
       accessMode: turnAccessMode,
-      source: { machineId: 'durango-bot', machineName: botName },
+      source: { machineId: 'durango-bot', machineName: cleanBotName || 'your bot' },
       durangoDispatch: {
         id: `${prefix}${key}`,
         origin: 'bot',
-        sourceLabel: `your bot ${botName}`,
+        sourceLabel: cleanBotName ? `your bot ${cleanBotName}` : 'your bot',
         followUp: true,
         sourceUrl: null,
         requestedAccessMode: turnAccessMode,
@@ -4833,7 +4843,7 @@ const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error, 
   if (threadId) {
     const thread = { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true };
     // Kept short enough that Durango's clip of the report never cuts the footer.
-    const head = (text) => String(text ?? '').trim().slice(0, 10_000);
+    const head = (text) => clipMiddle(String(text ?? '').trim(), 10_000);
     if (outcome === 'finished') summary = withThreadReportFooter(head(summary) || 'The Durango Code thread finished without a written summary.', thread);
     else error = withThreadReportFooter(head(error) || 'it stopped.', thread);
   }
@@ -5107,7 +5117,7 @@ const withReportRefs = async (input) => {
   const refs = await botTaskReportRefs({ threadId: input?.threadId, workspacePath: input?.workspacePath }).catch(() => '');
   // The thread's words are clipped first, so the refs (and the thread footer
   // reportBotTaskThread adds after them, within its 10,000-character clip) survive.
-  return refs ? `${(summary?.trim() || 'The thread finished without a written summary.').slice(0, 9_000)}${refs}` : summary;
+  return refs ? `${clipMiddle(summary?.trim() || 'The thread finished without a written summary.', 9_000)}${refs}` : summary;
 };
 
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
@@ -5162,7 +5172,7 @@ const sendBotTaskNotice = async ({ taskId, threadId, kind, key, seq, detail }) =
   const machineId = await getDurangoDeviceId().catch(() => null);
   if (!machineId || !taskId) return { ok: false, retry: true };
   const thread = threadId ? { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true } : null;
-  const text = String(detail ?? '').trim().slice(0, 3_000);
+  const text = clipMiddle(String(detail ?? '').trim(), 3_000);
   const notice = { kind, key, seq, detail: thread ? withThreadReportFooter(text, thread) : text };
   try {
     return await durangoClient.noticeBotTask({ taskId, machineId, notice });

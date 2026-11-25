@@ -410,6 +410,8 @@ const normalizeDispatch = (dispatch) => {
     sourceLabel: optional(dispatch.sourceLabel),
     /** Started by one of the person's bots: its name. */
     bot: optional(dispatch.bot)?.slice(0, 80) ?? null,
+    /** Started by one of the person's bots: its id. */
+    botId: optional(dispatch.botId)?.slice(0, 128) ?? null,
     createdAt: optional(dispatch.createdAt),
   };
 };
