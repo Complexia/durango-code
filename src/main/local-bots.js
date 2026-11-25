@@ -86,7 +86,6 @@ export const LOCAL_PROJECT_LIMITS = {
   fileBytes: 10 * 1024 * 1024,
   filesPerProject: 200,
   readChars: 60_000,
-  promptNotesChars: 6_000,
   toolDefaultLimit: 50,
   toolSearchDefaultLimit: 20,
   toolMaxChars: 40_000,
@@ -662,6 +661,8 @@ const nextLocalProjectBotName = (projectName, existingNames) => {
 };
 
 const PROJECT_NOTE_STOPWORDS = new Set([
+  'to', 'on', 'in', 'of', 'is', 'it', 'at', 'or', 'by', 'as', 'be', 'do',
+  'no', 'if', 'so', 'up', 'we', 'an', 'my', 'me', 'us', 'he',
   'the', 'and', 'for', 'with', 'that', 'this', 'from', 'are', 'was', 'were',
   'have', 'has', 'had', 'into', 'about', 'your', 'our', 'their', 'its', 'can',
   'will', 'all', 'any', 'but', 'not', 'per', 'via', 'when', 'where', 'what',
@@ -670,7 +671,7 @@ const PROJECT_NOTE_STOPWORDS = new Set([
   'use', 'using', 'used', 'make', 'keep',
 ]);
 
-const projectSearchTerms = (query, { dropStopwords = false, minLength = 2 } = {}) => {
+const projectSearchTerms = (query, { dropStopwords = false, minLength = 2, maxTerms = 12 } = {}) => {
   const normalized = str(query).normalize('NFKC').toLowerCase().trim();
   if (!normalized) return [];
   const raw = normalized
@@ -684,7 +685,7 @@ const projectSearchTerms = (query, { dropStopwords = false, minLength = 2 } = {}
     if (seen.has(token)) continue;
     seen.add(token);
     terms.push(token);
-    if (terms.length >= 12) break;
+    if (terms.length >= maxTerms) break;
   }
   if (!terms.length && !dropStopwords) return [normalized];
   return terms;
@@ -712,7 +713,8 @@ export const searchProjectNotes = (notes, files, { query, limit, maxChars } = {}
   const formatFile = (file) => ({ name: file.name, size: file.size, type: file.contentType });
 
   if (trimmedQuery) {
-    const terms = projectSearchTerms(trimmedQuery);
+    const filteredTerms = projectSearchTerms(trimmedQuery, { dropStopwords: true });
+    const terms = filteredTerms.length > 0 ? filteredTerms : projectSearchTerms(trimmedQuery, { dropStopwords: false });
     const phrase = trimmedQuery.normalize('NFKC').toLowerCase();
     const wordPatterns = terms.map((term) => new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(term)}`, 'u'));
     const scoredNotes = [];
@@ -746,10 +748,14 @@ export const searchProjectNotes = (notes, files, { query, limit, maxChars } = {}
     );
     const kept = [];
     let usedChars = 0;
+    let charCapped = false;
     for (const entry of scoredNotes) {
       if (kept.length >= cap) break;
       const len = str(entry.note.content).length;
-      if (usedChars + len > charCap && kept.length > 0) break;
+      if (usedChars + len > charCap && kept.length > 0) {
+        charCapped = true;
+        break;
+      }
       usedChars += len;
       kept.push(entry.note);
     }
@@ -771,7 +777,9 @@ export const searchProjectNotes = (notes, files, { query, limit, maxChars } = {}
       scoredNotes.length === 0 && sortedNotes.length > 0
         ? `No notes matched "${trimmedQuery}" (${sortedNotes.length} note${sortedNotes.length === 1 ? '' : 's'} in this project). Try broader keywords or call project_notes without query to browse.`
         : truncated
-          ? `Showing top ${kept.length} of ${scoredNotes.length} matching notes (${sortedNotes.length} total). Narrow your query or raise \`limit\` to see more.`
+          ? charCapped
+            ? `Showing top ${kept.length} of ${scoredNotes.length} matching notes (${sortedNotes.length} total; size limit reached). Narrow your query to see more.`
+            : `Showing top ${kept.length} of ${scoredNotes.length} matching notes (${sortedNotes.length} total). Narrow your query or raise \`limit\` to see more.`
           : undefined;
     return {
       notes: kept.map(formatNote),
@@ -791,10 +799,14 @@ export const searchProjectNotes = (notes, files, { query, limit, maxChars } = {}
   );
   const kept = [];
   let usedChars = 0;
+  let charCapped = false;
   for (const note of sortedNotes) {
     if (kept.length >= cap) break;
     const len = str(note.content).length;
-    if (usedChars + len > charCap && kept.length > 0) break;
+    if (usedChars + len > charCap && kept.length > 0) {
+      charCapped = true;
+      break;
+    }
     usedChars += len;
     kept.push(note);
   }
@@ -807,7 +819,9 @@ export const searchProjectNotes = (notes, files, { query, limit, maxChars } = {}
     ...(truncated
       ? {
           truncated: true,
-          hint: `Showing ${kept.length} newest of ${sortedNotes.length} notes. Pass \`query\` to search specific topics or a higher \`limit\`.`,
+          hint: charCapped
+            ? `Showing ${kept.length} newest of ${sortedNotes.length} notes (size limit reached). Pass \`query\` to search specific topics.`
+            : `Showing ${kept.length} newest of ${sortedNotes.length} notes. Pass \`query\` to search specific topics or a higher \`limit\`.`,
         }
       : {}),
   };
@@ -819,11 +833,11 @@ export const searchProjectNotes = (notes, files, { query, limit, maxChars } = {}
  * duplicates or superseded notes. Mirrors chat/convex/botPolicy.ts. Pure.
  */
 export const findSimilarProjectNotes = (existing, content, limit = 3) => {
-  const terms = projectSearchTerms(content, { dropStopwords: true, minLength: 3 });
+  const terms = projectSearchTerms(content, { dropStopwords: true, minLength: 3, maxTerms: Number.POSITIVE_INFINITY });
   if (!terms.length) return [];
   const scored = [];
   for (const note of Array.isArray(existing) ? existing : []) {
-    const noteTerms = new Set(projectSearchTerms(note?.content, { dropStopwords: true, minLength: 3 }));
+    const noteTerms = new Set(projectSearchTerms(note?.content, { dropStopwords: true, minLength: 3, maxTerms: Number.POSITIVE_INFINITY }));
     if (!noteTerms.size) continue;
     let shared = 0;
     for (const term of terms) {
@@ -851,22 +865,26 @@ export const projectLibraryHint = ({ name, noteCount = 0, fileCount = 0, files =
   if (notes === 0 && totalFiles === 0) {
     return `Project library (${name}): no notes or files yet.`;
   }
+  const inlineFiles = totalFiles > 0 && totalFiles <= MAX_INLINE_FILE_NAMES && fileNames.length === totalFiles;
   const parts = [];
   if (notes > 0) parts.push(`${notes} note${notes === 1 ? '' : 's'}`);
   if (totalFiles > 0) {
-    const names = fileNames.length > 0 && fileNames.length <= MAX_INLINE_FILE_NAMES ? ` (${fileNames.join(', ')})` : '';
+    const names = inlineFiles ? ` (${fileNames.join(', ')})` : '';
     parts.push(`${totalFiles} file${totalFiles === 1 ? '' : 's'}${names}`);
   }
-  const actions = [
-    notes > 0 ? 'call project_notes (with optional `query`) to search or list notes' : null,
-    totalFiles > 0
-      ? fileNames.length > 0 && fileNames.length <= MAX_INLINE_FILE_NAMES
-        ? 'read_project_file to read files'
-        : 'call project_notes to list files'
-      : null,
-  ]
-    .filter(Boolean)
-    .join('; ');
+  const actions =
+    notes > 0 && totalFiles > 0 && !inlineFiles
+      ? 'call project_notes (with optional `query`) to search or list notes and files'
+      : [
+          notes > 0 ? 'call project_notes (with optional `query`) to search or list notes' : null,
+          totalFiles > 0
+            ? inlineFiles
+              ? 'read_project_file to read files'
+              : 'call project_notes to list files'
+            : null,
+        ]
+          .filter(Boolean)
+          .join('; ');
   return `Project library (${name}): ${parts.join(', ')} — ${actions}.`;
 };
 
@@ -1208,6 +1226,17 @@ export const createLocalBotEngine = ({
     return { messages, claims, log: logName, lines, bytes };
   };
 
+  let projectStore = null; // { [key]: { notes: [...], files: [...] } }
+  let projectsLoaded = null;
+  const loadProjects = () => {
+    projectsLoaded ??= (async () => {
+      const raw = await readJson(path.join(storageDir(), PROJECTS_FILE));
+      projectStore = raw && typeof raw.projects === 'object' && raw.projects ? raw.projects : {};
+      return projectStore;
+    })();
+    return projectsLoaded;
+  };
+
   const ensureLoaded = () => {
     loaded ??= (async () => {
       const base = storageDir();
@@ -1237,6 +1266,9 @@ export const createLocalBotEngine = ({
         next.set(bot.id, entry);
       }
       entries = next;
+      // Load project library metadata upfront so the first reply's library count hint
+      // reflects persisted notes/files immediately after a restart.
+      await loadProjects();
     })();
     return loaded;
   };
@@ -2046,13 +2078,6 @@ export const createLocalBotEngine = ({
   // Notes and file records by project key in projects.json; file bytes under
   // project-files/<hash of the key>/<name>.
 
-  let projectStore = null; // { [key]: { notes: [...], files: [...] } }
-  const loadProjects = async () => {
-    if (projectStore) return projectStore;
-    const raw = await readJson(path.join(storageDir(), PROJECTS_FILE));
-    projectStore = raw && typeof raw.projects === 'object' && raw.projects ? raw.projects : {};
-    return projectStore;
-  };
   const persistProjects = () => persistFile(PROJECTS_FILE, () => (projectStore ? { version: 1, projects: projectStore } : null));
   const projectOf = (key, name) => {
     projectStore[key] ??= { notes: [], files: [] };
@@ -3168,6 +3193,7 @@ export const createLocalBotEngine = ({
       const target = path.join(base, `synced-${stamp}`);
       await fs.mkdir(target, { recursive: true });
       projectStore = null;
+      projectsLoaded = null;
       for (const name of [INDEX_FILE, PROJECTS_FILE, PROJECT_FILES_DIR, ...ids.map((id) => `${id}.json`), ...logs]) {
         await fs.rename(path.join(base, name), path.join(target, name)).catch((error) => {
           if (error?.code !== 'ENOENT') throw error;

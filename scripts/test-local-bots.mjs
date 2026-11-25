@@ -936,13 +936,13 @@ test('project bots: notes are fetched on demand (not pasted in), searchable, and
   assert.deepEqual(listed.notes.map((note) => note.by), ['Site', 'you']);
   assert.deepEqual(listed.files.map((file) => file.name), ['notes.txt', 'plan.md']);
 
-  const searched = await call('project_notes', { query: 'Next.js' });
-  assert.equal(searched.matchedNotes, 1);
+  const searched = await call('project_notes', { query: 'how to deploy' });
+  assert.equal(searched.matchedNotes, 1, 'stopwords like "how" and "to" do not match unrelated notes');
   assert.equal(searched.totalNotes, 2);
-  assert.deepEqual(searched.notes.map((note) => note.note), ['The site runs on Next.js.']);
+  assert.deepEqual(searched.notes.map((note) => note.note), ['Deploys go through durango-code land.']);
   assert.deepEqual(searched.files, [], 'unrelated files are filtered out when searching');
 
-  const missed = await call('project_notes', { query: 'billing stripe' });
+  const missed = await call('project_notes', { query: 'billing on stripe' });
   assert.deepEqual(missed.notes, []);
   assert.equal(missed.matchedNotes, 0);
   assert.equal(missed.totalNotes, 2);
@@ -978,6 +978,25 @@ test('project bots: notes are fetched on demand (not pasted in), searchable, and
   assert.match(nextLibraryContext.text, /2 notes, 2 files \(notes\.txt, plan\.md\)/);
   runner.lanes[1].finish({ text: 'All good.' });
   await engine.idle();
+
+  // Cold restart: a freshly loaded engine reads projects.json during ensureLoaded()
+  // so the first reply's library count hint reflects persisted notes/files immediately.
+  await engine.flush();
+  const coldDir = path.join(testRoot, `bots-cold-notes-${Date.now()}`);
+  const writer = makeEngine({ dir: coldDir });
+  const coldBot = await writer.engine.ensureProjectBot({ name: 'Cold', projectId: 'proj_c', machineId: 'this-device' });
+  await writer.engine.addProjectNote(coldBot.id, 'Use pnpm in this workspace.');
+  await writer.engine.saveProjectFile(coldBot.id, { name: 'guide.md', bytes: Buffer.from('# Guide') });
+  await writer.engine.flush();
+  await writer.engine.stop();
+  const reloaded = makeEngine({ dir: coldDir });
+  await reloaded.engine.send(coldBot.id, { messageId: 'cold_1', content: 'Hi' });
+  await waitFor(() => reloaded.runner.lanes.length === 1);
+  const coldHint = reloaded.runner.lanes[0].lane.session.context.find((part) => part.text.startsWith('Project library (Cold):'));
+  assert.match(coldHint?.text ?? '', /1 note, 1 file \(guide\.md\)/, 'cold restart loads persisted project library counts before first reply');
+  reloaded.runner.lanes[0].finish({ text: 'Hey!' });
+  await reloaded.engine.idle();
+  await reloaded.engine.stop();
 
   const exported = await engine.exportForSync();
   const site = exported.bots.find((item) => item.localId === bot.id);

@@ -1548,7 +1548,7 @@ const ProjectsView: React.FC<{ entries: ProjectEntry[]; onOpen: (projectId: stri
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto w-full max-w-[860px] px-5 py-5">
         <p className="mb-4 text-[12.5px] leading-relaxed text-neutral-500">
-          Each project can have its own bots, threads, and notes and files its bots and threads keep in mind.
+          Each project can have its own bots, threads, and a library of notes and files they check on demand.
         </p>
         {entries.length === 0 ? (
           <div className="text-[13px] text-neutral-500">No projects yet. Add one from the Threads tab (Add project) or the Code tab.</div>
@@ -1986,7 +1986,7 @@ const ProjectBotBox: React.FC<{
                   ? `One of ${bots.length} bots in ${entry.name}`
                   : 'Project bot'
               : 'No bots yet — create a custom bot or send a message below to start one'}
-            {library && (library.notes || library.files) ? ` · knows ${library.notes} note${library.notes === 1 ? '' : 's'} and ${library.files} file${library.files === 1 ? '' : 's'}` : ''}
+            {library && (library.notes || library.files) ? ` · ${library.notes} note${library.notes === 1 ? '' : 's'}, ${library.files} file${library.files === 1 ? '' : 's'} in library` : ''}
             {status && <> · {status}</>}
           </div>
         </div>

@@ -2066,6 +2066,26 @@ try {
     assert.match(prompt, /\(The rest of your context is as in your last message here\.\)/);
     assert.match(prompt, /\(Bot context, not from the person\.\)/, 'per-turn context still goes');
     assert.equal(second.usage.mode, 'resume');
+
+    // A steady context line that changes (1 note -> 2 notes) and later reverts (2 notes -> 1 note)
+    // must be re-sent on reversion instead of being suppressed by stale accumulated contextKeys.
+    const withHint = (seq, hint) => ({
+      ...sessionLane([...later, { id: 'r8', seq: 8, role: 'assistant', text: 'Done.' }, row(seq, 'user', `msg ${seq}`)], [seq], {
+        laneId: `lane_${seq}`,
+        replyMessageId: `r_${seq}`,
+      }),
+      session: {
+        history: [...later, { id: 'r8', seq: 8, role: 'assistant', text: 'Done.' }, row(seq, 'user', `msg ${seq}`)],
+        answering: [seq],
+        context: [{ text: '(Bot context, not from the person.)' }, { text: 'Roster: nobody.', steady: true }, { text: hint, steady: true }],
+      },
+    });
+    await runLane(withHint(9, 'Project library (Site): 1 note.'), sessionCtx());
+    assert.match(textOf(sdk.runs[2].inputs[0]), /Project library \(Site\): 1 note\./, 'initial library hint is sent');
+    await runLane(withHint(10, 'Project library (Site): 2 notes.'), sessionCtx());
+    assert.match(textOf(sdk.runs[3].inputs[0]), /Project library \(Site\): 2 notes\./, 'updated library hint is sent');
+    await runLane(withHint(11, 'Project library (Site): 1 note.'), sessionCtx());
+    assert.match(textOf(sdk.runs[4].inputs[0]), /Project library \(Site\): 1 note\./, 'reverted library hint is re-sent, not suppressed');
   });
 
   await test('kept session: a new summary (system prompt), a failure or a crash starts over', async () => {

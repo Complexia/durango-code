@@ -364,7 +364,7 @@ export const planBotPrompt = ({
         compact: behind,
         seenSeqs: capList([...(state.seenSeqs ?? []), ...session.history.map((row) => row.seq)]),
         seenIds: capList([...(state.seenIds ?? []), ...session.history.map((row) => row.id).filter(Boolean)]),
-        contextKeys: capList([...(state.contextKeys ?? []), ...session.context.filter((part) => part.steady).map((part) => contextKey(part.text))]),
+        contextKeys: capList(session.context.filter((part) => part.steady).map((part) => contextKey(part.text))),
         memoryKey,
       };
     }
