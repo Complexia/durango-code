@@ -1900,6 +1900,58 @@ test('rename updates a bot name and persists across reload; blank names are reje
   assert.equal(after.name, 'Captain Durango');
 });
 
+test('update edits name, job, and emoji (including clearing emoji to auto) for primary and project bots', async () => {
+  const dir = path.join(testRoot, `update-${(dirCount += 1)}`);
+  const { engine } = makeEngine({ dir });
+  const [primary] = (await engine.list()).bots;
+
+  const updatedPrimary = await engine.update(primary.id, {
+    name: '  Captain Durango  ',
+    job: '  Always keep replies concise.  ',
+    emoji: '🧭',
+  });
+  assert.equal(updatedPrimary.name, 'Captain Durango');
+  assert.equal(updatedPrimary.job, 'Always keep replies concise.');
+  assert.equal(updatedPrimary.emoji, '🧭');
+
+  const clearedPrimary = await engine.update(primary.id, { emoji: null, job: '' });
+  assert.equal(clearedPrimary.emoji, null);
+  assert.equal(clearedPrimary.job, '');
+
+  const projectBot = await engine.createProjectBot({
+    name: 'alpha',
+    projectId: 'p1',
+    repoId: 'r1',
+    botName: 'Frontend',
+    job: 'Own UI',
+    emoji: '🎨',
+  });
+  const updatedProject = await engine.update(projectBot.id, {
+    name: 'Design Systems',
+    job: 'Own UI components and accessibility',
+    emoji: '🚀',
+  });
+  assert.equal(updatedProject.name, 'Design Systems');
+  assert.equal(updatedProject.job, 'Own UI components and accessibility');
+  assert.equal(updatedProject.emoji, '🚀');
+  assert.equal(updatedProject.project?.name, 'alpha');
+
+  await assert.rejects(() => engine.update(projectBot.id, { name: '   ' }), /Enter a name/i);
+  await assert.rejects(() => engine.update(projectBot.id, {}), /Nothing to update/i);
+  await engine.flush();
+
+  const { engine: reloaded } = makeEngine({ dir });
+  const list = (await reloaded.list()).bots;
+  const reloadedPrimary = list.find((item) => item.id === primary.id);
+  const reloadedProject = list.find((item) => item.id === projectBot.id);
+  assert.equal(reloadedPrimary?.name, 'Captain Durango');
+  assert.equal(reloadedPrimary?.emoji, null);
+  assert.equal(reloadedPrimary?.job, '');
+  assert.equal(reloadedProject?.name, 'Design Systems');
+  assert.equal(reloadedProject?.job, 'Own UI components and accessibility');
+  assert.equal(reloadedProject?.emoji, '🚀');
+});
+
 test('deleteBot deletes non-primary bots and their files, aborts active replies, and refuses primary', async () => {
   const dir = path.join(testRoot, `delete-${(dirCount += 1)}`);
   const { engine, runner } = makeEngine({ dir });

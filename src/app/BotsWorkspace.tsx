@@ -52,7 +52,6 @@ import { botFaceDataUrl, botFaceSeed } from './botFace';
 import { ProjectIcon } from './ProjectIcon';
 import { ProjectBadge, ProjectMonogram } from './ProjectBadge';
 import { ThreadRow, type SidebarV2Actions } from './SidebarV2';
-import { InlineRenameInput } from './fileTree';
 import { compareSidebarV2Recent, sidebarV2ThreadLists, threadSidebarTone } from './threadLists';
 import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
@@ -284,10 +283,10 @@ type NewBotProjectOption = {
   existingNames: string[];
 };
 
-/** State for opening the New Bot modal (pre-associated with a project, or projectless). */
-type NewBotTarget = {
-  project: NewBotProjectOption | null;
-};
+/** State for opening the Bot modal in create mode (pre-associated with a project, or projectless) or edit mode. */
+type BotModalState =
+  | { mode: 'create'; project: NewBotProjectOption | null }
+  | { mode: 'edit'; bot: DesktopBot; projectPath: string | null; isSoleProjectBot: boolean };
 
 /** Curated icon choices for the bot icon picker (1–2 code points each so every client renders them identically). */
 const BOT_ICON_OPTIONS = [
@@ -344,9 +343,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const [modelChoices, setModelChoices] = useState<BotModelChoice[] | null>(() => botListCache?.modelChoices ?? null);
   const [listError, setListError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [renamingBotId, setRenamingBotId] = useState<string | null>(null);
-  const [creatingBot, setCreatingBot] = useState<NewBotTarget | null>(null);
-  const closeNewBotModal = useCallback(() => setCreatingBot(null), []);
+  const [botModal, setBotModal] = useState<BotModalState | null>(null);
+  const closeBotModal = useCallback(() => setBotModal(null), []);
   const [clearedEpochs, setClearedEpochs] = useState<Record<string, number>>({});
   const collapsedBotProjects = v3?.collapsedBotProjects ?? [];
   const collapsedSet = useMemo(() => new Set(collapsedBotProjects), [collapsedBotProjects]);
@@ -645,31 +643,17 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const botsRef = useRef(bots);
   botsRef.current = bots;
 
-  const handleRenameBot = useCallback(
-    async (bot: DesktopBot, nextName: string) => {
-      const trimmed = nextName.trim().slice(0, 40);
-      setRenamingBotId(null);
-      if (!trimmed || trimmed === bot.name) return;
-      setActionError(null);
-      const applyBot = (updated: DesktopBot) => {
-        const current = botsRef.current;
-        if (current) {
-          const next = current.map((item) => (item.id === bot.id ? updated : item));
-          if (botListCache) botListCache = { ...botListCache, bots: next };
-          noteBotList(next);
-          setBots(next);
-        }
-        const cached = botThreadCache.get(bot.id);
-        if (cached) botThreadCache.set(bot.id, { ...cached, bot: { ...cached.bot, ...updated } });
-      };
-      applyBot({ ...bot, name: trimmed });
-      const result = await window.orion?.renameBot?.({ botId: bot.id, name: trimmed });
-      if (!result?.ok) {
-        setActionError(result?.error ?? 'Couldn’t rename bot.');
-        void loadBots();
-        return;
+  const botUpdated = useCallback(
+    (updated: DesktopBot) => {
+      const current = botsRef.current;
+      if (current) {
+        const next = current.map((item) => (item.id === updated.id ? updated : item));
+        if (botListCache) botListCache = { ...botListCache, bots: next };
+        noteBotList(next);
+        setBots(next);
       }
-      applyBot(result.bot ?? { ...bot, name: result.name ?? trimmed });
+      const cached = botThreadCache.get(updated.id);
+      if (cached) botThreadCache.set(updated.id, { ...cached, bot: { ...cached.bot, ...updated } });
       void loadBots();
     },
     [loadBots]
@@ -733,7 +717,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       botThreadCache.delete(bot.id);
       botProjectCache.delete(bot.id);
       useOrionStore.getState().setBotDraft(botDraftKey(bot.id), { text: '', files: [] });
-      if (renamingBotId === bot.id) setRenamingBotId(null);
+      setBotModal((current) => (current?.mode === 'edit' && current.bot.id === bot.id ? null : current));
       const current = botsRef.current ?? [];
       const next = current.filter((item) => item.id !== bot.id);
       const fallbackId = next.find((item) => item.role === 'primary')?.id ?? next[0]?.id ?? null;
@@ -748,7 +732,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       }
       void loadBots();
     },
-    [loadBots, renamingBotId, selectedBotId, selectedProjectId, setSidebarV3Settings, view]
+    [loadBots, selectedBotId, selectedProjectId, setSidebarV3Settings, view]
   );
 
   const selectedBot = useMemo(() => (selectedBotId ? bots?.find((bot) => bot.id === selectedBotId) ?? null : null), [bots, selectedBotId]);
@@ -808,7 +792,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                   type="button"
                   title="New bot"
                   aria-label="New bot"
-                  onClick={() => setCreatingBot({ project: null })}
+                  onClick={() => setBotModal({ mode: 'create', project: null })}
                   className="inline-flex h-6 w-6 items-center justify-center rounded-md text-neutral-400 transition-colors duration-75 hover:bg-white/[0.08] hover:text-neutral-100"
                 >
                   <Plus size={14} />
@@ -823,11 +807,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                         projectPath={projectPathOfBot(bot)}
                         title={`${bot.name}: your main bot, across all projects`}
                         active={view === 'bot' && selectedBotId === bot.id}
-                        renaming={renamingBotId === bot.id}
                         onClick={() => openBot(bot.id)}
-                        onStartRename={() => setRenamingBotId(bot.id)}
-                        onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
-                        onRename={(name) => void handleRenameBot(bot, name)}
+                        onEdit={() => setBotModal({ mode: 'edit', bot, projectPath: projectPathOfBot(bot), isSoleProjectBot: false })}
                         onClear={() => void handleClearBot(bot)}
                       />
                     </li>
@@ -839,11 +820,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                         projectPath={null}
                         title={bot.job ? `${bot.name} — ${bot.job.slice(0, 100)}` : bot.name}
                         active={view === 'bot' && selectedBotId === bot.id}
-                        renaming={renamingBotId === bot.id}
                         onClick={() => openBot(bot.id)}
-                        onStartRename={() => setRenamingBotId(bot.id)}
-                        onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
-                        onRename={(name) => void handleRenameBot(bot, name)}
+                        onEdit={() => setBotModal({ mode: 'edit', bot, projectPath: null, isSoleProjectBot: false })}
                         onClear={() => void handleClearBot(bot)}
                         onDelete={() => void handleDeleteBot(bot)}
                       />
@@ -902,7 +880,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                         aria-label={`New bot in ${group.name}`}
                         onClick={(event) => {
                           event.stopPropagation();
-                          setCreatingBot({
+                          setBotModal({
+                            mode: 'create',
                             project: {
                               projectId: group.projectId,
                               key: group.groupKey,
@@ -927,11 +906,15 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                               projectPath={group.bots.length === 1 ? projectPathOfBot(bot) : null}
                               title={bot.project ? `${bot.name}: ${bot.project.name} project` : bot.name}
                               active={view === 'bot' && selectedBotId === bot.id}
-                              renaming={renamingBotId === bot.id}
                               onClick={() => openBot(bot.id)}
-                              onStartRename={() => setRenamingBotId(bot.id)}
-                              onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
-                              onRename={(name) => void handleRenameBot(bot, name)}
+                              onEdit={() =>
+                                setBotModal({
+                                  mode: 'edit',
+                                  bot,
+                                  projectPath: projectPathOfBot(bot),
+                                  isSoleProjectBot: group.bots.length === 1,
+                                })
+                              }
                               onClear={() => void handleClearBot(bot)}
                               onDelete={() => void handleDeleteBot(bot)}
                             />
@@ -965,7 +948,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               onNewThread={newProjectThread}
               onOpenThread={openProjectThread}
               onBotAdded={botAdded}
-              onRequestNewBot={(project) => setCreatingBot({ project })}
+              onRequestNewBot={(project) => setBotModal({ mode: 'create', project })}
               threadActions={threadActions}
               attentionThreadIds={attentionThreadIds}
               account={account}
@@ -982,7 +965,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             <BotPane
               key={`${account ?? ''}:${selectedBotId}:${clearedEpochs[selectedBotId] ?? 0}`}
               botId={selectedBotId}
-              botNameHint={selectedBot?.name}
+              botHint={selectedBot}
               projectPath={projectPathOfBot(selectedBot)}
               modelChoices={modelChoices}
               local={mode === 'local'}
@@ -1001,15 +984,20 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
           )}
         </div>
       )}
-      {creatingBot && (
-        <NewBotModal
-          initialProject={creatingBot.project}
+      {botModal && (
+        <BotFormModal
+          state={botModal}
           projectOptions={newBotProjectOptions}
-          onClose={closeNewBotModal}
-          onCreated={(created) => {
-            setCreatingBot(null);
-            botAdded(created);
-            openBot(created.id);
+          onClose={closeBotModal}
+          onSaved={(saved) => {
+            const wasCreate = botModal.mode === 'create';
+            setBotModal(null);
+            if (wasCreate) {
+              botAdded(saved);
+              openBot(saved.id);
+            } else {
+              botUpdated(saved);
+            }
           }}
         />
       )}
@@ -1020,12 +1008,17 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
 const projectOptionId = (project: NewBotProjectOption): string =>
   project.projectId ? `local:${project.projectId}` : `remote:${project.key ?? project.repoId ?? project.name}`;
 
-const NewBotModal: React.FC<{
-  initialProject: NewBotProjectOption | null;
+export const BotFormModal: React.FC<{
+  state: BotModalState;
   projectOptions: NewBotProjectOption[];
   onClose: () => void;
-  onCreated: (bot: DesktopBot) => void;
-}> = ({ initialProject, projectOptions, onClose, onCreated }) => {
+  onSaved: (bot: DesktopBot) => void;
+}> = ({ state, projectOptions, onClose, onSaved }) => {
+  const editingBot = state.mode === 'edit' ? state.bot : null;
+  const isEditing = editingBot !== null;
+  const isPrimary = editingBot?.role === 'primary';
+  const initialProject = state.mode === 'create' ? state.project : null;
+
   // Include initialProject in selectable options if it wasn't already in projectOptions.
   const options = useMemo(() => {
     if (!initialProject) return projectOptions;
@@ -1046,9 +1039,21 @@ const NewBotModal: React.FC<{
     [selectedProject]
   );
 
-  const [emoji, setEmoji] = useState<string | null>(null);
-  const [name, setName] = useState('');
-  const [job, setJob] = useState('');
+  // If an existing bot uses an emoji outside the curated palette (e.g. ✨ on the primary bot),
+  // include it so the current choice is visibly selected and can be restored while editing.
+  const initialCustomEmoji = useMemo(() => {
+    const existing = editingBot?.emoji ?? null;
+    if (!existing) return null;
+    return (BOT_ICON_OPTIONS as readonly string[]).includes(existing) ? null : existing;
+  }, [editingBot?.emoji]);
+  const iconOptions = useMemo<readonly string[]>(
+    () => (initialCustomEmoji ? [initialCustomEmoji, ...BOT_ICON_OPTIONS] : BOT_ICON_OPTIONS),
+    [initialCustomEmoji]
+  );
+
+  const [emoji, setEmoji] = useState<string | null>(() => editingBot?.emoji ?? null);
+  const [name, setName] = useState(() => editingBot?.name ?? '');
+  const [job, setJob] = useState(() => editingBot?.job ?? '');
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1057,7 +1062,8 @@ const NewBotModal: React.FC<{
 
   useEffect(() => {
     nameRef.current?.focus();
-  }, []);
+    if (isEditing) nameRef.current?.select();
+  }, [isEditing]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1082,19 +1088,77 @@ const NewBotModal: React.FC<{
   }, [projectMenuOpen]);
 
   const trimmedName = name.trim().slice(0, 40);
-  const canSubmit = !busy && (Boolean(selectedProject) || trimmedName.length > 0);
-  const previewName = trimmedName || (selectedProject ? suggestedName : 'New bot');
-  const previewSeed = selectedProject?.key ?? (trimmedName || 'new-bot');
-  const previewProjectPath = selectedProject && selectedProject.existingNames.length === 0 ? selectedProject.path : null;
+  const trimmedJob = job.trim().slice(0, 8_000);
+  const dirty = editingBot
+    ? trimmedName !== editingBot.name || emoji !== (editingBot.emoji ?? null) || trimmedJob !== (editingBot.job ?? '').trim()
+    : true;
+  const canSubmit = !busy && (isEditing ? trimmedName.length > 0 && dirty : Boolean(selectedProject) || trimmedName.length > 0);
+  const previewName = trimmedName || (editingBot ? editingBot.name : selectedProject ? suggestedName : 'New bot');
+  const previewSeed = editingBot
+    ? botFaceSeed({ id: editingBot.id, project: editingBot.project })
+    : selectedProject?.key ?? (trimmedName || 'new-bot');
+  const previewProjectPath =
+    state.mode === 'edit'
+      ? state.isSoleProjectBot
+        ? state.projectPath
+        : null
+      : selectedProject && selectedProject.existingNames.length === 0
+        ? selectedProject.path
+        : null;
+
+  const modalTitle = isEditing
+    ? editingBot.project
+      ? `Edit bot in ${editingBot.project.name}`
+      : isPrimary
+        ? 'Edit primary bot'
+        : 'Edit bot'
+    : selectedProject
+      ? `New bot in ${selectedProject.name}`
+      : 'New bot';
+
+  const modalSubtitle = isEditing
+    ? isPrimary
+      ? 'Your main bot, across all projects.'
+      : editingBot.project
+        ? `Shares ${editingBot.project.name}’s notes and files, with its own conversation.`
+        : 'An always-on assistant with its own conversation and instructions.'
+    : selectedProject
+      ? `Shares ${selectedProject.name}’s notes and files, with its own conversation.`
+      : 'An always-on assistant with its own conversation and instructions.';
 
   const submit = async () => {
+    if (busy) return;
+    if (isEditing) {
+      if (!trimmedName) {
+        setError('Enter a name for the bot.');
+        return;
+      }
+      if (!dirty) {
+        onClose();
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      const result = await window.orion?.updateBot?.({
+        botId: editingBot.id,
+        name: trimmedName,
+        job: trimmedJob,
+        emoji,
+      });
+      setBusy(false);
+      if (!result?.ok) {
+        setError(result?.error ?? 'Couldn’t save changes.');
+        return;
+      }
+      onSaved(result.bot ?? { ...editingBot, name: result.name ?? trimmedName, job: trimmedJob, emoji });
+      return;
+    }
     if (!canSubmit) {
       if (!selectedProject && !trimmedName) setError('Enter a name for the bot.');
       return;
     }
     setBusy(true);
     setError(null);
-    const trimmedJob = job.trim().slice(0, 8_000);
     const result = selectedProject
       ? await window.orion?.createProjectBot?.({
           ...(selectedProject.projectId ? { projectId: selectedProject.projectId } : {}),
@@ -1115,7 +1179,7 @@ const NewBotModal: React.FC<{
       setError(result?.error ?? 'Couldn’t create this bot.');
       return;
     }
-    onCreated(result.bot);
+    onSaved(result.bot);
   };
 
   return createPortal(
@@ -1128,7 +1192,7 @@ const NewBotModal: React.FC<{
       <div
         role="dialog"
         aria-modal="true"
-        aria-label={selectedProject ? `New bot in ${selectedProject.name}` : 'New bot'}
+        aria-label={modalTitle}
         className="relative w-full max-w-[460px] rounded-2xl border border-white/10 bg-[#18181b] p-5 text-neutral-100 shadow-[0_24px_64px_rgb(0_0_0_/_0.65)]"
       >
         <button
@@ -1144,23 +1208,22 @@ const NewBotModal: React.FC<{
         {/* Centered avatar preview */}
         <div className="flex flex-col items-center pt-1 text-center">
           <span
-            className="inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-white/[0.06] text-[28px] ring-1 ring-white/15"
+            className="relative inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-white/[0.06] text-[28px] ring-1 ring-white/15"
             aria-hidden
           >
             <BotIcon
-              bot={{ emoji, name: previewName, role: 'bot', faceSeed: previewSeed }}
+              bot={
+                editingBot
+                  ? { id: editingBot.id, emoji, name: previewName, role: editingBot.role, project: editingBot.project }
+                  : { emoji, name: previewName, role: 'bot', faceSeed: previewSeed }
+              }
               px={38}
               projectPath={emoji ? null : previewProjectPath}
             />
+            {isPrimary && <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full bg-amber-400 ring-2 ring-[#18181b]" />}
           </span>
-          <h2 className="mt-2.5 text-[15px] font-semibold text-neutral-100">
-            {selectedProject ? `New bot in ${selectedProject.name}` : 'New bot'}
-          </h2>
-          <p className="mt-0.5 text-[12px] text-neutral-500">
-            {selectedProject
-              ? `Shares ${selectedProject.name}’s notes and files, with its own conversation.`
-              : 'An always-on assistant with its own conversation and instructions.'}
-          </p>
+          <h2 className="mt-2.5 text-[15px] font-semibold text-neutral-100">{modalTitle}</h2>
+          <p className="mt-0.5 text-[12px] text-neutral-500">{modalSubtitle}</p>
         </div>
 
         <div className="mt-4 space-y-3.5">
@@ -1180,16 +1243,24 @@ const NewBotModal: React.FC<{
                     : 'bg-white/[0.03] hover:bg-white/[0.08]'
                 }`}
               >
-                <img
-                  src={botFaceDataUrl(previewSeed)}
-                  width={20}
-                  height={20}
-                  alt="Auto"
-                  draggable={false}
-                  className="block"
-                />
+                {editingBot ? (
+                  <BotIcon
+                    bot={{ id: editingBot.id, emoji: null, name: previewName, role: editingBot.role, project: editingBot.project }}
+                    px={20}
+                    projectPath={previewProjectPath}
+                  />
+                ) : (
+                  <img
+                    src={botFaceDataUrl(previewSeed)}
+                    width={20}
+                    height={20}
+                    alt="Auto"
+                    draggable={false}
+                    className="block"
+                  />
+                )}
               </button>
-              {BOT_ICON_OPTIONS.map((option) => {
+              {iconOptions.map((option) => {
                 const active = emoji === option;
                 return (
                   <button
@@ -1214,11 +1285,11 @@ const NewBotModal: React.FC<{
 
           {/* Name */}
           <div>
-            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-bot-name">
-              Name {selectedProject && <span className="font-normal text-neutral-500">(optional)</span>}
+            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="bot-form-name">
+              Name {!isEditing && selectedProject && <span className="font-normal text-neutral-500">(optional)</span>}
             </label>
             <input
-              id="new-bot-name"
+              id="bot-form-name"
               ref={nameRef}
               value={name}
               onChange={(event) => {
@@ -1233,109 +1304,138 @@ const NewBotModal: React.FC<{
               }}
               maxLength={40}
               placeholder={
-                selectedProject
-                  ? `e.g. Frontend, Reviewer (default: ${suggestedName})`
-                  : 'e.g. X Reply Scout, Job Hunter, Daily Digest'
+                isEditing
+                  ? 'Bot name'
+                  : selectedProject
+                    ? `e.g. Frontend, Reviewer (default: ${suggestedName})`
+                    : 'e.g. X Reply Scout, Job Hunter, Daily Digest'
               }
               className="h-9 w-full rounded-lg bg-white/[0.04] px-3 text-[13.5px] text-neutral-100 ring-1 ring-white/10 outline-none placeholder:text-neutral-500 focus:ring-white/25"
             />
           </div>
 
-          {/* Project association (custom Tailwind dropdown — never <select>) */}
-          {options.length > 0 && (
-            <div ref={projectMenuRef} className="relative">
+          {/* Project association (custom Tailwind dropdown in create mode; read-only in edit mode) */}
+          {isEditing ? (
+            <div>
               <span className="mb-1 block text-[11.5px] font-medium text-neutral-400">Project</span>
-              <button
-                type="button"
-                aria-haspopup="listbox"
-                aria-expanded={projectMenuOpen}
-                disabled={busy}
-                onClick={() => setProjectMenuOpen((open) => !open)}
-                className="flex h-9 w-full items-center gap-2 rounded-lg bg-white/[0.04] px-3 text-left text-[13px] text-neutral-100 ring-1 ring-white/10 transition-colors hover:bg-white/[0.06] focus:ring-white/25 disabled:opacity-40"
+              <div
+                aria-disabled="true"
+                className="flex h-9 w-full items-center gap-2 rounded-lg bg-white/[0.025] px-3 text-[13px] text-neutral-400 ring-1 ring-white/[0.08]"
               >
-                {selectedProject ? (
-                  selectedProject.path ? (
-                    <ProjectBadge project={{ name: selectedProject.name, path: selectedProject.path }} size={15} />
+                {editingBot.project ? (
+                  state.projectPath ? (
+                    <ProjectBadge project={{ name: editingBot.project.name, path: state.projectPath }} size={15} />
                   ) : (
-                    <ProjectMonogram name={selectedProject.name} size={15} />
+                    <ProjectMonogram name={editingBot.project.name} size={15} />
                   )
                 ) : (
-                  <Bot size={14} className="shrink-0 text-neutral-400" />
+                  <Bot size={14} className="shrink-0 text-neutral-500" />
                 )}
                 <span className="min-w-0 flex-1 truncate">
-                  {selectedProject ? selectedProject.name : 'None (projectless)'}
+                  {isPrimary ? 'All projects' : editingBot.project ? editingBot.project.name : 'None (projectless)'}
                 </span>
-                <ChevronDown
-                  size={14}
-                  className={`shrink-0 text-neutral-400 transition-transform duration-150 ${projectMenuOpen ? 'rotate-180' : ''}`}
-                />
-              </button>
-              {projectMenuOpen && (
-                <div
-                  role="listbox"
-                  aria-label="Project"
-                  className="absolute left-0 right-0 top-[calc(100%+4px)] z-20 max-h-[220px] overflow-y-auto rounded-xl border border-white/10 bg-[#1f1f23] p-1 shadow-[0_16px_48px_rgb(0_0_0_/_0.65)]"
-                >
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={selectedProjectId === null}
-                    onClick={() => {
-                      setSelectedProjectId(null);
-                      setProjectMenuOpen(false);
-                    }}
-                    className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                      selectedProjectId === null
-                        ? 'bg-white/[0.09] text-neutral-50'
-                        : 'text-neutral-300 hover:bg-white/[0.06]'
-                    }`}
-                  >
-                    <Bot size={14} className="shrink-0 text-neutral-400" />
-                    <span className="min-w-0 flex-1 truncate">None (projectless)</span>
-                    {selectedProjectId === null && <Check size={13} className="shrink-0 text-neutral-200" />}
-                  </button>
-                  <div className="my-1 border-t border-white/[0.06]" />
-                  {options.map((project) => {
-                    const id = projectOptionId(project);
-                    const active = selectedProjectId === id;
-                    return (
-                      <button
-                        key={id}
-                        type="button"
-                        role="option"
-                        aria-selected={active}
-                        onClick={() => {
-                          setSelectedProjectId(id);
-                          setProjectMenuOpen(false);
-                        }}
-                        className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-                          active ? 'bg-white/[0.09] text-neutral-50' : 'text-neutral-300 hover:bg-white/[0.06]'
-                        }`}
-                      >
-                        {project.path ? (
-                          <ProjectBadge project={{ name: project.name, path: project.path }} size={14} />
-                        ) : (
-                          <ProjectMonogram name={project.name} size={14} />
-                        )}
-                        <span className="min-w-0 flex-1 truncate">{project.name}</span>
-                        {active && <Check size={13} className="shrink-0 text-neutral-200" />}
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
+              </div>
             </div>
+          ) : (
+            options.length > 0 && (
+              <div ref={projectMenuRef} className="relative">
+                <span className="mb-1 block text-[11.5px] font-medium text-neutral-400">Project</span>
+                <button
+                  type="button"
+                  aria-haspopup="listbox"
+                  aria-expanded={projectMenuOpen}
+                  disabled={busy}
+                  onClick={() => setProjectMenuOpen((open) => !open)}
+                  className="flex h-9 w-full items-center gap-2 rounded-lg bg-white/[0.04] px-3 text-left text-[13px] text-neutral-100 ring-1 ring-white/10 transition-colors hover:bg-white/[0.06] focus:ring-white/25 disabled:opacity-40"
+                >
+                  {selectedProject ? (
+                    selectedProject.path ? (
+                      <ProjectBadge project={{ name: selectedProject.name, path: selectedProject.path }} size={15} />
+                    ) : (
+                      <ProjectMonogram name={selectedProject.name} size={15} />
+                    )
+                  ) : (
+                    <Bot size={14} className="shrink-0 text-neutral-400" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate">
+                    {selectedProject ? selectedProject.name : 'None (projectless)'}
+                  </span>
+                  <ChevronDown
+                    size={14}
+                    className={`shrink-0 text-neutral-400 transition-transform duration-150 ${projectMenuOpen ? 'rotate-180' : ''}`}
+                  />
+                </button>
+                {projectMenuOpen && (
+                  <div
+                    role="listbox"
+                    aria-label="Project"
+                    className="absolute left-0 right-0 top-[calc(100%+4px)] z-20 max-h-[220px] overflow-y-auto rounded-xl border border-white/10 bg-[#1f1f23] p-1 shadow-[0_16px_48px_rgb(0_0_0_/_0.65)]"
+                  >
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={selectedProjectId === null}
+                      onClick={() => {
+                        setSelectedProjectId(null);
+                        setProjectMenuOpen(false);
+                      }}
+                      className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                        selectedProjectId === null
+                          ? 'bg-white/[0.09] text-neutral-50'
+                          : 'text-neutral-300 hover:bg-white/[0.06]'
+                      }`}
+                    >
+                      <Bot size={14} className="shrink-0 text-neutral-400" />
+                      <span className="min-w-0 flex-1 truncate">None (projectless)</span>
+                      {selectedProjectId === null && <Check size={13} className="shrink-0 text-neutral-200" />}
+                    </button>
+                    <div className="my-1 border-t border-white/[0.06]" />
+                    {options.map((project) => {
+                      const id = projectOptionId(project);
+                      const active = selectedProjectId === id;
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          role="option"
+                          aria-selected={active}
+                          onClick={() => {
+                            setSelectedProjectId(id);
+                            setProjectMenuOpen(false);
+                          }}
+                          className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                            active ? 'bg-white/[0.09] text-neutral-50' : 'text-neutral-300 hover:bg-white/[0.06]'
+                          }`}
+                        >
+                          {project.path ? (
+                            <ProjectBadge project={{ name: project.name, path: project.path }} size={14} />
+                          ) : (
+                            <ProjectMonogram name={project.name} size={14} />
+                          )}
+                          <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                          {active && <Check size={13} className="shrink-0 text-neutral-200" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )
           )}
 
           {/* Description / system prompt */}
           <div>
-            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-bot-job">
-              Description / System prompt <span className="font-normal text-neutral-500">(optional)</span>
+            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="bot-form-job">
+              {isPrimary ? 'Standing instructions' : 'Description / System prompt'}{' '}
+              <span className="font-normal text-neutral-500">(optional)</span>
             </label>
             <textarea
-              id="new-bot-job"
+              id="bot-form-job"
               value={job}
-              onChange={(event) => setJob(event.target.value)}
+              onChange={(event) => {
+                setJob(event.target.value);
+                if (error) setError(null);
+              }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
                   event.preventDefault();
@@ -1345,9 +1445,13 @@ const NewBotModal: React.FC<{
               rows={4}
               maxLength={8_000}
               placeholder={
-                selectedProject
-                  ? `What should this bot focus on in ${selectedProject.name}? Leave blank for general project help.`
-                  : 'Describe what this bot does, its role, tone, or any standing instructions…'
+                isPrimary
+                  ? 'Anything you always want your primary bot to keep in mind…'
+                  : editingBot?.project
+                    ? `What should this bot focus on in ${editingBot.project.name}? Leave blank for general project help.`
+                    : selectedProject
+                      ? `What should this bot focus on in ${selectedProject.name}? Leave blank for general project help.`
+                      : 'Describe what this bot does, its role, tone, or any standing instructions…'
               }
               className="w-full resize-none rounded-lg bg-white/[0.04] px-3 py-2 text-[13px] leading-relaxed text-neutral-100 ring-1 ring-white/10 outline-none placeholder:text-neutral-500 focus:ring-white/25"
             />
@@ -1371,8 +1475,8 @@ const NewBotModal: React.FC<{
             onClick={() => void submit()}
             className="flex h-8 items-center gap-1.5 rounded-lg bg-neutral-100 px-3.5 text-[13px] font-medium text-neutral-900 hover:bg-white disabled:opacity-45"
           >
-            {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
-            {busy ? 'Creating…' : 'Create bot'}
+            {busy ? <Loader2 size={13} className="animate-spin" /> : isEditing ? <Check size={13} /> : <Plus size={13} />}
+            {isEditing ? (busy ? 'Saving…' : 'Save changes') : busy ? 'Creating…' : 'Create bot'}
           </button>
         </div>
       </div>
@@ -2203,18 +2307,15 @@ const BotRow: React.FC<{
   projectPath?: string | null;
   title: string;
   active: boolean;
-  renaming: boolean;
   onClick: () => void;
-  onStartRename: () => void;
-  onEndRename: () => void;
-  onRename: (name: string) => void;
+  onEdit: () => void;
   onClear: () => void;
   onDelete?: () => void;
-}> = ({ bot, projectPath, title, active, renaming, onClick, onStartRename, onEndRename, onRename, onClear, onDelete }) => {
+}> = ({ bot, projectPath, title, active, onClick, onEdit, onClear, onDelete }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const working = botIsWorking(bot);
   const actions: BotMenuAction[] = [
-    { key: 'rename', label: 'Rename', icon: <SquarePen size={13} />, run: onStartRename },
+    { key: 'edit', label: 'Edit', icon: <SquarePen size={13} />, run: onEdit },
     { key: 'clear', label: 'Clear', icon: <Eraser size={13} />, run: onClear },
     ...(onDelete ? [{ key: 'delete', label: 'Delete', icon: <Trash2 size={13} />, danger: true, run: onDelete }] : []),
   ];
@@ -2222,18 +2323,15 @@ const BotRow: React.FC<{
     <div
       role="button"
       tabIndex={0}
-      onClick={() => {
-        if (renaming) return;
-        onClick();
-      }}
+      onClick={onClick}
       onKeyDown={(event) => {
-        if (renaming || event.target !== event.currentTarget) return;
+        if (event.target !== event.currentTarget) return;
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
           onClick();
         }
       }}
-      title={renaming ? undefined : title}
+      title={title}
       aria-current={active ? 'true' : undefined}
       className={`group relative flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 text-left transition-colors duration-75 ${
         active ? 'bg-white/[0.08]' : menuOpen ? 'bg-white/[0.06]' : 'hover:bg-white/[0.045]'
@@ -2243,38 +2341,26 @@ const BotRow: React.FC<{
         <BotIcon bot={bot} px={22} projectPath={projectPath} />
         {bot.role === 'primary' && <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
       </span>
-      {renaming ? (
-        <InlineRenameInput
-          className="thread-rename-input text-[14px]"
-          initialValue={bot.name}
-          maxLength={40}
-          onSubmit={onRename}
-          onCancel={onEndRename}
-        />
-      ) : (
-        <>
-          <span className={`min-w-0 flex-1 truncate text-[14.5px] ${bot.unread > 0 ? 'font-semibold text-neutral-100' : 'text-neutral-300'}`}>
-            {bot.name}
-          </span>
-          <span className={`shrink-0 items-center ${menuOpen ? 'hidden' : 'flex group-hover:hidden group-focus-within:hidden'}`}>
-            {bot.unread > 0 ? (
-              <span className="rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
-            ) : working ? (
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
-            ) : bot.needsYou ? (
-              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-            ) : bot.paused ? (
-              <Pause size={11} className="text-neutral-600" />
-            ) : null}
-          </span>
-          <span
-            className={`-mr-0.5 shrink-0 items-center ${menuOpen ? 'flex' : 'hidden group-hover:flex group-focus-within:flex'}`}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <BotRowMenu botName={bot.name} actions={actions} onOpenChange={setMenuOpen} />
-          </span>
-        </>
-      )}
+      <span className={`min-w-0 flex-1 truncate text-[14.5px] ${bot.unread > 0 ? 'font-semibold text-neutral-100' : 'text-neutral-300'}`}>
+        {bot.name}
+      </span>
+      <span className={`shrink-0 items-center ${menuOpen ? 'hidden' : 'flex group-hover:hidden group-focus-within:hidden'}`}>
+        {bot.unread > 0 ? (
+          <span className="rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
+        ) : working ? (
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
+        ) : bot.needsYou ? (
+          <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+        ) : bot.paused ? (
+          <Pause size={11} className="text-neutral-600" />
+        ) : null}
+      </span>
+      <span
+        className={`-mr-0.5 shrink-0 items-center ${menuOpen ? 'flex' : 'hidden group-hover:flex group-focus-within:flex'}`}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <BotRowMenu botName={bot.name} actions={actions} onOpenChange={setMenuOpen} />
+      </span>
     </div>
   );
 };
@@ -2282,8 +2368,8 @@ const BotRow: React.FC<{
 /** One bot's conversation: messages, live replies at the bottom, and a composer that never blocks. */
 const BotPane: React.FC<{
   botId: string;
-  /** Latest name from the sidebar list so renames show in the header at once. */
-  botNameHint?: string;
+  /** Latest profile fields from the sidebar list so edits show in the header at once. */
+  botHint?: Pick<DesktopBot, 'name' | 'emoji' | 'job'> | null;
   /** Local project path for a project bot so its icon uses the project's icon when available. */
   projectPath?: string | null;
   /** The models the bot can be set to (null: no picker). */
@@ -2294,7 +2380,7 @@ const BotPane: React.FC<{
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
-}> = ({ botId, botNameHint, projectPath, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
+}> = ({ botId, botHint, projectPath, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
   // `thread.messages`: every message loaded so far (the newest page, older
   // pages scrolled back to, and what polls brought), in seq order; unchanged
   // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
@@ -2349,10 +2435,19 @@ const BotPane: React.FC<{
     [botId]
   );
 
+  const botHintName = botHint?.name;
+  const botHintEmoji = botHint?.emoji;
+  const botHintJob = botHint?.job;
   useEffect(() => {
-    if (!botNameHint) return;
-    setThread((current) => (current && current.bot.name !== botNameHint ? { ...current, bot: { ...current.bot, name: botNameHint } } : current));
-  }, [botNameHint, setThread]);
+    if (!botHintName) return;
+    setThread((current) => {
+      if (!current) return current;
+      const nextEmoji = botHintEmoji ?? null;
+      const nextJob = botHintJob ?? current.bot.job;
+      if (current.bot.name === botHintName && current.bot.emoji === nextEmoji && current.bot.job === nextJob) return current;
+      return { ...current, bot: { ...current.bot, name: botHintName, emoji: nextEmoji, job: nextJob } };
+    });
+  }, [botHintName, botHintEmoji, botHintJob, setThread]);
 
   /** The newest page, replacing what was loaded (opening the thread, or catching up after a long gap). */
   const loadNewest = useCallback(async () => {

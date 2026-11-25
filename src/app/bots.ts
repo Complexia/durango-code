@@ -248,6 +248,14 @@ export type SetBotModelResult = {
   code?: string;
 };
 export type RenameBotResult = { ok: boolean; name?: string; bot?: DesktopBot; error?: string; code?: string };
+export type UpdateBotInput = {
+  botId: string;
+  name?: string;
+  job?: string;
+  /** `null` clears the bot's emoji back to its automatic icon. */
+  emoji?: string | null;
+};
+export type UpdateBotResult = { ok: boolean; name?: string; bot?: DesktopBot; error?: string; code?: string };
 export type DeleteBotResult = { ok: boolean; error?: string; code?: string };
 export type ClearBotResult = { ok: boolean; bot?: DesktopBot; error?: string; code?: string };
 

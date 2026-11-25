@@ -898,6 +898,19 @@ export const createDurangoClient = ({
         ...(data.bot && typeof data.bot === 'object' ? { bot: data.bot } : {}),
       };
     },
+    /** Updates a bot's name, job and/or emoji (`emoji: null` clears it back to auto) → `{ name?, bot? }`. */
+    async updateBot(botId, { name, job, emoji } = {}) {
+      const body = {
+        ...(name !== undefined ? { name: str(name) } : {}),
+        ...(job !== undefined ? { job: str(job) } : {}),
+        ...(emoji !== undefined ? { emoji: emoji === null ? null : str(emoji) } : {}),
+      };
+      const data = await request('PATCH', `/bots/${encodeURIComponent(str(botId))}`, { body });
+      return {
+        ...(typeof data.name === 'string' ? { name: data.name } : name !== undefined ? { name: str(name) } : {}),
+        ...(data.bot && typeof data.bot === 'object' ? { bot: data.bot } : {}),
+      };
+    },
     /** Deletes (archives) a non-primary bot → `{ ok: true }`. */
     async deleteBot(botId) {
       await request('DELETE', `/bots/${encodeURIComponent(str(botId))}`);
@@ -1455,6 +1468,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async renameBot(_botId, name) {
       return { name: str(name) };
+    },
+    async updateBot(_botId, { name } = {}) {
+      return { ...(name !== undefined ? { name: str(name) } : {}) };
     },
     async deleteBot() {
       return { ok: true };

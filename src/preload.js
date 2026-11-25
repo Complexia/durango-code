@@ -484,6 +484,7 @@ contextBridge.exposeInMainWorld('orion', {
   listBots: () => ipcRenderer.invoke('bots:list'),
   setBotModel: (input) => ipcRenderer.invoke('bots:setModel', input),
   renameBot: (input) => ipcRenderer.invoke('bots:rename', input),
+  updateBot: (input) => ipcRenderer.invoke('bots:update', input),
   deleteBot: (input) => ipcRenderer.invoke('bots:delete', input),
   clearBot: (input) => ipcRenderer.invoke('bots:clear', input),
   getBotThread: (input) => ipcRenderer.invoke('bots:thread', input),

@@ -2432,6 +2432,30 @@ export const createLocalBotEngine = ({
       changed();
       return toDesktopBot(entry);
     },
+    /** Updates a local bot's name, job and/or emoji (`emoji: null` clears it back to auto). → the bot. */
+    async update(botId, { name, job, emoji } = {}) {
+      await ensureLoaded();
+      const entry = entryFor(botId);
+      if (name === undefined && job === undefined && emoji === undefined) {
+        throw new LocalBotError('invalid', 'Nothing to update.');
+      }
+      const nextName = name !== undefined ? clip(oneLine(name), 40) : entry.bot.name;
+      if (name !== undefined && !nextName) throw new LocalBotError('invalid', 'Enter a name for the bot.');
+      const nextJob = job !== undefined ? str(job).trim().slice(0, 8_000) : entry.bot.job;
+      const nextEmoji = emoji !== undefined ? (emoji === null ? null : clip(oneLine(emoji), 8) || null) : entry.bot.emoji;
+      const before = { name: entry.bot.name, job: entry.bot.job, emoji: entry.bot.emoji };
+      entry.bot.name = nextName;
+      entry.bot.job = nextJob;
+      entry.bot.emoji = nextEmoji;
+      if (!(await persistBot(entry, { messages: false }))) {
+        entry.bot.name = before.name;
+        entry.bot.job = before.job;
+        entry.bot.emoji = before.emoji;
+        throw new Error('Couldn’t save the bot on this computer. Try again.');
+      }
+      changed();
+      return toDesktopBot(entry);
+    },
     /** Deletes a non-primary local bot and removes its transcript from disk. */
     async deleteBot(botId) {
       await ensureLoaded();

@@ -6033,6 +6033,35 @@ ipcMain.handle('bots:rename', async (_event, input) => {
   }
 });
 
+ipcMain.handle('bots:update', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId : '';
+  const name = typeof input?.name === 'string' ? input.name : undefined;
+  const job = typeof input?.job === 'string' ? input.job : undefined;
+  const emoji = input?.emoji === null ? null : typeof input?.emoji === 'string' ? input.emoji : undefined;
+  if (!botId) return { ok: false, error: 'Bot not found.' };
+  if (name !== undefined && !name.trim()) return { ok: false, error: 'Enter a name for the bot.' };
+  if (name === undefined && job === undefined && emoji === undefined) {
+    return { ok: false, error: 'Nothing to update.' };
+  }
+  if (await localBotsMode()) {
+    try {
+      return { ok: true, bot: await localBots.update(botId, { name, job, emoji }) };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const result = await durangoClient.updateBot(botId, { name, job, emoji });
+    return {
+      ok: true,
+      ...(result.name !== undefined ? { name: result.name } : {}),
+      ...(result.bot ? { bot: result.bot } : {}),
+    };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
 ipcMain.handle('bots:delete', async (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId : '';
   if (!botId) return { ok: false, error: 'Bot not found.' };
