@@ -1,4 +1,4 @@
-import { clipMiddle } from '../report-clip.js';
+import { clipMiddle, selectFinalMessage } from '../report-clip.js';
 import type { AgentActivity, Message, Thread } from '../store';
 
 // Renderer side of Durango Chat dispatch (main: src/main/durango-dispatch.js).
@@ -15,29 +15,36 @@ export const BOT_TASK_SUMMARY_MAX_CHARS = 9_000;
 const summaryMaxCharsFor = (dispatchId: string) =>
   /^(bottask|localbot):/.test(dispatchId) ? BOT_TASK_SUMMARY_MAX_CHARS : DISPATCH_SUMMARY_MAX_CHARS;
 
+const isStepBoundaryActivity = (activity: AgentActivity) =>
+  !activity.visual &&
+  !activity.theme &&
+  (activity.type === 'command' || activity.type === 'tool' || activity.type === 'plan');
+
 /**
- * Prefer the turn's actual final message (text after the last tool/command/step)
- * over earlier progress narration from the same run. Visuals (`show_html`) and
- * theme cards stay inline with the answer they belong to. If the turn ended on
- * a tool call with no trailing text, falls back to the last non-empty text
- * segment before it (and to the whole content when activities carry no offsets).
+ * Prefer the turn's actual final message (text after the last tool/command/plan
+ * step) over earlier progress narration from the same run. Reasoning entries,
+ * visuals (`show_html`) and theme cards do not split the final answer. If the
+ * turn ended on a tool call with no trailing text, falls back to the last
+ * non-empty text segment before it; if it ended with a brief closing line right
+ * after a substantial summary, keeps that summary too.
  */
 export const dispatchRunFinalText = (run: Pick<Message, 'content' | 'activities'>): string => {
   const content = run.content || '';
   if (!content.trim()) return '';
   const offsets: number[] = [];
   for (const activity of run.activities ?? []) {
-    if (activity.visual || activity.theme) continue;
+    if (!isStepBoundaryActivity(activity)) continue;
     const offset = Math.max(0, Math.min(activity.contentOffset ?? 0, content.length));
     if (offset > 0) offsets.push(offset);
   }
   if (offsets.length === 0) return content.trim();
   const boundaries = [0, ...new Set(offsets.sort((a, b) => a - b)), content.length];
-  for (let index = boundaries.length - 1; index > 0; index -= 1) {
+  const segments: string[] = [];
+  for (let index = 1; index < boundaries.length; index += 1) {
     const segment = content.slice(boundaries[index - 1], boundaries[index]).trim();
-    if (segment) return segment;
+    if (segment) segments.push(segment);
   }
-  return content.trim();
+  return selectFinalMessage(segments) || content.trim();
 };
 
 /** Keep the opening summary and the closing outcome/links when a report exceeds `max`. */

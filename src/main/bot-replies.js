@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DurangoError } from './durango-client.js';
+import { selectFinalMessage } from '../report-clip.js';
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
 import { recordClaudeRateLimit } from './usage-limits.js';
@@ -1106,21 +1107,18 @@ export const createClaudeLaneRunner = ({
   await sending;
   await Promise.all(fileLookups);
   const finalMessageText = () => {
-    const tail = [...blocks.slice(finalStart), partial]
-      .map((part) => String(part ?? '').trim())
-      .filter(Boolean)
-      .join('\n\n');
-    if (tail) return tail;
-    const boundaries = [0, ...new Set(toolBoundaries.filter((n) => n > 0 && n < blocks.length).sort((a, b) => a - b)), blocks.length];
-    for (let index = boundaries.length - 1; index > 0; index -= 1) {
-      const segment = blocks
+    const allBlocks = partial.trim() ? [...blocks, partial] : blocks;
+    const boundaries = [0, ...new Set(toolBoundaries.filter((n) => n > 0 && n < allBlocks.length).sort((a, b) => a - b)), allBlocks.length];
+    const segments = [];
+    for (let index = 1; index < boundaries.length; index += 1) {
+      const segment = allBlocks
         .slice(boundaries[index - 1], boundaries[index])
         .map((part) => String(part ?? '').trim())
         .filter(Boolean)
         .join('\n\n');
-      if (segment) return segment;
+      if (segment) segments.push(segment);
     }
-    return '';
+    return selectFinalMessage(segments);
   };
   const written =
     lane.finalMessageOnly && !sendsMessages

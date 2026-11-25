@@ -2524,6 +2524,16 @@ try {
       success(),
     ]);
     assert.equal(endedOnTool.text, 'Final summary before cleanup.');
+
+    const substantial = 'Full report of everything found and changed across all services. ' + 'Details here. '.repeat(25);
+    const withPostscript = await runWith([
+      init('claude-sonnet-5-5'),
+      assistant('a1', [{ type: 'text', text: 'Checking...' }, { type: 'tool_use', id: 'tu1', name: 'Read', input: {} }]),
+      assistant('a2', [{ type: 'text', text: substantial }, { type: 'tool_use', id: 'tu2', name: 'Bash', input: {} }]),
+      assistant('a3', [{ type: 'text', text: 'Cleaned up temp files.' }]),
+      success(),
+    ]);
+    assert.equal(withPostscript.text, `${substantial.trim()}\n\nCleaned up temp files.`);
   });
 
   await test('bot attachments: stage locally for instant handoff, upload in background, handle failure + retry, and never re-download local files', async () => {

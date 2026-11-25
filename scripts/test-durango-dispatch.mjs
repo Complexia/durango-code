@@ -1066,8 +1066,28 @@ try {
     assert.ok(trimmed.endsWith('Verified live on durango.sh.\nChange: chg_abc123 https://durango.sh/c/chg_abc123'));
     assert.ok(trimmed.includes('\n\n…[middle trimmed]…\n\n'));
     assert.equal(clipMiddle('short', 100), 'short');
+    assert.equal(clipMiddle('   ', 100), '');
     assert.equal(clipMiddle('abc', 1), '…');
+    assert.equal(clipMiddle('abc', 2), 'a…');
     assert.equal(clipMiddle('abc', 0), '');
+    // Never splits UTF-16 surrogate pairs (e.g. emojis) at clip boundaries.
+    const emojis = '🚀'.repeat(3_000);
+    for (const limit of [2, 3, 20, 119, 120, 4_001]) {
+      const clipped = clipMiddle(emojis, limit);
+      assert.ok(clipped.length <= limit, `emoji clip <= ${limit}`);
+      assert.equal(clipped.isWellFormed(), true, `emoji clip well-formed at limit ${limit}`);
+    }
+    // End-to-end refs + footer pipeline (9,000 + refs -> 10,000 + footer -> 12,000) keeps opening, refs and footer.
+    const refs = '\n\n---\nThread: @thread:t_99\nChange: chg_abc123456 (open) https://durango.sh/c/chg_abc123456\nWorkspace: /tmp/ws';
+    const footer = '(Durango Code thread t_99, on Mac. Follow up there, e.g. to ship it, with message_thread thread_id "t_99".)';
+    const rawReport = `OPENING REPORT\n${'body line\n'.repeat(1_500)}CLOSING SUMMARY`;
+    const withRefs = `${clipMiddle(rawReport, 9_000)}${refs}`;
+    const withFooter = `${clipMiddle(withRefs, 10_000)}\n\n${footer}`;
+    const inInbox = clipMiddle(withFooter, 12_000);
+    assert.ok(inInbox.length <= 12_000);
+    assert.ok(inInbox.startsWith('OPENING REPORT'));
+    assert.ok(inInbox.includes('Change: chg_abc123456 (open)'));
+    assert.ok(inInbox.endsWith(footer));
   });
 
   await test('renderer outcome: prefers final message over earlier progress lines and uses server-aligned limits', () => {
@@ -1104,7 +1124,7 @@ try {
     });
     assert.equal(dispatchRunFinalText(endedOnTool), finalAnswer);
 
-    // Inline visual/theme cards inside the final answer do not split it.
+    // Inline visual/theme cards and reasoning/result activities do not split the final answer.
     const partA = 'Summary before chart.\n\n';
     const partB = 'Conclusion after chart.';
     const withVisual = run({
@@ -1113,9 +1133,24 @@ try {
       activities: [
         { id: 'a1', type: 'command', title: 'query', status: 'done', ts: 'x', contentOffset: progress1.length },
         { id: 'a2', type: 'tool', title: 'show_html', status: 'done', ts: 'x', contentOffset: progress1.length + partA.length, visual: { id: 'v1', html: '<p>hi</p>', title: 'Chart' } },
+        { id: 'a3', type: 'thought', title: 'Reasoning', status: 'done', ts: 'x', contentOffset: progress1.length + partA.length },
+        { id: 'a4', type: 'result', title: 'Retried', status: 'done', ts: 'x', contentOffset: progress1.length + partA.length },
       ],
     });
     assert.equal(dispatchRunFinalText(withVisual), `${partA}${partB}`);
+
+    // Brief closing postscript after a trailing cleanup/attach tool preserves the substantial summary right before it.
+    const substantialSummary = 'Implemented the fix across desktop and server, updated all tests, and opened chg_123. ' + 'Detailed breakdown. '.repeat(20);
+    const postscript = 'Attached the screenshot.';
+    const withPostscript = run({
+      status: 'done',
+      content: `${progress1}${substantialSummary}\n\n${postscript}`,
+      activities: [
+        { id: 'a1', type: 'command', title: 'test', status: 'done', ts: 'x', contentOffset: progress1.length },
+        { id: 'a2', type: 'command', title: 'durango-code change attach', status: 'done', ts: 'x', contentOffset: progress1.length + substantialSummary.length },
+      ],
+    });
+    assert.equal(dispatchRunFinalText(withPostscript), `${substantialSummary.trim()}\n\n${postscript}`);
 
     // Legacy activities without contentOffset keep the full content.
     const legacy = run({

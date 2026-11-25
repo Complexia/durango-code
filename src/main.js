@@ -5163,7 +5163,7 @@ const sendBotTaskNotice = async ({ taskId, threadId, kind, key, seq, detail }) =
   const machineId = await getDurangoDeviceId().catch(() => null);
   if (!machineId || !taskId) return { ok: false, retry: true };
   const thread = threadId ? { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true } : null;
-  const text = clipMiddle(String(detail ?? '').trim(), 3_500);
+  const text = clipMiddle(String(detail ?? '').trim(), 3_000);
   const notice = { kind, key, seq, detail: thread ? withThreadReportFooter(text, thread) : text };
   try {
     return await durangoClient.noticeBotTask({ taskId, machineId, notice });
