@@ -18,13 +18,12 @@ const execFileAsync = promisify(execFile);
 // generates the work digests that Durango Chat's memory uses from each
 // completed thread sync, so a finished turn should reach it promptly.
 //
-// Everything here is gated twice: the setting (on by default since the
-// Durango merge — see app/workspaceSyncConsent.ts — pushed from the renderer
-// over sync:configure) AND a signed-in account. While either is missing the
-// engine is inert — no timers, no network, no capture — so users who turn
-// sharing off are entirely unaffected. All work happens on debounced timers
-// in this process; failures land in the status broadcast, never in the
-// agent-run path.
+// Everything here is gated twice: the setting (off by default — opt-in, see
+// app/workspaceSyncConsent.ts — pushed from the renderer over sync:configure)
+// AND a signed-in account. While either is missing the engine is inert — no
+// timers, no network, no capture — so users who keep sharing off are entirely
+// unaffected. All work happens on debounced timers in this process; failures
+// land in the status broadcast, never in the agent-run path.
 //
 // Timing: every threads/store save calls notifyWorkspaceChanged(). The pass
 // runs SYNC_DEBOUNCE_MS (15 s) after the last save, so a thread that just
@@ -53,7 +52,7 @@ const MAX_REMOVALS_PER_SNAPSHOT = 20_000;
 // readThreadsByIds, broadcast }.
 let deps = null;
 
-let settings = { enabled: false, syncCode: true };
+let settings = { enabled: false, syncCode: false };
 let status = {
   enabled: false,
   authenticated: false,
@@ -67,6 +66,7 @@ let status = {
 let syncTimer = null;
 let codePollTimer = null;
 let syncInFlight = null;
+let syncingCode = false;
 let syncQueuedOptions = null;
 let scheduledSyncOptions = null;
 // When the currently pending (debounced) pass was first requested.
@@ -914,12 +914,14 @@ const syncCode = async (
   const failures = [];
   for (const project of projects) {
     ensureCurrentSync(generation, signal);
+    if (!settings.syncCode) break;
     const gitRoot = await getGitRootSafe(project?.path);
     if (!gitRoot || seenRoots.has(gitRoot)) continue;
     seenRoots.add(gitRoot);
 
     const branchState = await gitBranchState(gitRoot);
     ensureCurrentSync(generation, signal);
+    if (!settings.syncCode) break;
     if (!branchState) continue; // empty repo — nothing to push yet
 
     const priorFailure = publishFailures.get(gitRoot);
@@ -1070,12 +1072,17 @@ const runSyncPass = async (
     ensureCurrentSync(generation, signal);
     let codeFailures = [];
     if (settings.syncCode) {
-      codeFailures = await syncCode(session.token, storeState, {
-        retryFailedPublishes,
-        ownerId,
-        generation,
-        signal,
-      });
+      syncingCode = true;
+      try {
+        codeFailures = await syncCode(session.token, storeState, {
+          retryFailedPublishes,
+          ownerId,
+          generation,
+          signal,
+        });
+      } finally {
+        syncingCode = false;
+      }
     }
     ensureCurrentSync(generation, signal);
 
@@ -1149,12 +1156,16 @@ const startCodePoll = () => {
   codePollTimer.unref?.();
 };
 
+const stopCodePoll = () => {
+  if (codePollTimer) clearInterval(codePollTimer);
+  codePollTimer = null;
+};
+
 const stopTimers = () => {
   if (syncTimer) clearTimeout(syncTimer);
   syncTimer = null;
   scheduledSyncOptions = null;
-  if (codePollTimer) clearInterval(codePollTimer);
-  codePollTimer = null;
+  stopCodePoll();
 };
 
 // --- Public surface (called from main.js) ------------------------------------
@@ -1166,21 +1177,34 @@ export const initWorkspaceSync = (injectedDeps) => {
 /** Renderer pushes the persisted settings on hydration and every change. */
 export const configureWorkspaceSync = (nextSettings) => {
   const wasEnabled = settings.enabled;
+  const wasSyncCode = settings.syncCode;
   settings = {
     enabled: nextSettings?.enabled === true,
-    syncCode: nextSettings?.syncCode !== false,
+    syncCode: nextSettings?.syncCode === true,
   };
   if (settings.enabled && !wasEnabled) {
     // First enable (or re-enable): backfill everything in the background.
     setStatus({ enabled: true, backfillDone: false });
-    startCodePoll();
+    if (settings.syncCode) startCodePoll();
     scheduleSync(1_000);
   } else if (!settings.enabled && wasEnabled) {
     invalidateActiveSync();
     stopTimers();
     setStatus({ enabled: false, syncing: false });
+  } else if (settings.enabled) {
+    if (settings.syncCode && !wasSyncCode) {
+      startCodePoll();
+      scheduleSync(1_000);
+    } else if (!settings.syncCode && wasSyncCode) {
+      stopCodePoll();
+      if (syncingCode) {
+        invalidateActiveSync();
+        setStatus({ enabled: true, syncing: false });
+      }
+    }
+    setStatus({ enabled: true });
   } else {
-    setStatus({ enabled: settings.enabled });
+    setStatus({ enabled: false });
   }
   return { ...status };
 };

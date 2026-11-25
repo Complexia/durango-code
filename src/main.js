@@ -1482,10 +1482,9 @@ app.whenReady().then(async () => {
     broadcast: (channel, payload) => sendToAllWindows(channel, payload),
   });
   void readPersistedStoreState().then((state) => {
-    // Same consent reconciliation as the renderer store (work sharing
-    // defaults to Full; a persisted "off" made after consent v1 sticks).
-    // A store without settings yet is a fresh install: the renderer pushes
-    // its defaults on hydration.
+    // Same consent reconciliation as the renderer store (both sharing and code
+    // sync are opt-in and off by default since consent v2). A store without
+    // settings yet is a fresh install and stays off until the user opts in.
     if (state?.workspaceSyncSettings) {
       configureWorkspaceSync(migrateWorkspaceSyncSettings(state.workspaceSyncSettings));
     }

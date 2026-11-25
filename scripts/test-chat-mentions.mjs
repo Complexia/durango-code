@@ -20,7 +20,7 @@ import { getChatMentionReplaceEnd } from '../src/app/chatMentions.ts';
 import {
   WORKSPACE_SYNC_CONSENT_VERSION,
   migrateWorkspaceSyncSettings,
-  shouldShowWorkspaceSyncNotice,
+  shouldShowWorkspaceSyncConsentPrompt,
 } from '../src/app/workspaceSyncConsent.ts';
 
 const billing = {
@@ -103,33 +103,60 @@ assert.equal(getChatMentionReplaceEnd('@billing plan tail', { start: 0, query: '
 assert.equal(getChatMentionReplaceEnd('@gpt-5 tail', { start: 0, query: 'gp' }, 'model'), 6);
 
 // --- Work sharing consent ------------------------------------------------------------
-// Fresh install: on by default, notice pending until signed in.
+// Fresh install: both sharing and code sync are off by default; opt-in prompt
+// waits until signed in.
+assert.equal(WORKSPACE_SYNC_CONSENT_VERSION, 2);
 const fresh = migrateWorkspaceSyncSettings(undefined);
-assert.equal(fresh.enabled, true);
-assert.equal(fresh.syncCode, true);
-assert.equal(fresh.consentVersion, WORKSPACE_SYNC_CONSENT_VERSION);
-assert.equal(fresh.consentNoticeSeen, false);
-assert.equal(shouldShowWorkspaceSyncNotice(fresh, false), false, 'no notice while signed out');
-assert.equal(shouldShowWorkspaceSyncNotice(fresh, true), true);
+assert.deepEqual(fresh, {
+  enabled: false,
+  syncCode: false,
+  consentVersion: 2,
+  consentNoticeSeen: false,
+});
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(fresh, false), false, 'no prompt while signed out');
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(fresh, true), true, 'prompt once when signed in');
 
 // Pre-Durango user who never opted in (persisted the old default off):
-// migrated once to on, with the one-time notice.
+// stays off, code sync off, prompted once when signed in.
 const legacyOff = migrateWorkspaceSyncSettings({ enabled: false, syncCode: true });
-assert.deepEqual(legacyOff, { enabled: true, syncCode: true, consentVersion: 1, consentNoticeSeen: false });
-assert.equal(shouldShowWorkspaceSyncNotice(legacyOff, true), true);
-// Pre-Durango user who had opted in: stays on, already informed.
-const legacyOn = migrateWorkspaceSyncSettings({ enabled: true, syncCode: false });
-assert.deepEqual(legacyOn, { enabled: true, syncCode: false, consentVersion: 1, consentNoticeSeen: true });
-assert.equal(shouldShowWorkspaceSyncNotice(legacyOn, true), false);
+assert.deepEqual(legacyOff, { enabled: false, syncCode: false, consentVersion: 2, consentNoticeSeen: false });
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(legacyOff, true), true);
 
-// After consent v1, "off" sticks — across every later hydration.
-const turnedOff = { ...legacyOff, enabled: false, consentNoticeSeen: true };
-assert.deepEqual(migrateWorkspaceSyncSettings(turnedOff), turnedOff);
-assert.deepEqual(migrateWorkspaceSyncSettings(migrateWorkspaceSyncSettings(turnedOff)), turnedOff);
-assert.equal(shouldShowWorkspaceSyncNotice(turnedOff, true), false);
-// Acknowledged "on" also sticks without re-showing the notice.
-const acknowledged = { ...legacyOff, consentNoticeSeen: true };
-assert.deepEqual(migrateWorkspaceSyncSettings(acknowledged), acknowledged);
-assert.equal(shouldShowWorkspaceSyncNotice(acknowledged, true), false);
+// Pre-Durango user who had explicitly opted in: keeps sharing and their syncCode choice.
+const legacyOn = migrateWorkspaceSyncSettings({ enabled: true, syncCode: false });
+assert.deepEqual(legacyOn, { enabled: true, syncCode: false, consentVersion: 2, consentNoticeSeen: true });
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(legacyOn, true), false);
+const legacyOnWithCode = migrateWorkspaceSyncSettings({ enabled: true, syncCode: true });
+assert.deepEqual(legacyOnWithCode, { enabled: true, syncCode: true, consentVersion: 2, consentNoticeSeen: true });
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(legacyOnWithCode, true), false);
+
+// Consent v1 user switched on by the merge migration (unseen notice): goes back to off and gets opt-in prompt.
+const v1Unseen = migrateWorkspaceSyncSettings({ enabled: true, syncCode: true, consentVersion: 1, consentNoticeSeen: false });
+assert.deepEqual(v1Unseen, { enabled: false, syncCode: false, consentVersion: 2, consentNoticeSeen: false });
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(v1Unseen, true), true);
+
+// Consent v1 user who acknowledged/dismissed the notice: stored state cannot distinguish
+// dismissing the toast from an explicit toggle, so lean toward off and ask once.
+const v1Acked = migrateWorkspaceSyncSettings({ enabled: true, syncCode: true, consentVersion: 1, consentNoticeSeen: true });
+assert.deepEqual(v1Acked, { enabled: false, syncCode: false, consentVersion: 2, consentNoticeSeen: false });
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(v1Acked, true), true);
+
+// Consent v1 user who explicitly turned sharing off: stays off and is not prompted again.
+const v1ExplicitOff = migrateWorkspaceSyncSettings({ enabled: false, syncCode: true, consentVersion: 1, consentNoticeSeen: true });
+assert.deepEqual(v1ExplicitOff, { enabled: false, syncCode: false, consentVersion: 2, consentNoticeSeen: true });
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(v1ExplicitOff, true), false);
+
+// After consent v2, explicit choices stick across every later hydration.
+const declined = { ...fresh, enabled: false, syncCode: false, consentNoticeSeen: true };
+assert.deepEqual(migrateWorkspaceSyncSettings(declined), declined);
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(declined, true), false);
+
+const optedInNoCode = { ...fresh, enabled: true, syncCode: false, consentNoticeSeen: true };
+assert.deepEqual(migrateWorkspaceSyncSettings(optedInNoCode), optedInNoCode);
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(optedInNoCode, true), false);
+
+const optedInWithCode = { ...fresh, enabled: true, syncCode: true, consentNoticeSeen: true };
+assert.deepEqual(migrateWorkspaceSyncSettings(optedInWithCode), optedInWithCode);
+assert.equal(shouldShowWorkspaceSyncConsentPrompt(optedInWithCode, true), false);
 
 console.log('chat mentions + work sharing consent: ok');
