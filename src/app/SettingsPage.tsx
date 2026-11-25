@@ -90,6 +90,7 @@ import { CustomizationsSettings } from './themes/CustomizationsSettings';
 
 const CODEX_BROWSER_EXTENSION_URL =
   'https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg';
+const TELEMETRY_DOCS_URL = 'https://durango.sh/telemetry';
 
 // Settings remains controlled by App because its asynchronous account and
 // update operations are shared with the shell. Keeping that integration in a
@@ -655,6 +656,26 @@ const SettingsPage = React.memo(function SettingsPage(props: SettingsPageProps) 
                   </button>
                 </div>
               )}
+
+              <div className="setting-row">
+                <div className="setting-label">
+                  <div className="setting-label-title">What Durango Code sends</div>
+                  <div className="setting-label-desc">
+                    No analytics or crash-reporting SDKs. Read the full breakdown of sync, update
+                    checks, and third-party agent CLI telemetry.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="provider-auth-button"
+                  onClick={() => {
+                    void window.orion.openExternalUrl(TELEMETRY_DOCS_URL);
+                  }}
+                >
+                  <SquareArrowOutUpRight size={13} />
+                  Telemetry &amp; data
+                </button>
+              </div>
 
               <DurangoProfileMemorySetting authenticated={accountState.authenticated} />
               <DurangoDispatchSettings
