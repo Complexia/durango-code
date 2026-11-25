@@ -278,6 +278,56 @@ test('resolveThreadStarter attributes each thread to the bot that actually start
     resolveThreadStarter({ durangoDispatch: { id: 'bottask:y17followup', runOffset: 2 } }, allBots, projectBots),
     { kind: 'you' }
   );
+  // Follow-up on a 0-run user thread (followUp: true, no runOffset) stays attributed to You.
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 'bottask:y17zero', followUp: true } }, allBots, projectBots),
+    { kind: 'you' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 'localbot:y977code:lt_zero', followUp: true } }, allBots, projectBots),
+    { kind: 'you' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter({ durangoDispatch: { id: 't57followup', followUp: true } }, allBots, projectBots),
+    { kind: 'you' }
+  );
+
+  // Known botId of a deleted bot never falls back to a different live bot sharing the same name.
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'durango-code', startedByBotId: 'deleted_code_bot', durangoDispatch: { id: 'bottask:y17del' } },
+      allBots,
+      projectBots
+    ),
+    { kind: 'bot', bot: null, name: 'durango-code' }
+  );
+  assert.deepEqual(
+    resolveThreadStarter(
+      { startedByBot: 'Durango', startedByBotId: 'deleted_cloud_bot', durangoDispatch: { id: 't57del' } },
+      allBots,
+      projectBots
+    ),
+    { kind: 'bot', bot: null, name: 'Durango' }
+  );
+
+  // Nameless 'bot' placeholder never matches a real bot named "Bot".
+  const literalBot = makeBot({ id: 'y97lit', name: 'Bot', emoji: '🤖', project: durangoProject });
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'bot', durangoDispatch: { id: 'bottask:y17noname' } }, [literalBot, ...allBots], [literalBot, ...projectBots]),
+    { kind: 'bot', bot: null, name: 'A bot' }
+  );
+
+  // Signed-out / unloaded bot list keeps the recorded bot name cleanly.
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'durango-code', startedByBotId: 'y977code', durangoDispatch: { id: 'bottask:y1750' } }, [], []),
+    { kind: 'bot', bot: null, name: 'durango-code' }
+  );
+
+  // Legacy name-only matching is case-insensitive when no botId was stored.
+  assert.deepEqual(
+    resolveThreadStarter({ startedByBot: 'DURANGO-CHAT', durangoDispatch: { id: 'bottask:y17case' } }, allBots, projectBots),
+    { kind: 'bot', bot: chatBot, name: 'durango-chat' }
+  );
 
   // Durango Chat/Tasks/API dispatches and user-started threads.
   assert.deepEqual(resolveThreadStarter({ durangoDispatch: { id: 't57task1' } }, allBots, projectBots), { kind: 'durango' });

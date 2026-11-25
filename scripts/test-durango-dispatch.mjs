@@ -1011,11 +1011,11 @@ try {
     assert.equal(followUp.threadId, 'thread-9');
     assert.equal(followUp.sourceLabel, 'Grok (MCP)');
     server.on('POST', '/api/v1/code/dispatches/claim', () => ({
-      json: { dispatch: { id: 'd3', prompt: 'fix', project: { name: 'x' }, bot: 'durango-code', botId: 'y977tdqatmrxv9we88k0mhenpx8jxdrg' } },
+      json: { dispatch: { id: 'd3', prompt: 'fix', project: { name: 'x' }, bot: 'durango-code', botId: 'bot_code_1' } },
     }));
     const { dispatch: botDispatch } = await client.claimDispatch({ machineId: 'm' });
     assert.equal(botDispatch.bot, 'durango-code', "a cloud bot's task names its bot");
-    assert.equal(botDispatch.botId, 'y977tdqatmrxv9we88k0mhenpx8jxdrg', "a cloud bot's task carries its bot id");
+    assert.equal(botDispatch.botId, 'bot_code_1', "a cloud bot's task carries its bot id");
     server.on('POST', '/api/v1/code/dispatches/x', () => ({ status: 409, json: durangoErrorBody('Another machine claimed this dispatch.', 'claimed_elsewhere') }));
     await assert.rejects(client.reportDispatch('x', { status: 'running' }), (error) => error instanceof DurangoError && error.status === 409 && error.apiCode === 'claimed_elsewhere');
   });

@@ -4576,6 +4576,7 @@ const dispatchWorker = createDispatchWorker({
               ? dispatch.origin
               : 'chat',
         ...(dispatch.botId ? { botId: dispatch.botId } : {}),
+        ...(typeof dispatch.bot === 'string' && dispatch.bot.trim() ? { botName: dispatch.bot.trim().slice(0, 80) } : {}),
         sourceLabel: dispatchSourceLabel(dispatch),
         followUp: Boolean(threadId),
         taskId: dispatch.taskId,
@@ -4642,8 +4643,9 @@ const BOT_TASK_DISPATCH_PREFIX = 'bottask:';
 const startBotProjectThread =
   (prefix) =>
   ({ projectId, prompt, key, botId, botName, title, accessMode, modelId, reasoningEffort, codexServiceTier, claudeContextWindow }) => {
+    const cleanBotName = typeof botName === 'string' ? botName.trim().slice(0, 80) : '';
     // A plain thread title, without a "Bots:" style prefix (bot-thread-title.js).
-    const threadTitle = botThreadTitle(title, botName).slice(0, 80);
+    const threadTitle = botThreadTitle(title, cleanBotName).slice(0, 80);
     return requestDispatchRendererCommand({
       kind: 'runTurn',
       projectId,
@@ -4653,12 +4655,13 @@ const startBotProjectThread =
       ...(codexServiceTier ? { codexServiceTier } : {}),
       ...(claudeContextWindow ? { claudeContextWindow } : {}),
       accessMode,
-      source: { machineId: 'durango-bot', machineName: botName },
+      source: { machineId: 'durango-bot', machineName: cleanBotName || 'your bot' },
       durangoDispatch: {
         id: `${prefix}${key}`,
         origin: 'bot',
         ...(botId ? { botId } : {}),
-        sourceLabel: `your bot ${botName}`,
+        ...(cleanBotName ? { botName: cleanBotName } : {}),
+        sourceLabel: cleanBotName ? `your bot ${cleanBotName}` : 'your bot',
         ...(threadTitle ? { title: threadTitle } : {}),
         followUp: false,
         sourceUrl: null,
@@ -4683,6 +4686,7 @@ const startBotThreadFollowUp =
         30_000
       );
     }
+    const cleanBotName = typeof botName === 'string' ? botName.trim().slice(0, 80) : '';
     // Bots work with Full access, in their follow-ups too (bot-replies.js normalizeBotSettings).
     const turnAccessMode = accessMode;
     return requestDispatchRendererCommand({
@@ -4694,11 +4698,11 @@ const startBotThreadFollowUp =
       ...(codexServiceTier ? { codexServiceTier } : {}),
       ...(claudeContextWindow ? { claudeContextWindow } : {}),
       accessMode: turnAccessMode,
-      source: { machineId: 'durango-bot', machineName: botName },
+      source: { machineId: 'durango-bot', machineName: cleanBotName || 'your bot' },
       durangoDispatch: {
         id: `${prefix}${key}`,
         origin: 'bot',
-        sourceLabel: `your bot ${botName}`,
+        sourceLabel: cleanBotName ? `your bot ${cleanBotName}` : 'your bot',
         followUp: true,
         sourceUrl: null,
         requestedAccessMode: turnAccessMode,

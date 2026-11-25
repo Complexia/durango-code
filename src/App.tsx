@@ -9230,7 +9230,8 @@ const App: React.FC = () => {
             ? command.durangoDispatch
             : null;
         const dispatchSource =
-          dispatch?.sourceLabel ?? (dispatch?.origin === 'tasks' ? 'Durango Tasks' : 'Durango Chat');
+          dispatch?.sourceLabel ??
+          (dispatch?.origin === 'bot' ? 'your bot' : dispatch?.origin === 'tasks' ? 'Durango Tasks' : 'Durango Chat');
         // A follow-up's outcome is its own run, not the thread's first one.
         const dispatchRunOffset =
           dispatch && !createdThread
@@ -9286,9 +9287,15 @@ const App: React.FC = () => {
           if (dispatch.origin === 'bot') {
             const botId =
               typeof dispatch.botId === 'string' && dispatch.botId.trim() ? dispatch.botId.trim().slice(0, 128) : undefined;
-            const botName = dispatchSource.replace(/^your bot(?: |$)/, '').trim().slice(0, 80) || 'bot';
+            const rawBotName =
+              typeof dispatch.botName === 'string' && dispatch.botName.trim()
+                ? dispatch.botName.trim()
+                : typeof dispatch.sourceLabel === 'string'
+                  ? dispatch.sourceLabel.replace(/^your bot(?: |$)/, '').trim()
+                  : '';
+            const botName = rawBotName.slice(0, 80) || undefined;
             updateThread(threadId, {
-              startedByBot: botName,
+              ...(botName ? { startedByBot: botName } : !botId ? { startedByBot: 'bot' } : {}),
               ...(botId ? { startedByBotId: botId } : {}),
             });
           }
@@ -9359,6 +9366,7 @@ const App: React.FC = () => {
               sourceUrl: dispatch.sourceUrl,
               startedAt: new Date().toISOString(),
               ...(dispatchRunOffset ? { runOffset: dispatchRunOffset } : {}),
+              ...(!createdThread ? { followUp: true } : {}),
             },
           });
         }

@@ -1707,6 +1707,12 @@ const ProjectPage: React.FC<{
   }, [filter, threadLists, stateOf]);
 
   useEffect(() => {
+    if (createdBot && entry.bots.some((item) => item.id === createdBot.id)) {
+      setCreatedBot(null);
+    }
+  }, [createdBot, entry.bots]);
+
+  useEffect(() => {
     if (selectedProjectBotId && !projectBots.some((item) => item.id === selectedProjectBotId)) {
       setSelectedProjectBotId(projectBots[0]?.id ?? null);
     } else if (!selectedProjectBotId && projectBots[0]) {

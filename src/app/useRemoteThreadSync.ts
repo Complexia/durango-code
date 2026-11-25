@@ -263,6 +263,16 @@ export const useRemoteThreadSync = ({ enabled, threads, openThreadIds, machines 
       ) {
         settingsPatch.subagent = hostSubagent;
       }
+      const hostStartedByBot =
+        typeof (host as { startedByBot?: unknown }).startedByBot === 'string'
+          ? (host as { startedByBot: string }).startedByBot.trim()
+          : '';
+      const hostStartedByBotId =
+        typeof (host as { startedByBotId?: unknown }).startedByBotId === 'string'
+          ? (host as { startedByBotId: string }).startedByBotId.trim()
+          : '';
+      if (hostStartedByBot && !current.startedByBot) settingsPatch.startedByBot = hostStartedByBot;
+      if (hostStartedByBotId && !current.startedByBotId) settingsPatch.startedByBotId = hostStartedByBotId;
       // The actions it waits on the user for there (request_user_action).
       // Its subagents' too, as that machine rolls them up (older hosts: its own).
       // A subagent there whose parent is mirrored here keeps none: that

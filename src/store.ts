@@ -804,6 +804,8 @@ export type Thread = {
     startedAt: string;
     /** Follow-up: agent runs the thread had before this one (absent = its first run). */
     runOffset?: number;
+    /** True when this dispatch continued an existing thread rather than creating it. */
+    followUp?: boolean;
     /** Set once the outcome went back to Durango Chat. */
     reportedAt?: string;
     /**
@@ -954,6 +956,8 @@ export type RemoteThreadListing = {
   snoozedAt?: string | null;
   pinnedAt?: string | null;
   hiddenFromRecent?: boolean;
+  startedByBot?: string | null;
+  startedByBotId?: string | null;
   settings?: Record<string, string>;
   userActions?: UserAction[];
   waitingOnQuestion?: boolean;
@@ -2796,6 +2800,8 @@ export const useOrionStore = create<OrionState>()(
                 patch.parentThreadId = parentThreadId;
               }
               if (nativeSubagent && !current.subagent) patch.subagent = nativeSubagent;
+              if (entry.startedByBot && !current.startedByBot) patch.startedByBot = entry.startedByBot;
+              if (entry.startedByBotId && !current.startedByBotId) patch.startedByBotId = entry.startedByBotId;
               // A rename here stands until that machine renames it.
               if (
                 entry.title &&
@@ -2872,6 +2878,8 @@ export const useOrionStore = create<OrionState>()(
               ...(entry.snoozedAt && !entry.settledAt ? { snoozedAt: entry.snoozedAt } : {}),
               ...(entry.pinnedAt ? { pinnedAt: entry.pinnedAt } : {}),
               ...(entry.hiddenFromRecent || parentMirror ? { hiddenFromRecent: true } : {}),
+              ...(entry.startedByBot ? { startedByBot: entry.startedByBot } : {}),
+              ...(entry.startedByBotId ? { startedByBotId: entry.startedByBotId } : {}),
               ...(parentMirror
                 ? { parentThreadId: parentMirror.id }
                 : localParentOf(entry)

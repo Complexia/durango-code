@@ -362,7 +362,7 @@ export const projectBotFor = (bots: DesktopBot[], key: string | undefined) =>
 export type ThreadStarterInput = {
   startedByBot?: string;
   startedByBotId?: string;
-  durangoDispatch?: { id?: string; runOffset?: number } | null;
+  durangoDispatch?: { id?: string; runOffset?: number; followUp?: boolean } | null;
 };
 
 export type ThreadStarter =
@@ -393,7 +393,7 @@ export const resolveThreadStarter = (
   const recordedId = thread.startedByBotId?.trim() || null;
   const recordedName = thread.startedByBot?.trim() || null;
   const dispatchId = thread.durangoDispatch?.id ?? '';
-  const isFollowUpOnly = Boolean(thread.durangoDispatch?.runOffset);
+  const isFollowUpOnly = Boolean(thread.durangoDispatch?.followUp || thread.durangoDispatch?.runOffset);
   const isBotDispatchId = dispatchId.startsWith('bottask:') || dispatchId.startsWith('localbot:');
 
   if (recordedId || recordedName || (isBotDispatchId && !isFollowUpOnly)) {
@@ -404,8 +404,7 @@ export const resolveThreadStarter = (
         allBots.find((candidate) => candidate.id === botId) ??
         projectBots.find((candidate) => candidate.id === botId) ??
         null;
-    }
-    if (!matched && recordedName) {
+    } else if (recordedName && recordedName !== 'bot') {
       const lower = recordedName.toLowerCase();
       matched =
         projectBots.find((candidate) => candidate.name === recordedName) ??
