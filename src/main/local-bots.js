@@ -80,7 +80,17 @@ const PROJECT_FILES_DIR = 'project-files';
 export const TRANSCRIPT_LOG_MAX_LINES = 500;
 export const TRANSCRIPT_LOG_MAX_BYTES = 4 * 1024 * 1024;
 const TRANSCRIPT_LOG_NAME = /^[A-Za-z0-9_-]{1,64}\.[0-9a-f]{12}\.log$/;
-export const LOCAL_PROJECT_LIMITS = { noteChars: 2_000, notesPerProject: 200, fileBytes: 10 * 1024 * 1024, filesPerProject: 200, readChars: 60_000, promptNotesChars: 6_000 };
+export const LOCAL_PROJECT_LIMITS = {
+  noteChars: 2_000,
+  notesPerProject: 200,
+  fileBytes: 10 * 1024 * 1024,
+  filesPerProject: 200,
+  readChars: 60_000,
+  promptNotesChars: 6_000,
+  toolDefaultLimit: 50,
+  toolSearchDefaultLimit: 20,
+  toolMaxChars: 40_000,
+};
 
 // --- prompts ------------------------------------------------------------------------------
 
@@ -352,13 +362,21 @@ const scheduleSchema = {
 const LOCAL_PROJECT_TOOLS = [
   {
     name: 'project_notes',
-    description: "A project's notes and files (your home project by default, or name one). Notes are what its bots keep in mind about the project; files are its documents.",
-    inputSchema: { type: 'object', properties: { project: { type: 'string', maxLength: 200, description: 'Project name (default: your own project).' } } },
+    description:
+      "Search or list a project's notes and files (your home project by default, or name one). Project notes aren't pasted into your prompt — call this on demand when relevant: before starting or briefing project work, when a question may depend on project conventions or decisions, and before remember_project to avoid duplicates. Pass `query` (keywords) to fetch only relevant notes, or omit `query` to list recent notes and files.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project: { type: 'string', maxLength: 200, description: 'Project name (default: your own project).' },
+        query: { type: 'string', maxLength: 200, description: 'Optional keywords to search relevant notes and files (e.g. "sync", "deploy railway"). Omit to list recent notes and files.' },
+        limit: { type: 'integer', minimum: 1, maximum: LOCAL_PROJECT_LIMITS.notesPerProject, description: 'Maximum notes to return (default 20 with query, 50 without).' },
+      },
+    },
   },
   {
     name: 'remember_project',
     description:
-      "Keep a note in a project's memory (your home project by default): decisions, conventions, where things are, what's in progress, the person's preferences for this project. Every bot and every thread started in the project sees its notes. One fact per note; check project_notes to avoid repeats.",
+      "Save a durable note to a project's library (your home project by default): decisions, conventions, where things are, what's in progress, the person's preferences for this project. Bots and threads in the project pull notes on demand with project_notes. One fact per note. Always check project_notes (with a relevant query) first so you don't save duplicates — remove outdated notes with forget_project_note.",
     inputSchema: {
       type: 'object',
       properties: { note: { type: 'string', minLength: 1, maxLength: 2_000 }, project: { type: 'string', maxLength: 200 } },
@@ -410,7 +428,7 @@ export const LOCAL_BOT_TOOLS = [
           type: 'string',
           maxLength: 200,
           description:
-            "A Durango Code project on this computer (by name, as listed in your instructions): the task runs as a Durango Code thread in it, with every tool a thread has, and the person can watch and continue it in the app. It can read the project's notes itself (project_notes). Omit for work that isn't about a project.",
+            "A Durango Code project on this computer (by name, as listed in your instructions): the task runs as a Durango Code thread in it, with every tool a thread has, and the person can watch and continue it in the app. Check project_notes first if project conventions or prior decisions might apply; the thread can also read the project's notes itself (project_notes). Omit for work that isn't about a project.",
         },
         model: {
           type: 'string',
@@ -641,6 +659,215 @@ const nextLocalProjectBotName = (projectName, existingNames) => {
     if (!taken.has(candidate.toLowerCase())) return candidate;
   }
   return base;
+};
+
+const PROJECT_NOTE_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'that', 'this', 'from', 'are', 'was', 'were',
+  'have', 'has', 'had', 'into', 'about', 'your', 'our', 'their', 'its', 'can',
+  'will', 'all', 'any', 'but', 'not', 'per', 'via', 'when', 'where', 'what',
+  'which', 'who', 'how', 'why', 'only', 'also', 'then', 'than', 'just', 'more',
+  'most', 'some', 'such', 'each', 'other', 'should', 'must', 'need', 'needs',
+  'use', 'using', 'used', 'make', 'keep',
+]);
+
+const projectSearchTerms = (query, { dropStopwords = false, minLength = 2 } = {}) => {
+  const normalized = str(query).normalize('NFKC').toLowerCase().trim();
+  if (!normalized) return [];
+  const raw = normalized
+    .split(/[\s/_,;:()[\]{}"'`.!?-]+/)
+    .map((token) => token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter((token) => token.length >= minLength);
+  const seen = new Set();
+  const terms = [];
+  for (const token of raw) {
+    if (dropStopwords && PROJECT_NOTE_STOPWORDS.has(token)) continue;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    terms.push(token);
+    if (terms.length >= 12) break;
+  }
+  if (!terms.length && !dropStopwords) return [normalized];
+  return terms;
+};
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const noteDateIso = (createdAt) => (Number.isFinite(createdAt) && createdAt > 0 ? new Date(createdAt).toISOString().slice(0, 10) : undefined);
+
+/**
+ * Search or list a project's notes and files for the `project_notes` tool.
+ * Mirrors chat/convex/botPolicy.ts `searchProjectNotes`. Pure.
+ */
+export const searchProjectNotes = (notes, files, { query, limit, maxChars } = {}) => {
+  const sortedNotes = (Array.isArray(notes) ? notes : [])
+    .map((note, index) => ({ note, index }))
+    .sort((a, b) => (Number(b.note?.createdAt) || 0) - (Number(a.note?.createdAt) || 0) || b.index - a.index)
+    .map((entry) => entry.note);
+  const sortedFiles = [...(Array.isArray(files) ? files : [])].sort((a, b) => str(a?.name).localeCompare(str(b?.name)));
+  const trimmedQuery = str(query).trim();
+  const charCap = Math.max(1_000, Number.isFinite(maxChars) ? maxChars : LOCAL_PROJECT_LIMITS.toolMaxChars);
+  const formatNote = (note) => {
+    const at = noteDateIso(Number(note.createdAt));
+    return { id: note.id, note: note.content, by: note.author, ...(at ? { at } : {}) };
+  };
+  const formatFile = (file) => ({ name: file.name, size: file.size, type: file.contentType });
+
+  if (trimmedQuery) {
+    const terms = projectSearchTerms(trimmedQuery);
+    const phrase = trimmedQuery.normalize('NFKC').toLowerCase();
+    const wordPatterns = terms.map((term) => new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRegExp(term)}`, 'u'));
+    const scoredNotes = [];
+    for (const note of sortedNotes) {
+      const hay = str(note.content).normalize('NFKC').toLowerCase();
+      const author = str(note.author).normalize('NFKC').toLowerCase();
+      let matchedTerms = 0;
+      let wordMatches = 0;
+      for (let i = 0; i < terms.length; i += 1) {
+        const term = terms[i];
+        if (hay.includes(term)) {
+          matchedTerms += 1;
+          if (wordPatterns[i].test(hay)) wordMatches += 1;
+        } else if (author.includes(term)) {
+          matchedTerms += 1;
+        }
+      }
+      if (matchedTerms === 0) continue;
+      scoredNotes.push({ note, matchedTerms, phraseMatch: hay.includes(phrase) ? 1 : 0, wordMatches });
+    }
+    scoredNotes.sort(
+      (a, b) =>
+        b.matchedTerms - a.matchedTerms ||
+        b.phraseMatch - a.phraseMatch ||
+        b.wordMatches - a.wordMatches ||
+        (Number(b.note.createdAt) || 0) - (Number(a.note.createdAt) || 0)
+    );
+    const cap = Math.min(
+      LOCAL_PROJECT_LIMITS.notesPerProject,
+      Math.max(1, Number.isInteger(limit) ? limit : LOCAL_PROJECT_LIMITS.toolSearchDefaultLimit)
+    );
+    const kept = [];
+    let usedChars = 0;
+    for (const entry of scoredNotes) {
+      if (kept.length >= cap) break;
+      const len = str(entry.note.content).length;
+      if (usedChars + len > charCap && kept.length > 0) break;
+      usedChars += len;
+      kept.push(entry.note);
+    }
+    const truncated = kept.length < scoredNotes.length;
+    const matchedFiles = sortedFiles
+      .map((file) => {
+        const hay = str(file.name).normalize('NFKC').toLowerCase();
+        let hits = 0;
+        for (const term of terms) {
+          if (hay.includes(term)) hits += 1;
+        }
+        return { file, hits };
+      })
+      .filter((entry) => entry.hits > 0)
+      .sort((a, b) => b.hits - a.hits || str(a.file.name).localeCompare(str(b.file.name)))
+      .map((entry) => entry.file);
+
+    const hint =
+      scoredNotes.length === 0 && sortedNotes.length > 0
+        ? `No notes matched "${trimmedQuery}" (${sortedNotes.length} note${sortedNotes.length === 1 ? '' : 's'} in this project). Try broader keywords or call project_notes without query to browse.`
+        : truncated
+          ? `Showing top ${kept.length} of ${scoredNotes.length} matching notes (${sortedNotes.length} total). Narrow your query or raise \`limit\` to see more.`
+          : undefined;
+    return {
+      notes: kept.map(formatNote),
+      files: matchedFiles.map(formatFile),
+      totalNotes: sortedNotes.length,
+      totalFiles: sortedFiles.length,
+      query: trimmedQuery,
+      matchedNotes: scoredNotes.length,
+      ...(truncated ? { truncated: true } : {}),
+      ...(hint ? { hint } : {}),
+    };
+  }
+
+  const cap = Math.min(
+    LOCAL_PROJECT_LIMITS.notesPerProject,
+    Math.max(1, Number.isInteger(limit) ? limit : LOCAL_PROJECT_LIMITS.toolDefaultLimit)
+  );
+  const kept = [];
+  let usedChars = 0;
+  for (const note of sortedNotes) {
+    if (kept.length >= cap) break;
+    const len = str(note.content).length;
+    if (usedChars + len > charCap && kept.length > 0) break;
+    usedChars += len;
+    kept.push(note);
+  }
+  const truncated = kept.length < sortedNotes.length;
+  return {
+    notes: kept.map(formatNote),
+    files: sortedFiles.map(formatFile),
+    totalNotes: sortedNotes.length,
+    totalFiles: sortedFiles.length,
+    ...(truncated
+      ? {
+          truncated: true,
+          hint: `Showing ${kept.length} newest of ${sortedNotes.length} notes. Pass \`query\` to search specific topics or a higher \`limit\`.`,
+        }
+      : {}),
+  };
+};
+
+/**
+ * Find existing project notes closely related to a newly saved note (by shared
+ * non-stopword keywords), so `remember_project` can warn the bot about likely
+ * duplicates or superseded notes. Mirrors chat/convex/botPolicy.ts. Pure.
+ */
+export const findSimilarProjectNotes = (existing, content, limit = 3) => {
+  const terms = projectSearchTerms(content, { dropStopwords: true, minLength: 3 });
+  if (!terms.length) return [];
+  const scored = [];
+  for (const note of Array.isArray(existing) ? existing : []) {
+    const noteTerms = new Set(projectSearchTerms(note?.content, { dropStopwords: true, minLength: 3 }));
+    if (!noteTerms.size) continue;
+    let shared = 0;
+    for (const term of terms) {
+      if (noteTerms.has(term)) shared += 1;
+    }
+    if (shared === 0) continue;
+    const denom = Math.min(terms.length, noteTerms.size);
+    const overlap = shared / denom;
+    const strong = shared >= 2 && overlap >= 0.35;
+    const shortExact = terms.length <= 2 && shared >= 1 && terms.some((t) => t.length >= 5 && noteTerms.has(t));
+    if (!strong && !shortExact) continue;
+    scored.push({ id: note.id, note: note.content, shared, overlap });
+  }
+  scored.sort((a, b) => b.overlap - a.overlap || b.shared - a.shared);
+  return scored.slice(0, limit).map(({ id, note }) => ({ id, note }));
+};
+
+const MAX_INLINE_FILE_NAMES = 10;
+
+/** Short hint of how many project notes and files exist, for turn context (`steady: true`). Pure. */
+export const projectLibraryHint = ({ name, noteCount = 0, fileCount = 0, files = [] }) => {
+  const notes = Math.max(0, noteCount);
+  const fileNames = Array.isArray(files) ? files : [];
+  const totalFiles = Math.max(fileNames.length, fileCount);
+  if (notes === 0 && totalFiles === 0) {
+    return `Project library (${name}): no notes or files yet.`;
+  }
+  const parts = [];
+  if (notes > 0) parts.push(`${notes} note${notes === 1 ? '' : 's'}`);
+  if (totalFiles > 0) {
+    const names = fileNames.length > 0 && fileNames.length <= MAX_INLINE_FILE_NAMES ? ` (${fileNames.join(', ')})` : '';
+    parts.push(`${totalFiles} file${totalFiles === 1 ? '' : 's'}${names}`);
+  }
+  const actions = [
+    notes > 0 ? 'call project_notes (with optional `query`) to search or list notes' : null,
+    totalFiles > 0
+      ? fileNames.length > 0 && fileNames.length <= MAX_INLINE_FILE_NAMES
+        ? 'read_project_file to read files'
+        : 'call project_notes to list files'
+      : null,
+  ]
+    .filter(Boolean)
+    .join('; ');
+  return `Project library (${name}): ${parts.join(', ')} — ${actions}.`;
 };
 
 const CONTENT_TYPES = { md: 'text/markdown', markdown: 'text/markdown', txt: 'text/plain', json: 'application/json', csv: 'text/csv', html: 'text/html', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', pdf: 'application/pdf', svg: 'image/svg+xml' };
@@ -1281,6 +1508,17 @@ export const createLocalBotEngine = ({
           });
         }
       }
+      const record = projectStore?.[bot.project.key] ?? { notes: [], files: [] };
+      const fileNames = (record.files ?? []).map((file) => file.name).sort((a, b) => a.localeCompare(b));
+      lines.push({
+        steady: true,
+        text: projectLibraryHint({
+          name: bot.project.name,
+          noteCount: (record.notes ?? []).length,
+          fileCount: fileNames.length,
+          files: fileNames,
+        }),
+      });
     }
     if (counts.person === 0) {
       lines.push({ text: "The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention." });
@@ -1846,34 +2084,16 @@ export const createLocalBotEngine = ({
     return { key: projectKeyOf(project), name: project.name };
   };
 
-  const notesBlock = (notes) => {
-    const lines = [];
-    let used = 0;
-    for (let index = notes.length - 1; index >= 0; index -= 1) {
-      const line = `- ${oneLine(notes[index].content)}`;
-      if (used + line.length > LOCAL_PROJECT_LIMITS.promptNotesChars && lines.length) break;
-      used += line.length;
-      lines.unshift(line);
-    }
-    return lines.join('\n');
-  };
-
-  // Read synchronously by the prompt builders (the store is loaded before replies start).
-  const projectSection = (project) => {
-    const record = projectStore?.[project.key] ?? { notes: [], files: [] };
-    const notes = notesBlock(record.notes ?? []);
-    const files = (record.files ?? []).map((file) => file.name);
-    return [
+  // Steady instructions for a project bot: notes and files are fetched on demand (never pasted in),
+  // so adding or removing notes never busts the prompt cache or resets a kept Claude Code session.
+  const projectSection = (project) =>
+    [
       `## Your project: ${project.name}`,
-      `You are a bot for this project: its Durango Code project on this computer. Work in it by starting Durango Code threads there (delegate_task with \`project: "${project.name}"\`), several at once when the work splits; see where it stands with list_threads and read_thread, steer threads with message_thread, and report what matters. Keep what should be remembered about the project in its notes (remember_project) and its documents in its files (save_project_file): every bot sees them, and threads there read them with their project_notes tool. You aren't limited to this project.`,
-      notes ? `Project notes (oldest first):\n${notes}` : 'No project notes yet.',
-      files.length ? `Project files (read_project_file): ${files.join(', ')}` : null,
-    ]
-      .filter(Boolean)
-      .join('\n\n');
-  };
+      `You are a bot for this project: its Durango Code project on this computer. Work in it by starting Durango Code threads there (delegate_task with \`project: "${project.name}"\`), several at once when the work splits; see where it stands with list_threads and read_thread, steer threads with message_thread, and report what matters. You aren't limited to this project.`,
+      `Project notes and files aren't pasted into your prompt: fetch them on demand with \`project_notes\` (pass \`query\` to search relevant notes, or omit \`query\` to list them) and read files with \`read_project_file\`. Check \`project_notes\` before starting or briefing project work (for conventions, decisions, and constraints), when a question may depend on project history or rules, and before \`remember_project\` so you don't save duplicates (remove outdated notes with \`forget_project_note\`). Keep durable facts in notes (\`remember_project\`) and documents in files (\`save_project_file\`): other bots and threads in this project pull them on demand with \`project_notes\`.`,
+    ].join('\n\n');
 
-  const addNote = async (project, content, author) => {
+  const addNote = async (project, content, author, { includeSimilar = false } = {}) => {
     await loadProjects();
     const text = str(content).trim();
     if (!text) throw new Error('Write the note first.');
@@ -1881,11 +2101,19 @@ export const createLocalBotEngine = ({
     const record = projectOf(project.key, project.name);
     if (record.notes.some((note) => note.content.trim().toLowerCase() === text.toLowerCase())) return { ok: true, duplicate: true };
     if (record.notes.length >= LOCAL_PROJECT_LIMITS.notesPerProject) throw new Error('This project has too many notes: forget some first.');
+    const similarNotes = includeSimilar ? findSimilarProjectNotes(record.notes, text) : [];
     const note = { id: newId('ln'), content: text, author: clip(oneLine(author) || 'you', 60), createdAt: now() };
     record.notes.push(note);
     persistProjects();
     changed();
-    return { ok: true, noteId: note.id };
+    return similarNotes.length > 0
+      ? {
+          ok: true,
+          noteId: note.id,
+          similarNotes,
+          hint: 'Related notes already exist; if this duplicates or supersedes one, remove the redundant note with forget_project_note.',
+        }
+      : { ok: true, noteId: note.id };
   };
 
   const deleteNote = async (noteId) => {
@@ -2234,17 +2462,17 @@ export const createLocalBotEngine = ({
         }
         case 'project_notes': {
           await loadProjects();
-          const project = (await resolveHomeProject(self, input.project));
+          const project = await resolveHomeProject(self, input.project);
           const record = projectStore[project.key] ?? { notes: [], files: [] };
+          const filtered = searchProjectNotes(record.notes ?? [], record.files ?? [], { query: input.query, limit: input.limit });
           return {
             ok: true,
             project: project.name,
-            notes: (record.notes ?? []).map((note) => ({ id: note.id, note: note.content, by: note.author })),
-            files: (record.files ?? []).map((file) => ({ name: file.name, size: file.size, type: file.contentType })),
+            ...filtered,
           };
         }
         case 'remember_project':
-          return await addNote((await resolveHomeProject(self, input.project)), input.note, self.bot.name);
+          return await addNote(await resolveHomeProject(self, input.project), input.note, self.bot.name, { includeSimilar: true });
         case 'forget_project_note':
           return await deleteNote(str(input.note_id));
         case 'read_project_file': {

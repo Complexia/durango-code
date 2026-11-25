@@ -16,8 +16,9 @@ import { MEMORY_SECTION_HEADING, MEMORY_SECTION_INTRO } from './bot-memory.js';
 // elsewhere meanwhile, the new ones) and this turn's context. The session
 // starts over, seeded with the summary (in the system prompt) and the recent
 // messages, when:
-// - its basis changes: the bot's appended system prompt (a job or project
-//   note change), its model or its tools. A new summary after compaction is
+// - its basis changes: the bot's appended system prompt (e.g. a job change;
+//   project notes are fetched on demand via project_notes, not pasted in),
+//   its model or its tools. A new summary after compaction is
 //   not one: the kept session saw those messages itself, so it goes on with
 //   the system prompt it started with (its cache stays valid) and the next
 //   fresh session gets the new summary;

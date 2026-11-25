@@ -3082,7 +3082,7 @@ const LibraryPanel: React.FC<{
   </section>
 );
 
-/** The strip above the panels: where the project lives, and who reads its library. */
+/** The strip above the panels: where the project lives, and who checks its library on demand. */
 const LibraryAbout: React.FC<{ path: string | null; bots: DesktopBot[]; onOpenBot: (botId: string) => void }> = ({ path, bots, onOpenBot }) => {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
@@ -3129,11 +3129,11 @@ const LibraryAbout: React.FC<{ path: string | null; bots: DesktopBot[]; onOpenBo
           <span className="truncate">
             {bots.length === 1 ? (
               <>
-                Read by <span className="font-medium text-neutral-200">{primaryProjectBot.name}</span> and the threads it starts
+                Checked on demand by <span className="font-medium text-neutral-200">{primaryProjectBot.name}</span> and project threads
               </>
             ) : (
               <>
-                Read by <span className="font-medium text-neutral-200">{bots.length} bots</span> and the threads they start
+                Checked on demand by <span className="font-medium text-neutral-200">{bots.length} bots</span> and project threads
               </>
             )}
           </span>
@@ -3142,7 +3142,7 @@ const LibraryAbout: React.FC<{ path: string | null; bots: DesktopBot[]; onOpenBo
       ) : (
         <span className="flex min-w-0 items-center gap-2 px-2.5 py-1 text-[12px] text-neutral-500">
           <Bot size={14} className="shrink-0" />
-          <span className="truncate">No bots yet. Project bots keep this library in mind.</span>
+          <span className="truncate">No bots yet. Project threads can check this library on demand.</span>
         </span>
       )}
     </div>
@@ -3290,7 +3290,7 @@ const NoteComposer: React.FC<{ full: boolean; onAdd: (content: string) => Promis
   );
 };
 
-/** Context: the notes every bot on the project keeps in mind. Deleting waits a moment, so it can be undone. */
+/** Context: project notes that bots and threads check on demand. Deleting waits a moment, so it can be undone. */
 const ContextPanel: React.FC<{
   notes: BotProjectNote[] | null;
   bots: DesktopBot[];
@@ -3356,7 +3356,7 @@ const ContextPanel: React.FC<{
       icon={<NotebookPen size={14} />}
       title="Context"
       count={count}
-      description="Facts, rules and decisions the bots keep in mind."
+      description="Facts, rules and decisions bots and threads pull when relevant."
       actions={
         filterable ? (
           <label className="flex h-7 w-40 items-center gap-1.5 rounded-md bg-white/[0.03] px-2 text-neutral-500 ring-1 ring-white/[0.07] focus-within:ring-white/[0.16]">
@@ -3390,7 +3390,7 @@ const ContextPanel: React.FC<{
         <div className="mt-2.5 rounded-lg border border-dashed border-white/[0.08] px-4 py-4">
           <div className="text-[12.5px] text-neutral-300">No context yet</div>
           <p className="mt-0.5 text-[12px] leading-relaxed text-neutral-500">
-            Short facts every bot on this project should know: goals, conventions, people to ask, things to avoid. For example:
+            Short facts bots and threads on this project can pull when relevant: goals, conventions, people to ask, things to avoid. For example:
           </p>
           <div className="mt-2.5 flex flex-wrap gap-1.5">
             {NOTE_EXAMPLES.map((example) => (

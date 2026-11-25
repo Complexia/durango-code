@@ -888,7 +888,7 @@ test('local bots: a notice is acknowledged only once it is saved; a retry saves 
   await reloaded.engine.stop();
 });
 
-test('project bots: one per project, notes and files in their instructions and in threads they start', async () => {
+test('project bots: notes are fetched on demand (not pasted in), searchable, and duplicate-aware', async () => {
   const started = [];
   const { engine, runner } = makeEngine({
     listProjects: async () => [{ id: 'proj_1', name: 'Site', path: '/Users/me/site' }],
@@ -915,15 +915,50 @@ test('project bots: one per project, notes and files in their instructions and i
   await waitFor(() => runner.lanes.length === 1);
   const lane = runner.lanes[0];
   assert.match(lane.lane.systemPrompt, /## Your project: Site/);
-  assert.match(lane.lane.systemPrompt, /Project notes \(oldest first\):\n- Deploys go through durango-code land\./);
-  assert.match(lane.lane.systemPrompt, /Project files \(read_project_file\): plan\.md/);
+  assert.match(lane.lane.systemPrompt, /project_notes/);
+  assert.match(lane.lane.systemPrompt, /remember_project/);
+  assert.doesNotMatch(lane.lane.systemPrompt, /Deploys go through durango-code land/, 'note contents are never pasted into system prompt');
+  const libraryContext = lane.lane.session.context.find((part) => part.text.startsWith('Project library (Site):'));
+  assert.ok(libraryContext, 'turn context carries library count hint');
+  assert.equal(libraryContext.steady, true, 'library hint is steady so kept sessions only update on change');
+  assert.match(libraryContext.text, /1 note, 1 file \(plan\.md\)/);
+  assert.doesNotMatch(libraryContext.text, /Deploys go through durango-code land/, 'turn context does not paste note text');
+
   const call = (name, input) => lane.ctx.callTool({ name, input, toolCallId: 't' }).then((out) => out.result);
   assert.equal((await call('read_project_file', { name: 'PLAN.md' })).content, '# Plan\nShip it.');
   assert.equal((await call('remember_project', { note: 'The site runs on Next.js.' })).ok, true);
   assert.equal((await call('save_project_file', { name: 'notes.txt', content: 'hello' })).ok, true);
+
+  // Listing all notes (newest first) and searching by query.
   const listed = await call('project_notes', {});
-  assert.deepEqual(listed.notes.map((note) => note.by), ['you', 'Site']);
-  assert.deepEqual(listed.files.map((file) => file.name), ['plan.md', 'notes.txt']);
+  assert.equal(listed.totalNotes, 2);
+  assert.equal(listed.totalFiles, 2);
+  assert.deepEqual(listed.notes.map((note) => note.by), ['Site', 'you']);
+  assert.deepEqual(listed.files.map((file) => file.name), ['notes.txt', 'plan.md']);
+
+  const searched = await call('project_notes', { query: 'Next.js' });
+  assert.equal(searched.matchedNotes, 1);
+  assert.equal(searched.totalNotes, 2);
+  assert.deepEqual(searched.notes.map((note) => note.note), ['The site runs on Next.js.']);
+  assert.deepEqual(searched.files, [], 'unrelated files are filtered out when searching');
+
+  const missed = await call('project_notes', { query: 'billing stripe' });
+  assert.deepEqual(missed.notes, []);
+  assert.equal(missed.matchedNotes, 0);
+  assert.equal(missed.totalNotes, 2);
+  assert.match(missed.hint, /2 notes in this project/);
+
+  const limited = await call('project_notes', { limit: 1 });
+  assert.equal(limited.notes.length, 1);
+  assert.equal(limited.truncated, true);
+
+  // Overlapping remember_project surfaces similarNotes so the bot can clean up duplicates.
+  const overlap = await call('remember_project', { note: 'All deploys go through durango-code land.' });
+  assert.equal(overlap.ok, true);
+  assert.ok(overlap.similarNotes?.some((item) => item.note === 'Deploys go through durango-code land.'));
+  assert.match(overlap.hint, /forget_project_note/);
+  await call('forget_project_note', { note_id: overlap.noteId });
+
   assert.equal((await call('project_notes', { project: 'Other' })).project, 'Other', 'any project by name');
 
   const task = await call('delegate_task', { title: 'Upgrade Next', instructions: 'Upgrade Next.js.', project: 'Site' });
@@ -932,6 +967,16 @@ test('project bots: one per project, notes and files in their instructions and i
   assert.match(started[0].prompt, /^Upgrade Next\.js\.\n\nWhen you're done/);
   assert.doesNotMatch(started[0].prompt, /Project notes|Deploys go through/);
   lane.finish({ text: 'Upgrading.' });
+  await engine.idle();
+
+  // Adding notes does NOT change the bot's systemPrompt (preserving prompt cache and kept sessions),
+  // while the steady library hint in turn context reflects the new counts.
+  await engine.send(bot.id, { messageId: 'b', content: 'Any updates?' });
+  await waitFor(() => runner.lanes.length === 2);
+  assert.equal(runner.lanes[1].lane.systemPrompt, lane.lane.systemPrompt, 'systemPrompt stays byte-identical across note changes');
+  const nextLibraryContext = runner.lanes[1].lane.session.context.find((part) => part.text.startsWith('Project library (Site):'));
+  assert.match(nextLibraryContext.text, /2 notes, 2 files \(notes\.txt, plan\.md\)/);
+  runner.lanes[1].finish({ text: 'All good.' });
   await engine.idle();
 
   const exported = await engine.exportForSync();
