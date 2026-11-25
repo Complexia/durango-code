@@ -6062,6 +6062,23 @@ ipcMain.handle('bots:update', async (_event, input) => {
   }
 });
 
+ipcMain.handle('bots:setProjectPrimary', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId : '';
+  if (!botId) return { ok: false, error: 'Bot not found.' };
+  if (await localBotsMode()) {
+    try {
+      return { ok: true, bot: await localBots.setProjectPrimary(botId) };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const result = await durangoClient.setBotProjectPrimary(botId);
+    return { ok: true, ...(result.bot ? { bot: result.bot } : {}) };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
 ipcMain.handle('bots:delete', async (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId : '';
   if (!botId) return { ok: false, error: 'Bot not found.' };

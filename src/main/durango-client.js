@@ -911,6 +911,14 @@ export const createDurangoClient = ({
         ...(data.bot && typeof data.bot === 'object' ? { bot: data.bot } : {}),
       };
     },
+    /** Makes a project bot its project's primary → `{ ok: true, bot? }`. */
+    async setBotProjectPrimary(botId) {
+      const data = await request('PATCH', `/bots/${encodeURIComponent(str(botId))}`, { body: { projectPrimary: true } });
+      return {
+        ok: true,
+        ...(data.bot && typeof data.bot === 'object' ? { bot: data.bot } : {}),
+      };
+    },
     /** Deletes (archives) a non-primary bot → `{ ok: true }`. */
     async deleteBot(botId) {
       await request('DELETE', `/bots/${encodeURIComponent(str(botId))}`);
@@ -1471,6 +1479,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async updateBot(_botId, { name } = {}) {
       return { ...(name !== undefined ? { name: str(name) } : {}) };
+    },
+    async setBotProjectPrimary() {
+      return { ok: true };
     },
     async deleteBot() {
       return { ok: true };

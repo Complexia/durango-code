@@ -129,7 +129,7 @@ Schedules (manage_routine): when the person wants something done regularly or at
 
 Other bots:
 - The person can have many bots, each with its own job (e.g. a job hunter, a news digest). When they want a standing helper for an ongoing job, create one with create_bot: a clear name, a precise job, and usually a routine. Tell them it exists and what it will do.
-- Talk to another bot with message_bot (asynchronous: its answer comes back to your inbox later) and check on it with read_bot. Don't micromanage: bots run on their own.
+- Talk to another bot with message_bot (asynchronous: its answer comes back to your inbox later) and check on it with read_bot. When another bot messages you ("${INBOX_LABEL.bot}…") and expects an answer, reply to it with message_bot (its id is in your roster) — your normal reply stays in your own thread. Don't micromanage: bots run on their own.
 
 ${BOT_BRIEF_RULE}
 
@@ -606,6 +606,7 @@ const normalizeBot = (raw, now) => {
     inFlight: [],
     requeue: [...new Set([...seqList(raw?.requeue), ...seqList(raw?.inFlight)])].sort((a, b) => a - b),
     project: normalizeProject(raw?.project),
+    ...(raw?.projectPrimary === true ? { projectPrimary: true } : {}),
   };
 };
 
@@ -1015,7 +1016,7 @@ export const createLocalBotEngine = ({
 
   // --- bots ---------------------------------------------------------------------------
 
-  const createBotEntry = ({ name, job = '', emoji = null, role = 'bot', model = null, project = null }) => {
+  const createBotEntry = ({ name, job = '', emoji = null, role = 'bot', model = null, project = null, projectPrimary = false }) => {
     const at = now();
     const bot = normalizeBot(
       {
@@ -1025,6 +1026,7 @@ export const createLocalBotEngine = ({
         emoji,
         role,
         project,
+        ...(project && projectPrimary ? { projectPrimary: true } : {}),
         model: claudeModelFrom(model) ?? (role === 'primary' ? LOCAL_PRIMARY_BOT_MODEL : LOCAL_BOT_DEFAULT_MODEL),
         createdAt: at,
         lastActivityAt: at,
@@ -1051,6 +1053,34 @@ export const createLocalBotEngine = ({
     return entry;
   };
 
+  /** Resolves a bot by id, or by exact case-insensitive name when unique. */
+  const resolveBotRef = (ref) => {
+    const key = str(ref).trim();
+    if (!key) throw new LocalBotError('not_found', 'No such bot on this device.');
+    const direct = entries.get(key);
+    if (direct) return direct;
+    const lower = key.toLowerCase();
+    const matches = [...entries.values()].filter((candidate) => candidate.bot.name.trim().toLowerCase() === lower);
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw new LocalBotError('invalid', `Multiple bots are named "${key}". Pass the bot's id instead (${matches.map((m) => `${m.bot.name}: ${m.bot.id}`).join(', ')}).`);
+    }
+    throw new LocalBotError('not_found', 'No such bot on this device.');
+  };
+
+  /** Effective primary bot id for a project key: explicit `projectPrimary: true`, else oldest bot (`createdAt` ascending). */
+  const projectPrimaryIdFor = (projectKey) => {
+    if (!projectKey) return null;
+    const siblings = [...entries.values()].filter((candidate) => candidate.bot.project?.key === projectKey);
+    if (!siblings.length) return null;
+    const byAge = (a, b) => a.bot.createdAt - b.bot.createdAt || a.bot.id.localeCompare(b.bot.id);
+    const explicit = siblings.filter((candidate) => candidate.bot.projectPrimary === true).sort(byAge);
+    if (explicit.length) return explicit[0].bot.id;
+    return [...siblings].sort(byAge)[0].bot.id;
+  };
+
+  const isProjectPrimary = (entry) => Boolean(entry.bot.project?.key && projectPrimaryIdFor(entry.bot.project.key) === entry.bot.id);
+
   const lastPreview = (content) => clip(oneLine(content), 160) || null;
 
   const toDesktopBot = (entry) => {
@@ -1064,12 +1094,14 @@ export const createLocalBotEngine = ({
       name: bot.name,
       emoji: bot.emoji === LEGACY_PROJECT_BOT_EMOJI ? null : bot.emoji,
       role: bot.role,
+      projectPrimary: isProjectPrimary(entry),
       job: bot.job,
       model: bot.model,
       reasoningEffort: bot.reasoningEffort ?? null,
       status: replies.length ? 'running' : waking ? 'waking' : 'idle',
       paused: bot.paused,
       replies,
+      createdAt: bot.createdAt,
       lastActivityAt: bot.lastActivityAt,
       lastPreview: bot.lastPreview,
       unread: bot.unread,
@@ -1233,8 +1265,30 @@ export const createLocalBotEngine = ({
     lines.push({
       text: `You're running on this computer (${platform}) through the person's Claude Code. Now: ${formatAt(at)}${zone ? ` (${zone})` : ''}.`,
     });
+    if (bot.project?.key) {
+      const primaryId = projectPrimaryIdFor(bot.project.key);
+      if (primaryId === bot.id) {
+        lines.push({
+          steady: true,
+          text: `Your role in the ${bot.project.name} project: you are this project's primary bot (you oversee the project's other bots).`,
+        });
+      } else if (primaryId) {
+        const primaryEntry = entries.get(primaryId);
+        if (primaryEntry) {
+          lines.push({
+            steady: true,
+            text: `Your project's primary bot: ${primaryEntry.bot.name} (${primaryEntry.bot.id}) oversees the ${bot.project.name} project's bots.`,
+          });
+        }
+      }
+    }
     if (counts.person === 0) {
       lines.push({ text: "The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention." });
+    }
+    if (counts.bot > 0) {
+      lines.push({
+        text: `Messages labelled "${INBOX_LABEL.bot}…" came from another bot: to reply back to that bot, call message_bot with its id from your roster (your normal reply only posts to your own thread).`,
+      });
     }
     if (runtime.tasks.size || runtime.threads.size) {
       lines.push({
@@ -1269,15 +1323,25 @@ export const createLocalBotEngine = ({
           .join('; ')}.`,
       });
     }
+    const rosterPriority = (other) => {
+      if (bot.project?.key && other.bot.project?.key === bot.project.key) return isProjectPrimary(other) ? 0 : 1;
+      if (other.bot.role === 'primary') return 2;
+      return 3;
+    };
     const roster = sortedEntries()
       .filter((other) => other !== entry)
+      .sort((a, b) => rosterPriority(a) - rosterPriority(b) || b.bot.lastActivityAt - a.bot.lastActivityAt)
       .map((other) => {
         const desktop = toDesktopBot(other);
         const state = [other.bot.role === 'primary' ? 'primary' : null, other.bot.paused ? 'paused' : desktop.status, other.bot.needsYou ? 'waiting on the person' : null]
           .filter(Boolean)
           .join(', ');
         const last = other.bot.lastPreview ? ` Last: "${clip(other.bot.lastPreview, 90)}" (${ago(other.bot.lastActivityAt, at)}).` : '';
-        const home = other.bot.project ? ` Bot of the ${other.bot.project.name} project.` : '';
+        const home = other.bot.project
+          ? desktop.projectPrimary
+            ? ` Primary bot of the ${other.bot.project.name} project.`
+            : ` Bot of the ${other.bot.project.name} project.`
+          : '';
         return `- ${other.bot.name} (${other.bot.id}; ${state}).${home} Job: ${other.bot.job || 'general'}.${last}`;
       });
     if (roster.length) {
@@ -1911,9 +1975,8 @@ export const createLocalBotEngine = ({
     const key = localProjectKey({ repoId, machineId: machineId || 'this-device', projectId });
     if (!key) throw new LocalBotError('invalid', 'A project needs its id.');
     const projectName = clip(oneLine(name), 120) || 'Project';
-    const existingNames = projectBotEntries()
-      .filter((entry) => entry.bot.project.key === key)
-      .map((entry) => entry.bot.name);
+    const existingInProject = projectBotEntries().filter((entry) => entry.bot.project.key === key);
+    const existingNames = existingInProject.map((entry) => entry.bot.name);
     const cleanName = oneLine(botName) ? clip(oneLine(botName), 40) : nextLocalProjectBotName(projectName, existingNames);
     const cleanJob = str(job).trim() || localProjectBotJob(projectName);
     const entry = createBotEntry({
@@ -1922,6 +1985,7 @@ export const createLocalBotEngine = ({
       emoji: clip(oneLine(emoji), 8) || null,
       model: model ?? null,
       project: { key, name: projectName, projectId: projectId || null, repoId: repoId || null },
+      projectPrimary: existingInProject.length === 0,
     });
     if (model && claudeModelFrom(model)) {
       entry.bot.modelChosen = true;
@@ -1937,7 +2001,8 @@ export const createLocalBotEngine = ({
     if (!key) throw new LocalBotError('invalid', 'A project needs its id.');
     const projectName = clip(oneLine(name), 120) || 'Project';
     const existingList = projectBotEntries().filter((entry) => entry.bot.project.key === key);
-    const existing = existingList[0];
+    const primaryId = projectPrimaryIdFor(key);
+    const existing = existingList.find((entry) => entry.bot.id === primaryId) ?? existingList[0];
     if (existing) {
       for (const entry of existingList) {
         let dirty = false;
@@ -2107,22 +2172,34 @@ export const createLocalBotEngine = ({
           return { ok: true, bot: { id: bot.id, name: bot.name, model: bot.model, reasoningEffort: bot.reasoningEffort ?? null, paused: bot.paused } };
         }
         case 'message_bot': {
-          const target = entryFor(input.bot_id);
+          const target = resolveBotRef(input.bot_id);
           if (target === self) throw new Error("That's you: message another bot.");
           const message = str(input.message).trim();
           if (!message) throw new Error('message_bot needs a message.');
           appendInbox(target, { content: message, authorLabel: inboxLabel('bot', self.bot.name) });
-          return { ok: true, to: target.bot.name };
+          return {
+            ok: true,
+            to: target.bot.name,
+            ...(target.bot.paused ? { paused: true, note: `${target.bot.name} is paused, so it won't reply until resumed.` } : {}),
+          };
         }
         case 'search_history':
           return searchMessages(self.messages, { query: input.query, from: input.from, to: input.to, limit: input.limit, botName: self.bot.name });
         case 'read_bot': {
-          const target = entryFor(input.bot_id);
+          const target = resolveBotRef(input.bot_id);
           const limit = Math.min(40, Math.max(1, Number.isInteger(input.limit) ? input.limit : 10));
           const desktop = toDesktopBot(target);
           return {
             ok: true,
-            bot: { id: target.bot.id, name: target.bot.name, job: target.bot.job, status: desktop.status, paused: target.bot.paused, needsYou: target.bot.needsYou },
+            bot: {
+              id: target.bot.id,
+              name: target.bot.name,
+              job: target.bot.job,
+              status: desktop.status,
+              paused: target.bot.paused,
+              needsYou: target.bot.needsYou,
+              projectPrimary: desktop.projectPrimary,
+            },
             messages: peek(target, limit),
           };
         }
@@ -2365,6 +2442,7 @@ export const createLocalBotEngine = ({
           schedule: routine.schedule.kind === 'daily' && zone ? { ...routine.schedule, timeZone: zone } : routine.schedule,
         })),
         ...(bot.project ? exportProject(bot.project) : {}),
+        ...(bot.project && isProjectPrimary(entries.get(bot.id)) ? { projectPrimary: true } : {}),
       })),
       projects: exportProjects(),
     };
@@ -2456,12 +2534,35 @@ export const createLocalBotEngine = ({
       changed();
       return toDesktopBot(entry);
     },
+    /** Makes a local project bot its project's primary (clears any other in the project). → the bot. */
+    async setProjectPrimary(botId) {
+      await ensureLoaded();
+      const entry = entryFor(botId);
+      const projectKey = entry.bot.project?.key;
+      if (!projectKey) throw new LocalBotError('invalid', 'Only project bots can be made a project’s primary.');
+      const siblings = [...entries.values()].filter((candidate) => candidate.bot.project?.key === projectKey);
+      const previous = siblings.map((candidate) => [candidate, candidate.bot.projectPrimary]);
+      for (const candidate of siblings) {
+        if (candidate === entry) candidate.bot.projectPrimary = true;
+        else delete candidate.bot.projectPrimary;
+      }
+      if (!(await persistIndex())) {
+        for (const [candidate, prev] of previous) {
+          if (prev) candidate.bot.projectPrimary = true;
+          else delete candidate.bot.projectPrimary;
+        }
+        throw new Error('Couldn’t update the primary bot on this computer. Try again.');
+      }
+      changed();
+      return toDesktopBot(entry);
+    },
     /** Deletes a non-primary local bot and removes its transcript from disk. */
     async deleteBot(botId) {
       await ensureLoaded();
       const entry = entryFor(botId);
       if (entry.bot.role === 'primary') throw new LocalBotError('forbidden', 'Your primary bot can’t be deleted.');
       const id = entry.bot.id;
+      const projectKey = entry.bot.project?.key ?? null;
       const runtime = runtimes.get(id);
       if (runtime) {
         for (const reply of runtime.replies.values()) {
@@ -2472,8 +2573,23 @@ export const createLocalBotEngine = ({
         runtimes.delete(id);
       }
       entries.delete(id);
+      // If a project's primary was deleted (or no remaining sibling is marked primary),
+      // promote the next-oldest remaining bot in that project.
+      let promoted = null;
+      if (projectKey) {
+        const remaining = [...entries.values()].filter((candidate) => candidate.bot.project?.key === projectKey);
+        if (remaining.length > 0 && !remaining.some((candidate) => candidate.bot.projectPrimary === true)) {
+          const nextPrimaryId = projectPrimaryIdFor(projectKey);
+          const nextPrimary = nextPrimaryId ? entries.get(nextPrimaryId) : null;
+          if (nextPrimary) {
+            nextPrimary.bot.projectPrimary = true;
+            promoted = nextPrimary;
+          }
+        }
+      }
       if (!(await persistIndex())) {
         entries.set(id, entry);
+        if (promoted) delete promoted.bot.projectPrimary;
         throw new Error('Couldn’t delete the bot on this computer. Try again.');
       }
       // Wait for any in-flight transcript write to settle before removing files.
@@ -2754,7 +2870,8 @@ export const createLocalBotEngine = ({
       await ensureLoaded();
       await loadProjects();
       const record = projectStore[key] ?? { notes: [], files: [] };
-      const bot = projectBotEntries().find((entry) => entry.bot.project.key === key) ?? null;
+      const primaryId = projectPrimaryIdFor(key);
+      const bot = (primaryId ? entries.get(primaryId) : null) ?? projectBotEntries().find((entry) => entry.bot.project.key === key) ?? null;
       const project = { key, name: bot?.bot.project.name ?? name };
       return {
         projectKey: key,

@@ -8,6 +8,8 @@ export type DesktopBot = {
   name: string;
   emoji: string | null;
   role: 'primary' | 'bot';
+  /** True when this bot is its project's primary (overseer of that project's other bots). */
+  projectPrimary?: boolean;
   job: string;
   model: string;
   /** Optional reasoning effort override ("none", "low", "medium", "high", "xhigh", "max"); null/absent = model default. */
@@ -22,6 +24,7 @@ export type DesktopBot = {
   lastPreview: string | null;
   unread: number;
   needsYou: boolean;
+  createdAt?: number;
   /** A project bot's project (Durango's key: the Source repo, or a machine's project). */
   project?: { key: string; name: string; repoId: string | null } | null;
 };
@@ -256,6 +259,7 @@ export type UpdateBotInput = {
   emoji?: string | null;
 };
 export type UpdateBotResult = { ok: boolean; name?: string; bot?: DesktopBot; error?: string; code?: string };
+export type SetBotProjectPrimaryResult = { ok: boolean; bot?: DesktopBot; error?: string; code?: string };
 export type DeleteBotResult = { ok: boolean; error?: string; code?: string };
 export type ClearBotResult = { ok: boolean; bot?: DesktopBot; error?: string; code?: string };
 
@@ -343,9 +347,13 @@ export const botReasoningEffortShortLabel = (effort: string | null | undefined):
   }
 };
 
-/** All bots of a project (by the project's key), most recently active first. */
+/** Sort comparator for bots within a project: project primary first, then most recently active. */
+export const compareProjectBots = (a: DesktopBot, b: DesktopBot): number =>
+  Number(Boolean(b.projectPrimary)) - Number(Boolean(a.projectPrimary)) || b.lastActivityAt - a.lastActivityAt;
+
+/** All bots of a project (by the project's key), primary first then most recently active. */
 export const projectBotsFor = (bots: DesktopBot[], key: string | undefined): DesktopBot[] =>
-  key ? bots.filter((bot) => bot.project?.key === key).sort((a, b) => b.lastActivityAt - a.lastActivityAt) : [];
+  key ? bots.filter((bot) => bot.project?.key === key).sort(compareProjectBots) : [];
 
 /** A project's primary/most-recent bot (by the project's key), if any exists yet. */
 export const projectBotFor = (bots: DesktopBot[], key: string | undefined) =>

@@ -2024,6 +2024,77 @@ test('clear wipes history and memory, rotates threadId, does not requeue aborted
   await reloaded.idle();
 });
 
+test('per-project primary bots: default first/oldest, switch primary, promote on delete, context, and cross-project message_bot/read_bot', async () => {
+  const dir = path.join(testRoot, `project-primary-${(dirCount += 1)}`);
+  const { engine, runner, clock } = makeEngine({ dir });
+  await engine.list();
+
+  clock.now += 1_000;
+  const first = await engine.createProjectBot({ name: 'durango', projectId: 'p1', repoId: 'repo_d', botName: 'durango-primary' });
+  clock.now += 1_000;
+  const second = await engine.createProjectBot({ name: 'durango', projectId: 'p1', repoId: 'repo_d', botName: 'durango-bots' });
+  clock.now += 1_000;
+  const third = await engine.createProjectBot({ name: 'durango', projectId: 'p1', repoId: 'repo_d', botName: 'durango-cloud' });
+  clock.now += 1_000;
+  const other = await engine.createProjectBot({ name: 'website', projectId: 'p2', repoId: 'repo_w', botName: 'site-lead' });
+
+  assert.equal(first.projectPrimary, true);
+  assert.equal(second.projectPrimary, false);
+  assert.equal(third.projectPrimary, false);
+  assert.equal(other.projectPrimary, true);
+
+  // Context tells both primary and non-primary project bots who oversees, and message_bot / read_bot work same-project & cross-project.
+  await engine.send(second.id, { messageId: 'p_m1', content: 'Check in' });
+  await waitFor(() => runner.lanes.length === 1);
+  const secondCtx = runner.lanes[0].lane.session.context.map((part) => part.text).join('\n');
+  assert.match(secondCtx, new RegExp(`Your project's primary bot: durango-primary \\(${first.id}\\) oversees the durango project's bots\\.`));
+  assert.match(secondCtx, /Primary bot of the durango project\./);
+  assert.match(secondCtx, /Primary bot of the website project\./);
+
+  // Same-project message_bot (by id) and cross-project message_bot (by name) + read_bot.
+  const sameMsg = await runner.lanes[0].ctx.callTool({ name: 'message_bot', input: { bot_id: first.id, message: 'Ready for review.' } });
+  assert.equal(sameMsg.result.ok, true);
+  const crossMsg = await runner.lanes[0].ctx.callTool({ name: 'message_bot', input: { bot_id: 'site-lead', message: 'Heads up from durango.' } });
+  assert.equal(crossMsg.result.ok, true);
+  const crossRead = await runner.lanes[0].ctx.callTool({ name: 'read_bot', input: { bot_id: 'site-lead', limit: 5 } });
+  assert.equal(crossRead.result.ok, true);
+  assert.equal(crossRead.result.bot.projectPrimary, true);
+  assert.equal(crossRead.result.messages.at(-1).content, 'Heads up from durango.');
+  runner.lanes[0].finish({ text: 'Done.' });
+
+  await waitFor(() => runner.lanes.length === 3);
+  const firstLane = runner.lanes.find((item) => item.lane.botId === first.id);
+  const firstCtx = firstLane.lane.session.context.map((part) => part.text).join('\n');
+  assert.match(firstCtx, /Your role in the durango project: you are this project's primary bot/);
+  assert.match(firstCtx, /Messages labelled "Bot: …" came from another bot: to reply back to that bot, call message_bot/);
+  for (const lane of runner.lanes.slice(1)) lane.finish({ text: 'Got it.' });
+  await engine.idle();
+
+  // Switch primary to third: only third is primary in durango; website untouched.
+  const promoted = await engine.setProjectPrimary(third.id);
+  assert.equal(promoted.projectPrimary, true);
+  let listed = (await engine.list()).bots;
+  const byId = (id) => listed.find((b) => b.id === id);
+  assert.equal(byId(first.id).projectPrimary, false);
+  assert.equal(byId(second.id).projectPrimary, false);
+  assert.equal(byId(third.id).projectPrimary, true);
+  assert.equal(byId(other.id).projectPrimary, true);
+
+  // Deleting third promotes next-oldest remaining bot (first).
+  await engine.deleteBot(third.id);
+  listed = (await engine.list()).bots;
+  assert.equal(byId(third.id), undefined);
+  assert.equal(byId(first.id).projectPrimary, true);
+  assert.equal(byId(second.id).projectPrimary, false);
+
+  // Deleting first promotes second.
+  await engine.deleteBot(first.id);
+  listed = (await engine.list()).bots;
+  assert.equal(byId(second.id).projectPrimary, true);
+
+  await engine.stop();
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 let failed = 0;

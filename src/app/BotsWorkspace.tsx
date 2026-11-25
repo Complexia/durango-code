@@ -13,6 +13,7 @@ import {
   Clock,
   Copy,
   CornerDownLeft,
+  Crown,
   Ellipsis,
   Eraser,
   ExternalLink,
@@ -78,6 +79,7 @@ import {
   botInboxSource,
   botIsWorking,
   botModelLabel,
+  compareProjectBots,
   LOCAL_BOT_PLACE,
   formatFileSize,
   newBotMessageId,
@@ -488,7 +490,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
 
     const groups = [...byProject.values()];
     for (const group of groups) {
-      group.bots.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      group.bots.sort(compareProjectBots);
     }
     groups.sort((a, b) => b.latestActivityAt - a.latestActivityAt || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
 
@@ -564,7 +566,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       entry.bots.push(bot);
     }
     const elsewhere = [...remoteByKey.values()].map((entry) => {
-      entry.bots.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      entry.bots.sort(compareProjectBots);
       entry.bot = entry.bots[0] ?? null;
       return entry;
     });
@@ -659,6 +661,35 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     [loadBots]
   );
 
+  const handleMakePrimaryBot = useCallback(
+    async (bot: DesktopBot) => {
+      const projectKey = bot.project?.key;
+      if (!projectKey || bot.projectPrimary) return;
+      setActionError(null);
+      const current = botsRef.current;
+      if (current) {
+        const next = current.map((item) => {
+          if (item.project?.key !== projectKey) return item;
+          const updated = { ...item, projectPrimary: item.id === bot.id };
+          const cached = botThreadCache.get(item.id);
+          if (cached) botThreadCache.set(item.id, { ...cached, bot: { ...cached.bot, projectPrimary: updated.projectPrimary } });
+          return updated;
+        });
+        if (botListCache) botListCache = { ...botListCache, bots: next };
+        noteBotList(next);
+        setBots(next);
+      }
+      const result = await window.orion?.setBotProjectPrimary?.({ botId: bot.id });
+      if (!result?.ok) {
+        setActionError(result?.error ?? 'Couldn’t make bot primary.');
+        void loadBots();
+        return;
+      }
+      void loadBots();
+    },
+    [loadBots]
+  );
+
   const handleClearBot = useCallback(
     async (bot: DesktopBot) => {
       const confirmed = await confirmDialog({
@@ -719,7 +750,20 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       useOrionStore.getState().setBotDraft(botDraftKey(bot.id), { text: '', files: [] });
       setBotModal((current) => (current?.mode === 'edit' && current.bot.id === bot.id ? null : current));
       const current = botsRef.current ?? [];
-      const next = current.filter((item) => item.id !== bot.id);
+      let next = current.filter((item) => item.id !== bot.id);
+      if (bot.project?.key && bot.projectPrimary) {
+        const siblings = next.filter((item) => item.project?.key === bot.project?.key);
+        if (siblings.length > 0 && !siblings.some((item) => item.projectPrimary)) {
+          const oldest = [...siblings].sort(
+            (a, b) => (a.createdAt ?? Number.MAX_SAFE_INTEGER) - (b.createdAt ?? Number.MAX_SAFE_INTEGER) || a.id.localeCompare(b.id)
+          )[0];
+          if (oldest) {
+            next = next.map((item) => (item.id === oldest.id ? { ...item, projectPrimary: true } : item));
+            const cached = botThreadCache.get(oldest.id);
+            if (cached) botThreadCache.set(oldest.id, { ...cached, bot: { ...cached.bot, projectPrimary: true } });
+          }
+        }
+      }
       const fallbackId = next.find((item) => item.role === 'primary')?.id ?? next[0]?.id ?? null;
       if (botListCache) botListCache = { ...botListCache, bots: next };
       noteBotList(next);
@@ -904,7 +948,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                             <BotRow
                               bot={bot}
                               projectPath={group.bots.length === 1 ? projectPathOfBot(bot) : null}
-                              title={bot.project ? `${bot.name}: ${bot.project.name} project` : bot.name}
+                              title={
+                                bot.project
+                                  ? bot.projectPrimary
+                                    ? `${bot.name}: primary bot for ${bot.project.name} project`
+                                    : `${bot.name}: ${bot.project.name} project`
+                                  : bot.name
+                              }
                               active={view === 'bot' && selectedBotId === bot.id}
                               onClick={() => openBot(bot.id)}
                               onEdit={() =>
@@ -915,6 +965,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                                   isSoleProjectBot: group.bots.length === 1,
                                 })
                               }
+                              onMakePrimary={!bot.projectPrimary ? () => void handleMakePrimaryBot(bot) : undefined}
                               onClear={() => void handleClearBot(bot)}
                               onDelete={() => void handleDeleteBot(bot)}
                             />
@@ -1927,9 +1978,13 @@ const ProjectBotBox: React.FC<{
           )}
           <div className="truncate text-[14px] text-neutral-400">
             {bot
-              ? bots.length > 1
-                ? `One of ${bots.length} bots in ${entry.name}`
-                : 'Project bot'
+              ? bot.projectPrimary
+                ? bots.length > 1
+                  ? `Primary bot · ${bots.length} bots in ${entry.name}`
+                  : 'Primary project bot'
+                : bots.length > 1
+                  ? `One of ${bots.length} bots in ${entry.name}`
+                  : 'Project bot'
               : 'No bots yet — create a custom bot or send a message below to start one'}
             {library && (library.notes || library.files) ? ` · knows ${library.notes} note${library.notes === 1 ? '' : 's'} and ${library.files} file${library.files === 1 ? '' : 's'}` : ''}
             {status && <> · {status}</>}
@@ -1967,6 +2022,11 @@ const ProjectBotBox: React.FC<{
                   <BotIcon bot={candidate} px={16} projectPath={bots.length === 1 ? entry.path : null} />
                 </span>
                 <span className="max-w-[160px] truncate">{candidate.name}</span>
+                {candidate.projectPrimary && (
+                  <span className="shrink-0 rounded-full bg-amber-400/12 px-1.5 text-[10px] font-medium leading-[15px] text-amber-300/90 ring-1 ring-amber-400/20">
+                    Primary
+                  </span>
+                )}
                 {candidate.unread > 0 ? (
                   <span className="rounded-full bg-sky-500 px-1 text-[10px] font-semibold leading-[15px] text-white">{candidate.unread}</span>
                 ) : candidateWorking ? (
@@ -2309,13 +2369,15 @@ const BotRow: React.FC<{
   active: boolean;
   onClick: () => void;
   onEdit: () => void;
+  onMakePrimary?: () => void;
   onClear: () => void;
   onDelete?: () => void;
-}> = ({ bot, projectPath, title, active, onClick, onEdit, onClear, onDelete }) => {
+}> = ({ bot, projectPath, title, active, onClick, onEdit, onMakePrimary, onClear, onDelete }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const working = botIsWorking(bot);
   const actions: BotMenuAction[] = [
     { key: 'edit', label: 'Edit', icon: <SquarePen size={13} />, run: onEdit },
+    ...(onMakePrimary ? [{ key: 'make-primary', label: 'Make primary', icon: <Crown size={13} />, run: onMakePrimary }] : []),
     { key: 'clear', label: 'Clear', icon: <Eraser size={13} />, run: onClear },
     ...(onDelete ? [{ key: 'delete', label: 'Delete', icon: <Trash2 size={13} />, danger: true, run: onDelete }] : []),
   ];
@@ -2344,6 +2406,11 @@ const BotRow: React.FC<{
       <span className={`min-w-0 flex-1 truncate text-[14.5px] ${bot.unread > 0 ? 'font-semibold text-neutral-100' : 'text-neutral-300'}`}>
         {bot.name}
       </span>
+      {bot.projectPrimary && (
+        <span className="shrink-0 rounded-full bg-amber-400/12 px-1.5 text-[10px] font-medium leading-[16px] text-amber-300/90 ring-1 ring-amber-400/20">
+          Primary
+        </span>
+      )}
       <span className={`shrink-0 items-center ${menuOpen ? 'hidden' : 'flex group-hover:hidden group-focus-within:hidden'}`}>
         {bot.unread > 0 ? (
           <span className="rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
@@ -2369,7 +2436,7 @@ const BotRow: React.FC<{
 const BotPane: React.FC<{
   botId: string;
   /** Latest profile fields from the sidebar list so edits show in the header at once. */
-  botHint?: Pick<DesktopBot, 'name' | 'emoji' | 'job'> | null;
+  botHint?: Pick<DesktopBot, 'name' | 'emoji' | 'job' | 'projectPrimary'> | null;
   /** Local project path for a project bot so its icon uses the project's icon when available. */
   projectPath?: string | null;
   /** The models the bot can be set to (null: no picker). */
@@ -2438,16 +2505,25 @@ const BotPane: React.FC<{
   const botHintName = botHint?.name;
   const botHintEmoji = botHint?.emoji;
   const botHintJob = botHint?.job;
+  const botHintProjectPrimary = botHint?.projectPrimary;
   useEffect(() => {
     if (!botHintName) return;
     setThread((current) => {
       if (!current) return current;
       const nextEmoji = botHintEmoji ?? null;
       const nextJob = botHintJob ?? current.bot.job;
-      if (current.bot.name === botHintName && current.bot.emoji === nextEmoji && current.bot.job === nextJob) return current;
-      return { ...current, bot: { ...current.bot, name: botHintName, emoji: nextEmoji, job: nextJob } };
+      const nextProjectPrimary = botHintProjectPrimary !== undefined ? botHintProjectPrimary : current.bot.projectPrimary;
+      if (
+        current.bot.name === botHintName &&
+        current.bot.emoji === nextEmoji &&
+        current.bot.job === nextJob &&
+        current.bot.projectPrimary === nextProjectPrimary
+      ) {
+        return current;
+      }
+      return { ...current, bot: { ...current.bot, name: botHintName, emoji: nextEmoji, job: nextJob, projectPrimary: nextProjectPrimary } };
     });
-  }, [botHintName, botHintEmoji, botHintJob, setThread]);
+  }, [botHintName, botHintEmoji, botHintJob, botHintProjectPrimary, setThread]);
 
   /** The newest page, replacing what was loaded (opening the thread, or catching up after a long gap). */
   const loadNewest = useCallback(async () => {
@@ -2772,6 +2848,11 @@ const BotPane: React.FC<{
         <div className="flex items-center gap-2">
           <span className="truncate text-[14px] font-semibold text-[var(--text-primary)]">{bot.name}</span>
           {bot.role === 'primary' && <span className="shrink-0 text-[11px] text-[var(--text-muted)]">all projects</span>}
+          {bot.projectPrimary && (
+            <span className="shrink-0 rounded-full bg-amber-400/12 px-1.5 text-[10.5px] font-medium leading-[17px] text-amber-300/90 ring-1 ring-amber-400/20">
+              Primary
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1.5 text-[11.5px] text-[var(--text-muted)]">
           {bot.paused ? <Pause size={11} /> : working ? <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" /> : null}
