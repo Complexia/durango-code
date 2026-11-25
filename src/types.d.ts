@@ -673,6 +673,8 @@ export type RemoteCommandRequest = {
       id: string;
       /** Started from a chat, with Run in Durango Code on a task, or through the API (Durango MCP). */
       origin?: 'chat' | 'tasks' | 'api' | 'bot';
+      /** When `origin === 'bot'`, the starter bot's id (stable across renames). */
+      botId?: string | null;
       /** Who sent it, for the thread's note ("Durango Chat", "Grok (MCP) via Durango"). */
       sourceLabel?: string;
       /** Continue `threadId` instead of starting a thread. */

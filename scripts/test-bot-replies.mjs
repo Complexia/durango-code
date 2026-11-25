@@ -1010,6 +1010,7 @@ try {
       project: 'Durango', requestId: 't', readsProjectNotes: true, signal: tasks[0].signal,
     }, 'the tool call id makes a retried create return the same task; its threads read the notes themselves (no brief)');
     assert.equal(started[0].projectId, 'p1');
+    assert.equal(started[0].botId, 'bot_1', 'records which bot started the thread');
     assert.equal(started[0].key, 'task_1', 'the renderer reports it as bottask:<taskId>');
     assert.equal(started[0].accessMode, 'full-access', 'threads a bot starts run with Full access');
     assert.match(started[0].prompt, /^Fix the OpenCode updater spinner\.\n\nWhen you're done, end with a concise report/);

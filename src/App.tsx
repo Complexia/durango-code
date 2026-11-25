@@ -9284,7 +9284,13 @@ const App: React.FC = () => {
           if (title) updateThread(threadId, { title });
           // A bot's thread: record which bot started it.
           if (dispatch.origin === 'bot') {
-            updateThread(threadId, { startedByBot: dispatchSource.replace(/^your bot /, '').slice(0, 80) || 'bot' });
+            const botId =
+              typeof dispatch.botId === 'string' && dispatch.botId.trim() ? dispatch.botId.trim().slice(0, 128) : undefined;
+            const botName = dispatchSource.replace(/^your bot(?: |$)/, '').trim().slice(0, 80) || 'bot';
+            updateThread(threadId, {
+              startedByBot: botName,
+              ...(botId ? { startedByBotId: botId } : {}),
+            });
           }
           const accessLabel =
             accessModeOptions.find((option) => option.value === requestedAccessMode)?.label ?? 'Read only';

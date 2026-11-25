@@ -1169,7 +1169,7 @@ const isLaneGone = (error) =>
  * - runLane(lane, ctx): see createClaudeLaneRunner
  * - getMachineInfo(): { name, projects: [{ id, name, path, repoId?, key? }], models: string[] } for the
  *   claim (this machine's bot presence) and for starting threads here
- * - startProjectThread({ projectId, prompt, key, botName, title, accessMode }): starts a
+ * - startProjectThread({ projectId, prompt, key, botId, botName, title, accessMode }): starts a
  *   Durango Code thread here → { ok, threadId?, error? }; its outcome is reported by the
  *   caller (POST …/bots/tasks/:taskId/report, key = the task id)
  * - startThreadFollowUp({ threadId, prompt, key, botName, accessMode }): a follow-up turn
@@ -1623,6 +1623,7 @@ export const createBotReplyWorker = ({
           // The project's notes aren't pasted in: the thread reads them with project_notes.
           prompt: `${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${lane.botName}" that asked for this. ${BOT_REPORT_GUIDE}`,
           key: created.taskId,
+          botId: lane.botId,
           botName: lane.botName,
           title: created.title || title,
           accessMode,

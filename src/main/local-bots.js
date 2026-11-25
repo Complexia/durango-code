@@ -690,7 +690,7 @@ const defaultSleep = (ms) =>
  * - summarize({ model, systemPrompt, prompt }): one-shot text (createClaudeOneShot); optional
  * - getAccessMode(): the machine's dispatch access mode ('read-only' by default)
  * - listProjects(): this computer's Durango Code projects bots may use ([{ id, name, path }])
- * - startProjectThread({ projectId, prompt, key, botName, title, accessMode }): starts a
+ * - startProjectThread({ projectId, prompt, key, botId, botName, title, accessMode }): starts a
  *   Durango Code thread in a project → { ok, threadId?, error? }. Its outcome comes back
  *   through threadSettled({ key, … }).
  * - startThreadFollowUp({ threadId, prompt, key, botName, accessMode }): a follow-up turn in
@@ -1783,6 +1783,7 @@ export const createLocalBotEngine = ({
         projectId: project.id,
         prompt: `${instructions}\n\nWhen you're done, end with a concise report of the outcome: it goes back to the bot "${entry.bot.name}" that asked for this. ${BOT_REPORT_GUIDE}`,
         key,
+        botId: entry.bot.id,
         botName: entry.bot.name,
         title: task.title,
         accessMode: effectiveAccessMode,

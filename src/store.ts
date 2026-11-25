@@ -729,6 +729,8 @@ export type Thread = {
   settledAt?: string;
   /** Started by one of the person's bots (its name). */
   startedByBot?: string;
+  /** Started by one of the person's bots (its id, stable across renames). */
+  startedByBotId?: string;
   /**
    * Set on threads imported from a Claude Code or Codex session the user ran
    * outside Orion. The session id doubles as the dedupe key for re-imports;

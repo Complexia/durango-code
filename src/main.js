@@ -4570,11 +4570,12 @@ const dispatchWorker = createDispatchWorker({
       durangoDispatch: {
         id: dispatch.id,
         origin:
-          typeof dispatch.bot === 'string' && dispatch.bot.trim()
+          (typeof dispatch.bot === 'string' && dispatch.bot.trim()) || (typeof dispatch.botId === 'string' && dispatch.botId.trim())
             ? 'bot'
             : dispatch.origin === 'tasks' || dispatch.origin === 'api'
               ? dispatch.origin
               : 'chat',
+        ...(dispatch.botId ? { botId: dispatch.botId } : {}),
         sourceLabel: dispatchSourceLabel(dispatch),
         followUp: Boolean(threadId),
         taskId: dispatch.taskId,
@@ -4640,7 +4641,7 @@ const LOCAL_BOT_DISPATCH_PREFIX = 'localbot:';
 const BOT_TASK_DISPATCH_PREFIX = 'bottask:';
 const startBotProjectThread =
   (prefix) =>
-  ({ projectId, prompt, key, botName, title, accessMode, modelId, reasoningEffort, codexServiceTier, claudeContextWindow }) => {
+  ({ projectId, prompt, key, botId, botName, title, accessMode, modelId, reasoningEffort, codexServiceTier, claudeContextWindow }) => {
     // A plain thread title, without a "Bots:" style prefix (bot-thread-title.js).
     const threadTitle = botThreadTitle(title, botName).slice(0, 80);
     return requestDispatchRendererCommand({
@@ -4656,6 +4657,7 @@ const startBotProjectThread =
       durangoDispatch: {
         id: `${prefix}${key}`,
         origin: 'bot',
+        ...(botId ? { botId } : {}),
         sourceLabel: `your bot ${botName}`,
         ...(threadTitle ? { title: threadTitle } : {}),
         followUp: false,

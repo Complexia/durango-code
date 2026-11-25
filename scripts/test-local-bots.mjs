@@ -727,6 +727,8 @@ test('delegate_task with a project starts a Durango Code thread; its outcome is 
   assert.equal(result.project, 'Durango');
   assert.equal(started.length, 1);
   assert.equal(started[0].projectId, 'proj_1');
+  assert.equal(started[0].botId, primary.id);
+  assert.equal(started[0].botName, primary.name);
   assert.equal(started[0].accessMode, 'auto-edit');
   assert.equal(started[0].key, `${primary.id}:${result.taskId}`);
   assert.match(started[0].prompt, /^Find why signups fail\.\n\nWhen you're done, end with a concise report/);
