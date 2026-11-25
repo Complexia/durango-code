@@ -463,11 +463,18 @@ export const normalizeBotLane = (lane) => {
     heartbeatMs: clampInt(lane.heartbeatMs, 2_000, 60_000, BOT_LANE_DEFAULT_HEARTBEAT_MS),
     /** The reply goes out as messages (claim feature "reply-messages"): sendBotLaneMessage, then the final answer. */
     ...(lane.messages === true ? { messages: true } : {}),
-    /** Files attached in the conversation, with download links (saved for Claude Code). */
+    /** Files attached in the conversation: download links or local staged copies (saved for Claude Code). */
     attachments: (Array.isArray(lane.attachments) ? lane.attachments : [])
-      .filter((item) => item && typeof item.url === 'string' && /^https:\/\//.test(item.url))
+      .filter((item) => item && ((typeof item.url === 'string' && /^https:\/\//.test(item.url)) || (item.local === true && str(item.pendingId || item.id))))
       .slice(0, 10)
-      .map((item) => ({ id: str(item.id), name: str(item.name) || 'file', contentType: str(item.contentType), url: item.url })),
+      .map((item) => ({
+        id: str(item.id || item.pendingId),
+        ...(str(item.pendingId) ? { pendingId: str(item.pendingId) } : {}),
+        name: str(item.name) || 'file',
+        contentType: str(item.contentType),
+        ...(typeof item.url === 'string' && /^https:\/\//.test(item.url) ? { url: item.url } : {}),
+        ...(item.local === true ? { local: true } : {}),
+      })),
   };
 };
 
@@ -475,12 +482,27 @@ const BOT_INBOX_SOURCES = new Set(['person', 'routine', 'task', 'bot']);
 export const normalizeBotInbox = (inbox) =>
   (Array.isArray(inbox) ? inbox : [])
     .filter((item) => item && typeof item === 'object' && typeof item.content === 'string')
-    .map((item) => ({
-      seq: Number.isFinite(Number(item.seq)) ? Number(item.seq) : null,
-      source: BOT_INBOX_SOURCES.has(item.source) ? item.source : 'person',
-      label: typeof item.label === 'string' && item.label.trim() ? item.label.trim() : null,
-      content: item.content,
-    }));
+    .map((item) => {
+      const attachments = Array.isArray(item.attachments)
+        ? item.attachments
+            .filter((att) => att && typeof att === 'object' && typeof att.name === 'string' && att.name)
+            .slice(0, 10)
+            .map((att) => ({
+              name: att.name,
+              ...(str(att.pendingId) ? { pendingId: str(att.pendingId), id: str(att.pendingId) } : {}),
+              ...(str(att.assetId) ? { assetId: str(att.assetId), ...(!str(att.pendingId) ? { id: str(att.assetId) } : {}) } : {}),
+              ...(str(att.status) ? { status: str(att.status) } : {}),
+              ...(str(att.machineId) ? { machineId: str(att.machineId) } : {}),
+            }))
+        : [];
+      return {
+        seq: Number.isFinite(Number(item.seq)) ? Number(item.seq) : null,
+        source: BOT_INBOX_SOURCES.has(item.source) ? item.source : 'person',
+        label: typeof item.label === 'string' && item.label.trim() ? item.label.trim() : null,
+        content: item.content,
+        ...(attachments.length ? { attachments } : {}),
+      };
+    });
 
 const botLanePath = (laneId, action) => {
   const id = str(laneId).trim();
@@ -505,6 +527,8 @@ export const createDurangoClient = ({
   webOrigin = () => DEFAULT_DURANGO_URL,
 }) => {
   const chatUrls = createChatUrlMemory();
+  // Advertised by GET /api/v1/bots (`pendingAttachments: true`): null until known.
+  let pendingBotAttachmentsSupported = null;
   const request = async (method, apiPath, { query, body, form, timeout = timeoutMs, signal, headers: extraHeaders, account } = {}) => {
     const session = await readSession();
     if (!session?.token) throw notSignedIn();
@@ -834,13 +858,19 @@ export const createDurangoClient = ({
       return { ok: data.ok === true, ...(data.stale === true ? { stale: true } : {}) };
     },
     // --- Bots (Sidebar v3): the person's Durango bots and their threads ---------
-    /** → `{ allowed, bots, modelChoices }` (the primary first; modelChoices: null from an older Durango). */
+    /** Whether the connected Durango server supports non-blocking pending bot attachments (null before listBots). */
+    supportsPendingBotAttachments() {
+      return pendingBotAttachmentsSupported;
+    },
+    /** → `{ allowed, bots, modelChoices, pendingAttachments }` (the primary first; modelChoices: null from an older Durango). */
     async listBots() {
       const data = await request('GET', '/bots');
+      pendingBotAttachmentsSupported = data.pendingAttachments === true;
       return {
         allowed: data.allowed === true,
         bots: Array.isArray(data.bots) ? data.bots : [],
         modelChoices: normalizeBotModelChoices(data.modelChoices),
+        pendingAttachments: pendingBotAttachmentsSupported,
       };
     },
     /** Sets a bot's reply model and/or reasoning effort → `{ model?, reasoningEffort?, bot? }`. */
@@ -901,11 +931,34 @@ export const createDurangoClient = ({
     async sendBotMessage(botId, body, { account } = {}) {
       return await request('POST', `/bots/${encodeURIComponent(str(botId))}/messages`, { body, ...(account ? { account } : {}) });
     },
-    /** A file for a bot message, saved to the person's library → `{ part, attachment }` (send `part` in `assets`). */
-    async uploadBotAttachment({ name, bytes, contentType, account }) {
+    /**
+     * A file for a bot message, saved to the person's library → `{ part, attachment, attached? }`.
+     * When `botId`, `messageId` and `pendingId` are provided, Durango also resolves that pending
+     * attachment on the already-sent message in one round trip.
+     */
+    async uploadBotAttachment({ name, bytes, contentType, account, botId, messageId, pendingId }) {
       const form = new FormData();
       form.append('file', new Blob([bytes], { type: contentType || 'application/octet-stream' }), str(name) || 'file');
+      if (botId) form.append('botId', str(botId));
+      if (messageId) form.append('messageId', str(messageId));
+      if (pendingId) form.append('pendingId', str(pendingId));
       return await request('POST', '/bots/attachments', { form, timeout: Math.max(timeoutMs, 180_000), ...(account ? { account } : {}) });
+    },
+    /** Updates a background-uploaded attachment on an already-sent bot message (status: included | failed | uploading). */
+    async updateBotMessageAttachment({ botId, messageId, pendingId, status, part, error, account }) {
+      return await request(
+        'PATCH',
+        `/bots/${encodeURIComponent(str(botId))}/messages/${encodeURIComponent(str(messageId))}/attachments`,
+        {
+          body: {
+            pendingId: str(pendingId),
+            status: str(status),
+            ...(part ? { part } : {}),
+            ...(error ? { error: str(error) } : {}),
+          },
+          ...(account ? { account } : {}),
+        }
+      );
     },
     /** Read links (an hour) for files in the person's bot threads, by library id → `[{ id, name, contentType, byteSize, url }]`. */
     async botFileLinks(ids) {
@@ -1442,8 +1495,14 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     async projectMemoryAction() {
       throw new DurangoError('api', 'Mock Durango has no project bots.');
     },
+    supportsPendingBotAttachments() {
+      return false;
+    },
     async sendBotMessage() {
       return { seq: 0 };
+    },
+    async updateBotMessageAttachment() {
+      return { ok: true };
     },
     async importBots(payload) {
       const bots = Array.isArray(payload?.bots) ? payload.bots : [];

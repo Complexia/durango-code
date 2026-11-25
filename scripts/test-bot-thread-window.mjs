@@ -138,6 +138,15 @@ test("a reply's cards and file ids count as changes when merging (its row redraw
   assert.equal(carded[0], shown[0], 'the other row keeps its object');
   const filed = [message(3, { files: [{ name: 'a.png', size: 1 }] })];
   assert.notEqual(mergeBotMessages(filed, [message(3, { files: [{ name: 'a.png', size: 1, assetId: 'asset_1' }] })]), filed, 'a file that gained its library id');
+  const uploading = [message(3, { files: [{ name: 'a.png', size: 1, pendingId: 'att_1', status: 'uploading' }] })];
+  assert.notEqual(
+    mergeBotMessages(uploading, [message(3, { files: [{ name: 'a.png', size: 1, pendingId: 'att_1', status: 'failed', error: 'Offline' }] })]),
+    uploading,
+    'a file whose background upload failed'
+  );
+  assert.equal(botPollCursor([message(1), message(2), ...uploading], []), 2, 'poll cursor stays before a message with an uploading attachment');
+  const resolved = [message(3, { files: [{ name: 'a.png', size: 1, pendingId: 'att_1', assetId: 'asset_1' }] })];
+  assert.equal(botPollCursor([message(1), message(2), ...resolved], []), 3, 'poll cursor advances once uploads finish');
 });
 
 test('task reports: Ship goes to the thread the report came from; the footers stay out of the text', () => {

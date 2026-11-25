@@ -334,23 +334,31 @@ const defaultDownload = async (url) => {
 
 /**
  * Saves a reply's attachments in its work folder (`attachments/`, inside its
- * cwd, so Claude Code can read them in any access mode): from Durango's
- * download links, or copied from this computer (signed-out bots). → a note
- * for the prompt naming each file and where it is, or '' when there are none.
+ * cwd, so Claude Code can read them in any access mode): from a local copy on
+ * this computer (`item.path` or `resolveLocalPath(item)`), else from Durango's
+ * download links. → a note for the prompt naming each file and where it is, or
+ * '' when there are none.
  */
-export const saveLaneAttachments = async (attachments, dir, { download = defaultDownload, copyFile = (from, to) => fs.copyFile(from, to) } = {}) => {
+export const saveLaneAttachments = async (
+  attachments,
+  dir,
+  { download = defaultDownload, copyFile = (from, to) => fs.copyFile(from, to), resolveLocalPath = null } = {}
+) => {
   const list = (Array.isArray(attachments) ? attachments : []).slice(-LANE_ATTACHMENTS_MAX);
   if (!list.length) return '';
   await fs.mkdir(dir, { recursive: true });
   const lines = [];
   for (const item of list) {
     const name = safeFileName(item?.name);
-    const tag = String(item?.id ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
+    const tag = String(item?.id ?? item?.pendingId ?? '').replace(/[^A-Za-z0-9]/g, '').slice(0, 8);
     const target = path.join(dir, tag ? `${tag}-${name}` : name);
     try {
       const existing = await fs.stat(target).catch(() => null);
       if (!existing?.isFile()) {
-        if (typeof item?.path === 'string' && item.path) await copyFile(item.path, target);
+        const localPath =
+          (typeof item?.path === 'string' && item.path ? item.path : null) ??
+          (typeof resolveLocalPath === 'function' ? resolveLocalPath(item) : null);
+        if (localPath) await copyFile(localPath, target);
         else if (typeof item?.url === 'string' && /^https:\/\//.test(item.url)) await fs.writeFile(target, await download(item.url));
         else continue;
       }
@@ -513,6 +521,7 @@ export const createClaudeLaneRunner = ({
   mkdir = (dir) => fs.mkdir(dir, { recursive: true }),
   randomId = () => crypto.randomUUID(),
   downloadAttachment = defaultDownload,
+  resolveLocalAttachment = null,
   sessions = null,
   maxPromptTokens = maxPromptTokensFromEnv(),
   sessionResetTokens = BOT_SESSION_RESET_TOKENS,
@@ -543,9 +552,12 @@ export const createClaudeLaneRunner = ({
     return { text: '', retryElsewhere: true, failure: shorten(`Claude Code is not available here: ${error?.message ?? error}`) };
   }
   if (ctx.signal?.aborted) return { text: '', aborted: true };
-  // Files attached in the conversation: saved next to the reply for Claude Code.
-  const attachmentsNote = await saveLaneAttachments(lane.attachments, path.join(cwd, 'attachments'), {
+  // Files attached in the conversation: saved next to the reply for Claude Code
+  // (using any local staged copy on this computer before downloading).
+  const attachmentsDir = path.join(cwd, 'attachments');
+  const attachmentsNote = await saveLaneAttachments(lane.attachments, attachmentsDir, {
     download: downloadAttachment,
+    resolveLocalPath: resolveLocalAttachment,
   }).catch(() => '');
   const z = zod?.z ?? zod;
   const systemAppend = projectsNote ? `${lane.systemPrompt}\n\n${projectsNote}` : lane.systemPrompt;
@@ -747,13 +759,26 @@ export const createClaudeLaneRunner = ({
   const deliveredItems = []; // ...and the items themselves (handed back if the attempt is redone)
   let inboxRequest = null;
   let finalInboxRounds = 0;
+  const enrichInboxItem = async (item) => {
+    if (!resolveLocalAttachment || !Array.isArray(item?.attachments) || !item.attachments.length) return item;
+    const localItems = item.attachments.filter((att) => Boolean(resolveLocalAttachment(att)));
+    if (!localItems.length) return item;
+    const note = await saveLaneAttachments(localItems, attachmentsDir, {
+      download: downloadAttachment,
+      resolveLocalPath: resolveLocalAttachment,
+    }).catch(() => '');
+    return note ? { ...item, content: [item.content, note].filter(Boolean).join('\n\n') } : item;
+  };
   const requestInbox = (options) => {
     if (inboxRequest) return inboxRequest;
     inboxRequest = Promise.resolve()
       .then(() => ctx.takeInbox(options))
       .then(
-        (items) => {
-          if (Array.isArray(items)) pendingInbox.push(...items);
+        async (items) => {
+          if (Array.isArray(items) && items.length) {
+            const enriched = await Promise.all(items.map(enrichInboxItem));
+            pendingInbox.push(...enriched);
+          }
         },
         () => {}
       )

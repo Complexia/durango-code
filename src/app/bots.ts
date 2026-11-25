@@ -71,7 +71,33 @@ export type DesktopBotMessage = {
   cards?: BotCard[];
 };
 
-export type BotMessageFile = { name: string; size?: number; assetId?: string; contentType?: string; path?: string };
+export type BotMessageFile = {
+  name: string;
+  size?: number;
+  assetId?: string;
+  contentType?: string;
+  path?: string;
+  /** Client-assigned id while uploading in the background (or failed/resolved). */
+  pendingId?: string;
+  status?: 'uploading' | 'ready' | 'failed';
+  error?: string;
+};
+
+/** Live status of a local file uploading in the background for a bot message (main: bot-attachments.js). */
+export type BotAttachmentUploadStatus = {
+  botId: string;
+  messageId: string;
+  pendingId: string;
+  name: string;
+  size: number;
+  contentType: string;
+  kind?: string;
+  localPath?: string;
+  status: 'uploading' | 'ready' | 'failed';
+  assetId?: string;
+  error?: string;
+  canRetry?: boolean;
+};
 
 /** A card under a bot reply, in Durango Chat's ui part shape (chat/andromedus/lib/chat-ui-parts.ts). */
 export type BotCard = { id: string; component: string; props: unknown };

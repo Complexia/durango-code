@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
+  AlertCircle,
   Archive,
   ArrowDown,
   ArrowUp,
@@ -35,6 +36,7 @@ import {
   Pause,
   Pin,
   Plus,
+  RotateCw,
   Search,
   SquarePen,
   Trash2,
@@ -93,6 +95,7 @@ import {
   type DesktopBotMessage,
   type DesktopBotThread,
   type BotAttachmentFile,
+  type BotAttachmentUploadStatus,
   type BotModelChoice,
 } from './bots';
 import { BotModelMenu } from './BotModelMenu';
@@ -111,7 +114,14 @@ const LIST_POLL_MS = 5_000;
 const THREAD_POLL_ACTIVE_MS = 1_200;
 const THREAD_POLL_IDLE_MS = 4_000;
 
-type Outgoing = { id: string; content: string; files?: BotAttachmentFile[]; failed?: string; sent?: boolean };
+type Outgoing = {
+  id: string;
+  content: string;
+  files?: BotAttachmentFile[];
+  pendingIds?: string[];
+  failed?: string;
+  sent?: boolean;
+};
 
 /** Thumbnails of images you sent, by message id, so the stored message keeps them (this session only). */
 const SENT_PREVIEWS_MAX = 40;
@@ -133,7 +143,7 @@ const rememberSentPreviews = (messageId: string, files: BotAttachmentFile[]) => 
   }
 };
 /** A stored message's files with the thumbnails sent from here, matched by name in order. */
-const withSentPreviews = (messageId: string, files: { name: string; size?: number }[] | undefined) => {
+const withSentPreviews = (messageId: string, files: BubbleFile[] | undefined): BubbleFile[] | undefined => {
   const previews = sentPreviews.get(messageId);
   if (!files?.length || !previews?.length) return files;
   const left = [...previews];
@@ -141,7 +151,7 @@ const withSentPreviews = (messageId: string, files: { name: string; size?: numbe
     const index = left.findIndex((item) => item.name === file.name);
     if (index < 0) return file;
     const [match] = left.splice(index, 1);
-    return { ...file, preview: match.preview };
+    return file.preview ? file : { ...file, preview: match.preview };
   });
 };
 /** What Copy puts on the clipboard: the text, then the names of the files sent with it. */
@@ -2292,10 +2302,15 @@ const BotPane: React.FC<{
   const shellSlot = useBotsShellSlot();
   const [error, setError] = useState<string | null>(null);
   const [outgoing, setOutgoing] = useState<Outgoing[]>([]);
+  const [uploadStatuses, setUploadStatuses] = useState<ReadonlyMap<string, BotAttachmentUploadStatus>>(() => new Map());
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const working = thread ? botIsWorking(thread.bot) : false;
-  const sending = outgoing.some((message) => !message.failed);
+  const hasUploadingAttachment = useMemo(() => {
+    for (const item of uploadStatuses.values()) if (item.status === 'uploading') return true;
+    return Boolean(thread?.messages.some((message) => message.files?.some((file) => file.status === 'uploading')));
+  }, [uploadStatuses, thread?.messages]);
+  const sending = outgoing.some((message) => !message.failed) || hasUploadingAttachment;
   const threadRef = useRef(thread);
   const mountedRef = useRef(true);
   const mountEpochRef = useRef(botThreadEpochs.get(botId) ?? 0);
@@ -2404,6 +2419,84 @@ const BotPane: React.FC<{
     void poll();
   }, [poll]);
 
+  // Live background attachment upload state from main (survives tab switches,
+  // updates the message's attachment badge immediately without waiting on polls).
+  useEffect(() => {
+    let active = true;
+    void window.orion?.getBotAttachmentStatuses?.({ botId }).then((result) => {
+      if (!active || !result?.ok || !result.items?.length) return;
+      setUploadStatuses((current) => {
+        const next = new Map(current);
+        for (const item of result.items ?? []) next.set(item.pendingId, item);
+        return next;
+      });
+    });
+    const unsubscribe = window.orion?.onBotAttachmentStatus?.((status) => {
+      if (!active || status.botId !== botId) return;
+      setUploadStatuses((current) => {
+        const next = new Map(current);
+        next.set(status.pendingId, status);
+        return next;
+      });
+      if (status.status === 'ready' || status.status === 'failed' || status.status === 'uploading') {
+        setThread((current) => {
+          if (!current) return current;
+          let changed = false;
+          const messages = current.messages.map((message) => {
+            if (message.id !== status.messageId || !message.files?.length) return message;
+            let rowChanged = false;
+            const nextFiles = message.files.map((file) => {
+              if (file.pendingId !== status.pendingId) return file;
+              const nextStatus = status.status === 'ready' ? undefined : status.status;
+              const nextAssetId = status.assetId ?? file.assetId;
+              const nextError = status.status === 'failed' ? status.error : undefined;
+              if (file.status === nextStatus && file.assetId === nextAssetId && file.error === nextError) return file;
+              rowChanged = true;
+              return {
+                ...file,
+                ...(nextAssetId ? { assetId: nextAssetId } : {}),
+                ...(nextStatus ? { status: nextStatus } : { status: undefined }),
+                ...(nextError ? { error: nextError } : { error: undefined }),
+              };
+            });
+            if (!rowChanged) return message;
+            changed = true;
+            return { ...message, files: nextFiles };
+          });
+          return changed ? { ...current, messages } : current;
+        });
+      }
+    });
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [botId, setThread]);
+
+  const retryAttachment = useCallback(
+    async (messageId: string, pendingId: string) => {
+      setUploadStatuses((current) => {
+        const existing = current.get(pendingId);
+        if (!existing) return current;
+        const next = new Map(current);
+        next.set(pendingId, { ...existing, status: 'uploading', error: undefined, canRetry: false });
+        return next;
+      });
+      const result = await window.orion?.retryBotAttachmentUpload?.({ botId, messageId, pendingId });
+      if (!result?.ok) {
+        const errorMessage = result?.error ?? 'Couldn’t retry upload.';
+        setUploadStatuses((current) => {
+          const existing = current.get(pendingId);
+          if (!existing) return current;
+          const next = new Map(current);
+          next.set(pendingId, { ...existing, status: 'failed', error: errorMessage, canRetry: true });
+          return next;
+        });
+      }
+    },
+    [botId]
+  );
+
   // Brisk while a reply is being written (or just sent), slow otherwise.
   // A poll that finds nothing new keeps the same thread object, so this
   // timer is set again by `tick` itself rather than by a redraw.
@@ -2464,8 +2557,21 @@ const BotPane: React.FC<{
         setOutgoing((current) => current.map((message) => (message.id === id ? { ...message, failed: result?.error ?? 'Couldn’t send.' } : message)));
         return;
       }
+      const pendingAttachments = result.pendingAttachments ?? [];
+      if (pendingAttachments.length) {
+        setUploadStatuses((current) => {
+          const next = new Map(current);
+          for (const item of pendingAttachments) {
+            if (!next.has(item.pendingId)) next.set(item.pendingId, item);
+          }
+          return next;
+        });
+      }
       // Stored: it stops saying "Sending…" now, before the thread reloads.
-      setOutgoing((current) => current.map((message) => (message.id === id ? { ...message, sent: true } : message)));
+      const pendingIds = pendingAttachments.map((item) => item.pendingId);
+      setOutgoing((current) =>
+        current.map((message) => (message.id === id ? { ...message, sent: true, ...(pendingIds.length ? { pendingIds } : {}) } : message))
+      );
       void poll();
       onChanged();
     },
@@ -2637,6 +2743,8 @@ const BotPane: React.FC<{
                   message={row.message}
                   handlers={handlers}
                   answeredQuestions={answeredQuestions}
+                  uploadStatuses={row.message.role === 'user' && row.message.files?.some((file) => file.pendingId) ? uploadStatuses : undefined}
+                  onRetryAttachment={retryAttachment}
                 />
               </div>
             ) : (
@@ -2647,7 +2755,21 @@ const BotPane: React.FC<{
             <PersonBubble
               key={message.id}
               content={message.content}
-              files={message.files}
+              files={message.files?.map((file, index) => {
+                const pendingId = message.pendingIds?.[index];
+                const liveStatus = pendingId ? uploadStatuses.get(pendingId) : undefined;
+                const status = liveStatus?.status ?? (pendingId ? 'uploading' : undefined);
+                return {
+                  name: file.name,
+                  size: file.size,
+                  preview: file.preview,
+                  ...(status === 'uploading' || status === 'failed' ? { status } : {}),
+                  ...(liveStatus?.error ? { error: liveStatus.error } : {}),
+                  ...(status === 'failed' && pendingId && liveStatus?.canRetry !== false
+                    ? { onRetry: () => void retryAttachment(message.id, pendingId) }
+                    : {}),
+                };
+              })}
               meta={
                 message.failed ? (
                   <button type="button" className="text-red-400 hover:underline" onClick={() => void send(message.content, message.files ?? [], message.id)}>
@@ -3450,7 +3572,14 @@ const ProjectLibrary: React.FC<{
   );
 };
 
-type BubbleFile = { name: string; size?: number; preview?: string };
+type BubbleFile = {
+  name: string;
+  size?: number;
+  preview?: string;
+  status?: 'uploading' | 'ready' | 'failed';
+  error?: string;
+  onRetry?: () => void;
+};
 
 const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: React.ReactNode; copyable?: boolean }> = ({ content, files, meta, copyable = true }) => {
   const answer = /^> \*\*Answering:\*\* (.+)\n\n([\s\S]+)$/.exec(content);
@@ -3461,25 +3590,106 @@ const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: Rea
       {images.length > 0 && (
         <div className="flex max-w-[85%] flex-wrap justify-end gap-1.5">
           {images.map((file, index) => (
-            <img
-              key={`${file.name}-${index}`}
-              src={file.preview}
-              alt={file.name}
-              title={file.name}
-              onClick={handleLightboxImageClick}
-              className="max-h-[180px] max-w-[260px] cursor-zoom-in rounded-xl object-cover ring-1 ring-white/[0.08]"
-            />
+            <div key={`${file.name}-${index}`} className="flex flex-col items-end gap-1">
+              <div
+                className={`relative inline-block overflow-hidden rounded-xl ring-1 ${
+                  file.status === 'failed' ? 'ring-red-400/55' : 'ring-white/[0.08]'
+                }`}
+              >
+                <img
+                  src={file.preview}
+                  alt={file.name}
+                  title={file.status === 'failed' && file.error ? `${file.name} — ${file.error}` : file.name}
+                  onClick={handleLightboxImageClick}
+                  className="block max-h-[180px] max-w-[260px] cursor-zoom-in object-cover"
+                />
+                {file.status === 'uploading' && (
+                  <span
+                    className="pointer-events-none absolute bottom-1.5 right-1.5 inline-flex items-center gap-1 rounded-full bg-black/75 px-2 py-0.5 text-[10.5px] font-medium text-neutral-200 ring-1 ring-white/15 backdrop-blur-sm"
+                    aria-label={`Uploading ${file.name}`}
+                  >
+                    <Loader2 size={10} className="animate-spin text-sky-400" />
+                    Uploading
+                  </span>
+                )}
+                {file.status === 'failed' && (
+                  <div className="absolute inset-x-1.5 bottom-1.5 flex items-center justify-between gap-2 rounded-lg bg-black/85 px-2 py-1 text-[11px] text-red-300 ring-1 ring-red-400/35 backdrop-blur-sm">
+                    <span className="inline-flex min-w-0 items-center gap-1 truncate" title={file.error || 'Upload failed'}>
+                      <AlertCircle size={11} className="shrink-0 text-red-400" />
+                      <span className="truncate">Upload failed</span>
+                    </span>
+                    {file.onRetry && (
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          file.onRetry?.();
+                        }}
+                        className="inline-flex shrink-0 items-center gap-1 rounded bg-white/15 px-1.5 py-0.5 text-[10.5px] font-medium text-neutral-100 transition-colors hover:bg-white/25"
+                      >
+                        <RotateCw size={10} />
+                        Retry
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+              {file.status === 'failed' && file.error && file.error !== 'Upload failed' && file.error !== 'Upload failed.' && (
+                <span className="max-w-[260px] truncate pr-0.5 text-[11px] text-red-300/90" title={file.error}>
+                  {file.error}
+                </span>
+              )}
+            </div>
           ))}
         </div>
       )}
       {others.length > 0 && (
         <div className="flex max-w-[85%] flex-wrap justify-end gap-1.5">
           {others.map((file, index) => (
-            <span key={`${file.name}-${index}`} className="inline-flex max-w-[260px] items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[12px] text-neutral-300 ring-1 ring-white/[0.08]">
-              <Paperclip size={12} className="shrink-0 text-neutral-500" />
-              <span className="truncate">{file.name}</span>
-              {file.size ? <span className="shrink-0 text-neutral-500">{formatFileSize(file.size)}</span> : null}
-            </span>
+            <div key={`${file.name}-${index}`} className="flex flex-col items-end gap-0.5">
+              <span
+                className={`inline-flex max-w-[300px] items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[12px] ring-1 ${
+                  file.status === 'failed'
+                    ? 'bg-red-500/[0.08] text-red-200 ring-red-400/35'
+                    : 'bg-white/[0.06] text-neutral-300 ring-white/[0.08]'
+                }`}
+                title={file.status === 'failed' && file.error ? `${file.name} — ${file.error}` : file.name}
+              >
+                {file.status === 'failed' ? (
+                  <AlertCircle size={12} className="shrink-0 text-red-400" />
+                ) : (
+                  <Paperclip size={12} className="shrink-0 text-neutral-500" />
+                )}
+                <span className="truncate">{file.name}</span>
+                {file.size ? <span className="shrink-0 text-neutral-500">{formatFileSize(file.size)}</span> : null}
+                {file.status === 'uploading' && (
+                  <span className="inline-flex shrink-0 items-center gap-1 text-[11px] text-neutral-400" aria-label={`Uploading ${file.name}`}>
+                    <Loader2 size={10} className="animate-spin text-sky-400" />
+                    Uploading
+                  </span>
+                )}
+                {file.status === 'failed' && (
+                  <>
+                    <span className="shrink-0 text-[11px] text-red-300">Failed</span>
+                    {file.onRetry && (
+                      <button
+                        type="button"
+                        onClick={() => file.onRetry?.()}
+                        className="inline-flex shrink-0 items-center gap-1 rounded bg-white/10 px-1.5 py-0.5 text-[10.5px] font-medium text-neutral-100 transition-colors hover:bg-white/20"
+                      >
+                        <RotateCw size={10} />
+                        Retry
+                      </button>
+                    )}
+                  </>
+                )}
+              </span>
+              {file.status === 'failed' && file.error && file.error !== 'Upload failed' && file.error !== 'Upload failed.' && (
+                <span className="max-w-[300px] truncate pr-0.5 text-[11px] text-red-300/90" title={file.error}>
+                  {file.error}
+                </span>
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -3530,7 +3740,9 @@ const BotMessage: React.FC<{
   message: DesktopBotMessage;
   handlers: BotActionHandlers;
   answeredQuestions: ReadonlyMap<string, string>;
-}> = React.memo(({ bot, projectPath, message, handlers, answeredQuestions }) => {
+  uploadStatuses?: ReadonlyMap<string, BotAttachmentUploadStatus>;
+  onRetryAttachment?: (messageId: string, pendingId: string) => void;
+}> = React.memo(({ bot, projectPath, message, handlers, answeredQuestions, uploadStatuses, onRetryAttachment }) => {
   const files = useMessageFiles(message.files);
   if (message.role === 'assistant') {
     const via = message.authorLabel?.startsWith('via ') ? message.authorLabel : null;
@@ -3546,7 +3758,14 @@ const BotMessage: React.FC<{
     );
   }
   const source = botInboxSource(message.authorLabel);
-  if (source === 'person') return <PersonBubble content={message.content} files={withSentPreviews(message.id, personFiles(message.files, files))} />;
+  if (source === 'person') {
+    return (
+      <PersonBubble
+        content={message.content}
+        files={withSentPreviews(message.id, personFiles(message.id, message.files, files, uploadStatuses, onRetryAttachment))}
+      />
+    );
+  }
   const Icon = INBOX_ICON[source];
   // A task report carries its thread and change: open or ship them from here.
   const actions = source === 'task' ? taskReportActions(message.content) : [];
@@ -3563,13 +3782,32 @@ const BotMessage: React.FC<{
   );
 });
 
-/** The person's files with a thumbnail: the one sent from here, else the image loaded from the library. */
-const personFiles = (stored: DesktopBotMessage['files'], shown: ReturnType<typeof useMessageFiles>): BubbleFile[] | undefined =>
+/** The person's files with thumbnail, background upload badge, and retry action when failed on this computer. */
+const personFiles = (
+  messageId: string,
+  stored: DesktopBotMessage['files'],
+  shown: ReturnType<typeof useMessageFiles>,
+  uploadStatuses?: ReadonlyMap<string, BotAttachmentUploadStatus>,
+  onRetryAttachment?: (messageId: string, pendingId: string) => void
+): BubbleFile[] | undefined =>
   stored?.map((file, index) => {
     const loaded = shown[index];
-    const image = loaded && /^image\/(png|jpe?g|gif|webp)$/i.test(loaded.contentType ?? '');
-    const preview = image ? loaded.url ?? (loaded.path ? localMediaSrc(loaded.path, []) : undefined) : undefined;
-    return { name: file.name, ...(file.size ? { size: file.size } : {}), ...(preview ? { preview } : {}) };
+    const live = file.pendingId ? uploadStatuses?.get(file.pendingId) : undefined;
+    const contentType = loaded?.contentType ?? live?.contentType ?? file.contentType ?? '';
+    const image = /^image\/(png|jpe?g|gif|webp)$/i.test(contentType);
+    const localPath = loaded?.path ?? live?.localPath;
+    const preview = image ? loaded?.url ?? (localPath ? localMediaSrc(localPath, []) : undefined) : undefined;
+    const status = live ? live.status : file.assetId ? 'ready' : file.status;
+    const error = live?.error ?? file.error;
+    const canRetry = Boolean(status === 'failed' && file.pendingId && live?.localPath && live?.canRetry !== false && onRetryAttachment);
+    return {
+      name: file.name,
+      ...(file.size ? { size: file.size } : {}),
+      ...(preview ? { preview } : {}),
+      ...(status === 'uploading' || status === 'failed' ? { status } : {}),
+      ...(error ? { error } : {}),
+      ...(canRetry ? { onRetry: () => onRetryAttachment!(messageId, file.pendingId!) } : {}),
+    };
   });
 
 /** Always open: messages queue while the bot works, like texting a person. */

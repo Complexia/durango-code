@@ -488,6 +488,13 @@ contextBridge.exposeInMainWorld('orion', {
   clearBot: (input) => ipcRenderer.invoke('bots:clear', input),
   getBotThread: (input) => ipcRenderer.invoke('bots:thread', input),
   sendBotMessage: (input) => ipcRenderer.invoke('bots:send', input),
+  getBotAttachmentStatuses: (input) => ipcRenderer.invoke('bots:attachmentStatuses', input),
+  retryBotAttachmentUpload: (input) => ipcRenderer.invoke('bots:retryAttachment', input),
+  onBotAttachmentStatus: (callback) => {
+    const listener = (_event, status) => callback(status);
+    ipcRenderer.on('bots:attachmentStatus', listener);
+    return () => ipcRenderer.removeListener('bots:attachmentStatus', listener);
+  },
   pickBotAttachments: () => ipcRenderer.invoke('bots:pickAttachments'),
   saveBotAttachment: (input) => ipcRenderer.invoke('bots:saveAttachment', input),
   createBot: (input) => ipcRenderer.invoke('bots:create', input),

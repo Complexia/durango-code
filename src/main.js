@@ -105,6 +105,7 @@ import {
   createClaudeOneShot,
   normalizeBotSettings,
 } from './main/bot-replies.js';
+import { createBotAttachmentManager } from './main/bot-attachments.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
 import { botThreadTitle } from './main/bot-thread-title.js';
@@ -4610,6 +4611,16 @@ const botSessions = createBotSessionStore({
   log: (...args) => console.warn('[bot sessions]', ...args),
 });
 
+// Local staging + background cloud upload for files attached to bot messages.
+// Replies on this Mac read the local copy straight away; cloud/other machines
+// get the background upload.
+const botAttachments = createBotAttachmentManager({
+  stagingDir: () => path.join(app.getPath('userData'), 'bots', 'staged-attachments'),
+  client: durangoClient,
+  onChange: (status) => sendToAllWindows('bots:attachmentStatus', status),
+});
+void app.whenReady().then(() => botAttachments.pruneStagedFiles().catch(() => {}));
+
 const claudeBotLaneRunner = createClaudeLaneRunner({
   loadSdk: loadClaudeSdk,
   loadZod,
@@ -4617,6 +4628,7 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
   createInputQueue: createClaudeInputQueue,
   botsDir: () => path.join(app.getPath('userData'), 'bots'),
   getProjects: botProjects,
+  resolveLocalAttachment: (item) => botAttachments.resolveLocalPath(item),
   sessions: botSessions,
 });
 
@@ -6480,14 +6492,49 @@ ipcMain.handle('bots:send', async (_event, input) => {
     // Pinned to the account signed in now (uploads and the message alike).
     const account = await durangoAccountKey();
     if (!account) return { ok: false, error: 'Sign in to Durango first.' };
-    // Uploads in parallel (and the device id alongside): sending waits only for the slowest file.
-    const [uploads, machineId] = await Promise.all([
-      Promise.all(files.map(async (file) => durangoClient.uploadBotAttachment({ name: file.name, bytes: await fs.readFile(file.path), contentType: file.contentType, account }))),
-      // Sent from this machine: its replies run here first (unless the bot has its own order).
-      getDurangoDeviceId().catch(() => null),
-    ]);
-    const assets = uploads.map((uploaded) => uploaded?.part).filter(Boolean);
     const timeZone = typeof input?.timeZone === 'string' ? input.timeZone.slice(0, 64) : undefined;
+    const machineId = await getDurangoDeviceId().catch(() => null);
+    // Stage files locally and send the message immediately without blocking on
+    // cloud upload; upload in the background for phone/web/other machines/history.
+    // Falls back to upload-before-send only if an older Durango server explicitly
+    // did not advertise `pendingAttachments` in GET /api/v1/bots.
+    if (files.length && durangoClient.supportsPendingBotAttachments() !== false) {
+      const staged = await botAttachments.stageFiles({ botId, messageId, files });
+      const pendingAttachments = staged.map((item) => ({
+        id: item.pendingId,
+        name: item.name,
+        contentType: item.contentType,
+        byteSize: item.size,
+        kind: item.kind,
+      }));
+      let sent;
+      try {
+        sent = await durangoClient.sendBotMessage(
+          botId,
+          {
+            messageId,
+            content,
+            pendingAttachments,
+            ...(timeZone ? { timeZone } : {}),
+            ...(machineId ? { machineId } : {}),
+          },
+          { account }
+        );
+      } catch (error) {
+        await botAttachments.discardMessage(messageId).catch(() => {});
+        throw error;
+      }
+      // Kick off cloud uploads in the background — never block sending.
+      void botAttachments.startUploads({ pendingIds: staged.map((item) => item.pendingId), account });
+      return { ok: true, ...sent, pendingAttachments: staged };
+    }
+    // Older server (or no files): upload synchronously before sending.
+    const uploads = await Promise.all(
+      files.map(async (file) =>
+        durangoClient.uploadBotAttachment({ name: file.name, bytes: await fs.readFile(file.path), contentType: file.contentType, account })
+      )
+    );
+    const assets = uploads.map((uploaded) => uploaded?.part).filter(Boolean);
     return {
       ok: true,
       ...(await durangoClient.sendBotMessage(
@@ -6502,6 +6549,25 @@ ipcMain.handle('bots:send', async (_event, input) => {
         { account }
       )),
     };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
+ipcMain.handle('bots:attachmentStatuses', (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : undefined;
+  return { ok: true, items: botAttachments.listStatuses({ ...(botId ? { botId } : {}) }) };
+});
+
+ipcMain.handle('bots:retryAttachment', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : '';
+  const messageId = typeof input?.messageId === 'string' ? input.messageId.slice(0, 128) : '';
+  const pendingId = typeof input?.pendingId === 'string' ? input.pendingId.slice(0, 128) : '';
+  if (!botId || !messageId || !pendingId) return { ok: false, error: 'Missing attachment id.' };
+  try {
+    const account = await durangoAccountKey();
+    if (!account) return { ok: false, error: 'Sign in to Durango first.' };
+    return await botAttachments.retryUpload({ botId, messageId, pendingId, account });
   } catch (error) {
     return durangoIpcError(error);
   }

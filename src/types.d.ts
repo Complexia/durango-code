@@ -2099,7 +2099,22 @@ type OrionCodexBrowserIntegrationStatus = {
         timeZone?: string;
         /** Files attached (paths on this computer). */
         files?: import('./app/bots').BotAttachmentFile[];
-      }) => Promise<{ ok: boolean; seq?: number; error?: string; code?: string }>;
+      }) => Promise<{
+        ok: boolean;
+        seq?: number;
+        pendingAttachments?: import('./app/bots').BotAttachmentUploadStatus[];
+        error?: string;
+        code?: string;
+      }>;
+      getBotAttachmentStatuses?: (input?: {
+        botId?: string;
+      }) => Promise<{ ok: boolean; items?: import('./app/bots').BotAttachmentUploadStatus[]; error?: string }>;
+      retryBotAttachmentUpload?: (input: {
+        botId: string;
+        messageId: string;
+        pendingId: string;
+      }) => Promise<{ ok: boolean; item?: import('./app/bots').BotAttachmentUploadStatus; error?: string }>;
+      onBotAttachmentStatus?: (callback: (status: import('./app/bots').BotAttachmentUploadStatus) => void) => () => void;
       pickBotAttachments?: () => Promise<{ ok: boolean; files?: import('./app/bots').BotAttachmentFile[]; error?: string }>;
       saveBotAttachment?: (input: { name: string; data: string }) => Promise<{ ok: boolean; file?: import('./app/bots').BotAttachmentFile; error?: string }>;
       /** Read links (an hour) for library files in bot threads, by id (signed in). */

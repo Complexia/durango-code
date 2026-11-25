@@ -9,7 +9,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { DurangoError, accountKeyOf, createDurangoClient, normalizeBotLane } from '../src/main/durango-client.js';
+import { DurangoError, accountKeyOf, createDurangoClient, normalizeBotInbox, normalizeBotLane } from '../src/main/durango-client.js';
+import { createBotAttachmentManager } from '../src/main/bot-attachments.js';
 import { buildMachinePayload, createDispatchWorker } from '../src/main/durango-dispatch.js';
 import {
   botCacheColdMs,
@@ -2471,6 +2472,117 @@ try {
     );
     assert.equal(result.text, 'Deep answer.');
     assert.equal(sdk.runs[0].options.effort, 'xhigh');
+  });
+
+  await test('bot attachments: stage locally for instant handoff, upload in background, handle failure + retry, and never re-download local files', async () => {
+    const srcFile = path.join(testRoot, 'retina-shot.png');
+    const payload = Buffer.from('fake-png-bytes-5.9mb');
+    await fs.writeFile(srcFile, payload);
+    const stagingDir = path.join(testRoot, 'staged');
+    const events = [];
+    const uploadCalls = [];
+    const updateCalls = [];
+    let failNextUpload = true;
+
+    const manager = createBotAttachmentManager({
+      stagingDir,
+      client: {
+        uploadBotAttachment: async (args) => {
+          uploadCalls.push(args);
+          if (failNextUpload) throw new Error('Network dropped');
+          return {
+            part: {
+              type: 'asset',
+              asset: { id: 'asset_cloud_1', name: args.name, kind: 'image', contentType: args.contentType, byteSize: args.bytes.length },
+            },
+            attached: true,
+          };
+        },
+        updateBotMessageAttachment: async (args) => {
+          updateCalls.push(args);
+          return { ok: true };
+        },
+      },
+      onChange: (status) => events.push({ ...status }),
+      log: () => {},
+    });
+
+    // 1. Stage locally: instant copy, immediately resolvable by pendingId before upload finishes.
+    const staged = await manager.stageFiles({
+      botId: 'b1',
+      messageId: 'm1',
+      files: [{ path: srcFile, name: 'retina-shot.png', size: payload.length, contentType: 'image/png' }],
+    });
+    assert.equal(staged.length, 1);
+    assert.equal(staged[0].status, 'uploading');
+    const pendingId = staged[0].pendingId;
+    const localPath = manager.resolveLocalPath({ pendingId });
+    assert.ok(localPath, 'resolvable by pendingId immediately');
+    assert.deepEqual(await fs.readFile(localPath), payload);
+
+    // 2. Local reply reads the staged file straight away without downloading (even with local: true and no url).
+    const normalized = normalizeBotLane({
+      laneId: 'l1',
+      botId: 'b1',
+      attachments: [{ id: pendingId, pendingId, name: 'retina-shot.png', contentType: 'image/png', local: true }],
+    });
+    assert.equal(normalized.attachments.length, 1);
+    assert.equal(normalized.attachments[0].local, true);
+    let downloads = 0;
+    const replyDir = path.join(testRoot, 'reply-attachments');
+    const note1 = await saveLaneAttachments(normalized.attachments, replyDir, {
+      download: async () => {
+        downloads += 1;
+        throw new Error('should not download local file');
+      },
+      resolveLocalPath: (item) => manager.resolveLocalPath(item),
+    });
+    assert.equal(downloads, 0, 'never downloads a locally staged file');
+    assert.match(note1, /retina-shot\.png/);
+
+    // 3. Background upload fails: status flips to failed, canRetry=true, server notified so remote/cloud unblocks.
+    await manager.startUploads({ pendingIds: [pendingId], account: 'acct_1' });
+    assert.equal(uploadCalls.length, 1);
+    assert.equal(uploadCalls[0].botId, 'b1');
+    assert.equal(uploadCalls[0].messageId, 'm1');
+    assert.equal(uploadCalls[0].pendingId, pendingId);
+    const failedState = manager.listStatuses({ botId: 'b1' })[0];
+    assert.equal(failedState.status, 'failed');
+    assert.equal(failedState.canRetry, true);
+    assert.match(failedState.error, /Network dropped/);
+    assert.equal(updateCalls.some((c) => c.pendingId === pendingId && c.status === 'failed'), true);
+
+    // 4. Retry succeeds: flips to uploading then ready, maps assetId -> localPath so future local replies still skip download.
+    failNextUpload = false;
+    const retried = await manager.retryUpload({ botId: 'b1', messageId: 'm1', pendingId, account: 'acct_1' });
+    assert.equal(retried.ok, true);
+    await waitFor(() => manager.listStatuses({ botId: 'b1' })[0]?.status === 'ready', { label: 'retry ready' });
+    const readyState = manager.listStatuses({ botId: 'b1' })[0];
+    assert.equal(readyState.assetId, 'asset_cloud_1');
+    assert.equal(manager.resolveLocalPath({ id: 'asset_cloud_1' }), localPath, 'resolvable by assetId after upload');
+
+    const replyDir2 = path.join(testRoot, 'reply-attachments-after-upload');
+    const normalizedAfter = normalizeBotLane({
+      laneId: 'l2',
+      botId: 'b1',
+      attachments: [{ id: 'asset_cloud_1', pendingId, name: 'retina-shot.png', contentType: 'image/png', url: 'https://example.invalid/shot.png' }],
+    });
+    const note2 = await saveLaneAttachments(normalizedAfter.attachments, replyDir2, {
+      download: async () => {
+        downloads += 1;
+        throw new Error('should not re-download file uploaded from this Mac');
+      },
+      resolveLocalPath: (item) => manager.resolveLocalPath(item),
+    });
+    assert.equal(downloads, 0, 'still skips download after upload completes');
+    assert.match(note2, /retina-shot\.png/);
+
+    // 5. Mid-reply inbox preserves attachment metadata for local resolution.
+    const inbox = normalizeBotInbox([
+      { seq: 5, source: 'person', content: 'Look\n[attached: retina-shot.png]', attachments: [{ name: 'retina-shot.png', pendingId, status: 'uploading' }] },
+    ]);
+    assert.equal(inbox[0].attachments?.length, 1);
+    assert.equal(inbox[0].attachments[0].pendingId, pendingId);
   });
 } finally {
   await fs.rm(testRoot, { recursive: true, force: true });

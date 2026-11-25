@@ -33,7 +33,10 @@ const sameFiles = (a: DesktopBotMessage['files'], b: DesktopBotMessage['files'])
         file.size === other?.size &&
         file.assetId === other?.assetId &&
         file.path === other?.path &&
-        file.contentType === other?.contentType
+        file.contentType === other?.contentType &&
+        file.pendingId === other?.pendingId &&
+        file.status === other?.status &&
+        file.error === other?.error
       );
     }));
 
@@ -86,6 +89,12 @@ export const botPollCursor = (messages: DesktopBotMessage[], live: DesktopBotLiv
     if (typeof reply.seq === 'number' && reply.seq <= cursor) cursor = Math.min(cursor, reply.seq - 1);
     // Its messages so far are read again: cards are added to them while it runs and when it ends.
     if (typeof reply.firstSeq === 'number' && reply.firstSeq <= cursor) cursor = Math.min(cursor, reply.firstSeq - 1);
+  }
+  // Messages with attachments still uploading are re-read until they resolve (assetId or failed).
+  for (const message of messages) {
+    if (message.seq <= cursor && message.files?.some((file) => file.status === 'uploading')) {
+      cursor = Math.min(cursor, message.seq - 1);
+    }
   }
   return cursor;
 };
