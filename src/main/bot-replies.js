@@ -150,6 +150,11 @@ export const BOT_PROGRESS_THROTTLE_MS = 1_000;
 export const BOT_CLAIM_WAIT_MS = 25_000;
 export const BOT_INBOX_HEADER =
   "(Bot inbox: arrived while you were working. Take it into what you're doing and answer it in this reply too.)";
+export const BOT_FINAL_INBOX_HEADER =
+  "(Bot inbox: arrived before your final answer was posted. Your draft above wasn't sent — take this into account and write a single final answer covering everything that needs an answer.)";
+// Maximum extra rounds a reply takes when new person messages arrive right
+// before its final answer is posted (Durango's BOT_FINAL_INBOX_MAX_ROUNDS).
+export const BOT_FINAL_INBOX_MAX_ROUNDS = 2;
 export const BOT_FAILURE_MAX_CHARS = 500;
 const MAX_BACKOFF_MS = 60_000;
 const OFFLINE_RECHECK_MS = 15_000;
@@ -158,14 +163,21 @@ const REPORT_RETRY_DELAYS_MS = [1_000, 4_000, 10_000];
 
 const BOT_TOOL_PREFIX = `mcp__${BOT_MCP_SERVER}__`;
 
+const formatBotInboxItems = (items) =>
+  items.map((item) =>
+    item.source === 'person' ? item.content : `[${item.label || item.source}]\n${item.content}`
+  );
+
 /** One inbox batch as the user message the running session reads. */
-export const formatBotInbox = (items) =>
-  [
-    BOT_INBOX_HEADER,
-    ...items.map((item) =>
-      item.source === 'person' ? item.content : `[${item.label || item.source}]\n${item.content}`
-    ),
-  ].join('\n\n');
+export const formatBotInbox = (items) => [BOT_INBOX_HEADER, ...formatBotInboxItems(items)].join('\n\n');
+
+/**
+ * One inbox batch claimed right before posting the final answer: when
+ * `replacedDraft` is true, the unposted draft text was discarded so the model
+ * writes one cohesive final answer covering everything.
+ */
+export const formatBotFinalInbox = (items, { replacedDraft = false } = {}) =>
+  replacedDraft ? [BOT_FINAL_INBOX_HEADER, ...formatBotInboxItems(items)].join('\n\n') : formatBotInbox(items);
 
 const CLAUDE_BOT_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
@@ -506,6 +518,7 @@ export const createClaudeLaneRunner = ({
   sessionResetTokens = BOT_SESSION_RESET_TOKENS,
   sessionMaxTokens = BOT_SESSION_MAX_TOKENS,
   sessionColdMs = null,
+  maxFinalInboxRounds = BOT_FINAL_INBOX_MAX_ROUNDS,
   log = (...args) => console.info('[bot replies]', ...args),
 }) => async (lane, ctx) => {
   const accessMode = ctx.accessMode || 'read-only';
@@ -648,6 +661,7 @@ export const createClaudeLaneRunner = ({
   // afterwards. Without it (a task), everything it writes is one text.
   const sendsMessages = typeof ctx.sendMessage === 'function';
   const blocks = []; // finished text blocks of the message being written (main loop)
+  let finalStart = 0; // blocks index where text after the last tool call begins
   let partial = ''; // the text block streaming now
   const toolCalls = new Map(); // tool_use id -> tool name (main loop)
   let sentCount = 0; // messages sent before the final answer
@@ -674,6 +688,7 @@ export const createClaudeLaneRunner = ({
     const index = sentCount;
     sentCount += 1;
     blocks.length = 0;
+    finalStart = 0;
     const modelId = durangoModelIdForClaude(modelOfReply);
     // Screenshots and files it names are attached (with its final answer, or
     // its last message); their local embeds leave the text.
@@ -731,10 +746,11 @@ export const createClaudeLaneRunner = ({
   const deliveredSeqs = []; // inbox messages the session read
   const deliveredItems = []; // ...and the items themselves (handed back if the attempt is redone)
   let inboxRequest = null;
-  const requestInbox = () => {
+  let finalInboxRounds = 0;
+  const requestInbox = (options) => {
     if (inboxRequest) return inboxRequest;
     inboxRequest = Promise.resolve()
-      .then(() => ctx.takeInbox())
+      .then(() => ctx.takeInbox(options))
       .then(
         (items) => {
           if (Array.isArray(items)) pendingInbox.push(...items);
@@ -757,7 +773,7 @@ export const createClaudeLaneRunner = ({
   const deliverAtToolResult = (hookEventName) => async (input) => {
     if (input?.agent_id) return { continue: true };
     const items = takePending();
-    void requestInbox();
+    if (finalInboxRounds < maxFinalInboxRounds) void requestInbox();
     if (!items.length) return { continue: true };
     return { hookSpecificOutput: { hookEventName, additionalContext: formatBotInbox(items) } };
   };
@@ -869,11 +885,6 @@ export const createClaudeLaneRunner = ({
           if (message.error) attempt.assistantError = message.error;
           const synthetic = Boolean(message.error) || message.message?.model === '<synthetic>';
           const id = message.message?.id ?? null;
-          if (!synthetic && id !== lastAssistantId) {
-            lastAssistantId = id;
-            // A new step: take what arrived meanwhile, read at its next tool result.
-            void requestInbox();
-          }
           if (!synthetic && id !== stepId) {
             stepId = id;
             stepMessage = null;
@@ -885,9 +896,15 @@ export const createClaudeLaneRunner = ({
               partial = '';
             } else if (block?.type === 'tool_use' && block.id) {
               attempt.usedTools = true;
+              if (!synthetic && id !== lastAssistantId) {
+                lastAssistantId = id;
+                // A tool step: take what arrived meanwhile, read at its next tool result.
+                if (finalInboxRounds < maxFinalInboxRounds) void requestInbox();
+              }
               toolCalls.set(block.id, block.name);
               // The step's text is a message of its own, sent as its first call starts.
               if (stepMessage === null) stepMessage = sendPending();
+              finalStart = blocks.length;
               noteToolCall(block.id);
             }
           }
@@ -910,18 +927,33 @@ export const createClaudeLaneRunner = ({
           partial = '';
           toolCalls.clear();
           if (message.is_error || message.subtype !== 'success') break;
-          // Before finishing: anything that reached the bot meanwhile continues
-          // this reply (like a steer at a turn's end).
+          // Before posting the final answer: check for unclaimed new messages
+          // from the person (capped so a burst never loops forever).
           if (inboxRequest) await inboxRequest;
-          await requestInbox();
+          if (finalInboxRounds < maxFinalInboxRounds && !ctx.signal?.aborted) {
+            await requestInbox({ beforeFinish: true });
+          }
           if (ctx.signal?.aborted) break;
           const items = takePending();
           if (!items.length) break;
+          finalInboxRounds += 1;
           attempt.result = null;
-          // What it answered so far is a message of its own; the reply goes on.
-          sendPending();
-          update();
-          inputQueue.push(userMessage(formatBotInbox(items)));
+          if (items.some((item) => item?.source === 'person')) {
+            // Discard the unposted final draft so the bot writes a single
+            // cohesive final answer covering the new message(s) instead of
+            // posting two separate replies (e.g. "He" then "Hey").
+            const hadDraft = blocks.slice(finalStart).some((part) => String(part ?? '').trim());
+            blocks.length = finalStart;
+            update();
+            inputQueue.push(userMessage(formatBotFinalInbox(items, { replacedDraft: hadDraft })));
+          } else {
+            // Non-person items (e.g. a routine already claimed mid-reply):
+            // keep what was answered so far as its own message and go on.
+            sendPending();
+            finalStart = blocks.length;
+            update();
+            inputQueue.push(userMessage(formatBotInbox(items)));
+          }
         }
       }
     } catch (error) {
@@ -963,6 +995,8 @@ export const createClaudeLaneRunner = ({
   const startOver = async (nextPlan) => {
     plan = nextPlan;
     blocks.length = 0;
+    finalStart = 0;
+    finalInboxRounds = 0;
     partial = '';
     toolCalls.clear();
     // Messages the failed attempt was handed (at its turn's end) are this
@@ -1394,7 +1428,7 @@ export const createBotReplyWorker = ({
     };
 
     // Progress posts go out one at a time, in order. → the inbox items it took.
-    const send = (takeInbox) => {
+    const send = (takeInbox, { beforeFinish = false } = {}) => {
       const next = entry.chain.then(async () => {
         if (abort.signal.aborted) return [];
         entry.dirty = false;
@@ -1415,6 +1449,7 @@ export const createBotReplyWorker = ({
               ...(entry.activeTool ? { activeTool: entry.activeTool } : {}),
               takeInbox: Boolean(takeInbox),
               ...(takeId ? { takeId } : {}),
+              ...(beforeFinish ? { beforeFinish: true } : {}),
             })
           );
           if (takeId) entry.pendingTakeId = null;
@@ -1437,6 +1472,9 @@ export const createBotReplyWorker = ({
             entry.seenSeqs.add(item.seq);
           }
           items.push(item);
+        }
+        if (beforeFinish && items.some((item) => item?.source === 'person')) {
+          entry.text = '';
         }
         return items;
       });
@@ -1777,7 +1815,7 @@ export const createBotReplyWorker = ({
           signal: abort.signal,
           accessMode: settings.accessMode,
           update,
-          takeInbox: () => send(true),
+          takeInbox: (options) => send(true, options),
           callTool,
           // A Durango that stores a reply's messages one by one (the job's `messages`).
           ...(lane.messages ? { sendMessage } : {}),

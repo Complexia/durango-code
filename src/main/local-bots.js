@@ -1162,19 +1162,36 @@ export const createLocalBotEngine = ({
     return { seq: message.seq, source, label: message.authorLabel, content: message.content };
   };
 
-  /** Claims every unanswered inbox message for `reply`. */
-  const claim = (entry, reply) => {
-    const items = unclaimed(entry);
-    if (!items.length) {
+  /** Claims unanswered inbox messages for `reply`. With `beforeFinish`, claims only messages from the person and clears the draft place/text so the final answer rewrites below them. */
+  const claim = (entry, reply, { beforeFinish = false } = {}) => {
+    const allUnclaimed = unclaimed(entry);
+    if (!allUnclaimed.length) {
       // Requeued seqs whose messages are gone (trimmed): nothing to answer.
       if (entry.bot.requeue?.length) entry.bot.requeue = [];
       return [];
     }
+    const items = beforeFinish
+      ? allUnclaimed.filter((message) => inboxSourceOf(message.authorLabel) === 'person')
+      : allUnclaimed;
+    if (!items.length) return [];
     const seqs = items.map((message) => message.seq);
     entry.bot.processedSeq = Math.max(entry.bot.processedSeq, ...seqs);
-    entry.bot.requeue = (entry.bot.requeue ?? []).filter((seq) => !seqs.includes(seq));
+    const skippedBefore = beforeFinish
+      ? allUnclaimed
+          .filter((message) => inboxSourceOf(message.authorLabel) !== 'person' && message.seq <= entry.bot.processedSeq)
+          .map((message) => message.seq)
+      : [];
+    entry.bot.requeue = [
+      ...new Set([...(entry.bot.requeue ?? []).filter((seq) => !seqs.includes(seq)), ...skippedBefore]),
+    ].sort((a, b) => a - b);
     entry.bot.inFlight = [...new Set([...(entry.bot.inFlight ?? []), ...seqs])];
     for (const message of items) reply.claimSeqs.push(message.seq);
+    if (beforeFinish) {
+      // The draft final answer is replaced instead of posted, so clear its
+      // reserved place and live text; the rewritten answer places below these.
+      reply.seq = undefined;
+      reply.text = '';
+    }
     // A reply is sent as messages: the one showing now keeps its place (it was
     // written before these were read); what it writes after reading them is
     // its next message, which takes the next free place, below them.
@@ -1479,7 +1496,7 @@ export const createLocalBotEngine = ({
           reply.activeTool = activeTool || null;
           changed();
         },
-        takeInbox: async () => (reply.abort.signal.aborted ? [] : claim(entry, reply).map(inboxItem)),
+        takeInbox: async (options) => (reply.abort.signal.aborted ? [] : claim(entry, reply, options).map(inboxItem)),
         callTool: async ({ name, input, message }) => {
           // A card goes on the message it was made with (or the reply's next one).
           const shown = localCard(name, input, `ui-${reply.id}-${cardCount}`);

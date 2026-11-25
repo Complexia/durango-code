@@ -14,6 +14,8 @@ import { buildMachinePayload, createDispatchWorker } from '../src/main/durango-d
 import {
   botCacheColdMs,
   botClaudeEnv,
+  BOT_FINAL_INBOX_HEADER,
+  BOT_FINAL_INBOX_MAX_ROUNDS,
   BOT_INBOX_HEADER,
   BOT_REPLIES_CAPABILITY,
   BOT_REPLY_MESSAGES_FEATURE,
@@ -1766,6 +1768,69 @@ try {
     assert.equal(lastTake.text, 'Working on it.\n\nDone, and the weather is sunny.\n\nDigest: all quiet.', 'final take right before finishing');
   });
 
+  await test('quick back-to-back messages (He -> Hey) with no tool calls discard the draft greeting and answer once', async () => {
+    let beforeFinishCalls = 0;
+    const sdk = createFakeSdk(async function* ({ next }) {
+      const first = await next();
+      assert.equal(textOf(first), 'He');
+      yield init('claude-opus-5-5');
+      // Quick tool-free answer to "He".
+      yield assistant('a1', [{ type: 'text', text: 'Hey! What can I help you with?' }]);
+      yield success();
+      // Pre-finish check claimed "Hey" and discarded the unposted draft.
+      const continuation = await next();
+      assert.ok(continuation, 'continuation pushed with Hey');
+      assert.equal(textOf(continuation), `${BOT_FINAL_INBOX_HEADER}\n\nHey`);
+      yield assistant('a2', [{ type: 'text', text: "Hey! What's up?" }]);
+      yield success();
+    });
+    const client = createFakeClient({
+      claim: laneClaims([makeLane({ prompt: 'He', messages: true })]),
+      progress: (input) => {
+        if (!input.takeInbox) return { stop: false, inbox: [] };
+        assert.equal(input.beforeFinish, true, 'quick tool-free reply only checks inbox with beforeFinish');
+        beforeFinishCalls += 1;
+        if (beforeFinishCalls === 1) return { stop: false, inbox: [{ seq: 1, source: 'person', label: null, content: 'Hey' }] };
+        return { stop: false, inbox: [] };
+      },
+    });
+    startWorker({ client, runLane: sdkRunner(sdk) });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(beforeFinishCalls, 2);
+    // Crucial: the draft greeting was NOT sent as an earlier message.
+    assert.deepEqual(client.calls.message, []);
+    assert.equal(client.calls.finish[0].text, "Hey! What's up?");
+    assert.equal(sdk.runs[0].inputs.length, 2);
+  });
+
+  await test('messages arriving during the pre-finish check are capped at BOT_FINAL_INBOX_MAX_ROUNDS (never loops forever)', async () => {
+    let takeCount = 0;
+    const sdk = createFakeSdk(async function* ({ next }) {
+      await next();
+      yield init('claude-opus-5-5');
+      for (let round = 0; ; round += 1) {
+        yield assistant(`a${round}`, [{ type: 'text', text: `Reply round ${round}` }]);
+        yield success();
+        if (!(await next())) return;
+      }
+    });
+    const client = createFakeClient({
+      claim: laneClaims([makeLane({ prompt: 'He', messages: true })]),
+      progress: (input) => {
+        if (!input.takeInbox) return { stop: false, inbox: [] };
+        takeCount += 1;
+        // Every check returns another new person message.
+        return { stop: false, inbox: [{ seq: takeCount, source: 'person', label: null, content: `followup ${takeCount}` }] };
+      },
+    });
+    startWorker({ client, runLane: sdkRunner(sdk) });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(takeCount, BOT_FINAL_INBOX_MAX_ROUNDS);
+    assert.equal(sdk.runs[0].inputs.length, 1 + BOT_FINAL_INBOX_MAX_ROUNDS);
+    assert.deepEqual(client.calls.message, []);
+    assert.equal(client.calls.finish[0].text, `Reply round ${BOT_FINAL_INBOX_MAX_ROUNDS}`);
+  });
+
   await test('stop from Durango aborts the run without a finish', async () => {
     let aborted = false;
     const sdk = createFakeSdk(async function* ({ next, aborted: abortedPromise }) {
@@ -2125,7 +2190,8 @@ try {
     const fresh = sdk.runs[runs + 1];
     assert.equal(fresh.options.resume, undefined);
     assert.match(textOf(fresh.inputs[1]), /also: the second thing/, 'the message the failed attempt read goes to the fresh one');
-    assert.equal(retried.text, 'Done.\n\nAnd that too.');
+    assert.ok(textOf(fresh.inputs[1]).startsWith(BOT_FINAL_INBOX_HEADER), 'unposted draft was discarded before rewriting');
+    assert.equal(retried.text, 'And that too.');
   });
 
   await test('a reply whose setup fails leaves its bot\'s kept session free', async () => {

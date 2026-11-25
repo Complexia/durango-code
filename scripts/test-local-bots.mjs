@@ -281,6 +281,40 @@ test('messages sent mid-reply are taken in between steps', async () => {
   assert.equal(runner.lanes.length, 1, 'no extra reply');
 });
 
+test('pre-finish check in local bots claims back-to-back person messages, resets draft seq below them, and skips routines', async () => {
+  const { engine, runner, sleeper } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'he', content: 'He' });
+  await waitFor(() => runner.lanes.length === 1);
+  const run = runner.lanes[0];
+  // Draft text reserves seq 2.
+  run.ctx.update({ text: 'Hey! What can I help you with?' });
+  assert.equal((await engine.thread(primary.id)).live[0].seq, 2);
+  // A second message from the person arrives at seq 3 while replying.
+  await engine.send(primary.id, { messageId: 'hey', content: 'Hey' });
+  const taken = await run.ctx.takeInbox({ beforeFinish: true });
+  assert.deepEqual(taken, [{ seq: 3, source: 'person', label: null, content: 'Hey' }]);
+  // Draft place and live text were cleared so the rewritten final answer sits below "Hey".
+  assert.equal((await engine.thread(primary.id)).live[0].seq, null);
+  assert.equal((await engine.thread(primary.id)).live[0].content, '');
+  // Parallel timer wakes up and finds nothing waiting.
+  sleeper.release();
+  await delay(5);
+  assert.equal(runner.lanes.length, 1);
+  run.finish({ text: "Hey! What's up?" });
+  await engine.idle();
+  const thread = await engine.thread(primary.id);
+  assert.deepEqual(
+    thread.messages.map((message) => [message.seq, message.role, message.content]),
+    [
+      [1, 'user', 'He'],
+      [3, 'user', 'Hey'],
+      [4, 'assistant', "Hey! What's up?"],
+    ]
+  );
+  assert.equal(runner.lanes.length, 1, 'single reply answered both messages');
+});
+
 test('a message not taken in within 5 s gets a parallel reply (at most 2)', async () => {
   const { engine, runner, sleeper } = makeEngine();
   const [primary] = (await engine.list()).bots;
