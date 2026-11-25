@@ -1160,12 +1160,32 @@ test('projects get no bot on their own: create_bot with a project makes it; note
     ['Prices are in AUD.', 'Ships on Fridays.']
   );
   // Direct createProjectBot API also creates additional bots for a project.
-  const fourth = await engine.createProjectBot({ name: 'Shop', projectId: 'proj_7', repoId: 'repo_shop', botName: 'Release' });
+  const fourth = await engine.createProjectBot({ name: 'Shop', projectId: 'proj_7', repoId: 'repo_shop', botName: 'Release', emoji: '🚀' });
   assert.equal(fourth.name, 'Release');
+  assert.equal(fourth.emoji, '🚀');
   assert.equal(fourth.project.key, 'repo:repo_shop');
+  // Direct createBot API creates a standalone (projectless) bot with optional job and emoji.
+  const scout = await engine.createBot({ name: 'X Reply Scout', job: 'Find high-signal posts to reply to.', emoji: '🔎' });
+  assert.equal(scout.name, 'X Reply Scout');
+  assert.equal(scout.job, 'Find high-signal posts to reply to.');
+  assert.equal(scout.emoji, '🔎');
+  assert.equal(scout.project, null);
+  const minimal = await engine.createBot({ name: 'Quick Helper' });
+  assert.equal(minimal.name, 'Quick Helper');
+  assert.equal(minimal.job, '');
+  assert.equal(minimal.emoji, null);
+  assert.equal(minimal.project, null);
+  await assert.rejects(() => engine.createBot({ name: '   ' }), /Enter a name for the bot/);
   assert.equal((await call('create_bot', { name: 'X' })).ok, false, 'a plain bot still needs a job');
   runner.lanes[0].finish({ text: 'Done.' });
   await engine.idle();
+});
+
+test('hasDataToSync includes newly created local projectless bots', async () => {
+  const { engine } = makeEngine();
+  assert.equal(await engine.hasDataToSync(), false);
+  await engine.createBot({ name: 'News Digest', emoji: '🗞️' });
+  assert.equal(await engine.hasDataToSync(), true);
 });
 
 test('thread tools: list and read threads, message_thread is a follow-up reported like a task', async () => {

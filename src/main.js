@@ -6119,6 +6119,36 @@ ipcMain.handle('bots:ensureProjectBot', async (_event, input) => {
   }
 });
 
+// Creates a standalone (projectless) bot.
+ipcMain.handle('bots:create', async (_event, input) => {
+  const name = typeof input?.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 40) : '';
+  if (!name) return { ok: false, error: 'Enter a name for the bot.' };
+  const job = typeof input?.job === 'string' && input.job.trim() ? input.job.trim().slice(0, 8_000) : undefined;
+  const emoji = typeof input?.emoji === 'string' && input.emoji.trim() ? input.emoji.trim().slice(0, 8) : undefined;
+  const model = typeof input?.model === 'string' && input.model.trim() ? input.model.trim().slice(0, 80) : undefined;
+  const local = await localBotsMode();
+  try {
+    if (local) {
+      return {
+        ok: true,
+        bot: await localBots.createBot({ name, job, emoji, model }),
+      };
+    }
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const bot = await durangoClient.createBot({
+      name,
+      ...(job ? { job } : {}),
+      ...(emoji ? { emoji } : {}),
+      ...(model ? { model } : {}),
+      ...(timeZone ? { timeZone } : {}),
+    });
+    botReplyWorker.wake();
+    return { ok: true, bot };
+  } catch (error) {
+    return local ? localBotsIpcError(error) : durangoIpcError(error);
+  }
+});
+
 // Creates an additional bot in a project (a project open here, or a remote project by key/repoId).
 ipcMain.handle('bots:createProjectBot', async (_event, input) => {
   const projectId = typeof input?.projectId === 'string' ? input.projectId : '';

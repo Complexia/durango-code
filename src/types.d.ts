@@ -2077,6 +2077,7 @@ type OrionCodexBrowserIntegrationStatus = {
       deleteBot?: (input: { botId: string }) => Promise<import('./app/bots').DeleteBotResult>;
       clearBot?: (input: { botId: string }) => Promise<import('./app/bots').ClearBotResult>;
       getBotThread?: (input: { botId: string; limit?: number; read?: boolean; beforeSeq?: number; afterSeq?: number }) => Promise<import('./app/bots').BotThreadResult>;
+      createBot?: (input: import('./app/bots').CreateBotInput) => Promise<import('./app/bots').EnsureProjectBotResult>;
       ensureProjectBot?: (input: { projectId: string }) => Promise<import('./app/bots').EnsureProjectBotResult>;
       createProjectBot?: (input: import('./app/bots').CreateProjectBotInput) => Promise<import('./app/bots').EnsureProjectBotResult>;
       getBotProject?: (input: import('./app/bots').BotProjectTarget) => Promise<import('./app/bots').BotProjectResult>;

@@ -42,6 +42,12 @@ export type BotProjectResult = { ok: boolean; project?: BotProject | null; error
 /** Whose notes and files: a project bot's, or a project open here (it needs no bot). */
 export type BotProjectTarget = { botId: string; projectId?: never } | { projectId: string; botId?: never };
 export type EnsureProjectBotResult = { ok: boolean; bot?: DesktopBot; error?: string; code?: string };
+export type CreateBotInput = {
+  name: string;
+  job?: string;
+  emoji?: string;
+  model?: string;
+};
 export type CreateProjectBotInput = {
   projectId?: string;
   project?: { key: string; name: string; repoId?: string | null };

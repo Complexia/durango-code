@@ -1869,6 +1869,25 @@ export const createLocalBotEngine = ({
     };
   };
 
+  const createBot = async ({ name, job, emoji, model }) => {
+    await ensurePrimary();
+    const cleanName = clip(oneLine(name), 40);
+    if (!cleanName) throw new LocalBotError('invalid', 'Enter a name for the bot.');
+    const cleanJob = str(job).trim().slice(0, 8_000);
+    const entry = createBotEntry({
+      name: cleanName,
+      job: cleanJob,
+      emoji: clip(oneLine(emoji), 8) || null,
+      model: model ?? null,
+      project: null,
+    });
+    if (model && claudeModelFrom(model)) {
+      entry.bot.modelChosen = true;
+      persistBot(entry, { messages: false });
+    }
+    return entry;
+  };
+
   const createProjectBot = async ({ name, projectId, repoId, machineId, botName, job, emoji, model }) => {
     await ensurePrimary();
     await loadProjects();
@@ -2660,7 +2679,7 @@ export const createLocalBotEngine = ({
       await ensureLoaded();
       await loadProjects();
       return (
-        [...entries.values()].some((entry) => entry.messages.length > 0 || entry.bot.project) ||
+        [...entries.values()].some((entry) => entry.messages.length > 0 || entry.bot.project || entry.bot.role !== 'primary') ||
         Object.values(projectStore).some((record) => (record?.notes ?? []).length > 0 || (record?.files ?? []).length > 0)
       );
     },
@@ -2676,6 +2695,10 @@ export const createLocalBotEngine = ({
           files: (record?.files ?? []).map((file) => ({ name: file.name, path: filePath({ key }, file.name), contentType: file.contentType })),
         }))
         .filter((item) => item.files.length);
+    },
+    /** Creates a standalone (projectless) bot on this device. */
+    async createBot(input = {}) {
+      return toDesktopBot(await createBot(input));
     },
     /** The project's bot on this device, created the first time: `{ name, projectId, repoId?, machineId? }`. */
     async ensureProjectBot(input = {}) {

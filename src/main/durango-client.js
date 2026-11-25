@@ -933,6 +933,12 @@ export const createDurangoClient = ({
       }
       return out;
     },
+    /** Creates a new standalone (projectless) bot: `{ name, job?, emoji?, model?, timeZone? }` → the bot. */
+    async createBot(body) {
+      const data = await request('POST', '/bots', { body });
+      if (!data.bot || typeof data.bot !== 'object') throw new DurangoError('api', errorMessageFrom(data) || 'Durango did not return the new bot.');
+      return data.bot;
+    },
     /** A project's bot, created the first time: `{ name, repoId?, machineId?, projectId?, timeZone? }` → the bot. */
     async ensureProjectBot(body) {
       const data = await request('POST', '/bots/projects', { body });
@@ -1411,6 +1417,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     },
     async botThread() {
       return { bot: null, messages: [], live: [], hasMore: false };
+    },
+    async createBot() {
+      throw new DurangoError('api', 'Mock Durango cannot create bots.');
     },
     async ensureProjectBot() {
       throw new DurangoError('api', 'Mock Durango has no project bots.');

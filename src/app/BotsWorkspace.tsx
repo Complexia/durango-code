@@ -7,6 +7,7 @@ import {
   Bot,
   CalendarClock,
   Check,
+  ChevronDown,
   ChevronRight,
   Clock,
   Copy,
@@ -251,27 +252,55 @@ type ProjectEntry = {
 
 /** A project group in the Bots sidebar (expandable menu of bots under a project). */
 type SidebarProjectGroup = {
-  /** Unique collapse key (the project key, or "other" for standalone bots). */
+  /** Unique collapse key (the project key). */
   groupKey: string;
   name: string;
   /** Store project id when open on this computer, else null. */
   projectId: string | null;
   path: string | null;
   repoId: string | null;
-  /** True for a real project group; false for standalone non-project bots. */
-  isProject: boolean;
   bots: DesktopBot[];
   latestActivityAt: number;
 };
 
-/** Target passed to the "New bot in <project>" modal. */
-type NewProjectBotTarget = {
+/** A project option selectable inside the New Bot modal. */
+type NewBotProjectOption = {
+  /** Store project id when open on this computer, else null. */
   projectId: string | null;
   key: string | null;
   name: string;
+  path: string | null;
   repoId: string | null;
   existingNames: string[];
 };
+
+/** State for opening the New Bot modal (pre-associated with a project, or projectless). */
+type NewBotTarget = {
+  project: NewBotProjectOption | null;
+};
+
+/** Curated icon choices for the bot icon picker (1–2 code points each so every client renders them identically). */
+const BOT_ICON_OPTIONS = [
+  '🤖',
+  '🧭',
+  '💼',
+  '📬',
+  '📈',
+  '🔎',
+  '🗞️',
+  '🛠️',
+  '🎯',
+  '🧠',
+  '⚡',
+  '🚀',
+  '🎨',
+  '📝',
+  '🔒',
+  '🧪',
+  '📣',
+  '💡',
+  '🌐',
+] as const;
 
 const suggestProjectBotName = (projectName: string, existingNames: readonly string[]): string => {
   const base = projectName.replace(/\s+/g, ' ').trim().slice(0, 40) || 'Project';
@@ -306,7 +335,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const [listError, setListError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [renamingBotId, setRenamingBotId] = useState<string | null>(null);
-  const [creatingForProject, setCreatingForProject] = useState<NewProjectBotTarget | null>(null);
+  const [creatingBot, setCreatingBot] = useState<NewBotTarget | null>(null);
   const [clearedEpochs, setClearedEpochs] = useState<Record<string, number>>({});
   const collapsedBotProjects = v3?.collapsedBotProjects ?? [];
   const collapsedSet = useMemo(() => new Set(collapsedBotProjects), [collapsedBotProjects]);
@@ -406,10 +435,9 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     setSidebarV3Settings({ selectedBotId: bots[0].id, view: 'bot' });
   }, [bots, selectedBotId, setSidebarV3Settings, view]);
 
-  // Primary bot(s) stay pinned at the top; project bots are grouped into
-  // expandable menus by project; standalone bots (no project) sit in an
-  // expandable "Other" group below if any exist.
-  const { primaryBots, sidebarProjectGroups } = useMemo(() => {
+  // Primary bot(s) stay pinned at the top; projectless (standalone) bots sit
+  // directly below them; project bots are grouped into expandable menus by project.
+  const { primaryBots, standaloneBots, sidebarProjectGroups } = useMemo(() => {
     const list = bots ?? [];
     const primary = list.filter((bot) => bot.role === 'primary');
     const rest = list.filter((bot) => bot.role !== 'primary');
@@ -435,7 +463,6 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             projectId: local?.id ?? null,
             path: local?.path ?? null,
             repoId: bot.project.repoId ?? null,
-            isProject: true,
             bots: [],
             latestActivityAt: 0,
           };
@@ -448,27 +475,15 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       }
     }
 
+    standalone.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+
     const groups = [...byProject.values()];
     for (const group of groups) {
       group.bots.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
     }
     groups.sort((a, b) => b.latestActivityAt - a.latestActivityAt || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
 
-    if (standalone.length > 0) {
-      standalone.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-      groups.push({
-        groupKey: 'other',
-        name: 'Other',
-        projectId: null,
-        path: null,
-        repoId: null,
-        isProject: false,
-        bots: standalone,
-        latestActivityAt: standalone[0]?.lastActivityAt ?? 0,
-      });
-    }
-
-    return { primaryBots: primary, sidebarProjectGroups: groups };
+    return { primaryBots: primary, standaloneBots: standalone, sidebarProjectGroups: groups };
   }, [bots, projectKeys, projects]);
 
   const threadsByProject = useMemo(() => {
@@ -546,6 +561,22 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     });
     return [...here, ...elsewhere];
   }, [bots, projectKeys, projects, threads, threadsByProject]);
+
+  // Every project selectable in the New Bot modal (local projects + remote projects with bots).
+  const newBotProjectOptions = useMemo<NewBotProjectOption[]>(
+    () =>
+      projectEntries
+        .filter((entry) => !entry.id.startsWith('bot:') && (!entry.id.startsWith('project:') || Boolean(entry.key)))
+        .map((entry) => ({
+          projectId: !entry.id.startsWith('project:') ? entry.id : null,
+          key: entry.key,
+          name: entry.name,
+          path: entry.path,
+          repoId: entry.repoId,
+          existingNames: entry.bots.map((item) => item.name),
+        })),
+    [projectEntries]
+  );
 
   const openBot = (botId: string) => setSidebarV3Settings({ selectedBotId: botId, view: 'bot' });
   // A thread opened from a project page shows in the usual thread view (the
@@ -760,7 +791,19 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             </div>
           ) : (
             <div className="px-1.5 pb-3">
-              {primaryBots.length > 0 && (
+              <div className="mb-1 flex h-7 items-center justify-between px-2">
+                <span className="text-[11px] font-medium tracking-[0.02em] text-neutral-500">Bots</span>
+                <button
+                  type="button"
+                  title="New bot"
+                  aria-label="New bot"
+                  onClick={() => setCreatingBot({ project: null })}
+                  className="inline-flex h-6 w-6 items-center justify-center rounded-md text-neutral-400 transition-colors duration-75 hover:bg-white/[0.08] hover:text-neutral-100"
+                >
+                  <Plus size={14} />
+                </button>
+              </div>
+              {(primaryBots.length > 0 || standaloneBots.length > 0) && (
                 <ul className="space-y-px">
                   {primaryBots.map((bot) => (
                     <li key={bot.id}>
@@ -778,6 +821,23 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                       />
                     </li>
                   ))}
+                  {standaloneBots.map((bot) => (
+                    <li key={bot.id}>
+                      <BotRow
+                        bot={bot}
+                        projectPath={null}
+                        title={bot.job ? `${bot.name} — ${bot.job.slice(0, 100)}` : bot.name}
+                        active={view === 'bot' && selectedBotId === bot.id}
+                        renaming={renamingBotId === bot.id}
+                        onClick={() => openBot(bot.id)}
+                        onStartRename={() => setRenamingBotId(bot.id)}
+                        onEndRename={() => setRenamingBotId((current) => (current === bot.id ? null : current))}
+                        onRename={(name) => void handleRenameBot(bot, name)}
+                        onClear={() => void handleClearBot(bot)}
+                        onDelete={() => void handleDeleteBot(bot)}
+                      />
+                    </li>
+                  ))}
                 </ul>
               )}
               {sidebarProjectGroups.map((group, index) => {
@@ -788,7 +848,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                 return (
                   <section
                     key={group.groupKey}
-                    className={index === 0 && primaryBots.length === 0 ? '' : 'mt-2.5'}
+                    className={index === 0 && primaryBots.length === 0 && standaloneBots.length === 0 ? '' : 'mt-2.5'}
                     aria-label={group.name}
                   >
                     <div className="group/proj flex h-7 items-center gap-1 rounded-md pr-1">
@@ -803,14 +863,10 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                           className={`shrink-0 text-neutral-500 transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`}
                           aria-hidden
                         />
-                        {group.isProject ? (
-                          group.path ? (
-                            <ProjectBadge project={{ name: group.name, path: group.path }} size={13} />
-                          ) : (
-                            <ProjectMonogram name={group.name} size={13} />
-                          )
+                        {group.path ? (
+                          <ProjectBadge project={{ name: group.name, path: group.path }} size={13} />
                         ) : (
-                          <Bot size={11} className="shrink-0 text-neutral-500" aria-hidden />
+                          <ProjectMonogram name={group.name} size={13} />
                         )}
                         <span className="min-w-0 flex-1 truncate text-[11px] font-medium tracking-[0.01em] text-neutral-500 transition-colors duration-75 group-hover/proj:text-neutral-300">
                           {group.name}
@@ -829,26 +885,27 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                           </span>
                         )}
                       </button>
-                      {group.isProject && (
-                        <button
-                          type="button"
-                          title={`New bot in ${group.name}`}
-                          aria-label={`New bot in ${group.name}`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setCreatingForProject({
+                      <button
+                        type="button"
+                        title={`New bot in ${group.name}`}
+                        aria-label={`New bot in ${group.name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setCreatingBot({
+                            project: {
                               projectId: group.projectId,
                               key: group.groupKey,
                               name: group.name,
+                              path: group.path,
                               repoId: group.repoId,
                               existingNames: group.bots.map((bot) => bot.name),
-                            });
-                          }}
-                          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity duration-75 hover:bg-white/[0.08] hover:text-neutral-200 focus-visible:opacity-100 group-hover/proj:opacity-100"
-                        >
-                          <Plus size={12} />
-                        </button>
-                      )}
+                            },
+                          });
+                        }}
+                        className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity duration-75 hover:bg-white/[0.08] hover:text-neutral-200 focus-visible:opacity-100 group-hover/proj:opacity-100"
+                      >
+                        <Plus size={12} />
+                      </button>
                     </div>
                     {expanded && (
                       <ul className="ml-[13px] mt-0.5 space-y-px border-l border-white/[0.06] pl-1.5">
@@ -897,7 +954,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               onNewThread={newProjectThread}
               onOpenThread={openProjectThread}
               onBotAdded={botAdded}
-              onRequestNewBot={(target) => setCreatingForProject(target)}
+              onRequestNewBot={(project) => setCreatingBot({ project })}
               threadActions={threadActions}
               attentionThreadIds={attentionThreadIds}
               account={account}
@@ -933,12 +990,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
           )}
         </div>
       )}
-      {creatingForProject && (
-        <NewProjectBotModal
-          target={creatingForProject}
-          onClose={() => setCreatingForProject(null)}
+      {creatingBot && (
+        <NewBotModal
+          initialProject={creatingBot.project}
+          projectOptions={newBotProjectOptions}
+          onClose={() => setCreatingBot(null)}
           onCreated={(created) => {
-            setCreatingForProject(null);
+            setCreatingBot(null);
             botAdded(created);
             openBot(created.id);
           }}
@@ -948,42 +1006,99 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   );
 });
 
-const NewProjectBotModal: React.FC<{
-  target: NewProjectBotTarget;
+const projectOptionId = (project: NewBotProjectOption): string =>
+  project.projectId ? `local:${project.projectId}` : `remote:${project.key ?? project.repoId ?? project.name}`;
+
+const NewBotModal: React.FC<{
+  initialProject: NewBotProjectOption | null;
+  projectOptions: NewBotProjectOption[];
   onClose: () => void;
   onCreated: (bot: DesktopBot) => void;
-}> = ({ target, onClose, onCreated }) => {
-  const suggestedName = useMemo(() => suggestProjectBotName(target.name, target.existingNames), [target.name, target.existingNames]);
+}> = ({ initialProject, projectOptions, onClose, onCreated }) => {
+  // Include initialProject in selectable options if it wasn't already in projectOptions.
+  const options = useMemo(() => {
+    if (!initialProject) return projectOptions;
+    const targetId = projectOptionId(initialProject);
+    if (projectOptions.some((item) => projectOptionId(item) === targetId)) return projectOptions;
+    return [initialProject, ...projectOptions];
+  }, [initialProject, projectOptions]);
+
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(() =>
+    initialProject ? projectOptionId(initialProject) : null
+  );
+  const selectedProject = useMemo(
+    () => (selectedProjectId ? options.find((item) => projectOptionId(item) === selectedProjectId) ?? null : null),
+    [options, selectedProjectId]
+  );
+  const suggestedName = useMemo(
+    () => (selectedProject ? suggestProjectBotName(selectedProject.name, selectedProject.existingNames) : ''),
+    [selectedProject]
+  );
+
+  const [emoji, setEmoji] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [job, setJob] = useState('');
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     nameRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !busy) onClose();
+      if (event.key !== 'Escape' || busy) return;
+      if (projectMenuOpen) {
+        setProjectMenuOpen(false);
+        return;
+      }
+      onClose();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [busy, onClose]);
+  }, [busy, onClose, projectMenuOpen]);
+
+  useEffect(() => {
+    if (!projectMenuOpen) return undefined;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!projectMenuRef.current?.contains(event.target as Node)) setProjectMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [projectMenuOpen]);
+
+  const trimmedName = name.trim().slice(0, 40);
+  const canSubmit = !busy && (Boolean(selectedProject) || trimmedName.length > 0);
+  const previewName = trimmedName || (selectedProject ? suggestedName : 'New bot');
+  const previewSeed = selectedProject?.key ?? (trimmedName || 'new-bot');
+  const previewProjectPath = selectedProject && selectedProject.existingNames.length === 0 ? selectedProject.path : null;
 
   const submit = async () => {
-    if (busy) return;
+    if (!canSubmit) {
+      if (!selectedProject && !trimmedName) setError('Enter a name for the bot.');
+      return;
+    }
     setBusy(true);
     setError(null);
-    const trimmedName = name.trim().slice(0, 40);
     const trimmedJob = job.trim().slice(0, 8_000);
-    const result = await window.orion?.createProjectBot?.({
-      ...(target.projectId ? { projectId: target.projectId } : {}),
-      ...(!target.projectId && target.key ? { project: { key: target.key, name: target.name, repoId: target.repoId } } : {}),
-      ...(trimmedName ? { name: trimmedName } : {}),
-      ...(trimmedJob ? { job: trimmedJob } : {}),
-    });
+    const result = selectedProject
+      ? await window.orion?.createProjectBot?.({
+          ...(selectedProject.projectId ? { projectId: selectedProject.projectId } : {}),
+          ...(!selectedProject.projectId && selectedProject.key
+            ? { project: { key: selectedProject.key, name: selectedProject.name, repoId: selectedProject.repoId } }
+            : {}),
+          ...(trimmedName ? { name: trimmedName } : {}),
+          ...(trimmedJob ? { job: trimmedJob } : {}),
+          ...(emoji ? { emoji } : {}),
+        })
+      : await window.orion?.createBot?.({
+          name: trimmedName,
+          ...(trimmedJob ? { job: trimmedJob } : {}),
+          ...(emoji ? { emoji } : {}),
+        });
     setBusy(false);
     if (!result?.ok || !result.bot) {
-      setError(result?.error ?? 'Couldn’t create a bot for this project.');
+      setError(result?.error ?? 'Couldn’t create this bot.');
       return;
     }
     onCreated(result.bot);
@@ -999,35 +1114,103 @@ const NewProjectBotModal: React.FC<{
       <div
         role="dialog"
         aria-modal="true"
-        aria-label={`New bot in ${target.name}`}
-        className="w-full max-w-[440px] rounded-2xl border border-white/10 bg-[#18181b] p-5 text-neutral-100 shadow-[0_24px_64px_rgb(0_0_0_/_0.65)]"
+        aria-label={selectedProject ? `New bot in ${selectedProject.name}` : 'New bot'}
+        className="relative w-full max-w-[460px] rounded-2xl border border-white/10 bg-[#18181b] p-5 text-neutral-100 shadow-[0_24px_64px_rgb(0_0_0_/_0.65)]"
       >
-        <div className="flex items-center gap-2.5">
-          <ProjectMonogram name={target.name} size={18} />
-          <h2 className="min-w-0 flex-1 truncate text-[15px] font-semibold">New bot in {target.name}</h2>
-          <button
-            type="button"
-            aria-label="Close"
-            disabled={busy}
-            onClick={onClose}
-            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-neutral-400 hover:bg-white/[0.07] hover:text-neutral-100 disabled:opacity-40"
+        <button
+          type="button"
+          aria-label="Close"
+          disabled={busy}
+          onClick={onClose}
+          className="absolute right-4 top-4 inline-flex h-7 w-7 items-center justify-center rounded-lg text-neutral-400 hover:bg-white/[0.07] hover:text-neutral-100 disabled:opacity-40"
+        >
+          <X size={15} />
+        </button>
+
+        {/* Centered avatar preview */}
+        <div className="flex flex-col items-center pt-1 text-center">
+          <span
+            className="inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-white/[0.06] text-[28px] ring-1 ring-white/15"
+            aria-hidden
           >
-            <X size={15} />
-          </button>
+            <BotIcon
+              bot={{ emoji, name: previewName, role: 'bot', faceSeed: previewSeed }}
+              px={38}
+              projectPath={emoji ? null : previewProjectPath}
+            />
+          </span>
+          <h2 className="mt-2.5 text-[15px] font-semibold text-neutral-100">
+            {selectedProject ? `New bot in ${selectedProject.name}` : 'New bot'}
+          </h2>
+          <p className="mt-0.5 text-[12px] text-neutral-500">
+            {selectedProject
+              ? `Shares ${selectedProject.name}’s notes and files, with its own conversation.`
+              : 'An always-on assistant with its own conversation and instructions.'}
+          </p>
         </div>
-        <p className="mt-1.5 text-[12.5px] leading-relaxed text-neutral-400">
-          Shares {target.name}’s notes and files, with its own conversation and focus.
-        </p>
-        <div className="mt-4 space-y-3">
+
+        <div className="mt-4 space-y-3.5">
+          {/* Icon picker */}
           <div>
-            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-project-bot-name">
-              Name
+            <span className="mb-1.5 block text-[11.5px] font-medium text-neutral-400">Icon</span>
+            <div className="grid grid-cols-10 gap-1" role="radiogroup" aria-label="Bot icon">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={emoji === null}
+                title="Auto icon"
+                onClick={() => setEmoji(null)}
+                className={`flex h-9 items-center justify-center rounded-lg transition-colors duration-75 ${
+                  emoji === null
+                    ? 'bg-white/[0.14] ring-1 ring-white/35'
+                    : 'bg-white/[0.03] hover:bg-white/[0.08]'
+                }`}
+              >
+                <img
+                  src={botFaceDataUrl(previewSeed)}
+                  width={20}
+                  height={20}
+                  alt="Auto"
+                  draggable={false}
+                  className="block"
+                />
+              </button>
+              {BOT_ICON_OPTIONS.map((option) => {
+                const active = emoji === option;
+                return (
+                  <button
+                    key={option}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    title={option}
+                    onClick={() => setEmoji(active ? null : option)}
+                    className={`flex h-9 items-center justify-center rounded-lg text-[17px] leading-none transition-colors duration-75 ${
+                      active
+                        ? 'bg-white/[0.14] ring-1 ring-white/35'
+                        : 'bg-white/[0.03] hover:bg-white/[0.08]'
+                    }`}
+                  >
+                    {option}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Name */}
+          <div>
+            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-bot-name">
+              Name {selectedProject && <span className="font-normal text-neutral-500">(optional)</span>}
             </label>
             <input
-              id="new-project-bot-name"
+              id="new-bot-name"
               ref={nameRef}
               value={name}
-              onChange={(event) => setName(event.target.value)}
+              onChange={(event) => {
+                setName(event.target.value);
+                if (error) setError(null);
+              }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && !event.nativeEvent.isComposing) {
                   event.preventDefault();
@@ -1035,16 +1218,108 @@ const NewProjectBotModal: React.FC<{
                 }
               }}
               maxLength={40}
-              placeholder={`e.g. Frontend, Reviewer (default: ${suggestedName})`}
+              placeholder={
+                selectedProject
+                  ? `e.g. Frontend, Reviewer (default: ${suggestedName})`
+                  : 'e.g. X Reply Scout, Job Hunter, Daily Digest'
+              }
               className="h-9 w-full rounded-lg bg-white/[0.04] px-3 text-[13.5px] text-neutral-100 ring-1 ring-white/10 outline-none placeholder:text-neutral-500 focus:ring-white/25"
             />
           </div>
+
+          {/* Project association (custom Tailwind dropdown — never <select>) */}
+          {options.length > 0 && (
+            <div ref={projectMenuRef} className="relative">
+              <span className="mb-1 block text-[11.5px] font-medium text-neutral-400">Project</span>
+              <button
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded={projectMenuOpen}
+                disabled={busy}
+                onClick={() => setProjectMenuOpen((open) => !open)}
+                className="flex h-9 w-full items-center gap-2 rounded-lg bg-white/[0.04] px-3 text-left text-[13px] text-neutral-100 ring-1 ring-white/10 transition-colors hover:bg-white/[0.06] focus:ring-white/25 disabled:opacity-40"
+              >
+                {selectedProject ? (
+                  selectedProject.path ? (
+                    <ProjectBadge project={{ name: selectedProject.name, path: selectedProject.path }} size={15} />
+                  ) : (
+                    <ProjectMonogram name={selectedProject.name} size={15} />
+                  )
+                ) : (
+                  <Bot size={14} className="shrink-0 text-neutral-400" />
+                )}
+                <span className="min-w-0 flex-1 truncate">
+                  {selectedProject ? selectedProject.name : 'None (projectless)'}
+                </span>
+                <ChevronDown
+                  size={14}
+                  className={`shrink-0 text-neutral-400 transition-transform duration-150 ${projectMenuOpen ? 'rotate-180' : ''}`}
+                />
+              </button>
+              {projectMenuOpen && (
+                <div
+                  role="listbox"
+                  aria-label="Project"
+                  className="absolute left-0 right-0 top-[calc(100%+4px)] z-20 max-h-[220px] overflow-y-auto rounded-xl border border-white/10 bg-[#1f1f23] p-1 shadow-[0_16px_48px_rgb(0_0_0_/_0.65)]"
+                >
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={selectedProjectId === null}
+                    onClick={() => {
+                      setSelectedProjectId(null);
+                      setProjectMenuOpen(false);
+                    }}
+                    className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                      selectedProjectId === null
+                        ? 'bg-white/[0.09] text-neutral-50'
+                        : 'text-neutral-300 hover:bg-white/[0.06]'
+                    }`}
+                  >
+                    <Bot size={14} className="shrink-0 text-neutral-400" />
+                    <span className="min-w-0 flex-1 truncate">None (projectless)</span>
+                    {selectedProjectId === null && <Check size={13} className="shrink-0 text-neutral-200" />}
+                  </button>
+                  <div className="my-1 border-t border-white/[0.06]" />
+                  {options.map((project) => {
+                    const id = projectOptionId(project);
+                    const active = selectedProjectId === id;
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        role="option"
+                        aria-selected={active}
+                        onClick={() => {
+                          setSelectedProjectId(id);
+                          setProjectMenuOpen(false);
+                        }}
+                        className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+                          active ? 'bg-white/[0.09] text-neutral-50' : 'text-neutral-300 hover:bg-white/[0.06]'
+                        }`}
+                      >
+                        {project.path ? (
+                          <ProjectBadge project={{ name: project.name, path: project.path }} size={14} />
+                        ) : (
+                          <ProjectMonogram name={project.name} size={14} />
+                        )}
+                        <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                        {active && <Check size={13} className="shrink-0 text-neutral-200" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Description / system prompt */}
           <div>
-            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-project-bot-job">
-              Focus <span className="font-normal text-neutral-500">(optional)</span>
+            <label className="mb-1 block text-[11.5px] font-medium text-neutral-400" htmlFor="new-bot-job">
+              Description / System prompt <span className="font-normal text-neutral-500">(optional)</span>
             </label>
             <textarea
-              id="new-project-bot-job"
+              id="new-bot-job"
               value={job}
               onChange={(event) => setJob(event.target.value)}
               onKeyDown={(event) => {
@@ -1053,14 +1328,20 @@ const NewProjectBotModal: React.FC<{
                   void submit();
                 }
               }}
-              rows={3}
+              rows={4}
               maxLength={8_000}
-              placeholder="What should this bot focus on? Leave blank for general project help."
+              placeholder={
+                selectedProject
+                  ? `What should this bot focus on in ${selectedProject.name}? Leave blank for general project help.`
+                  : 'Describe what this bot does, its role, tone, or any standing instructions…'
+              }
               className="w-full resize-none rounded-lg bg-white/[0.04] px-3 py-2 text-[13px] leading-relaxed text-neutral-100 ring-1 ring-white/10 outline-none placeholder:text-neutral-500 focus:ring-white/25"
             />
           </div>
+
           {error && <div className="rounded-lg bg-red-500/10 px-3 py-2 text-[12px] text-red-300 ring-1 ring-red-400/20">{error}</div>}
         </div>
+
         <div className="mt-4 flex items-center justify-end gap-2">
           <button
             type="button"
@@ -1072,9 +1353,9 @@ const NewProjectBotModal: React.FC<{
           </button>
           <button
             type="button"
-            disabled={busy}
+            disabled={!canSubmit}
             onClick={() => void submit()}
-            className="flex h-8 items-center gap-1.5 rounded-lg bg-neutral-100 px-3.5 text-[13px] font-medium text-neutral-900 hover:bg-white disabled:opacity-50"
+            className="flex h-8 items-center gap-1.5 rounded-lg bg-neutral-100 px-3.5 text-[13px] font-medium text-neutral-900 hover:bg-white disabled:opacity-45"
           >
             {busy ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />}
             {busy ? 'Creating…' : 'Create bot'}
@@ -1199,7 +1480,7 @@ const ProjectPage: React.FC<{
   onNewThread: (projectId: string) => void;
   onOpenThread: (threadId: string) => void;
   onBotAdded: (bot: DesktopBot) => void;
-  onRequestNewBot: (target: NewProjectBotTarget) => void;
+  onRequestNewBot: (project: NewBotProjectOption) => void;
   threadActions: SidebarV2Actions;
   attentionThreadIds: ReadonlyMap<string, number>;
   /** The account the Bots view shows ('local' signed out): unsent prompts are kept per account. */
@@ -1250,6 +1531,7 @@ const ProjectPage: React.FC<{
       projectId: local ? entry.id : null,
       key: entry.key,
       name: entry.name,
+      path: entry.path,
       repoId: entry.repoId,
       existingNames: projectBots.map((item) => item.name),
     });
@@ -1514,7 +1796,7 @@ const ProjectBotBox: React.FC<{
     <div>
       <div className="flex items-center gap-4">
         <span className="grid h-14 w-14 shrink-0 place-items-center rounded-2xl bg-white/[0.04] text-[28px] ring-1 ring-white/[0.07]">
-          <BotIcon bot={faceBot} px={38} projectPath={entry.path} />
+          <BotIcon bot={faceBot} px={38} projectPath={bots.length <= 1 ? entry.path : null} />
         </span>
         <div className="min-w-0 flex-1">
           {bot ? (
@@ -1526,13 +1808,26 @@ const ProjectBotBox: React.FC<{
             <div className="text-[22px] font-semibold text-neutral-50">{entry.name}</div>
           )}
           <div className="truncate text-[14px] text-neutral-400">
-            {bot ? (bots.length > 1 ? `One of ${bots.length} bots in ${entry.name}` : 'Project bot') : 'No bots yet: send a message and one is made for this project'}
+            {bot
+              ? bots.length > 1
+                ? `One of ${bots.length} bots in ${entry.name}`
+                : 'Project bot'
+              : 'No bots yet — create a custom bot or send a message below to start one'}
             {library && (library.notes || library.files) ? ` · knows ${library.notes} note${library.notes === 1 ? '' : 's'} and ${library.files} file${library.files === 1 ? '' : 's'}` : ''}
             {status && <> · {status}</>}
           </div>
         </div>
+        {(local || entry.key) && bots.length === 0 && (
+          <button
+            type="button"
+            onClick={onRequestNewBot}
+            className="flex h-9 shrink-0 items-center gap-1.5 rounded-xl bg-white/[0.07] px-3.5 text-[13px] font-medium text-neutral-100 ring-1 ring-white/[0.1] transition-colors duration-75 hover:bg-white/[0.12]"
+          >
+            <Plus size={14} /> Create bot
+          </button>
+        )}
       </div>
-      {bots.length > 1 && (
+      {bots.length > 0 && (
         <div className="mt-3.5 flex flex-wrap items-center gap-1.5">
           {bots.map((candidate) => {
             const active = candidate.id === bot?.id;
@@ -1551,7 +1846,7 @@ const ProjectBotBox: React.FC<{
                 }`}
               >
                 <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[11px]" aria-hidden>
-                  <BotIcon bot={candidate} px={16} />
+                  <BotIcon bot={candidate} px={16} projectPath={bots.length === 1 ? entry.path : null} />
                 </span>
                 <span className="max-w-[160px] truncate">{candidate.name}</span>
                 {candidate.unread > 0 ? (
@@ -1568,9 +1863,9 @@ const ProjectBotBox: React.FC<{
             <button
               type="button"
               onClick={onRequestNewBot}
-              className="flex h-7 items-center gap-1 rounded-lg px-2 text-[12px] text-neutral-500 ring-1 ring-dashed ring-white/[0.1] transition-colors duration-75 hover:bg-white/[0.04] hover:text-neutral-200"
+              className="flex h-7 items-center gap-1 rounded-lg px-2 text-[12px] text-neutral-400 ring-1 ring-dashed ring-white/[0.12] transition-colors duration-75 hover:bg-white/[0.05] hover:text-neutral-100"
             >
-              <Plus size={12} /> Add bot
+              <Plus size={12} /> New bot
             </button>
           )}
         </div>
