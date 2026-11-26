@@ -9170,6 +9170,110 @@ html.theme-light .setting-row .release-notes-list {
   .picker-backdrop-in, .picker-backdrop-out, .picker-panel-in, .picker-panel-out { animation-duration: 1ms; }
 }
 
+/* Bots sidebar drag-and-drop reorder (src/app/BotsWorkspace.tsx, useSidebarDragReorder.ts). */
+body.bots-dragging {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  cursor: grabbing !important;
+}
+body.bots-dragging * {
+  cursor: grabbing !important;
+}
+body.bots-dragging .agents-sidebar-content {
+  scroll-behavior: auto;
+  pointer-events: none;
+}
+.bots-drag-item {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+.bots-drag-placeholder {
+  border-radius: 8px;
+  background: rgb(255 255 255 / 0.025);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.06);
+  pointer-events: none;
+}
+.bots-drag-placeholder > * {
+  opacity: 0.16;
+}
+.bots-drag-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 1300;
+  pointer-events: none;
+  will-change: transform;
+  border-radius: 9px;
+  background: rgb(28 28 33 / 0.96);
+  border: 1px solid rgb(255 255 255 / 0.14);
+  box-shadow:
+    0 14px 36px rgb(0 0 0 / 0.48),
+    0 3px 10px rgb(0 0 0 / 0.32),
+    inset 0 1px 0 rgb(255 255 255 / 0.06);
+  backdrop-filter: blur(10px);
+}
+.bots-drag-overlay-stack::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: -5px;
+  height: 5px;
+  border-bottom-left-radius: 7px;
+  border-bottom-right-radius: 7px;
+  background: rgb(28 28 33 / 0.78);
+  border: 1px solid rgb(255 255 255 / 0.1);
+  border-top: none;
+  box-shadow: 0 6px 14px rgb(0 0 0 / 0.35);
+}
+.bots-drop-indicator {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  top: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: rgb(56 189 248 / 0.95);
+  box-shadow: 0 0 8px rgb(56 189 248 / 0.55);
+  pointer-events: none;
+  z-index: 20;
+  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+.bots-drop-indicator::before {
+  content: "";
+  position: absolute;
+  left: -3px;
+  top: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: rgb(125 211 252);
+  box-shadow: 0 0 6px rgb(56 189 248 / 0.85);
+}
+html.theme-light .bots-drag-placeholder {
+  background: rgb(0 0 0 / 0.035);
+  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.08);
+}
+html.theme-light .bots-drag-overlay {
+  background: var(--bg-elevated, #ffffff);
+  border-color: rgb(0 0 0 / 0.12);
+  box-shadow:
+    0 12px 32px rgb(0 0 0 / 0.16),
+    0 2px 6px rgb(0 0 0 / 0.08);
+  color: var(--text-primary);
+}
+html.theme-light .bots-drag-overlay-stack::after {
+  background: rgb(0 0 0 / 0.04);
+  border-color: rgb(0 0 0 / 0.08);
+}
+@media (prefers-reduced-motion: reduce) {
+  .bots-drag-item,
+  .bots-drop-indicator {
+    transition: none;
+  }
+}
+
 /* Shell breadcrumb, as in T3 Code: project / thread. The project opens the
    project picker while the thread can still move; after that it is a label. */
 .shell-title-group:has(.shell-breadcrumb-project) {

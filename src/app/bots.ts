@@ -3,6 +3,8 @@
 // helpers. A bot is an always-on assistant with one thread; messages to it
 // are never blocked, and its replies may run on this machine's Claude Code.
 
+import { sortProjectBots } from './botOrder';
+
 export type DesktopBot = {
   id: string;
   name: string;
@@ -10,6 +12,8 @@ export type DesktopBot = {
   role: 'primary' | 'bot';
   /** True when this bot is its project's primary (overseer of that project's other bots). */
   projectPrimary?: boolean;
+  /** Manual sidebar position within its project group (0, 1, 2…); null/absent = default order. */
+  sortOrder?: number | null;
   job: string;
   model: string;
   /** Optional reasoning effort override ("none", "low", "medium", "high", "xhigh", "max"); null/absent = model default. */
@@ -223,6 +227,8 @@ export type BotsListResult = {
   ok: boolean;
   allowed?: boolean;
   bots?: DesktopBot[];
+  /** Manual order of project groups in the Bots sidebar (projectKeys, top to bottom). */
+  projectOrder?: string[];
   /** Each Durango Code project's key (project id → key), to find its bot. */
   projectKeys?: Record<string, string>;
   /** Whose bots these are ("local", or a hash of the Durango account): cached data of another account is dropped. */
@@ -232,6 +238,16 @@ export type BotsListResult = {
   error?: string;
   code?: string;
 };
+
+export type ReorderBotsInput = {
+  /** New top-to-bottom order of project keys for the Bots sidebar. */
+  projectOrder?: string[];
+  /** Project key whose bots are being reordered (must be paired with `botIds`). */
+  projectKey?: string;
+  /** New top-to-bottom order of bot ids within `projectKey`. */
+  botIds?: string[];
+};
+export type ReorderBotsResult = { ok: boolean; projectOrder?: string[]; error?: string; code?: string };
 
 /** A model a bot can be set to. `claude`: it can also reply on a machine's Claude Code (others reply from Durango's cloud). */
 export type BotModelChoice = {
@@ -347,13 +363,13 @@ export const botReasoningEffortShortLabel = (effort: string | null | undefined):
   }
 };
 
-/** Sort comparator for bots within a project: project primary first, then most recently active. */
+/** Sort comparator for bots within a project when no manual order is set: project primary first, then most recently active. */
 export const compareProjectBots = (a: DesktopBot, b: DesktopBot): number =>
   Number(Boolean(b.projectPrimary)) - Number(Boolean(a.projectPrimary)) || b.lastActivityAt - a.lastActivityAt;
 
-/** All bots of a project (by the project's key), primary first then most recently active. */
+/** All bots of a project (by the project's key), following manual order when set else primary first then most recently active. */
 export const projectBotsFor = (bots: DesktopBot[], key: string | undefined): DesktopBot[] =>
-  key ? bots.filter((bot) => bot.project?.key === key).sort(compareProjectBots) : [];
+  key ? sortProjectBots(bots.filter((bot) => bot.project?.key === key)) : [];
 
 /** A project's primary/most-recent bot (by the project's key), if any exists yet. */
 export const projectBotFor = (bots: DesktopBot[], key: string | undefined) =>

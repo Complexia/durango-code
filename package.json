@@ -62,6 +62,7 @@
     "test:no-project": "bun scripts/test-no-project.ts",
     "test:project-icon": "node --no-warnings scripts/test-project-icon.mjs",
     "test:project-order": "bun scripts/test-project-order.ts",
+    "test:bot-order": "bun scripts/test-bot-order.ts",
     "test:sidebar-v2": "bun scripts/test-sidebar-v2.ts && bun scripts/test-sidebar-v2-update.ts && bun scripts/test-sidebar-v2-update.ts --failed-backfill",
     "test:thread-transcripts": "bun scripts/test-thread-transcripts.ts",
     "test:workspace-sync-consent": "bun scripts/test-workspace-sync-consent.tsx",

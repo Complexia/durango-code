@@ -2255,6 +2255,65 @@ test('local bots: delegated tasks request finalMessageOnly and middle-trim huge 
   await engine.idle();
 });
 
+test('reorder persists project group order and per-project bot order across restarts, exportForSync, and primary changes', async () => {
+  const dir = path.join(testRoot, `bots-reorder-${(dirCount += 1)}`);
+  const { engine, clock } = makeEngine({ dir });
+  await engine.list();
+
+  clock.now += 1_000;
+  const a1 = await engine.createProjectBot({ name: 'Alpha', projectId: 'proj_a', repoId: 'repo_alpha', botName: 'Alpha One' });
+  clock.now += 1_000;
+  const a2 = await engine.createProjectBot({ name: 'Alpha', projectId: 'proj_a', repoId: 'repo_alpha', botName: 'Alpha Two' });
+  clock.now += 1_000;
+  const a3 = await engine.createProjectBot({ name: 'Alpha', projectId: 'proj_a', repoId: 'repo_alpha', botName: 'Alpha Three' });
+  clock.now += 1_000;
+  const b1 = await engine.createProjectBot({ name: 'Beta', projectId: 'proj_b', repoId: 'repo_beta', botName: 'Beta One' });
+  clock.now += 1_000;
+  const c1 = await engine.createProjectBot({ name: 'Gamma', projectId: 'proj_c', repoId: 'repo_gamma', botName: 'Gamma One' });
+  assert.equal(a1.projectPrimary, true);
+  assert.equal(a1.sortOrder, null);
+
+  // Reorder bots within Alpha so Alpha Three is first, Alpha Two second, Alpha One (primary) last.
+  const keyA = a1.project.key;
+  const keyB = b1.project.key;
+  const keyC = c1.project.key;
+  await engine.reorder({ projectKey: keyA, botIds: [a3.id, a2.id, a1.id] });
+  // Reorder project groups: Gamma, Alpha, Beta.
+  await engine.reorder({ projectOrder: [keyC, keyA, keyB] });
+
+  // Changing primary to Alpha Two keeps manual sortOrder intact.
+  await engine.setProjectPrimary(a2.id);
+
+  // Adding a new bot in Alpha leaves its sortOrder null so it appends to the end.
+  clock.now += 1_000;
+  const a4 = await engine.createProjectBot({ name: 'Alpha', projectId: 'proj_a', repoId: 'repo_alpha', botName: 'Alpha Four' });
+  assert.equal(a4.sortOrder, null);
+
+  await engine.flush();
+
+  // Reload from disk in a fresh engine instance.
+  const { engine: reloaded } = makeEngine({ dir });
+  const listed = await reloaded.list();
+  assert.deepEqual(listed.projectOrder, [keyC, keyA, keyB]);
+  const alphaBots = listed.bots.filter((item) => item.project?.key === keyA);
+  const byId = new Map(alphaBots.map((item) => [item.id, item]));
+  assert.equal(byId.get(a3.id)?.sortOrder, 0);
+  assert.equal(byId.get(a2.id)?.sortOrder, 1);
+  assert.equal(byId.get(a2.id)?.projectPrimary, true);
+  assert.equal(byId.get(a1.id)?.sortOrder, 2);
+  assert.equal(byId.get(a4.id)?.sortOrder, null);
+
+  // exportForSync carries both projectOrder and per-bot sortOrder.
+  const exported = await reloaded.exportForSync();
+  assert.deepEqual(exported.projectOrder, [keyC, keyA, keyB]);
+  const exportedA3 = exported.bots.find((item) => item.localId === a3.id);
+  const exportedA1 = exported.bots.find((item) => item.localId === a1.id);
+  const exportedA4 = exported.bots.find((item) => item.localId === a4.id);
+  assert.equal(exportedA3?.sortOrder, 0);
+  assert.equal(exportedA1?.sortOrder, 2);
+  assert.equal(exportedA4?.sortOrder, undefined);
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 let failed = 0;

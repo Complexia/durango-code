@@ -631,7 +631,23 @@ const normalizeBot = (raw, now) => {
     requeue: [...new Set([...seqList(raw?.requeue), ...seqList(raw?.inFlight)])].sort((a, b) => a - b),
     project: normalizeProject(raw?.project),
     ...(raw?.projectPrimary === true ? { projectPrimary: true } : {}),
+    ...(typeof raw?.sortOrder === 'number' && Number.isFinite(raw.sortOrder) ? { sortOrder: raw.sortOrder } : {}),
   };
+};
+
+const normalizeLocalProjectOrder = (keys) => {
+  if (!Array.isArray(keys)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of keys) {
+    if (typeof raw !== 'string') continue;
+    const key = raw.trim().slice(0, 420);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+    if (out.length >= 200) break;
+  }
+  return out;
 };
 
 const seqList = (value) => (Array.isArray(value) ? value.filter((seq) => Number.isInteger(seq) && seq > 0) : []);
@@ -983,6 +999,7 @@ export const createLocalBotEngine = ({
   const storageDir = () => (typeof dir === 'function' ? dir() : dir);
   let loaded = null; // Promise while/after loading
   let entries = new Map(); // botId -> { bot, messages, compacting }
+  let projectOrder = []; // Manual project-group order in the Bots sidebar (projectKeys, top to bottom)
   const runtimes = new Map(); // botId -> { replies: Map, tasks: Map, pendingChecks }
   const work = new Set(); // promises of running replies/tasks (idle())
   let generation = 0; // bumped by markSynced(): stale work never writes
@@ -1056,7 +1073,11 @@ export const createLocalBotEngine = ({
     return next;
   };
   const persistIndex = () =>
-    persistFile(INDEX_FILE, () => ({ version: 1, bots: [...entries.values()].map((entry) => entry.bot) }));
+    persistFile(INDEX_FILE, () => ({
+      version: 1,
+      bots: [...entries.values()].map((entry) => entry.bot),
+      ...(projectOrder.length ? { projectOrder } : {}),
+    }));
   /** What a bot has claimed and answered: saved in its transcript file, with the messages it refers to. */
   const claimStateOf = (bot) => ({
     nextSeq: bot.nextSeq,
@@ -1273,6 +1294,7 @@ export const createLocalBotEngine = ({
         next.set(bot.id, entry);
       }
       entries = next;
+      projectOrder = normalizeLocalProjectOrder(index?.projectOrder);
       // Load project library metadata upfront so the first reply's library count hint
       // reflects persisted notes/files immediately after a restart.
       await loadProjects();
@@ -1361,6 +1383,7 @@ export const createLocalBotEngine = ({
       emoji: bot.emoji === LEGACY_PROJECT_BOT_EMOJI ? null : bot.emoji,
       role: bot.role,
       projectPrimary: isProjectPrimary(entry),
+      sortOrder: typeof bot.sortOrder === 'number' && Number.isFinite(bot.sortOrder) ? bot.sortOrder : null,
       job: bot.job,
       model: bot.model,
       reasoningEffort: bot.reasoningEffort ?? null,
@@ -2724,8 +2747,10 @@ export const createLocalBotEngine = ({
         })),
         ...(bot.project ? exportProject(bot.project) : {}),
         ...(bot.project && isProjectPrimary(entries.get(bot.id)) ? { projectPrimary: true } : {}),
+        ...(typeof bot.sortOrder === 'number' && Number.isFinite(bot.sortOrder) ? { sortOrder: bot.sortOrder } : {}),
       })),
       projects: exportProjects(),
+      ...(projectOrder.length ? { projectOrder: [...projectOrder] } : {}),
     };
   };
 
@@ -2753,7 +2778,12 @@ export const createLocalBotEngine = ({
     ensurePrimary: async () => toDesktopBot(await ensurePrimary()),
     async list() {
       await ensurePrimary();
-      return { allowed: true, bots: sortedEntries().map(toDesktopBot), modelChoices: LOCAL_BOT_MODEL_CHOICES };
+      return {
+        allowed: true,
+        bots: sortedEntries().map(toDesktopBot),
+        projectOrder: [...projectOrder],
+        modelChoices: LOCAL_BOT_MODEL_CHOICES,
+      };
     },
     /** The person picks a bot's model and/or reasoning effort; the next reply runs on it. → the bot. */
     async setModel(botId, model, reasoningEffort) {
@@ -2836,6 +2866,67 @@ export const createLocalBotEngine = ({
       }
       changed();
       return toDesktopBot(entry);
+    },
+    /** Persists manual sidebar ordering (project groups and/or bots within one project). */
+    async reorder({ projectOrder: nextOrderInput, projectKey, botIds } = {}) {
+      await ensureLoaded();
+      const hasProjects = nextOrderInput !== undefined;
+      const hasProjectBots = projectKey !== undefined || botIds !== undefined;
+      if (!hasProjects && !hasProjectBots) {
+        throw new LocalBotError('invalid', 'Specify a project order or a project and bot order.');
+      }
+      if (hasProjectBots && (!str(projectKey).trim() || !Array.isArray(botIds))) {
+        throw new LocalBotError('invalid', 'Specify both projectKey and botIds.');
+      }
+      const prevProjectOrder = projectOrder;
+      const prevBotOrders = [];
+
+      if (hasProjects) {
+        projectOrder = normalizeLocalProjectOrder(nextOrderInput);
+      }
+
+      if (projectKey && Array.isArray(botIds)) {
+        const cleanKey = str(projectKey).trim();
+        const siblings = [...entries.values()].filter((candidate) => candidate.bot.project?.key === cleanKey);
+        if (siblings.length === 0) throw new LocalBotError('not_found', 'Project has no bots.');
+        const byId = new Map(siblings.map((candidate) => [candidate.bot.id, candidate]));
+        const ordered = [];
+        const seen = new Set();
+        for (const rawId of botIds) {
+          if (typeof rawId !== 'string') continue;
+          const candidate = byId.get(rawId);
+          if (!candidate || seen.has(candidate.bot.id)) continue;
+          seen.add(candidate.bot.id);
+          ordered.push(candidate);
+        }
+        const remaining = siblings
+          .filter((candidate) => !seen.has(candidate.bot.id))
+          .sort((a, b) => {
+            const aHas = typeof a.bot.sortOrder === 'number' && Number.isFinite(a.bot.sortOrder);
+            const bHas = typeof b.bot.sortOrder === 'number' && Number.isFinite(b.bot.sortOrder);
+            if (aHas && bHas) return a.bot.sortOrder - b.bot.sortOrder || a.bot.createdAt - b.bot.createdAt;
+            if (aHas) return -1;
+            if (bHas) return 1;
+            return a.bot.createdAt - b.bot.createdAt || a.bot.id.localeCompare(b.bot.id);
+          });
+        const full = [...ordered, ...remaining];
+        for (let index = 0; index < full.length; index += 1) {
+          const candidate = full[index];
+          prevBotOrders.push([candidate, candidate.bot.sortOrder]);
+          candidate.bot.sortOrder = index;
+        }
+      }
+
+      if (!(await persistIndex())) {
+        projectOrder = prevProjectOrder;
+        for (const [candidate, prev] of prevBotOrders) {
+          if (typeof prev === 'number' && Number.isFinite(prev)) candidate.bot.sortOrder = prev;
+          else delete candidate.bot.sortOrder;
+        }
+        throw new Error('Couldn’t save the bot order on this computer. Try again.');
+      }
+      changed();
+      return { ok: true, projectOrder: [...projectOrder] };
     },
     /** Deletes a non-primary local bot and removes its transcript from disk. */
     async deleteBot(botId) {
@@ -3219,6 +3310,7 @@ export const createLocalBotEngine = ({
       generation += 1;
       abortAll();
       entries = new Map();
+      projectOrder = [];
       runtimes.clear();
       loaded = Promise.resolve();
       const base = storageDir();

@@ -864,15 +864,30 @@ export const createDurangoClient = ({
     supportsPendingBotAttachments() {
       return pendingBotAttachmentsSupported;
     },
-    /** → `{ allowed, bots, modelChoices, pendingAttachments }` (the primary first; modelChoices: null from an older Durango). */
+    /** → `{ allowed, bots, projectOrder, modelChoices, pendingAttachments }` (the primary first; modelChoices: null from an older Durango). */
     async listBots() {
       const data = await request('GET', '/bots');
       pendingBotAttachmentsSupported = data.pendingAttachments === true;
       return {
         allowed: data.allowed === true,
         bots: Array.isArray(data.bots) ? data.bots : [],
+        projectOrder: Array.isArray(data.projectOrder) ? data.projectOrder.filter((key) => typeof key === 'string') : [],
         modelChoices: normalizeBotModelChoices(data.modelChoices),
         pendingAttachments: pendingBotAttachmentsSupported,
+      };
+    },
+    /** Saves the person's manual Bots sidebar ordering (project groups and/or bots within one project) → `{ ok, projectOrder }`. */
+    async reorderBots({ projectOrder, projectKey, botIds } = {}) {
+      const body = {
+        ...(Array.isArray(projectOrder) ? { projectOrder: projectOrder.map(str).filter(Boolean) } : {}),
+        ...(typeof projectKey === 'string' && projectKey.trim() && Array.isArray(botIds)
+          ? { projectKey: projectKey.trim(), botIds: botIds.map(str).filter(Boolean) }
+          : {}),
+      };
+      const data = await request('PUT', '/bots/order', { body });
+      return {
+        ok: true,
+        ...(Array.isArray(data?.projectOrder) ? { projectOrder: data.projectOrder.filter((key) => typeof key === 'string') } : {}),
       };
     },
     /** Sets a bot's reply model and/or reasoning effort → `{ model?, reasoningEffort?, bot? }`. */
@@ -1468,7 +1483,10 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       return MOCK_CHATS.find((chat) => chat.id === chatId)?.url ?? `${DEFAULT_DURANGO_URL}/chats`;
     },
     async listBots() {
-      return { allowed: true, bots: [], modelChoices: null };
+      return { allowed: true, bots: [], projectOrder: [], modelChoices: null };
+    },
+    async reorderBots({ projectOrder } = {}) {
+      return { ok: true, ...(Array.isArray(projectOrder) ? { projectOrder } : {}) };
     },
     async setBotModel(_botId, model, reasoningEffort) {
       return {

@@ -28,6 +28,7 @@ import {
   FileVideo,
   Folder,
   FolderOpen,
+  GripVertical,
   Library,
   ListChecks,
   Loader2,
@@ -79,7 +80,6 @@ import {
   botInboxSource,
   botIsWorking,
   botModelLabel,
-  compareProjectBots,
   LOCAL_BOT_PLACE,
   formatFileSize,
   newBotMessageId,
@@ -101,6 +101,13 @@ import {
   type BotModelChoice,
   type ThreadStarter,
 } from './bots';
+import { applyOptimisticBotOrder, reorderList, sortProjectBots, sortProjectGroups } from './botOrder';
+import {
+  computeDropIndicatorOffset,
+  computeItemDisplacement,
+  handleReorderKeyDown,
+  useSidebarDragReorder,
+} from './useSidebarDragReorder';
 import { BotModelMenu } from './BotModelMenu';
 
 // The sidebar's Bots tab (once "Sidebar v3" in Settings → Experimental): the
@@ -168,6 +175,7 @@ type BotListCache = {
   /** Whose (BotsListResult.account). */
   account: string | null;
   bots: DesktopBot[];
+  projectOrder: string[];
   projectKeys: Record<string, string>;
   allowed: boolean;
   mode: 'local' | 'durango' | null;
@@ -274,7 +282,12 @@ type SidebarProjectGroup = {
   repoId: string | null;
   bots: DesktopBot[];
   latestActivityAt: number;
+  earliestCreatedAt: number;
 };
+
+type SidebarDragMeta =
+  | { kind: 'project'; group: SidebarProjectGroup; expanded: boolean }
+  | { kind: 'bot'; bot: DesktopBot; projectKey: string; projectPath: string | null };
 
 /** A project option selectable inside the New Bot modal. */
 type NewBotProjectOption = {
@@ -342,14 +355,33 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const projects = useOrionStore((state) => state.projects);
   const threads = useOrionStore((state) => state.threads);
   const { sidebarRef, resizeHandle } = useSidebarResize({ storageKey: AGENTS_SIDEBAR_STORAGE_KEY, label: 'Agents sidebar' });
+  const sidebarScrollRef = useRef<HTMLDivElement>(null);
   const [bots, setBots] = useState<DesktopBot[] | null>(() => botListCache?.bots ?? null);
+  const [projectOrder, setProjectOrder] = useState<string[]>(() => botListCache?.projectOrder ?? []);
   const [projectKeys, setProjectKeys] = useState<Record<string, string>>(() => botListCache?.projectKeys ?? {});
   const [modelChoices, setModelChoices] = useState<BotModelChoice[] | null>(() => botListCache?.modelChoices ?? null);
   const [listError, setListError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [reorderAnnouncement, setReorderAnnouncement] = useState('');
   const [botModal, setBotModal] = useState<BotModalState | null>(null);
   const closeBotModal = useCallback(() => setBotModal(null), []);
   const [clearedEpochs, setClearedEpochs] = useState<Record<string, number>>({});
+  // Incremented on every optimistic order edit so in-flight background polls
+  // never overwrite a freshly dropped order with stale server data.
+  const listEpochRef = useRef(0);
+  const inFlightReordersRef = useRef(0);
+  const reorderQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const projectOrderRef = useRef(projectOrder);
+  projectOrderRef.current = projectOrder;
+  const {
+    activeDrag,
+    overlayElRef,
+    registerItem,
+    startPointerDrag,
+    shouldSuppressClick,
+  } = useSidebarDragReorder<SidebarDragMeta>(sidebarScrollRef);
+  const activeDragRef = useRef(activeDrag);
+  activeDragRef.current = activeDrag;
   const collapsedBotProjects = v3?.collapsedBotProjects ?? [];
   const collapsedSet = useMemo(() => new Set(collapsedBotProjects), [collapsedBotProjects]);
   const toggleProjectGroup = useCallback(
@@ -384,6 +416,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   };
 
   const loadBots = useCallback(async () => {
+    const requestEpoch = listEpochRef.current;
     const [result, modeResult] = await Promise.all([window.orion?.listBots?.(), window.orion?.getBotsMode?.().catch(() => null)]);
     const nextMode = modeResult ? modeResult.mode : botListCache?.mode ?? null;
     const nextCloudOnly = modeResult
@@ -401,6 +434,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       if (result.code === 'not_signed_in') {
         clearBotCaches();
         setBots(null);
+        setProjectOrder([]);
         setAccount(null);
       }
       setListError(result.code === 'not_signed_in' ? 'Sign in to Durango (Settings → Durango) to see your bots.' : result.error ?? 'Couldn’t load your bots.');
@@ -409,17 +443,26 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     // Another account (or signed in or out) since the cache was made: the old
     // account's bots, threads and libraries go.
     const nextAccount = result.account ?? null;
-    if (botListCache && (botListCache.mode !== nextMode || botListCache.account !== nextAccount)) clearBotCaches();
+    const accountSwitched = Boolean(botListCache && (botListCache.mode !== nextMode || botListCache.account !== nextAccount));
+    if (accountSwitched) clearBotCaches();
+    // Ignore stale poll responses that began before an optimistic reorder or while dragging (unless the account changed).
+    if (!accountSwitched && (activeDragRef.current || listEpochRef.current !== requestEpoch || inFlightReordersRef.current > 0)) {
+      return;
+    }
+    const nextBots = result.bots ?? [];
+    const nextProjectOrder = Array.isArray(result.projectOrder) ? result.projectOrder : [];
     setAccount(nextAccount);
     setListError(null);
     setAllowed(result.allowed !== false);
-    setBots(result.bots ?? []);
-    noteBotList(result.allowed === false ? null : (result.bots ?? []));
+    setBots(nextBots);
+    setProjectOrder(nextProjectOrder);
+    noteBotList(result.allowed === false ? null : nextBots);
     setProjectKeys(result.projectKeys ?? {});
     setModelChoices(result.modelChoices ?? null);
     botListCache = {
       account: nextAccount,
-      bots: result.bots ?? [],
+      bots: nextBots,
+      projectOrder: nextProjectOrder,
       projectKeys: result.projectKeys ?? {},
       allowed: result.allowed !== false,
       mode: nextMode,
@@ -478,11 +521,15 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             repoId: bot.project.repoId ?? null,
             bots: [],
             latestActivityAt: 0,
+            earliestCreatedAt: Number.MAX_SAFE_INTEGER,
           };
           byProject.set(key, group);
         }
         group.bots.push(bot);
         if (bot.lastActivityAt > group.latestActivityAt) group.latestActivityAt = bot.lastActivityAt;
+        if (typeof bot.createdAt === 'number' && bot.createdAt < group.earliestCreatedAt) {
+          group.earliestCreatedAt = bot.createdAt;
+        }
       } else {
         standalone.push(bot);
       }
@@ -490,14 +537,13 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
 
     standalone.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
 
-    const groups = [...byProject.values()];
-    for (const group of groups) {
-      group.bots.sort(compareProjectBots);
-    }
-    groups.sort((a, b) => b.latestActivityAt - a.latestActivityAt || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    const groups = sortProjectGroups(
+      [...byProject.values()].map((group) => ({ ...group, bots: sortProjectBots(group.bots) })),
+      projectOrder
+    );
 
     return { primaryBots: primary, standaloneBots: standalone, sidebarProjectGroups: groups };
-  }, [bots, projectKeys, projects]);
+  }, [bots, projectKeys, projectOrder, projects]);
 
   const threadsByProject = useMemo(() => {
     const map = new Map<string, Thread[]>();
@@ -584,7 +630,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       entry.bots.push(bot);
     }
     const elsewhere = [...remoteByKey.values()].map((entry) => {
-      entry.bots.sort(compareProjectBots);
+      entry.bots = sortProjectBots(entry.bots);
       entry.bot = entry.bots[0] ?? null;
       return entry;
     });
@@ -797,6 +843,94 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     [loadBots, selectedBotId, selectedProjectId, setSidebarV3Settings, view]
   );
 
+  const persistReorder = useCallback(
+    (payload: { projectOrder?: string[]; projectKey?: string; botIds?: string[] }) => {
+      listEpochRef.current += 1;
+      inFlightReordersRef.current += 1;
+      reorderQueueRef.current = reorderQueueRef.current
+        .catch(() => {})
+        .then(async () => {
+          try {
+            const result = await window.orion?.reorderBots?.(payload);
+            if (!result?.ok) {
+              setActionError(result?.error ?? 'Couldn’t save sidebar order.');
+              inFlightReordersRef.current = Math.max(0, inFlightReordersRef.current - 1);
+              if (inFlightReordersRef.current === 0) void loadBots();
+              return;
+            }
+            if (Array.isArray(result.projectOrder) && payload.projectOrder) {
+              if (botListCache) botListCache = { ...botListCache, projectOrder: result.projectOrder };
+            }
+            inFlightReordersRef.current = Math.max(0, inFlightReordersRef.current - 1);
+          } catch {
+            setActionError('Couldn’t save sidebar order.');
+            inFlightReordersRef.current = Math.max(0, inFlightReordersRef.current - 1);
+            if (inFlightReordersRef.current === 0) void loadBots();
+          }
+        });
+    },
+    [loadBots]
+  );
+
+  const handleReorderProjectGroups = useCallback(
+    (fromIndex: number, toIndex: number, { preserveFocusKey }: { preserveFocusKey?: string } = {}) => {
+      if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= sidebarProjectGroups.length || toIndex >= sidebarProjectGroups.length) {
+        return;
+      }
+      const currentKeys = sidebarProjectGroups.map((group) => group.groupKey);
+      const movedGroup = sidebarProjectGroups[fromIndex];
+      const nextOrder = reorderList(currentKeys, fromIndex, toIndex);
+      setActionError(null);
+      setProjectOrder(nextOrder);
+      if (botListCache) botListCache = { ...botListCache, projectOrder: nextOrder };
+      setReorderAnnouncement(`Moved ${movedGroup.name} to position ${toIndex + 1} of ${sidebarProjectGroups.length}.`);
+      persistReorder({ projectOrder: nextOrder });
+      if (preserveFocusKey) {
+        window.requestAnimationFrame(() => {
+          const el = sidebarScrollRef.current?.querySelector<HTMLElement>(`[data-project-header-key="${CSS.escape(preserveFocusKey)}"]`);
+          el?.focus();
+        });
+      }
+    },
+    [persistReorder, sidebarProjectGroups]
+  );
+
+  const handleReorderProjectBots = useCallback(
+    (projectKey: string, fromIndex: number, toIndex: number, { preserveFocusBotId }: { preserveFocusBotId?: string } = {}) => {
+      const group = sidebarProjectGroups.find((candidate) => candidate.groupKey === projectKey);
+      if (!group || fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= group.bots.length || toIndex >= group.bots.length) {
+        return;
+      }
+      const movedBot = group.bots[fromIndex];
+      const nextBotIds = reorderList(
+        group.bots.map((bot) => bot.id),
+        fromIndex,
+        toIndex
+      );
+      const current = botsRef.current ?? [];
+      const nextBots = applyOptimisticBotOrder(current, projectKey, nextBotIds);
+      setActionError(null);
+      setBots(nextBots);
+      if (botListCache) botListCache = { ...botListCache, bots: nextBots };
+      noteBotList(nextBots);
+      setReorderAnnouncement(`Moved ${movedBot.name} to position ${toIndex + 1} of ${group.bots.length} in ${group.name}.`);
+      persistReorder({ projectKey, botIds: nextBotIds });
+      if (preserveFocusBotId) {
+        window.requestAnimationFrame(() => {
+          const el = sidebarScrollRef.current?.querySelector<HTMLElement>(`[data-bot-row-id="${CSS.escape(preserveFocusBotId)}"]`);
+          el?.focus();
+        });
+      }
+    },
+    [persistReorder, sidebarProjectGroups]
+  );
+
+  const reorderShortcutHint = isMac ? 'Option+Up/Down' : 'Alt+Up/Down';
+  const isProjectDragging = activeDrag?.scope === 'projects';
+  const projectDropIndicatorY =
+    isProjectDragging && activeDrag ? computeDropIndicatorOffset(activeDrag.items, activeDrag.fromIndex, activeDrag.toIndex) : null;
+  const projectGroupKeys = useMemo(() => sidebarProjectGroups.map((group) => group.groupKey), [sidebarProjectGroups]);
+
   const selectedBot = useMemo(() => (selectedBotId ? bots?.find((bot) => bot.id === selectedBotId) ?? null : null), [bots, selectedBotId]);
   const ready = !listError && allowed && bots !== null;
   const selectedEntry = view === 'project' ? projectEntries.find((entry) => entry.id === selectedProjectId) ?? null : null;
@@ -824,7 +958,10 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
             <span className="mt-1 block text-[10.5px] text-neutral-500">Uses your Claude Code and projects here (Settings → Durango).</span>
           </div>
         )}
-        <div className="sidebar-content agents-sidebar-content !pt-0">
+        <div className="sidebar-content agents-sidebar-content !pt-0" ref={sidebarScrollRef}>
+          <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+            {reorderAnnouncement}
+          </div>
           {actionError && (
             <div className="mx-2 mb-2 flex items-start gap-1.5 rounded-lg bg-red-500/10 px-2.5 py-1.5 text-[11.5px] leading-snug text-red-300 ring-1 ring-red-400/20">
               <span className="min-w-0 flex-1">{actionError}</span>
@@ -891,115 +1028,251 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                   ))}
                 </ul>
               )}
-              {sidebarProjectGroups.map((group, index) => {
-                const expanded = !collapsedSet.has(group.groupKey);
-                const groupUnread = group.bots.reduce((sum, bot) => sum + bot.unread, 0);
-                const groupWorking = group.bots.some((bot) => botIsWorking(bot));
-                const groupNeedsYou = group.bots.some((bot) => bot.needsYou);
-                return (
-                  <section
-                    key={group.groupKey}
-                    className={index === 0 && primaryBots.length === 0 && standaloneBots.length === 0 ? '' : 'mt-2.5'}
-                    aria-label={group.name}
-                  >
-                    <div className="group/proj flex h-7 items-center gap-1 rounded-md pr-1">
-                      <button
-                        type="button"
-                        onClick={() => toggleProjectGroup(group.groupKey)}
-                        aria-expanded={expanded}
-                        className="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left transition-colors duration-75 hover:bg-white/[0.04]"
+              {sidebarProjectGroups.length > 0 && (
+                <div
+                  className={`relative ${primaryBots.length > 0 || standaloneBots.length > 0 ? 'mt-2.5' : ''}`}
+                  data-testid="bots-project-groups"
+                >
+                  {projectDropIndicatorY !== null && (
+                    <div
+                      className="bots-drop-indicator"
+                      data-testid="bots-project-drop-indicator"
+                      style={{ transform: `translate3d(0, ${projectDropIndicatorY.toFixed(1)}px, 0)` }}
+                      aria-hidden
+                    />
+                  )}
+                  {sidebarProjectGroups.map((group, index) => {
+                    const expanded = !collapsedSet.has(group.groupKey);
+                    const groupUnread = group.bots.reduce((sum, bot) => sum + bot.unread, 0);
+                    const groupWorking = group.bots.some((bot) => botIsWorking(bot));
+                    const groupNeedsYou = group.bots.some((bot) => bot.needsYou);
+                    const groupCanReorder = sidebarProjectGroups.length > 1;
+                    const groupDisplacement =
+                      isProjectDragging && activeDrag
+                        ? computeItemDisplacement(activeDrag.items, activeDrag.fromIndex, activeDrag.toIndex, index)
+                        : 0;
+                    const isDraggedGroup = isProjectDragging && activeDrag?.id === group.groupKey;
+                    const botScope = `bots:${group.groupKey}`;
+                    const isBotDraggingGroup = activeDrag?.scope === botScope;
+                    const botDropIndicatorY =
+                      isBotDraggingGroup && activeDrag
+                        ? computeDropIndicatorOffset(activeDrag.items, activeDrag.fromIndex, activeDrag.toIndex)
+                        : null;
+                    const groupBotIds = group.bots.map((bot) => bot.id);
+                    return (
+                      <section
+                        key={group.groupKey}
+                        ref={registerItem('projects', group.groupKey)}
+                        data-project-group-key={group.groupKey}
+                        className={`${index === 0 ? '' : 'mt-2.5'} ${isProjectDragging ? 'bots-drag-item' : ''} ${
+                          isDraggedGroup ? 'bots-drag-placeholder' : ''
+                        }`}
+                        style={groupDisplacement ? { transform: `translate3d(0, ${groupDisplacement.toFixed(1)}px, 0)` } : undefined}
+                        aria-label={group.name}
                       >
-                        <ChevronRight
-                          size={11}
-                          className={`shrink-0 text-neutral-500 transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`}
-                          aria-hidden
-                        />
-                        {group.path ? (
-                          <ProjectBadge project={{ name: group.name, path: group.path }} size={13} />
-                        ) : (
-                          <ProjectMonogram name={group.name} size={13} />
-                        )}
-                        <span className="min-w-0 flex-1 truncate text-[11px] font-medium tracking-[0.01em] text-neutral-500 transition-colors duration-75 group-hover/proj:text-neutral-300">
-                          {group.name}
-                        </span>
-                        {!expanded && (
-                          <span className="flex shrink-0 items-center">
-                            {groupUnread > 0 ? (
-                              <span className="rounded-full bg-sky-500 px-1.5 text-[10px] font-semibold leading-[16px] text-white">{groupUnread}</span>
-                            ) : groupWorking ? (
-                              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
-                            ) : groupNeedsYou ? (
-                              <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
-                            ) : (
-                              <span className="text-[10px] tabular-nums text-neutral-600">{group.bots.length}</span>
+                        <div
+                          className="group/proj relative flex h-7 items-center gap-1 rounded-md pr-1"
+                          onPointerDown={(event) =>
+                            startPointerDrag(event, {
+                              scope: 'projects',
+                              id: group.groupKey,
+                              orderedIds: projectGroupKeys,
+                              meta: { kind: 'project', group, expanded },
+                              disabled: !groupCanReorder,
+                              onCommit: (from, to) => handleReorderProjectGroups(from, to),
+                            })
+                          }
+                        >
+                          <button
+                            type="button"
+                            data-project-header-key={group.groupKey}
+                            onClick={() => {
+                              if (shouldSuppressClick()) return;
+                              toggleProjectGroup(group.groupKey);
+                            }}
+                            onKeyDown={(event) =>
+                              handleReorderKeyDown(event, index, sidebarProjectGroups.length, (from, to) =>
+                                handleReorderProjectGroups(from, to, { preserveFocusKey: group.groupKey })
+                              )
+                            }
+                            aria-expanded={expanded}
+                            aria-roledescription={groupCanReorder ? 'sortable project group' : undefined}
+                            aria-description={groupCanReorder ? `Drag or press ${reorderShortcutHint} to reorder project groups` : undefined}
+                            title={groupCanReorder ? `${group.name} · drag or ${reorderShortcutHint} to reorder` : group.name}
+                            className={`flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left transition-colors duration-75 hover:bg-white/[0.04] ${
+                              groupCanReorder ? 'cursor-grab active:cursor-grabbing' : ''
+                            }`}
+                          >
+                            {groupCanReorder && (
+                              <GripVertical
+                                size={10}
+                                className="pointer-events-none absolute -left-0.5 top-1/2 -translate-y-1/2 text-neutral-500 opacity-0 transition-opacity duration-100 group-hover/proj:opacity-60"
+                                aria-hidden
+                              />
                             )}
-                          </span>
-                        )}
-                      </button>
-                      <button
-                        type="button"
-                        title={`New bot in ${group.name}`}
-                        aria-label={`New bot in ${group.name}`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setBotModal({
-                            mode: 'create',
-                            project: {
-                              projectId: group.projectId,
-                              key: group.groupKey,
-                              name: group.name,
-                              path: group.path,
-                              repoId: group.repoId,
-                              existingNames: group.bots.map((bot) => bot.name),
-                            },
-                          });
-                        }}
-                        className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity duration-75 hover:bg-white/[0.08] hover:text-neutral-200 focus-visible:opacity-100 group-hover/proj:opacity-100"
-                      >
-                        <Plus size={12} />
-                      </button>
-                    </div>
-                    {expanded && (
-                      <ul className="ml-[13px] mt-0.5 space-y-px border-l border-white/[0.06] pl-1.5">
-                        {group.bots.map((bot) => (
-                          <li key={bot.id}>
-                            <BotRow
-                              bot={bot}
-                              projectPath={group.bots.length === 1 ? projectPathOfBot(bot) : null}
-                              title={
-                                bot.project
-                                  ? bot.projectPrimary
-                                    ? `${bot.name}: primary bot for ${bot.project.name} project`
-                                    : `${bot.name}: ${bot.project.name} project`
-                                  : bot.name
-                              }
-                              active={view === 'bot' && selectedBotId === bot.id}
-                              onClick={() => openBot(bot.id)}
-                              onEdit={() =>
-                                setBotModal({
-                                  mode: 'edit',
-                                  bot,
-                                  projectPath: projectPathOfBot(bot),
-                                  isSoleProjectBot: group.bots.length === 1,
-                                })
-                              }
-                              onMakePrimary={!bot.projectPrimary ? () => void handleMakePrimaryBot(bot) : undefined}
-                              onClear={() => void handleClearBot(bot)}
-                              onDelete={() => void handleDeleteBot(bot)}
+                            <ChevronRight
+                              size={11}
+                              className={`shrink-0 text-neutral-500 transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`}
+                              aria-hidden
                             />
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </section>
-                );
-              })}
+                            {group.path ? (
+                              <ProjectBadge project={{ name: group.name, path: group.path }} size={13} />
+                            ) : (
+                              <ProjectMonogram name={group.name} size={13} />
+                            )}
+                            <span className="min-w-0 flex-1 truncate text-[11px] font-medium tracking-[0.01em] text-neutral-500 transition-colors duration-75 group-hover/proj:text-neutral-300">
+                              {group.name}
+                            </span>
+                            {!expanded && (
+                              <span className="flex shrink-0 items-center">
+                                {groupUnread > 0 ? (
+                                  <span className="rounded-full bg-sky-500 px-1.5 text-[10px] font-semibold leading-[16px] text-white">{groupUnread}</span>
+                                ) : groupWorking ? (
+                                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
+                                ) : groupNeedsYou ? (
+                                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                                ) : (
+                                  <span className="text-[10px] tabular-nums text-neutral-600">{group.bots.length}</span>
+                                )}
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            data-no-drag="true"
+                            title={`New bot in ${group.name}`}
+                            aria-label={`New bot in ${group.name}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setBotModal({
+                                mode: 'create',
+                                project: {
+                                  projectId: group.projectId,
+                                  key: group.groupKey,
+                                  name: group.name,
+                                  path: group.path,
+                                  repoId: group.repoId,
+                                  existingNames: group.bots.map((bot) => bot.name),
+                                },
+                              });
+                            }}
+                            className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 opacity-0 transition-opacity duration-75 hover:bg-white/[0.08] hover:text-neutral-200 focus-visible:opacity-100 group-hover/proj:opacity-100"
+                          >
+                            <Plus size={12} />
+                          </button>
+                        </div>
+                        {expanded && (
+                          <ul
+                            className="relative ml-[13px] mt-0.5 space-y-px border-l border-white/[0.06] pl-1.5"
+                            data-project-bots-list={group.groupKey}
+                          >
+                            {botDropIndicatorY !== null && (
+                              <div
+                                className="bots-drop-indicator"
+                                data-testid="bots-row-drop-indicator"
+                                style={{ transform: `translate3d(0, ${botDropIndicatorY.toFixed(1)}px, 0)` }}
+                                aria-hidden
+                              />
+                            )}
+                            {group.bots.map((bot, botIndex) => {
+                              const botCanReorder = group.bots.length > 1;
+                              const botDisplacement =
+                                isBotDraggingGroup && activeDrag
+                                  ? computeItemDisplacement(activeDrag.items, activeDrag.fromIndex, activeDrag.toIndex, botIndex)
+                                  : 0;
+                              const isDraggedBot = isBotDraggingGroup && activeDrag?.id === bot.id;
+                              const botProjectPath = group.bots.length === 1 ? projectPathOfBot(bot) : null;
+                              return (
+                                <li
+                                  key={bot.id}
+                                  ref={registerItem(botScope, bot.id)}
+                                  className={`${isBotDraggingGroup ? 'bots-drag-item' : ''} ${
+                                    isDraggedBot ? 'bots-drag-placeholder' : ''
+                                  }`}
+                                  style={botDisplacement ? { transform: `translate3d(0, ${botDisplacement.toFixed(1)}px, 0)` } : undefined}
+                                >
+                                  <BotRow
+                                    bot={bot}
+                                    projectPath={botProjectPath}
+                                    title={
+                                      bot.project
+                                        ? bot.projectPrimary
+                                          ? `${bot.name}: primary bot for ${bot.project.name} project${botCanReorder ? ` · drag or ${reorderShortcutHint} to reorder` : ''}`
+                                          : `${bot.name}: ${bot.project.name} project${botCanReorder ? ` · drag or ${reorderShortcutHint} to reorder` : ''}`
+                                        : bot.name
+                                    }
+                                    active={view === 'bot' && selectedBotId === bot.id}
+                                    sortable={botCanReorder}
+                                    reorderHint={botCanReorder ? reorderShortcutHint : undefined}
+                                    onPointerDown={(event) =>
+                                      startPointerDrag(event, {
+                                        scope: botScope,
+                                        id: bot.id,
+                                        orderedIds: groupBotIds,
+                                        meta: { kind: 'bot', bot, projectKey: group.groupKey, projectPath: botProjectPath },
+                                        disabled: !botCanReorder,
+                                        onCommit: (from, to) => handleReorderProjectBots(group.groupKey, from, to),
+                                      })
+                                    }
+                                    onKeyDownReorder={(event) =>
+                                      handleReorderKeyDown(event, botIndex, group.bots.length, (from, to) =>
+                                        handleReorderProjectBots(group.groupKey, from, to, { preserveFocusBotId: bot.id })
+                                      )
+                                    }
+                                    onClick={() => {
+                                      if (shouldSuppressClick()) return;
+                                      openBot(bot.id);
+                                    }}
+                                    onEdit={() =>
+                                      setBotModal({
+                                        mode: 'edit',
+                                        bot,
+                                        projectPath: projectPathOfBot(bot),
+                                        isSoleProjectBot: group.bots.length === 1,
+                                      })
+                                    }
+                                    onMakePrimary={!bot.projectPrimary ? () => void handleMakePrimaryBot(bot) : undefined}
+                                    onClear={() => void handleClearBot(bot)}
+                                    onDelete={() => void handleDeleteBot(bot)}
+                                  />
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
         </div>
         <SidebarFooter {...sidebarFooterProps} />
         {resizeHandle}
       </div>
+      {activeDrag &&
+        createPortal(
+          <div
+            ref={overlayElRef}
+            data-testid="bots-drag-overlay"
+            className={`bots-drag-overlay bots-font ${
+              activeDrag.meta.kind === 'project' && activeDrag.meta.expanded ? 'bots-drag-overlay-stack' : ''
+            }`}
+            style={{
+              width: `${activeDrag.initialRect.width}px`,
+              transform: `translate3d(${activeDrag.overlayPos.x.toFixed(1)}px, ${activeDrag.overlayPos.y.toFixed(1)}px, 0) scale(1.015)`,
+            }}
+            aria-hidden
+          >
+            {activeDrag.meta.kind === 'bot' ? (
+              <BotDragPreview bot={activeDrag.meta.bot} projectPath={activeDrag.meta.projectPath} />
+            ) : (
+              <ProjectGroupDragPreview group={activeDrag.meta.group} expanded={activeDrag.meta.expanded} />
+            )}
+          </div>,
+          document.body
+        )}
       {/* Threads and the projects window are this machine's own: they show
           whether or not bots are available (signed out, another plan, offline). */}
       {view === 'thread' ? (
@@ -2402,18 +2675,97 @@ const BotRowMenu: React.FC<{
   );
 };
 
+/** Lifted floating card shown under the cursor while dragging a bot row. */
+const BotDragPreview: React.FC<{ bot: DesktopBot; projectPath?: string | null }> = ({ bot, projectPath }) => {
+  const working = botIsWorking(bot);
+  return (
+    <div className="flex h-9 w-full items-center gap-2.5 px-2 text-left">
+      <span className="relative flex h-[22px] w-[22px] shrink-0 items-center justify-center text-[15px] leading-none" aria-hidden>
+        <BotIcon bot={bot} px={22} projectPath={projectPath} />
+        {bot.role === 'primary' && <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
+      </span>
+      <span className={`min-w-0 flex-1 truncate text-[14.5px] ${bot.unread > 0 ? 'font-semibold text-neutral-100' : 'text-neutral-200'}`}>
+        {bot.name}
+      </span>
+      {bot.projectPrimary && (
+        <span className="shrink-0 rounded-full bg-amber-400/12 px-1.5 text-[10px] font-medium leading-[16px] text-amber-300/90 ring-1 ring-amber-400/20">
+          Primary
+        </span>
+      )}
+      {bot.unread > 0 ? (
+        <span className="shrink-0 rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
+      ) : working ? (
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
+      ) : bot.needsYou ? (
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
+      ) : null}
+    </div>
+  );
+};
+
+/** Lifted floating card shown under the cursor while dragging a collapsed or expanded project group. */
+const ProjectGroupDragPreview: React.FC<{ group: SidebarProjectGroup; expanded: boolean }> = ({ group, expanded }) => {
+  const groupUnread = group.bots.reduce((sum, bot) => sum + bot.unread, 0);
+  const groupWorking = group.bots.some((bot) => botIsWorking(bot));
+  const groupNeedsYou = group.bots.some((bot) => bot.needsYou);
+  return (
+    <div className="flex h-7 w-full items-center gap-1.5 px-2 text-left">
+      <ChevronRight size={11} className={`shrink-0 text-neutral-400 ${expanded ? 'rotate-90' : ''}`} aria-hidden />
+      {group.path ? (
+        <ProjectBadge project={{ name: group.name, path: group.path }} size={13} />
+      ) : (
+        <ProjectMonogram name={group.name} size={13} />
+      )}
+      <span className="min-w-0 flex-1 truncate text-[11.5px] font-medium tracking-[0.01em] text-neutral-200">
+        {group.name}
+      </span>
+      {expanded ? (
+        <span className="shrink-0 rounded-full bg-white/[0.08] px-1.5 text-[10px] tabular-nums leading-[16px] text-neutral-300">
+          {group.bots.length} {group.bots.length === 1 ? 'bot' : 'bots'}
+        </span>
+      ) : groupUnread > 0 ? (
+        <span className="shrink-0 rounded-full bg-sky-500 px-1.5 text-[10px] font-semibold leading-[16px] text-white">{groupUnread}</span>
+      ) : groupWorking ? (
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
+      ) : groupNeedsYou ? (
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
+      ) : (
+        <span className="shrink-0 text-[10px] tabular-nums text-neutral-400">{group.bots.length}</span>
+      )}
+    </div>
+  );
+};
+
 /** A compact one-line sidebar row: icon, name, hover menu, and unread count or a working / waiting dot. */
 const BotRow: React.FC<{
   bot: DesktopBot;
   projectPath?: string | null;
   title: string;
   active: boolean;
+  sortable?: boolean;
+  reorderHint?: string;
+  onPointerDown?: (event: React.PointerEvent<HTMLDivElement>) => void;
+  onKeyDownReorder?: (event: React.KeyboardEvent<HTMLDivElement>) => void;
   onClick: () => void;
   onEdit: () => void;
   onMakePrimary?: () => void;
   onClear: () => void;
   onDelete?: () => void;
-}> = ({ bot, projectPath, title, active, onClick, onEdit, onMakePrimary, onClear, onDelete }) => {
+}> = ({
+  bot,
+  projectPath,
+  title,
+  active,
+  sortable = false,
+  reorderHint,
+  onPointerDown,
+  onKeyDownReorder,
+  onClick,
+  onEdit,
+  onMakePrimary,
+  onClear,
+  onDelete,
+}) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const working = botIsWorking(bot);
   const actions: BotMenuAction[] = [
@@ -2426,9 +2778,15 @@ const BotRow: React.FC<{
     <div
       role="button"
       tabIndex={0}
+      data-bot-row-id={bot.id}
       onClick={onClick}
+      onPointerDown={sortable && !menuOpen ? onPointerDown : undefined}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) return;
+        if (sortable && onKeyDownReorder) {
+          onKeyDownReorder(event);
+          if (event.defaultPrevented) return;
+        }
         if (event.key === 'Enter' || event.key === ' ') {
           event.preventDefault();
           onClick();
@@ -2436,10 +2794,19 @@ const BotRow: React.FC<{
       }}
       title={title}
       aria-current={active ? 'true' : undefined}
-      className={`group relative flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-lg px-2 text-left transition-colors duration-75 ${
-        active ? 'bg-white/[0.08]' : menuOpen ? 'bg-white/[0.06]' : 'hover:bg-white/[0.045]'
-      }`}
+      aria-roledescription={sortable ? 'sortable bot' : undefined}
+      aria-description={sortable && reorderHint ? `Drag or press ${reorderHint} to reorder within this project` : undefined}
+      className={`group relative flex h-9 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors duration-75 ${
+        sortable ? 'cursor-pointer' : 'cursor-pointer'
+      } ${active ? 'bg-white/[0.08]' : menuOpen ? 'bg-white/[0.06]' : 'hover:bg-white/[0.045]'}`}
     >
+      {sortable && (
+        <GripVertical
+          size={9}
+          className="pointer-events-none absolute -left-1 top-1/2 -translate-y-1/2 text-neutral-500 opacity-0 transition-opacity duration-100 group-hover:opacity-55"
+          aria-hidden
+        />
+      )}
       <span className="relative flex h-[22px] w-[22px] shrink-0 items-center justify-center text-[15px] leading-none" aria-hidden>
         <BotIcon bot={bot} px={22} projectPath={projectPath} />
         {bot.role === 'primary' && <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
@@ -2464,6 +2831,7 @@ const BotRow: React.FC<{
         ) : null}
       </span>
       <span
+        data-no-drag="true"
         className={`-mr-0.5 shrink-0 items-center ${menuOpen ? 'flex' : 'hidden group-hover:flex group-focus-within:flex'}`}
         onClick={(event) => event.stopPropagation()}
       >

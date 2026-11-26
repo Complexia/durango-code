@@ -6125,6 +6125,38 @@ ipcMain.handle('bots:setProjectPrimary', async (_event, input) => {
     return durangoIpcError(error);
   }
 });
+ipcMain.handle('bots:reorder', async (_event, input) => {
+  const projectOrder = Array.isArray(input?.projectOrder)
+    ? input.projectOrder.filter((key) => typeof key === 'string' && key.trim())
+    : undefined;
+  const projectKey = typeof input?.projectKey === 'string' && input.projectKey.trim() ? input.projectKey.trim() : undefined;
+  const botIds = Array.isArray(input?.botIds)
+    ? input.botIds.filter((id) => typeof id === 'string' && id.trim())
+    : undefined;
+  if (projectOrder === undefined && !(projectKey && botIds)) {
+    return { ok: false, error: 'Specify a project order or a project and bot order.' };
+  }
+  if ((projectKey && !botIds) || (!projectKey && botIds)) {
+    return { ok: false, error: 'Specify both projectKey and botIds.' };
+  }
+  const payload = {
+    ...(projectOrder !== undefined ? { projectOrder } : {}),
+    ...(projectKey && botIds ? { projectKey, botIds } : {}),
+  };
+  if (await localBotsMode()) {
+    try {
+      return { ok: true, ...(await localBots.reorder(payload)) };
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const result = await durangoClient.reorderBots(payload);
+    return { ok: true, ...(result.projectOrder ? { projectOrder: result.projectOrder } : {}) };
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
 ipcMain.handle('bots:delete', async (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId : '';
   if (!botId) return { ok: false, error: 'Bot not found.' };
