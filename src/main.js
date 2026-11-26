@@ -106,6 +106,7 @@ import {
   normalizeBotSettings,
 } from './main/bot-replies.js';
 import { createBotAttachmentManager } from './main/bot-attachments.js';
+import { mergeDesktopBotModelCatalog } from './main/bot-models.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
 import { clipMiddle } from './report-clip.js';
@@ -128,6 +129,7 @@ import {
   configureAgentModelsCache,
   getAgentModels,
   invalidateAgentModelsCache,
+  listClaudeModels,
   listAgentModelsWithAvailability,
   onAgentModelsChanged,
   resolveLegacyAntigravityModelId,
@@ -6003,12 +6005,19 @@ ipcMain.handle('bots:mode', async () => ({
 }));
 
 ipcMain.handle('bots:list', async () => {
+  const localClaudePromise = listClaudeModels().catch(() => []);
   if (await localBotsMode()) {
     if (!(await botRepliesAvailable().catch(() => false))) {
       return { ok: false, code: 'claude_unavailable', error: LOCAL_BOTS_CLAUDE_UNAVAILABLE };
     }
     try {
-      return { ok: true, ...(await localBots.list()), projectKeys: await botProjectKeys({ local: true }), account: 'local' };
+      const [listed, localClaudeModels] = await Promise.all([localBots.list(), localClaudePromise]);
+      const modelCatalog = mergeDesktopBotModelCatalog({
+        mode: 'local',
+        modelChoices: listed.modelChoices,
+        localClaudeModels,
+      });
+      return { ok: true, ...listed, modelCatalog, projectKeys: await botProjectKeys({ local: true }), account: 'local' };
     } catch (error) {
       return localBotsIpcError(error);
     }
@@ -6017,11 +6026,20 @@ ipcMain.handle('bots:list', async () => {
     // Which account this list is for (no secret: a hash), so the Bots view
     // drops what it kept for another account.
     const before = await durangoAccountKey();
-    const list = await durangoClient.listBots();
+    const [list, localClaudeModels] = await Promise.all([durangoClient.listBots(), localClaudePromise]);
     const after = await durangoAccountKey();
     if (!before || before !== after) return { ok: false, code: 'account_changed', error: 'The Durango account changed. Try again.' };
     const account = crypto.createHash('sha256').update(before).digest('hex').slice(0, 16);
-    return { ok: true, ...list, projectKeys: await botProjectKeys({ local: false }), account };
+    const modelCatalog =
+      list.modelChoices?.length || list.modelCatalog?.length
+        ? mergeDesktopBotModelCatalog({
+            mode: 'durango',
+            modelChoices: list.modelChoices,
+            modelCatalog: list.modelCatalog,
+            localClaudeModels,
+          })
+        : null;
+    return { ok: true, ...list, modelCatalog, projectKeys: await botProjectKeys({ local: false }), account };
   } catch (error) {
     return durangoIpcError(error);
   }

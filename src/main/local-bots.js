@@ -48,10 +48,10 @@ export const LOCAL_BOT_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'm
 const LOCAL_BOT_EFFORT_SET = new Set(LOCAL_BOT_REASONING_EFFORTS);
 /** Models a local bot can be set to (its Claude Code on this machine). */
 export const LOCAL_BOT_MODEL_CHOICES = [
-  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', note: 'Smartest (the default)', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
-  { id: 'claude-fable-5-2', label: 'Claude Fable 5.2', note: 'Deep reasoning', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
-  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', note: 'Fast and capable', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
-  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', note: 'Cheapest', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'medium' },
+  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', note: 'Smartest (the default)', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-fable-5-2', label: 'Claude Fable 5.2', note: 'Deep reasoning', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', note: 'Fast and capable', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', note: 'Cheapest', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'medium' },
 ];
 
 export const defaultLocalBotReasoningEffort = (model) =>
@@ -2789,7 +2789,7 @@ export const createLocalBotEngine = ({
     async setModel(botId, model, reasoningEffort) {
       await ensureLoaded();
       const entry = entryFor(botId);
-      if (model && !LOCAL_BOT_MODEL_CHOICES.some((choice) => choice.id === model)) throw new Error('Pick one of the bot models.');
+      if (model && !claudeModelFrom(model)) throw new Error('Pick one of the bot models.');
       if (!model && reasoningEffort === undefined) throw new Error('Pick a model or reasoning level.');
       const before = { model: entry.bot.model, modelChosen: entry.bot.modelChosen, reasoningEffort: entry.bot.reasoningEffort };
       if (model) applyModel(entry.bot, model);

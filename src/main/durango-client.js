@@ -365,17 +365,22 @@ const normalizeConnector = (connector, baseUrl) => {
   };
 };
 
-/** The models a bot can be set to (GET /api/v1/bots modelChoices), or null when Durango sent none. */
-const normalizeBotModelChoices = (value) => {
+/** The models a bot can be set to (GET /api/v1/bots modelChoices / modelCatalog), or null when Durango sent none. */
+const normalizeBotModelChoices = (value, maxCount = 30) => {
   if (!Array.isArray(value)) return null;
   const choices = value
     .filter((choice) => choice && typeof choice.id === 'string' && choice.id && typeof choice.label === 'string')
-    .slice(0, 30)
+    .slice(0, maxCount)
     .map((choice) => ({
       id: choice.id,
       label: choice.label,
       note: typeof choice.note === 'string' ? choice.note : '',
       claude: choice.claude === true,
+      ...(typeof choice.provider === 'string' && choice.provider ? { provider: choice.provider } : {}),
+      ...(typeof choice.lab === 'string' && choice.lab ? { lab: choice.lab } : {}),
+      ...(typeof choice.recommended === 'boolean' ? { recommended: choice.recommended } : {}),
+      ...(choice.legacy === true ? { legacy: true } : {}),
+      ...(typeof choice.local === 'boolean' ? { local: choice.local } : {}),
       ...(Array.isArray(choice.efforts)
         ? { efforts: choice.efforts.filter((effort) => typeof effort === 'string' && effort).slice(0, 10) }
         : {}),
@@ -864,7 +869,7 @@ export const createDurangoClient = ({
     supportsPendingBotAttachments() {
       return pendingBotAttachmentsSupported;
     },
-    /** → `{ allowed, bots, projectOrder, modelChoices, pendingAttachments }` (the primary first; modelChoices: null from an older Durango). */
+    /** → `{ allowed, bots, projectOrder, modelChoices, modelCatalog, pendingAttachments }` (the primary first; modelChoices: null from an older Durango). */
     async listBots() {
       const data = await request('GET', '/bots');
       pendingBotAttachmentsSupported = data.pendingAttachments === true;
@@ -873,6 +878,7 @@ export const createDurangoClient = ({
         bots: Array.isArray(data.bots) ? data.bots : [],
         projectOrder: Array.isArray(data.projectOrder) ? data.projectOrder.filter((key) => typeof key === 'string') : [],
         modelChoices: normalizeBotModelChoices(data.modelChoices),
+        modelCatalog: normalizeBotModelChoices(data.modelCatalog, 600),
         pendingAttachments: pendingBotAttachmentsSupported,
       };
     },
@@ -1483,7 +1489,7 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       return MOCK_CHATS.find((chat) => chat.id === chatId)?.url ?? `${DEFAULT_DURANGO_URL}/chats`;
     },
     async listBots() {
-      return { allowed: true, bots: [], projectOrder: [], modelChoices: null };
+      return { allowed: true, bots: [], projectOrder: [], modelChoices: null, modelCatalog: null };
     },
     async reorderBots({ projectOrder } = {}) {
       return { ok: true, ...(Array.isArray(projectOrder) ? { projectOrder } : {}) };

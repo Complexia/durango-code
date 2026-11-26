@@ -180,8 +180,12 @@ type BotListCache = {
   allowed: boolean;
   mode: 'local' | 'durango' | null;
   cloudOnly: boolean;
-  /** The models a bot can be set to (null: an older Durango, no picker). */
+  /** The recommended models a bot can be set to (null: an older Durango, no picker). */
   modelChoices: BotModelChoice[] | null;
+  /** The full searchable catalog (recommended + cloud catalog + local Claude models). */
+  modelCatalog: BotModelChoice[] | null;
+  /** Whether Claude Code is available to answer bot replies on this machine. */
+  claudeAvailable: boolean;
 };
 let botListCache: BotListCache | null = null;
 const botThreadCache = new Map<string, DesktopBotThread>();
@@ -360,6 +364,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const [projectOrder, setProjectOrder] = useState<string[]>(() => botListCache?.projectOrder ?? []);
   const [projectKeys, setProjectKeys] = useState<Record<string, string>>(() => botListCache?.projectKeys ?? {});
   const [modelChoices, setModelChoices] = useState<BotModelChoice[] | null>(() => botListCache?.modelChoices ?? null);
+  const [modelCatalog, setModelCatalog] = useState<BotModelChoice[] | null>(() => botListCache?.modelCatalog ?? null);
+  const [claudeAvailable, setClaudeAvailable] = useState<boolean>(() => botListCache?.claudeAvailable ?? true);
   const [listError, setListError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [reorderAnnouncement, setReorderAnnouncement] = useState('');
@@ -422,9 +428,11 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     const nextCloudOnly = modeResult
       ? modeResult.mode === 'durango' && modeResult.claudeAvailable && modeResult.machineReplies === false
       : botListCache?.cloudOnly ?? false;
+    const nextClaudeAvailable = modeResult ? modeResult.claudeAvailable : botListCache?.claudeAvailable ?? true;
     if (modeResult) {
       setMode(nextMode);
       setCloudOnly(nextCloudOnly);
+      setClaudeAvailable(nextClaudeAvailable);
     }
     if (!result) return;
     if (!result.ok) {
@@ -459,6 +467,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     noteBotList(result.allowed === false ? null : nextBots);
     setProjectKeys(result.projectKeys ?? {});
     setModelChoices(result.modelChoices ?? null);
+    setModelCatalog(result.modelCatalog ?? result.modelChoices ?? null);
     botListCache = {
       account: nextAccount,
       bots: nextBots,
@@ -467,7 +476,9 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       allowed: result.allowed !== false,
       mode: nextMode,
       cloudOnly: nextCloudOnly,
+      claudeAvailable: nextClaudeAvailable,
       modelChoices: result.modelChoices ?? null,
+      modelCatalog: result.modelCatalog ?? result.modelChoices ?? null,
     };
   }, []);
 
@@ -1312,7 +1323,10 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               botHint={selectedBot}
               projectPath={projectPathOfBot(selectedBot)}
               modelChoices={modelChoices}
+              modelCatalog={modelCatalog}
               local={mode === 'local'}
+              claudeAvailable={claudeAvailable}
+              machineReplies={!cloudOnly}
               onChanged={loadBots}
               onOpenProject={openProjectOfBot}
               onOpenThread={openBotThread}
@@ -2848,15 +2862,21 @@ const BotPane: React.FC<{
   botHint?: Pick<DesktopBot, 'name' | 'emoji' | 'job' | 'projectPrimary'> | null;
   /** Local project path for a project bot so its icon uses the project's icon when available. */
   projectPath?: string | null;
-  /** The models the bot can be set to (null: no picker). */
+  /** The recommended models the bot can be set to (null: no picker). */
   modelChoices: BotModelChoice[] | null;
+  /** Full searchable catalog (recommended + cloud catalog + local Claude models). */
+  modelCatalog: BotModelChoice[] | null;
   /** The bots are this computer's own (signed out). */
   local: boolean;
+  /** Whether Claude Code is available on this machine. */
+  claudeAvailable: boolean;
+  /** Whether this machine is configured to answer bots locally. */
+  machineReplies: boolean;
   onChanged: () => void;
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
-}> = ({ botId, botHint, projectPath, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
+}> = ({ botId, botHint, projectPath, modelChoices, modelCatalog, local, claudeAvailable, machineReplies, onChanged, onOpenProject, onOpenThread }) => {
   // `thread.messages`: every message loaded so far (the newest page, older
   // pages scrolled back to, and what polls brought), in seq order; unchanged
   // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
@@ -3283,7 +3303,10 @@ const BotPane: React.FC<{
           model={bot.model}
           reasoningEffort={bot.reasoningEffort}
           choices={modelChoices}
+          catalog={modelCatalog}
           local={local}
+          claudeAvailable={claudeAvailable}
+          machineReplies={machineReplies}
           onPick={pickModel}
         />
       ) : null}
