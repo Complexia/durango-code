@@ -255,6 +255,12 @@ export type RemoteCommandOutcome = {
   threadTitle?: string;
   /** addProject: the project that holds the path. */
   projectId?: string;
+  /** threadTurnState: the thread runs a turn, and the "Needs you" requests it waits on. */
+  running?: boolean;
+  requests?: Array<{ id: string; action: string; url?: string; threadId?: string }>;
+  secretIds?: string[];
+  /** runTurn: a bot's follow-up went to this pending request as its reply. */
+  answeredRequest?: string;
   error?: string;
 };
 

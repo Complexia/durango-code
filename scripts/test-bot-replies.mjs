@@ -23,6 +23,7 @@ import {
   BOT_SESSIONS_FEATURE,
   BOT_THREAD_ACTIONS_FEATURE,
   BOT_THREAD_CONFIGURE_FEATURE,
+  BOT_THREAD_REQUESTS_FEATURE,
   createBotSessionStore,
   botProjectsNote,
   botToolLabel,
@@ -811,6 +812,7 @@ try {
       BOT_REPLY_MESSAGES_FEATURE,
       BOT_THREAD_ACTIONS_FEATURE,
       BOT_THREAD_CONFIGURE_FEATURE,
+      BOT_THREAD_REQUESTS_FEATURE,
     ]);
     assert.deepEqual(
       client.calls.message.map(({ index, text }) => [index, text]),
@@ -1355,6 +1357,179 @@ try {
     assert.equal(tasks[0].title, 'Ship it');
     assert.equal(tasks[0].project, undefined);
     assert.deepEqual(client.calls.tool.map((call) => call.input.thread_id), ['thread_on_omarchy'], 'a thread not here: Durango sends it to its machine');
+  });
+
+  await test('"Needs you" requests: answer_thread_request presses Done/Reply/X; message_thread and steers to a waiting thread answer it; a busy thread is refused before any task', async () => {
+    const client = createFakeClient({ claim: laneClaims([makeLane()]) });
+    const tasks = [];
+    client.createBotLaneTask = async (input) => {
+      tasks.push(input);
+      return { taskId: `task_${tasks.length}`, title: input.title };
+    };
+    const reports = [];
+    client.reportBotTask = async (input) => {
+      reports.push(input);
+      return { ok: true };
+    };
+    const entries = [
+      // The iOS release thread's shape: a turn still open, one request pinned.
+      { id: 'thread_release', projectId: 'p1', title: 'Ship iOS app', status: 'running', activityAt: 3, shell: { userActions: [{ id: 'ua_asc', action: 'Sign in to App Store Connect in Chrome', url: 'https://appstoreconnect.apple.com/apps/1/distribution', requestedAt: 'x' }] } },
+      { id: 'thread_two', projectId: 'p1', title: 'Two asks', status: 'idle', activityAt: 2, shell: { userActions: [{ id: 'ua_a', action: 'Sign in to npm', requestedAt: 'x' }] } },
+      // A subagent's request shows on its parent, as on its card.
+      { id: 'thread_two_sub', projectId: 'p1', title: 'Review', status: 'idle', parentThreadId: 'thread_two', shell: { userActions: [{ id: 'ua_b', action: 'Plug in the phone', requestedAt: 'y' }] } },
+      { id: 'thread_secret', projectId: 'p1', title: 'Needs a key', status: 'running', activityAt: 1, shell: { userActions: [{ id: 'sr_1', action: 'Enter the Stripe key', requestedAt: 'x', secret: { name: 'STRIPE' } }] } },
+      { id: 'thread_busy', projectId: 'p1', title: 'Busy', status: 'running', activityAt: 0 },
+    ];
+    // The renderer's live view (App.tsx threadTurnState), from the same rows.
+    const live = (threadId) => {
+      const own = entries.filter((entry) => entry.id === threadId || entry.parentThreadId === threadId);
+      const actions = own.flatMap((entry) => (entry.shell?.userActions ?? []).map((action) => ({ ...action, threadId: entry.id })));
+      return {
+        ok: true,
+        running: entries.find((entry) => entry.id === threadId)?.status === 'running',
+        requests: actions.filter((action) => !action.secret).map(({ id, action, url, threadId: owner }) => ({ id, action, ...(url ? { url } : {}), ...(owner !== threadId ? { threadId: owner } : {}) })),
+        secretIds: actions.filter((action) => action.secret).map((action) => action.id),
+      };
+    };
+    const answered = [];
+    const threadTools = createBotThreadTools({
+      readIndex: async () => ({ entries }),
+      readThread: async () => 'transcript',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/Users/me/durango' }],
+      threadTurnState: async (threadId) => live(threadId),
+      answerRequest: async (input) => {
+        answered.push(input);
+        const thread = entries.find((entry) => (entry.shell?.userActions ?? []).some((action) => action.id === input.actionId));
+        if (!thread) return { ok: false, error: 'That action is no longer waiting.' };
+        thread.shell.userActions = thread.shell.userActions.filter((action) => action.id !== input.actionId);
+        return { ok: true, threadId: thread.id };
+      },
+    });
+    const followUps = [];
+    let results;
+    startWorker({
+      client,
+      threadTools,
+      startThreadFollowUp: async (input) => {
+        followUps.push(input);
+        return { ok: true, threadId: input.threadId };
+      },
+      runLane: async (lane, ctx) => {
+        const call = (name, input) => ctx.callTool({ name, input, toolCallId: `t_${name}` }).then((out) => out.result);
+        results = {
+          listed: await call('list_threads', {}),
+          read: await call('read_thread', { thread_id: 'thread_release' }),
+          // The person said "done", the bot passes it on: as a message, the request takes it as their reply.
+          message: await call('message_thread', { thread_id: 'thread_release', message: 'The person says they are signed in. Carry on.' }),
+          noneLeft: await call('answer_thread_request', { thread_id: 'thread_release', answer: 'done' }),
+          several: await call('answer_thread_request', { thread_id: 'thread_two', answer: 'done' }),
+          severalMessage: await call('message_thread', { thread_id: 'thread_two', message: 'Done.' }),
+          done: await call('answer_thread_request', { thread_id: 'thread_two', request_id: 'ua_b', answer: 'done' }),
+          wrongId: await call('answer_thread_request', { thread_id: 'thread_two', request_id: 'ua_nope', answer: 'done' }),
+          replyEmpty: await call('answer_thread_request', { thread_id: 'thread_two', answer: 'reply' }),
+          steer: await call('message_thread', { thread_id: 'thread_two', message: 'They cannot sign in: npm is down.', steer: true }),
+          secret: await call('answer_thread_request', { thread_id: 'thread_secret', request_id: 'sr_1', answer: 'done' }),
+          secretOnly: await call('answer_thread_request', { thread_id: 'thread_secret', answer: 'done' }),
+          busy: await call('message_thread', { thread_id: 'thread_busy', message: 'Also do X.' }),
+          busySteer: await call('message_thread', { thread_id: 'thread_busy', message: 'Also do X.', steer: true }),
+          elsewhere: await call('answer_thread_request', { thread_id: 'thread_on_omarchy', answer: 'done' }),
+        };
+        return { text: 'Told the thread.' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+
+    const release = results.listed.threads.find((thread) => thread.id === 'thread_release');
+    assert.deepEqual(release.needsYou, [{ id: 'ua_asc', action: 'Sign in to App Store Connect in Chrome', url: 'https://appstoreconnect.apple.com/apps/1/distribution' }], 'list_threads shows the pending request');
+    assert.deepEqual(results.listed.threads.find((thread) => thread.id === 'thread_two').needsYou.map((request) => request.id), ['ua_a', 'ua_b'], "a subagent's request shows on its parent");
+    assert.equal(results.listed.threads.find((thread) => thread.id === 'thread_secret').needsYou, undefined, 'a secret request is not one a bot answers');
+    assert.deepEqual(results.read.needsYou.map((request) => request.id), ['ua_asc']);
+
+    assert.equal(results.message.ok, true, 'not "already running a turn"');
+    assert.equal(results.message.answeredRequest, 'ua_asc');
+    assert.deepEqual(answered[0], { threadId: 'thread_release', actionId: 'ua_asc', op: 'reply', reply: 'The person says they are signed in. Carry on.', botName: 'Scout' });
+    assert.match(results.noneLeft.error, /no pending "Needs you" request/);
+
+    assert.match(results.several.error, /waits on 2 requests: pass request_id, one of: ua_a .*; ua_b /);
+    assert.match(results.severalMessage.error, /waiting on the person for 2 requests: answer the one this is about with answer_thread_request/);
+    assert.deepEqual(results.done, { ok: true, threadId: 'thread_two', requestId: 'ua_b', answer: 'done', request: 'Plug in the phone', note: results.done.note });
+    assert.deepEqual(answered[1], { threadId: 'thread_two', actionId: 'ua_b', op: 'done', botName: 'Scout' });
+    assert.match(results.wrongId.error, /No pending request "ua_nope" on that thread\. It waits on: ua_a/);
+    assert.match(results.replyEmpty.error, /needs `reply`/);
+    // One request left: a steer goes to it as the reply, not into the turn.
+    assert.equal(results.steer.answeredRequest, 'ua_a');
+    assert.deepEqual(answered[2], { threadId: 'thread_two', actionId: 'ua_a', op: 'reply', reply: 'They cannot sign in: npm is down.', botName: 'Scout' });
+
+    assert.match(results.secret.error, /secret request: only the person/);
+    assert.match(results.secretOnly.error, /only waits on a secret request/);
+    assert.match(results.busy.error, /currently running a turn\. Pass `steer: true`/);
+    assert.equal(results.busySteer.steered, true, 'a busy thread with no request still steers');
+
+    assert.equal(answered.length, 3, 'secrets and refusals press nothing');
+    assert.equal(tasks.length, 0, 'no task (and no failed task card) for answers or refusals');
+    assert.equal(reports.length, 0);
+    assert.deepEqual(followUps.map((input) => [input.threadId, input.steer === true]), [['thread_busy', true]]);
+    assert.deepEqual(client.calls.tool.map((call) => [call.name, call.input.thread_id]), [['answer_thread_request', 'thread_on_omarchy']], 'a thread not here: Durango hands it to its machine');
+  });
+
+  await test('"Needs you" requests: a follow-up the renderer turned into the reply to a fresh request ends its task at once; queued answers from Durango run with the bot name', async () => {
+    const client = createFakeClient({ claim: laneClaims([makeLane()]) });
+    client.createBotLaneTask = async (input) => ({ taskId: 'task_1', title: input.title });
+    const reports = [];
+    client.reportBotTask = async (input) => {
+      reports.push(input);
+      return { ok: true };
+    };
+    const threadTools = createBotThreadTools({
+      readIndex: async () => ({ entries: [{ id: 'thread_1', projectId: 'p1', title: 'T', status: 'idle' }] }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/x' }],
+      // The look before it found nothing pending; the request came just after.
+      threadTurnState: async () => ({ ok: true, running: false, requests: [], secretIds: [] }),
+      answerRequest: async () => ({ ok: true }),
+    });
+    let result;
+    startWorker({
+      client,
+      threadTools,
+      startThreadFollowUp: async (input) => ({ ok: true, threadId: input.threadId, answeredRequest: 'ua_new' }),
+      runLane: async (lane, ctx) => {
+        result = (await ctx.callTool({ name: 'message_thread', input: { thread_id: 'thread_1', message: 'Signed in.' }, toolCallId: 't' })).result;
+        return { text: 'ok' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 1 && reports.length === 1, { label: 'finish + report' });
+    assert.equal(result.ok, true);
+    assert.equal(result.answeredRequest, 'ua_new');
+    assert.equal(reports[0].taskId, 'task_1');
+    assert.equal(reports[0].outcome, 'finished', 'finished, not a failed card');
+    assert.match(reports[0].summary, /request ua_new, so this message went to it as their reply/);
+
+    // From the cloud: answer_thread_request queued as a threadAction.
+    let pending = [
+      { id: 'ta_ans', threadId: 'thread_q', action: 'answer_request', answer: 'done', requestId: 'ua_q', botName: 'durango-primary' },
+      { id: 'ta_gone', threadId: 'thread_q', action: 'answer_request', answer: 'done', requestId: 'ua_old' },
+    ];
+    const claimClient = createFakeClient({
+      claim: async (input) => {
+        pending = pending.filter((item) => !(input.ackThreadActions ?? []).includes(item.id));
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { lane: null, threadActions: [...pending] };
+      },
+    });
+    const presses = [];
+    const queuedTools = createBotThreadTools({
+      readIndex: async () => ({ entries: [{ id: 'thread_q', projectId: 'p1', title: 'Q', status: 'running', shell: { userActions: [{ id: 'ua_q', action: 'Sign in', requestedAt: 'x' }] } }] }),
+      readThread: async () => '',
+      getProjects: () => [{ id: 'p1', name: 'Durango', path: '/x' }],
+      answerRequest: async (input) => {
+        presses.push(input);
+        return { ok: true };
+      },
+    });
+    startWorker({ client: claimClient, threadTools: queuedTools });
+    await waitFor(() => pending.length === 0, { label: 'queued answers acknowledged' });
+    assert.deepEqual(presses, [{ threadId: 'thread_q', actionId: 'ua_q', op: 'done', botName: 'durango-primary' }], 'the gone request is acknowledged without a press');
   });
 
   await test('manage_thread: a thread here is managed here (its tool replaces Durango\'s); one elsewhere goes to Durango', async () => {
@@ -2404,6 +2579,7 @@ try {
       BOT_REPLY_MESSAGES_FEATURE,
       BOT_THREAD_ACTIONS_FEATURE,
       BOT_THREAD_CONFIGURE_FEATURE,
+      BOT_THREAD_REQUESTS_FEATURE,
     ]);
     assert.deepEqual(client.calls.finish[0].usage, { mode: 'resume', input: 5, cacheRead: 100 });
     assert.equal(client.calls.finish[0].compact, true);

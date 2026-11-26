@@ -328,6 +328,10 @@ export const buildDispatchPrompt = (dispatch) => {
   return `${header}\n\n${String(dispatch?.prompt ?? '').trim()}`;
 };
 
+/** A follow-up dispatch the thread took as the reply to its pending "Needs you" request. */
+export const answeredRequestSummary = (requestId) =>
+  `The thread was waiting on the person for request ${requestId}, so this message went to it as their reply (as the Reply button on its card would) and it carries on; no new turn was started for it. The thread's own task reports when its work ends.`;
+
 export const truncateText = (value, max) => {
   const text = String(value ?? '').trim();
   if (text.length <= max) return text;
@@ -689,6 +693,25 @@ export const createDispatchWorker = ({
       }
       if (!result?.ok || !result.threadId) {
         await fail(entry, result?.error || 'The agent could not start.');
+        return;
+      }
+      // A bot's follow-up to a thread waiting on a "Needs you" request went
+      // to the request as the person's reply (App.tsx runTurn): the thread
+      // carries on in its own turn, reported by its own task, so this one
+      // ends now instead of failing as "already running a turn".
+      if (typeof result.answeredRequest === 'string' && result.answeredRequest) {
+        entry.threadId = result.threadId;
+        entry.settled = true;
+        release(entry);
+        await queueReport(
+          entry,
+          {
+            status: 'finished',
+            codeThreadId: result.threadId,
+            summary: answeredRequestSummary(result.answeredRequest),
+          },
+          { retries: reportRetryDelaysMs }
+        );
         return;
       }
       entry.threadId = result.threadId;

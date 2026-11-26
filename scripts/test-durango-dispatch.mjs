@@ -29,6 +29,7 @@ import {
   registeredModels,
   resolveDispatchModel,
   dispatchEffort,
+  answeredRequestSummary,
 } from '../src/main/durango-dispatch.js';
 import { checkoutFolderName, chooseCheckoutDir, cliSupportsClone, createSourceCheckout, sourceCheckoutRoot } from '../src/main/source-checkout.js';
 import { linuxPasswordStore } from '../src/main/linux-password-store-policy.js';
@@ -844,6 +845,34 @@ try {
     await worker.idle();
   });
 
+  await test('a bot follow-up the thread took as the reply to its "Needs you" request reports finished at once, never "already running a turn"', async () => {
+    let claims = 0;
+    server.always('POST', '/api/v1/code/machines', () => ({ json: { ok: true } }));
+    server.always('POST', '/api/v1/code/dispatches/claim', async () => {
+      claims += 1;
+      if (claims === 1) return { json: { dispatch: dispatchWire({ id: 'disp_answer', origin: 'bot', threadId: 'thread-asc', taskId: null, sourceChat: null, project: {}, prompt: 'The person says they are signed in.' }) } };
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return { json: { dispatch: null } };
+    });
+    server.always('POST', '/api/v1/code/dispatches/disp_answer', () => ({ json: { ok: true } }));
+    const { worker, calls } = makeWorker({
+      startResult: { ok: true, threadId: 'thread-asc', answeredRequest: 'ua_asc' },
+      deps: { getThread: async (threadId) => (threadId === 'thread-asc' ? { projectId: 'p1', accessMode: 'full-access' } : undefined) },
+    });
+    worker.configure({ settings: { enabled: true, accessMode: 'full-access' }, projects });
+    worker.accountChanged(true);
+    await waitUntil(() => reports('disp_answer').length, 'the answer report');
+    assert.equal(calls.starts.length, 1);
+    const [report] = reports('disp_answer');
+    assert.equal(report.status, 'finished', 'one report, finished: no running heartbeat for a turn it never started');
+    assert.equal(report.codeThreadId, 'thread-asc');
+    assert.equal(report.summary, answeredRequestSummary('ua_asc'));
+    await nextTick();
+    assert.equal(reports('disp_answer').length, 1);
+    worker.stop();
+    await worker.idle();
+  });
+
   const MODELS = [
     { id: 'claude:claude-haiku-5-5', label: 'Haiku 5.5', slug: 'claude-haiku-5-5', provider: 'Claude', efforts: ['low', 'medium', 'high'], available: true },
     { id: 'codex:gpt-6-luna', label: 'GPT-6 Luna', slug: 'gpt-6-luna', provider: 'Codex', efforts: ['low', 'max'], available: true },
@@ -1209,7 +1238,7 @@ try {
     // Waiting on the person (request_user_action) is waiting too.
     assert.deepEqual(
       outcomeOf({ status: 'done', messages: [run({ status: 'done', content: 'Sign in, please.' })], userActions: [{ id: 'ua_1', action: 'Finish  the npm login', requestedAt: 'x' }], durangoDispatch: dispatch }).waiting,
-      ['the person: Finish the npm login']
+      ['the person (request ua_1): Finish the npm login']
     );
     const reportedWaiting = { ...dispatch, reportedAt: 'x', reportedSeq: 1 };
     assert.equal(outcomeOf({ status: 'done', messages: early, durangoDispatch: reportedWaiting }), null, 'that wait was reported');
@@ -1519,7 +1548,11 @@ try {
     world.set({ threads: [botThread({ userActions: [{ id: 'ua_1', action: 'Sign in to npm', url: 'https://www.npmjs.com/login?next=%2Fsettings%2Ftokens&token=abc123', requestedAt: 'x' }] }), own] });
     await world.tick(0);
     assert.deepEqual(world.sent.map((n) => n.key), ['input:7', 'action:ua_1']);
-    assert.equal(world.sent[1].detail, 'It asked the person to: Sign in to npm\nhttps://www.npmjs.com/login', 'the page, without its query');
+    assert.equal(
+      world.sent[1].detail,
+      'It asked the person to: Sign in to npm\nhttps://www.npmjs.com/login\n(Request ua_1: when the person says they did it, mark it done with answer_thread_request.)',
+      'the page, without its query, and the id a bot answers it by'
+    );
     assert.equal(userActionText({ action: 'Plug in the phone', url: 'javascript:alert(1)' }), 'It asked the person to: Plug in the phone');
     world.stop();
   });

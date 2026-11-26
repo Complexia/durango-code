@@ -613,6 +613,7 @@ export type RemoteCommandRequest = {
       | 'addProject'
       | 'answerQuestion'
       | 'userAction'
+      | 'threadTurnState'
       | 'threadState'
       | 'renameThread'
       | 'configureThread'
@@ -630,6 +631,8 @@ export type RemoteCommandRequest = {
     actionId?: string;
     op?: 'done' | 'reply' | 'dismiss' | 'watch' | 'secret';
     reply?: string;
+    /** userAction: a bot answered it for the person (answer_thread_request); the agent is told so. */
+    answeredBy?: { botName: string };
     watching?: boolean;
     secretAnswer?: { type: 'save'; value: string } | { type: 'decline' };
     projectPath?: string;
@@ -2387,6 +2390,12 @@ type OrionCodexBrowserIntegrationStatus = {
         reasoningEffort?: string;
         accessMode?: 'read-only' | 'workspace-write' | 'full-access';
         mirrored?: boolean;
+        /** threadTurnState: the thread runs a turn, and the "Needs you" requests it waits on. */
+        running?: boolean;
+        requests?: Array<{ id: string; action: string; url?: string; threadId?: string }>;
+        secretIds?: string[];
+        /** runTurn: a bot's follow-up went to this pending request as its reply. */
+        answeredRequest?: string;
         error?: string;
       }) => Promise<{ ok: boolean }>;
       onRemoteState?: (cb: (state: RemoteControlState) => void) => () => void;

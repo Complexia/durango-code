@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DurangoError } from './durango-client.js';
+import { answeredRequestSummary } from './durango-dispatch.js';
 import { selectFinalMessage } from '../report-clip.js';
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
@@ -15,7 +16,7 @@ import { BOT_THREAD_ACCESS_MODES, SHIP_VIA_THREAD_MESSAGE, resolveThreadModelCho
 // THREAD_ACTION_ATTEMPTS times. (`a bot started|can only settle` stays for
 // backwards compatibility with older desktop error messages.)
 const THREAD_ACTION_FINAL_ERROR =
-  /^No thread |matches several threads|matches several models|a bot started|can only settle|running a turn|still running|no running turn|title is required|requires at least one of|has no model|takes effort|has no effort setting|isn't available on|cannot be selected remotely|could not be branched|branching a thread that runs on|unsupported (?:thread action|access[_ ]mode|codex_service_tier|claude_context_window)|runs on another machine|not found on this machine|not available here/i;
+  /^No thread |matches several threads|matches several models|a bot started|can only settle|running a turn|still running|no running turn|title is required|requires at least one of|has no model|takes effort|has no effort setting|isn't available on|cannot be selected remotely|could not be branched|branching a thread that runs on|unsupported (?:thread action|access[_ ]mode|codex_service_tier|claude_context_window)|runs on another machine|not found on this machine|not available here|no pending (?:request|"Needs you")|secret request|waits on \d+ requests|unsupported answer|needs `reply`|no longer waiting/i;
 const THREAD_ACTION_ATTEMPTS = 5;
 
 // A Durango bot's manage_thread on a machine: as on Durango, it can name the
@@ -140,6 +141,8 @@ export const BOT_REPLY_MESSAGES_FEATURE = 'reply-messages';
 export const BOT_THREAD_ACTIONS_FEATURE = 'thread-actions';
 /** Claim feature: this machine supports manage_thread action "configure" (model/effort/access). */
 export const BOT_THREAD_CONFIGURE_FEATURE = 'thread-configure';
+/** Claim feature: this machine answers threads' "Needs you" requests (queued answer_thread_request). */
+export const BOT_THREAD_REQUESTS_FEATURE = 'thread-requests';
 // A reply's messages before its final answer, at most (Durango's
 // BOT_REPLY_MESSAGES_MAX): past it, the text goes into the final answer.
 export const BOT_REPLY_MESSAGES_MAX = 30;
@@ -1308,7 +1311,19 @@ export const createBotReplyWorker = ({
         continue;
       }
       const invoke = () =>
-        typeof threadTools.manage === 'function'
+        action === 'answer_request'
+          ? typeof threadTools.answer === 'function'
+            ? threadTools.answer(
+                {
+                  thread_id: threadId,
+                  answer: item.answer,
+                  ...(item.requestId ? { request_id: item.requestId } : {}),
+                  ...(item.reply ? { reply: item.reply } : {}),
+                },
+                { exact: true, botName: typeof item.botName === 'string' ? item.botName : '' }
+              )
+            : { ok: false, error: 'Answering thread requests is not available here.' }
+          : typeof threadTools.manage === 'function'
           ? threadTools.manage(
               {
                 thread_id: threadId,
@@ -1685,6 +1700,14 @@ export const createBotReplyWorker = ({
       const { entry } = await threadTools.findThread(input?.thread_id);
       const message = String(input?.message ?? '').trim();
       if (!message) return { ok: false, error: 'message_thread needs a message.' };
+      // A thread waiting on a "Needs you" request takes the message as the
+      // reply to it; one running a turn is refused before any task exists, so
+      // a refusal never leaves a failed task card in the bot's chat.
+      const routed =
+        typeof threadTools.routeMessage === 'function'
+          ? await threadTools.routeMessage(entry, { message, botName: lane.botName })
+          : { running: threadTools.isRunning?.(entry.id) === true };
+      if (routed.result) return routed.result;
       if (input?.steer === true) {
         const hasSettings =
           Boolean(String(input?.model ?? '').trim()) ||
@@ -1711,7 +1734,7 @@ export const createBotReplyWorker = ({
         }
         return { ok: true, threadId: entry.id, steered: true, note: 'Steered the running turn in that thread.' };
       }
-      if (threadTools.isRunning?.(entry.id)) {
+      if (routed.running || threadTools.isRunning?.(entry.id)) {
         return {
           ok: false,
           error: 'That thread is currently running a turn. Pass `steer: true` to steer it mid-turn, or wait until it finishes.',
@@ -1758,6 +1781,13 @@ export const createBotReplyWorker = ({
         void client.reportBotTask({ taskId: created.taskId, machineId, outcome: 'failed', error }).catch(() => {});
         return { ok: false, error };
       }
+      // The thread took it as the reply to a request it raised just now (the
+      // renderer's own check): no turn of this task's runs, so it ends here.
+      if (started.answeredRequest) {
+        const summary = answeredRequestSummary(started.answeredRequest);
+        void client.reportBotTask({ taskId: created.taskId, machineId, outcome: 'finished', summary }).catch(() => {});
+        return { ok: true, threadId: entry.id, answeredRequest: started.answeredRequest, note: summary };
+      }
       rememberTaskThread(created.taskId, entry.id);
       const effectiveModel = started.modelId ?? choice.modelId ?? null;
       const effectiveEffort = started.reasoningEffort ?? choice.reasoningEffort ?? null;
@@ -1788,6 +1818,17 @@ export const createBotReplyWorker = ({
               ? await threadTools.manage({ ...normalized, thread_id: here.entry.id })
               : await threadTools.settle({ ...normalized, thread_id: here.entry.id });
           return { result: outcome };
+        } catch (error) {
+          return { result: { ok: false, error: error?.message ?? String(error) } };
+        }
+      }
+      // answer_thread_request: a thread here is answered here; one elsewhere
+      // goes to Durango, which hands it to the machine that has it.
+      if (name === 'answer_thread_request') {
+        const here = threadTools?.answer ? await threadTools.findThread(input?.thread_id).catch(() => null) : null;
+        if (!here) return callServerTool({ name, input, toolCallId });
+        try {
+          return { result: await threadTools.answer({ ...(input ?? {}), thread_id: here.entry.id }, { botName: lane.botName }) };
         } catch (error) {
           return { result: { ok: false, error: error?.message ?? String(error) } };
         }
@@ -1989,7 +2030,13 @@ export const createBotReplyWorker = ({
           ...(actionAcks.length ? { ackThreadActions: actionAcks } : {}),
           // Replies come as a structured conversation (lane.session): kept sessions;
           // go out as messages (lane.messages); drain queued threadActions; and support configure.
-          features: [BOT_SESSIONS_FEATURE, BOT_REPLY_MESSAGES_FEATURE, BOT_THREAD_ACTIONS_FEATURE, BOT_THREAD_CONFIGURE_FEATURE],
+          features: [
+            BOT_SESSIONS_FEATURE,
+            BOT_REPLY_MESSAGES_FEATURE,
+            BOT_THREAD_ACTIONS_FEATURE,
+            BOT_THREAD_CONFIGURE_FEATURE,
+            BOT_THREAD_REQUESTS_FEATURE,
+          ],
           waitMs: claimWaitMs,
           signal,
         });

@@ -226,7 +226,12 @@ const dispatchWaitingOn = (
     )
     .flatMap((message) => message.claudeBackgroundIntervention?.tasks ?? [])
     .map((task) => `background command: ${clipLine(task)}`);
-  const person = (thread.userActions ?? []).map((action) => `the person: ${clipLine(action.action)}`);
+  // With the request's id, so the bot can press Done for the person (answer_thread_request).
+  const person = (thread.userActions ?? []).map((action) =>
+    action.secret
+      ? `the person (secret request ${action.id}, only they can answer it): ${clipLine(action.action)}`
+      : `the person (request ${action.id}): ${clipLine(action.action)}`
+  );
   return [...new Set([...commands, ...person])].slice(0, 6);
 };
 
@@ -549,8 +554,12 @@ export const pendingInputText = (request: PendingInputRequest) => {
   return clipNotice(`It asked the person:\n${lines.join('\n')}`, DETAIL_MAX_CHARS);
 };
 
-/** request_user_action: what the agent asked the person to do, and the page (no query string or fragment). */
-export const userActionText = (action: { action: string; url?: string }) => {
+/**
+ * request_user_action: what the agent asked the person to do, the page (no
+ * query string or fragment), and the request's id, which a bot answers it by
+ * (answer_thread_request) when the person tells it they did it.
+ */
+export const userActionText = (action: { id?: string; action: string; url?: string; secret?: unknown }) => {
   let page = '';
   if (action.url) {
     try {
@@ -560,7 +569,13 @@ export const userActionText = (action: { action: string; url?: string }) => {
       page = '';
     }
   }
-  return clipNotice(`It asked the person to: ${action.action}${page ? `\n${page}` : ''}`, DETAIL_MAX_CHARS);
+  const id = action.id
+    ? action.secret
+      ? `\n(Secret request ${action.id}: only the person can answer it, on its card.)`
+      : `\n(Request ${action.id}: when the person says they did it, mark it done with answer_thread_request.)`
+    : '';
+  // The id goes last but is never clipped away.
+  return `${clipNotice(`It asked the person to: ${action.action}${page ? `\n${page}` : ''}`, DETAIL_MAX_CHARS - id.length)}${id}`;
 };
 
 // Tools an agent waits on by its own choice: a background wait it set up, a

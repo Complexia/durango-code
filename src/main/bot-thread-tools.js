@@ -24,7 +24,17 @@ export const BOT_THREAD_ACTIONS = [
   'stop',
   'delete',
 ];
-export const BOT_THREAD_TOOL_NAMES = ['list_thread_models', 'list_threads', 'read_thread', 'message_thread', 'manage_thread'];
+export const BOT_THREAD_TOOL_NAMES = [
+  'list_thread_models',
+  'list_threads',
+  'read_thread',
+  'message_thread',
+  'manage_thread',
+  'answer_thread_request',
+];
+// What a bot can do with a thread's "Needs you" request (request_user_action):
+// the card's own Done, Reply and dismiss (X) buttons.
+export const BOT_REQUEST_ANSWERS = ['done', 'reply', 'dismiss'];
 export const BOT_THREAD_ACCESS_MODES = ['read-only', 'workspace-write', 'full-access'];
 
 const EFFORT_FIELD_BY_PROVIDER = {
@@ -186,6 +196,14 @@ export const BOT_BRIEF_RULE = `Briefing a Durango Code thread (delegate_task wit
 export const BOT_SHIPPING_RULE = `Shipping (land, ship, deploy, merge, release, publish): the Durango Code thread that made a change ships it, not you. How a project ships is its own (its code may live on GitHub rather than Durango Source, it may deploy through a website, it may need an order such as Convex before the web app, migrations or seeding), and that thread has the context; you usually don't. So when the person asks to ship something, find the thread that did the work (the thread id in its task report, or list_threads and read_thread in that project) and send it the request with message_thread, e.g. "${SHIP_VIA_THREAD_MESSAGE}" Then tell the person what it reports (what landed, what deployed, how it was checked). Only when there is no such thread (deleted, or the work wasn't done in one) start a new thread in that project with delegate_task to ship it, with the change id and what it can't find on its own. Don't land or deploy it yourself (the durango-code CLI, git, provider CLIs) unless the person explicitly tells you to do it yourself. Shipping is public and hard to undo: confirm with the person first unless they already asked you to ship it.`;
 
 /**
+ * How a bot handles a thread's "Needs you" request (request_user_action: sign
+ * in somewhere, approve something, plug something in) when the person answers
+ * it to the bot instead of on the card. Durango's copy: BOT_PROMPT "Needs you
+ * requests", chat/andromedus/lib/bots/prompt.ts.
+ */
+export const BOT_THREAD_REQUEST_RULE = `"Needs you" requests: a Durango Code thread that needs the person to do something only they can (sign in in a browser, approve a prompt, plug in a device) pins a request card on the thread and waits on it; its report or notice gives the request id (ua_…), and list_threads / read_thread show a thread's pending requests. When the person tells you they did it ("done", "signed in"), press Done for them: answer_thread_request with answer "done" (and the request id when the thread has more than one). When they answer it some other way (it's wrong, they can't, they want something else), use answer "reply" with what they said. Use "dismiss" only when the request no longer applies and the thread needn't hear about it. The thread then carries on exactly as if the person had clicked the button. A message_thread (or steer) to a thread waiting on a request goes to it as a reply too, but only press Done when the person said it's done. Never answer one on your own guess; a secret request (an API key, password, code) can only be answered by the person on its card.`;
+
+/**
  * The line a thread's report to a bot ends with: which thread it was, so the
  * bot can follow up there (message_thread), e.g. to ship the change.
  */
@@ -237,7 +255,7 @@ export const threadNoticeText = (title, kind, detail) => {
   const name = String(title ?? '').replace(/\s+/g, ' ').trim().slice(0, 120) || 'Durango Code thread';
   const head =
     kind === 'input'
-      ? `NEEDS THE PERSON: the task "${name}" is blocked: its thread is waiting for the person and does nothing until they answer. Tell the person now, in your reply, what it's waiting for; they answer it in that thread in Durango Code. This isn't its report: it reports when its work ends.`
+      ? `NEEDS THE PERSON: the task "${name}" is blocked: its thread is waiting for the person and does nothing until they answer. Tell the person now, in your reply, what it's waiting for; they answer it in that thread in Durango Code, or tell you. For a request with an id (ua_…), when they tell you they did it, mark it done yourself with answer_thread_request (answer "done"; "reply" with what they said otherwise). This isn't its report: it reports when its work ends.`
       : `LOOKS STUCK: the task "${name}" is still running but has shown no progress for a while, and it isn't waiting on anything it started itself (a command, a subagent, a background wait). Check before you assume it hung (read the thread, or send it a message), and tell the person if it needs them. This isn't its report.`;
   const body = String(detail ?? '').trim();
   return body ? `${head}\n\n${body}` : head;
@@ -263,7 +281,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'list_threads',
     description:
-      "List Durango Code threads on this computer, newest first: the threads in the person's sidebar, their own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), model, reasoning effort, accessMode, sidebar flags (settled, snoozed, pinned) and last activity. Subagent threads (ones a thread spawned, e.g. reviews) aren't in the sidebar and aren't listed: their parent shows how many it has (`subagents`); they come and go with it, so there's nothing to settle there. Pass include_subagents to list them too (each with its parentThreadId).",
+      "List Durango Code threads on this computer, newest first: the threads in the person's sidebar, their own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), model, reasoning effort, accessMode, sidebar flags (settled, snoozed, pinned), last activity, and `needsYou`: the \"Needs you\" requests it waits on the person for (answer them with answer_thread_request). Subagent threads (ones a thread spawned, e.g. reviews) aren't in the sidebar and aren't listed: their parent shows how many it has (`subagents`); they come and go with it, so there's nothing to settle there. Pass include_subagents to list them too (each with its parentThreadId).",
     inputSchema: {
       type: 'object',
       properties: {
@@ -284,7 +302,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'read_thread',
     description:
-      "Read a Durango Code thread's transcript (by id from list_threads or a task report): what was asked, what the agent did, changed files and its final answer. Long threads come in pages: pass offset to read more.",
+      "Read a Durango Code thread's transcript (by id from list_threads or a task report): what was asked, what the agent did, changed files and its final answer, plus `needsYou`: the \"Needs you\" requests it waits on the person for. Long threads come in pages: pass offset to read more.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -298,7 +316,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'message_thread',
     description:
-      "Send a follow-up message into an existing Durango Code thread on this computer (by id, from list_threads or a task report), as the person would: e.g. answer its question, ask for a fix, tell it to continue or wrap up. Also how you ship a change (land, deploy, merge, release): message the thread that made it and let it ship the change the way its project ships, rather than landing or deploying it yourself. Optionally pass `model`, `effort`, or `access_mode` to switch the thread's settings before running the turn (ids and efforts from list_thread_models). Don't send a normal follow-up to a thread that is running right now — pass `steer: true` to steer a running turn mid-flight instead (without changing model/effort/access_mode).",
+      "Send a follow-up message into an existing Durango Code thread on this computer (by id, from list_threads or a task report), as the person would: e.g. answer its question, ask for a fix, tell it to continue or wrap up. Also how you ship a change (land, deploy, merge, release): message the thread that made it and let it ship the change the way its project ships, rather than landing or deploying it yourself. Optionally pass `model`, `effort`, or `access_mode` to switch the thread's settings before running the turn (ids and efforts from list_thread_models). Don't send a normal follow-up to a thread that is running right now — pass `steer: true` to steer a running turn mid-flight instead (without changing model/effort/access_mode). A thread waiting on a \"Needs you\" request takes the message as the person's reply to it (no new turn or task); to press Done on it, use answer_thread_request.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -336,6 +354,21 @@ export const BOT_THREAD_TOOLS = [
         reason: { type: 'string', maxLength: 300, description: 'Optional short note on why (e.g. "change landed and deployed").' },
       },
       required: ['thread_id', 'action'],
+    },
+  },
+  {
+    name: 'answer_thread_request',
+    description:
+      "Answer a Durango Code thread's \"Needs you\" request for the person (a request card the thread pinned, e.g. sign in somewhere, approve a prompt): exactly what the card's buttons do, and the thread carries on as if the person had clicked. answer \"done\" when the person told you they did it; \"reply\" with `reply` when they answered it another way (it's wrong, they can't, they want something else); \"dismiss\" when it no longer applies (the thread isn't told). The request id (ua_…) is in the thread's report or notice, and list_threads / read_thread show pending requests; leave request_id out when the thread has only one. Only on the person's word: never mark a request done on your own guess. Secret requests (keys, passwords, codes) are only answered by the person on the card.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        thread_id: { type: 'string', minLength: 1, maxLength: 200 },
+        request_id: { type: 'string', maxLength: 80, description: 'The request id (ua_…); optional when the thread has only one pending request.' },
+        answer: { type: 'string', enum: BOT_REQUEST_ANSWERS, description: '"done" (the person did it), "reply" (with `reply`), or "dismiss" (no longer needed).' },
+        reply: { type: 'string', maxLength: 8_000, description: 'For answer "reply": what the person said, as it should reach the thread.' },
+      },
+      required: ['thread_id', 'answer'],
     },
   },
 ];
@@ -408,6 +441,63 @@ export const sidebarThreadRoots = (entries) => {
   };
 };
 
+const REQUEST_TEXT_MAX = 400;
+const clipRequest = (text) => {
+  const line = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return line.length > REQUEST_TEXT_MAX ? `${line.slice(0, REQUEST_TEXT_MAX - 1)}…` : line;
+};
+
+/** A pending request as a bot sees it: id, what it asks, its page, and the subagent thread that asked (when not the thread itself). */
+const publicRequest = (action, threadId) => ({
+  id: action.id,
+  action: clipRequest(action.action),
+  ...(typeof action.url === 'string' && action.url ? { url: action.url } : {}),
+  ...(action.threadId && action.threadId !== threadId ? { threadId: action.threadId } : {}),
+});
+
+/**
+ * A thread's pending "Needs you" requests (request_user_action) in the saved
+ * index: its own and its subagents' (its card shows both, as the renderer's
+ * pendingUserActions). `requests` are the ones a bot can answer; `secretIds`
+ * are request_secret cards, which only the person answers.
+ */
+export const indexThreadRequests = (entries, threadId) => {
+  const list = Array.isArray(entries) ? entries : [];
+  const children = new Map();
+  for (const entry of list) {
+    const parent = entry?.parentThreadId ?? entry?.shell?.parentThreadId ?? null;
+    if (!parent) continue;
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(entry);
+  }
+  const byId = new Map(list.map((entry) => [entry?.id, entry]));
+  const requests = [];
+  const secretIds = [];
+  const seen = new Set();
+  const queue = byId.has(threadId) ? [byId.get(threadId)] : [];
+  while (queue.length) {
+    const entry = queue.shift();
+    if (!entry || seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    const actions = entry.shell?.userActions ?? entry.userActions;
+    for (const action of Array.isArray(actions) ? actions : []) {
+      if (!action || typeof action.id !== 'string' || !action.id) continue;
+      if (action.secret) secretIds.push(action.id);
+      else if (typeof action.action === 'string') requests.push(publicRequest({ ...action, threadId: entry.id }, threadId));
+    }
+    queue.push(...(children.get(entry.id) ?? []));
+  }
+  return { requests, secretIds };
+};
+
+const requestList = (requests) => requests.map((request) => `${request.id} ("${request.action.slice(0, 120)}")`).join('; ');
+
+const REQUEST_ANSWER_NOTES = {
+  done: 'Marked done for the person, as their Done button would: the thread is told and carries on.',
+  reply: "Sent as the person's reply to it, as their Reply button would: the thread reads it and carries on.",
+  dismiss: "Dismissed, as the card's X would: the card is gone and the thread isn't told.",
+};
+
 // agentCatalog.ts claudeCodeCliModelId: a CLI thread keeps its conversation
 // in the terminal, so the sidebar always shows it.
 const CLAUDE_CODE_CLI_MODEL_ID = 'claude:claude-code-cli';
@@ -422,6 +512,10 @@ const CLAUDE_CODE_CLI_MODEL_ID = 'claude:claude-code-cli';
  * - manageThread({ threadId, action, title?, modelId?, reasoningEffort?, accessMode?, codexServiceTier?, claudeContextWindow? }):
  *   runs a thread action on any thread here → { ok, threadId?, threadTitle?, modelId?, reasoningEffort?, accessMode?, mirrored?, error? }
  * - settleThread(threadId): legacy fallback for settle only when manageThread is omitted
+ * - threadTurnState(threadId): the renderer's live view of a thread → { ok, running, requests: [{ id, action, url?, threadId? }],
+ *   secretIds } (optional: without it, or when it fails, the saved index and liveStatus stand in)
+ * - answerRequest({ threadId, actionId, op: 'done' | 'reply' | 'dismiss', reply?, botName? }): presses that button on
+ *   a thread's "Needs you" card → { ok, error? } (answer_thread_request)
  */
 export const createBotThreadTools = ({
   readIndex,
@@ -431,6 +525,8 @@ export const createBotThreadTools = ({
   liveStatus = () => null,
   manageThread = null,
   settleThread = null,
+  threadTurnState = null,
+  answerRequest = null,
 }) => {
   const projectsById = async () => {
     const list = (await Promise.resolve(getProjects()).catch(() => [])) ?? [];
@@ -455,6 +551,114 @@ export const createBotThreadTools = ({
       throw new Error(found.length ? `"${id}" matches several threads: use the full id.` : `No thread "${id}" in this computer's projects.`);
     }
     return { entry: found[0], project: projects.get(found[0].projectId) };
+  };
+
+  /**
+   * Whether a thread runs a turn now, and the "Needs you" requests it waits
+   * on: the renderer's live state, or the saved index when that isn't there.
+   */
+  const turnState = async (entry) => {
+    const live = typeof threadTurnState === 'function' ? await Promise.resolve(threadTurnState(entry.id)).catch(() => null) : null;
+    if (live?.ok) {
+      const requests = (Array.isArray(live.requests) ? live.requests : [])
+        .filter((request) => request && typeof request.id === 'string' && request.id && typeof request.action === 'string')
+        .map((request) => publicRequest(request, entry.id));
+      const secretIds = (Array.isArray(live.secretIds) ? live.secretIds : []).filter((id) => typeof id === 'string');
+      return { running: live.running === true, requests, secretIds };
+    }
+    const { entries } = await readIndex();
+    return { running: (liveStatus(entry.id) ?? entry.status) === 'running', ...indexThreadRequests(entries, entry.id) };
+  };
+
+  const pressRequest = async ({ entry, request, op, reply, botName }) => {
+    if (typeof answerRequest !== 'function') return { ok: false, error: 'Answering thread requests is not available here.' };
+    return Promise.resolve(
+      answerRequest({ threadId: entry.id, actionId: request.id, op, ...(op === 'reply' ? { reply } : {}), botName })
+    ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+  };
+
+  /**
+   * answer_thread_request: Done, Reply or dismiss on a thread's "Needs you"
+   * card, for the person. `exact`: the full thread id only (a request queued
+   * on Durango). `botName`: shown to the thread with the answer.
+   */
+  const answer = async (input = {}, { exact = false, botName = '' } = {}) => {
+    const op = String(input.answer ?? '').trim().toLowerCase();
+    if (!BOT_REQUEST_ANSWERS.includes(op)) {
+      return { ok: false, error: `Unsupported answer "${input.answer ?? ''}". Use one of: ${BOT_REQUEST_ANSWERS.join(', ')}.` };
+    }
+    const reply = String(input.reply ?? '').trim();
+    if (op === 'reply' && !reply) return { ok: false, error: 'answer "reply" needs `reply`: what the person said.' };
+    if (typeof answerRequest !== 'function') return { ok: false, error: 'Answering thread requests is not available here.' };
+    const { entry } = await findThread(input.thread_id, { exact });
+    const { requests, secretIds } = await turnState(entry);
+    const wanted = String(input.request_id ?? '').trim();
+    let request = null;
+    if (wanted) {
+      request = requests.find((candidate) => candidate.id === wanted) ?? null;
+      if (!request) {
+        if (secretIds.includes(wanted)) {
+          return { ok: false, error: 'That is a secret request: only the person can answer it, on its card in Durango Code.' };
+        }
+        return {
+          ok: false,
+          error: requests.length
+            ? `No pending request "${wanted}" on that thread. It waits on: ${requestList(requests)}.`
+            : `No pending request "${wanted}" on that thread: it was answered or cleared already.`,
+        };
+      }
+    } else if (requests.length === 1) {
+      [request] = requests;
+    } else if (requests.length > 1) {
+      return { ok: false, error: `That thread waits on ${requests.length} requests: pass request_id, one of: ${requestList(requests)}.` };
+    } else {
+      return {
+        ok: false,
+        error: secretIds.length
+          ? 'That thread only waits on a secret request: the person answers it themselves, on its card in Durango Code.'
+          : 'That thread has no pending "Needs you" request: it was answered or cleared already.',
+      };
+    }
+    const result = await pressRequest({ entry, request, op, reply, botName });
+    if (!result?.ok) return { ok: false, error: result?.error || 'The request could not be answered.' };
+    return { ok: true, threadId: entry.id, requestId: request.id, answer: op, request: request.action, note: REQUEST_ANSWER_NOTES[op] };
+  };
+
+  /**
+   * Before a bot's message_thread (or steer) to `entry`: a thread waiting on
+   * one "Needs you" request takes the message as the reply to it, as the
+   * person's Reply button would (it carries on in its own turn, and its own
+   * task reports as usual), rather than refusing it as busy.
+   * → `{ result }` when that settled it (the tool's result), else
+   *   `{ running }` for an ordinary follow-up or steer.
+   */
+  const routeMessage = async (entry, { message, botName = '' } = {}) => {
+    const state = await turnState(entry);
+    if (!state.requests.length || typeof answerRequest !== 'function') return { running: state.running };
+    if (state.requests.length > 1) {
+      return {
+        result: {
+          ok: false,
+          error: `That thread is waiting on the person for ${state.requests.length} requests: answer the one this is about with answer_thread_request (request_id, answer "done" or "reply"). Requests: ${requestList(state.requests)}.`,
+        },
+      };
+    }
+    const [request] = state.requests;
+    const result = await pressRequest({ entry, request, op: 'reply', reply: message, botName });
+    if (!result?.ok) {
+      // Answered meanwhile (by the person, its check, the agent): an ordinary message then.
+      if (/no longer waiting/i.test(String(result?.error ?? ''))) return { running: state.running };
+      return { result: { ok: false, error: result?.error || 'The message could not reach the thread.' } };
+    }
+    return {
+      result: {
+        ok: true,
+        threadId: entry.id,
+        answeredRequest: request.id,
+        request: request.action,
+        note: "That thread was waiting on the person for this request, so your message went to it as their reply (as the Reply button on its card would): it carries on from there. No new task was started; the thread's own task reports as usual. When the person says they did what it asked, answer_thread_request with answer \"done\" is the plainer signal.",
+      },
+    };
   };
 
   const manage = async (input = {}, { exact = false } = {}) => {
@@ -662,6 +866,10 @@ export const createBotThreadTools = ({
             ...(flags.snoozed ? { snoozed: true } : {}),
             ...(flags.pinned ? { pinned: true } : {}),
             ...(subagents ? { subagents } : {}),
+            ...(() => {
+              const { requests } = indexThreadRequests(entries, entry.id);
+              return requests.length ? { needsYou: requests } : {};
+            })(),
             messages: entry.messageCount ?? null,
             lastActivity: iso(entry.activityAt ?? entry.updatedAt),
           };
@@ -670,13 +878,25 @@ export const createBotThreadTools = ({
     },
     async read(input = {}) {
       const { entry } = await findThread(input.thread_id);
-      const text = await readThread({
-        thread_id: entry.id,
-        ...(Number.isInteger(input.offset) ? { offset: input.offset } : {}),
-        ...(Number.isInteger(input.limit) ? { limit: input.limit } : {}),
-      });
-      return { ok: true, transcript: text };
+      const [text, state] = await Promise.all([
+        readThread({
+          thread_id: entry.id,
+          ...(Number.isInteger(input.offset) ? { offset: input.offset } : {}),
+          ...(Number.isInteger(input.limit) ? { limit: input.limit } : {}),
+        }),
+        turnState(entry).catch(() => ({ requests: [], secretIds: [] })),
+      ]);
+      return {
+        ok: true,
+        transcript: text,
+        ...(state.requests.length ? { needsYou: state.requests } : {}),
+        ...(state.secretIds.length ? { secretRequests: state.secretIds.length } : {}),
+      };
     },
+    /** answer_thread_request (Done / Reply / dismiss on a "Needs you" card). */
+    answer,
+    /** message_thread's check for a thread waiting on a request (see routeMessage). */
+    routeMessage,
     /**
      * manage_thread: settle, unsettle, snooze, unsnooze, pin, unpin, rename,
      * configure, branch, stop or delete any thread here. `exact`: the full id

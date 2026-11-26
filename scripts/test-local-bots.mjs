@@ -17,6 +17,7 @@ import {
   nextRunAfter,
 } from '../src/main/local-bots.js';
 import { createClaudeOneShot } from '../src/main/bot-replies.js';
+import { createBotThreadTools } from '../src/main/bot-thread-tools.js';
 import { EARLIER_HISTORY_MAX_CHARS, SUMMARY_MAX_CHARS, memorySection, parseCompaction } from '../src/main/bot-memory.js';
 
 const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-local-bots-'));
@@ -1325,6 +1326,52 @@ test('thread tools: list and read threads, message_thread is a follow-up reporte
   await waitFor(() => runner.lanes.length === 2, { label: 'reply to the follow-up report' });
   assert.match(runner.lanes[1].lane.prompt, /\[Task: Follow-up: Fix spinner\]:\nFixed\./);
   runner.lanes[1].finish({ text: 'Done.' });
+  await engine.idle();
+});
+
+test('"Needs you" requests: a local bot answers a thread\'s request (answer_thread_request), and message_thread to a waiting thread answers it, with no task', async () => {
+  const presses = [];
+  const followUps = [];
+  const entries = [{ id: 'thread_1', projectId: 'p1', title: 'Ship iOS', status: 'running', shell: { userActions: [{ id: 'ua_1', action: 'Sign in to App Store Connect', requestedAt: 'x' }] } }];
+  const threadTools = createBotThreadTools({
+    readIndex: async () => ({ entries }),
+    readThread: async () => '',
+    getProjects: () => [{ id: 'p1', name: 'Site', path: '/x' }],
+    answerRequest: async (input) => {
+      presses.push(input);
+      entries[0].shell.userActions = [];
+      return { ok: true };
+    },
+  });
+  const { engine, runner } = makeEngine({
+    threadTools,
+    startThreadFollowUp: async (input) => {
+      followUps.push(input);
+      return { ok: true };
+    },
+  });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'done' });
+  await waitFor(() => runner.lanes.length === 1);
+  const lane = runner.lanes[0];
+  assert.match(lane.lane.systemPrompt, /"Needs you" requests: .*answer_thread_request with answer "done"/);
+  assert.ok(lane.lane.tools.some((tool) => tool.name === 'answer_thread_request'));
+  const call = (name, input) => lane.ctx.callTool({ name, input, toolCallId: 't' }).then((out) => out.result);
+  const sent = await call('message_thread', { thread_id: 'thread_1', message: 'They are signed in.' });
+  assert.equal(sent.ok, true);
+  assert.equal(sent.answeredRequest, 'ua_1');
+  assert.equal(sent.taskId, undefined, 'no task for an answer');
+  assert.deepEqual(presses, [{ threadId: 'thread_1', actionId: 'ua_1', op: 'reply', reply: 'They are signed in.', botName: 'Durango' }]);
+  entries[0].shell.userActions = [{ id: 'ua_2', action: 'Approve the upload', requestedAt: 'y' }];
+  const done = await call('answer_thread_request', { thread_id: 'thread_1', answer: 'done' });
+  assert.equal(done.ok, true);
+  assert.deepEqual(presses[1], { threadId: 'thread_1', actionId: 'ua_2', op: 'done', botName: 'Durango' });
+  // No request left and the turn still runs: refused, nothing started.
+  const busy = await call('message_thread', { thread_id: 'thread_1', message: 'More.' });
+  assert.equal(busy.ok, false);
+  assert.match(busy.error, /currently running a turn/);
+  assert.equal(followUps.length, 0);
+  lane.finish({ text: 'Told it.' });
   await engine.idle();
 });
 

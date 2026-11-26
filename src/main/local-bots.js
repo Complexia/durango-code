@@ -2,11 +2,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { BOT_REPLY_MESSAGES_MAX, botReplyMessageId, durangoModelIdForClaude } from './bot-replies.js';
+import { answeredRequestSummary } from './durango-dispatch.js';
 import {
   BOT_BRIEF_RULE,
   BOT_SETTLE_RULE,
   BOT_SHIPPING_RULE,
   BOT_THREAD_ACCESS_MODES,
+  BOT_THREAD_REQUEST_RULE,
   BOT_THREAD_TOOLS,
   resolveThreadModelChoice,
   threadNoticeText,
@@ -148,6 +150,8 @@ ${BOT_BRIEF_RULE}
 ${BOT_SHIPPING_RULE}
 
 ${BOT_SETTLE_RULE}
+
+${BOT_THREAD_REQUEST_RULE}
 
 Acting for the person: draft first and confirm before anything irreversible or public (sending email or messages, posting, buying, applying, deleting), unless they told you to go ahead for that kind of thing.`;
 
@@ -2539,11 +2543,25 @@ export const createLocalBotEngine = ({
           if (!threadTools) throw new Error('Threads are not available here.');
           return await threadTools.manage({ ...(input ?? {}), action: 'settle' });
         }
+        case 'answer_thread_request': {
+          if (!threadTools?.answer) throw new Error('Threads are not available here.');
+          return await threadTools.answer(input, { botName: self.bot.name });
+        }
         case 'message_thread': {
           if (!threadTools || !startThreadFollowUp) throw new Error('Follow-ups are not available here.');
           const { entry: thread } = await threadTools.findThread(input.thread_id);
           const message = str(input.message).trim();
           if (!message) throw new Error('message_thread needs a message.');
+          // A thread waiting on a "Needs you" request takes the message as the
+          // reply to it; one running a turn is refused before a task exists.
+          const routed =
+            typeof threadTools.routeMessage === 'function'
+              ? await threadTools.routeMessage(thread, { message, botName: self.bot.name })
+              : { running: threadTools.isRunning?.(thread.id) === true };
+          if (routed.result) {
+            if (!routed.result.ok) throw new Error(routed.result.error);
+            return routed.result;
+          }
           if (input.steer === true) {
             const hasSettings =
               Boolean(str(input.model).trim()) ||
@@ -2565,7 +2583,7 @@ export const createLocalBotEngine = ({
             if (!steered?.ok) throw new Error(steered?.error || 'That turn could not be steered.');
             return { ok: true, threadId: thread.id, steered: true, note: 'Steered the running turn in that thread.' };
           }
-          if (threadTools.isRunning?.(thread.id)) {
+          if (routed.running || threadTools.isRunning?.(thread.id)) {
             throw new Error('That thread is currently running a turn. Pass `steer: true` to steer it mid-turn, or wait until it finishes.');
           }
           const choice = resolveThreadModelChoice({
@@ -2599,6 +2617,11 @@ export const createLocalBotEngine = ({
           if (!started?.ok) {
             runtime.threads.delete(key);
             throw new Error(started?.error || 'The follow-up could not start.');
+          }
+          // Taken as the reply to a request it raised just now: no turn of this task's runs.
+          if (started.answeredRequest) {
+            runtime.threads.delete(key);
+            return { ok: true, threadId: thread.id, answeredRequest: started.answeredRequest, note: answeredRequestSummary(started.answeredRequest) };
           }
           changed();
           const effectiveModel = started.modelId ?? choice.modelId ?? null;

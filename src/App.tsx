@@ -174,6 +174,7 @@ import {
   claimRemoteThreadStart,
   mergeSynchronouslyTrackedRuns,
   persistSuccessfulRemoteCommand,
+  type RemoteCommandOutcome,
   remoteAgentSettingsPatch,
   remoteControlIsAuthenticated,
   remoteModelEfforts,
@@ -840,6 +841,28 @@ const waitingOnUserStatusText = (threadId: string): string | undefined => {
   const clipped = first.length > 80 ? `${first.slice(0, 79)}…` : first;
   return `${WAITING_ON_USER_PREFIX}${clipped}${pending.length > 1 ? ` (+${pending.length - 1} more)` : ''}`;
 };
+/**
+ * The "Needs you" requests a bot may answer for the user on a thread (its
+ * subagents' too, as its card shows them), and the secret ones it may not.
+ */
+const threadRequestsForBots = (threads: Thread[], threadId: string) => {
+  const pending = pendingUserActions(threads, threadId);
+  return {
+    requests: pending
+      .filter((action) => !action.secret)
+      .map((action) => ({
+        id: action.id,
+        action: action.action,
+        ...(action.url ? { url: action.url } : {}),
+        ...(action.threadId !== threadId ? { threadId: action.threadId } : {}),
+      })),
+    secretIds: pending.filter((action) => action.secret).map((action) => action.id),
+  };
+};
+// A bot's follow-up prompt asks for a report back (bot-replies.js); as the
+// reply to a request, no report is owed, so that ask goes.
+const botFollowUpReplyText = (prompt: string) =>
+  prompt.replace(/\n\n\(From the bot "[^"\n]*": end with a concise report of the outcome;[\s\S]*\)\s*$/, '').trim();
 // Pending actions count a thread's subagents, so the caption can sit on any
 // ancestor of the thread whose action went: settle each one up the chain.
 const settleWaitingOnUserCaptions = (threadId: string) => {
@@ -1994,7 +2017,7 @@ const App: React.FC = () => {
     (
       threadId: string,
       actionId: string,
-      answer: { reply?: string; attachments?: FileAttachment[]; detected?: boolean } = {}
+      answer: { reply?: string; attachments?: FileAttachment[]; detected?: boolean; byBot?: string } = {}
     ) => {
       const threads = useOrionStore.getState().threads;
       const thread = threads.find((candidate) => candidate.id === threadId);
@@ -2014,9 +2037,22 @@ const App: React.FC = () => {
       const providerId = findAgentModel(agentModels, target.modelId ?? defaultAgentModelId)?.providerId;
       settleWaitingOnUserCaptions(threadId);
       const { reply, detected } = answer;
+      // A bot the user told (answer_thread_request, or its message_thread to
+      // this thread): the same answer, saying who gave it.
+      const byBot = answer.byBot?.trim() || '';
       const attachments = reply !== undefined ? (answer.attachments ?? []) : [];
       // A reply may be only files (a screenshot of where the user is stuck).
-      const replyText = reply !== undefined ? [`Not done: ${done.action}`, reply].filter(Boolean).join('\n\n') : '';
+      // A bot's reply isn't necessarily "not done" (it relays what the user
+      // said), so it says whose it is instead.
+      const replyText =
+        reply !== undefined
+          ? (byBot
+              ? [`The user's bot "${byBot}" answered for them: ${done.action}`, reply]
+              : [`Not done: ${done.action}`, reply]
+            )
+              .filter(Boolean)
+              .join('\n\n')
+          : '';
       // Files go to the running agent as paths it can read (every provider's
       // notify path is text); a queued fallback carries them as attachments.
       const text =
@@ -2024,16 +2060,18 @@ const App: React.FC = () => {
           ? buildPromptWithAttachments(replyText, attachments)
           : detected && done.check
             ? `Done: ${done.action}\n\n(Durango Code saw \`${done.check}\` succeed.)`
-            : `Done: ${done.action}`;
+            : byBot
+              ? `Done: ${done.action}\n\n(The user told their bot "${byBot}" it is done, and it marked it done for them.)`
+              : `Done: ${done.action}`;
       const notice =
         reply !== undefined
           ? {
-              title: 'You replied instead of marking it done',
+              title: byBot ? `Your bot ${byBot} answered it for you` : 'You replied instead of marking it done',
               detail: buildPromptWithAttachments([done.action, reply].filter(Boolean).join('\n\n'), attachments),
             }
           : detected && done.check
             ? { title: `Done: \`${done.check}\` succeeded`, detail: done.action }
-            : { title: 'You marked it done', detail: done.action };
+            : { title: byBot ? `Your bot ${byBot} marked it done for you` : 'You marked it done', detail: done.action };
       // In order with steers, and cancelled with them by Stop: a fallback
       // queued after Stop would start the stopped agent again.
       void steeringCoordinatorRef.current.enqueue(targetId, async (cancelled) => {
@@ -2067,12 +2105,12 @@ const App: React.FC = () => {
     answerUserActionRef.current = answerUserAction;
   });
   const markUserActionDone = useCallback(
-    (threadId: string, actionId: string) => answerUserAction(threadId, actionId),
+    (threadId: string, actionId: string, byBot?: string) => answerUserAction(threadId, actionId, { byBot }),
     [answerUserAction]
   );
   const replyToUserAction = useCallback(
-    (threadId: string, actionId: string, reply: string, attachments: FileAttachment[]) =>
-      answerUserAction(threadId, actionId, { reply, attachments }),
+    (threadId: string, actionId: string, reply: string, attachments: FileAttachment[], byBot?: string) =>
+      answerUserAction(threadId, actionId, { reply, attachments, byBot }),
     [answerUserAction]
   );
   // The X on a card: the action is redundant (already done, superseded, or
@@ -9025,13 +9063,7 @@ const App: React.FC = () => {
       command: RemoteCommandRequest['command'],
       canPrepare: () => boolean,
       claimStart: (threadId?: string) => Promise<boolean>
-    ) => Promise<{
-      ok: boolean;
-      threadId?: string;
-      threadTitle?: string;
-      projectId?: string;
-      error?: string;
-    }>
+    ) => Promise<RemoteCommandOutcome & { mirrored?: boolean }>
   >(async () => ({ ok: false, error: 'Remote commands are unavailable.' }));
   useLayoutEffect(() => {
     remoteCommandHandlerRef.current = async (command, canPrepare, claimStart) => {
@@ -9069,6 +9101,26 @@ const App: React.FC = () => {
           if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
           const unsupportedError = remoteThreadRunError(thread.modelId);
           if (unsupportedError) return { ok: false, threadId: thread.id, error: unsupportedError };
+          // A bot's follow-up (message_thread, delegate_task with thread_id)
+          // to a thread waiting on one "Needs you" request is the person's
+          // answer, relayed: it goes to that request as their reply, as the
+          // card's Reply would, rather than bouncing off the waiting turn.
+          if (command.durangoDispatch?.origin === 'bot' && command.durangoDispatch.followUp) {
+            const { requests } = threadRequestsForBots(state.threads, thread.id);
+            if (requests.length === 1) {
+              const [request] = requests;
+              if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
+                return { ok: false, error: 'The follow-up expired or was cancelled.' };
+              }
+              const botName =
+                command.durangoDispatch.botName?.trim() ||
+                command.durangoDispatch.sourceLabel?.replace(/^your bot\s*/i, '').trim() ||
+                command.source?.machineName ||
+                'your bot';
+              replyToUserAction(request.threadId ?? thread.id, request.id, botFollowUpReplyText(promptText), [], botName);
+              return { ok: true, threadId: thread.id, answeredRequest: request.id };
+            }
+          }
           // React publishes activeRunsByThreadRef only after a render. The
           // output registry and pending-start set are updated synchronously,
           // so they close admission before a concurrent remote request can
@@ -9537,6 +9589,20 @@ const App: React.FC = () => {
           ? { ok: true, threadId }
           : { ok: false, error: 'This question is no longer waiting for an answer.' };
       }
+      if (command.kind === 'threadTurnState') {
+        // A bot's look before it messages a thread (bot-thread-tools.js
+        // routeMessage, answer_thread_request): whether a turn runs, and the
+        // "Needs you" requests it waits on (its subagents' too, as on its card).
+        const threadId = command.threadId ?? '';
+        const thread = state.threads.find((candidate) => candidate.id === threadId);
+        if (!thread) return { ok: false, error: 'Thread not found on this machine.' };
+        const running =
+          thread.status === 'running' ||
+          pendingTurnStartsRef.current.has(threadId) ||
+          [...runOutputMessages.current.values()].some((tracked) => tracked.threadId === threadId) ||
+          Boolean(activeRunsByThreadRef.current[threadId]);
+        return { ok: true, threadId, running, ...threadRequestsForBots(state.threads, threadId) };
+      }
       if (command.kind === 'userAction') {
         // Done / Reply / Dismiss / Watch from a paired controller, through the
         // same handlers as this machine's own action cards.
@@ -9549,12 +9615,26 @@ const App: React.FC = () => {
             state.threads.find((candidate) => candidate.id === id)?.userActions?.some((action) => action.id === actionId)
           ) ?? '';
         if (!threadId) return { ok: false, error: 'That action is no longer waiting.' };
+        // A bot answering for the person (answer_thread_request) presses Done,
+        // Reply or X, never a secret card's Save.
+        const byBot = command.answeredBy?.botName?.trim() || undefined;
+        if (byBot) {
+          if (command.op !== 'done' && command.op !== 'reply' && command.op !== 'dismiss') {
+            return { ok: false, error: 'Invalid user action operation.' };
+          }
+          const asked = state.threads
+            .find((candidate) => candidate.id === threadId)
+            ?.userActions?.find((action) => action.id === actionId);
+          if (asked?.secret) {
+            return { ok: false, error: 'That is a secret request: only the person can answer it, on its card in Durango Code.' };
+          }
+        }
         if (!(await claimRemoteSideEffect(canPrepare, claimStart))) {
           return { ok: false, error: 'The action expired or was cancelled.' };
         }
-        if (command.op === 'done') markUserActionDone(threadId, actionId);
+        if (command.op === 'done') markUserActionDone(threadId, actionId, byBot);
         else if (command.op === 'reply') {
-          replyToUserAction(threadId, actionId, command.reply ?? '', Array.isArray(command.attachments) ? command.attachments : []);
+          replyToUserAction(threadId, actionId, command.reply ?? '', Array.isArray(command.attachments) ? command.attachments : [], byBot);
         } else if (command.op === 'dismiss') dismissUserAction(threadId, actionId);
         else if (command.op === 'watch') setUserActionWatching(threadId, actionId, command.watching === true);
         else if (command.op === 'secret' && command.secretAnswer) {

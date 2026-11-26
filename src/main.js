@@ -4408,6 +4408,22 @@ const resolveDispatchRendererCommand = (payload) => ({
     reasoningEffort: typeof payload?.reasoningEffort === 'string' ? payload.reasoningEffort : undefined,
     accessMode: typeof payload?.accessMode === 'string' ? payload.accessMode : undefined,
     mirrored: payload?.mirrored === true ? true : undefined,
+    // threadTurnState: whether it runs a turn, and the "Needs you" requests it waits on.
+    running: typeof payload?.running === 'boolean' ? payload.running : undefined,
+    requests: Array.isArray(payload?.requests)
+      ? payload.requests
+          .filter((request) => request && typeof request.id === 'string' && typeof request.action === 'string')
+          .slice(0, 20)
+          .map((request) => ({
+            id: request.id,
+            action: request.action.slice(0, 2_000),
+            ...(typeof request.url === 'string' ? { url: request.url } : {}),
+            ...(typeof request.threadId === 'string' ? { threadId: request.threadId } : {}),
+          }))
+      : undefined,
+    secretIds: Array.isArray(payload?.secretIds) ? payload.secretIds.filter((id) => typeof id === 'string').slice(0, 20) : undefined,
+    // runTurn: a bot's follow-up went to the thread's pending request as its reply instead.
+    answeredRequest: typeof payload?.answeredRequest === 'string' ? payload.answeredRequest : undefined,
     error: typeof payload?.error === 'string' ? payload.error : undefined,
   }),
 });
@@ -4764,6 +4780,26 @@ const botThreadTools = createBotThreadTools({
       default:
         return Promise.resolve({ ok: false, error: `Unsupported thread action "${action}".` });
     }
+  },
+  // The renderer's live view: a thread counts as waiting on the person, not
+  // busy, while a "Needs you" request is pending (message_thread answers it).
+  threadTurnState: (threadId) => requestDispatchRendererCommand({ kind: 'threadTurnState', threadId }, 15_000),
+  // answer_thread_request: the card's Done / Reply / X, through the same
+  // handlers as the person's clicks (and a paired controller's).
+  answerRequest: ({ threadId, actionId, op, reply, botName }) => {
+    const name = typeof botName === 'string' && botName.trim() ? botName.trim().slice(0, 80) : '';
+    return requestDispatchRendererCommand(
+      {
+        kind: 'userAction',
+        threadId,
+        actionId,
+        op,
+        ...(op === 'reply' ? { reply: String(reply ?? '').slice(0, 16_000) } : {}),
+        answeredBy: { botName: name || 'your bot' },
+        source: { machineId: 'durango-bot', machineName: name || 'your bot' },
+      },
+      30_000
+    );
   },
 });
 
