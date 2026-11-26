@@ -1,18 +1,14 @@
-// Unit tests for upgraded Antigravity usage limits (provider-usage-limits.js)
-// and native Antigravity skills discovery (antigravity-skills.js).
+// Guards that Durango Code never reads Antigravity's plan limits from Google
+// (provider-usage-limits.js), plus unit tests for native Antigravity skills
+// discovery (antigravity-skills.js).
 //   node --no-warnings scripts/test-antigravity-skills-and-limits.mjs
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {
-  antigravityWindowsFromAvailableModels,
-  antigravityWindowsFromQuotaSummary,
-  decodeGoKeyringValue,
-  readAntigravityLimits,
-  readAntigravityToken,
-} from '../src/main/provider-usage-limits.js';
+import { fileURLToPath } from 'node:url';
+import * as providerUsageLimits from '../src/main/provider-usage-limits.js';
 import {
   MAX_SCAN_BYTES,
   MAX_SCAN_ENTRIES,
@@ -37,291 +33,62 @@ const writeSkill = async (dir, content) => {
   await fs.writeFile(path.join(dir, 'SKILL.md'), content, 'utf8');
 };
 
-// --- Part 1: Antigravity usage limits ----------------------------------------
+// --- Part 1: no Antigravity limits from Google --------------------------------
+//
+// Google exposes Antigravity's quota only through internal Cloud Code
+// endpoints, and its terms call using Antigravity's OAuth from other software a
+// breach. Durango must not read agy's sign-in or call those endpoints.
 
-await check('decodeGoKeyringValue decodes base64, hex, and plain text', () => {
-  assert.equal(decodeGoKeyringValue(`go-keyring-base64:${Buffer.from('{"a":1}').toString('base64')}`), '{"a":1}');
-  assert.equal(decodeGoKeyringValue(`go-keyring-encoded:${Buffer.from('{"b":2}').toString('hex')}`), '{"b":2}');
-  assert.equal(decodeGoKeyringValue('  plain-text  '), 'plain-text');
+const srcDir = fileURLToPath(new URL('../src/', import.meta.url));
+
+await check('provider-usage-limits exports no Antigravity reader', () => {
+  const names = Object.keys(providerUsageLimits).filter((name) => /antigravity|keyring/i.test(name));
+  assert.deepEqual(names, []);
 });
 
-await check('readAntigravityToken reads Windows Credential Manager via PowerShell CredReadW', async () => {
-  const expiry = '2026-12-01T00:00:00Z';
-  const payload = `go-keyring-base64:${Buffer.from(JSON.stringify({ token: { access_token: 'win-secret', expiry } })).toString('base64')}`;
-  const calls = [];
-  const token = await readAntigravityToken({
-    platform: 'win32',
-    homeDir: '/nonexistent-home-dir-for-test',
-    readFile: async () => {
-      throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
-    },
-    exec: async (cmd, args) => {
-      calls.push({ cmd, args });
-      return Buffer.from(payload, 'utf8').toString('base64');
-    },
-  });
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].cmd, 'powershell.exe');
-  assert.equal(calls[0].args[0], '-NoProfile');
-  assert.equal(calls[0].args[1], '-NonInteractive');
-  assert.equal(calls[0].args[2], '-Command');
-  assert.match(calls[0].args[3], /advapi32\.dll/);
-  assert.match(calls[0].args[3], /CredReadW/);
-  assert.match(calls[0].args[3], /1168/);
-  assert.match(calls[0].args[3], /gemini:antigravity/);
-  assert.deepEqual(token, { accessToken: 'win-secret', expiresAt: Date.parse(expiry) });
-
-  // UTF-16LE credential blob also decodes cleanly.
-  const utf16Token = await readAntigravityToken({
-    platform: 'win32',
-    homeDir: '/nonexistent-home-dir-for-test',
-    readFile: async () => {
-      throw new Error('ENOENT');
-    },
-    exec: async () => Buffer.from(payload, 'utf16le').toString('base64'),
-  });
-  assert.equal(utf16Token?.accessToken, 'win-secret');
-
-  // Empty output (ERROR_NOT_FOUND 1168) or exec failure returns null without throwing.
-  const missing = await readAntigravityToken({
-    platform: 'win32',
-    homeDir: '/nonexistent-home-dir-for-test',
-    readFile: async () => {
-      throw new Error('ENOENT');
-    },
-    exec: async () => '',
-  });
-  assert.equal(missing, null);
-
-  const errored = await readAntigravityToken({
-    platform: 'win32',
-    homeDir: '/nonexistent-home-dir-for-test',
-    readFile: async () => {
-      throw new Error('ENOENT');
-    },
-    exec: async () => {
-      throw new Error('powershell failed');
-    },
-  });
-  assert.equal(errored, null);
+await check('readProviderUsageLimits skips Antigravity without touching the network', async () => {
+  const realFetch = globalThis.fetch;
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    throw new Error('network disabled in this test');
+  };
+  try {
+    const only = await providerUsageLimits.readProviderUsageLimits({ force: true, providers: ['antigravity'] });
+    assert.deepEqual(only, {});
+    assert.deepEqual(urls, []);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
-await check('antigravityWindowsFromQuotaSummary handles Argon/Carbon families and rolling reset suppression', () => {
-  const now = Date.parse('2026-11-23T12:00:00Z');
-  const fiveHoursAhead = new Date(now + 300 * 60_000).toISOString();
-  const fiveHoursPlus45s = new Date(now + 300 * 60_000 + 45_000).toISOString();
-  const fiveHoursPlus2m = new Date(now + 300 * 60_000 + 120_000).toISOString();
-  const weeklyAhead = new Date(now + 10080 * 60_000 - 30_000).toISOString();
-
-  const windows = antigravityWindowsFromQuotaSummary(
-    {
-      buckets: [
-        // Untouched 100% bucket with rolling reset ~5h from now -> resetsAt suppressed to null.
-        { bucketId: 'gemini-argon-5h', window: '5h', remainingFraction: 1, resetTime: fiveHoursAhead },
-        // Untouched 100% bucket within ±60s of weekly window -> suppressed to null.
-        { bucketId: 'gemini-carbon-weekly', window: 'weekly', remainingFraction: 1, resetTime: weeklyAhead },
-        // Untouched 100% bucket WITH description -> resetTime preserved!
-        { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1, resetTime: fiveHoursPlus45s, description: 'Active window' },
-        // Untouched 100% bucket >60s off from rolling window -> resetTime preserved!
-        { bucketId: '3p-5h', window: '5h', remainingFraction: 1, resetTime: fiveHoursPlus2m },
-        // Partially used bucket -> resetTime preserved!
-        { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 0.6, resetTime: weeklyAhead },
-      ],
-    },
-    now
-  );
-
-  const byId = Object.fromEntries(windows.map((w) => [w.id, w]));
-  assert.equal(byId['gemini-argon-5h'].label, 'Gemini Argon · 5-hour');
-  assert.equal(byId['gemini-argon-5h'].resetsAt, null);
-  assert.equal(byId['gemini-carbon-weekly'].label, 'Gemini Carbon · Weekly');
-  assert.equal(byId['gemini-carbon-weekly'].resetsAt, null);
-  assert.equal(byId['gemini-5h'].label, 'Gemini · 5-hour');
-  assert.equal(byId['gemini-5h'].resetsAt, Date.parse(fiveHoursPlus45s));
-  assert.equal(byId['gemini-5h'].detail, 'Active window');
-  assert.equal(byId['3p-5h'].label, 'Claude & GPT · 5-hour');
-  assert.equal(byId['3p-5h'].resetsAt, Date.parse(fiveHoursPlus2m));
-  assert.equal(byId['3p-weekly'].label, 'Claude & GPT · Weekly');
-  assert.equal(byId['3p-weekly'].usedPercent, 40);
-  assert.equal(byId['3p-weekly'].resetsAt, Date.parse(weeklyAhead));
-
-  // Explicit group displayName overrides default family label.
-  const grouped = antigravityWindowsFromQuotaSummary(
-    {
-      groups: [
-        { displayName: 'Custom Argon', buckets: [{ bucketId: 'gemini-argon-5h', window: '5h', remainingFraction: 0.5 }] },
-      ],
-    },
-    now
-  );
-  assert.equal(grouped[0].label, 'Custom Argon · 5-hour');
-});
-
-await check('antigravityWindowsFromAvailableModels aggregates max usedPercent per family and window', () => {
-  const now = Date.parse('2026-11-23T12:00:00Z');
-  const resetSoon = '2026-11-23T14:00:00Z';
-  const rolling5h = new Date(now + 300 * 60_000).toISOString();
-  const weeklyReset = '2026-11-29T00:00:00Z';
-
-  const windows = antigravityWindowsFromAvailableModels(
-    {
-      models: {
-        'gemini-2.5-pro': {
-          modelProvider: 'MODEL_PROVIDER_GOOGLE',
-          quotaInfo: { remainingFraction: 0.8, resetTime: '2026-11-23T16:00:00Z' },
-          weeklyQuotaInfo: { remainingFraction: 0.9, resetTime: weeklyReset },
-        },
-        'gemini-3.8-flash': {
-          // Prefix-only detection (no modelProvider) with higher usage -> wins max!
-          quotaInfo: { remainingFraction: 0.35, resetTime: resetSoon },
-          weeklyQuotaInfo: { remainingFraction: 0.5, resetTime: weeklyReset },
-        },
-        'claude-opus-4-6-thinking': {
-          modelProvider: 'MODEL_PROVIDER_ANTHROPIC',
-          quotaInfo: { remainingFraction: 1, resetTime: rolling5h },
-          weeklyQuotaInfo: { isExhausted: true, resetTime: weeklyReset },
-        },
-        'gpt-5': {
-          // Lower usage than claude weekly exhausted, higher 5h usage than claude 0% -> 5h becomes 25%
-          quotaInfo: { remainingFraction: 0.75, resetTime: resetSoon },
-          weeklyQuotaInfo: { remainingFraction: 0.4, resetTime: weeklyReset },
-        },
-        'gemini-argon-pro': {
-          quotaInfo: { remainingFraction: 1, resetTime: rolling5h },
-        },
-      },
-    },
-    now
-  );
-
-  const byId = Object.fromEntries(windows.map((w) => [w.id, w]));
-  assert.equal(byId['gemini-5h'].label, 'Gemini · 5-hour');
-  assert.equal(byId['gemini-5h'].usedPercent, 65);
-  assert.equal(byId['gemini-5h'].resetsAt, Date.parse(resetSoon));
-  assert.equal(byId['gemini-weekly'].usedPercent, 50);
-  assert.equal(byId['3p-5h'].label, 'Claude & GPT · 5-hour');
-  assert.equal(byId['3p-5h'].usedPercent, 25);
-  assert.equal(byId['3p-weekly'].usedPercent, 100);
-  assert.equal(byId['gemini-argon-5h'].label, 'Gemini Argon · 5-hour');
-  assert.equal(byId['gemini-argon-5h'].usedPercent, 0);
-  assert.equal(byId['gemini-argon-5h'].resetsAt, null, 'untouched rolling reset suppressed in fallback too');
-});
-
-await check('readAntigravityLimits queries both hosts in parallel, merges with daily priority, and picks first non-null plan/detail', async () => {
-  const now = Date.parse('2026-11-23T12:00:00Z');
-  let inFlightLoad = 0;
-  let maxConcurrentLoad = 0;
-
-  const result = await readAntigravityLimits({
-    now,
-    readToken: async () => ({ accessToken: 'tok', expiresAt: now + 3600_000 }),
-    fetchJsonFn: async (url) => {
-      if (url.endsWith(':loadCodeAssist')) {
-        inFlightLoad += 1;
-        maxConcurrentLoad = Math.max(maxConcurrentLoad, inFlightLoad);
-        await new Promise((r) => setTimeout(r, 15));
-        inFlightLoad -= 1;
-        if (url.includes('daily-cloudcode-pa')) {
-          return { ok: true, status: 200, body: { cloudaicompanionProject: 'proj-daily', currentTier: null } };
-        }
-        return { ok: true, status: 200, body: { cloudaicompanionProject: 'proj-prod', currentTier: { id: 'pro', name: 'Google AI Pro' } } };
+await check('no app source calls Google Cloud Code or reads agy\'s OAuth token', async () => {
+  const banned = [
+    [/cloudcode-pa|cloudcode\.googleapis|v1internal:/i, 'Google Cloud Code internal API'],
+    [/antigravity\/hub/i, 'borrowed Antigravity User-Agent'],
+    [/loadCodeAssist|retrieveUserQuotaSummary|fetchAvailableModels/, 'Cloud Code quota call'],
+    [/['"]-s['"],\s*['"]gemini['"]|gemini:antigravity|['"]service['"],\s*['"]gemini['"]/, "agy's keyring item"],
+  ];
+  // provider-sign-in-watch.js only stats the token file (mtime + size) to
+  // notice sign-in changes; it never opens it.
+  const tokenFileAllowed = new Set([path.join('main', 'provider-sign-in-watch.js')]);
+  const hits = [];
+  const walk = async (dir) => {
+    for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+        continue;
       }
-      if (url.endsWith(':retrieveUserQuotaSummary')) {
-        if (url.includes('daily-cloudcode-pa')) {
-          return {
-            ok: true,
-            status: 200,
-            body: {
-              buckets: [
-                { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.7 },
-              ],
-            },
-          };
-        }
-        return {
-          ok: true,
-          status: 200,
-          body: {
-            description: 'Prod quota summary',
-            buckets: [
-              // Same bucketId as daily -> daily's 30% used must win over prod's 90% used!
-              { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.1 },
-              // Unique bucket from prod -> merged in!
-              { bucketId: '3p-weekly', window: 'weekly', remainingFraction: 0.5 },
-            ],
-          },
-        };
-      }
-      throw new Error(`Unexpected URL ${url}`);
-    },
-  });
-
-  assert.equal(maxConcurrentLoad, 2, 'both hosts must be queried in parallel');
-  assert.equal(result.status, 'ok');
-  assert.equal(result.plan, 'Google AI Pro', 'falls back to second host plan when first is null');
-  assert.equal(result.detail, 'Prod quota summary', 'falls back to second host detail when first is null');
-  assert.deepEqual(
-    result.windows.map((w) => [w.id, Math.round(w.usedPercent)]),
-    [
-      ['3p-weekly', 50],
-      ['gemini-5h', 30],
-    ]
-  );
-});
-
-await check('readAntigravityLimits falls back to fetchAvailableModels across both hosts when summary has 0 windows', async () => {
-  const now = Date.parse('2026-11-23T12:00:00Z');
-  const seenUrls = [];
-
-  const result = await readAntigravityLimits({
-    now,
-    readToken: async () => ({ accessToken: 'tok', expiresAt: now + 3600_000 }),
-    fetchJsonFn: async (url) => {
-      seenUrls.push(url);
-      if (url.endsWith(':loadCodeAssist')) {
-        return { ok: true, status: 200, body: { cloudaicompanionProject: 'proj-1', currentTier: { id: 'free-tier' } } };
-      }
-      if (url.endsWith(':retrieveUserQuotaSummary')) {
-        return { ok: true, status: 200, body: { buckets: [] } };
-      }
-      if (url.endsWith(':fetchAvailableModels')) {
-        if (url.includes('daily-cloudcode-pa')) {
-          return {
-            ok: true,
-            status: 200,
-            body: {
-              models: {
-                'gemini-2.5-pro': { modelProvider: 'MODEL_PROVIDER_GOOGLE', quotaInfo: { remainingFraction: 0.6 } },
-              },
-            },
-          };
-        }
-        return {
-          ok: true,
-          status: 200,
-          body: {
-            models: {
-              'gemini-2.5-pro': { modelProvider: 'MODEL_PROVIDER_GOOGLE', quotaInfo: { remainingFraction: 0.1 } },
-              'claude-sonnet-4-5': { modelProvider: 'MODEL_PROVIDER_ANTHROPIC', weeklyQuotaInfo: { remainingFraction: 0.25 } },
-            },
-          },
-        };
-      }
-      throw new Error(`Unexpected URL ${url}`);
-    },
-  });
-
-  assert.equal(result.status, 'ok');
-  assert.equal(result.plan, 'Free');
-  assert.ok(seenUrls.some((u) => u.includes('daily-cloudcode-pa') && u.endsWith(':fetchAvailableModels')));
-  assert.ok(seenUrls.some((u) => u.includes('cloudcode-pa.googleapis.com') && !u.includes('daily-') && u.endsWith(':fetchAvailableModels')));
-  assert.deepEqual(
-    result.windows.map((w) => [w.id, Math.round(w.usedPercent)]),
-    [
-      ['3p-weekly', 75],
-      ['gemini-5h', 40],
-    ]
-  );
+      if (!/\.(m?js|cjs|tsx?)$/.test(entry.name)) continue;
+      const rel = path.relative(srcDir, full);
+      const text = await fs.readFile(full, 'utf8');
+      for (const [pattern, label] of banned) if (pattern.test(text)) hits.push(`${rel}: ${label}`);
+      if (/antigravity-oauth-token/.test(text) && !tokenFileAllowed.has(rel)) hits.push(`${rel}: agy OAuth token file`);
+    }
+  };
+  await walk(srcDir);
+  assert.deepEqual(hits, []);
 });
 
 // --- Part 2: Antigravity skills discovery ------------------------------------

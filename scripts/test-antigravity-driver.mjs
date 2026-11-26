@@ -32,16 +32,10 @@ import {
 import { parseAntigravityLoginUrl, parseAntigravityModelRows } from '../src/main/provider-updates.js';
 import { commandForModel } from '../src/main/command-for-model.js';
 import { createProviderSignInWatch } from '../src/main/provider-sign-in-watch.js';
-import { readAntigravityLimits } from '../src/main/provider-usage-limits.js';
 import { antigravityVersionError } from '../src/main/antigravity-driver.js';
 import { antigravityFailureFromErrorText } from '../src/main/antigravity-turn-outcome.js';
 import { handleAntigravitySubagentLine } from '../src/main/antigravity-child-work.js';
-import {
-  antigravityWindowsFromQuotaSummary,
-  codexLimitsFromRateLimitsRead,
-  decodeGoKeyringValue,
-  grokWindowsFromBilling,
-} from '../src/main/provider-usage-limits.js';
+import { codexLimitsFromRateLimitsRead, grokWindowsFromBilling } from '../src/main/provider-usage-limits.js';
 
 let failures = 0;
 // AGY_ONLY=<regex> runs only the matching checks.
@@ -157,18 +151,7 @@ await check('classifies error steps', () => {
 });
 
 await check('limits parsing', () => {
-  const windows = antigravityWindowsFromQuotaSummary({
-    groups: [
-      { displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.75, resetTime: '2026-11-28T11:47:35Z' }] },
-      { displayName: 'Claude and GPT models', buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1 }, { bucketId: 'x', disabled: true, remainingFraction: 0 }] },
-    ],
-  });
-  assert.deepEqual(windows.map((w) => [w.id, w.label, w.usedPercent, w.windowMinutes]), [
-    ['3p-5h', 'Claude and GPT models · 5-hour', 0, 300],
-    ['gemini-weekly', 'Gemini Models · Weekly', 25, 10080],
-  ]);
   assert.deepEqual(grokWindowsFromBilling({ config: { creditUsagePercent: 1, currentPeriod: { type: 'USAGE_PERIOD_TYPE_WEEKLY', start: '2026-11-22T06:57:08Z', end: '2026-11-29T06:57:08Z' } } })[0].label, 'Weekly');
-  assert.equal(decodeGoKeyringValue(`go-keyring-base64:${Buffer.from('{"a":1}').toString('base64')}`), '{"a":1}');
   const codex = codexLimitsFromRateLimitsRead({ rateLimits: { primary: { usedPercent: 1, windowDurationMins: 10080, resetsAt: 5 }, planType: 'plus' } });
   assert.deepEqual(codex.value.primary, { used_percent: 1, window_minutes: 10080, resets_at: 5 });
 });
@@ -1576,12 +1559,6 @@ if (process.env.AGY_LIVE === '1') {
   const outside = path.join(root, 'outside.txt');
   fs.mkdirSync(workspace);
   let sessionId = null;
-
-  await check('live: Antigravity limits read the current sign-in', async () => {
-    const limits = await readAntigravityLimits();
-    assert.equal(limits.status, 'ok', limits.detail);
-    assert.ok(limits.windows.length > 0);
-  });
 
   await check('live: ACP model probe discovers real thought_level options and leaves zero session files', async () => {
     const convDir = path.join(antigravityCliHome(), 'conversations');

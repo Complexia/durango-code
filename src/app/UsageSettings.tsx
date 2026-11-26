@@ -18,6 +18,11 @@ const PROVIDERS: Record<string, { label: string; Icon: typeof ClaudeBrandIcon; c
   grok: { label: 'Grok Build', Icon: GrokBrandIcon, color: 'var(--usage-grok)' },
 };
 const PROVIDER_ORDER = ['claude', 'codex', 'antigravity', 'grok'];
+// Providers whose plan limits are read live (provider-usage-limits.js).
+// Antigravity isn't one: Google shares its limits with no other app.
+const LIVE_LIMIT_PROVIDERS = PROVIDER_ORDER.filter((id) => id !== 'antigravity');
+const liveLimitTargets = (provider: string) =>
+  provider === 'all' ? LIVE_LIMIT_PROVIDERS : LIVE_LIMIT_PROVIDERS.filter((id) => id === provider);
 
 const RANGES: Array<{ id: UsageRange; label: string }> = [
   { id: '24h', label: 'Past 24h' },
@@ -690,30 +695,14 @@ const PlanLimitsSection = ({
             <div className="usage-card-title">
               <AntigravityBrandIcon size={15} />
               <span>Antigravity</span>
-              {live?.antigravity?.plan && <span className="usage-pill">{live.antigravity.plan}</span>}
               <InfoTip align="end">
-                Read live from Google with Antigravity&apos;s own sign-in. Models in a group share its 5-hour and weekly limits, including usage outside Durango Code.
+                Google has no way for other apps to read Antigravity&apos;s plan limits: its quota service is internal to Antigravity, and Google&apos;s terms don&apos;t allow other software to use Antigravity&apos;s sign-in. So Durango Code doesn&apos;t read them.
               </InfoTip>
-              <span className="usage-card-meta">
-                {liveLoading.antigravity
-                  ? 'Checking…'
-                  : live?.antigravity?.at
-                    ? `${live.antigravity.status === 'ok' ? 'Live · ' : 'Checked '}${relativeTime(live.antigravity.at)}`
-                    : ''}
-              </span>
-              <button
-                type="button"
-                className="usage-icon-button h-6 w-6"
-                onClick={() => onRefreshProvider('antigravity')}
-                disabled={liveLoading.antigravity === true}
-                title="Refresh Antigravity limits"
-                aria-label="Refresh Antigravity limits"
-              >
-                <RefreshCw size={12} className={liveLoading.antigravity === true ? 'animate-spin' : ''} />
-              </button>
             </div>
             <div className="usage-card-body">
-              <LiveLimitsBody limits={live?.antigravity} loading={liveLoading.antigravity === true} empty="Antigravity reported no limits." />
+              <p className="usage-empty-note">
+                Antigravity doesn&apos;t share its plan limits with other apps. Check them in Antigravity itself. Token use from Antigravity runs is still counted below.
+              </p>
             </div>
           </div>
         )}
@@ -789,7 +778,7 @@ const UsageSettings = React.memo(function UsageSettings() {
 
   React.useEffect(() => window.orion?.onUsageProgress?.((next) => setProgress(next)), []);
 
-  const loadLive = React.useCallback(async (force = false, targetProviders: string[] = PROVIDER_ORDER) => {
+  const loadLive = React.useCallback(async (force = false, targetProviders: string[] = LIVE_LIMIT_PROVIDERS) => {
     const read = window.orion?.usageLiveLimits;
     if (!read) return;
     await Promise.all(
@@ -874,7 +863,7 @@ const UsageSettings = React.memo(function UsageSettings() {
             aria-label="Refresh usage logs and plan limits"
             onClick={() => {
               void load(true);
-              void loadLive(true, provider === 'all' ? PROVIDER_ORDER : [provider]);
+              void loadLive(true, liveLimitTargets(provider));
             }}
             disabled={refreshingAll}
           >
@@ -891,7 +880,7 @@ const UsageSettings = React.memo(function UsageSettings() {
         liveLoading={liveLoading}
         providerFilter={provider}
         onRefreshProvider={(providerId) => void loadLive(true, [providerId])}
-        onRefreshAll={() => void loadLive(true, provider === 'all' ? PROVIDER_ORDER : [provider])}
+        onRefreshAll={() => void loadLive(true, liveLimitTargets(provider))}
       />
 
       {firstScan && (

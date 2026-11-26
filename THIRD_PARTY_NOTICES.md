@@ -61,9 +61,13 @@ the quota stop reason, and the release manifest the CLI updates from. The
 session-database error check (`src/main/antigravity-turn-outcome.js`, its step
 types and error patterns), the subagent files read in
 `src/main/antigravity-child-work.js`, steering with a second `session/prompt`,
-and the Antigravity and Grok quota endpoints in `src/main/provider-usage-limits.js`
-follow T3 Code's `AntigravityTurnOutcome.ts`, `AntigravityChildWork.ts`,
-`antigravityUsageLimits.ts` and `provider-grok/src/server/usageLimits.ts`. The
+and the Grok quota endpoint in `src/main/provider-usage-limits.js` follow T3
+Code's `AntigravityTurnOutcome.ts`, `AntigravityChildWork.ts` and
+`provider-grok/src/server/usageLimits.ts`. Durango Code doesn't read
+Antigravity's plan limits: it once followed T3 Code's `antigravityUsageLimits.ts`
+(Google's internal Cloud Code quota API with Antigravity's own sign-in), and
+dropped it, as T3 Code did, because Google offers no quota API to other apps and
+its terms don't allow other software to use Antigravity's sign-in. The
 Antigravity mark (`assets/antigravity-icon.png`) is the image T3 Code ships in
 `apps/web/src/components/Icons.tsx`; it is Google's trademark.
 

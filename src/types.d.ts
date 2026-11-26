@@ -410,7 +410,6 @@ export type LiveProviderLimits = {
 };
 export type LiveUsageLimits = {
   claude?: LiveProviderLimits;
-  antigravity?: LiveProviderLimits;
   grok?: LiveProviderLimits;
   /** Codex live snapshot (shared app-server or ChatGPT OAuth usage API), in the session logs' shape; `status` alone when unavailable. */
   codex?: (NonNullable<UsageReport['limits']['codex']> & { live?: boolean }) | { status: string; detail?: string; at: number };

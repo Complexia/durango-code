@@ -9638,8 +9638,9 @@ ipcMain.handle('usage:report', async (_event, input) => {
   }
 });
 
-// Limits read live from Claude Code's, Codex's, Antigravity's and Grok's
-// own quota endpoints (provider-usage-limits.js).
+// Limits read live from Claude Code's, Codex's and Grok's own quota endpoints
+// (provider-usage-limits.js). Antigravity's are never read: Google shares them
+// with no other app.
 ipcMain.handle('usage:liveLimits', async (_event, input) => {
   try {
     configureCodexLiveLimits(codexAppServerManager, app.getVersion?.() ?? '0.0.0');
