@@ -153,13 +153,16 @@ const prunePackagedBuild = (buildPath, platform, arch) => {
   // `node-pty/lib/utils.js` always resolves `build/Release` before `prebuilds/`.
   // When `@electron/rebuild` produced the native binary (plus `spawn-helper` on
   // macOS) under `build/Release/`, drop `prebuilds/` so unreachable Mach-O
-  // binaries are not shipped or code-signed.
+  // binaries are not shipped or code-signed. Conversely, when falling back to a
+  // target prebuild, remove any incomplete `build/` so it cannot shadow
+  // `prebuilds/`.
   const hasRebuiltPty =
     platform !== 'win32' &&
     fs.existsSync(path.join(ptyDir, 'build', 'Release', 'pty.node')) &&
     (platform !== 'darwin' || fs.existsSync(path.join(ptyDir, 'build', 'Release', 'spawn-helper')));
 
   const prebuildsDir = path.join(ptyDir, 'prebuilds');
+  let hasTargetPrebuild = false;
   if (fs.existsSync(prebuildsDir)) {
     if (hasRebuiltPty) {
       fs.rmSync(prebuildsDir, { recursive: true, force: true });
@@ -170,6 +173,7 @@ const prunePackagedBuild = (buildPath, platform, arch) => {
           fs.rmSync(dirPath, { recursive: true, force: true });
           continue;
         }
+        hasTargetPrebuild = true;
         if (fs.statSync(dirPath).isDirectory()) {
           removeMatchingFiles(dirPath, /\.pdb$/i);
         }
@@ -178,6 +182,10 @@ const prunePackagedBuild = (buildPath, platform, arch) => {
         fs.rmSync(prebuildsDir, { recursive: true, force: true });
       }
     }
+  }
+
+  if (!hasRebuiltPty && hasTargetPrebuild) {
+    fs.rmSync(buildDir, { recursive: true, force: true });
   }
 
   restoreSpawnHelperPermissions(ptyDir, platform);

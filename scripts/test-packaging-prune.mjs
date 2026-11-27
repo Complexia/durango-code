@@ -167,7 +167,8 @@ try {
     }
   }
 
-  // 3. macOS arm64 (prebuild fallback when build/Release is absent): keeps only darwin-arm64 prebuild with 0755.
+  // 3. macOS arm64 (prebuild fallback when build/Release is absent or missing spawn-helper):
+  // removes any incomplete build/ so it cannot shadow prebuilds/darwin-arm64 (with 0755).
   {
     const buildPath = path.join(tmpRoot, 'build-darwin-arm64-prebuild');
     const ptyDest = path.join(buildPath, 'node_modules', 'node-pty');
@@ -176,6 +177,8 @@ try {
       dereference: true,
       filter: (entryPath) => shouldCopyNodePtyEntry(ptySrc, entryPath, 'darwin', 'arm64'),
     });
+    // Simulate incomplete rebuild (pty.node without spawn-helper)
+    writeFiles(ptyDest, { 'build/Release/pty.node': 'incomplete-rebuild' });
     prunePackagedBuild(buildPath, 'darwin', 'arm64');
     assert.deepEqual(listRelativeFiles(ptyDest), [
       'LICENSE',
