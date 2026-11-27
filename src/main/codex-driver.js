@@ -4,6 +4,7 @@ import path from 'node:path';
 import { chromeDevtoolsMcpPackage, codexReasoningEffortForModel, defaultCodexServiceTier } from './models.js';
 import { codexBrowserEnvironmentNote, codexBrowserMcpConfig, codexModelConfig, codexPersonalizationConfig } from './codex-config.js';
 import { killAgentChild } from './run-registry.js';
+import { codexAgentEnvConfig, durangoAgentEnv } from './durango-agent-env.js';
 import { spawnCodexServerProcess } from './codex-server-process.js';
 import { loginShell } from './shell-env.js';
 import { formatToolInput, formatToolOutput, stringifySummary } from './stream-adapters.js';
@@ -61,6 +62,10 @@ export const codexAppServerConfig = (model, input) => {
     }
     config.mcp_servers = merged;
   }
+  // Thread + model for `durango-code change create|amend` in this thread's
+  // commands: the app-server is shared by every thread, so its own
+  // environment can't carry them (durango-agent-env.js).
+  if (!input.aside) Object.assign(config, codexAgentEnvConfig(durangoAgentEnv({ threadId: input.threadId, model })));
   return config;
 };
 

@@ -1147,6 +1147,7 @@ await server.connect(new StdioServerTransport());
     const fxLaunch = null;
     const usePersistentAntigravity = false;
     const antigravityLease = null;
+    const runAgentEnv = { DURANGO_MODEL: 'codex:gpt-5.6-sol' };
     const loginShell = '/bin/zsh';
     const process = { env: {} };
     const commandForModel = () => ['codex', 'app-server'];
@@ -1174,6 +1175,10 @@ await server.connect(new StdioServerTransport());
   const customizedLaunch = captureLaunch({ ...launchInput, providerOptions: { extraArgs: '--profile work' } }, true, false, null, launchOs);
   assert.equal(customizedLaunch.options.cwd, launchInput.projectPath, 'customized runs retain their checked project-shell environment');
   assert.equal(captureLaunch(launchInput, false, false, null, launchOs).options.cwd, launchInput.projectPath, 'other launches still start in the project');
+  // Per-run processes carry the thread's model for durango-code; the shared
+  // Codex app-server gets it as per-thread config instead (codexAppServerConfig).
+  assert.equal(captureLaunch(launchInput, false, false, null, launchOs).options.env.DURANGO_MODEL, 'codex:gpt-5.6-sol');
+  assert.equal(captureLaunch(launchInput, true, true, { persistent: false, child: null }, launchOs).options.env.DURANGO_MODEL, undefined);
   const resolutionStart = runTurnSource.indexOf('    const orionMcps =');
   const resolutionEnd = runTurnSource.indexOf('    // Connectors from the Durango account join', resolutionStart);
   assert.ok(resolutionStart >= 0 && resolutionEnd > resolutionStart);

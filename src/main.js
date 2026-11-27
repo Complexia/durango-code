@@ -73,6 +73,7 @@ import { spawnCodexServerProcess } from './main/codex-server-process.js';
 import { codexGoalRunDrivers, codexSteerableRunDrivers, createCodexAppServerDriver, runCodexGoalOp, steerCodexAppServerRun } from './main/codex-driver.js';
 import { createCompletedCodexQuestions } from './main/codex-questions.js';
 import { commandForModel } from './main/command-for-model.js';
+import { durangoAgentEnv } from './main/durango-agent-env.js';
 import { validateAgentWorkspace } from './main/agent-run-preflight.js';
 import { captureGitChangeSnapshot, commandSucceeds, commitMessageForEntries, getCurrentGitBranch, getDetachedGitHead, getGitRoot, getGitStateForPath, getGitStatusMap, invalidateTreeGitStatusCache, readGitStatusEntries, summarizeChangedFiles, validateNewBranchName } from './main/git-utils.js';
 import { createFxAcpDriver, fxReadOnlyOneShot, fxStatsFromPromptResult, fxSteerableRunDrivers, steerFxRun } from './main/fx-driver.js';
@@ -7459,6 +7460,8 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       Boolean(input.codexReview) &&
       typeof input.codexReview === 'object';
     const useCodexAppServer = model.providerId === 'codex' && !input.aside;
+    // Thread + model for `durango-code change create|amend` (durango-agent-env.js).
+    const runAgentEnv = input.aside ? {} : durangoAgentEnv({ threadId: input.threadId, model });
     // Resolve user/plugin MCP definitions before allocating the per-run
     // bridge. If Codex cannot list or parse its MCP configuration, startup
     // fails without leaving a bridge session or temporary plugin directory.
@@ -7572,7 +7575,11 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             ...process.env,
             FORCE_COLOR: '0',
             NO_COLOR: '1',
+            ...runAgentEnv,
           }),
+          // A warm process keeps its environment: a new model needs a new one
+          // so DURANGO_MODEL stays right.
+          envKey: runAgentEnv.DURANGO_MODEL ?? '',
           mcpKey: JSON.stringify({
             servers: [...orionMcps.servers, ...accountMcps],
             projectId: typeof input.projectId === 'string' ? input.projectId : null,
@@ -7708,6 +7715,9 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
             ...(openCodeConfig ? { OPENCODE_CONFIG_CONTENT: openCodeConfig } : {}),
             ...(museConfigRoot ? { XDG_CONFIG_HOME: museConfigRoot } : {}),
             ...(fxLaunch ? fxLaunch.env : {}),
+            // A per-run process; the shared Codex app-server gets these as
+            // per-thread config instead (codexAgentEnvConfig).
+            ...(useCodexAppServer ? {} : runAgentEnv),
           }),
           // ACP and app-server runs speak JSON-RPC over stdin; one-shot CLIs
           // take no input.

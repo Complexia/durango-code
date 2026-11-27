@@ -30,6 +30,7 @@
     "test:mcp-http-bridge": "node scripts/run-electron-test.mjs scripts/test-mcp-http-bridge.mjs",
     "refresh-usage-prices": "node --no-warnings scripts/refresh-usage-prices.mjs",
     "test:durango-workspaces": "node scripts/run-electron-test.mjs scripts/test-durango-workspaces.mjs",
+    "test:durango-agent-env": "node scripts/test-durango-agent-env.mjs",
     "test:skills": "electron scripts/test-skills.mjs",
     "test:mcps": "electron scripts/test-mcps.mjs",
     "test:orion-mcps": "node scripts/run-electron-test.mjs scripts/test-orion-mcps.mjs",

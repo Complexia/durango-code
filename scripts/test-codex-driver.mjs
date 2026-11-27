@@ -698,6 +698,11 @@ const astraInput = {
 };
 assert.equal(codexAppServerConfig(astra, astraInput)['features.context_management.experimental_mode'], true);
 assert.equal(codexAppServerConfig(astra, astraInput).model_reasoning_effort, 'max');
+// The shared app-server's commands for this thread get its thread + model
+// (durango-code change create|amend → Durango Source model attribution).
+assert.equal(codexAppServerConfig(astra, astraInput)['shell_environment_policy.set.DURANGO_THREAD_ID'], 'orion-astra');
+assert.equal(codexAppServerConfig(astra, astraInput)['shell_environment_policy.set.DURANGO_MODEL'], 'codex:gpt-6-astra');
+assert.equal(codexAppServerConfig(astra, { ...astraInput, aside: true })['shell_environment_policy.set.DURANGO_MODEL'], undefined);
 assert.ok(commandForModel(astra, { ...astraInput, projectPath: '/tmp' }).includes('features.context_management.experimental_mode=true'));
 const extensionInput = { ...astraInput, accessMode: 'full-access', providerOptions: { browserUseMode: 'extension' } };
 const extensionConfig = codexAppServerConfig(astra, extensionInput);

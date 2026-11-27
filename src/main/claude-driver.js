@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { durangoAgentEnv } from './durango-agent-env.js';
 import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } from './claude-input.js';
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { CLAUDE_CHROME_BROWSER_TIPS, claudeChromeLeaseHooks } from './claude-chrome.js';
@@ -2472,13 +2473,15 @@ export const createClaudeSdkSession = ({
         stderr: (data) => {
           session.stderrTail = `${session.stderrTail}${data}`.slice(-2000);
         },
-        // DURANGO_THREAD_ID: `durango-code change create` records the thread on
-        // the change, so a Durango task linked to this thread follows it.
+        // DURANGO_THREAD_ID / DURANGO_MODEL(_LABEL): `durango-code change
+        // create|amend` records the thread and model on the change (a Durango
+        // task linked to the thread follows it; Source shows the models). A
+        // model switch starts a new session (optionsKey), so they stay right.
         env: withClaudeEnv({
           ...process.env,
           FORCE_COLOR: '0',
           NO_COLOR: '1',
-          ...(session.threadId ? { DURANGO_THREAD_ID: String(session.threadId) } : {}),
+          ...durangoAgentEnv({ threadId: session.threadId ? String(session.threadId) : null, model }),
         }),
       },
     });

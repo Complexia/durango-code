@@ -24,8 +24,10 @@ const defaultSpawnProcess = ({ commandArgs, cwd, env }) =>
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
-const signatureFor = ({ cwd, accessMode, commandArgs, mcpKey }) =>
-  JSON.stringify([cwd || '', accessMode || '', commandArgs || [], mcpKey || '']);
+// envKey: what of the spawn environment must match to reuse a warm process
+// (the run's DURANGO_MODEL), since a running process keeps its environment.
+const signatureFor = ({ cwd, accessMode, commandArgs, mcpKey, envKey }) =>
+  JSON.stringify([cwd || '', accessMode || '', commandArgs || [], mcpKey || '', envKey || '']);
 
 export const createAntigravitySessionManager = ({
   spawnProcess = defaultSpawnProcess,
@@ -128,12 +130,13 @@ export const createAntigravitySessionManager = ({
     commandArgs,
     env,
     mcpKey = '',
+    envKey = '',
     resumeSessionId = null,
     createMcp,
     rebindMcp,
   }) => {
     const key = typeof threadId === 'string' && threadId ? threadId : null;
-    const signature = signatureFor({ cwd, accessMode, commandArgs, mcpKey });
+    const signature = signatureFor({ cwd, accessMode, commandArgs, mcpKey, envKey });
     const existing = key ? sessions.get(key) : null;
 
     if (
