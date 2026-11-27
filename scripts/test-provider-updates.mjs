@@ -172,8 +172,18 @@ assert.match(
 );
 assert.match(
   appSource,
-  /window\.setTimeout\(\(\) => \{\s*if \(!providerUpdatesCheckedOnceRef\.current\) void refreshProviderUpdates\(\);\s*\}, PROVIDER_UPDATE_BOOT_DELAY_MS\);/,
+  /window\.setTimeout\(\(\) => \{\s*if \(!providerUpdatesCheckedOnceRef\.current && !providerUpdatesCheckingRef\.current\) \{\s*void refreshProviderUpdates\(\);\s*\}\s*\}, PROVIDER_UPDATE_BOOT_DELAY_MS\);/,
   'initial provider update check should run after PROVIDER_UPDATE_BOOT_DELAY_MS once hydrated'
+);
+assert.match(
+  appSource,
+  /const providerUpdatesSeqRef = useRef\(0\);[\s\S]*?if \(seq !== providerUpdatesSeqRef\.current\) return;/,
+  'provider update refreshes should guard against stale out-of-order responses'
+);
+assert.match(
+  appSource,
+  /const enabledProviderIdsKey = agentProviders[\s\S]*?\.join\(','\);/,
+  'enabledProviderIds should stay referentially stable across unrelated provider option edits'
 );
 assert.match(
   appSource,
@@ -281,6 +291,20 @@ exit 0
     { code: 'ENOENT' },
     'disabled providers must not spawn CLI processes for auth or version checks'
   );
+
+  const disabledMissing = await checkProviderUpdate(
+    {
+      id: 'fixture-disabled-missing',
+      label: 'Disabled Missing Provider',
+      command: path.join(fixtureDir, 'definitely-missing-cli'),
+      statusCommand: ['status'],
+    },
+    new Set(['claude'])
+  );
+  assert.equal(disabledMissing.enabled, false);
+  assert.equal(disabledMissing.installed, false);
+  assert.equal(disabledMissing.status, 'missing');
+  assert.equal(disabledMissing.auth.status, 'missing');
 
   const controller = new AbortController();
   const chunks = [];

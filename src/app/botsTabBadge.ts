@@ -63,14 +63,20 @@ export const useBotsTabBadge = (poll: boolean): BotsTabBadge => {
     };
     void load();
     const timer = window.setInterval(() => void load(), POLL_MS);
-    const onFocus = () => {
-      if (focusCooldown.tryRun()) void load();
+    const onResume = () => {
+      if (!visible()) return;
+      focusCooldown.trigger(() => {
+        if (!stopped && visible()) void load();
+      });
     };
-    window.addEventListener('focus', onFocus);
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
     return () => {
       stopped = true;
+      focusCooldown.cancel();
       window.clearInterval(timer);
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, [poll]);
   return current;

@@ -526,13 +526,19 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     const timer = window.setInterval(() => {
       if (visible()) refresh();
     }, LIST_POLL_MS);
-    const onFocus = () => {
-      if (focusCooldown.tryRun()) void loadBots();
+    const onResume = () => {
+      if (!visible()) return;
+      focusCooldown.trigger(() => {
+        if (visible()) void loadBots();
+      });
     };
-    window.addEventListener('focus', onFocus);
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
     return () => {
+      focusCooldown.cancel();
       window.clearInterval(timer);
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, [loadBots]);
 

@@ -20,32 +20,50 @@ const durangoHome = () => path.join(os.homedir(), '.durango');
 const registryPath = () => path.join(durangoHome(), 'workspaces.json');
 const slotsPath = () => path.join(durangoHome(), 'server-slots.json');
 
-const jsonFileCache = new Map(); // path -> { mtimeMs, size, ino, data }
+const jsonFileCache = new Map(); // path -> { mtimeNs, ctimeNs, size, ino, data }
+const TRANSIENT_READ_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
 
 const readCachedJsonFile = (filePath) => {
-  try {
-    const stats = statSync(filePath);
-    const cached = jsonFileCache.get(filePath);
-    if (
-      cached &&
-      cached.mtimeMs === stats.mtimeMs &&
-      cached.size === stats.size &&
-      cached.ino === stats.ino
-    ) {
-      return cached.data;
+  const cached = jsonFileCache.get(filePath);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const stats = statSync(filePath, { bigint: true });
+      if (
+        cached &&
+        cached.mtimeNs === stats.mtimeNs &&
+        cached.ctimeNs === stats.ctimeNs &&
+        cached.size === stats.size &&
+        cached.ino === stats.ino
+      ) {
+        return cached.data;
+      }
+      const parsed = JSON.parse(readFileSync(filePath, 'utf8'));
+      jsonFileCache.set(filePath, {
+        mtimeNs: stats.mtimeNs,
+        ctimeNs: stats.ctimeNs,
+        size: stats.size,
+        ino: stats.ino,
+        data: parsed,
+      });
+      return parsed;
+    } catch (error) {
+      const code = error?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        jsonFileCache.delete(filePath);
+        return null;
+      }
+      if (TRANSIENT_READ_CODES.has(code)) {
+        if (attempt === 0) continue;
+        // On Windows, a concurrent atomic renameSync can briefly raise
+        // EBUSY/EPERM/EACCES; keep the last-known-good snapshot rather than
+        // flashing registered:false / server:null.
+        return cached ? cached.data : null;
+      }
+      jsonFileCache.delete(filePath);
+      return null;
     }
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8'));
-    jsonFileCache.set(filePath, {
-      mtimeMs: stats.mtimeMs,
-      size: stats.size,
-      ino: stats.ino,
-      data: parsed,
-    });
-    return parsed;
-  } catch {
-    jsonFileCache.delete(filePath);
-    return null;
   }
+  return cached ? cached.data : null;
 };
 
 const pidAlive = (pid) => {
@@ -72,7 +90,7 @@ const groupAlive = (pgid) => {
 /** Read-only view of `~/.durango/workspaces.json` (written atomically by the CLI). */
 export const readWorkspaceRegistry = () => {
   const parsed = readCachedJsonFile(registryPath());
-  return Array.isArray(parsed?.workspaces) ? parsed.workspaces : [];
+  return Array.isArray(parsed?.workspaces) ? parsed.workspaces.slice() : [];
 };
 
 /**
@@ -292,11 +310,27 @@ export const durangoWorkspaceStatus = async ({ path: workspacePath, name, repo, 
   const exists = typeof workspacePath === 'string' && existsSync(workspacePath);
   const local = exists ? readLocalChange(workspacePath) : {};
   const changeId = local.changeId ?? local.lastChangeId ?? null;
-  const entry = readWorkspaceRegistry().find(
+  const registry = readWorkspaceRegistry();
+  let entry = registry.find(
     (candidate) =>
       candidate.path === workspacePath ||
       (Boolean(name) && candidate.name === name && candidate.repo === repo)
   );
+  if (!entry && typeof workspacePath === 'string') {
+    // Fall back to canonical paths so symlinks (e.g. macOS /var vs /private/var)
+    // still match when a caller passes a non-canonical workspace or repo path.
+    const canonicalPath = realpath(workspacePath);
+    const canonicalRepo = typeof repo === 'string' && repo ? realpath(repo) : null;
+    entry = registry.find(
+      (candidate) =>
+        (typeof candidate.path === 'string' && realpath(candidate.path) === canonicalPath) ||
+        (Boolean(name) &&
+          candidate.name === name &&
+          Boolean(canonicalRepo) &&
+          typeof candidate.repo === 'string' &&
+          realpath(candidate.repo) === canonicalRepo)
+    );
+  }
   let server = null;
   if (entry?.name) {
     const slots = readWorkspaceServerSlots();

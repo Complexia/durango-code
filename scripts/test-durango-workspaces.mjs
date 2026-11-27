@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -134,6 +134,65 @@ try {
     null,
     'empty slots reports null'
   );
+
+  // Process-group liveness (`childPid`): alive child process group reports
+  // running even when the wrapper `pid` is dead; killing the group clears it.
+  const detachedChild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  try {
+    await fs.writeFile(
+      slotsFile,
+      JSON.stringify({
+        version: 1,
+        running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: 99999999, childPid: detachedChild.pid, startedAt: new Date().toISOString() }],
+        queue: [],
+      })
+    );
+    assert.equal(
+      (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
+      'running',
+      'alive childPid process group reports running even if wrapper pid exited'
+    );
+  } finally {
+    try {
+      process.kill(-detachedChild.pid, 'SIGKILL');
+    } catch {
+      detachedChild.kill('SIGKILL');
+    }
+    await new Promise((resolve) => detachedChild.once('close', resolve));
+  }
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
+    null,
+    'once childPid process group exits, server status clears without rewriting slots file'
+  );
+  await fs.writeFile(slotsFile, JSON.stringify({ version: 1, running: [], queue: [] }));
+
+  // Direct registry lookup (`findDurangoWorkspace`) + symlink path matching + cache immutability.
+  const found = await workspaces.findDurangoWorkspace({ projectPath: path.join(repo, 'app'), name: workspace.name });
+  assert.equal(found.ok, true);
+  assert.equal(found.workspace?.path, workspace.path);
+
+  const symlinkPath = path.join(testRoot, 'ws-symlink');
+  await fs.symlink(workspace.path, symlinkPath);
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: symlinkPath })).registered,
+    true,
+    'durangoWorkspaceStatus resolves symlinked workspace paths canonically'
+  );
+  await fs.rm(symlinkPath, { force: true });
+
+  const regCopy = workspaces.readWorkspaceRegistry();
+  const initialCount = regCopy.length;
+  regCopy.pop();
+  assert.equal(
+    workspaces.readWorkspaceRegistry().length,
+    initialCount,
+    'mutating readWorkspaceRegistry() result does not corrupt internal cache'
+  );
+
   await fs.mkdir(path.join(workspace.path, '.durango'), { recursive: true });
   await fs.writeFile(
     path.join(workspace.path, '.durango', 'change.json'),

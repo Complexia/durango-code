@@ -117,6 +117,7 @@
     "test:approval-card": "bun scripts/test-approval-card.ts",
     "test:grok-access-mode": "electron scripts/test-grok-access-mode.mjs",
     "test:provider-updates": "node --no-warnings scripts/test-provider-updates.mjs",
+    "test:shell-env-and-focus": "node --no-warnings --experimental-strip-types scripts/test-shell-env-and-focus.mjs",
     "test:linux-package-install": "node --no-warnings scripts/test-linux-package-install.mjs",
     "test:app-updater": "electron scripts/test-app-updater.mjs",
     "test:agent-models": "node --no-warnings scripts/test-agent-models.mjs",

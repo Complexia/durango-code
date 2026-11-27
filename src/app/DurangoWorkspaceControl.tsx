@@ -94,14 +94,16 @@ const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ wo
       if (isDocumentVisible()) void refresh(false);
     }, STATUS_POLL_MS);
     const onVisibilityChange = () => {
-      if (isDocumentVisible() && visibilityCooldownRef.current.tryRun()) {
-        void refresh(false);
-      }
+      if (!isDocumentVisible()) return;
+      visibilityCooldownRef.current.trigger(() => {
+        if (isDocumentVisible()) void refresh(false);
+      });
     };
     const onFocus = () => {
-      if (isDocumentVisible() && focusCooldownRef.current.tryRun()) {
-        void refresh(false);
-      }
+      if (!isDocumentVisible()) return;
+      focusCooldownRef.current.trigger(() => {
+        if (isDocumentVisible()) void refresh(false);
+      });
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('focus', onFocus);
@@ -111,6 +113,8 @@ const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ wo
       void refresh(false);
     });
     return () => {
+      focusCooldownRef.current.cancel();
+      visibilityCooldownRef.current.cancel();
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('focus', onFocus);

@@ -1,35 +1,101 @@
 // Shared focus/visibility cooldown helper and shallow-value comparators used to
 // keep window.focus storms from re-running git, cloud, MCP, bot, and workspace
-// refreshes back-to-back.
+// refreshes back-to-back without leaving state stale after quick round-trips.
 
 export const DEFAULT_FOCUS_COOLDOWN_MS = 5_000;
 
 export type FocusCooldown = {
-  /** Record that a refresh ran at `at` (defaults to `now()`). */
+  /** Record that a refresh ran at `at` (defaults to `now()`), cancelling any queued trailing retry. */
   mark: (at?: number) => void;
-  /** Clear the recorded timestamp (e.g. when the target project changes). */
+  /** Clear the recorded timestamp and cancel any queued trailing retry. */
   reset: () => void;
+  /** Cancel any queued trailing retry timer (call on effect cleanup). */
+  cancel: () => void;
   /** True when at least `cooldownMs` has passed since the last run; marks now on true. */
   tryRun: (at?: number) => boolean;
+  /**
+   * Leading + trailing throttle: runs `fn` immediately when cooldown has
+   * elapsed and `isBusy?.()` is false; otherwise coalesces into one trailing
+   * call once the cooldown finishes (re-checking `isBusy?.()`).
+   */
+  trigger: (fn: () => void, options?: { isBusy?: () => boolean }) => boolean;
 };
+
+type TimerHandle = ReturnType<typeof setTimeout>;
 
 export function createFocusCooldown(
   cooldownMs = DEFAULT_FOCUS_COOLDOWN_MS,
-  now: () => number = Date.now
+  now: () => number = Date.now,
+  timers: {
+    setTimer?: (fn: () => void, ms: number) => TimerHandle;
+    clearTimer?: (handle: TimerHandle) => void;
+  } = {}
 ): FocusCooldown {
+  const setTimer = timers.setTimer ?? ((fn, ms) => globalThis.setTimeout(fn, ms));
+  const clearTimer = timers.clearTimer ?? ((handle) => globalThis.clearTimeout(handle));
   let lastRunAt = -Infinity;
+  let timer: TimerHandle | null = null;
+  let pendingFn: (() => void) | null = null;
+  let pendingIsBusy: (() => boolean) | undefined;
+
+  const cancel = () => {
+    if (timer !== null) {
+      clearTimer(timer);
+      timer = null;
+    }
+    pendingFn = null;
+    pendingIsBusy = undefined;
+  };
+
+  const trigger = (fn: () => void, options?: { isBusy?: () => boolean }): boolean => {
+    const current = now();
+    const elapsed = current - lastRunAt;
+    if (elapsed >= cooldownMs && !options?.isBusy?.()) {
+      cancel();
+      lastRunAt = current;
+      fn();
+      return true;
+    }
+    pendingFn = fn;
+    pendingIsBusy = options?.isBusy;
+    if (timer === null) {
+      const remaining =
+        elapsed >= cooldownMs ? Math.min(250, Math.max(1, cooldownMs)) : Math.max(1, cooldownMs - elapsed);
+      timer = setTimer(() => {
+        timer = null;
+        const nextFn = pendingFn;
+        const nextIsBusy = pendingIsBusy;
+        pendingFn = null;
+        pendingIsBusy = undefined;
+        if (!nextFn) return;
+        if (nextIsBusy?.()) {
+          trigger(nextFn, { isBusy: nextIsBusy });
+          return;
+        }
+        lastRunAt = now();
+        nextFn();
+      }, remaining);
+    }
+    return false;
+  };
+
   return {
     mark(at = now()) {
+      cancel();
       lastRunAt = at;
     },
     reset() {
+      cancel();
       lastRunAt = -Infinity;
     },
+    cancel,
     tryRun(at = now()): boolean {
       if (at - lastRunAt < cooldownMs) return false;
+      cancel();
       lastRunAt = at;
       return true;
     },
+    trigger,
   };
 }
 

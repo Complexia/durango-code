@@ -57,10 +57,13 @@ export const FxConnectionsPanel = ({
     // fx sign-in finishes in the browser; pick up the new login when the
     // user comes back to the window.
     const onFocus = () => {
-      if (focusCooldownRef.current.tryRun()) void refresh();
+      focusCooldownRef.current.trigger(() => {
+        void refresh();
+      });
     };
     window.addEventListener('focus', onFocus);
     return () => {
+      focusCooldownRef.current.cancel();
       unsubscribe?.();
       window.removeEventListener('focus', onFocus);
     };

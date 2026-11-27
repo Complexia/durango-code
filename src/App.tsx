@@ -520,6 +520,7 @@ const CLOUD_DEPLOY_POLL_INTERVAL_MS = 4000;
 // Match the packaged app update scheduler so both update banners stay fresh.
 const PROVIDER_UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const PROVIDER_UPDATE_BOOT_DELAY_MS = 15_000;
+const CLOUD_FOCUS_COOLDOWN_MS = 15_000;
 const CLOUD_DEPLOY_POLL_TIMEOUT_MS = 20 * 60 * 1000;
 
 const cloudAppHost = (url: string) => {
@@ -1652,13 +1653,16 @@ const App: React.FC = () => {
       }
     };
     const onFocus = () => {
-      if (focusCooldown.tryRun()) void load();
+      focusCooldown.trigger(() => {
+        if (active) void load();
+      });
     };
     void load();
     window.addEventListener(ORION_MCPS_CHANGED_EVENT, load);
     window.addEventListener('focus', onFocus);
     return () => {
       active = false;
+      focusCooldown.cancel();
       window.removeEventListener(ORION_MCPS_CHANGED_EVENT, load);
       window.removeEventListener('focus', onFocus);
     };
@@ -1794,14 +1798,15 @@ const App: React.FC = () => {
     };
   }, [threadReaderProviderId]);
   const canReferenceThreads = hasThreadReaderSupport(threadReaderProviderId, threadReaderSupport);
+  const enabledProviderIdsKey = agentProviders
+    .map((provider) => provider.id)
+    // 'orion' has no providerSettings entry (it's a pseudo-provider, not a
+    // CLI); it is always enabled.
+    .filter((id) => id === 'orion' || normalizedProviderSettings[id as ProviderId]?.enabled !== false)
+    .join(',');
   const enabledProviderIds = useMemo(
-    () =>
-      agentProviders
-        .map((provider) => provider.id)
-        // 'orion' has no providerSettings entry (it's a pseudo-provider, not a
-        // CLI); it is always enabled.
-        .filter((id) => id === 'orion' || normalizedProviderSettings[id as ProviderId]?.enabled !== false),
-    [normalizedProviderSettings]
+    () => (enabledProviderIdsKey ? enabledProviderIdsKey.split(',') : []),
+    [enabledProviderIdsKey]
   );
   const enabledProviderIdSet = useMemo(() => new Set(enabledProviderIds), [enabledProviderIds]);
   const visibleAgentModels = useMemo(() => {
@@ -2806,7 +2811,10 @@ const App: React.FC = () => {
       void releaseMissingDurangoWorkspaces();
     };
     const onResume = () => {
-      if (isVisible() && focusCooldown.tryRun()) void releaseMissingDurangoWorkspaces();
+      if (!isVisible()) return;
+      focusCooldown.trigger(() => {
+        if (isVisible()) void releaseMissingDurangoWorkspaces();
+      });
     };
     check();
     const timer = window.setInterval(() => {
@@ -2815,6 +2823,7 @@ const App: React.FC = () => {
     window.addEventListener('focus', onResume);
     document.addEventListener('visibilitychange', onResume);
     return () => {
+      focusCooldown.cancel();
       window.clearInterval(timer);
       window.removeEventListener('focus', onResume);
       document.removeEventListener('visibilitychange', onResume);
@@ -3031,16 +3040,26 @@ const App: React.FC = () => {
   }, []);
 
   const providerUpdatesCheckedOnceRef = useRef(false);
+  const providerUpdatesCheckingRef = useRef(false);
+  const providerUpdatesSeqRef = useRef(0);
   const refreshProviderUpdates = useCallback(async () => {
     if (!window.orion?.checkProviderUpdates) return;
-    providerUpdatesCheckedOnceRef.current = true;
+    const seq = ++providerUpdatesSeqRef.current;
+    providerUpdatesCheckingRef.current = true;
     setProviderUpdatesChecking(true);
     try {
-      setProviderUpdateState(await window.orion.checkProviderUpdates({ enabledProviderIds }));
+      const nextState = await window.orion.checkProviderUpdates({ enabledProviderIds });
+      if (seq !== providerUpdatesSeqRef.current) return;
+      providerUpdatesCheckedOnceRef.current = true;
+      setProviderUpdateState(nextState);
     } catch {
+      if (seq !== providerUpdatesSeqRef.current) return;
       setProviderUpdateState(null);
     } finally {
-      setProviderUpdatesChecking(false);
+      if (seq === providerUpdatesSeqRef.current) {
+        providerUpdatesCheckingRef.current = false;
+        setProviderUpdatesChecking(false);
+      }
     }
   }, [enabledProviderIds]);
 
@@ -3071,7 +3090,7 @@ const App: React.FC = () => {
     if (!window.orion?.onProviderAuthenticated) return undefined;
     return window.orion.onProviderAuthenticated(() => {
       void refreshAgentModels(true);
-      void refreshProviderUpdates();
+      if (useOrionStore.persist.hasHydrated()) void refreshProviderUpdates();
     });
   }, [refreshAgentModels, refreshProviderUpdates]);
 
@@ -3256,20 +3275,23 @@ const App: React.FC = () => {
   // crowded). Subsequent changes to enabled providers refresh immediately.
   useEffect(() => {
     if (!storeHydrated) return undefined;
-    if (providerUpdatesCheckedOnceRef.current) {
+    if (providerUpdatesCheckedOnceRef.current || providerUpdatesCheckingRef.current) {
       void refreshProviderUpdates();
       return undefined;
     }
     const timer = window.setTimeout(() => {
-      if (!providerUpdatesCheckedOnceRef.current) void refreshProviderUpdates();
+      if (!providerUpdatesCheckedOnceRef.current && !providerUpdatesCheckingRef.current) {
+        void refreshProviderUpdates();
+      }
     }, PROVIDER_UPDATE_BOOT_DELAY_MS);
     return () => {
       window.clearTimeout(timer);
     };
   }, [storeHydrated, refreshProviderUpdates]);
-  // Opening Settings → Providers before the boot delay fires checks right away.
+  // Opening Settings → Providers before the boot delay fires (or after an
+  // initial failure) checks right away.
   useEffect(() => {
-    if (!storeHydrated || providerUpdatesCheckedOnceRef.current) return;
+    if (!storeHydrated || providerUpdatesCheckedOnceRef.current || providerUpdatesCheckingRef.current) return;
     if (settingsOpen && settingsTab === 'providers') void refreshProviderUpdates();
   }, [storeHydrated, settingsOpen, settingsTab, refreshProviderUpdates]);
   // Drafts saved by the last session list their threads again, like ones
@@ -3639,34 +3661,47 @@ const App: React.FC = () => {
   const gitRefreshSeqRef = useRef(0);
   const gitRefreshInFlightRef = useRef(false);
   const gitFocusCooldownRef = useRef(createFocusCooldown());
-  const refreshGitState = useCallback(async () => {
+  const lastGitStateRef = useRef<GitRepoState | null>(null);
+  const refreshGitState = useCallback(async (): Promise<boolean> => {
     const projectPath = activeWorkingDir;
     const seq = ++gitRefreshSeqRef.current;
     gitFocusCooldownRef.current.mark();
     if (!projectPath || !window.orion?.getGitState) {
       gitRefreshInFlightRef.current = false;
+      const changed = lastGitStateRef.current !== null;
+      lastGitStateRef.current = null;
       setGitState(null);
       setGitLoading(false);
-      return;
+      return changed;
     }
 
     gitRefreshInFlightRef.current = true;
     setGitLoading(true);
     try {
       const state = await window.orion.getGitState(projectPath);
-      if (seq !== gitRefreshSeqRef.current) return;
+      if (seq !== gitRefreshSeqRef.current) return false;
       // Preserve reference equality when nothing changed so effects keyed on
       // `gitState` (notably `refreshCloudState`) do not cascade on every focus.
-      setGitState((previous) => (isSameGitState(previous, state) ? previous : state));
+      const changed = !isSameGitState(lastGitStateRef.current, state);
+      if (changed) {
+        lastGitStateRef.current = state;
+        setGitState(state);
+      }
+      return changed;
     } catch (error) {
-      if (seq !== gitRefreshSeqRef.current) return;
+      if (seq !== gitRefreshSeqRef.current) return false;
       const errorState = {
         ok: false,
         branches: [],
         hasUncommittedChanges: false,
         error: error instanceof Error ? error.message : 'Unable to read git state',
       };
-      setGitState((previous) => (isSameGitState(previous, errorState) ? previous : errorState));
+      const changed = !isSameGitState(lastGitStateRef.current, errorState);
+      if (changed) {
+        lastGitStateRef.current = errorState;
+        setGitState(errorState);
+      }
+      return changed;
     } finally {
       if (seq === gitRefreshSeqRef.current) {
         gitRefreshInFlightRef.current = false;
@@ -3677,43 +3712,39 @@ const App: React.FC = () => {
 
   useEffect(() => {
     gitFocusCooldownRef.current.reset();
+    lastGitStateRef.current = null;
     void refreshGitState();
-  }, [refreshGitState]);
-
-  // A checkout in an outside terminal doesn't notify the app; re-read when
-  // the window regains focus (with a cooldown) so the pill matches HEAD
-  // without spawning a git burst on rapid focus flips.
-  useEffect(() => {
-    const onFocus = () => {
-      if (gitRefreshInFlightRef.current || !gitFocusCooldownRef.current.tryRun()) return;
-      void refreshGitState();
-    };
-    window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
   }, [refreshGitState]);
 
   // An agent can switch branches (or leave its workspace) during a turn;
   // re-read when the turn ends so the pill shows where the checkout is now.
   const selectedThreadRunning = selectedThread?.status === 'running';
-  const wasSelectedThreadRunningRef = useRef(selectedThreadRunning);
+  const prevRunningStateRef = useRef({ running: selectedThreadRunning, dir: activeWorkingDir });
   useEffect(() => {
-    const wasRunning = wasSelectedThreadRunningRef.current;
-    wasSelectedThreadRunningRef.current = selectedThreadRunning;
-    if (wasRunning && !selectedThreadRunning) void refreshGitState();
-  }, [refreshGitState, selectedThreadRunning]);
+    const prev = prevRunningStateRef.current;
+    prevRunningStateRef.current = { running: selectedThreadRunning, dir: activeWorkingDir };
+    if (prev.running && !selectedThreadRunning && prev.dir === activeWorkingDir) {
+      void refreshGitState();
+    }
+  }, [activeWorkingDir, refreshGitState, selectedThreadRunning]);
 
   // Same stale-response race as refreshGitState: only the latest request may
   // write, so a slow read for the previous project can't repaint the cloud
   // pill after a project switch.
   const cloudRefreshSeqRef = useRef(0);
+  const cloudRefreshInFlightRef = useRef(false);
+  const cloudFocusCooldownRef = useRef(createFocusCooldown(CLOUD_FOCUS_COOLDOWN_MS));
   const refreshCloudState = useCallback(async () => {
     const projectPath = activeWorkingDir;
     const seq = ++cloudRefreshSeqRef.current;
+    cloudFocusCooldownRef.current.mark();
     if (!projectPath || !window.orion?.getCloudState) {
+      cloudRefreshInFlightRef.current = false;
       setCloudState(null);
       return;
     }
 
+    cloudRefreshInFlightRef.current = true;
     try {
       const state = await window.orion.getCloudState(projectPath);
       if (seq !== cloudRefreshSeqRef.current) return;
@@ -3724,7 +3755,15 @@ const App: React.FC = () => {
         ok: false,
         error: error instanceof Error ? error.message : 'Unable to read Durango Cloud state',
       });
+    } finally {
+      if (seq === cloudRefreshSeqRef.current) {
+        cloudRefreshInFlightRef.current = false;
+      }
     }
+  }, [activeWorkingDir]);
+
+  useEffect(() => {
+    cloudFocusCooldownRef.current.reset();
   }, [activeWorkingDir]);
 
   // Cloud state depends on both the account session and local git state
@@ -3732,6 +3771,37 @@ const App: React.FC = () => {
   useEffect(() => {
     void refreshCloudState();
   }, [refreshCloudState, accountState.authenticated, gitState]);
+
+  // A checkout or remote push outside the app doesn't notify us; re-read git
+  // state on focus (leading + trailing 5s cooldown so quick terminal round-trips
+  // are never dropped). If git summary fields didn't change, still refresh
+  // cloud state on a 15s cooldown so remote pushes/deploys and local commits
+  // without an upstream don't go stale.
+  useEffect(() => {
+    const isVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
+    const onFocus = () => {
+      gitFocusCooldownRef.current.trigger(
+        () => {
+          void refreshGitState().then((changed) => {
+            if (changed || !isVisible()) return;
+            cloudFocusCooldownRef.current.trigger(
+              () => {
+                if (isVisible()) void refreshCloudState();
+              },
+              { isBusy: () => cloudRefreshInFlightRef.current }
+            );
+          });
+        },
+        { isBusy: () => gitRefreshInFlightRef.current }
+      );
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      gitFocusCooldownRef.current.cancel();
+      cloudFocusCooldownRef.current.cancel();
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [refreshCloudState, refreshGitState]);
 
   // The Orion Cloud app for the active project: whatever we've learned since
   // the last cloud-state refresh wins, because a deploy queued a second ago is
