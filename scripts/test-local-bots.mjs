@@ -547,6 +547,7 @@ test('models: bots on the old default move to Opus, chosen ones stay; switching 
   runner.lanes[1].finish({ text: 'Yes.' });
   await engine.idle();
   await assert.rejects(engine.setModel('lbolddefault', 'gpt-9'), /Pick one of the bot models/);
+  await assert.rejects(engine.setModel('lbolddefault', 'claude-code-cli'), /Pick one of the bot models/);
 
   // Chosen survives a restart (it doesn't fall back to the default), and goes to Durango as a choice.
   const withEffort = await engine.setModel('lbolddefault', null, 'xhigh');

@@ -195,6 +195,8 @@ export const BotModelMenu = ({
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const modelRef = useRef(model);
+  modelRef.current = model;
 
   // Merge catalog + choices once so every lookup (labels, efforts, tabs, search) shares one canonical list.
   const allChoices = useMemo<BotModelChoice[]>(() => {
@@ -218,6 +220,8 @@ export const BotModelMenu = ({
     const rec = allChoices.filter((choice) => choice.recommended);
     return rec.length > 0 ? rec : [...choices];
   }, [allChoices, choices]);
+  const recommendedChoicesRef = useRef(recommendedChoices);
+  recommendedChoicesRef.current = recommendedChoices;
 
   const counts = useMemo(() => {
     let localCount = 0;
@@ -247,14 +251,16 @@ export const BotModelMenu = ({
       }),
     [allChoices, recommendedChoices, model, tab, query, local, showLegacy]
   );
+  const filteredItemsRef = useRef(filtered.items);
+  filteredItemsRef.current = filtered.items;
 
-  // Reset search/tab/focus cleanly whenever the menu opens.
+  // Reset search/tab/focus ONLY when the menu opens (never on background 5s bot-list polls).
   useEffect(() => {
     if (!open) return undefined;
     setQuery('');
     setShowLegacy(false);
     setTab('recommended');
-    const selectedIdx = recommendedChoices.findIndex((item) => item.id === model);
+    const selectedIdx = recommendedChoicesRef.current.findIndex((item) => item.id === modelRef.current);
     setActiveIndex(selectedIdx >= 0 ? selectedIdx : 0);
     const frame = window.requestAnimationFrame(() => searchInputRef.current?.focus());
     const onPointerDown = (event: MouseEvent) => {
@@ -270,12 +276,13 @@ export const BotModelMenu = ({
       document.removeEventListener('mousedown', onPointerDown);
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [open, model, recommendedChoices]);
+  }, [open]);
 
-  // Keep activeIndex in bounds whenever the filtered list changes.
+  // Reset highlighted index when tab or query changes (not on background array-identity polls).
   useEffect(() => {
     if (!open) return;
-    if (filtered.items.length === 0) {
+    const items = filteredItemsRef.current;
+    if (items.length === 0) {
       setActiveIndex(0);
       return;
     }
@@ -284,9 +291,15 @@ export const BotModelMenu = ({
       if (listRef.current) listRef.current.scrollTop = 0;
       return;
     }
-    const selectedIdx = filtered.items.findIndex((item) => item.id === model);
+    const selectedIdx = items.findIndex((item) => item.id === modelRef.current);
     setActiveIndex(selectedIdx >= 0 ? selectedIdx : 0);
-  }, [open, tab, query, filtered.items, model]);
+  }, [open, tab, query]);
+
+  // Clamp activeIndex if the visible item count shrinks underneath us.
+  useEffect(() => {
+    if (!open) return;
+    setActiveIndex((current) => (filtered.items.length === 0 ? 0 : Math.min(current, filtered.items.length - 1)));
+  }, [open, filtered.items.length]);
 
   // Scroll the highlighted row into view within the list container (never scrolls the window).
   useEffect(() => {
@@ -367,9 +380,15 @@ export const BotModelMenu = ({
         { id: 'cloud', label: 'Cloud', count: counts.cloud },
       ];
 
-  const isSearchingFromRecommended = Boolean(query.trim()) && tab === 'recommended';
   const showGroupHeaders = !query.trim() && (tab === 'all' || tab === 'cloud');
   const groupLabelOf = (choice: BotModelChoice): string => (choice.recommended ? 'Recommended' : providerLabelOf(choice));
+
+  const handleQueryChange = (next: string) => {
+    setQuery(next);
+    if (next.trim() && tab === 'recommended') {
+      setTab('all');
+    }
+  };
 
   return (
     <div className="relative shrink-0 [-webkit-app-region:no-drag]" ref={anchorRef}>
@@ -407,7 +426,7 @@ export const BotModelMenu = ({
                 ref={searchInputRef}
                 type="text"
                 value={query}
-                onChange={(event) => setQuery(event.target.value)}
+                onChange={(event) => handleQueryChange(event.target.value)}
                 onKeyDown={onSearchKeyDown}
                 placeholder={local ? 'Search local Claude models…' : 'Search all models & providers…'}
                 aria-label="Search bot models"
@@ -437,7 +456,7 @@ export const BotModelMenu = ({
               className="mt-2 flex items-center gap-0.5 rounded-lg bg-white/[0.04] p-0.5"
             >
               {tabs.map((item) => {
-                const active = isSearchingFromRecommended ? item.id === 'all' : tab === item.id;
+                const active = tab === item.id;
                 return (
                   <button
                     key={item.id}
@@ -445,6 +464,7 @@ export const BotModelMenu = ({
                     role="tab"
                     aria-selected={active}
                     onClick={() => {
+                      if (item.id === 'recommended' && query.trim()) setQuery('');
                       setTab(item.id);
                       setShowLegacy(false);
                       searchInputRef.current?.focus();

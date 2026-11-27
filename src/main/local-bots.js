@@ -200,6 +200,7 @@ export const durangoModelForLocalBot = (model) =>
 /** A Claude Code model id from what a bot asked for ("anthropic/claude-opus-5.5" works too), or null. */
 const claudeModelFrom = (value) => {
   const raw = oneLine(value).toLowerCase().replace(/^anthropic\//, '').replace(/\./g, '-');
+  if (raw === 'claude-code-cli') return null;
   return /^claude-[a-z0-9-]{2,60}(\[1m\])?$/.test(raw) ? raw : null;
 };
 

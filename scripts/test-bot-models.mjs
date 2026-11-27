@@ -16,7 +16,8 @@ const EXTRA_CLOUD = [
   { id: 'openai/gpt-6.2-astra', label: 'GPT-6.2 Astra', note: 'OpenAI', provider: 'OpenAI', lab: 'openai', claude: false, recommended: false },
   { id: 'x-ai/grok-4.7', label: 'Grok 4.7', note: 'SpaceXAI', provider: 'SpaceXAI', lab: 'xai', claude: false, recommended: false },
   { id: 'google/gemini-4-argon', label: 'Gemini 4 Argon', note: 'Google', provider: 'Google', lab: 'google', claude: false, recommended: false, efforts: ['low', 'medium', 'high'], defaultEffort: 'medium' },
-  { id: 'anthropic/claude-opus-5.5-fast', label: 'Claude Opus 5.5 (Fast)', note: 'Anthropic', provider: 'Anthropic', lab: 'anthropic', claude: true, recommended: false },
+  { id: 'anthropic/claude-opus-5.5-fast', label: 'Claude Opus 5.5 (Fast)', note: 'Anthropic', provider: 'Anthropic', lab: 'anthropic', claude: false, recommended: false },
+  { id: 'anthropic/claude-opus-4.8', label: 'Claude Opus 4.8', note: 'Anthropic', provider: 'Anthropic', lab: 'anthropic', claude: false, recommended: false, legacy: true },
   { id: 'anthropic/claude-opus-5', label: 'Claude Opus 5', note: 'Anthropic', provider: 'Anthropic', lab: 'anthropic', claude: true, recommended: false, legacy: true },
   { id: 'deepseek/deepseek-v4-pro-0813', label: 'DeepSeek V4 Pro', note: 'DeepSeek', provider: 'DeepSeek', lab: 'deepseek', claude: false, recommended: false },
   { id: 'openai/gpt-4o-mini', label: 'GPT-4o mini', note: 'OpenAI', provider: 'OpenAI', lab: 'openai', claude: false, recommended: false, legacy: true },
@@ -51,6 +52,7 @@ assert.deepEqual(
 assert.equal(isLocalBotModelChoice(merged.find((m) => m.id === 'google/gemini-4-neon'), false), false);
 assert.equal(isLocalBotModelChoice(merged.find((m) => m.id === 'openai/gpt-6.1-sol'), false), false);
 assert.equal(isLocalBotModelChoice(merged.find((m) => m.id === 'anthropic/claude-opus-5.5-fast'), false), false);
+assert.equal(isLocalBotModelChoice(merged.find((m) => m.id === 'anthropic/claude-opus-4.8'), false), false);
 
 // 2. Filtering: Recommended shows exact 7; searching from Recommended searches across All providers (including legacy).
 const rec = filterBotModelChoices({
@@ -100,7 +102,7 @@ const allNoLegacy = filterBotModelChoices({
   localMode: false,
   showLegacy: false,
 });
-assert.equal(allNoLegacy.hiddenLegacyCount, 2);
+assert.equal(allNoLegacy.hiddenLegacyCount, 3);
 assert.equal(allNoLegacy.items.some((m) => m.id === 'openai/gpt-4o-mini'), false);
 
 const allWithLegacySelected = filterBotModelChoices({
