@@ -1,3 +1,4 @@
+import { appendFileSync, readFileSync } from 'node:fs';
 import { DEFAULT_PACKAGED_WEB_URL, isSameWebOrigin } from './web-origin.js';
 
 // Durango (durango.sh) access for the desktop: a scoped `dgo_` API key minted
@@ -365,17 +366,22 @@ const normalizeConnector = (connector, baseUrl) => {
   };
 };
 
-/** The models a bot can be set to (GET /api/v1/bots modelChoices), or null when Durango sent none. */
-const normalizeBotModelChoices = (value) => {
+/** The models a bot can be set to (GET /api/v1/bots modelChoices / modelCatalog), or null when Durango sent none. */
+const normalizeBotModelChoices = (value, maxCount = 30) => {
   if (!Array.isArray(value)) return null;
   const choices = value
     .filter((choice) => choice && typeof choice.id === 'string' && choice.id && typeof choice.label === 'string')
-    .slice(0, 30)
+    .slice(0, maxCount)
     .map((choice) => ({
       id: choice.id,
       label: choice.label,
       note: typeof choice.note === 'string' ? choice.note : '',
       claude: choice.claude === true,
+      ...(typeof choice.provider === 'string' && choice.provider ? { provider: choice.provider } : {}),
+      ...(typeof choice.lab === 'string' && choice.lab ? { lab: choice.lab } : {}),
+      ...(typeof choice.recommended === 'boolean' ? { recommended: choice.recommended } : {}),
+      ...(choice.legacy === true ? { legacy: true } : {}),
+      ...(typeof choice.local === 'boolean' ? { local: choice.local } : {}),
       ...(Array.isArray(choice.efforts)
         ? { efforts: choice.efforts.filter((effort) => typeof effort === 'string' && effort).slice(0, 10) }
         : {}),
@@ -454,6 +460,8 @@ export const normalizeBotLane = (lane) => {
     replyMessageId: str(lane.replyMessageId),
     /** Claude Code model id ("claude-opus-5-5"); null = Claude Code's default. */
     model: str(lane.model).trim() || null,
+    /** The Durango model id the reply runs on ("openai/gpt-6.1-sol"): a non-Claude one runs on this machine's harness for it. */
+    modelId: str(lane.modelId).trim() || null,
     /** Reasoning effort for Claude Code ("low" … "max"); null = CLI default. */
     reasoningEffort: str(lane.reasoningEffort).trim() || null,
     /** Appended to Claude Code's system prompt. */
@@ -859,12 +867,22 @@ export const createDurangoClient = ({
       const data = await request('POST', `/code/bots/tasks/${encodeURIComponent(str(taskId))}/notice`, { body });
       return { ok: data.ok === true, ...(data.stale === true ? { stale: true } : {}) };
     },
+    /** Outcome of a person- or Ship-button-started turn in a bot-started thread → `{ ok }`. */
+    async reportBotThreadTurn(body = {}) {
+      const data = await request('POST', '/code/bots/threads/report', { body });
+      return { ok: data.ok === true };
+    },
+    /** Notice while a person- or Ship-button-started turn in a bot-started thread needs the person or looks stuck. */
+    async noticeBotThreadTurn(body = {}) {
+      const data = await request('POST', '/code/bots/threads/notice', { body });
+      return { ok: data.ok === true, ...(data.stale === true ? { stale: true } : {}) };
+    },
     // --- Bots (Sidebar v3): the person's Durango bots and their threads ---------
     /** Whether the connected Durango server supports non-blocking pending bot attachments (null before listBots). */
     supportsPendingBotAttachments() {
       return pendingBotAttachmentsSupported;
     },
-    /** → `{ allowed, bots, projectOrder, modelChoices, pendingAttachments }` (the primary first; modelChoices: null from an older Durango). */
+    /** → `{ allowed, bots, projectOrder, modelChoices, modelCatalog, pendingAttachments }` (the primary first; modelChoices: null from an older Durango). */
     async listBots() {
       const data = await request('GET', '/bots');
       pendingBotAttachmentsSupported = data.pendingAttachments === true;
@@ -873,6 +891,7 @@ export const createDurangoClient = ({
         bots: Array.isArray(data.bots) ? data.bots : [],
         projectOrder: Array.isArray(data.projectOrder) ? data.projectOrder.filter((key) => typeof key === 'string') : [],
         modelChoices: normalizeBotModelChoices(data.modelChoices),
+        modelCatalog: normalizeBotModelChoices(data.modelCatalog, 600),
         pendingAttachments: pendingBotAttachmentsSupported,
       };
     },
@@ -1338,8 +1357,34 @@ const mockTask = (id, columnId, title, description, extra = {}) => ({
 
 const MOCK_THREAD_COLUMN = { running: 'col_progress', finished: 'col_review', done: 'col_done' };
 
-export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
+// DURANGO_MOCK_BOT_LANES=<file.json> (with DURANGO_MOCK=1): bot replies to
+// offer, one after the other, for checking machine replies end to end on real
+// harnesses without an account: `{ log: <file.jsonl>, bots?: [...], lanes:
+// [{ ...lane, inbox?: [[item…]…], beforeFinish?: [[item…]…], toolResults?: { name: result } }] }`.
+// Everything the app sends back (claims with its presence, progress, tool
+// calls, messages, finishes) is appended to `log`.
+const readMockBotLanes = (file) => {
+  if (!file) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (error) {
+    console.warn('[durango mock] bot lanes file unreadable:', error?.message ?? error);
+    return null;
+  }
+};
+
+export const createMockDurangoClient = ({ dispatchDelayMs = 4_000, botLanesFile = process.env.DURANGO_MOCK_BOT_LANES } = {}) => {
   const remembered = [];
+  const mockBots = readMockBotLanes(botLanesFile);
+  const mockLanes = Array.isArray(mockBots?.lanes) ? [...mockBots.lanes] : [];
+  const mockRunning = new Map(); // laneId -> its fixture (inbox to hand out)
+  const mockLog = (entry) => {
+    if (!mockBots?.log) return;
+    try {
+      appendFileSync(mockBots.log, `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`);
+    } catch {}
+  };
   const tasks = [
     mockTask('mock_task_1', 'col_todo', 'Fix the futuremail signup bug', 'Signup fails when the email has a plus sign.', {
       projectName: 'futuremail',
@@ -1451,23 +1496,42 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       console.log(`[durango mock] dispatch ${dispatchId} → ${report?.status}${report?.error ? ` (${report.error})` : ''}`);
       return { ok: true };
     },
-    // No mock bot replies: the claim just waits, like an idle Durango.
-    async claimBotLane({ waitMs = DISPATCH_CLAIM_WAIT_MS, signal } = {}) {
-      await waitFor(Math.min(clampInt(waitMs, 0, DISPATCH_CLAIM_WAIT_MS, DISPATCH_CLAIM_WAIT_MS), 25_000), signal);
+    // Without DURANGO_MOCK_BOT_LANES the claim just waits, like an idle Durango.
+    // With it, the next fixture lane is offered once the previous one finished.
+    async claimBotLane({ waitMs = DISPATCH_CLAIM_WAIT_MS, signal, ...body } = {}) {
+      mockLog({ kind: 'claim', machine: body.machine ?? null, features: body.features ?? [] });
+      if (mockLanes.length && mockRunning.size === 0) {
+        const fixture = mockLanes.shift();
+        const lane = normalizeBotLane(fixture);
+        if (lane) {
+          mockRunning.set(lane.laneId, { inbox: [...(fixture.inbox ?? [])], beforeFinish: [...(fixture.beforeFinish ?? [])], toolResults: fixture.toolResults ?? {} });
+          mockLog({ kind: 'offered', laneId: lane.laneId, modelId: lane.modelId });
+          return { lane };
+        }
+      }
+      await waitFor(Math.min(clampInt(waitMs, 0, DISPATCH_CLAIM_WAIT_MS, DISPATCH_CLAIM_WAIT_MS), mockRunning.size ? 2_000 : 25_000), signal);
       return { lane: null };
     },
-    async reportBotLaneProgress() {
-      return { stop: false, inbox: [] };
+    async reportBotLaneProgress({ laneId, text, activeTool, takeInbox, beforeFinish } = {}) {
+      const fixture = mockRunning.get(laneId);
+      const inbox = fixture && takeInbox ? ((beforeFinish ? fixture.beforeFinish : fixture.inbox).shift() ?? []) : [];
+      mockLog({ kind: 'progress', laneId, text, activeTool: activeTool ?? null, takeInbox: Boolean(takeInbox), beforeFinish: Boolean(beforeFinish), inbox });
+      return { stop: false, inbox: normalizeBotInbox(inbox) };
     },
-    async callBotLaneTool({ name } = {}) {
-      return { result: { ok: false, error: `Mock Durango has no bot tool ${str(name)}.` } };
+    async callBotLaneTool({ laneId, name, input, message } = {}) {
+      const result = mockRunning.get(laneId)?.toolResults?.[str(name)];
+      mockLog({ kind: 'tool', laneId, name, input, message: message ?? null, answered: result !== undefined });
+      return { result: result ?? { ok: false, error: `Mock Durango has no bot tool ${str(name)}.` } };
     },
     async sendBotLaneMessage({ laneId, ...body } = {}) {
       reports.push({ laneId, message: true, ...body });
+      mockLog({ kind: 'message', laneId, ...body });
       return { ok: true, stop: false };
     },
     async finishBotLane({ laneId, ...body } = {}) {
       reports.push({ laneId, ...body });
+      mockRunning.delete(laneId);
+      mockLog({ kind: 'finish', laneId, ...body });
       return { ok: true, stored: true };
     },
     async createBotLaneTask() {
@@ -1479,11 +1543,23 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     async noticeBotTask() {
       return { ok: false };
     },
+    async reportBotThreadTurn() {
+      return { ok: false };
+    },
+    async noticeBotThreadTurn() {
+      return { ok: false };
+    },
     async chatUrl(chatId) {
       return MOCK_CHATS.find((chat) => chat.id === chatId)?.url ?? `${DEFAULT_DURANGO_URL}/chats`;
     },
     async listBots() {
-      return { allowed: true, bots: [], projectOrder: [], modelChoices: null };
+      return {
+        allowed: true,
+        bots: Array.isArray(mockBots?.bots) ? mockBots.bots : [],
+        projectOrder: [],
+        modelChoices: mockBots?.modelChoices ?? null,
+        modelCatalog: mockBots?.modelCatalog ?? null,
+      };
     },
     async reorderBots({ projectOrder } = {}) {
       return { ok: true, ...(Array.isArray(projectOrder) ? { projectOrder } : {}) };
@@ -1515,8 +1591,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
     async botRefs() {
       return { changes: {}, threads: {} };
     },
-    async botThread() {
-      return { bot: null, messages: [], live: [], hasMore: false };
+    async botThread(botId) {
+      const bot = (Array.isArray(mockBots?.bots) ? mockBots.bots : []).find((item) => item?.id === botId) ?? null;
+      return { bot, messages: [], live: [], hasMore: false };
     },
     async createBot() {
       throw new DurangoError('api', 'Mock Durango cannot create bots.');

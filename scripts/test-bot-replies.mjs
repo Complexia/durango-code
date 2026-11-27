@@ -2843,6 +2843,96 @@ try {
     assert.equal(inbox[0].attachments?.length, 1);
     assert.equal(inbox[0].attachments[0].pendingId, pendingId);
   });
+
+  await test('stay_silent in Claude runner suppresses trailing boilerplate, keeps session, and wakes if a person writes before finish', async () => {
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-silent') });
+    const silentTool = { name: 'stay_silent', description: 'Stay silent', inputSchema: { type: 'object', properties: { reason: { type: 'string' } } } };
+    const updates = [];
+    const sdk = createFakeSdk(async function* ({ next, options, tools }) {
+      await next();
+      yield { ...init(), session_id: 'sess-silent-1' };
+      yield assistant('a1', [{ type: 'tool_use', id: 'tu_s1', name: 'mcp__durango_bot__stay_silent', input: { reason: 'Interim report' } }]);
+      await tools.stay_silent.handler({ reason: 'Interim report' });
+      const postHook = options.hooks.PostToolUse[0].hooks[0];
+      const hookOut = await postHook({ tool_name: 'mcp__durango_bot__stay_silent' });
+      assert.deepEqual(hookOut, { continue: false, stopReason: 'stay_silent' }, 'PostToolUse stops Claude right after stay_silent');
+      // Even if Claude Code emits a short post-tool acknowledgement, it must be suppressed.
+      yield { type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'text' } } };
+      yield { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Okay, staying silent.' } } };
+      yield assistant('a2', [{ type: 'text', text: 'Okay, staying silent.' }]);
+      yield { ...success(), session_id: 'sess-silent-1' };
+    });
+    const runLane = sdkRunner(sdk, { sessions });
+    const history = [row(1, 'user', 'Task A done', { label: 'Task: Worker A' })];
+    const outcome = await runLane(sessionLane(history, [1], { tools: [silentTool], replyMessageId: 'r_silent' }), {
+      update: (u) => updates.push(u),
+      takeInbox: async () => [],
+      callTool: async ({ name }) => ({ result: name === 'stay_silent' ? { ok: true, silent: true } : { ok: true } }),
+    });
+    assert.equal(outcome.silent, true);
+    assert.equal(outcome.silentReason, 'Interim report');
+    assert.equal(outcome.text, '');
+    assert.equal(updates.some((u) => u.text.includes('staying silent')), false, 'suppressed live boilerplate');
+    const stored = await sessions.begin('bot_1__claude-opus-5-5');
+    assert.equal(stored.state?.sessionId, 'sess-silent-1', 'kept session preserved across silent turn');
+    await sessions.end('bot_1__claude-opus-5-5', stored.state);
+
+    // If a person message arrives during beforeFinish after stay_silent, silent mode clears and the bot replies.
+    let beforeFinishCalls = 0;
+    const sdkWake = createFakeSdk(async function* ({ next, tools }) {
+      await next();
+      yield init();
+      yield assistant('a1', [{ type: 'tool_use', id: 'tu_s2', name: 'mcp__durango_bot__stay_silent', input: { reason: 'Routine quiet' } }]);
+      await tools.stay_silent.handler({ reason: 'Routine quiet' });
+      yield success();
+      const followUp = await next();
+      assert.ok(followUp, 'received pre-finish person message');
+      yield assistant('a2', [{ type: 'text', text: 'Hey! Here is the update.' }]);
+      yield success();
+    });
+    const woke = await sdkRunner(sdkWake)(makeLane({ tools: [silentTool] }), {
+      update: () => {},
+      takeInbox: async (opts) => {
+        if (!opts?.beforeFinish) return [];
+        beforeFinishCalls += 1;
+        return beforeFinishCalls === 1 ? [{ seq: 2, source: 'person', label: null, content: 'Quick check?' }] : [];
+      },
+      callTool: async () => ({ result: { ok: true, silent: true } }),
+    });
+    assert.equal(woke.silent, undefined);
+    assert.equal(woke.text, 'Hey! Here is the update.');
+  });
+
+  await test('worker handles stay_silent from any harness runner (Codex/Antigravity/Grok/Muse), suppresses post-tool text, and keeps errors/empty visible', async () => {
+    const client = createFakeClient({
+      claim: laneClaims([makeLane({ laneId: 'l_silent' }), makeLane({ laneId: 'l_empty' }), makeLane({ laneId: 'l_fail' })]),
+      tool: async ({ name }) => ({ result: name === 'stay_silent' ? { ok: true, silent: true } : { ok: true } }),
+    });
+    startWorker({
+      client,
+      runLane: async (lane, ctx) => {
+        if (lane.laneId === 'l_silent') {
+          await ctx.callTool({ name: 'stay_silent', input: { reason: 'Duplicate report' }, toolCallId: 'tc_1' });
+          // Simulate a harness (e.g. Antigravity/Codex/Grok/Muse) that still returns post-tool boilerplate text.
+          ctx.update({ text: 'Done, staying silent.' });
+          return { text: 'Done, staying silent.' };
+        }
+        if (lane.laneId === 'l_empty') {
+          return { text: '' };
+        }
+        await ctx.callTool({ name: 'stay_silent', input: { reason: 'Quiet' }, toolCallId: 'tc_2' });
+        return { text: '', failure: 'ACP stream failed' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 3, { label: 'three finishes' });
+    const byLane = new Map(client.calls.finish.map((item) => [item.laneId, item]));
+    assert.equal(byLane.get('l_silent').silent, true);
+    assert.equal(byLane.get('l_silent').silentReason, 'Duplicate report');
+    assert.equal(byLane.get('l_silent').text, '');
+    assert.equal(byLane.get('l_empty').silent, undefined, 'empty answer without stay_silent is never silent');
+    assert.equal(byLane.get('l_fail').silent, undefined, 'actual error after stay_silent is never silent');
+    assert.equal(byLane.get('l_fail').failure, 'ACP stream failed');
+  });
 } finally {
   await fs.rm(testRoot, { recursive: true, force: true });
 }

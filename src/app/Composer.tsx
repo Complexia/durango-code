@@ -320,14 +320,43 @@ export const Composer = ({
     setChatMention(null);
     chatMentionDismissRef.current = null;
     setSlashDismissedDraft(null);
+    atBottomRef.current = true;
   }, [draftKey]);
+
+  const [scrolling, setScrolling] = useState(false);
+  const scrollTimerRef = useRef<number | null>(null);
+  const atBottomRef = useRef(true);
+  useEffect(
+    () => () => {
+      if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    },
+    []
+  );
+  const handleChatScroll = useCallback((event: React.UIEvent<HTMLTextAreaElement>) => {
+    const el = event.currentTarget;
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
+    setScrolling(true);
+    if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = window.setTimeout(() => {
+      scrollTimerRef.current = null;
+      setScrolling(false);
+    }, 900);
+  }, []);
 
   // Autosize the composer to its content. The height lives as an inline style
   // on the textarea, so it is lost with the DOM node on every unmount.
   const resizeChatInput = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
+    const prevScrollTop = el.scrollTop;
+    const stickToBottom =
+      atBottomRef.current &&
+      (document.activeElement !== el || el.selectionEnd === el.value.length);
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
+    if (el.scrollHeight > el.clientHeight) {
+      el.scrollTop = stickToBottom ? el.scrollHeight : prevScrollTop;
+    }
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
   }, []);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   // The composer unmounts whenever the shell swaps views — Settings, the Code
@@ -1310,7 +1339,8 @@ export const Composer = ({
         ref={setChatInputRef}
         className={`chat-input min-h-[52px]${
           offeredPromptSuggestion ? ' placeholder:!text-transparent' : ''
-        }`}
+        }${scrolling ? ' is-scrolling' : ''}`}
+        onScroll={handleChatScroll}
         disabled={isNativeSubagentThread || workspaceUnavailable}
         placeholder={
           offeredPromptSuggestion

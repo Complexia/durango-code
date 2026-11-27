@@ -304,7 +304,7 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
       ),
       tool(
         'read_thread',
-        'Read the transcript of another Durango Code thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Durango Code work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit.',
+        'Read the transcript of another Durango Code thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Durango Code work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit, or page through a very long message with offset, limit=1, and char_offset.',
         {
           thread_id: z
             .string()
@@ -322,6 +322,12 @@ export const createOrionMcpServer = ({ createSdkMcpServer, tool }, { z }, sessio
             .max(READ_THREAD_MAX_LIMIT)
             .optional()
             .describe(`Maximum number of messages to return (default ${READ_THREAD_DEFAULT_LIMIT})`),
+          char_offset: z
+            .number()
+            .int()
+            .min(1)
+            .optional()
+            .describe("1-based character offset into a long message's content (use with offset and limit=1 when a message was truncated)."),
         },
         async (args) => {
           const resultText = await readThreadForAgent(args);

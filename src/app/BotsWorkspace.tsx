@@ -59,12 +59,13 @@ import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
 import { localMediaSrc } from './attachments';
-import { botDraftKey, loadBotDraft, projectBotDraftKey, restoreUnsentBotDraft, useBotDraftSaver } from './botDrafts';
+import { appendBotDraftFiles, botDraftKey, loadBotDraft, projectBotDraftKey, restoreUnsentBotDraft, useBotDraftSaver } from './botDrafts';
 import { BotActionsRow, BotCards, BotFileGallery, threadIsHere, useMessageFiles, type BotActionHandlers } from './BotReplyCards';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { sortProjectsByLatestThreadStart } from './projectOrder';
 import { useSidebarResize } from './useSidebarResize';
 import { useBotsShellSlot } from './botsShellSlot';
+import { registerBotFileDropHandler } from './rootFileDrop';
 import { AGENTS_SIDEBAR_STORAGE_KEY, SidebarModeHeader } from './SidebarModeHeader';
 import { noteBotList } from './botsTabBadge';
 import {
@@ -180,8 +181,12 @@ type BotListCache = {
   allowed: boolean;
   mode: 'local' | 'durango' | null;
   cloudOnly: boolean;
-  /** The models a bot can be set to (null: an older Durango, no picker). */
+  /** The recommended models a bot can be set to (null: an older Durango, no picker). */
   modelChoices: BotModelChoice[] | null;
+  /** The full searchable catalog (recommended + cloud catalog + local Claude models). */
+  modelCatalog: BotModelChoice[] | null;
+  /** Whether Claude Code is available to answer bot replies on this machine. */
+  claudeAvailable: boolean;
 };
 let botListCache: BotListCache | null = null;
 const botThreadCache = new Map<string, DesktopBotThread>();
@@ -360,6 +365,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const [projectOrder, setProjectOrder] = useState<string[]>(() => botListCache?.projectOrder ?? []);
   const [projectKeys, setProjectKeys] = useState<Record<string, string>>(() => botListCache?.projectKeys ?? {});
   const [modelChoices, setModelChoices] = useState<BotModelChoice[] | null>(() => botListCache?.modelChoices ?? null);
+  const [modelCatalog, setModelCatalog] = useState<BotModelChoice[] | null>(() => botListCache?.modelCatalog ?? null);
+  const [claudeAvailable, setClaudeAvailable] = useState<boolean>(() => botListCache?.claudeAvailable ?? true);
   const [listError, setListError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [reorderAnnouncement, setReorderAnnouncement] = useState('');
@@ -422,9 +429,11 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     const nextCloudOnly = modeResult
       ? modeResult.mode === 'durango' && modeResult.claudeAvailable && modeResult.machineReplies === false
       : botListCache?.cloudOnly ?? false;
+    const nextClaudeAvailable = modeResult ? modeResult.claudeAvailable : botListCache?.claudeAvailable ?? true;
     if (modeResult) {
       setMode(nextMode);
       setCloudOnly(nextCloudOnly);
+      setClaudeAvailable(nextClaudeAvailable);
     }
     if (!result) return;
     if (!result.ok) {
@@ -459,6 +468,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     noteBotList(result.allowed === false ? null : nextBots);
     setProjectKeys(result.projectKeys ?? {});
     setModelChoices(result.modelChoices ?? null);
+    setModelCatalog(result.modelCatalog ?? result.modelChoices ?? null);
     botListCache = {
       account: nextAccount,
       bots: nextBots,
@@ -467,7 +477,9 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
       allowed: result.allowed !== false,
       mode: nextMode,
       cloudOnly: nextCloudOnly,
+      claudeAvailable: nextClaudeAvailable,
       modelChoices: result.modelChoices ?? null,
+      modelCatalog: result.modelCatalog ?? result.modelChoices ?? null,
     };
   }, []);
 
@@ -1312,7 +1324,10 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               botHint={selectedBot}
               projectPath={projectPathOfBot(selectedBot)}
               modelChoices={modelChoices}
+              modelCatalog={modelCatalog}
               local={mode === 'local'}
+              claudeAvailable={claudeAvailable}
+              machineReplies={!cloudOnly}
               onChanged={loadBots}
               onOpenProject={openProjectOfBot}
               onOpenThread={openBotThread}
@@ -2848,15 +2863,21 @@ const BotPane: React.FC<{
   botHint?: Pick<DesktopBot, 'name' | 'emoji' | 'job' | 'projectPrimary'> | null;
   /** Local project path for a project bot so its icon uses the project's icon when available. */
   projectPath?: string | null;
-  /** The models the bot can be set to (null: no picker). */
+  /** The recommended models the bot can be set to (null: no picker). */
   modelChoices: BotModelChoice[] | null;
+  /** Full searchable catalog (recommended + cloud catalog + local Claude models). */
+  modelCatalog: BotModelChoice[] | null;
   /** The bots are this computer's own (signed out). */
   local: boolean;
+  /** Whether Claude Code is available on this machine. */
+  claudeAvailable: boolean;
+  /** Whether this machine is configured to answer bots locally. */
+  machineReplies: boolean;
   onChanged: () => void;
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
-}> = ({ botId, botHint, projectPath, modelChoices, local, onChanged, onOpenProject, onOpenThread }) => {
+}> = ({ botId, botHint, projectPath, modelChoices, modelCatalog, local, claudeAvailable, machineReplies, onChanged, onOpenProject, onOpenThread }) => {
   // `thread.messages`: every message loaded so far (the newest page, older
   // pages scrolled back to, and what polls brought), in seq order; unchanged
   // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
@@ -3283,7 +3304,10 @@ const BotPane: React.FC<{
           model={bot.model}
           reasoningEffort={bot.reasoningEffort}
           choices={modelChoices}
+          catalog={modelCatalog}
           local={local}
+          claudeAvailable={claudeAvailable}
+          machineReplies={machineReplies}
           onPick={pickModel}
         />
       ) : null}
@@ -4359,7 +4383,19 @@ const BotMessage: React.FC<{
       <div className="flex items-center gap-1.5 text-neutral-400">
         <Icon size={12} />
         <span className="truncate font-medium text-neutral-300">{message.authorLabel}</span>
-        <span className="ml-auto text-[10.5px] text-neutral-600">{relativeBotTime(message.createdAt)}</span>
+        <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10.5px] text-neutral-600">
+          {message.silentRead && (
+            <span
+              className="inline-flex items-center gap-0.5 text-neutral-500"
+              title={message.silentRead.reason ? `Read without replying: ${message.silentRead.reason}` : 'Read without replying'}
+            >
+              <Check size={10} />
+              Read
+            </span>
+          )}
+          {message.silentRead && <span aria-hidden="true">·</span>}
+          <span>{relativeBotTime(message.createdAt)}</span>
+        </span>
       </div>
       <div className="mt-1 line-clamp-4 whitespace-pre-wrap text-neutral-400">{source === 'task' ? taskReportBody(message.content) : message.content}</div>
       {actions.length > 0 && <BotActionsRow actions={actions} handlers={handlers} />}
@@ -4429,18 +4465,52 @@ const BotComposer: React.FC<{
   const draftSaver = useBotDraftSaver(draftKey);
   useEffect(() => draftSaver.save(text, files), [draftSaver, text, files]);
   const [dragging, setDragging] = useState(false);
+  const [scrolling, setScrolling] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const scrollTimerRef = useRef<number | null>(null);
+  const atBottomRef = useRef(true);
+  useEffect(
+    () => () => {
+      if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    },
+    []
+  );
+  const handleScroll = (event: React.UIEvent<HTMLTextAreaElement>) => {
+    const element = event.currentTarget;
+    atBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 2;
+    setScrolling(true);
+    if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = window.setTimeout(() => {
+      scrollTimerRef.current = null;
+      setScrolling(false);
+    }, 900);
+  };
   useLayoutEffect(() => {
     const element = ref.current;
     if (!element) return;
-    element.style.height = '0px';
-    element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
+    const prevScrollTop = element.scrollTop;
+    const stickToBottom =
+      atBottomRef.current &&
+      (document.activeElement !== element || element.selectionEnd === element.value.length);
+    element.style.height = 'auto';
+    element.style.height = `${element.scrollHeight}px`;
+    if (element.scrollHeight > element.clientHeight) {
+      element.scrollTop = stickToBottom ? element.scrollHeight : prevScrollTop;
+    }
+    atBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 2;
   }, [text]);
   // Thumbnails still in the box when it goes away are released (sent ones belong to their message).
   const filesRef = useRef(files);
   filesRef.current = files;
-  useEffect(() => () => filesRef.current.forEach((file) => releasePreview(file.preview)), []);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      filesRef.current.forEach((file) => releasePreview(file.preview));
+    };
+  }, []);
   const add = (next: BotAttachmentFile[]) => {
     setAttachError(null);
     const merged = [...filesRef.current];
@@ -4460,12 +4530,57 @@ const BotComposer: React.FC<{
   const addFiles = async (list: FileList | File[]) => {
     const picked = await Promise.all([...list].map((file) => fileToAttachment(file).catch(() => null)));
     const ok = picked.filter((file): file is BotAttachmentFile => Boolean(file));
+    if (!mountedRef.current) {
+      // Composer unmounted while staging (e.g. switched bots): release transient
+      // previews and save the files into the original bot's draft.
+      ok.forEach((file) => releasePreview(file.preview));
+      appendBotDraftFiles(draftKey, ok, BOT_ATTACHMENTS_MAX);
+      return;
+    }
     if (ok.length < picked.length) setAttachError('Some files couldn’t be attached.');
     add(ok);
   };
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+  useEffect(
+    () =>
+      registerBotFileDropHandler({
+        botName,
+        onDrop: (dropped) => void addFilesRef.current(dropped),
+      }),
+    [botName]
+  );
+  useEffect(() => {
+    if (!dragging) return undefined;
+    const clear = () => setDragging(false);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') clear();
+    };
+    window.addEventListener('dragend', clear);
+    window.addEventListener('blur', clear);
+    window.addEventListener('drop', clear, true);
+    window.addEventListener('pointermove', clear, true);
+    window.addEventListener('mousedown', clear, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('dragend', clear);
+      window.removeEventListener('blur', clear);
+      window.removeEventListener('drop', clear, true);
+      window.removeEventListener('pointermove', clear, true);
+      window.removeEventListener('mousedown', clear, true);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [dragging]);
   const pick = async () => {
     const result = await window.orion?.pickBotAttachments?.();
     if (!result) return;
+    if (!mountedRef.current) {
+      if (result.ok && result.files?.length) {
+        result.files.forEach((file) => releasePreview(file.preview));
+        appendBotDraftFiles(draftKey, result.files, BOT_ATTACHMENTS_MAX);
+      }
+      return;
+    }
     if (!result.ok) {
       setAttachError(result.error ?? 'Couldn’t attach those files.');
       return;
@@ -4485,11 +4600,9 @@ const BotComposer: React.FC<{
   return (
     <div className="shrink-0 px-4 pb-4 pt-2">
       <div className="mx-auto w-full max-w-[760px]">
-        {paused && <div className="mb-1.5 text-center text-[11.5px] text-neutral-500">{botName} is paused: messages wait until you resume it.</div>}
+        {paused && <div className="mb-1.5 text-center text-[11.5px] text-[var(--text-muted)]">{botName} is paused: messages wait until you resume it.</div>}
         <div
-          className={`rounded-2xl border bg-white/[0.035] px-3.5 py-2 transition-colors focus-within:border-white/20 ${
-            dragging ? 'border-sky-400/60 bg-sky-400/[0.06]' : 'border-white/10'
-          }`}
+          className={`composer-shell bot-composer${dragging ? ' is-dragging' : ''}`}
           onDragOver={(event) => {
             if (!event.dataTransfer.types.includes('Files')) return;
             event.preventDefault();
@@ -4499,17 +4612,17 @@ const BotComposer: React.FC<{
             if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
           }}
           onDrop={(event) => {
+            setDragging(false);
             if (!event.dataTransfer.files.length) return;
             event.preventDefault();
-            setDragging(false);
             void addFiles(event.dataTransfer.files);
           }}
         >
           {files.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap items-end gap-1.5 pt-0.5">
+            <div className="composer-attachments items-end">
               {files.map((file) =>
                 file.preview ? (
-                  <span key={file.path} className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-lg ring-1 ring-white/[0.1]" title={`${file.name} · ${formatFileSize(file.size)}`}>
+                  <span key={file.path} className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-[var(--border-default)]" title={`${file.name} · ${formatFileSize(file.size)}`}>
                     <img src={file.preview} alt={file.name} onClick={handleLightboxImageClick} className="h-full w-full cursor-zoom-in object-cover" />
                     <button
                       type="button"
@@ -4521,64 +4634,66 @@ const BotComposer: React.FC<{
                     </button>
                   </span>
                 ) : (
-                <span key={file.path} className="inline-flex max-w-[240px] items-center gap-1.5 rounded-lg bg-white/[0.06] py-1 pl-2.5 pr-1 text-[12px] text-neutral-200 ring-1 ring-white/[0.08]">
-                  <Paperclip size={12} className="shrink-0 text-neutral-500" />
-                  <span className="truncate">{file.name}</span>
-                  <span className="shrink-0 text-neutral-500">{formatFileSize(file.size)}</span>
-                  <button
-                    type="button"
-                    aria-label={`Remove ${file.name}`}
-                    onClick={() => remove(file)}
-                    className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 hover:bg-white/[0.08] hover:text-neutral-200"
-                  >
-                    <X size={11} />
-                  </button>
-                </span>
+                  <span key={file.path} className="inline-flex max-w-[240px] items-center gap-1.5 rounded-lg border border-[var(--border-default)] bg-[var(--bg-surface)] py-1 pl-2.5 pr-1 text-[12px] text-[var(--text-primary)]">
+                    <Paperclip size={12} className="shrink-0 text-[var(--text-muted)]" />
+                    <span className="truncate">{file.name}</span>
+                    <span className="shrink-0 text-[var(--text-muted)]">{formatFileSize(file.size)}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${file.name}`}
+                      onClick={() => remove(file)}
+                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
                 )
               )}
             </div>
           )}
-          <div className="flex items-end gap-2">
+          <textarea
+            ref={ref}
+            value={text}
+            rows={2}
+            placeholder={`Message ${botName}`}
+            onChange={(event) => setText(event.target.value)}
+            onScroll={handleScroll}
+            onPaste={(event) => {
+              if (!event.clipboardData.files.length) return;
+              event.preventDefault();
+              void addFiles(event.clipboardData.files);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                submit();
+              }
+            }}
+            className={`chat-input min-h-[52px]${scrolling ? ' is-scrolling' : ''}`}
+          />
+          <div className="composer-controls">
             <button
               type="button"
               aria-label="Attach files"
               title="Attach files (or paste, or drop them here)"
               onClick={() => void pick()}
-              className="mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/[0.08] hover:text-neutral-100"
+              className="attachment-trigger ml-auto"
             >
               <Paperclip size={15} />
             </button>
-            <textarea
-              ref={ref}
-              value={text}
-              rows={1}
-              placeholder={`Message ${botName}`}
-              onChange={(event) => setText(event.target.value)}
-              onPaste={(event) => {
-                if (!event.clipboardData.files.length) return;
-                event.preventDefault();
-                void addFiles(event.clipboardData.files);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  submit();
-                }
-              }}
-              className="max-h-[200px] min-h-[22px] flex-1 resize-none bg-transparent py-1 text-[13.5px] leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-500"
-            />
             <button
               type="button"
               aria-label="Send"
+              title="Send"
               onClick={submit}
               disabled={!text.trim() && !files.length}
-              className="mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-neutral-100 text-neutral-900 transition-opacity disabled:opacity-25"
+              className="send-button"
             >
-              <ArrowUp size={14} strokeWidth={2.4} />
+              <ArrowUp size={16} strokeWidth={2.5} />
             </button>
           </div>
         </div>
-        {attachError && <div className="mt-1 px-1 text-[11.5px] text-red-300">{attachError}</div>}
+        {attachError && <div className="mt-1 px-1 text-[11.5px] text-[var(--danger)]">{attachError}</div>}
       </div>
     </div>
   );

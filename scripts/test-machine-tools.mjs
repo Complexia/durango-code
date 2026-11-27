@@ -457,12 +457,41 @@ process.on('unhandledRejection', (error) => {
   console.log('ok  Full access for bridge providers; stopped runs send nothing');
 }
 
-// machine_read_thread and machine_stop_agent.
+// machine_read_thread (including long final message + char_offset paging) and machine_stop_agent.
 {
   const read = await runMachineTool('machine_read_thread', { machine: 'omarchy', thread_id: 't-new' }, { accessMode: 'read-only' });
   assert.equal(read.ok, true);
   assert.match(read.text, /machine: omarchy \(id: m-omarchy\)/);
   assert.doesNotMatch(read.text, /@thread:/, 'no local link for a thread of another machine');
+  const remoteCore = 'REMOTE_AGENTMAIL_FINDING_15K';
+  const remoteTail = 'REMOTE_AGENTMAIL_TAIL_36K';
+  hostThreads.set('t-long', {
+    id: 't-long',
+    title: 'AgentMail research',
+    status: 'done',
+    modelId: 'claude:opus',
+    createdAt: '2026-11-27T00:00:00Z',
+    messages: [
+      { role: 'user', content: 'Research AgentMail' },
+      { role: 'agent', content: `HEAD\n${'r'.repeat(15_000)}\n${remoteCore}\n${'s'.repeat(21_000)}\n${remoteTail}` },
+    ],
+  });
+  const longPage1 = await runMachineTool(
+    'machine_read_thread',
+    { machine: 'omarchy', thread_id: 't-long', limit: 1 },
+    { accessMode: 'read-only' }
+  );
+  assert.equal(longPage1.ok, true);
+  assert.ok(longPage1.text.includes(remoteCore));
+  const remotePtr = longPage1.text.match(/machine_read_thread with offset=(\d+), limit=1, char_offset=(\d+)/);
+  assert.ok(remotePtr);
+  const longPage2 = await runMachineTool(
+    'machine_read_thread',
+    { machine: 'omarchy', thread_id: 't-long', offset: Number(remotePtr[1]), limit: 1, char_offset: Number(remotePtr[2]) },
+    { accessMode: 'read-only' }
+  );
+  assert.equal(longPage2.ok, true);
+  assert.ok(longPage2.text.includes(remoteTail));
   const stop = await runMachineTool('machine_stop_agent', { machine: 'omarchy', thread_id: 't-run' }, full);
   assert.equal(stop.ok, true);
   console.log('ok  machine_read_thread and machine_stop_agent');

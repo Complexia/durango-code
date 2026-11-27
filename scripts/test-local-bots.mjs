@@ -161,7 +161,7 @@ test('a message while idle starts a reply; live progress and the stored reply', 
     [
       'ask_user', 'create_bot', 'delegate_task', 'forget_project_note', 'manage_routine', 'message_bot', 'notify_user',
       'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'search_history', 'show_actions',
-      'show_html', 'update_bot',
+      'show_html', 'stay_silent', 'update_bot',
     ]
   );
 
@@ -547,6 +547,7 @@ test('models: bots on the old default move to Opus, chosen ones stay; switching 
   runner.lanes[1].finish({ text: 'Yes.' });
   await engine.idle();
   await assert.rejects(engine.setModel('lbolddefault', 'gpt-9'), /Pick one of the bot models/);
+  await assert.rejects(engine.setModel('lbolddefault', 'claude-code-cli'), /Pick one of the bot models/);
 
   // Chosen survives a restart (it doesn't fall back to the default), and goes to Durango as a choice.
   const withEffort = await engine.setModel('lbolddefault', null, 'xhigh');
@@ -2234,11 +2235,14 @@ test('local bots: delegated tasks request finalMessageOnly and middle-trim huge 
   const researchPrompt = runner.lanes[2].lane.prompt;
   assert.match(researchPrompt, /RESEARCH START/);
   assert.match(researchPrompt, /RESEARCH END/);
-  assert.match(researchPrompt, /…\[middle trimmed\]…/);
+  assert.match(researchPrompt, /…\[middle trimmed: [\d,]+ chars omitted\]…/);
   runner.lanes[2].finish({ text: 'Reported research.' });
   await waitFor(() => runner.running().length === 0);
 
-  // Project thread settled with > 12,000 chars: middle-trimmed, footer preserved.
+  // Project thread settled with > 12,000 chars: middle-trimmed with thread pointer, footer preserved.
+  // Also verifies bot instructions tell it to call read_thread on trimmed reports, and dispatched
+  // thread prompts ask for plain path:line references (not file:// links).
+  assert.match(started[0].prompt, /plain `path:line` code references \(not `file:\/\/` markdown links\)/);
   await engine.threadSettled({
     key: started[0].key,
     threadId: 'thread_99',
@@ -2247,12 +2251,106 @@ test('local bots: delegated tasks request finalMessageOnly and middle-trim huge 
   });
   await waitFor(() => runner.lanes.length === 4);
   const shipPrompt = runner.lanes[3].lane.prompt;
+  const shipSystemPrompt = runner.lanes[3].lane.systemPrompt;
   assert.match(shipPrompt, /SHIP SUMMARY/);
   assert.match(shipPrompt, /Change: chg_999/);
   assert.match(shipPrompt, /Durango Code thread thread_99/);
-  assert.match(shipPrompt, /…\[middle trimmed\]…/);
+  assert.match(shipPrompt, /…\[middle trimmed: [\d,]+ chars omitted — full report is in thread thread_99; call read_thread to read it in full\]…/);
+  assert.match(shipSystemPrompt, /Call read_thread with the thread id named in the marker/);
+  assert.match(shipSystemPrompt, /Never pass on a partial list or trimmed finding as if it were complete/);
   runner.lanes[3].finish({ text: 'Done.' });
   await engine.idle();
+
+  // End-to-end audit case: a bot receives a trimmed report with a thread pointer and calls
+  // read_thread (with char_offset forwarding through createBotThreadTools) to fetch the full text.
+  const coreMiddleFinding = 'NON-ACP PATH #7: code/src/main/usage-stats.js:412 reads ~/.gemini/antigravity-cli/brain';
+  const hugeAuditTailFinding = 'LATE AUDIT FINDING PAST 34K: code/src/main/antigravity-models-probe.js:120';
+  const fullAuditMessage = [
+    '### 1. Audit Summary: 12 non-ACP paths found.',
+    'A'.repeat(16_000),
+    coreMiddleFinding,
+    'B'.repeat(20_000),
+    hugeAuditTailFinding,
+  ].join('\n');
+  const auditThreadId = 'cbb36805-9f56-4cfd-b81b-f7d27137e65b';
+  const readCalls = [];
+  const realThreadTools = createBotThreadTools({
+    readIndex: async () => ({
+      entries: [{ id: auditThreadId, projectId: 'p1', title: 'Audit Antigravity integration', status: 'done', messageCount: 2 }],
+    }),
+    readThread: async (args) => {
+      readCalls.push(args);
+      const start = Math.max(0, (args.char_offset ?? 1) - 1);
+      const end = Math.min(fullAuditMessage.length, start + 34_000);
+      const slice = fullAuditMessage.slice(start, end);
+      return end < fullAuditMessage.length
+        ? `${slice}\n…[message truncated: showing chars ${start + 1}–${end} of ${fullAuditMessage.length} — call read_thread with offset=2, limit=1, char_offset=${end + 1} to read more]`
+        : `${slice}\n(Showing chars ${start + 1}–${end} of ${fullAuditMessage.length}; end of message.)`;
+    },
+    getProjects: async () => [{ id: 'p1', name: 'Durango', path: '/tmp/durango' }],
+  });
+  const auditStarted = [];
+  const auditDir = path.join(testRoot, `bots-audit-e2e-${(dirCount += 1)}`);
+  const { engine: auditEngine, runner: auditRunner } = makeEngine({
+    dir: auditDir,
+    listProjects: async () => [{ id: 'p1', name: 'Durango', path: '/tmp/durango' }],
+    threadTools: realThreadTools,
+    startProjectThread: async (input) => {
+      auditStarted.push(input);
+      return { ok: true, threadId: auditThreadId };
+    },
+  });
+  const [auditBot] = (await auditEngine.list()).bots;
+  await auditEngine.send(auditBot.id, { messageId: 'audit_m1', content: 'Audit Antigravity.' });
+  await waitFor(() => auditRunner.lanes.length === 1);
+  await auditRunner.lanes[0].ctx.callTool({
+    name: 'delegate_task',
+    input: { title: 'Audit Antigravity', instructions: 'Check ACP coverage.', project: 'Durango' },
+    toolCallId: 'audit_t1',
+  });
+  auditRunner.lanes[0].finish({ text: 'Started audit.' });
+  await waitFor(() => auditRunner.lanes[0].done);
+
+  await auditEngine.threadSettled({
+    key: auditStarted[0].key,
+    threadId: auditThreadId,
+    outcome: 'finished',
+    summary: fullAuditMessage,
+  });
+  await waitFor(() => auditRunner.lanes.length === 2);
+  const auditPrompt = auditRunner.lanes[1].lane.prompt;
+  assert.doesNotMatch(auditPrompt, new RegExp(coreMiddleFinding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'core finding was in the trimmed middle');
+  assert.match(
+    auditPrompt,
+    /…\[middle trimmed: [\d,]+ chars omitted — full report is in thread cbb36805-9f56-4cfd-b81b-f7d27137e65b; call read_thread to read it in full\]…/
+  );
+  // Bot follows the marker and calls read_thread, then pages with char_offset to get the entire final message.
+  const page1 = (
+    await auditRunner.lanes[1].ctx.callTool({
+      name: 'read_thread',
+      input: { thread_id: auditThreadId },
+      toolCallId: 'read_1',
+    })
+  ).result;
+  assert.equal(page1.ok, true);
+  assert.ok(page1.transcript.includes(coreMiddleFinding), 'bot recovers the trimmed middle finding via read_thread');
+  const nextPtr = page1.transcript.match(/offset=(\d+), limit=1, char_offset=(\d+)/);
+  assert.ok(nextPtr, 'read_thread provides exact char_offset for the remainder past 34k');
+  const page2 = (
+    await auditRunner.lanes[1].ctx.callTool({
+      name: 'read_thread',
+      input: { thread_id: auditThreadId, offset: Number(nextPtr[1]), limit: 1, char_offset: Number(nextPtr[2]) },
+      toolCallId: 'read_2',
+    })
+  ).result;
+  assert.equal(page2.ok, true);
+  assert.ok(page2.transcript.includes(hugeAuditTailFinding), 'bot recovers the tail past 34k via char_offset');
+  assert.deepEqual(readCalls, [
+    { thread_id: auditThreadId },
+    { thread_id: auditThreadId, offset: 2, limit: 1, char_offset: 34_001 },
+  ]);
+  auditRunner.lanes[1].finish({ text: 'Complete audit reported.' });
+  await auditEngine.idle();
 });
 
 test('reorder persists project group order and per-project bot order across restarts, exportForSync, and primary changes', async () => {
@@ -2312,6 +2410,299 @@ test('reorder persists project group order and per-project bot order across rest
   assert.equal(exportedA3?.sortOrder, 0);
   assert.equal(exportedA1?.sortOrder, 2);
   assert.equal(exportedA4?.sortOrder, undefined);
+});
+
+test('local bot threadTurnSettled and threadTurnNotice report Ship button and person turns with waiting/notices and idempotency', async () => {
+  const { engine, runner, dir } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+
+  // 1) Ship button turn ends still waiting -> NOT FINISHED YET, wakes bot once.
+  const waiting = await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'ship_button',
+    changeId: 'chg_62ci2dyvpsf7suikernh',
+    outcome: 'finished',
+    summary: 'Waiting for deploy.',
+    waiting: ['background command: durango-code deploys --watch'],
+    seq: 3,
+  });
+  assert.equal(waiting.ok, true);
+  await waitFor(() => runner.lanes.length === 1);
+  assert.match(runner.lanes[0].lane.prompt, /\[Task: Ship button — Release 1\.0\.236\]:/);
+  assert.match(runner.lanes[0].lane.prompt, /tapped the Ship button for chg_62ci2dyvpsf7suikernh/);
+  assert.match(runner.lanes[0].lane.prompt, /NOT FINISHED YET/);
+  assert.match(runner.lanes[0].lane.prompt, /Durango Code thread thread_ship_1, project durango/);
+  runner.lanes[0].finish({ text: 'Watching the deploy.' });
+  await engine.idle();
+
+  // Retry of the same seq is idempotent and does not wake another lane.
+  await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'ship_button',
+    changeId: 'chg_62ci2dyvpsf7suikernh',
+    outcome: 'finished',
+    summary: 'Waiting for deploy.',
+    waiting: ['background command: durango-code deploys --watch'],
+    seq: 3,
+  });
+  await delay(5);
+  assert.equal(runner.lanes.length, 1);
+
+  // 2) Notice while the Ship turn still runs (seq 4 > 3) reaches the bot.
+  const noticed = await engine.threadTurnNotice({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'ship_button',
+    changeId: 'chg_62ci2dyvpsf7suikernh',
+    kind: 'input',
+    noticeKey: 'input:req-1',
+    seq: 4,
+    detail: 'It is waiting for the person to approve a Bash call in the thread.',
+  });
+  assert.equal(noticed.ok, true);
+  assert.equal(noticed.stale, undefined);
+  await waitFor(() => runner.lanes.length === 2);
+  assert.match(runner.lanes[1].lane.prompt, /NEEDS THE PERSON:/);
+  assert.match(runner.lanes[1].lane.prompt, /Ship button for chg_62ci2dyvpsf7suikernh, not your own request/);
+  runner.lanes[1].finish({ text: 'Heads up: approve the Bash call.' });
+  await engine.idle();
+
+  // 3) Person types directly in the thread -> labelled "Person in thread — …" with prompt preview.
+  const person = await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'person',
+    surface: 'iPhone',
+    promptPreview: 'so basically land and cut the desktop release',
+    outcome: 'finished',
+    summary: 'Released 1.0.236.',
+    seq: 6,
+  });
+  assert.equal(person.ok, true);
+  await waitFor(() => runner.lanes.length === 3);
+  assert.match(runner.lanes[2].lane.prompt, /\[Task: Person in thread — Release 1\.0\.236\]:/);
+  assert.match(runner.lanes[2].lane.prompt, /sent a message directly in the thread "Release 1\.0\.236" you started \(via iPhone\)/);
+  assert.match(runner.lanes[2].lane.prompt, /What they asked: "so basically land and cut the desktop release"/);
+  assert.match(runner.lanes[2].lane.prompt, /Released 1\.0\.236\./);
+  runner.lanes[2].finish({ text: 'Nice — 1.0.236 is out.' });
+  await engine.idle();
+
+  // Stale notice after seq 6 is dropped.
+  const stale = await engine.threadTurnNotice({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    trigger: 'person',
+    kind: 'stuck',
+    noticeKey: 'stuck:late',
+    seq: 6,
+    detail: 'No progress.',
+  });
+  assert.deepEqual(stale, { ok: true, stale: true });
+  await delay(5);
+  assert.equal(runner.lanes.length, 3);
+
+  // External trigger (e.g. machine_run_agent / API) is labelled "External turn — …".
+  const external = await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'external',
+    surface: 'another agent on Studio Mac',
+    promptPreview: 'Verify build artifacts',
+    outcome: 'finished',
+    summary: 'Artifacts verified.',
+    seq: 8,
+  });
+  assert.equal(external.ok, true);
+  await waitFor(() => runner.lanes.length === 4);
+  assert.match(runner.lanes[3].lane.prompt, /\[Task: External turn — Release 1\.0\.236\]:/);
+  assert.match(runner.lanes[3].lane.prompt, /Another turn ran in the thread "Release 1\.0\.236" you started \(started by another agent on Studio Mac, not your own request\)\./);
+  assert.match(runner.lanes[3].lane.prompt, /What it asked: "Verify build artifacts"/);
+  runner.lanes[3].finish({ text: 'Verified.' });
+  await engine.idle();
+
+  // Deleting a local bot and creating a replacement with the same name NEVER
+  // falls back to botName when botId is supplied.
+  const oldHelper = await engine.createBot({ name: 'Release Helper', job: 'Old' });
+  const oldHelperId = oldHelper.id;
+  await engine.deleteBot(oldHelperId);
+  const newHelper = await engine.createBot({ name: 'Release Helper', job: 'New' });
+  assert.notEqual(newHelper.id, oldHelperId);
+  const toDeleted = await engine.threadTurnSettled({
+    botId: oldHelperId,
+    botName: 'Release Helper',
+    threadId: 'thread_old_helper',
+    trigger: 'person',
+    outcome: 'finished',
+    summary: 'Should never reach newHelper.',
+    seq: 2,
+  });
+  assert.deepEqual(toDeleted, { ok: false });
+  const noticeToDeleted = await engine.threadTurnNotice({
+    botId: oldHelperId,
+    botName: 'Release Helper',
+    threadId: 'thread_old_helper',
+    trigger: 'person',
+    kind: 'input',
+    noticeKey: 'input:x',
+    seq: 2,
+    detail: 'Blocked.',
+  });
+  assert.deepEqual(noticeToDeleted, { ok: false });
+  await delay(5);
+  assert.equal(runner.lanes.length, 4);
+
+  // After a reload from disk (cold in-memory runtime map), a late waiting report
+  // from an earlier turn (seq 1) and a stale notice (seq 4) are still dropped
+  // because seq 8 is already persisted in the bot's messages.
+  await engine.flush();
+  const { engine: reloaded, runner: reloadedRunner } = makeEngine({ dir });
+  const lateWaitAfterRestart = await reloaded.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    trigger: 'person',
+    outcome: 'finished',
+    summary: 'Old waiting update.',
+    waiting: ['background command: old'],
+    seq: 1,
+  });
+  assert.deepEqual(lateWaitAfterRestart, { ok: true });
+  const staleNoticeAfterRestart = await reloaded.threadTurnNotice({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    trigger: 'person',
+    kind: 'stuck',
+    noticeKey: 'stuck:after-restart',
+    seq: 4,
+    detail: 'Stale.',
+  });
+  assert.deepEqual(staleNoticeAfterRestart, { ok: true, stale: true });
+  await delay(5);
+  assert.equal(reloadedRunner.lanes.length, 0);
+
+  // Trimmed threadTurnSettled report and threadTurnNotice compact file:// links and point to threadId.
+  const longThreadTurn = await reloaded.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_long',
+    threadTitle: 'Ship long report',
+    project: 'durango',
+    trigger: 'ship_button',
+    changeId: 'chg_long',
+    outcome: 'finished',
+    summary: `HEAD [main.js](file:///repo/code/src/main.js#L42)\n${'z'.repeat(14_000)}\nTAIL`,
+    seq: 2,
+  });
+  assert.equal(longThreadTurn.ok, true);
+  await waitFor(() => reloadedRunner.lanes.length === 1);
+  assert.ok(!reloadedRunner.lanes[0].lane.prompt.includes('file:///'), 'file:// link compacted in threadTurnSettled');
+  assert.match(reloadedRunner.lanes[0].lane.prompt, /\/repo\/code\/src\/main\.js:42/);
+  assert.match(reloadedRunner.lanes[0].lane.prompt, /full report is in thread thread_ship_long; call read_thread to read it in full/);
+  reloadedRunner.lanes[0].finish({ text: 'Read full thread.' });
+  await reloaded.idle();
+
+  const longThreadNotice = await reloaded.threadTurnNotice({
+    botId: primary.id,
+    threadId: 'thread_ship_long',
+    threadTitle: 'Ship long report',
+    project: 'durango',
+    trigger: 'person',
+    kind: 'input',
+    noticeKey: 'input:long',
+    seq: 4,
+    detail: `ASK [app.ts](file:///repo/app.ts#L9)\n${'q'.repeat(5_000)}\nEND_ASK`,
+  });
+  assert.equal(longThreadNotice.ok, true);
+  await waitFor(() => reloadedRunner.lanes.length === 2);
+  assert.ok(!reloadedRunner.lanes[1].lane.prompt.includes('file:///'), 'file:// link compacted in threadTurnNotice');
+  assert.match(reloadedRunner.lanes[1].lane.prompt, /full report is in thread thread_ship_long; call read_thread to read it in full/);
+  reloadedRunner.lanes[1].finish({ text: 'Noted.' });
+  await reloaded.idle();
+
+  await reloaded.stop();
+  await engine.stop();
+});
+
+test('silent turns (stay_silent): marks inbox card Read with no message/unread, refuses person DMs, surfaces empty replies without stay_silent, and exports silentRead', async () => {
+  const dir = path.join(testRoot, 'silent-turns-clean');
+  let mode = 'silent';
+  let refusedPerson = null;
+  let watcherId = null;
+  const { engine: eng3 } = makeEngine({
+    dir,
+    runner: {
+      runLane: async (lane, ctx) => {
+        if (lane.botName === 'Durango') {
+          await ctx.callTool({ name: 'message_bot', input: { bot_id: watcherId, message: 'Interim update #1' } });
+          return { text: 'Relayed.' };
+        }
+        if (mode === 'silent') {
+          const res = await ctx.callTool({ name: 'stay_silent', input: { reason: 'Waiting for all tasks' } });
+          assert.equal(res.result.ok, true);
+          assert.equal(res.result.silent, true);
+          return { text: '', silent: true, silentReason: 'Waiting for all tasks' };
+        }
+        if (mode === 'person') {
+          refusedPerson = await ctx.callTool({ name: 'stay_silent', input: { reason: 'nope' } });
+          return { text: 'Answering your direct message.' };
+        }
+        return { text: '' };
+      },
+    },
+  });
+  const primary3 = await eng3.ensurePrimary();
+  const watcher3 = await eng3.createBot({ name: 'QuietBot', job: 'Stay quiet on interim updates.' });
+  watcherId = watcher3.id;
+  mode = 'silent';
+  await eng3.send(primary3.id, { content: 'Ping QuietBot' });
+  await eng3.idle();
+
+  const t1 = await eng3.thread(watcher3.id);
+  assert.equal(t1.messages.filter((m) => m.role === 'assistant').length, 0, 'no assistant message posted on silent turn');
+  assert.equal(t1.bot.unread, 0, 'unread stays 0 on silent turn');
+  assert.equal(t1.messages.length, 1);
+  assert.equal(t1.messages[0].silentRead?.reason, 'Waiting for all tasks');
+  // afterSeq poll at seq 0 still returns the recently silent-read message.
+  const polled = await eng3.thread(watcher3.id, { afterSeq: t1.messages[0].seq });
+  assert.equal(polled.messages.some((m) => m.id === t1.messages[0].id && m.silentRead?.reason === 'Waiting for all tasks'), true);
+
+  // Persists across reload and exports in exportForSync.
+  await eng3.flush();
+  const { engine: reloaded3 } = makeEngine({ dir });
+  const tReloaded = await reloaded3.thread(watcher3.id);
+  assert.equal(tReloaded.messages[0].silentRead?.reason, 'Waiting for all tasks');
+  const synced = await reloaded3.exportForSync();
+  const exportedQuiet = synced.bots.find((b) => b.localId === watcher3.id);
+  assert.equal(exportedQuiet?.messages[0]?.silentRead?.reason, 'Waiting for all tasks');
+
+  // 2. Direct message from the person: stay_silent is refused, reply is posted.
+  mode = 'person';
+  await eng3.send(watcher3.id, { content: 'Are you there?' });
+  await eng3.idle();
+  assert.equal(refusedPerson?.result?.ok, false);
+  assert.match(refusedPerson?.result?.error ?? '', /direct message from the person/);
+  const t2 = await eng3.thread(watcher3.id);
+  assert.equal(t2.messages.at(-1)?.role, 'assistant');
+  assert.equal(t2.messages.at(-1)?.content, 'Answering your direct message.');
+
+  // 3. Accidental empty reply without stay_silent surfaces an error message (never counts as silent).
+  mode = 'empty';
+  await eng3.send(primary3.id, { content: 'Ping QuietBot again' });
+  await eng3.idle();
+  const t3 = await eng3.thread(watcher3.id);
+  assert.equal(t3.messages.at(-1)?.role, 'assistant');
+  assert.match(t3.messages.at(-1)?.content ?? '', /no reply was produced/);
 });
 
 // --- run -------------------------------------------------------------------------------------

@@ -668,6 +668,12 @@ export type RemoteCommandRequest = {
     spawnedBy?: import('./store').ThreadSpawnedBy;
     /** runTurn: an agent on the controller sent this turn (machine_run_agent), not the user. */
     fromAgent?: boolean;
+    /** runTurn: explicit trigger metadata (e.g. Ship button on a bot reply) for reporting back to a bot-started thread's owner. */
+    botTurnTrigger?: {
+      trigger: 'person' | 'ship_button' | 'external';
+      changeId?: string;
+      surface?: string;
+    };
     /**
      * Set when Durango started this run (dispatch worker in main): the
      * renderer creates the thread exactly like a remote runTurn (or, for a
@@ -2196,6 +2202,44 @@ type OrionCodexBrowserIntegrationStatus = {
         seq: number;
         detail: string;
       }) => Promise<{ ok: boolean; skipped?: boolean; retry?: boolean }>;
+      /**
+       * Outcome of a turn the person or the Ship button started in a bot-started
+       * thread: goes back to that bot's inbox as a labelled task report.
+       */
+      botThreadTurnSettled?: (input: {
+        owner: { mode: 'local' | 'durango'; botId?: string; botName?: string; originDispatchId?: string };
+        threadId: string;
+        threadTitle?: string;
+        projectName?: string;
+        workspacePath?: string;
+        trigger: 'person' | 'ship_button' | 'external';
+        changeId?: string;
+        surface?: string;
+        promptPreview?: string;
+        outcome: 'finished' | 'failed';
+        summary?: string;
+        error?: string;
+        waiting?: string[];
+        later?: boolean;
+        seq: number;
+      }) => Promise<{ ok: boolean; skipped?: boolean; retry?: boolean }>;
+      /**
+       * Notice while a person-, Ship-button-, or externally-started turn in a
+       * bot-started thread still runs and needs the person or looks stuck.
+       */
+      botThreadTurnNotice?: (input: {
+        owner: { mode: 'local' | 'durango'; botId?: string; botName?: string; originDispatchId?: string };
+        threadId: string;
+        threadTitle?: string;
+        projectName?: string;
+        trigger: 'person' | 'ship_button' | 'external';
+        changeId?: string;
+        surface?: string;
+        kind: 'input' | 'stuck';
+        key: string;
+        seq: number;
+        detail: string;
+      }) => Promise<{ ok: boolean; skipped?: boolean; stale?: boolean; retry?: boolean }>;
       onDurangoDispatchState?: (cb: (state: DurangoDispatchState) => void) => () => void;
       onDurangoFocusThread?: (cb: (payload: { threadId: string }) => void) => () => void;
       workspaceSyncConfigure?: (

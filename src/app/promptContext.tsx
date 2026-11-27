@@ -635,7 +635,7 @@ export const buildRemoteThreadMentionsContext = (
   const byId = new Map(pages.map((page) => [page.threadId, page.text]));
   return [
     '[Thread mentions from another machine]',
-    `The user referenced these Durango Code threads with @-mentions. They live on the machine the user is typing on, not on ${targetMachineName} where you run, so read_thread cannot open them here. The newest page of each transcript is included below as it was when the message was sent. If you can reach that machine with the machine_* tools (machine_list), machine_read_thread reads earlier pages.`,
+    `The user referenced these Durango Code threads with @-mentions. They live on the machine the user is typing on, not on ${targetMachineName} where you run, so read_thread cannot open them here. The newest page of each transcript is included below as it was when the message was sent. If you can reach that machine with the machine_* tools (machine_list), machine_read_thread reads earlier pages (or pages through a long message with offset, limit=1, and char_offset).`,
     ...mentions.map(({ thread, token }) =>
       [`## @${token} → "${thread.title}"`, byId.get(thread.id) ?? '(Could not read this thread.)'].join('\n')
     ),
@@ -678,7 +678,7 @@ export const buildThreadMentionsContext = (
 ) =>
   [
     '[Thread mentions]',
-    'The user referenced these Durango Code threads (separate agent conversations in this app) with @-mentions. Their transcripts are NOT included here. To see what happened in a mentioned thread, call the `read_thread` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__read_thread, orion.read_thread, or a plugin-prefixed equivalent) with its thread_id. It returns thread metadata plus a page of messages — the newest page by default; browse earlier ones with offset/limit. Read a mentioned thread before making claims about what happened in it, and pull only the pages the task needs. To point the user at a thread in your reply, write `@thread:<thread_id>`; Durango Code renders it as a clickable link that opens the thread.',
+    'The user referenced these Durango Code threads (separate agent conversations in this app) with @-mentions. Their transcripts are NOT included here. To see what happened in a mentioned thread, call the `read_thread` tool from Durango Code\'s `orion` MCP server (the fully-qualified name varies by provider, for example mcp__orion__read_thread, orion.read_thread, or a plugin-prefixed equivalent) with its thread_id. It returns thread metadata plus a page of messages — the newest page by default; browse earlier ones with offset/limit, or pass offset, limit=1, and char_offset to read the rest of a very long message. Read a mentioned thread before making claims about what happened in it, and pull only the pages the task needs. To point the user at a thread in your reply, write `@thread:<thread_id>`; Durango Code renders it as a clickable link that opens the thread.',
     ...mentions.map(({ thread, token }) => {
       const projectName = projectNameById?.get(thread.projectId);
       const details = [

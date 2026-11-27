@@ -1,5 +1,5 @@
 import { DurangoError } from './durango-client.js';
-import { clipMiddle } from '../report-clip.js';
+import { clipMiddle, compactFileLinks } from '../report-clip.js';
 
 // Dispatch worker: runs agents that the user started from Durango Chat
 // (merge plan Phase 5, contracts §7 "Dispatch").
@@ -926,12 +926,18 @@ export const createDispatchWorker = ({
       if (entry.settled && running.get(dispatchId) !== entry) return { ok: true, skipped: true };
       entry.settled = true;
       release(entry);
+      const isBotDispatch = Boolean(entry.dispatch?.bot || entry.dispatch?.botId);
       const body =
         outcome === 'finished'
           ? {
               status: 'finished',
               ...(threadId || entry.threadId ? { codeThreadId: threadId || entry.threadId } : {}),
-              summary: clipMiddle(summary, DISPATCH_SUMMARY_MAX_CHARS) || 'The agent finished.',
+              summary:
+                clipMiddle(
+                  compactFileLinks(summary),
+                  DISPATCH_SUMMARY_MAX_CHARS,
+                  isBotDispatch ? { threadId: threadId || entry.threadId } : undefined
+                ) || 'The agent finished.',
               ...(Array.isArray(waiting) && waiting.length ? { waiting } : {}),
               ...(seq ? { reportSeq: seq } : {}),
             }
@@ -959,7 +965,7 @@ export const createDispatchWorker = ({
       if (!machineId) return { ok: false, retry: true };
       const body = {
         machineId,
-        notice: { kind, key, seq, detail: clipMiddle(detail, DISPATCH_SUMMARY_MAX_CHARS) },
+        notice: { kind, key, seq, detail: clipMiddle(detail, DISPATCH_SUMMARY_MAX_CHARS, { threadId }) },
         ...(threadId ? { codeThreadId: threadId } : {}),
       };
       try {

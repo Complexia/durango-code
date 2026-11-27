@@ -56,9 +56,15 @@ Object.assign(globalThis, {
 });
 
 const { useOrionStore, flushOrionStoreSave } = await import('../src/store');
-const { botDraftKey, botDraftThumbnail, createBotDraftSaver, loadBotDraft, projectBotDraftKey, restoreUnsentBotDraft } = await import(
-  '../src/app/botDrafts'
-);
+const {
+  appendBotDraftFiles,
+  botDraftKey,
+  botDraftThumbnail,
+  createBotDraftSaver,
+  loadBotDraft,
+  projectBotDraftKey,
+  restoreUnsentBotDraft,
+} = await import('../src/app/botDrafts');
 
 await new Promise<void>((resolve) => {
   if (useOrionStore.persist.hasHydrated()) resolve();
@@ -154,6 +160,26 @@ assert.equal(draftOf(sendKey)?.text, 'a newer thought', 'a failed send never ove
 saver.save('');
 assert.equal(draftOf(sendKey), undefined, 'an emptied box forgets its draft without waiting');
 assert.equal(timers.size, 0);
+
+// Late-resolving async drops after unmount merge into the original bot's saved draft,
+// deduplicate by path, enforce max count, and strip blob: preview URLs.
+appendBotDraftFiles('bot:b2', [{ path: '/tmp/late.png', name: 'late.png', size: 12, preview: 'blob:ephemeral' }], 2);
+assert.equal(draftOf('bot:b2')?.text, 'second bot', 'appending files preserves existing draft text');
+assert.deepEqual(draftOf('bot:b2')?.files, [{ path: '/tmp/late.png', name: 'late.png', size: 12 }]);
+appendBotDraftFiles(
+  'bot:b2',
+  [
+    { path: '/tmp/late.png', name: 'late.png', size: 12 },
+    { path: '/tmp/second.png', name: 'second.png', size: 24 },
+    { path: '/tmp/overflow.png', name: 'overflow.png', size: 36 },
+  ],
+  2
+);
+assert.deepEqual(
+  draftOf('bot:b2')?.files.map((file) => file.path),
+  ['/tmp/late.png', '/tmp/second.png'],
+  'appendBotDraftFiles deduplicates and enforces maxFiles'
+);
 
 await flushOrionStoreSave();
 const lastSave = JSON.parse(storeSaves.at(-1) ?? syncStoreSaves.at(-1) ?? '{}');

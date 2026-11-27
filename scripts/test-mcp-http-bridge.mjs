@@ -25,8 +25,10 @@ import {
 } from '../src/main/mcp-bridge.js';
 import { setProjectNotesReader } from '../src/main/project-notes-tool.js';
 import { setDeviceDataRootForTests } from '../src/main/devices/device-settings.js';
+import { writeThreadsPatch } from '../src/main/thread-storage.js';
 
-const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-mcp-http-bridge-'));
+const testRoot = await fs.mkdtemp(path.join('/tmp', 'om-'));
+app.setPath('userData', testRoot);
 setDeviceDataRootForTests(path.join(testRoot, 'device-data'));
 
 const postRpc = async (url, token, body, extraHeaders = {}) => {
@@ -345,6 +347,58 @@ try {
   assert.equal(blankRead.status, 200);
   assert.equal(blankRead.json.result.isError, true);
   assert.match(blankRead.json.result.content[0].text, /requires a string `thread_id`/);
+
+  // Thread-reads-thread over HTTP MCP bridge (e.g. plan rewrite reading an AgentMail research thread):
+  // returns a long final report in full and pages a >34k report cleanly with char_offset.
+  {
+    const researchCore = 'AGENTMAIL_KEY_FINDING_AT_14K: webhook signature uses Svix HMAC-SHA256';
+    const researchTail = 'AGENTMAIL_TAIL_PAST_34K: pricing tier limits';
+    const researchThread = {
+      id: 'research-agentmail-0001',
+      projectId: 'proj-http',
+      title: 'AgentMail research',
+      status: 'done',
+      modelId: 'claude:opus',
+      createdAt: '2026-11-27T00:00:00.000Z',
+      messages: [
+        { role: 'user', content: 'Research AgentMail integration.' },
+        {
+          role: 'agent',
+          content: `OPENING\n${'a'.repeat(14_000)}\n${researchCore}\n${'b'.repeat(21_000)}\n${researchTail}`,
+        },
+      ],
+    };
+    await writeThreadsPatch({ version: 2, upserts: [researchThread], deletes: [], order: [researchThread.id] });
+    const readFull = await postRpc(antigravityReg.httpUrl, antigravityReg.token, {
+      jsonrpc: '2.0',
+      id: 121,
+      method: 'tools/call',
+      params: { name: 'read_thread', arguments: { thread_id: researchThread.id, limit: 1 } },
+    });
+    assert.equal(readFull.status, 200);
+    assert.equal(readFull.json.result.isError, false);
+    const page1Text = readFull.json.result.content[0].text;
+    assert.ok(page1Text.includes(researchCore), 'thread-reads-thread receives finding past 6k on first call');
+    const nextPtr = page1Text.match(/offset=(\d+), limit=1, char_offset=(\d+)/);
+    assert.ok(nextPtr, 'thread-reads-thread gets exact char_offset continuation pointer');
+    const readRest = await postRpc(antigravityReg.httpUrl, antigravityReg.token, {
+      jsonrpc: '2.0',
+      id: 122,
+      method: 'tools/call',
+      params: {
+        name: 'read_thread',
+        arguments: {
+          thread_id: researchThread.id,
+          offset: Number(nextPtr[1]),
+          limit: 1,
+          char_offset: Number(nextPtr[2]),
+        },
+      },
+    });
+    assert.equal(readRest.status, 200);
+    assert.equal(readRest.json.result.isError, false);
+    assert.ok(readRest.json.result.content[0].text.includes(researchTail), 'thread-reads-thread reads tail via char_offset');
+  }
 
   // Real tool call: project_notes (happy path through dispatchBridgeToolCall)
   let capturedProjectRun = null;

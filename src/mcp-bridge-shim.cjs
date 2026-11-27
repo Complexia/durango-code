@@ -125,7 +125,7 @@ const waitSubagentsTool = {
 const readThreadTool = {
   name: 'read_thread',
   description:
-    'Read the transcript of another Durango Code thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Durango Code work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit.',
+    'Read the transcript of another Durango Code thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Durango Code work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit, or page through a very long message with offset, limit=1, and char_offset.',
   // Genuinely read-only: reads persisted transcripts and mutates nothing.
   // Mirrored in main's in-process SDK server for Claude runs; keep in sync.
   annotations: { readOnlyHint: true },
@@ -148,6 +148,12 @@ const readThreadTool = {
         minimum: 1,
         maximum: 200,
         description: 'Maximum number of messages to return (default 30)',
+      },
+      char_offset: {
+        type: 'integer',
+        minimum: 1,
+        description:
+          '1-based character offset into a long message\'s content (use with offset and limit=1 when a message was truncated).',
       },
     },
     required: ['thread_id'],
@@ -729,6 +735,9 @@ const serverInstructions = (all) => {
 // in-process HTTP MCP endpoint (src/main/mcp-bridge.js) so tool schemas,
 // compact listing, schema validation, and server instructions never diverge.
 const createOrionMcpBridgeHandler = ({
+  // A Durango bot's reply (src/main/mcp-bridge.js registerBotToolsBridge):
+  // only the bot's own tools, all from the app (`__tools`), listed in full.
+  botTools = false,
   devicesEnabled = false,
   compactTools = false,
   describeServer = false,
@@ -736,7 +745,8 @@ const createOrionMcpBridgeHandler = ({
   cacheExtraTools = true,
   callOrion,
 } = {}) => {
-  const tools = buildStaticBridgeTools({ devicesEnabled, backgroundSubagents });
+  if (botTools) compactTools = false;
+  const tools = botTools ? [] : buildStaticBridgeTools({ devicesEnabled, backgroundSubagents });
   const toolNames = new Set(tools.map((tool) => tool.name));
   // Tools whose full definition this run has been given (load_tools, or a
   // call refused for its arguments).
@@ -774,8 +784,8 @@ const createOrionMcpBridgeHandler = ({
       return reply(message.id, {
         protocolVersion: typeof requested === 'string' && requested ? requested : '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'orion', version: '1.0.0' },
-        ...(describeServer ? { instructions: serverInstructions([...tools, ...(await loadExtraTools())]) } : {}),
+        serverInfo: { name: botTools ? 'durango_bot' : 'orion', version: '1.0.0' },
+        ...(describeServer && !botTools ? { instructions: serverInstructions([...tools, ...(await loadExtraTools())]) } : {}),
       });
     }
     if (method === 'tools/list') {
@@ -850,6 +860,8 @@ const startStdioShim = () => {
   // returns once the subthread starts and wait_subagents collects the reports
   // (src/main/background-subagents.js).
   const backgroundSubagents = argv.includes('--background-subagents');
+  // A Durango bot's reply: only the bot's tools (see createOrionMcpBridgeHandler).
+  const botTools = argv.includes('--bot-tools');
 
   const write = (message) => {
     try {
@@ -908,6 +920,7 @@ const startStdioShim = () => {
     });
 
   const handler = createOrionMcpBridgeHandler({
+    botTools,
     devicesEnabled,
     compactTools,
     describeServer,

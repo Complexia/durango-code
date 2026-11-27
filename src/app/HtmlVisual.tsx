@@ -161,6 +161,7 @@ const VisualFrame: React.FC<FrameProps> = ({
     <dialog
       ref={dialogRef}
       role={expanded ? undefined : 'group'}
+      aria-modal={expanded ? true : undefined}
       aria-label={expanded ? undefined : visual.title}
       aria-labelledby={expanded ? headingId : undefined}
       onClose={(event) => {

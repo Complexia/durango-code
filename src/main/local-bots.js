@@ -10,13 +10,18 @@ import {
   BOT_THREAD_ACCESS_MODES,
   BOT_THREAD_REQUEST_RULE,
   BOT_THREAD_TOOLS,
+  botThreadTurnMessageId,
+  botThreadTurnNoticeId,
+  botThreadTurnNoticeText,
+  botThreadTurnReportText,
+  botThreadTurnTitle,
   resolveThreadModelChoice,
   threadNoticeText,
   threadReportFooter,
   threadReportText,
   withThreadReportFooter,
 } from './bot-thread-tools.js';
-import { clipMiddle } from '../report-clip.js';
+import { clipMiddle, compactFileLinks } from '../report-clip.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -48,10 +53,10 @@ export const LOCAL_BOT_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'm
 const LOCAL_BOT_EFFORT_SET = new Set(LOCAL_BOT_REASONING_EFFORTS);
 /** Models a local bot can be set to (its Claude Code on this machine). */
 export const LOCAL_BOT_MODEL_CHOICES = [
-  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', note: 'Smartest (the default)', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
-  { id: 'claude-fable-5-2', label: 'Claude Fable 5.2', note: 'Deep reasoning', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
-  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', note: 'Fast and capable', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
-  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', note: 'Cheapest', claude: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'medium' },
+  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', note: 'Smartest (the default)', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-fable-5-2', label: 'Claude Fable 5.2', note: 'Deep reasoning', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-sonnet-5-5', label: 'Claude Sonnet 5.5', note: 'Fast and capable', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'high' },
+  { id: 'claude-haiku-5-5', label: 'Claude Haiku 5.5', note: 'Cheapest', provider: 'Anthropic', lab: 'anthropic', claude: true, local: true, recommended: true, efforts: LOCAL_BOT_REASONING_EFFORTS, defaultEffort: 'medium' },
 ];
 
 export const defaultLocalBotReasoningEffort = (model) =>
@@ -111,9 +116,9 @@ How your inbox works:
 How your replies show: like texting, as messages you choose to send.
 - Whatever you write right before calling tools is sent at once as its own message. What you write after your last tool call is your final answer, its own message too. Nothing you send is merged, shortened or taken back, so write each message once, as the person should read it.
 - Your thinking is never shown. Anything the person should read must be in a message you write, never only in your thinking.
-- First, acknowledge: when a reply needs any tool call, start with one short line that shows you got it and what you're doing ("Nice one on the call. Checking SF weather now."), before the first call. A quick answer that needs no tools is just the answer.
+- First, acknowledge: when replying to the person and you need any tool call, start with one short line that shows you got it and what you're doing ("Nice one on the call. Checking SF weather now."), before the first call. A quick answer that needs no tools is just the answer. When waking up on a routine, task report, or bot message that might not need a reply, skip the opening line so you can stay silent if nothing needs saying.
 - Then progress, when it's worth it: during long or multi-step work, send a short update when there's something worth knowing (what you found, what you're on next, a step done), not before every tool call. Quick one- or two-step work needs none.
-- Last, the final answer: once the work is done, write the whole answer as your last message, after your last tool call. Every reply ends with it: never end on a tool call, and never leave the answer in your thinking or only in an earlier progress line.
+- Last, the final answer: once the work is done, write the whole answer as your last message, after your last tool call — never leave an answer in your thinking or only in an earlier progress line, and never end on a tool call unless you explicitly end the turn silently with \`stay_silent\`.
 - Cards go on the message you write them with: buttons (show_actions), pages (show_html) and questions (ask_user) attach to the text you wrote right before the call in the same step; called with no text before it, they go on the next message you write; files (attach_files) go with your final answer. For buttons under your final answer: call show_actions first (no text before it), then write the answer; don't mention the buttons.
 
 Stay responsive:
@@ -124,10 +129,13 @@ Stay responsive:
 - Your older messages are condensed into your summary. When it lacks a detail you need (exact wording, a link, a number, what was said or decided when), look it up with search_history instead of guessing or asking again.
 
 Routines and reports:
-- A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
+- Deciding whether to speak (\`stay_silent\`): not every wake-up needs a message in the thread — use your own judgment. When nothing needs to be said, do any quiet bookkeeping you need (memory, project notes, settling a finished thread, messaging another bot) and call \`stay_silent\` (with a brief \`reason\`) with no text before or after it. Everything you read stays in your history and memory for later turns; no message is posted, no notification is sent, and the person only sees a small "Read" mark on the inbox item. Good times to stay silent: a routine run that found nothing worth saying, an interim task report when the person asked to hear only when everything is done (or a routine "NOT FINISHED YET" status update that doesn't need their attention), a duplicate report or notice, or internal bot-to-bot coordination that needs nothing from the person. Never use \`stay_silent\` on the person's own direct messages — their direct messages should always get an answer. Don't call \`stay_silent\` after sending a message or card in the same turn, and never call \`notify_user\` on a silent turn.
+- A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, call \`stay_silent\` instead of posting filler.
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
+- Trimmed task reports ("…[middle trimmed: …]…"): when a report was trimmed, the omitted middle is often the core detail. Call read_thread with the thread id named in the marker and limit=1 to read just the full final message before summarizing or acting on it (page with offset/limit/char_offset only as far as needed — don't loop endlessly over massive raw dumps; summarize or link the thread/file instead). Never pass on a partial list or trimmed finding as if it were complete.
 - A task report that starts "NOT FINISHED YET" (or says the task isn't finished yet) is an update, not the outcome: the thread is still working in the background and reports again when it finishes. Tell the person briefly where it stands if it matters, don't report it as done, and don't start the work again.
 - "NEEDS THE PERSON" from a task's thread: it is blocked on the person (an approval, a question, an action) and stays blocked until they answer in that thread. Tell them right away what it needs, in a line or two. "LOOKS STUCK": check the thread before you cancel or redo the work.
+- A task report labelled "Ship button — …", "Person in thread — …" or "External turn — …" (saying the person tapped the Ship button, sent a message directly, or another agent/app ran a turn in a thread you started, not your own request) is an automatic update so you stay in sync with what happened there. Never echo or re-send that request back into the thread; note the outcome briefly for the person (and settle the thread if its work is now truly finished).
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
 
 Show, don't point: your thread renders rich replies, so use them.
@@ -161,7 +169,7 @@ export const LOCAL_TASK_PROMPT = `## You are running a task for a Durango bot
 
 A bot handed you this task. It runs in the background on this computer through Claude Code. Work through it fully and on your own: there is no one to answer questions mid-task, so make sensible assumptions and note them. Use your tools as needed.
 
-Your final reply is the report the bot receives: lead with the outcome or answer, then the details that matter (links, numbers, names, drafts), concise and complete. If something couldn't be done, say exactly what and why. Don't send, post, buy, apply or delete anything unless the task explicitly says to.`;
+Your final reply is the report the bot receives: lead with the outcome or answer, then the details that matter (links, numbers, names, drafts), concise and complete. Keep it compact: use plain path:line code references (not file:// markdown links) and leave long detail in a saved file when needed. If something couldn't be done, say exactly what and why. Don't send, post, buy, apply or delete anything unless the task explicitly says to.`;
 
 /** The summarizer's instructions: the summary chain (bot-memory.js). */
 export const LOCAL_COMPACTION_PROMPT = COMPACTION_PROMPT;
@@ -174,6 +182,17 @@ const clip = (value, max) => {
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 };
 const oneLine = (value) => str(value).replace(/\s+/g, ' ').trim();
+const normalizeLocalSilentReason = (value) => {
+  const clean = oneLine(value);
+  return clean ? clip(clean, 200) : null;
+};
+const localSilentReadNote = (silentRead) => {
+  if (!silentRead || typeof silentRead !== 'object') return '';
+  const reason = normalizeLocalSilentReason(silentRead.reason);
+  return reason
+    ? `(You already read this earlier and chose to stay silent: ${reason})`
+    : '(You already read this earlier and chose to stay silent.)';
+};
 const newId = (prefix) => `${prefix}${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`;
 const finite = (value, fallback) => (Number.isFinite(value) ? value : fallback);
 
@@ -200,6 +219,7 @@ export const durangoModelForLocalBot = (model) =>
 /** A Claude Code model id from what a bot asked for ("anthropic/claude-opus-5.5" works too), or null. */
 const claudeModelFrom = (value) => {
   const raw = oneLine(value).toLowerCase().replace(/^anthropic\//, '').replace(/\./g, '-');
+  if (raw === 'claude-code-cli') return null;
   return /^claude-[a-z0-9-]{2,60}(\[1m\])?$/.test(raw) ? raw : null;
 };
 
@@ -563,6 +583,21 @@ export const LOCAL_BOT_TOOLS = [
         options: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 120 }, minItems: 1, maxItems: 6 },
       },
       required: ['question', 'options'],
+    },
+  },
+  {
+    name: 'stay_silent',
+    description:
+      "End this turn silently without posting any message or sending any notification. The incoming inbox item still stays in your history and memory for later turns, and the person only sees a small 'Read' mark on the inbox item. Use this when nothing needs to be posted in the thread — e.g. a routine run with nothing worth saying, an interim task report when the person asked to hear only when everything is done, a duplicate report or notice, or quiet bookkeeping. Never use this when the person wrote a direct message, after already sending a message or card in this turn, or alongside notify_user. Call it with no text before or after it.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          maxLength: 200,
+          description: "Optional brief note on why you stayed silent (e.g. 'Waiting for remaining tasks', 'Routine found nothing new'). Shown only when the person inspects the Read mark, never posted as a message.",
+        },
+      },
     },
   },
   ...LOCAL_PROJECT_TOOLS,
@@ -942,6 +977,15 @@ const normalizeMessage = (raw) =>
                 .map((card) => ({ id: card.id, component: card.component, props: card.props })),
             }
           : {}),
+        // Inbox item handled silently (stay_silent).
+        ...(raw.silentRead && typeof raw.silentRead === 'object' && Number.isFinite(raw.silentRead.at)
+          ? {
+              silentRead: {
+                at: raw.silentRead.at,
+                ...(normalizeLocalSilentReason(raw.silentRead.reason) ? { reason: normalizeLocalSilentReason(raw.silentRead.reason) } : {}),
+              },
+            }
+          : {}),
       }
     : null;
 
@@ -1021,7 +1065,15 @@ export const createLocalBotEngine = ({
     if (!runtime) {
       // reportedThreads: threads that already reported (key → task), for the reports of turns they resume by themselves.
       // reportedSeqs: each thread's latest report number (key → seq): a notice for a run that already reported is dropped.
-      runtime = { replies: new Map(), tasks: new Map(), threads: new Map(), reportedThreads: new Map(), reportedSeqs: new Map(), pendingChecks: 0 };
+      runtime = {
+        replies: new Map(),
+        tasks: new Map(),
+        threads: new Map(),
+        reportedThreads: new Map(),
+        reportedSeqs: new Map(),
+        threadTurnReportedSeqs: new Map(),
+        pendingChecks: 0,
+      };
       runtimes.set(botId, runtime);
     }
     return runtime;
@@ -1507,6 +1559,8 @@ export const createLocalBotEngine = ({
     ].sort((a, b) => a - b);
     entry.bot.inFlight = [...new Set([...(entry.bot.inFlight ?? []), ...seqs])];
     for (const message of items) reply.claimSeqs.push(message.seq);
+    reply.silent = false;
+    reply.silentReason = null;
     if (beforeFinish) {
       // The draft final answer is replaced instead of posted, so clear its
       // reserved place and live text; the rewritten answer places below these.
@@ -1583,7 +1637,7 @@ export const createLocalBotEngine = ({
       });
     }
     if (counts.person === 0) {
-      lines.push({ text: "The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention." });
+      lines.push({ text: "The person didn't write this time: decide whether this warrants a message in the thread. If nothing needs to be said (e.g. a routine with nothing new, an interim task report while waiting for the rest, or a duplicate), do any quiet bookkeeping you need and call stay_silent with no text instead of posting. Use notify_user only when posting something worth their attention." });
     }
     if (counts.bot > 0) {
       lines.push({
@@ -1681,7 +1735,7 @@ export const createLocalBotEngine = ({
         id: message.id,
         seq: message.seq,
         role: message.role,
-        text: [message.content.trim(), files].filter(Boolean).join('\n'),
+        text: [message.content.trim(), files, localSilentReadNote(message.silentRead)].filter(Boolean).join('\n'),
         ...(message.role === 'user' && message.authorLabel ? { label: message.authorLabel } : {}),
       };
     };
@@ -1804,6 +1858,8 @@ export const createLocalBotEngine = ({
     reply.seq = undefined;
     reply.cards = [];
     reply.text = '';
+    reply.silent = false;
+    reply.silentReason = null;
     reply.sent = [...(reply.sent ?? []), id];
     reply.firstSeq ??= message.seq;
     insertMessage(entry, message);
@@ -1849,6 +1905,12 @@ export const createLocalBotEngine = ({
         accessMode: getAccessMode() || 'read-only',
         update: ({ text, activeTool } = {}) => {
           if (reply.cleared || reply.abort.signal.aborted) return;
+          if (reply.silent) {
+            reply.text = '';
+            reply.activeTool = activeTool || null;
+            changed();
+            return;
+          }
           if (typeof text === 'string') reply.text = text;
           // The reply takes its place in the thread when it first shows text:
           // what the person sends after that comes below it.
@@ -1862,10 +1924,43 @@ export const createLocalBotEngine = ({
         },
         takeInbox: async (options) => (reply.abort.signal.aborted ? [] : claim(entry, reply, options).map(inboxItem)),
         callTool: async ({ name, input, message }) => {
+          if (name === 'stay_silent') {
+            if ((reply.sent?.length ?? 0) > 0) {
+              return { result: { ok: false, error: 'You already sent a message in this turn — write a brief closing reply instead of staying silent.' } };
+            }
+            if ((reply.cards?.length ?? 0) > 0) {
+              return { result: { ok: false, error: 'You already showed a card in this turn — write a reply instead of staying silent.' } };
+            }
+            const hasPerson = reply.claimSeqs.some((seq) => {
+              const msg = entry.messages.find((item) => item.seq === seq);
+              return Boolean(msg && msg.role === 'user' && inboxSourceOf(msg.authorLabel) === 'person');
+            });
+            if (hasPerson) {
+              return { result: { ok: false, error: 'This turn includes a direct message from the person — always reply to them instead of staying silent.' } };
+            }
+            reply.silent = true;
+            reply.silentReason = normalizeLocalSilentReason(input?.reason);
+            reply.text = '';
+            reply.seq = undefined;
+            changed();
+            return {
+              result: {
+                ok: true,
+                silent: true,
+                note: 'Turn marked silent. Nothing from this turn will be posted to the person. Do not call stay_silent again — stop now (if your runtime requires a brief closing word like "Done", it will be discarded).',
+              },
+            };
+          }
+          if (name === 'notify_user' || name === 'ask_user') {
+            reply.silent = false;
+            reply.silentReason = null;
+          }
           // A card goes on the message it was made with (or the reply's next one).
           const shown = localCard(name, input, `ui-${reply.id}-${cardCount}`);
           if (!shown) return { result: await callTool(entry, name, input) };
           if (shown.error) return { result: { ok: false, error: shown.error } };
+          reply.silent = false;
+          reply.silentReason = null;
           const id = Number.isInteger(message) ? botReplyMessageId(reply.id, message) : null;
           if (!addReplyCards(entry, reply, [shown.card], id)) return { result: { ok: false, error: 'This message already shows as much as it can.' } };
           cardCount += 1;
@@ -1882,8 +1977,15 @@ export const createLocalBotEngine = ({
     // move its cursor past the reply, and a new message would start a reply
     // that doesn't see this one).
     const sentIds = reply.sent ?? [];
+    const text = str(outcome?.text).trim();
+    const failure = outcome?.failure ? clip(oneLine(outcome.failure), 300) : null;
+    const hasPersonClaim = reply.claimSeqs.some((seq) => {
+      const msg = entry.messages.find((item) => item.seq === seq);
+      return Boolean(msg && msg.role === 'user' && inboxSourceOf(msg.authorLabel) === 'person');
+    });
+    const silentEnd = !reply.abort.signal.aborted && !outcome?.aborted && !failure && !sentIds.length && !hasPersonClaim && (reply.silent === true || outcome?.silent === true);
     const attachments =
-      !reply.abort.signal.aborted && !outcome?.aborted && (str(outcome?.text).trim() || sentIds.length)
+      !reply.abort.signal.aborted && !outcome?.aborted && !silentEnd && (text || sentIds.length)
         ? await copyReplyFiles(reply.id, outcome?.files)
         : [];
     runtime.replies.delete(reply.id);
@@ -1901,9 +2003,22 @@ export const createLocalBotEngine = ({
       return;
     }
     settleClaims();
-    const text = str(outcome?.text).trim();
-    const failure = outcome?.failure ? clip(oneLine(outcome.failure), 300) : null;
-    const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : '');
+    if (silentEnd) {
+      const reason = normalizeLocalSilentReason(outcome?.silentReason) ?? reply.silentReason ?? null;
+      const silentRead = { at: now(), ...(reason ? { reason } : {}) };
+      let marked = false;
+      for (const seq of reply.claimSeqs) {
+        const msg = entry.messages.find((item) => item.seq === seq);
+        if (!msg || msg.role !== 'user' || inboxSourceOf(msg.authorLabel) === 'person') continue;
+        if (replaceMessage(entry, msg.id, () => ({ silentRead }))) marked = true;
+      }
+      persistBot(entry, { messages: marked });
+      changed();
+      if (!runtime.replies.size && hasUnclaimed(entry) && active && !entry.bot.paused) startReply(entry);
+      await compactIfNeeded(entry, { force: outcome?.compact === true });
+      return;
+    }
+    const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : !sentIds.length ? "Couldn't reply on this computer: no reply was produced." : '');
     // Its last message came before its last tool call: that is the answer, and
     // the files and cards made after it go with it.
     const last =
@@ -2016,7 +2131,7 @@ export const createLocalBotEngine = ({
         }
         runtime.tasks.delete(task.id);
         if (myGeneration !== generation || entries.get(entry.bot.id) !== entry || task.abort.signal.aborted || outcome?.aborted) return;
-        const text = clipMiddle(str(outcome?.text), LOCAL_BOT_TASK_RESULT_MAX_CHARS);
+        const text = clipMiddle(compactFileLinks(str(outcome?.text)), LOCAL_BOT_TASK_RESULT_MAX_CHARS);
         const report = text || `The task couldn't finish: ${clip(oneLine(outcome?.failure) || 'it ended without a report.', 300)}`;
         appendInbox(entry, { content: report, authorLabel: inboxLabel('task', task.title) });
       })()
@@ -2734,6 +2849,7 @@ export const createLocalBotEngine = ({
             : message.content,
           authorLabel: message.authorLabel,
           createdAt: message.createdAt,
+          ...(message.silentRead ? { silentRead: message.silentRead } : {}),
           // Not answered here yet: Durango answers it after the upload.
           ...(message.role === 'user' &&
           (message.seq > bot.processedSeq || (bot.requeue ?? []).includes(message.seq) || (bot.inFlight ?? []).includes(message.seq))
@@ -2789,7 +2905,7 @@ export const createLocalBotEngine = ({
     async setModel(botId, model, reasoningEffort) {
       await ensureLoaded();
       const entry = entryFor(botId);
-      if (model && !LOCAL_BOT_MODEL_CHOICES.some((choice) => choice.id === model)) throw new Error('Pick one of the bot models.');
+      if (model && !claudeModelFrom(model)) throw new Error('Pick one of the bot models.');
       if (!model && reasoningEffort === undefined) throw new Error('Pick a model or reasoning level.');
       const before = { model: entry.bot.model, modelChosen: entry.bot.modelChosen, reasoningEffort: entry.bot.reasoningEffort };
       if (model) applyModel(entry.bot, model);
@@ -3049,10 +3165,19 @@ export const createLocalBotEngine = ({
         end = Number.isInteger(beforeSeq) ? indexAfter(beforeSeq - 1) : all.length;
         start = Math.max(0, end - count);
       }
+      let slice = all.slice(start, end);
+      if (Number.isInteger(afterSeq)) {
+        const cutoff = now() - 5 * 60_000;
+        const seen = new Set(slice.map((message) => message.id));
+        const recentSilent = all
+          .slice(Math.max(0, start - 30), start)
+          .filter((message) => message.silentRead && message.silentRead.at >= cutoff && !seen.has(message.id));
+        if (recentSilent.length) slice = [...recentSilent, ...slice];
+      }
       return {
         bot: toDesktopBot(entry),
         ...(hasNewer !== undefined ? { hasNewer } : {}),
-        messages: all.slice(start, end).map(({ attachments, ...message }) => ({
+        messages: slice.map(({ attachments, ...message }) => ({
           ...message,
           // On this device: the files themselves (Durango Code shows images from their path).
           ...(attachments?.length
@@ -3146,12 +3271,15 @@ export const createLocalBotEngine = ({
         outcome === 'finished'
           ? withThreadReportFooter(
               clipMiddle(
-                threadReportText({
-                  summary: str(summary).trim() || 'The thread finished without a written summary.',
-                  waiting: stillWaiting ? waiting : [],
-                  later: !running && Boolean(task),
-                }),
-                bodyMax
+                compactFileLinks(
+                  threadReportText({
+                    summary: str(summary).trim() || 'The thread finished without a written summary.',
+                    waiting: stillWaiting ? waiting : [],
+                    later: !running && Boolean(task),
+                  })
+                ),
+                bodyMax,
+                { threadId: thread.threadId }
               ),
               thread
             )
@@ -3183,13 +3311,177 @@ export const createLocalBotEngine = ({
       const thread = { threadId: str(threadId).trim() || task?.threadId || '', project: task?.project ?? null };
       const message = appendInbox(entry, {
         id: `notice_${str(key).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120)}_${id}`,
-        content: withThreadReportFooter(threadNoticeText(title, kind, clipMiddle(str(detail), 4_000)), thread),
+        content: withThreadReportFooter(
+          threadNoticeText(title, kind, clipMiddle(str(detail), 4_000, { threadId: thread.threadId })),
+          thread
+        ),
         authorLabel: inboxLabel('task', title),
       });
       // On disk: in the saved transcript, or (trimmed past the cap) no longer kept at all.
       const onDisk = () => entries.get(botId) !== entry || !entry.messages.includes(message) || entry.disk?.messages?.get(message.id) === message;
       let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
       // A retry of a notice whose save failed (or hasn't run): save it again.
+      if (!saved) saved = (await persistBot(entry)) && onDisk();
+      return saved ? { ok: true } : { ok: false, retry: true };
+    },
+    /**
+     * Outcome of a turn started by the person or the Ship button in a thread
+     * originally started by a local bot. Goes back to that bot's inbox as a
+     * labelled task report (idempotent per threadId + seq).
+     */
+    async threadTurnSettled({
+      botId,
+      botName,
+      threadId,
+      threadTitle,
+      project,
+      trigger,
+      changeId,
+      surface,
+      promptPreview,
+      outcome,
+      summary,
+      error,
+      waiting,
+      later = false,
+      seq,
+    } = {}) {
+      await ensureLoaded();
+      const cleanThreadId = str(threadId).trim();
+      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' || trigger === 'external' ? trigger : null;
+      if (!cleanThreadId || !cleanTrigger || !Number.isSafeInteger(seq) || seq <= 0) return { ok: false };
+      const cleanBotId = str(botId).trim();
+      let entry = cleanBotId ? entries.get(cleanBotId) : null;
+      // Never fall back to `botName` when a `botId` was supplied (prevents
+      // routing a deleted/other-account bot's thread to a different bot with
+      // the same name).
+      if (!cleanBotId && str(botName).trim()) {
+        const wanted = str(botName).trim().toLowerCase();
+        const matches = [...entries.values()].filter((candidate) => candidate.bot.name.trim().toLowerCase() === wanted);
+        if (matches.length === 1) entry = matches[0];
+      }
+      if (!entry) return { ok: false };
+      const runtime = runtimeFor(entry.bot.id);
+      const stillWaiting = outcome === 'finished' && Array.isArray(waiting) && waiting.length > 0;
+      const reportedPrefix = botThreadTurnMessageId(cleanThreadId, 0).slice(0, -1);
+      let persistedMaxSeq = 0;
+      for (const m of entry.messages) {
+        if (!m?.id?.startsWith(reportedPrefix)) continue;
+        const tail = m.id.slice(reportedPrefix.length);
+        if (!/^\d+$/.test(tail)) continue;
+        const n = Number(tail);
+        if (Number.isSafeInteger(n) && n > persistedMaxSeq) persistedMaxSeq = n;
+      }
+      const reported = Math.max(runtime.threadTurnReportedSeqs.get(cleanThreadId) ?? 0, persistedMaxSeq);
+      if (stillWaiting && seq % 2 === 1 && reported >= seq) {
+        return { ok: true };
+      }
+      runtime.threadTurnReportedSeqs.set(cleanThreadId, Math.max(seq, reported));
+      while (runtime.threadTurnReportedSeqs.size > 200) {
+        runtime.threadTurnReportedSeqs.delete(runtime.threadTurnReportedSeqs.keys().next().value);
+      }
+      const thread = { threadId: cleanThreadId, project: str(project).trim() || null };
+      const footer = threadReportFooter(thread);
+      const bodyMax = Math.max(200, LOCAL_BOT_TASK_RESULT_MAX_CHARS - (footer ? footer.length + 2 : 0));
+      const rawReport =
+        outcome === 'finished'
+          ? compactFileLinks(str(summary).trim() || 'The thread finished without a written summary.')
+          : `The Durango Code thread didn't finish: ${clip(oneLine(error) || 'it stopped.', 300)}`;
+      const report = withThreadReportFooter(
+        clipMiddle(
+          botThreadTurnReportText({
+            trigger: cleanTrigger,
+            status: outcome === 'finished' ? 'done' : 'failed',
+            report: rawReport,
+            threadTitle,
+            changeId,
+            surface,
+            promptPreview,
+            waiting: stillWaiting ? waiting : [],
+            later: later === true,
+          }),
+          bodyMax,
+          { threadId: cleanThreadId }
+        ),
+        thread
+      );
+      const title = botThreadTurnTitle(cleanTrigger, threadTitle, changeId);
+      const message = appendInbox(entry, {
+        id: botThreadTurnMessageId(cleanThreadId, seq),
+        content: report,
+        authorLabel: inboxLabel('task', title),
+      });
+      const onDisk = () =>
+        entries.get(entry.bot.id) !== entry || !entry.messages.includes(message) || entry.disk?.messages?.get(message.id) === message;
+      let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
+      if (!saved) saved = (await persistBot(entry)) && onDisk();
+      return saved ? { ok: true } : { ok: false, retry: true };
+    },
+    /**
+     * Notice while a person-, Ship-button-, or externally-started turn in a
+     * local-bot-started thread still runs and needs the person or looks stuck.
+     */
+    async threadTurnNotice({
+      botId,
+      botName,
+      threadId,
+      threadTitle,
+      project,
+      trigger,
+      changeId,
+      surface,
+      kind,
+      noticeKey,
+      seq,
+      detail,
+    } = {}) {
+      await ensureLoaded();
+      const cleanThreadId = str(threadId).trim();
+      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' || trigger === 'external' ? trigger : null;
+      const id = str(noticeKey).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120);
+      if (!cleanThreadId || !cleanTrigger || !id || (kind !== 'input' && kind !== 'stuck')) return { ok: false };
+      const cleanBotId = str(botId).trim();
+      let entry = cleanBotId ? entries.get(cleanBotId) : null;
+      if (!cleanBotId && str(botName).trim()) {
+        const wanted = str(botName).trim().toLowerCase();
+        const matches = [...entries.values()].filter((candidate) => candidate.bot.name.trim().toLowerCase() === wanted);
+        if (matches.length === 1) entry = matches[0];
+      }
+      if (!entry) return { ok: false };
+      const runtime = runtimeFor(entry.bot.id);
+      const reportedPrefix = botThreadTurnMessageId(cleanThreadId, 0).slice(0, -1);
+      let persistedMaxSeq = 0;
+      for (const m of entry.messages) {
+        if (!m?.id?.startsWith(reportedPrefix)) continue;
+        const tail = m.id.slice(reportedPrefix.length);
+        if (!/^\d+$/.test(tail)) continue;
+        const n = Number(tail);
+        if (Number.isSafeInteger(n) && n > persistedMaxSeq) persistedMaxSeq = n;
+      }
+      const reported = Math.max(runtime.threadTurnReportedSeqs.get(cleanThreadId) ?? 0, persistedMaxSeq);
+      if (reported > 0 && Number.isSafeInteger(seq) && seq <= reported) {
+        return { ok: true, stale: true };
+      }
+      const thread = { threadId: cleanThreadId, project: str(project).trim() || null };
+      const title = botThreadTurnTitle(cleanTrigger, threadTitle, changeId);
+      const message = appendInbox(entry, {
+        id: botThreadTurnNoticeId(cleanThreadId, id),
+        content: withThreadReportFooter(
+          botThreadTurnNoticeText({
+            trigger: cleanTrigger,
+            kind,
+            detail: clipMiddle(compactFileLinks(str(detail)), 4_000, { threadId: cleanThreadId }),
+            threadTitle,
+            changeId,
+            surface,
+          }),
+          thread
+        ),
+        authorLabel: inboxLabel('task', title),
+      });
+      const onDisk = () =>
+        entries.get(entry.bot.id) !== entry || !entry.messages.includes(message) || entry.disk?.messages?.get(message.id) === message;
+      let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
       if (!saved) saved = (await persistBot(entry)) && onDisk();
       return saved ? { ok: true } : { ok: false, retry: true };
     },

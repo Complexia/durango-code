@@ -182,7 +182,15 @@ import {
   remoteThreadRuntime,
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
-import { dispatchProjectsPayload, startDurangoDispatchNotices, startDurangoDispatchReporter } from './app/durangoDispatch';
+import {
+  applyBotThreadTurnReported,
+  botThreadOwner,
+  botThreadTurnStateAfterEdit,
+  dispatchProjectsPayload,
+  stampNextBotThreadTurn,
+  startDurangoDispatchNotices,
+  startDurangoDispatchReporter,
+} from './app/durangoDispatch';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
 import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
@@ -275,6 +283,14 @@ const BotsWorkspace = React.lazy(() => loadBotsWorkspace().then((module) => ({ d
 import ThemeLayer from './app/themes/ThemeLayer';
 import { CommunityInstallDialog } from './app/themes/CommunityThemes';
 import { setBotsShellSlot } from './app/botsShellSlot';
+import {
+  getBotFileDropHandler,
+  hasFileDrag,
+  hasOpenModalDialog,
+  resolveRootFileDropTarget,
+  rootFileDropOverlayLabel,
+  useBotFileDropHandler,
+} from './app/rootFileDrop';
 import { useBotRefLinks } from './app/botRefLinks';
 import { BotsTabLoading, loadBotsWorkspace } from './app/SidebarModeHeader';
 // Remote control is opt-in and rarely on screen; keep its view out of the
@@ -1248,7 +1264,8 @@ const App: React.FC = () => {
         claimStart?: (threadId?: string) => Promise<boolean>,
         applyClaimedSettings?: () => void,
         extraContext?: string,
-        fromAgent?: boolean
+        fromAgent?: boolean,
+        botTurnTrigger?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
       ) => Promise<ThreadTurnStartResult>)
     | null
   >(null);
@@ -2227,8 +2244,8 @@ const App: React.FC = () => {
         return;
       }
       if (request.type === 'undelivered') {
-        // The agent's session ended before it saw these answers.
-        for (const text of request.texts) queueMessageToThread(thread.id, { text });
+        // The agent's session ended before it saw these answers: continue its active run chain.
+        for (const text of request.texts) queueMessageToThread(thread.id, { text, continuation: true });
         return;
       }
       if (request.type === 'resolve') {
@@ -5690,6 +5707,20 @@ const App: React.FC = () => {
     [composerDraft]
   );
 
+  const attachFilesToThread = useCallback(
+    async (threadId: string, files: FileList | File[]) => {
+      const selectedFiles = Array.from(files);
+      if (selectedFiles.length === 0) return false;
+
+      const savedAttachments = await saveFilesAsAttachments(selectedFiles);
+      if (!savedAttachments) return true;
+      appendComposerAttachments(threadId, savedAttachments);
+
+      return true;
+    },
+    [appendComposerAttachments]
+  );
+
   const attachFiles = useCallback(
     async (files: FileList | File[]) => {
       const selectedFiles = Array.from(files);
@@ -5698,13 +5729,9 @@ const App: React.FC = () => {
       const targetThreadId = resolveComposerTarget();
       if (!targetThreadId) return true;
 
-      const savedAttachments = await saveFilesAsAttachments(selectedFiles);
-      if (!savedAttachments) return true;
-      appendComposerAttachments(targetThreadId, savedAttachments);
-
-      return true;
+      return attachFilesToThread(targetThreadId, selectedFiles);
     },
-    [appendComposerAttachments, resolveComposerTarget]
+    [attachFilesToThread, resolveComposerTarget]
   );
 
   // SnapShot captures (src/main/snapshot.js) wait in main until collected:
@@ -5754,21 +5781,114 @@ const App: React.FC = () => {
     return useOrionStore.persist.onFinishHydration(push);
   }, [snapShotSettings]);
 
-  const handleRootDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
-    event.preventDefault();
-    dragDepth.current += 1;
-    setDraggingFiles(true);
-  }, []);
+  const botFileDropHandler = useBotFileDropHandler();
+  const canAttachToVisibleThread =
+    Boolean(selectedThread) &&
+    (paneThreadIds.length === 0 || paneThreadIds.includes(selectedThread!.id)) &&
+    !isNativeSubagentThread &&
+    !selectedThreadWorkspaceUnavailable;
 
-  const handleRootDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = 'copy';
-  }, []);
+  const resolveCurrentRootFileDropTarget = useCallback(
+    () =>
+      resolveRootFileDropTarget({
+        settingsOpen,
+        activeTab,
+        botsTabOpen,
+        sidebarV3View,
+        hasModalOpen: hasOpenModalDialog(),
+        canAttachToThread: canAttachToVisibleThread,
+        hasBotDropHandler: Boolean(getBotFileDropHandler()),
+      }),
+    [activeTab, botsTabOpen, canAttachToVisibleThread, settingsOpen, sidebarV3View]
+  );
+
+  const rootFileDropTarget = resolveRootFileDropTarget({
+    settingsOpen,
+    activeTab,
+    botsTabOpen,
+    sidebarV3View,
+    hasModalOpen: false,
+    canAttachToThread: canAttachToVisibleThread,
+    hasBotDropHandler: Boolean(botFileDropHandler),
+  });
+  const rootFileDropLabel = rootFileDropOverlayLabel(rootFileDropTarget, botFileDropHandler?.botName);
+
+  useEffect(() => {
+    if (!draggingFiles) return undefined;
+    const clear = () => {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+    };
+    if (rootFileDropTarget === 'none' || hasOpenModalDialog()) {
+      clear();
+      return undefined;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') clear();
+    };
+    window.addEventListener('dragend', clear);
+    window.addEventListener('blur', clear);
+    window.addEventListener('pointermove', clear, true);
+    window.addEventListener('mousedown', clear, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    let observer: MutationObserver | null = null;
+    if (typeof MutationObserver !== 'undefined' && document.body) {
+      observer = new MutationObserver(() => {
+        if (hasOpenModalDialog()) clear();
+      });
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['aria-modal', 'open'],
+      });
+    }
+    return () => {
+      window.removeEventListener('dragend', clear);
+      window.removeEventListener('blur', clear);
+      window.removeEventListener('pointermove', clear, true);
+      window.removeEventListener('mousedown', clear, true);
+      window.removeEventListener('keydown', onKeyDown, true);
+      observer?.disconnect();
+    };
+  }, [draggingFiles, rootFileDropTarget]);
+
+  const handleRootDragEnter = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDrag(event.dataTransfer)) return;
+      if (resolveCurrentRootFileDropTarget() === 'none') return;
+      event.preventDefault();
+      dragDepth.current += 1;
+      setDraggingFiles(true);
+    },
+    [resolveCurrentRootFileDropTarget]
+  );
+
+  const handleRootDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDrag(event.dataTransfer)) return;
+      if (resolveCurrentRootFileDropTarget() === 'none') {
+        if (dragDepth.current !== 0) {
+          dragDepth.current = 0;
+          setDraggingFiles(false);
+        }
+        return;
+      }
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    },
+    [resolveCurrentRootFileDropTarget]
+  );
 
   const handleRootDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    const nextTarget = event.relatedTarget as Node | null;
+    if (!nextTarget || !event.currentTarget.contains(nextTarget)) {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+      return;
+    }
+    if (!hasFileDrag(event.dataTransfer)) return;
+    if (dragDepth.current === 0) return;
     dragDepth.current = Math.max(0, dragDepth.current - 1);
     if (dragDepth.current === 0) {
       setDraggingFiles(false);
@@ -5777,15 +5897,23 @@ const App: React.FC = () => {
 
   const handleRootDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
-      if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+      if (!hasFileDrag(event.dataTransfer)) return;
       dragDepth.current = 0;
       setDraggingFiles(false);
-      // Taken by a drop target of its own (a Needs you reply).
+      // Taken by a drop target of its own (a Needs you reply, or the bot composer itself).
       if (event.defaultPrevented) return;
       event.preventDefault();
-      void attachFiles(event.dataTransfer.files);
+      if (event.dataTransfer.files.length === 0) return;
+      const target = resolveCurrentRootFileDropTarget();
+      if (target === 'bot') {
+        void getBotFileDropHandler()?.onDrop(event.dataTransfer.files);
+        return;
+      }
+      if (target === 'thread' && selectedThread) {
+        void attachFilesToThread(selectedThread.id, event.dataTransfer.files);
+      }
     },
-    [attachFiles]
+    [attachFilesToThread, resolveCurrentRootFileDropTarget, selectedThread]
   );
 
   // Durango workspaces (docs/workspaces.md). A thread that has never run gets
@@ -5863,6 +5991,44 @@ const App: React.FC = () => {
     [markWorkspaceThreads, updateThread]
   );
 
+  // When a non-bot-dispatched turn (Ship button, or a message the person typed
+  // on desktop, web, phone or remote) starts in a bot-started thread, record
+  // its run offset so its outcome and NEEDS THE PERSON / LOOKS STUCK notices
+  // report back to that bot's inbox. Bot-dispatched turns pass `null` and
+  // continuations keep the current chain's tracker, so nothing double-reports.
+  const stampBotThreadTurn = useCallback(
+    (
+      threadId: string,
+      promptText: string,
+      triggerOpt?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
+    ) => {
+      if (triggerOpt === null || continuationTurnsRef.current.has(threadId)) return;
+      const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      if (!current || !botThreadOwner(current)) return;
+      const loaded = loadedMessages(threadId);
+      const runOffset = loaded
+        ? loaded.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length
+        : current.summary.agentRunCount;
+      const trigger = triggerOpt?.trigger ?? 'person';
+      const surface = triggerOpt?.surface ?? (trigger === 'person' ? 'desktop' : undefined);
+      const changeId = triggerOpt?.changeId;
+      const promptPreview =
+        trigger !== 'ship_button' ? promptText.replace(/\s+/g, ' ').trim().slice(0, 240) || undefined : undefined;
+      updateThread(
+        threadId,
+        stampNextBotThreadTurn(current, {
+          runOffset,
+          trigger,
+          ...(changeId ? { changeId } : {}),
+          ...(surface ? { surface } : {}),
+          ...(promptPreview ? { promptPreview } : {}),
+          startedAt: new Date().toISOString(),
+        })
+      );
+    },
+    [updateThread]
+  );
+
   // Internal turn setup. The wrapper below owns the per-thread reservation
   // across this whole promise, including every asynchronous preflight.
   const startTurnForThreadUnlocked = useCallback(
@@ -5877,7 +6043,10 @@ const App: React.FC = () => {
       extraContext?: string,
       // An agent sent this turn (machine_run_agent from another machine);
       // it counts as the agent's only in a thread that agent created.
-      fromAgent?: boolean
+      fromAgent?: boolean,
+      // Null for bot-dispatched turns (reported by durangoDispatch); omitted for
+      // local person turns; explicit for Ship button / remote / external turns.
+      botTurnTrigger?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
     ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
       if (claimStart && !(await claimRemoteThreadStart(() => claimStart(threadId), applyClaimedSettings))) {
@@ -6204,6 +6373,7 @@ const App: React.FC = () => {
       });
       updateThread(threadId, { status: 'running' });
       pushLinkedTaskStatus(threadId, 'running');
+      stampBotThreadTurn(threadId, promptText, botTurnTrigger);
 
       const messageId = addMessageToThread(threadId, {
         ...(shownTurn ? { id: shownTurn.runMessage.id } : {}),
@@ -6342,6 +6512,7 @@ const App: React.FC = () => {
       pushLinkedTaskStatus,
       refreshLinkedTasksBeforeDispatch,
       ensureThreadDurangoWorkspace,
+      stampBotThreadTurn,
     ]
   );
 
@@ -6361,7 +6532,8 @@ const App: React.FC = () => {
       extraContext?: string,
       // An agent sent this turn (machine_run_agent from another machine);
       // it counts as the agent's only in a thread that agent created.
-      fromAgent?: boolean
+      fromAgent?: boolean,
+      botTurnTrigger?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
     ): Promise<ThreadTurnStartResult> => {
       // A thread on another machine starts its turns there, whichever path
       // (retry, follow-up, composer) asked for one.
@@ -6390,7 +6562,8 @@ const App: React.FC = () => {
               claimStart,
               applyClaimedSettings,
               extraContext,
-              fromAgent
+              fromAgent,
+              botTurnTrigger
             );
           } finally {
             release();
@@ -7002,6 +7175,8 @@ const App: React.FC = () => {
         );
       }
 
+      updateThread(threadId, { status: 'running' });
+      stampBotThreadTurn(threadId, rawText);
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
@@ -7016,7 +7191,6 @@ const App: React.FC = () => {
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
-      updateThread(threadId, { status: 'running' });
       pinThreadToBottom(threadId);
 
       void window.orion
@@ -7081,6 +7255,7 @@ const App: React.FC = () => {
       updateThreadMessage,
       clearActiveRun,
       resolveUtilityTurn,
+      stampBotThreadTurn,
     ]
   );
 
@@ -7112,7 +7287,8 @@ const App: React.FC = () => {
         base?: string;
         commit?: string;
         instructions?: string;
-      }
+      },
+      botTurnTrigger?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
@@ -7163,6 +7339,8 @@ const App: React.FC = () => {
         updateThread(threadId, { title: 'Review Changes' });
       }
 
+      updateThread(threadId, { status: 'running' });
+      stampBotThreadTurn(threadId, rawText, botTurnTrigger);
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
@@ -7177,7 +7355,6 @@ const App: React.FC = () => {
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
-      updateThread(threadId, { status: 'running' });
       pinThreadToBottom(threadId);
 
       void window.orion
@@ -7239,19 +7416,25 @@ const App: React.FC = () => {
       updateThread,
       updateThreadMessage,
       clearActiveRun,
+      stampBotThreadTurn,
     ]
   );
 
   // The run's context comes from the transcript: load it (and keep it
   // loaded) first, and refuse rather than run without it.
   const startReviewForThread = useCallback(
-    async (threadId: string, rawText: string, review: Parameters<typeof startReviewForThreadLoaded>[2]): Promise<{ ok: boolean; error?: string }> => {
+    async (
+      threadId: string,
+      rawText: string,
+      review: Parameters<typeof startReviewForThreadLoaded>[2],
+      botTurnTrigger?: Parameters<typeof startReviewForThreadLoaded>[3]
+    ): Promise<{ ok: boolean; error?: string }> => {
       const release = holdThreadTranscript(threadId);
       try {
         if (!(await loadThreadMessages(threadId)) && findThread(useOrionStore.getState().threads, threadId)) {
           return { ok: false, error: TRANSCRIPT_UNAVAILABLE_ERROR };
         }
-        return startReviewForThreadLoaded(threadId, rawText, review);
+        return startReviewForThreadLoaded(threadId, rawText, review, botTurnTrigger);
       } finally {
         release();
       }
@@ -7346,7 +7529,7 @@ const App: React.FC = () => {
       subagentReportThreadsRef.current.delete(threadId);
       void window.orion?.takeSubagentReports?.(threadId).then((result) => {
         if (!result?.text || !findThread(useOrionStore.getState().threads, threadId)) return;
-        queueMessageToThread(threadId, { text: result.text });
+        queueMessageToThread(threadId, { text: result.text, continuation: true });
       });
     }
   }, [threads, activeRunsByThread, queueMessageToThread, subagentReportsTick]);
@@ -8206,6 +8389,9 @@ const App: React.FC = () => {
             (exchange) => !exchange.afterMessageId || kept.some((message) => message.id === exchange.afterMessageId)
           ),
         }));
+        const priorRunCount = messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length;
+        const keptRunCount = kept.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length;
+        const editedThread = findThread(useOrionStore.getState().threads, editedThreadId);
         const context = buildEditedThreadContext(kept);
         updateThread(editedThreadId, {
           agentSessionIds: {},
@@ -8213,6 +8399,7 @@ const App: React.FC = () => {
           // A Codex goal lived in the dropped session.
           goal: undefined,
           pendingResumeContext: context || undefined,
+          ...(editedThread ? botThreadTurnStateAfterEdit(editedThread, priorRunCount, keptRunCount) : {}),
         });
       }
     }
@@ -9289,7 +9476,37 @@ const App: React.FC = () => {
                 : 'Thread not found on this machine.',
             };
           }
-          const result = await startReviewForThread(threadId, promptText, reviewCommand.review);
+          const reviewBotTrigger =
+            command.durangoDispatch?.origin === 'bot'
+              ? null
+              : command.botTurnTrigger ??
+                (command.fromAgent === true
+                  ? {
+                      trigger: 'external' as const,
+                      surface: command.source?.machineName?.trim()
+                        ? `another agent on ${command.source.machineName.trim()}`
+                        : 'another agent',
+                    }
+                  : command.durangoDispatch?.origin === 'api'
+                    ? {
+                        trigger: 'external' as const,
+                        surface: command.durangoDispatch.sourceLabel?.trim() || 'a connected app (API)',
+                      }
+                    : command.durangoDispatch?.origin === 'tasks'
+                      ? {
+                          trigger: 'external' as const,
+                          surface: command.durangoDispatch.sourceLabel?.trim() || 'Durango Tasks',
+                        }
+                      : command.durangoDispatch?.origin === 'chat'
+                        ? {
+                            trigger: 'person' as const,
+                            surface: command.durangoDispatch.sourceLabel?.trim() || 'Durango Chat',
+                          }
+                        : {
+                            trigger: 'person' as const,
+                            surface: command.source?.machineName?.trim() || 'remote',
+                          });
+          const result = await startReviewForThread(threadId, promptText, reviewCommand.review, reviewBotTrigger);
           if (!result.ok && createdThread) useOrionStore.getState().deleteThread(threadId);
           return result.ok
             ? { ok: true, threadId }
@@ -9372,6 +9589,7 @@ const App: React.FC = () => {
             updateThread(threadId, {
               ...(botName ? { startedByBot: botName } : !botId ? { startedByBot: 'bot' } : {}),
               ...(botId ? { startedByBotId: botId } : {}),
+              startedByBotDispatchId: dispatch.id,
             });
           }
           const accessLabel =
@@ -9397,6 +9615,36 @@ const App: React.FC = () => {
             void window.orion?.unlinkBoardTask?.({ taskId: dispatchLinkedTaskId, threadId }).catch(() => {});
           }
         };
+        const remoteBotTurnTrigger =
+          dispatch?.origin === 'bot'
+            ? null
+            : command.botTurnTrigger ??
+              (command.fromAgent === true
+                ? {
+                    trigger: 'external' as const,
+                    surface: command.source?.machineName?.trim()
+                      ? `another agent on ${command.source.machineName.trim()}`
+                      : 'another agent',
+                  }
+                : dispatch?.origin === 'api'
+                  ? {
+                      trigger: 'external' as const,
+                      surface: dispatch.sourceLabel?.trim() || 'a connected app (API)',
+                    }
+                  : dispatch?.origin === 'tasks'
+                    ? {
+                        trigger: 'external' as const,
+                        surface: dispatch.sourceLabel?.trim() || 'Durango Tasks',
+                      }
+                    : dispatch?.origin === 'chat'
+                      ? {
+                          trigger: 'person' as const,
+                          surface: dispatch.sourceLabel?.trim() || 'Durango Chat',
+                        }
+                      : {
+                          trigger: 'person' as const,
+                          surface: command.source?.machineName?.trim() || 'remote',
+                        });
         const start = thread
           ? startTurnForThreadRef.current?.(
               threadId,
@@ -9406,7 +9654,8 @@ const App: React.FC = () => {
               claimStart,
               applyClaimedSettings,
               typeof command.context === 'string' ? command.context : undefined,
-              command.fromAgent === true
+              command.fromAgent === true,
+              remoteBotTurnTrigger
             )
           : undefined;
         if (!start) {
@@ -9936,10 +10185,12 @@ const App: React.FC = () => {
   );
 
   // Durango Chat dispatch and bots: report each dispatched thread's outcome
-  // back to whoever started it (app/durangoDispatchReporter.ts).
+  // back to whoever started it, plus every later person / Ship-button turn in
+  // a bot-started thread back to the starting bot (app/durangoDispatch.ts).
   useEffect(() => {
     const settle = window.orion?.durangoDispatchSettled;
     if (!settle) return undefined;
+    const settleBotTurn = window.orion?.botThreadTurnSettled;
     return startDurangoDispatchReporter({
       getState: () => useOrionStore.getState(),
       subscribe: (listener) => useOrionStore.subscribe(listener),
@@ -9949,14 +10200,29 @@ const App: React.FC = () => {
         const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.durangoDispatch;
         if (current?.id === dispatchId) updateThread(threadId, { durangoDispatch: { ...current, ...reported } });
       },
+      ...(settleBotTurn
+        ? {
+            settleBotTurn: (input) => settleBotTurn(input),
+            markBotTurnReported: (threadId, runOffset, reported, seqBase) => {
+              const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+              if (!current) return;
+              const patch = applyBotThreadTurnReported(current, runOffset, reported, seqBase);
+              if (patch) updateThread(threadId, patch);
+            },
+          }
+        : {}),
+      getProjectName: (projectId) =>
+        projectId ? useOrionStore.getState().projects.find((project) => project.id === projectId)?.name : undefined,
     });
   }, [updateThread]);
 
-  // While a dispatched thread (a bot's task) still runs, its bot hears at once
-  // when it needs the person or looks stuck (startDurangoDispatchNotices).
+  // While a dispatched thread (a bot's task) or a later person / Ship-button
+  // turn in a bot-started thread still runs, its bot hears at once when it
+  // needs the person or looks stuck (startDurangoDispatchNotices).
   useEffect(() => {
     const notice = window.orion?.durangoDispatchNotice;
     if (!notice) return undefined;
+    const noticeBotTurn = window.orion?.botThreadTurnNotice;
     return startDurangoDispatchNotices({
       getState: () => useOrionStore.getState(),
       subscribe: (listener) => useOrionStore.subscribe(listener),
@@ -9970,6 +10236,9 @@ const App: React.FC = () => {
       },
       runMessageId: (runId) => runOutputMessages.current.get(runId)?.messageId,
       notice: (input) => notice(input),
+      ...(noticeBotTurn ? { noticeBotTurn: (input) => noticeBotTurn(input) } : {}),
+      getProjectName: (projectId) =>
+        projectId ? useOrionStore.getState().projects.find((project) => project.id === projectId)?.name : undefined,
     });
   }, []);
 
@@ -11636,7 +11905,7 @@ const App: React.FC = () => {
 
   return (
     <div
-      className={`app-container ${draggingFiles ? 'dragging-files' : ''}`}
+      className={`app-container ${draggingFiles && rootFileDropLabel ? 'dragging-files' : ''}`}
       onDragEnter={handleRootDragEnter}
       onDragOver={handleRootDragOver}
       onDragLeave={handleRootDragLeave}
@@ -11667,11 +11936,11 @@ const App: React.FC = () => {
       />
       <ImageLightbox />
       <ConfirmDialogHost />
-      {draggingFiles && (
-        <div className="file-drop-overlay">
+      {draggingFiles && rootFileDropLabel && (
+        <div className="file-drop-overlay" data-drop-target={rootFileDropTarget}>
           <div className="file-drop-target">
             <Paperclip size={28} />
-            <span>Drop files to attach</span>
+            <span>{rootFileDropLabel}</span>
           </div>
         </div>
       )}

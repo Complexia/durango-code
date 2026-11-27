@@ -133,7 +133,7 @@ export const MACHINE_TOOL_DEFINITIONS = Object.freeze([
     name: 'machine_read_thread',
     readOnly: true,
     description:
-      "Read the transcript of a Durango Code thread on another machine by its id there (from machine_threads or machine_run_agent). Returns the newest page of messages by default; page with offset/limit.",
+      "Read the transcript of a Durango Code thread on another machine by its id there (from machine_threads or machine_run_agent). Returns the newest page of messages by default; page with offset/limit, or use offset + limit=1 + char_offset to read the rest of a very long message.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -145,6 +145,11 @@ export const MACHINE_TOOL_DEFINITIONS = Object.freeze([
           description: '1-based index of the first message to return (oldest first). Omit for the newest messages.',
         },
         limit: { type: 'integer', minimum: 1, maximum: 200, description: 'Maximum number of messages (default 30)' },
+        char_offset: {
+          type: 'integer',
+          minimum: 1,
+          description: "1-based character offset into a long message's content (use with offset and limit=1 when a message was truncated).",
+        },
       },
       required: ['thread_id'],
       additionalProperties: false,
@@ -464,6 +469,7 @@ const machineReadThread = async (args) => {
     text: formatThreadForAgent(thread, {
       offset: args.offset,
       limit: args.limit,
+      charOffset: args.char_offset,
       toolCall: 'machine_read_thread',
       extraHeader: [`machine: ${machine.name} (id: ${machine.id})`],
       link: false,

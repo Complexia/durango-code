@@ -56,6 +56,15 @@ test('merging a page keeps unchanged messages as the same objects (no redraw)', 
   const withFiles = [message(1, { files: [{ name: 'a.png', size: 3 }] })];
   assert.equal(mergeBotMessages(withFiles, [message(1, { files: [{ name: 'a.png', size: 3 }] })]), withFiles);
   assert.notEqual(mergeBotMessages(withFiles, [message(1, { files: [{ name: 'b.png', size: 3 }] })]), withFiles);
+  // Silent read mark: adding or changing silentRead triggers a row update; identical keeps object.
+  const inbox = [message(2, { role: 'user', authorLabel: 'Task: Build' })];
+  const marked = mergeBotMessages(inbox, [message(2, { role: 'user', authorLabel: 'Task: Build', silentRead: { at: 100, reason: 'Interim' } })]);
+  assert.notEqual(marked, inbox);
+  assert.equal(marked[0].silentRead?.reason, 'Interim');
+  assert.equal(
+    mergeBotMessages(marked, [message(2, { role: 'user', authorLabel: 'Task: Build', silentRead: { at: 100, reason: 'Interim' } })]),
+    marked
+  );
 });
 
 test('older pages merge in seq order, all the way back past 200 and 2,000', () => {

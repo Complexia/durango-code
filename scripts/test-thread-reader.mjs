@@ -3,11 +3,24 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-import { app } from 'electron';
+import { app, dialog } from 'electron';
+
+// Never block CI or the desktop with Electron's modal error box on assertion failure.
+app.dock?.hide?.();
+dialog.showErrorBox = (title, content) => {
+  console.error(`${title}: ${content}`);
+};
+const failAndExit = (error) => {
+  console.error(error);
+  app.exit(1);
+};
+process.on('uncaughtException', failAndExit);
+process.on('unhandledRejection', failAndExit);
 
 const testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-thread-reader-'));
 app.setPath('userData', testDataDir);
 
+let exitCode = 0;
 try {
   const { getStorageFilePath, getThreadsFilePath } = await import('../src/main/paths.js');
   const { writeThreadsPatch } = await import('../src/main/thread-storage.js');
@@ -208,8 +221,130 @@ try {
     setThreadReaderRemoteFetch(null);
   }
 
+  // Long final message (the audit case): returned in full on the default page even
+  // alongside huge tool activity, and messages past the 34,000-char single-message
+  // budget can be paged cleanly with offset + limit=1 + char_offset without splitting
+  // UTF-16 surrogate pairs.
+  {
+    const coreFinding = 'NON-ACP PATH #7: code/src/main/usage-stats.js:412 reads ~/.gemini/antigravity-cli/brain';
+    const auditFinal = [
+      '### 1. Does every Antigravity path go through ACP?',
+      'A'.repeat(7_500),
+      coreFinding,
+      'B'.repeat(7_500),
+      '### 4. Dead or leftover code: none remaining after 71b83f90.',
+    ].join('\n');
+    thread.messages = [
+      { role: 'user', content: 'Audit Antigravity integration.' },
+      {
+        role: 'agent',
+        content: auditFinal,
+        activities: Array.from({ length: 20 }, (_, i) => ({
+          title: `Command ${i + 1}`,
+          input: 'i'.repeat(1_500),
+          output: 'o'.repeat(3_500),
+        })),
+      },
+    ];
+    await persistThread();
+    const auditPage = await readThreadForAgent({ thread_id: thread.id });
+    assert.ok(auditPage.includes(coreFinding), 'final message core finding is returned in full on default read_thread');
+    assert.ok(auditPage.includes('### 4. Dead or leftover code'), 'final message closing is intact');
+    assert.doesNotMatch(auditPage, /\[message truncated/, 'final message under 34,000 chars is not truncated');
+    assert.match(auditPage, /\[message details truncated\]/, 'huge tool activities are bounded separately from message content');
+
+    // A very long final message (> 24,000 default / > 34,000 limit=1) pages losslessly with char_offset.
+    const middleMarker = 'MIDDLE_FINDING_AT_35K';
+    const endMarker = 'END_OF_45K_REPORT';
+    const hugeFinal = `START_OF_45K_REPORT\n${'x'.repeat(34_500)}\n${middleMarker}\n${'y'.repeat(8_000)}\n${endMarker}`;
+    thread.messages = [
+      { role: 'user', content: 'Huge report please.' },
+      { role: 'agent', content: hugeFinal },
+    ];
+    await persistThread();
+    // Single-message read (limit=1) gets 34,000 chars and pages to the remainder cleanly.
+    const chunk1 = await readThreadForAgent({ thread_id: thread.id, limit: 1 });
+    const nextMatch = chunk1.match(/offset=(\d+), limit=1, char_offset=(\d+) to read more/);
+    assert.ok(nextMatch, 'truncated long message prints exact char_offset continuation pointer');
+    assert.equal(Number(nextMatch[1]), 2);
+    const nextOffset = Number(nextMatch[2]);
+    assert.ok(nextOffset > 30_000 && nextOffset <= 34_001);
+    const chunk2 = await readThreadForAgent({
+      thread_id: thread.id,
+      offset: Number(nextMatch[1]),
+      limit: 1,
+      char_offset: nextOffset,
+    });
+    assert.ok(chunk2.includes(middleMarker), 'char_offset continuation includes middle past 34k');
+    assert.ok(chunk2.includes(endMarker), 'char_offset continuation reaches end of message');
+    assert.match(chunk2, /end of message\.\)/);
+
+    // Context eviction protection: 2-message thread with 4,500-char user prompt + 24,000-char
+    // final reply + 20 huge tool activities keeps Message 1/2 (user prompt) without evicting it.
+    thread.messages = [
+      { role: 'user', content: `USER_PROMPT_MARKER\n${'u'.repeat(4_500)}` },
+      {
+        role: 'agent',
+        content: `FINAL_24K_START\n${'f'.repeat(23_500)}\nFINAL_24K_END`,
+        activities: Array.from({ length: 20 }, (_, i) => ({
+          title: `Tool ${i + 1}`,
+          input: '🚀'.repeat(1_000),
+          output: '🚀'.repeat(2_000),
+        })),
+      },
+    ];
+    await persistThread();
+    const nonEvicted = await readThreadForAgent({ thread_id: thread.id });
+    assert.match(nonEvicted, /Showing messages 1–2 of 2/, 'user prompt is not evicted by final message details');
+    assert.ok(nonEvicted.includes('USER_PROMPT_MARKER'));
+    assert.ok(nonEvicted.includes('FINAL_24K_END'));
+    assert.equal(nonEvicted.isWellFormed(), true, 'emoji details truncation stays UTF-16 well-formed');
+
+    // Trailing lone low surrogate at content.length - 1 never produces an inverted char_offset range.
+    const loneLowTail = 'abc\udc00';
+    thread.messages = [{ role: 'agent', content: loneLowTail }];
+    await persistThread();
+    const loneLowPage = await readThreadForAgent({ thread_id: thread.id, offset: 1, limit: 1, char_offset: 4 });
+    assert.match(loneLowPage, /past the end of message 1/);
+    assert.doesNotMatch(loneLowPage, /5–4/);
+
+    // Non-final long message: truncated at 6,000 on multi-message page with pointer,
+    // and readable in full via offset + limit=1.
+    const earlierLong = `EARLIER_HEAD\n${'e'.repeat(8_000)}\nEARLIER_TAIL`;
+    thread.messages = [
+      { role: 'agent', content: earlierLong },
+      { role: 'user', content: 'Thanks.' },
+      { role: 'agent', content: 'Short final reply.' },
+    ];
+    await persistThread();
+    const multiPage = await readThreadForAgent({ thread_id: thread.id });
+    assert.match(multiPage, /offset=1, limit=1, char_offset=6001 to read more/);
+    const earlierFull = await readThreadForAgent({ thread_id: thread.id, offset: 1, limit: 1 });
+    assert.ok(earlierFull.includes('EARLIER_HEAD') && earlierFull.includes('EARLIER_TAIL'));
+    assert.doesNotMatch(earlierFull, /\[message truncated/);
+
+    // Surrogate-pair safety at char_offset boundary.
+    const emojiReport = '🚀'.repeat(20_000);
+    thread.messages = [{ role: 'agent', content: emojiReport }];
+    await persistThread();
+    const emojiChunk1 = await readThreadForAgent({ thread_id: thread.id });
+    assert.equal(emojiChunk1.isWellFormed(), true, 'emoji chunk 1 well-formed');
+    const emojiNext = emojiChunk1.match(/char_offset=(\d+)/);
+    assert.ok(emojiNext);
+    const emojiChunk2 = await readThreadForAgent({
+      thread_id: thread.id,
+      offset: 1,
+      limit: 1,
+      char_offset: Number(emojiNext[1]),
+    });
+    assert.equal(emojiChunk2.isWellFormed(), true, 'emoji chunk 2 well-formed');
+  }
+
   console.log('Thread reader regression checks passed.');
+} catch (error) {
+  console.error(error);
+  exitCode = 1;
 } finally {
   await fs.rm(testDataDir, { recursive: true, force: true });
-  app.quit();
+  app.exit(exitCode);
 }

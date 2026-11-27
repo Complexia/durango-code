@@ -95,7 +95,9 @@ import {
 
 export { createBotSessionStore };
 
-// Bot replies: a Durango bot's reply, run here on the person's own Claude Code.
+// Bot replies: a Durango bot's reply, run here on the person's own Claude Code
+// (Claude models; other models run on this machine's Codex, Antigravity, Grok
+// or Muse: bot-harness-lanes.js, the same worker and contract).
 //
 // Durango bots are always-on assistants with a chat thread on Durango. While
 // the person is signed in, Claude Code is available here and "Answer your
@@ -166,6 +168,13 @@ const UNAVAILABLE_RECHECK_MS = 60_000;
 const REPORT_RETRY_DELAYS_MS = [1_000, 4_000, 10_000];
 
 const BOT_TOOL_PREFIX = `mcp__${BOT_MCP_SERVER}__`;
+// Tools that put something in front of the person: calling one ends a silent turn (stay_silent).
+export const SILENT_BREAKING_TOOLS = new Set(['ask_user', 'show_actions', 'show_html', 'notify_user', 'attach_files']);
+export const normalizeSilentReason = (value) => {
+  if (typeof value !== 'string') return null;
+  const clean = value.replace(/\s+/g, ' ').trim();
+  return clean ? clean.slice(0, 200) : null;
+};
 
 const formatBotInboxItems = (items) =>
   items.map((item) =>
@@ -314,6 +323,12 @@ export const presenceOf = (info) => ({
     .slice(0, 100)
     .map((project) => ({ name: project.name, id: project.id, repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null })),
   models: (Array.isArray(info?.models) ? info.models : []).filter((model) => typeof model === 'string' && model).slice(0, 20),
+  // The Durango bot models this machine answers with on its harnesses
+  // (bot-harness-models.js localBotModelIds): Durango routes a bot here only
+  // when its models are among them.
+  ...(Array.isArray(info?.localModels)
+    ? { localModels: info.localModels.filter((model) => typeof model === 'string' && model).slice(0, 80) }
+    : {}),
 });
 
 /** The bot's working directory: `<botsDir>/<botId>`, the id made path-safe. */
@@ -567,6 +582,12 @@ export const createClaudeLaneRunner = ({
   const systemAppend = projectsNote ? `${lane.systemPrompt}\n\n${projectsNote}` : lane.systemPrompt;
 
   // --- the bot's tools ---------------------------------------------------------------
+  let silent = false;
+  let silentReason = null;
+  const clearSilent = () => {
+    silent = false;
+    silentReason = null;
+  };
   const toolUseIds = new Map(); // tool name -> tool_use ids waiting for their handler
   const botTools = lane.tools.map((definition) =>
     sdk.tool(
@@ -579,6 +600,17 @@ export const createClaudeLaneRunner = ({
           // The message this call was made with is sent (and known) first.
           const message = await messageOfCall(toolCallId);
           const { result } = await ctx.callTool({ name: definition.name, input: args ?? {}, toolCallId, message });
+          if (definition.name === 'stay_silent' && result?.ok === true && result?.silent === true) {
+            silent = true;
+            silentReason = normalizeSilentReason(args?.reason);
+            blocks.length = 0;
+            finalStart = 0;
+            toolBoundaries.length = 0;
+            partial = '';
+            update();
+          } else if (SILENT_BREAKING_TOOLS.has(definition.name)) {
+            clearSilent();
+          }
           return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result ?? null) }] };
         } catch (error) {
           return {
@@ -602,6 +634,7 @@ export const createClaudeLaneRunner = ({
         ATTACH_FILES_TOOL.description,
         zodShapeForInputSchema(z, ATTACH_FILES_TOOL.inputSchema),
         async (args) => {
+          clearSilent();
           const lines = await replyFiles.add(Array.isArray(args?.paths) ? args.paths : []);
           return { content: [{ type: 'text', text: lines.join('\n') || 'Nothing to attach.' }] };
         },
@@ -699,7 +732,7 @@ export const createClaudeLaneRunner = ({
   const currentText = () => [pendingText(), partial.trim()].filter(Boolean).join('\n\n');
   // Sends the message written so far as one of its own → its index, or null (nothing to send).
   const sendPending = () => {
-    if (!sendsMessages || sentCount >= BOT_REPLY_MESSAGES_MAX) return null;
+    if (!sendsMessages || sentCount >= BOT_REPLY_MESSAGES_MAX || silent) return null;
     const text = pendingText();
     if (!text) return null;
     const index = sentCount;
@@ -757,7 +790,7 @@ export const createClaudeLaneRunner = ({
     const names = [...toolCalls.values()];
     return names.length ? botToolLabel(names[names.length - 1]) : null;
   };
-  const update = () => ctx.update({ text: currentText(), activeTool: activeTool() });
+  const update = () => ctx.update({ text: silent ? '' : currentText(), activeTool: activeTool() });
 
   // --- inbox: taken between steps, read at the next tool result or turn end -------
   const pendingInbox = [];
@@ -795,6 +828,7 @@ export const createClaudeLaneRunner = ({
   };
   const takePending = () => {
     const items = pendingInbox.splice(0);
+    if (items.length) clearSilent();
     for (const item of items) if (Number.isInteger(item?.seq)) deliveredSeqs.push(item.seq);
     deliveredItems.push(...items);
     return items;
@@ -805,8 +839,15 @@ export const createClaudeLaneRunner = ({
     if (input?.agent_id) return { continue: true };
     const items = takePending();
     if (finalInboxRounds < maxFinalInboxRounds) void requestInbox();
-    if (!items.length) return { continue: true };
-    return { hookSpecificOutput: { hookEventName, additionalContext: formatBotInbox(items) } };
+    if (items.length) {
+      return { hookSpecificOutput: { hookEventName, additionalContext: formatBotInbox(items) } };
+    }
+    // Once stay_silent succeeds and nothing new arrived, stop the turn right away
+    // so Claude Code does not spin extra steps trying to emit an empty message.
+    if (hookEventName === 'PostToolUse' && silent && input?.tool_name === `${BOT_TOOL_PREFIX}stay_silent`) {
+      return { continue: false, stopReason: 'stay_silent' };
+    }
+    return { continue: true };
   };
 
   // --- the run -------------------------------------------------------------------------
@@ -1028,6 +1069,7 @@ export const createClaudeLaneRunner = ({
     !isRetryElsewhereError(failureText(attempt));
   const startOver = async (nextPlan) => {
     plan = nextPlan;
+    clearSilent();
     blocks.length = 0;
     finalStart = 0;
     toolBoundaries.length = 0;
@@ -1132,6 +1174,9 @@ export const createClaudeLaneRunner = ({
   // Messages it sent before its final answer.
   const withSent = sentCount ? { sent: sentCount } : {};
   if (ctx.signal?.aborted) return { text: written, aborted: true, ...withSent, ...withModel, ...extras };
+  if (succeeded(attempt) && silent && sentCount === 0) {
+    return { text: '', silent: true, ...(silentReason ? { silentReason } : {}), ...withModel, ...extras };
+  }
   // Screenshots the text names are attached too; their /tmp embeds leave the text.
   const { text, files } = attaches
     ? await finishReplyFiles(written, replyFiles).catch(() => ({ text: written, files: replyFiles.list() }))
@@ -1537,6 +1582,10 @@ export const createBotReplyWorker = ({
           }
           items.push(item);
         }
+        if (items.length) {
+          entry.silent = false;
+          entry.silentReason = null;
+        }
         if (beforeFinish && items.some((item) => item?.source === 'person')) {
           entry.text = '';
         }
@@ -1548,7 +1597,7 @@ export const createBotReplyWorker = ({
 
     const update = ({ text, activeTool } = {}) => {
       if (abort.signal.aborted) return;
-      const nextText = typeof text === 'string' ? text : entry.text;
+      const nextText = entry.silent ? '' : typeof text === 'string' ? text : entry.text;
       const nextTool = activeTool || null;
       if (nextText === entry.text && nextTool === entry.activeTool) return;
       entry.text = nextText;
@@ -1582,6 +1631,8 @@ export const createBotReplyWorker = ({
     // progress posts (the live text after it shows only what follows it).
     // → whether it was stored.
     const sendMessage = ({ index, text, modelId }) => {
+      entry.silent = false;
+      entry.silentReason = null;
       const next = entry.chain.then(async () => {
         if (abort.signal.aborted) return false;
         try {
@@ -1885,6 +1936,19 @@ export const createBotReplyWorker = ({
           return { result: { ok: false, error: error?.message ?? String(error) } };
         }
       }
+      if (name === 'stay_silent') {
+        const response = await callServerTool({ name, input, toolCallId, message });
+        if (response?.result?.ok === true && response?.result?.silent === true) {
+          entry.silent = true;
+          entry.silentReason = normalizeSilentReason(input?.reason);
+          entry.text = '';
+        }
+        return response;
+      }
+      if (SILENT_BREAKING_TOOLS.has(name)) {
+        entry.silent = false;
+        entry.silentReason = null;
+      }
       return callServerTool({ name, input, toolCallId, message });
     };
 
@@ -1928,13 +1992,18 @@ export const createBotReplyWorker = ({
         const failure = outcome?.failure ? shorten(outcome.failure) : null;
         // Messages it already sent (their files go on the last one).
         const sent = Number.isInteger(outcome?.sent) ? outcome.sent : 0;
-        body =
-          outcome?.retryElsewhere && !text
+        // Explicit stay_silent: suppress any post-tool boilerplate text from
+        // Claude Code or other harnesses (Codex/Antigravity/Grok/Muse).
+        const silent = !failure && !outcome?.retryElsewhere && !outcome?.aborted && sent === 0 && (outcome?.silent === true || entry.silent === true);
+        const silentReason = normalizeSilentReason(outcome?.silentReason) ?? entry.silentReason ?? null;
+        body = silent
+          ? { text: '', silent: true, ...(silentReason ? { silentReason } : {}) }
+          : outcome?.retryElsewhere && !text
             ? { text: '', retryElsewhere: true, ...(failure ? { failure } : {}) }
             : { text, ...(failure ? { failure } : {}) };
         if (outcome?.modelId) body.modelId = outcome.modelId;
         // Its files go up now, in parallel (on its final answer, or its last message); one that doesn't is named under the text.
-        if (!body.retryElsewhere && (body.text || sent) && outcome?.files?.length && uploadReplyFile) {
+        if (!body.retryElsewhere && !body.silent && (body.text || sent) && outcome?.files?.length && uploadReplyFile) {
           const uploads = await Promise.all(
             outcome.files.map((file) =>
               Promise.resolve()
