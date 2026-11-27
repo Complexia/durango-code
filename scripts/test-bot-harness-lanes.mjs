@@ -17,6 +17,7 @@ import { createRequire } from 'node:module';
 import {
   BOT_LOCAL_CLAUDE_WILDCARD,
   durangoIdForHarnessModel,
+  grokOrMuseBotEffort,
   harnessModelFor,
   localBotModelHarnesses,
   localBotModelIds,
@@ -24,6 +25,8 @@ import {
 import {
   HarnessError,
   botInstructionsBlock,
+  isApiErrorAnswer,
+  isApiLimitError,
   createAcpBotHarness,
   createCodexBotHarness,
   createHarnessLaneRunner,
@@ -72,6 +75,7 @@ const fakeChild = (serve) => {
       child.killed = true;
       child.exitCode = code;
       child.emit('exit', code);
+      child.emit('close', code);
     },
   };
   let buffer = '';
@@ -544,7 +548,7 @@ await test('antigravity: a message mid-turn goes in as a steer prompt; the newes
     },
   });
   const ctx = ctxFor({ inbox: [[{ seq: 9, source: 'person', content: 'and the other file' }]] });
-  const outcome = await runnerFor({ harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: agy.spawnProcess, steerSettleMs: 20 }) }, registry })(
+  const outcome = await runnerFor({ harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: agy.spawnProcess }) }, registry })(
     lane({ modelId: 'google/gemini-4-neon' }),
     ctx
   );
@@ -571,7 +575,178 @@ await test('antigravity: an upstream error reported as the answer moves the repl
     onUnavailable: (provider) => down.push(provider),
   })(lane({ modelId: 'google/gemini-4-neon', messages: false }), { ...ctxFor(), sendMessage: undefined });
   assert.equal(outcome.retryElsewhere, true);
+  assert.equal(outcome.text, '', 'the error line is never posted as the reply (Durango only moves a reply with no text)');
   assert.deepEqual(down, ['antigravity']);
+});
+
+await test('only a whole-answer agy error line counts as an API error; a reply about one does not', () => {
+  assert.equal(isApiErrorAnswer('Error 429, Message: Resource has been exhausted (e.g. check quota)., Status: RESOURCE_EXHAUSTED'), true);
+  assert.equal(isApiErrorAnswer('UNAVAILABLE (code 503): The model is overloaded.'), true);
+  assert.equal(isApiErrorAnswer('The log shows reason:QUOTA_EXHAUSTED at 10:02, so the job hit its quota.'), false);
+  assert.equal(isApiErrorAnswer('Here is what happened:\n\nError 429, Message: x, Status: RESOURCE_EXHAUSTED'), false, 'more than the error line');
+  assert.equal(isApiErrorAnswer('Error 429, Message: x, Status: RESOURCE_EXHAUSTED', 1), false, 'a tool ran this turn');
+  assert.equal(isApiLimitError('Error 429, Message: x, Status: RESOURCE_EXHAUSTED'), true);
+  assert.equal(isApiLimitError('INVALID_ARGUMENT (code 400): bad request'), false);
+});
+
+await test('antigravity: a reply that talks about a quota error is posted, not treated as one', async () => {
+  const registry = fakeRegistry();
+  const down = [];
+  const agy = fakeAcp({
+    provider: 'antigravity',
+    registry,
+    caps: {},
+    onPrompt: async ({ message, peer, update }) => {
+      update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Your job failed with reason:QUOTA_EXHAUSTED; raise the quota.' } });
+      peer.reply(message, { stopReason: 'end_turn' });
+    },
+  });
+  const outcome = await runnerFor({ harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: agy.spawnProcess }) }, registry, onUnavailable: (p) => down.push(p) })(
+    lane({ modelId: 'google/gemini-4-neon' }),
+    ctxFor()
+  );
+  assert.equal(outcome.failure, undefined);
+  assert.match(outcome.text, /raise the quota/);
+  assert.deepEqual(down, []);
+});
+
+await test('antigravity: a steer agy refuses, at once or later, folds its message into the final answer (nothing lost)', async () => {
+  for (const late of [false, true]) {
+    const registry = fakeRegistry();
+    const agy = fakeAcp({
+      provider: 'antigravity',
+      registry,
+      caps: {},
+      onPrompt: async ({ message, prompts, peer, update }) => {
+        const text = message.params.prompt[0].text;
+        if (prompts.length === 1) {
+          update({ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Read', status: 'in_progress' });
+          update({ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' });
+          return; // answered once the steer is dealt with
+        }
+        if (prompts.length === 2) {
+          assert.ok(text.startsWith(BOT_INBOX_HEADER), 'the steer');
+          if (late) {
+            peer.reply(prompts[0], { stopReason: 'end_turn' });
+            await delay(30);
+          }
+          peer.fail(message, { message: 'already processing' });
+          if (!late) {
+            await delay(5);
+            update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Draft.' } });
+            peer.reply(prompts[0], { stopReason: 'end_turn' });
+          }
+          return;
+        }
+        // The folded round: the person's message reaches the final answer.
+        assert.match(text, /and the other file/);
+        update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Both covered.' } });
+        peer.reply(message, { stopReason: 'end_turn' });
+      },
+    });
+    const ctx = ctxFor({ inbox: [[{ seq: 9, source: 'person', content: 'and the other file' }]] });
+    const outcome = await runnerFor({ harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: agy.spawnProcess }) }, registry })(
+      lane({ modelId: 'google/gemini-4-neon' }),
+      ctx
+    );
+    assert.equal(outcome.failure, undefined, `${late ? 'late' : 'immediate'}: ${outcome.failure}`);
+    assert.equal(outcome.text, 'Both covered.');
+    // The waiting message got the next round as it was; only that round's end checked the inbox.
+    assert.equal(ctx.takes.filter((options) => options.beforeFinish).length, 1);
+  }
+});
+
+await test('antigravity: its ask_question prompts are cancelled, never answered with option 1', async () => {
+  const registry = fakeRegistry();
+  const answers = [];
+  const agy = fakeAcp({
+    provider: 'antigravity',
+    registry,
+    caps: {},
+    onPrompt: async ({ message, peer, update }) => {
+      const ask = (id, toolCallId, options) =>
+        new Promise((resolve) => {
+          peer.onResponse = peer.onResponse ?? new Map();
+          answers.push({ id, resolve });
+          peer.send({ id, method: 'session/request_permission', params: { sessionId: 'ses_1', toolCall: { toolCallId }, options } });
+        });
+      peer.send({ id: 'q1', method: 'session/request_permission', params: { sessionId: 'ses_1', toolCall: { toolCallId: 'interaction_1', title: 'Which?' }, options: [{ optionId: 'a', name: 'Option A' }, { optionId: 'b', name: 'Option B' }] } });
+      peer.send({ id: 'q2', method: 'session/request_permission', params: { sessionId: 'ses_1', toolCall: { toolCallId: 'call_2' }, options: [{ optionId: 'no', kind: 'reject_once', name: 'No' }, { optionId: 'yes', kind: 'allow_once', name: 'Yes' }] } });
+      peer.send({ id: 'q3', method: 'session/request_permission', params: { sessionId: 'ses_1', toolCall: { toolCallId: 'call_3' }, options: [{ optionId: 'x', name: 'Something' }] } });
+      await delay(30);
+      update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Asked in my reply instead.' } });
+      peer.reply(message, { stopReason: 'end_turn' });
+    },
+  });
+  await runnerFor({ harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: agy.spawnProcess }) }, registry })(lane({ modelId: 'google/gemini-4-neon' }), ctxFor());
+  const replies = Object.fromEntries(agy.seen.filter((m) => m.id === 'q1' || m.id === 'q2' || m.id === 'q3').map((m) => [m.id, m.result.outcome]));
+  assert.deepEqual(replies.q1, { outcome: 'cancelled' });
+  assert.deepEqual(replies.q2, { outcome: 'selected', optionId: 'yes' });
+  assert.deepEqual(replies.q3, { outcome: 'cancelled' }, 'no allow kind: not picked by position');
+});
+
+await test('antigravity: model and thinking level fall back to ACP config options', async () => {
+  const registry = fakeRegistry();
+  const seenConfig = [];
+  const spawnProcess = (argv) =>
+    fakeChild(async (message, peer) => {
+      if (message.method === 'initialize') return peer.reply(message, { protocolVersion: 1, agentCapabilities: {} });
+      if (message.method === 'session/new') return peer.reply(message, { sessionId: 's' });
+      if (message.method === 'session/set_model') return peer.fail(message, { message: 'unknown model id' });
+      if (message.method === 'session/set_config_option') {
+        seenConfig.push(message.params);
+        return peer.reply(message, { configOptions: [] });
+      }
+      if (message.method === 'session/prompt') {
+        peer.send({ method: 'session/update', params: { sessionId: 's', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Hi.' } } } });
+        return peer.reply(message, { stopReason: 'end_turn' });
+      }
+    });
+  const outcome = await runnerFor({
+    harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess }) },
+    registry,
+    resolved: { providerId: 'antigravity', model: { slug: 'gemini-4-neon', acpModelId: 'gemini-4-neon-xhigh', antigravityThoughtLevelValues: { xhigh: 'extra_high' } }, effort: 'xhigh' },
+  })(lane({ modelId: 'google/gemini-4-neon' }), ctxFor());
+  assert.equal(outcome.text, 'Hi.');
+  assert.deepEqual(seenConfig, [
+    { sessionId: 's', configId: 'model', value: 'gemini-4-neon' },
+    { sessionId: 's', configId: 'thought_level', value: 'extra_high' },
+  ]);
+});
+
+await test('a reply stopped while its harness starts never sends a prompt', async () => {
+  const registry = fakeRegistry();
+  const abort = new AbortController();
+  const seen = [];
+  const spawnProcess = () =>
+    fakeChild(async (message, peer) => {
+      seen.push(message.method);
+      if (message.method === 'initialize') {
+        abort.abort(); // stopped mid-handshake
+        await delay(5);
+        return peer.reply(message, { protocolVersion: 1, agentCapabilities: {} });
+      }
+      if (message.method === 'session/new') return peer.reply(message, { sessionId: 's' });
+      if (message.method === 'session/prompt') return peer.reply(message, { stopReason: 'end_turn' });
+    });
+  const outcome = await runnerFor({ harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess }) }, registry })(
+    lane({ modelId: 'google/gemini-4-neon' }),
+    { ...ctxFor(), signal: abort.signal }
+  );
+  assert.equal(outcome.aborted, true);
+  assert.ok(!seen.includes('session/prompt'), `sent: ${seen.join(', ')}`);
+});
+
+await test("bot tools that can't be served move the reply instead of running it toolless", async () => {
+  const outcome = await createHarnessLaneRunner({
+    resolveModel: async () => ({ providerId: 'codex', model: { slug: 'gpt-6.1-sol' } }),
+    harnesses: { codex: { id: 'codex', open: async () => assert.fail('must not open') } },
+    registerTools: async () => null,
+    botsDir: path.join(testRoot, 'bots'),
+    log: () => {},
+  })(lane(), ctxFor());
+  assert.equal(outcome.retryElsewhere, true);
+  assert.equal(outcome.text, '');
 });
 
 await test('grok over ACP: instructions open the first prompt, no steering, resume replays nothing into the reply', async () => {
@@ -628,6 +803,7 @@ await test('muse: one exec per prompt, the session goes on with --session-id, to
       line({ payload_type: 'run.output.delta', payload: { text: prompt.includes('<bot_instructions>') ? 'Fresh run.' : 'Resumed run.' } });
       line({ payload_type: 'run.terminal.completed', payload: { terminal: 'completed', text: 'x' } });
       child.emit('exit', 0);
+      child.emit('close', 0);
     }, 2);
     return child;
   };
@@ -650,6 +826,80 @@ await test('muse: one exec per prompt, the session goes on with --session-id, to
   );
   assert.equal(second.text, 'Resumed run.');
   assert.equal(runs[1].argv[runs[1].argv.indexOf('--session-id') + 1], 'muse_ses');
+});
+
+await test('grok and muse efforts: none for a Grok model without tiers; Muse within the model\'s own tiers', () => {
+  const clamp = (effort, efforts, fallback) => (effort && efforts.includes(effort) ? effort : fallback);
+  assert.equal(grokOrMuseBotEffort('grok', { slug: 'grok-4.7', reasoningEfforts: ['low', 'medium', 'high', 'xhigh'] }, 'high', clamp), 'high');
+  assert.equal(grokOrMuseBotEffort('grok', { slug: 'grok-4.6' }, 'high', clamp), null, 'no --reasoning-effort for a model without tiers');
+  assert.equal(grokOrMuseBotEffort('muse', { slug: 'muse-spark-1.3', reasoningEfforts: ['low', 'medium', 'high'] }, 'max', clamp), 'high');
+  assert.equal(grokOrMuseBotEffort('muse', { slug: 'muse-spark-1.3' }, 'ultra', clamp), 'ultra');
+});
+
+await test('muse: a run whose last events arrive after its exit still counts', async () => {
+  const runs = [];
+  const spawnProcess = (argv) => {
+    const child = fakeChild(() => {});
+    runs.push(argv);
+    setTimeout(() => {
+      child.emit('exit', 0); // exit first: stdout isn't drained yet
+      child.stdout.write(`${JSON.stringify({ stream: { kind: 'session', id: 's' }, payload_type: 'run.output.delta', payload: { text: 'Late but fine.' } })}\n`);
+      // the last line without a newline
+      child.stdout.write(JSON.stringify({ stream: { kind: 'session', id: 's' }, payload_type: 'run.terminal.completed', payload: { terminal: 'completed' } }));
+      setTimeout(() => child.emit('close', 0), 5);
+    }, 2);
+    return child;
+  };
+  const outcome = await runnerFor({ harnesses: { muse: createMuseBotHarness({ spawnProcess }) } })(lane({ modelId: 'meta/muse-spark-1.3' }), ctxFor());
+  assert.equal(outcome.failure, undefined, outcome.failure);
+  assert.equal(outcome.text, 'Late but fine.');
+});
+
+await test('codex: a tool step with no text of its own puts its card on the next message, not an earlier one', async () => {
+  const registry = fakeRegistry();
+  const codex = fakeCodex({
+    registry,
+    script: async (index, text, api) => {
+      api.delta('Step one.');
+      await api.tool('web_search', async () => {
+        await api.callBotTool('web_search', { query: 'a' });
+      });
+      // the next step calls a tool straight away
+      await api.tool('show_actions', async () => {
+        await api.callBotTool('web_search', { query: 'b' });
+      });
+      api.delta('Done.');
+      api.complete();
+    },
+  });
+  const ctx = ctxFor();
+  const outcome = await runnerFor({ harnesses: { codex: createCodexBotHarness({ spawnProcess: codex.spawnProcess }) }, registry })(lane(), ctx);
+  assert.equal(outcome.text, 'Done.');
+  assert.deepEqual(ctx.calls.map((call) => call.message), [0, null]);
+});
+
+await test('grok: messages are not taken mid-turn (it cannot be given them); the check before the final answer takes them', async () => {
+  const registry = fakeRegistry();
+  const grok = fakeAcp({
+    provider: 'grok',
+    registry,
+    caps: {},
+    onPrompt: async ({ message, prompts, peer, update }) => {
+      if (prompts.length === 1) {
+        update({ sessionUpdate: 'tool_call', toolCallId: 't1', title: 'Read', status: 'in_progress' });
+        update({ sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' });
+        update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Draft.' } });
+      } else {
+        assert.match(message.params.prompt[0].text, /and Paris/);
+        update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Both.' } });
+      }
+      peer.reply(message, { stopReason: 'end_turn' });
+    },
+  });
+  const ctx = ctxFor({ beforeFinish: [[{ seq: 4, source: 'person', content: 'and Paris' }]] });
+  const outcome = await runnerFor({ harnesses: { grok: createAcpBotHarness({ provider: 'grok', spawnProcess: grok.spawnProcess }) }, registry })(lane({ modelId: 'x-ai/grok-4.7' }), ctx);
+  assert.equal(outcome.text, 'Both.');
+  assert.ok(ctx.takes.every((options) => options.beforeFinish), 'no mid-turn take');
 });
 
 await fs.rm(testRoot, { recursive: true, force: true }).catch(() => {});

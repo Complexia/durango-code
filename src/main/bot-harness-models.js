@@ -102,3 +102,18 @@ export const localBotModelHarnesses = (models, options) => {
   }
   return out;
 };
+
+const MUSE_BOT_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+
+/**
+ * A lane's reasoning effort for a Grok or Muse model (`clamp`: models.js
+ * clampReasoningEffort). Grok: only a model that lists reasoning tiers takes
+ * --reasoning-effort (null: none passed). Muse: the model's own tiers when it
+ * lists them, else every tier Muse takes.
+ */
+export const grokOrMuseBotEffort = (providerId, model, wanted, clamp) => {
+  const listed = Array.isArray(model?.reasoningEfforts) && model.reasoningEfforts.length ? model.reasoningEfforts : null;
+  if (providerId === 'grok') return listed ? clamp(wanted || null, listed, null) : null;
+  const efforts = listed ?? MUSE_BOT_EFFORTS;
+  return clamp(wanted || null, efforts, efforts.includes('high') ? 'high' : efforts[efforts.length - 1]);
+};

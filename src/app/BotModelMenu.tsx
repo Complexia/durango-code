@@ -483,7 +483,7 @@ export const BotModelMenu = ({
                   ? 'Machine replies are off in Settings → Durango — these will reply from Durango’s cloud until turned on.'
                   : claudeAvailable
                     ? 'Runs locally on this machine with its own Claude Code, Codex, Antigravity, Grok or Muse (falls back to the cloud if it can’t).'
-                    : 'Runs locally on this machine with its own Codex, Antigravity, Grok or Muse (falls back to the cloud if it can’t). Claude models need Claude Code here.'}
+                    : 'Codex, Antigravity, Grok or Muse here can run these, but Claude Code isn’t installed: a bot replies here only if its routine model (Claude Haiku by default) runs here too; otherwise it replies from Durango’s cloud.'}
               </span>
             </div>
           )}
@@ -523,8 +523,11 @@ export const BotModelMenu = ({
                 const selected = choice.id === model;
                 const highlighted = index === activeIndex;
                 const isLocalChoice = isLocalBotModelChoice(choice, local);
-                // Claude models need Claude Code here; others were found on their harness (choice.localVia).
-                const choiceActive = local || (machineReplies && (choice.claude ? claudeAvailable : true));
+                // A machine takes a bot only when it runs both its reply model and its
+                // routine model (Claude Haiku by default): without Claude Code here,
+                // a bot on another harness's model still replies from the cloud
+                // unless its routine model runs here too, so the pill isn't shown as active.
+                const choiceActive = local || (machineReplies && claudeAvailable);
                 const via = choice.localVia || (choice.claude ? 'Claude Code' : 'its harness');
                 const provider = providerLabelOf(choice);
                 const groupLabel = groupLabelOf(choice);
@@ -576,7 +579,9 @@ export const BotModelMenu = ({
                             isLocalChoice
                               ? choiceActive
                                 ? `Replies locally on this machine via ${via} (cloud fallback)`
-                                : `Can reply locally via ${via}; currently routes to Durango’s cloud`
+                                : !machineReplies
+                                  ? `Can reply locally via ${via}; machine replies are off, so it replies from Durango’s cloud`
+                                  : `Runs here via ${via}, but Claude Code isn’t installed: a bot whose routine model is Claude (the default) replies from Durango’s cloud`
                               : 'Replies from Durango’s cloud'
                           }
                           className={`inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${

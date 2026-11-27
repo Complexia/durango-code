@@ -107,7 +107,7 @@ import {
 } from './main/bot-replies.js';
 import { createBotAttachmentManager } from './main/bot-attachments.js';
 import { mergeDesktopBotModelCatalog } from './main/bot-models.js';
-import { harnessModelFor, localBotModelHarnesses, localBotModelIds } from './main/bot-harness-models.js';
+import { grokOrMuseBotEffort, harnessModelFor, localBotModelHarnesses, localBotModelIds } from './main/bot-harness-models.js';
 import { createAcpBotHarness, createCodexBotHarness, createHarnessLaneRunner, createMuseBotHarness } from './main/bot-harness-lanes.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
@@ -4672,19 +4672,20 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
 const BOT_HARNESS_DOWN_MS = 10 * 60_000;
 const botHarnessDownUntil = new Map(); // providerId -> until
 const isBotHarnessDown = (providerId) => (botHarnessDownUntil.get(providerId) ?? 0) > Date.now();
+// Each harness runs under the supervisor Codex threads use
+// (codex-server-process.js): it owns the whole process group (the native
+// binary behind a JS launcher, the bot tools' MCP shim) and reaps it when the
+// reply ends, and also when this app quits or is killed (its IPC lease closes).
 const spawnBotHarness = (argv, { cwd, env } = {}) => {
-  const child = spawn(loginShell, ['-lc', argv.map(shellQuote).join(' ')], {
+  const child = spawnCodexServerProcess(loginShell, ['-lc', argv.map(shellQuote).join(' ')], {
     cwd: cwd || os.homedir(),
     env: withClaudeEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', ...(env ?? {}) }),
-    stdio: ['pipe', 'pipe', 'pipe'],
   });
-  // SIGTERM, then SIGKILL if it lingers (run-registry.js).
+  // SIGTERM to the supervisor (it reaps the group), SIGKILL if it lingers (run-registry.js).
   const kill = child.kill.bind(child);
   child.kill = (signal) => (signal ? kill(signal) : (killAgentChild(child), true));
   return child;
 };
-const GROK_BOT_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const MUSE_BOT_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const resolveBotHarnessModel = async (lane) => {
   const found = harnessModelFor(await listDispatchModels(), lane.modelId);
   if (!found || isBotHarnessDown(found.providerId)) return null;
@@ -4700,9 +4701,8 @@ const resolveBotHarnessModel = async (lane) => {
       return { providerId: 'antigravity', model: { ...model, acpModelId: antigravityWireModelId(model, effort) }, effort };
     }
     case 'grok':
-      return { providerId: 'grok', model, effort: clampReasoningEffort(wanted, Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length ? model.reasoningEfforts : GROK_BOT_EFFORTS, null) };
     case 'muse':
-      return { providerId: 'muse', model, effort: clampReasoningEffort(wanted, MUSE_BOT_EFFORTS, 'high') };
+      return { providerId: found.providerId, model, effort: grokOrMuseBotEffort(found.providerId, model, wanted, clampReasoningEffort) };
     default:
       return null;
   }

@@ -61,7 +61,6 @@ import { selectFinalMessage } from '../report-clip.js';
 //   bot tools through Muse's settings file in a private config root).
 
 export const HARNESS_HANDSHAKE_TIMEOUT_MS = 60_000;
-export const HARNESS_STEER_SETTLE_MS = 2_000;
 const FAILURE_MAX_CHARS = 500;
 const STDERR_TAIL_CHARS = 4_000;
 const BOT_TOOLS_SERVER = 'durango_bot';
@@ -85,10 +84,19 @@ export class HarnessError extends Error {
 const errorText = (error) =>
   typeof error === 'string' ? error : str(error?.message) || str(error?.data?.message) || (error ? JSON.stringify(error).slice(0, 400) : '');
 
-// An upstream API failure some harnesses (Antigravity) report as the turn's
-// only text with a clean end_turn.
-const API_ERROR_TEXT =
-  /^\s*(?:Error \d{3}, Message: .+, Status: [A-Z_0-9]+|[A-Z_]{4,} \(code \d{3}\): .+|.*\breason:QUOTA_EXHAUSTED\b.*)\s*$/s;
+// An upstream API failure Antigravity reports as the turn's only text with a
+// clean end_turn: the whole answer is one error line in agy's own shape
+// ("Error 429, Message: …, Status: RESOURCE_EXHAUSTED" or "UNAVAILABLE (code
+// 503): …"). A reply that merely talks about such an error isn't one.
+const API_ERROR_TEXT = /^\s*(?:Error \d{3}, Message: [^\n]+, Status: [A-Z_0-9]+[^\n]*|[A-Z_]{4,} \(code \d{3}\): [^\n]+)\s*$/;
+const API_ERROR_MAX_CHARS = 2_000;
+/** Is this turn's whole answer an upstream error line (and no tool ran)? */
+export const isApiErrorAnswer = (text, toolsRan = 0) => {
+  const value = String(text ?? '');
+  return toolsRan === 0 && value.length <= API_ERROR_MAX_CHARS && API_ERROR_TEXT.test(value);
+};
+/** An upstream error that means "not now" (quota, rate limit, overloaded): the harness is left out for a while. */
+export const isApiLimitError = (text) => /\b(?:429|503)\b|RESOURCE_EXHAUSTED|QUOTA_EXHAUSTED|UNAVAILABLE|rate.?limit|quota/i.test(String(text ?? ''));
 
 /** The instructions folded into a fresh session's first prompt, for a harness with no system prompt of its own. */
 export const botInstructionsBlock = (instructions) =>
@@ -170,7 +178,13 @@ export const createJsonRpcPeer = (child, { onRequest = () => null, onNotificatio
     settleAll(reason);
     onExit(reason);
   };
-  child.on?.('exit', (code) => ended(`The process exited (${code ?? 'signal'}).`));
+  // 'close' comes once stdout is drained (its last lines handled); 'exit' alone
+  // only after a moment, for a process whose pipes a child of its holds open.
+  child.on?.('close', (code) => ended(`The process exited (${code ?? 'signal'}).`));
+  child.on?.('exit', (code) => {
+    const timer = setTimeout(() => ended(`The process exited (${code ?? 'signal'}).`), 1_500);
+    timer.unref?.();
+  });
   child.on?.('error', (error) => ended(error?.message ?? 'The process failed to start.'));
   return {
     request: (method, params, { timeoutMs = 0 } = {}) =>
@@ -210,6 +224,24 @@ export const createJsonRpcPeer = (child, { onRequest = () => null, onNotificatio
   };
 };
 
+/**
+ * While a harness opens (a handshake can take a minute): an abort closes the
+ * connection, and every step after an await checks it. → { check(), done() }
+ */
+const abortWhileOpening = (signal, close) => {
+  const onAbort = () => close();
+  signal?.addEventListener?.('abort', onAbort, { once: true });
+  return {
+    check: () => {
+      if (signal?.aborted) {
+        close();
+        throw new HarnessError('The reply was stopped while the harness was starting.');
+      }
+    },
+    done: () => signal?.removeEventListener?.('abort', onAbort),
+  };
+};
+
 const signInText = /not (?:logged|signed) in|log ?in|sign ?in|authenticat|auth(?:entication)? required|unauthori[sz]ed|credentials|oauth|api key/i;
 
 /** Does a harness error mean "not here, now" (move the reply) rather than "this reply failed"? */
@@ -227,7 +259,8 @@ const CODEX_TEXTLESS_ITEMS = new Set(['agentMessage', 'reasoning', 'userMessage'
 export const createCodexBotHarness = ({ spawnProcess, clientVersion = '0.0.0', handshakeTimeoutMs = HARNESS_HANDSHAKE_TIMEOUT_MS }) => ({
   id: 'codex',
   steers: true,
-  async open({ cwd, model, effort, instructions, resumeSessionId, mcp, onEvent }) {
+  async open({ cwd, model, effort, instructions, resumeSessionId, mcp, onEvent, signal }) {
+    if (signal?.aborted) throw new HarnessError('The reply was stopped before Codex started.');
     let threadId = null;
     let activeTurnId = null;
     let turnWaiter = null;
@@ -308,11 +341,15 @@ export const createCodexBotHarness = ({ spawnProcess, clientVersion = '0.0.0', h
       peer.close();
       throw new HarnessError(`${text}\n${peer.stderrTail()}`.trim(), { retryElsewhere: isHarnessUnavailableError(`${text}\n${peer.stderrTail()}`), ...options });
     };
+    const opening = abortWhileOpening(signal, () => peer.close());
+    let resumed = false;
+    try {
     const init = await peer.request(
       'initialize',
       { clientInfo: { name: 'durango-code-bots', title: 'Durango Code bots', version: clientVersion }, capabilities: { experimentalApi: true } },
       { timeoutMs: handshakeTimeoutMs }
     );
+    opening.check();
     if (init.error) fail(init.error, { retryElsewhere: true });
     peer.notify('initialized', {});
     const config = {
@@ -337,16 +374,21 @@ export const createCodexBotHarness = ({ spawnProcess, clientVersion = '0.0.0', h
       config,
       ...(instructions ? { developerInstructions: instructions } : {}),
     };
-    let resumed = false;
     if (resumeSessionId) {
       const response = await peer.request('thread/resume', { threadId: resumeSessionId, ...threadParams }, { timeoutMs: handshakeTimeoutMs });
-      if (response.error) fail(response.error, { resumeFailed: true });
+      opening.check();
+      // Signed out is the machine's problem, not the session's: move the reply.
+      if (response.error) fail(response.error, isHarnessUnavailableError(errorText(response.error)) ? {} : { resumeFailed: true });
       threadId = response.result?.thread?.id ?? resumeSessionId;
       resumed = true;
     } else {
       const response = await peer.request('thread/start', threadParams, { timeoutMs: handshakeTimeoutMs });
+      opening.check();
       threadId = response.result?.thread?.id ?? null;
       if (response.error || typeof threadId !== 'string') fail(response.error ?? 'Codex did not return a thread id.');
+    }
+    } finally {
+      opening.done();
     }
     const input = (text) => [{ type: 'text', text }];
     return {
@@ -387,12 +429,13 @@ export const createCodexBotHarness = ({ spawnProcess, clientVersion = '0.0.0', h
  * The lane's model is set with session/set_model (`model.acpModelId`, e.g.
  * agy's "gemini-4-neon-high") or, for Grok, its `-m` flag.
  */
-export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs = HARNESS_HANDSHAKE_TIMEOUT_MS, steerSettleMs = HARNESS_STEER_SETTLE_MS }) => ({
+export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs = HARNESS_HANDSHAKE_TIMEOUT_MS }) => ({
   id: provider,
   // Antigravity takes a session/prompt during a running turn and carries the
   // turn on under it (its ACP steering); Grok's ACP has no such thing.
   steers: provider === 'antigravity',
-  async open({ cwd, model, effort, instructions, resumeSessionId, mcp, projects = [], onEvent }) {
+  async open({ cwd, model, effort, instructions, resumeSessionId, mcp, projects = [], onEvent, signal }) {
+    if (signal?.aborted) throw new HarnessError(`The reply was stopped before ${provider} started.`);
     const argv =
       provider === 'antigravity'
         ? ['agy', 'acp', '--dangerously-skip-permissions']
@@ -400,15 +443,22 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
     const child = spawnProcess(argv, { cwd });
     let replaying = false;
     let turnText = '';
+    let turnTools = 0; // tool calls this turn
     let usage = null;
     let contextTokens = 0;
     const tools = new Set();
     const peer = createJsonRpcPeer(child, {
       onRequest: (message) => {
         if (message.method === 'session/request_permission') {
-          // Bots work with Full access (bot-replies.js normalizeBotSettings).
+          const toolCallId = str(message.params?.toolCall?.toolCallId);
+          // agy asks the person multiple-choice questions this way (an
+          // `interaction_` call, its options are answers): nobody is there
+          // during a bot reply, so it's cancelled, never answered for them.
+          if (toolCallId.startsWith('interaction_')) return { outcome: { outcome: 'cancelled' } };
+          // Bots work with Full access (bot-replies.js normalizeBotSettings):
+          // an approval is allowed, by its ACP kind only.
           const options = Array.isArray(message.params?.options) ? message.params.options : [];
-          const chosen = options.find((option) => option?.kind === 'allow_once') ?? options.find((option) => option?.kind === 'allow_always') ?? options[0];
+          const chosen = options.find((option) => option?.kind === 'allow_once') ?? options.find((option) => option?.kind === 'allow_always');
           return chosen ? { outcome: { outcome: 'selected', optionId: chosen.optionId } } : { outcome: { outcome: 'cancelled' } };
         }
         return undefined;
@@ -431,6 +481,7 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
           if (!id) return;
           if (!tools.has(id) && update.status !== 'completed' && update.status !== 'failed') {
             tools.add(id);
+            turnTools += 1;
             onEvent({ type: 'tool-start', id, name: str(update.title) || str(update.kind) || 'tool' });
           }
           if (tools.has(id) && (update.status === 'completed' || update.status === 'failed' || update.status === 'cancelled')) {
@@ -448,13 +499,20 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
       throw new HarnessError(text, { retryElsewhere: isHarnessUnavailableError(text), ...options });
     };
     const handshake = { timeoutMs: handshakeTimeoutMs };
+    const opening = abortWhileOpening(signal, () => peer.close());
+    let caps;
+    let sessionId = null;
+    let resumed = false;
+    let nativeInstructions = false;
+    try {
     const init = await peer.request(
       'initialize',
       { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } }, clientInfo: { name: 'durango-code-bots', version: '1' } },
       handshake
     );
+    opening.check();
     if (init.error) fail(init.error, { retryElsewhere: true });
-    const caps = init.result?.agentCapabilities ?? {};
+    caps = init.result?.agentCapabilities ?? {};
     const useHttp = caps.mcpCapabilities?.http === true && mcp?.httpUrl;
     const mcpServers = mcp
       ? useHttp
@@ -463,14 +521,13 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
       : [];
     // agy advertises a system-prompt extension in initialize; elsewhere the
     // instructions open the session's first prompt.
-    const nativeInstructions = provider === 'antigravity' && caps._meta?.antigravity?.systemPrompt?.append === true && Boolean(instructions);
+    nativeInstructions = provider === 'antigravity' && caps._meta?.antigravity?.systemPrompt?.append === true && Boolean(instructions);
     const extraDirs = caps.sessionCapabilities?.additionalDirectories && projects.length ? { additionalDirectories: projects } : {};
-    let sessionId = null;
-    let resumed = false;
     if (resumeSessionId) {
       // session/resume (no replay) where advertised, else session/load (replays; ignored).
       if (caps.sessionCapabilities?.resume) {
         const response = await peer.request('session/resume', { sessionId: resumeSessionId, cwd, mcpServers, ...extraDirs }, handshake);
+        opening.check();
         if (!response.error) sessionId = resumeSessionId;
         else if (signInText.test(errorText(response.error))) fail(response.error, { retryElsewhere: true });
       }
@@ -478,6 +535,7 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
         replaying = true;
         const response = await peer.request('session/load', { sessionId: resumeSessionId, cwd, mcpServers, ...extraDirs }, handshake);
         replaying = false;
+        opening.check();
         if (!response.error) sessionId = resumeSessionId;
         else if (signInText.test(errorText(response.error))) fail(response.error, { retryElsewhere: true });
       }
@@ -494,12 +552,30 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
         },
         handshake
       );
+      opening.check();
       sessionId = response.result?.sessionId ?? null;
       if (response.error || typeof sessionId !== 'string') fail(response.error ?? `${provider} did not return a session id.`);
     }
     if (provider === 'antigravity' && model.acpModelId) {
+      // ACP session/set_model with agy's `<model>-<effort>` id; an agy that
+      // takes the model and thinking level as ACP config options instead gets
+      // session/set_config_option (`model`, `thought_level`).
       const response = await peer.request('session/set_model', { sessionId, modelId: model.acpModelId }, handshake);
-      if (response.error) fail(response.error);
+      opening.check();
+      if (response.error) {
+        const setModel = await peer.request('session/set_config_option', { sessionId, configId: 'model', value: model.slug }, handshake);
+        opening.check();
+        if (setModel.error) fail(response.error);
+        if (effort) {
+          const value = model.antigravityThoughtLevelValues?.[effort] ?? effort;
+          const setEffort = await peer.request('session/set_config_option', { sessionId, configId: 'thought_level', value }, handshake);
+          opening.check();
+          if (setEffort.error) fail(setEffort.error);
+        }
+      }
+    }
+    } finally {
+      opening.done();
     }
     // Every session/prompt of a turn, steers included: agy ends a running
     // prompt as soon as a newer one arrives and carries the turn on under the
@@ -507,14 +583,17 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
     // Superseded prompts answer at once (end_turn), a refused steer with an
     // error, the newest at the turn's end: the turn's outcome is the newest
     // answer that isn't an error.
+    // A steer that fails (refused at once, or an error later) is reported as
+    // not taken by steer(), which resolves only once its prompt is answered:
+    // the runner then folds its messages into the final answer instead.
     let prompts = [];
     let turnActive = false;
     const send = (text) => {
-      const entry = { settled: false, refused: false, value: null };
+      const entry = { settled: false, failed: false, value: null };
       entry.done = peer.request('session/prompt', { sessionId, prompt: [{ type: 'text', text }] }).then((response) => {
         entry.settled = true;
         entry.value = { response };
-        if (response.error && entry !== prompts[0]) entry.refused = true;
+        if (response.error) entry.failed = true;
         return entry.value;
       });
       prompts.push(entry);
@@ -522,13 +601,15 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
     };
     const runTurn = async (text) => {
       turnText = '';
+      turnTools = 0;
       prompts = [];
       turnActive = true;
       const first = send(text);
       while (prompts.some((entry) => !entry.settled)) await Promise.all(prompts.map((entry) => entry.done));
       turnActive = false;
-      const answered = prompts.filter((entry) => !entry.refused);
-      const outcome = (answered.filter((entry) => !entry.value.response.error).pop() ?? first).value;
+      // The turn's outcome: the newest prompt that was answered (a failed
+      // steer's messages go back to the runner; the first prompt's own error is the turn's).
+      const outcome = (prompts.filter((entry) => !entry.failed).pop() ?? first).value;
       prompts = [];
       const { response } = outcome;
       if (response.error) return { ok: false, error: errorText(response.error) };
@@ -547,7 +628,7 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
       if (result.stopReason === 'cancelled') return { ok: false, cancelled: true, error: `${provider} turn was cancelled.` };
       if (result.stopReason === 'refusal') return { ok: false, error: `${provider} refused the prompt.` };
       // An upstream failure reported as the answer (quota, a 5xx).
-      if (tools.size === 0 && API_ERROR_TEXT.test(turnText)) return { ok: false, error: turnText.trim(), apiError: true };
+      if (isApiErrorAnswer(turnText, turnTools)) return { ok: false, error: turnText.trim(), apiError: true, errorText: turnText };
       return { ok: true, usage, contextTokens };
     };
     return {
@@ -559,10 +640,12 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
         ? {
             async steer(text) {
               if (!turnActive) return false;
+              // Its answer is a new paragraph of the reply (agy may also take it as the next turn).
+              onEvent({ type: 'text-break' });
               const entry = send(text);
-              // A refused steer comes back at once; an accepted one only at the turn's end.
-              await Promise.race([entry.done, new Promise((resolve) => setTimeout(resolve, steerSettleMs).unref?.())]);
-              return !entry.refused;
+              // Taken only once agy answered it: a refusal (at once) or a later error is not taken.
+              await entry.done;
+              return !entry.failed;
             },
           }
         : {}),
@@ -585,9 +668,11 @@ export const createAcpBotHarness = ({ provider, spawnProcess, handshakeTimeoutMs
 export const createMuseBotHarness = ({ spawnProcess, museEnv = async () => ({}) }) => ({
   id: 'muse',
   steers: false,
-  async open({ cwd, model, effort, resumeSessionId, mcp, onEvent }) {
+  async open({ cwd, model, effort, resumeSessionId, mcp, onEvent, signal }) {
+    if (signal?.aborted) throw new HarnessError('The reply was stopped before Muse started.');
     let sessionId = resumeSessionId || null;
     const env = await museEnv(mcp);
+    if (signal?.aborted) throw new HarnessError('The reply was stopped before Muse started.');
     let running = null;
     const promptDir = await fs.mkdtemp(path.join(os.tmpdir(), 'durango-bot-muse-'));
     let promptCount = 0;
@@ -653,13 +738,33 @@ export const createMuseBotHarness = ({ spawnProcess, museEnv = async () => ({}) 
           child.stderr?.on('data', (data) => {
             stderr = `${stderr}${data}`.slice(-STDERR_TAIL_CHARS);
           });
+          let finished = false;
           const finish = (code) => {
+            if (finished) return;
+            finished = true;
             if (running === child) running = null;
+            // A last line without a newline.
+            const rest = buffer.trim();
+            buffer = '';
+            if (rest) {
+              try {
+                handle(JSON.parse(rest));
+              } catch {}
+            }
             if (terminal?.ok) resolve({ ok: true });
             else resolve({ ok: false, error: terminal?.reason || terminal?.text || `${stderr.trim() || `muse exited (${code ?? 'signal'})`}` });
           };
-          child.on?.('exit', finish);
-          child.on?.('error', (error) => resolve({ ok: false, error: error?.message ?? 'muse failed to start.' }));
+          // 'close': stdout drained (the run's last events read). 'exit' alone
+          // only after a moment (a child of muse's holding the pipes).
+          child.on?.('close', finish);
+          child.on?.('exit', (code) => {
+            const timer = setTimeout(() => finish(code), 1_500);
+            timer.unref?.();
+          });
+          child.on?.('error', (error) => {
+            finished = true;
+            resolve({ ok: false, error: error?.message ?? 'muse failed to start.' });
+          });
         });
       },
       async cancel() {
@@ -873,6 +978,14 @@ export const createHarnessLaneRunner = ({
     }
   };
   const mcp = toolDefinitions.length && registerTools ? await registerTools({ tools: toolDefinitions, call: callBotTool }).catch(() => null) : null;
+  // Without its tools it isn't the same bot: the next place answers.
+  if (toolDefinitions.length && registerTools && !mcp) {
+    return { text: '', retryElsewhere: true, failure: "The bot's tools couldn't be served to the harness here." };
+  }
+  if (ctx.signal?.aborted) {
+    mcp?.release?.();
+    return { text: '', aborted: true };
+  }
 
   // --- the prompt: a kept session's next message, or a fresh session's whole conversation --
   const session = normalizeLaneSession(lane.session);
@@ -924,10 +1037,15 @@ export const createHarnessLaneRunner = ({
       usedTools = true;
       if (partial.trim()) blocks.push(partial);
       partial = '';
+      // Every earlier call ended and nothing was written since: a step of its
+      // own with no text, so a card it shows goes with the next message.
+      if (afterTool && !runningTools.size && !pendingText()) stepMessage = null;
       startStep();
       runningTools.set(event.id, event.name);
       update();
-      if (finalRounds < maxFinalInboxRounds) void requestInbox();
+      // New messages are taken mid-turn only where the harness can be given
+      // them now; elsewhere the check before the final answer takes them.
+      if (harness.steers && finalRounds < maxFinalInboxRounds) void requestInbox();
     } else if (event.type === 'tool-end') {
       if (!runningTools.delete(event.id)) return;
       update();
@@ -975,10 +1093,18 @@ export const createHarnessLaneRunner = ({
       attempt.resumeFailed = Boolean(error?.resumeFailed);
       return attempt;
     }
+    // Stopped (or moved elsewhere) while it opened: nothing is sent.
+    if (ctx.signal?.aborted) {
+      current.close?.();
+      current = null;
+      attempt.error = 'The reply was stopped.';
+      return attempt;
+    }
     attempt.opened = true;
+    const session = current;
     const onAbort = () => {
-      void current?.cancel?.().catch(() => {});
-      setTimeout(() => current?.close?.(), 1_500).unref?.();
+      void session.cancel?.().catch(() => {});
+      setTimeout(() => session.close?.(), 1_500).unref?.();
     };
     ctx.signal?.addEventListener('abort', onAbort, { once: true });
     try {
@@ -992,11 +1118,14 @@ export const createHarnessLaneRunner = ({
         if (!result?.ok) {
           attempt.error = result?.error || 'The harness ended the reply.';
           attempt.apiError = Boolean(result?.apiError);
+          // The error line it wrote as its answer is not the bot's reply.
+          if (attempt.apiError) dropTrailingText(result.errorText ?? result.error);
           break;
         }
-        // Before the final answer is posted: messages that arrived meanwhile.
+        // Before the final answer is posted: messages that arrived meanwhile
+        // (unless some are waiting already: they get the next round as they are).
         if (inboxRequest) await inboxRequest;
-        if (finalRounds < maxFinalInboxRounds && !ctx.signal?.aborted) await requestInbox({ beforeFinish: true });
+        if (!pendingInbox.length && finalRounds < maxFinalInboxRounds && !ctx.signal?.aborted) await requestInbox({ beforeFinish: true });
         if (ctx.signal?.aborted) break;
         const items = takePending();
         if (!items.length) {
@@ -1033,6 +1162,17 @@ export const createHarnessLaneRunner = ({
     return attempt;
   };
 
+  // Removes `text` from the end of what the reply wrote (its streamed error line).
+  function dropTrailingText(text) {
+    const wanted = String(text ?? '').trim();
+    if (!wanted) return;
+    if (partial.trim() === wanted || partial.trim().endsWith(wanted)) partial = partial.trim().slice(0, -wanted.length);
+    else if (blocks.length && String(blocks[blocks.length - 1]).trim().endsWith(wanted)) {
+      const last = String(blocks.pop()).trim().slice(0, -wanted.length);
+      if (last.trim()) blocks.push(last);
+    }
+    update();
+  }
   const failureOf = (attempt) => errorText(attempt.error) || 'The harness ended before finishing the reply.';
   const nothingDone = () => !pendingText() && sentCount === 0 && !usedTools && segments.length === 0;
   const retryableHere = (attempt) => !attempt.ok && !ctx.signal?.aborted && nothingDone() && !attempt.unavailable && !isHarnessUnavailableError(failureOf(attempt));
@@ -1040,7 +1180,7 @@ export const createHarnessLaneRunner = ({
   let resumeFailed = false;
   try {
     attempt = await runAttempt(plan.mode === 'resume' ? { ...plan, sessionId: claimed.state.sessionId, systemAppend: claimed.state.systemAppend } : plan);
-    if (plan.mode === 'resume' && (attempt.resumeFailed || retryableHere(attempt))) {
+    if (plan.mode === 'resume' && !ctx.signal?.aborted && !attempt.unavailable && (attempt.resumeFailed || retryableHere(attempt))) {
       resumeFailed = true;
       pendingInbox.unshift(...deliveredItems.splice(0));
       deliveredSeqs.length = 0;
@@ -1103,7 +1243,7 @@ export const createHarnessLaneRunner = ({
   const withFiles = files.length ? { files } : {};
   if (attempt.ok) return { text, ...withSent, ...withFiles, ...withModel, ...extras };
   const reason = failureOf(attempt);
-  const unavailable = attempt.unavailable || isHarnessUnavailableError(reason) || (attempt.apiError && /quota|429|RESOURCE_EXHAUSTED|limit/i.test(reason));
+  const unavailable = attempt.unavailable || isHarnessUnavailableError(reason) || (attempt.apiError && isApiLimitError(reason));
   if (unavailable) onUnavailable(providerId, reason);
   // Nothing written or done yet: the next place (another machine, the cloud) answers instead.
   const retryElsewhere = (!text.trim() && sentCount === 0) || unavailable;
