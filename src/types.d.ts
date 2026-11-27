@@ -2124,6 +2124,18 @@ type OrionCodexBrowserIntegrationStatus = {
         error?: string;
         code?: string;
       }>;
+      dismissBotAsk?: (input: {
+        botId: string;
+        messageId?: string;
+        partId?: string;
+        question?: string;
+      }) => Promise<{
+        ok: boolean;
+        dismissed?: boolean;
+        needsYou?: boolean;
+        error?: string;
+        code?: string;
+      }>;
       getBotAttachmentStatuses?: (input?: {
         botId?: string;
       }) => Promise<{ ok: boolean; items?: import('./app/bots').BotAttachmentUploadStatus[]; error?: string }>;

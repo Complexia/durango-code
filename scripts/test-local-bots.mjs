@@ -644,7 +644,7 @@ test('notify_user and ask_user', async () => {
   await waitFor(() => runner.lanes.length === 1);
   const call = (name, input) => runner.lanes[0].ctx.callTool({ name, input, toolCallId: 'x' }).then((out) => out.result);
   assert.deepEqual(await call('notify_user', { title: 'Found a flat', message: '2BR in Surry Hills' }), { ok: true });
-  const asked = await call('ask_user', { question: 'Which one?', options: ['A', 'B'] });
+  const asked = await call('ask_user', { question: 'Which one?', options: ['A', 'B'], recommended: 0 });
   assert.equal(asked.ok, true);
   assert.match(asked.note, /in your reply/);
   assert.equal((await engine.list()).bots[0].needsYou, true);
@@ -654,12 +654,77 @@ test('notify_user and ask_user', async () => {
   ]);
   runner.lanes[0].finish({ text: 'Which one: A or B?' });
   await engine.idle();
+  const askedThread = await engine.thread(primary.id);
+  const askCard = askedThread.messages.at(-1)?.cards?.find((card) => card.component === 'bot-ask');
+  assert.deepEqual(askCard?.props, { question: 'Which one?', options: ['A', 'B'], recommended: 0 });
   // The person's answer clears it.
   await engine.send(primary.id, { messageId: 'b', content: 'A' });
   assert.equal((await engine.list()).bots[0].needsYou, false);
   await waitFor(() => runner.lanes.length === 2);
   runner.lanes[1].finish({ text: 'A it is.' });
   await engine.idle();
+});
+
+test('dismissAsk collapses ask_user card, clears needsYou without waking the bot, persists, and informs the next turn', async () => {
+  const { engine, runner, dir } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'check two things' });
+  await waitFor(() => runner.lanes.length === 1);
+  const call = (name, input) => runner.lanes[0].ctx.callTool({ name, input, toolCallId: 'x' }).then((out) => out.result);
+  await call('ask_user', { question: 'Which region?', options: ['US', 'EU'], recommended: 0 });
+  await call('ask_user', { question: 'Deploy tonight?', options: ['Yes', 'Tomorrow'] });
+  runner.lanes[0].finish({ text: 'Two quick questions.' });
+  await engine.idle();
+
+  const before = await engine.thread(primary.id);
+  const askMsg = before.messages.at(-1);
+  assert.equal(before.bot.needsYou, true);
+  assert.equal(askMsg?.cards?.length, 2);
+  const [firstCard, secondCard] = askMsg.cards;
+
+  // Dismissing the first keeps needsYou true while the second is still open, and posts no message / starts no turn.
+  const firstDismiss = await engine.dismissAsk(primary.id, { messageId: askMsg.id, partId: firstCard.id, question: 'Which region?' });
+  assert.equal(firstDismiss.ok, true);
+  assert.equal(firstDismiss.needsYou, true);
+  assert.equal(runner.lanes.length, 1);
+  assert.equal((await engine.thread(primary.id)).messages.length, before.messages.length);
+
+  // Dismissing the second clears needsYou and still posts no message / starts no turn.
+  const secondDismiss = await engine.dismissAsk(primary.id, { messageId: askMsg.id, partId: secondCard.id, question: 'Deploy tonight?' });
+  assert.equal(secondDismiss.ok, true);
+  assert.equal(secondDismiss.needsYou, false);
+  assert.equal(runner.lanes.length, 1);
+  assert.equal((await engine.list()).bots[0].needsYou, false);
+
+  // Polling with afterSeq still receives the updated message with dismissed cards.
+  const polled = await engine.thread(primary.id, { afterSeq: askMsg.seq });
+  const polledAsk = polled.messages.find((m) => m.id === askMsg.id);
+  assert.equal(polledAsk?.cards?.[0]?.props?.dismissed, true);
+  assert.equal(polledAsk?.cards?.[1]?.props?.dismissed, true);
+  await engine.stop();
+
+  // Reload from disk: dismissed state and cleared needsYou persist.
+  const reloaded = makeEngine({ dir });
+  const reloadedThread = await reloaded.engine.thread(primary.id);
+  assert.equal(reloadedThread.bot.needsYou, false);
+  const persistedCards = reloadedThread.messages.find((m) => m.id === askMsg.id)?.cards ?? [];
+  assert.equal(persistedCards[0]?.props?.dismissed, true);
+  assert.equal(persistedCards[1]?.props?.dismissed, true);
+
+  // On its next turn, the bot sees both dismissed questions in its history AND steady context (for kept sessions).
+  await reloaded.engine.send(primary.id, { messageId: 'next', content: 'Moving on to billing.' });
+  await waitFor(() => reloaded.runner.lanes.length === 1);
+  const nextLane = reloaded.runner.lanes[0].lane;
+  const historyRow = nextLane.session.history.find((row) => row.id === askMsg.id);
+  assert.match(historyRow?.text ?? '', /Which region\?.*dismissed by the person without answering/);
+  assert.match(historyRow?.text ?? '', /Deploy tonight\?.*dismissed by the person without answering/);
+  const dismissedCtx = nextLane.session.context.find((part) => part.steady && /dismissed without answering/.test(part.text));
+  assert.ok(dismissedCtx, 'kept sessions receive a steady context note of dismissed questions');
+  assert.match(dismissedCtx.text, /"Which region\?"/);
+  assert.match(dismissedCtx.text, /"Deploy tonight\?"/);
+  reloaded.runner.lanes[0].finish({ text: 'Got it, looking at billing.' });
+  await reloaded.engine.idle();
+  await reloaded.engine.stop();
 });
 
 test('delegate_task runs in the background and its report wakes the bot', async () => {

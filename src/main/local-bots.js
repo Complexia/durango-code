@@ -582,6 +582,7 @@ export const LOCAL_BOT_TOOLS = [
       properties: {
         question: { type: 'string', minLength: 1, maxLength: 500 },
         options: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 120 }, minItems: 1, maxItems: 6 },
+        recommended: { type: 'integer', minimum: 0, maximum: 5, description: 'Index of the option you suggest (optional).' },
       },
       required: ['question', 'options'],
     },
@@ -1448,6 +1449,7 @@ export const createLocalBotEngine = ({
       lastPreview: bot.lastPreview,
       unread: bot.unread,
       needsYou: bot.needsYou,
+      asked: bot.needsYou,
       project: bot.project ? { key: bot.project.key, name: bot.project.name, repoId: bot.project.repoId } : null,
     };
   };
@@ -1707,6 +1709,27 @@ export const createLocalBotEngine = ({
     } else if (bot.role === 'primary') {
       lines.push({ steady: true, text: 'The person has no other bots yet.' });
     }
+    const dismissedQuestions = [];
+    const seenDismissed = new Set();
+    for (const message of entry.messages) {
+      if (message.seq <= bot.compactedThroughSeq || message.role !== 'assistant' || !Array.isArray(message.cards)) continue;
+      for (const card of message.cards) {
+        if (card?.component !== 'bot-ask' || card.props?.dismissed !== true) continue;
+        const q = oneLine(card.props?.question);
+        if (!q || seenDismissed.has(q)) continue;
+        seenDismissed.add(q);
+        dismissedQuestions.push(q);
+      }
+    }
+    if (dismissedQuestions.length) {
+      lines.push({
+        steady: true,
+        text: `Questions you asked that the person dismissed without answering (do not ask them again unless they bring them up): ${dismissedQuestions
+          .slice(-20)
+          .map((q) => `"${q}"`)
+          .join('; ')}.`,
+      });
+    }
     return lines;
   };
 
@@ -1727,10 +1750,19 @@ export const createLocalBotEngine = ({
     const claimSeqs = new Set(claims.map((message) => message.seq));
     const lastClaim = claims[claims.length - 1].seq;
     const row = (message) => {
-      // Files and cards (show_html pages, buttons) it carried, named so the bot knows what it showed.
+      // Files and cards (show_html pages, buttons, ask_user questions) it carried, named so the bot knows what it showed.
       const files = [
         ...(message.attachments ?? []).map((item) => `[attached file: ${item.name}]`),
-        ...(message.cards ?? []).map((card) => `[showed ${card.component === 'html' ? `a page "${card.props?.title ?? ''}"` : 'buttons'}]`),
+        ...(message.cards ?? []).map((card) => {
+          if (card.component === 'html') return `[showed a page "${card.props?.title ?? ''}"]`;
+          if (card.component === 'bot-ask') {
+            const q = oneLine(card.props?.question);
+            const opts = Array.isArray(card.props?.options) ? card.props.options.map((o) => `"${oneLine(o)}"`).join(', ') : '';
+            const status = card.props?.dismissed === true ? ' — dismissed by the person without answering; do not ask again' : '';
+            return `[Asked the person: "${q}"${opts ? ` Options: ${opts}` : ''}${status}]`;
+          }
+          return '[showed buttons]';
+        }),
       ].join('\n');
       return {
         id: message.id,
@@ -1958,7 +1990,21 @@ export const createLocalBotEngine = ({
           }
           // A card goes on the message it was made with (or the reply's next one).
           const shown = localCard(name, input, `ui-${reply.id}-${cardCount}`);
-          if (!shown) return { result: await callTool(entry, name, input) };
+          if (!shown) {
+            const result = await callTool(entry, name, input);
+            if (name === 'ask_user' && result?.ok && Array.isArray(result.options) && result.options.length > 0) {
+              const id = Number.isInteger(message) ? botReplyMessageId(reply.id, message) : null;
+              const props = {
+                question: result.asked,
+                options: result.options,
+                ...(typeof result.recommended === 'number' ? { recommended: result.recommended } : {}),
+              };
+              if (addReplyCards(entry, reply, [{ id: `ui-${reply.id}-${cardCount}`, component: 'bot-ask', props }], id)) {
+                cardCount += 1;
+              }
+            }
+            return { result };
+          }
           if (shown.error) return { result: { ok: false, error: shown.error } };
           reply.silent = false;
           reply.silentReason = null;
@@ -2797,6 +2843,10 @@ export const createLocalBotEngine = ({
         case 'ask_user': {
           const question = oneLine(input.question);
           const options = (Array.isArray(input.options) ? input.options : []).map(oneLine).filter(Boolean).slice(0, 6);
+          const recommended =
+            Number.isInteger(input.recommended) && input.recommended >= 0 && input.recommended < options.length
+              ? input.recommended
+              : undefined;
           if (!question) throw new Error('ask_user needs a question.');
           self.bot.needsYou = true;
           persistBot(self, { messages: false });
@@ -2806,6 +2856,7 @@ export const createLocalBotEngine = ({
             ok: true,
             asked: question,
             options,
+            ...(recommended !== undefined ? { recommended } : {}),
             note: 'Write the question and these options in your reply now (the person reads your reply), then end it. Their answer arrives as their next message.',
           };
         }
@@ -3181,10 +3232,15 @@ export const createLocalBotEngine = ({
       if (Number.isInteger(afterSeq)) {
         const cutoff = now() - 5 * 60_000;
         const seen = new Set(slice.map((message) => message.id));
-        const recentSilent = all
+        const recentUpdates = all
           .slice(Math.max(0, start - 30), start)
-          .filter((message) => message.silentRead && message.silentRead.at >= cutoff && !seen.has(message.id));
-        if (recentSilent.length) slice = [...recentSilent, ...slice];
+          .filter(
+            (message) =>
+              !seen.has(message.id) &&
+              ((message.silentRead && message.silentRead.at >= cutoff) ||
+                (typeof message.cardUpdatedAt === 'number' && message.cardUpdatedAt >= cutoff))
+          );
+        if (recentUpdates.length) slice = [...recentUpdates, ...slice];
       }
       return {
         bot: toDesktopBot(entry),
@@ -3216,6 +3272,68 @@ export const createLocalBotEngine = ({
       entry.bot.unread = 0;
       persistBot(entry, { messages: false });
       changed();
+    },
+    /** Dismisses an ask_user question card without posting a message or waking the bot. */
+    async dismissAsk(botId, { messageId, partId, question } = {}) {
+      await ensureLoaded();
+      const entry = entryFor(botId);
+      const cleanPartId = str(partId).trim();
+      const cleanQuestion = oneLine(question);
+      if (!cleanPartId && !cleanQuestion) throw new LocalBotError('invalid', 'Provide partId or question to dismiss.');
+      const matchesCard = (card) => {
+        if (!card || card.component !== 'bot-ask') return false;
+        if (cleanPartId) return card.id === cleanPartId;
+        return oneLine(card.props?.question) === cleanQuestion;
+      };
+      const cleanMessageId = str(messageId).trim();
+      let target = cleanMessageId
+        ? entry.messages.find((message) => message.id === cleanMessageId && Array.isArray(message.cards) && message.cards.some(matchesCard))
+        : null;
+      if (!target) {
+        for (let index = entry.messages.length - 1; index >= 0; index -= 1) {
+          const message = entry.messages[index];
+          if (message.role === 'assistant' && Array.isArray(message.cards) && message.cards.some(matchesCard)) {
+            target = message;
+            break;
+          }
+        }
+      }
+      const at = now();
+      let matchedPartId = cleanPartId || null;
+      let mutated = false;
+      if (target) {
+        replaceMessage(entry, target.id, (current) => ({
+          cards: (current.cards ?? []).map((card) => {
+            if (!matchesCard(card)) return card;
+            if (typeof card.id === 'string') matchedPartId = card.id;
+            const props = card.props && typeof card.props === 'object' ? card.props : {};
+            if (props.dismissed === true) return card;
+            mutated = true;
+            return { ...card, props: { ...props, dismissed: true, dismissedAt: at } };
+          }),
+          cardUpdatedAt: at,
+        }));
+      }
+      // Keep needsYou true only if another undismissed ask_user card sits after the person's last direct message.
+      let hasOtherOpenAsk = false;
+      for (let index = entry.messages.length - 1; index >= 0; index -= 1) {
+        const message = entry.messages[index];
+        if (message.role === 'user' && inboxSourceOf(message.authorLabel) === 'person') break;
+        if (message.role !== 'assistant' || !Array.isArray(message.cards)) continue;
+        if (message.cards.some((card) => card?.component === 'bot-ask' && card.props?.dismissed !== true)) {
+          hasOtherOpenAsk = true;
+          break;
+        }
+      }
+      const needsYouChanged = entry.bot.needsYou !== hasOtherOpenAsk;
+      entry.bot.needsYou = hasOtherOpenAsk;
+      if (mutated || needsYouChanged) {
+        if (!(await persistBot(entry))) {
+          throw new Error('Couldn’t dismiss the question on this computer. Try again.');
+        }
+        changed();
+      }
+      return { ok: true, dismissed: true, needsYou: hasOtherOpenAsk, messageId: target?.id ?? null, partId: matchedPartId };
     },
     /** The person's message: stored, then answered (never blocked by a reply in progress). → { seq } */
     async send(botId, { messageId, content, files = [] } = {}) {

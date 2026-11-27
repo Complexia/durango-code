@@ -1,5 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { ExternalLink, FileText, GitMerge, Loader2, MessageCircleQuestion, MessageSquare, Paperclip, Reply } from 'lucide-react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Check, ExternalLink, FileText, GitMerge, Loader2, MessageCircleQuestion, MessageSquare, Paperclip, Reply, SendHorizontal, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useOrionStore } from '../store';
 import { imageFileNamePattern, localMediaSrc, videoFileNamePattern } from './attachments';
@@ -223,6 +223,8 @@ export type BotActionHandlers = {
   onReply: (text: string) => void;
   /** Opens a Durango Code thread here (false: not on this computer). */
   onOpenThread: (threadId: string) => boolean;
+  /** Dismisses an ask_user question card without answering or starting a bot turn. Returns false on failure. */
+  onDismissAsk?: (target: { messageId?: string; partId?: string; question: string }) => Promise<boolean> | boolean | void;
 };
 
 const ACTION_ICONS = { ship_change: GitMerge, open_change: ExternalLink, open_thread: MessageSquare, open_url: ExternalLink, reply: Reply } as const;
@@ -398,21 +400,98 @@ export const BotActionsRow: React.FC<{ actions: BotAction[]; title?: string; han
 
 // --- questions (ask_user) --------------------------------------------------------------------
 
-/** The message a picked answer sends (Durango's lib/bots/ui.ts botAskAnswer; the person's bubble shows it as an answer). */
-export const botAskAnswer = (question: string, option: string) => `> **Answering:** ${question.replace(/\s+/g, ' ')}\n\n${option}`;
+/** The message a picked or typed answer sends (Durango's lib/bots/ui.ts botAskAnswer; the person's bubble shows it as an answer). */
+export const botAskAnswer = (question: string, option: string) =>
+  `> **Answering:** ${question.replace(/\s+/g, ' ').trim()}\n\n${option.trim()}`;
 
-const AskCard: React.FC<{ props: Record<string, unknown>; handlers: BotActionHandlers; answered?: string | null }> = ({ props, handlers, answered }) => {
+export const AskCard: React.FC<{
+  props: Record<string, unknown>;
+  handlers: BotActionHandlers;
+  answered?: string | null;
+  messageId?: string;
+  partId?: string;
+}> = ({ props, handlers, answered, messageId, partId }) => {
   const question = typeof props.question === 'string' ? props.question : '';
   const options = (Array.isArray(props.options) ? props.options : []).filter((option): option is string => typeof option === 'string').slice(0, 6);
   const recommended = typeof props.recommended === 'number' ? props.recommended : -1;
   const [picked, setPicked] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
+  const [localDismissed, setLocalDismissed] = useState(false);
+  const [dismissing, setDismissing] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const chosen = picked ?? answered ?? null;
+  const isDismissed = chosen === null && (localDismissed || props.dismissed === true);
+  const customChosen = chosen !== null && !options.includes(chosen);
+  const trimmedDraft = draft.trim();
+  const canSend = chosen === null && !isDismissed && trimmedDraft.length > 0;
+  const canDismiss = chosen === null && !isDismissed && Boolean(handlers.onDismissAsk);
+
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 112)}px`;
+  }, [draft]);
+
   if (!question || !options.length) return null;
+
+  const submitCustom = () => {
+    if (!canSend) return;
+    setPicked(trimmedDraft);
+    setDraft('');
+    handlers.onReply(botAskAnswer(question, trimmedDraft));
+  };
+
+  const cancelCustom = () => {
+    setDraft('');
+    inputRef.current?.blur();
+  };
+
+  const dismiss = async () => {
+    if (!canDismiss || dismissing || !handlers.onDismissAsk) return;
+    setDismissing(true);
+    setLocalDismissed(true);
+    setDraft('');
+    try {
+      const ok = await handlers.onDismissAsk({ ...(messageId ? { messageId } : {}), ...(partId ? { partId } : {}), question });
+      if (ok === false) setLocalDismissed(false);
+    } catch {
+      setLocalDismissed(false);
+    } finally {
+      setDismissing(false);
+    }
+  };
+
+  if (isDismissed) {
+    return (
+      <div
+        data-ask-dismissed=""
+        className="bot-card-ask bot-card-ask-dismissed mt-2 flex max-w-[520px] items-center gap-2 rounded-xl bg-white/[0.02] px-3 py-2 text-[12px] text-neutral-500 ring-1 ring-white/[0.06]"
+      >
+        <MessageCircleQuestion size={13} className="shrink-0 text-neutral-500/80" />
+        <span className="min-w-0 flex-1 truncate">{question}</span>
+        <span className="shrink-0 text-[11px] text-neutral-500/80">Dismissed</span>
+      </div>
+    );
+  }
+
   return (
     <div className="bot-card-ask mt-2 max-w-[520px] rounded-xl bg-white/[0.03] p-3 ring-1 ring-white/[0.08]">
       <div className="flex items-start gap-2 text-[13px] font-medium text-neutral-100">
         <MessageCircleQuestion size={14} className="mt-0.5 shrink-0 text-sky-400" />
-        {question}
+        <span className="min-w-0 flex-1">{question}</span>
+        {canDismiss ? (
+          <button
+            type="button"
+            title="Dismiss question"
+            aria-label="Dismiss question"
+            disabled={dismissing}
+            onClick={() => void dismiss()}
+            className="-mr-1 -mt-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-neutral-400 transition-colors duration-75 hover:bg-white/[0.08] hover:text-neutral-100 disabled:opacity-40"
+          >
+            <X size={13} />
+          </button>
+        ) : null}
       </div>
       <div className="mt-2 flex flex-col gap-1">
         {options.map((option, index) => (
@@ -422,22 +501,80 @@ const AskCard: React.FC<{ props: Record<string, unknown>; handlers: BotActionHan
             disabled={chosen !== null}
             onClick={() => {
               setPicked(option);
+              setDraft('');
               handlers.onReply(botAskAnswer(question, option));
             }}
             className={`flex items-center justify-between gap-2 rounded-lg px-2.5 py-1.5 text-left text-[12.5px] ring-1 transition-colors duration-75 ${
               chosen === option
                 ? 'bg-sky-500/10 text-neutral-100 ring-sky-400/40'
                 : chosen
-                  ? 'text-neutral-500 ring-white/[0.06]'
+                  ? 'cursor-default text-neutral-500 ring-white/[0.06]'
                   : 'text-neutral-200 ring-white/[0.08] hover:bg-white/[0.05]'
             }`}
           >
             <span>{option}</span>
-            {recommended === index && !chosen ? <span className="text-[10.5px] uppercase tracking-wide text-sky-400">Suggested</span> : null}
+            {chosen === option ? (
+              <Check size={13} className="shrink-0 text-sky-400" />
+            ) : recommended === index && !chosen ? (
+              <span className="shrink-0 text-[10.5px] uppercase tracking-wide text-sky-400">Suggested</span>
+            ) : null}
           </button>
         ))}
       </div>
-      {!chosen ? <div className="mt-1.5 text-[11px] text-neutral-500">Or type your own answer.</div> : null}
+      {customChosen ? (
+        <div
+          data-ask-custom-answer=""
+          className="mt-1.5 flex items-start justify-between gap-2 rounded-lg bg-sky-500/10 px-2.5 py-1.5 text-[12.5px] text-neutral-100 ring-1 ring-sky-400/40"
+        >
+          <span className="min-w-0 whitespace-pre-wrap break-words">{chosen}</span>
+          <Check size={13} className="mt-0.5 shrink-0 text-sky-400" />
+        </div>
+      ) : null}
+      {chosen === null ? (
+        <div className="mt-1.5 flex items-end gap-1 rounded-lg bg-black/20 p-1 pl-2.5 ring-1 ring-white/[0.08] transition-colors duration-75 focus-within:bg-black/30 focus-within:ring-sky-400/50">
+          <textarea
+            ref={inputRef}
+            rows={1}
+            value={draft}
+            placeholder="Or type your own answer…"
+            aria-label={`Answer “${question}”`}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                submitCustom();
+              } else if (event.key === 'Escape') {
+                event.preventDefault();
+                cancelCustom();
+              }
+            }}
+            className="max-h-28 min-h-[24px] flex-1 resize-none bg-transparent py-0.5 text-[12.5px] leading-[20px] text-neutral-100 outline-none placeholder:text-neutral-500"
+          />
+          {draft ? (
+            <button
+              type="button"
+              title="Cancel (Esc)"
+              aria-label="Cancel answer"
+              onClick={cancelCustom}
+              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-neutral-400 transition-colors duration-75 hover:bg-white/[0.06] hover:text-neutral-200"
+            >
+              <X size={12.5} />
+            </button>
+          ) : null}
+          <button
+            type="button"
+            title="Send answer (Enter)"
+            aria-label="Send answer"
+            disabled={!canSend}
+            onClick={submitCustom}
+            className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors duration-75 ${
+              canSend ? 'bg-sky-500 text-white hover:bg-sky-400' : 'text-neutral-500 opacity-50 disabled:cursor-default'
+            }`}
+          >
+            <SendHorizontal size={12.5} />
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 };
@@ -474,11 +611,12 @@ const OtherCard: React.FC<{ card: BotCard }> = ({ card }) => {
 };
 
 /** The cards under one reply, in the order the reply showed them. */
-export const BotCards: React.FC<{ cards: BotCard[]; handlers: BotActionHandlers; answeredQuestions?: ReadonlyMap<string, string> }> = ({
-  cards,
-  handlers,
-  answeredQuestions,
-}) => (
+export const BotCards: React.FC<{
+  cards: BotCard[];
+  handlers: BotActionHandlers;
+  answeredQuestions?: ReadonlyMap<string, string>;
+  messageId?: string;
+}> = ({ cards, handlers, answeredQuestions, messageId }) => (
   <>
     {cards.map((card) => {
       const props = (card.props && typeof card.props === 'object' ? card.props : {}) as Record<string, unknown>;
@@ -493,7 +631,16 @@ export const BotCards: React.FC<{ cards: BotCard[]; handlers: BotActionHandlers;
         }
         case 'bot-ask': {
           const question = typeof props.question === 'string' ? props.question.replace(/\s+/g, ' ').trim() : '';
-          return <AskCard key={card.id} props={props} handlers={handlers} answered={answeredQuestions?.get(question) ?? null} />;
+          return (
+            <AskCard
+              key={card.id}
+              props={props}
+              handlers={handlers}
+              answered={answeredQuestions?.get(question) ?? null}
+              messageId={messageId}
+              partId={card.id}
+            />
+          );
         }
         default:
           return <OtherCard key={card.id} card={card} />;

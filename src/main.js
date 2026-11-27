@@ -7085,6 +7085,32 @@ ipcMain.handle('bots:send', async (_event, input) => {
   }
 });
 
+ipcMain.handle('bots:dismissAsk', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId.trim().slice(0, 128) : '';
+  const messageId = typeof input?.messageId === 'string' ? input.messageId.trim().slice(0, 128) : undefined;
+  const partId = typeof input?.partId === 'string' ? input.partId.trim().slice(0, 128) : undefined;
+  const question = typeof input?.question === 'string' ? input.question.trim().slice(0, 500) : undefined;
+  if (!botId || (!partId && !question)) return { ok: false, error: 'Missing bot or question to dismiss.' };
+  if (await localBotsMode()) {
+    try {
+      return await localBots.dismissAsk(botId, { messageId, partId, question });
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const account = await durangoAccountKey();
+    if (!account) return { ok: false, error: 'Sign in to Durango first.' };
+    return await durangoClient.dismissBotAsk(
+      botId,
+      { ...(messageId ? { messageId } : {}), ...(partId ? { partId } : {}), ...(question ? { question } : {}) },
+      { account }
+    );
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
 ipcMain.handle('bots:attachmentStatuses', (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : undefined;
   return { ok: true, items: botAttachments.listStatuses({ ...(botId ? { botId } : {}) }) };
