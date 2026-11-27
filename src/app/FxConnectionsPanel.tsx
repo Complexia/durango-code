@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import type { ProviderRuntimeOptions } from '../store';
 import { SelectMenu } from './SelectMenu';
 import { installFx, useFxInstall } from './fxInstall';
+import { createFocusCooldown } from './focusCooldown';
 
 type FxConnections = NonNullable<Awaited<ReturnType<Window['orion']['getFxConnections']>>['connections']>;
 type FxLoginTarget = 'codex' | 'grok' | 'vercel';
@@ -40,7 +41,10 @@ export const FxConnectionsPanel = ({
   const { installing, error: installError } = useFxInstall();
   const [gatewayKeyDraft, setGatewayKeyDraft] = useState('');
 
+  const focusCooldownRef = useRef(createFocusCooldown(3_000));
+
   const refresh = useCallback(async () => {
+    focusCooldownRef.current.mark();
     const result = await window.orion?.getFxConnections?.();
     if (result?.ok && result.connections) setConnections(result.connections);
   }, []);
@@ -52,9 +56,14 @@ export const FxConnectionsPanel = ({
     });
     // fx sign-in finishes in the browser; pick up the new login when the
     // user comes back to the window.
-    const onFocus = () => void refresh();
+    const onFocus = () => {
+      focusCooldownRef.current.trigger(() => {
+        void refresh();
+      });
+    };
     window.addEventListener('focus', onFocus);
     return () => {
+      focusCooldownRef.current.cancel();
       unsubscribe?.();
       window.removeEventListener('focus', onFocus);
     };

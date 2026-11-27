@@ -1032,6 +1032,18 @@ export const createDurangoClient = ({
     async sendBotMessage(botId, body, { account } = {}) {
       return await request('POST', `/bots/${encodeURIComponent(str(botId))}/messages`, { body, ...(account ? { account } : {}) });
     },
+    /** Dismisses an ask_user question card without answering or starting a bot turn → `{ ok, dismissed, needsYou }`. */
+    async dismissBotAsk(botId, body = {}, { account } = {}) {
+      const data = await request('POST', `/bots/${encodeURIComponent(str(botId))}/ask/dismiss`, {
+        body,
+        ...(account ? { account } : {}),
+      });
+      return {
+        ok: data?.ok !== false,
+        dismissed: data?.dismissed !== false,
+        needsYou: data?.needsYou === true,
+      };
+    },
     /**
      * A file for a bot message, saved to the person's library → `{ part, attachment, attached? }`.
      * When `botId`, `messageId` and `pendingId` are provided, Durango also resolves that pending
@@ -1678,6 +1690,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000, botLanesFile 
     },
     async sendBotMessage() {
       return { seq: 0 };
+    },
+    async dismissBotAsk() {
+      return { ok: true, dismissed: true, needsYou: false };
     },
     async updateBotMessageAttachment() {
       return { ok: true };

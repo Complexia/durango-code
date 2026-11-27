@@ -11,7 +11,7 @@ const delay = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const mainSource = await readFile(new URL('../src/main.js', import.meta.url), 'utf8');
 const pendingQuitWorkSource = mainSource.match(
-  /const waitForPendingQuitWork = \(\) =>[\s\S]*?\.then\(\(\) => threadsSaveQueue/
+  /const waitForPendingQuitWork = \(\) =>[\s\S]*?\.then\(\(\) =>[^\n]*threadsSaveQueue/
 )?.[0];
 assert.ok(pendingQuitWorkSource, 'the pending quit-work barrier should remain present');
 assert.doesNotMatch(

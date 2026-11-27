@@ -132,8 +132,10 @@ import {
   type MuseReasoningEffort,
 } from './agentCatalog';
 import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
-import orionIconUrl from '../assets/icon.png';
 import { removeBootSkeleton } from './app/bootSkeleton';
+
+// Reuses public/icon.png emitted next to index.html (avoids a duplicate PNG in app.asar).
+const orionIconUrl = './icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
 import { SavedViewsSection, THREAD_DRAG_MIME } from './app/SavedViewsSection';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
@@ -160,6 +162,7 @@ import { DeviceCard } from './app/DeviceCard';
 import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
 import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
+import { createFocusCooldown, isSameGitState } from './app/focusCooldown';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import {
   Composer,
@@ -518,6 +521,8 @@ const legacyAntigravityEffortForThread = (
 const CLOUD_DEPLOY_POLL_INTERVAL_MS = 4000;
 // Match the packaged app update scheduler so both update banners stay fresh.
 const PROVIDER_UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
+const PROVIDER_UPDATE_BOOT_DELAY_MS = 15_000;
+const CLOUD_FOCUS_COOLDOWN_MS = 15_000;
 const CLOUD_DEPLOY_POLL_TIMEOUT_MS = 20 * 60 * 1000;
 
 const cloudAppHost = (url: string) => {
@@ -1636,7 +1641,9 @@ const App: React.FC = () => {
   const orionMcpsRef = useRef<OrionMcpEntry[]>([]);
   useEffect(() => {
     let active = true;
+    const focusCooldown = createFocusCooldown(10_000);
     const load = async () => {
+      focusCooldown.mark();
       try {
         const result = await window.orion?.listOrionMcps?.();
         if (active && result?.ok) {
@@ -1647,13 +1654,19 @@ const App: React.FC = () => {
         // Keep the last known list; the composer simply offers fewer mentions.
       }
     };
+    const onFocus = () => {
+      focusCooldown.trigger(() => {
+        if (active) void load();
+      });
+    };
     void load();
     window.addEventListener(ORION_MCPS_CHANGED_EVENT, load);
-    window.addEventListener('focus', load);
+    window.addEventListener('focus', onFocus);
     return () => {
       active = false;
+      focusCooldown.cancel();
       window.removeEventListener(ORION_MCPS_CHANGED_EVENT, load);
-      window.removeEventListener('focus', load);
+      window.removeEventListener('focus', onFocus);
     };
   }, []);
   const attachedOrionMcps = useMemo(() => {
@@ -1787,14 +1800,15 @@ const App: React.FC = () => {
     };
   }, [threadReaderProviderId]);
   const canReferenceThreads = hasThreadReaderSupport(threadReaderProviderId, threadReaderSupport);
+  const enabledProviderIdsKey = agentProviders
+    .map((provider) => provider.id)
+    // 'orion' has no providerSettings entry (it's a pseudo-provider, not a
+    // CLI); it is always enabled.
+    .filter((id) => id === 'orion' || normalizedProviderSettings[id as ProviderId]?.enabled !== false)
+    .join(',');
   const enabledProviderIds = useMemo(
-    () =>
-      agentProviders
-        .map((provider) => provider.id)
-        // 'orion' has no providerSettings entry (it's a pseudo-provider, not a
-        // CLI); it is always enabled.
-        .filter((id) => id === 'orion' || normalizedProviderSettings[id as ProviderId]?.enabled !== false),
-    [normalizedProviderSettings]
+    () => (enabledProviderIdsKey ? enabledProviderIdsKey.split(',') : []),
+    [enabledProviderIdsKey]
   );
   const enabledProviderIdSet = useMemo(() => new Set(enabledProviderIds), [enabledProviderIds]);
   const visibleAgentModels = useMemo(() => {
@@ -2792,13 +2806,29 @@ const App: React.FC = () => {
   // A workspace removed outside its thread (by another thread's agent, or in a
   // terminal) is released from every thread that still points at it.
   useEffect(() => {
-    const check = () => void releaseMissingDurangoWorkspaces();
+    const focusCooldown = createFocusCooldown(10_000);
+    const isVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
+    const check = () => {
+      focusCooldown.mark();
+      void releaseMissingDurangoWorkspaces();
+    };
+    const onResume = () => {
+      if (!isVisible()) return;
+      focusCooldown.trigger(() => {
+        if (isVisible()) void releaseMissingDurangoWorkspaces();
+      });
+    };
     check();
-    const timer = window.setInterval(check, WORKSPACE_PRESENCE_POLL_MS);
-    window.addEventListener('focus', check);
+    const timer = window.setInterval(() => {
+      if (isVisible()) check();
+    }, WORKSPACE_PRESENCE_POLL_MS);
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
     return () => {
+      focusCooldown.cancel();
       window.clearInterval(timer);
-      window.removeEventListener('focus', check);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, []);
 
@@ -3011,22 +3041,35 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const providerUpdatesCheckedOnceRef = useRef(false);
+  const providerUpdatesCheckingRef = useRef(false);
+  const providerUpdatesSeqRef = useRef(0);
   const refreshProviderUpdates = useCallback(async () => {
     if (!window.orion?.checkProviderUpdates) return;
+    const seq = ++providerUpdatesSeqRef.current;
+    providerUpdatesCheckingRef.current = true;
     setProviderUpdatesChecking(true);
     try {
-      setProviderUpdateState(await window.orion.checkProviderUpdates({ enabledProviderIds }));
+      const nextState = await window.orion.checkProviderUpdates({ enabledProviderIds });
+      if (seq !== providerUpdatesSeqRef.current) return;
+      providerUpdatesCheckedOnceRef.current = true;
+      setProviderUpdateState(nextState);
     } catch {
+      if (seq !== providerUpdatesSeqRef.current) return;
       setProviderUpdateState(null);
     } finally {
-      setProviderUpdatesChecking(false);
+      if (seq === providerUpdatesSeqRef.current) {
+        providerUpdatesCheckingRef.current = false;
+        setProviderUpdatesChecking(false);
+      }
     }
   }, [enabledProviderIds]);
 
   useEffect(() => {
     void refreshAgentModels();
-    void refreshProviderUpdates();
+  }, [refreshAgentModels]);
 
+  useEffect(() => {
     const interval = window.setInterval(() => {
       void refreshProviderUpdates();
     }, PROVIDER_UPDATE_CHECK_INTERVAL_MS);
@@ -3034,7 +3077,7 @@ const App: React.FC = () => {
     return () => {
       window.clearInterval(interval);
     };
-  }, [refreshAgentModels, refreshProviderUpdates]);
+  }, [refreshProviderUpdates]);
 
   // Background discovery refreshes the main-process catalog; pick up the
   // cached result whenever it changes.
@@ -3044,14 +3087,6 @@ const App: React.FC = () => {
       void refreshAgentModels();
     });
   }, [refreshAgentModels]);
-
-  useEffect(() => {
-    if (!window.orion?.onProviderAuthenticated) return undefined;
-    return window.orion.onProviderAuthenticated(() => {
-      void refreshAgentModels(true);
-      void refreshProviderUpdates();
-    });
-  }, [refreshAgentModels, refreshProviderUpdates]);
 
   useEffect(() => {
     let active = true;
@@ -3229,6 +3264,40 @@ const App: React.FC = () => {
     // Runs after the hydrated frame commits: the real sidebar is underneath.
     if (storeHydrated) removeBootSkeleton();
   }, [storeHydrated]);
+  // Defer the initial provider update check until after store hydration and
+  // startup settle (so disabled providers are skipped and boot I/O is not
+  // crowded). Subsequent changes to enabled providers refresh immediately.
+  useEffect(() => {
+    if (!storeHydrated) return undefined;
+    if (providerUpdatesCheckedOnceRef.current || providerUpdatesCheckingRef.current) {
+      void refreshProviderUpdates();
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      if (!providerUpdatesCheckedOnceRef.current && !providerUpdatesCheckingRef.current) {
+        void refreshProviderUpdates();
+      }
+    }, PROVIDER_UPDATE_BOOT_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [storeHydrated, refreshProviderUpdates]);
+  // Opening Settings → Providers before the boot delay fires (or after an
+  // initial failure) checks right away.
+  useEffect(() => {
+    if (!storeHydrated || providerUpdatesCheckedOnceRef.current || providerUpdatesCheckingRef.current) return;
+    if (settingsOpen && settingsTab === 'providers') void refreshProviderUpdates();
+  }, [storeHydrated, settingsOpen, settingsTab, refreshProviderUpdates]);
+  // Re-check models and provider updates after sign-in completes, gated on
+  // `storeHydrated` so `refreshProviderUpdates` always captures post-hydration
+  // `enabledProviderIds`.
+  useEffect(() => {
+    if (!window.orion?.onProviderAuthenticated) return undefined;
+    return window.orion.onProviderAuthenticated(() => {
+      void refreshAgentModels(true);
+      if (storeHydrated) void refreshProviderUpdates();
+    });
+  }, [refreshAgentModels, refreshProviderUpdates, storeHydrated]);
   // Drafts saved by the last session list their threads again, like ones
   // typed into this session.
   useEffect(() => {
@@ -3594,64 +3663,80 @@ const App: React.FC = () => {
   // just switched to, and would overwrite the pill and picker with the wrong
   // repository's branches. Only the latest request may write state.
   const gitRefreshSeqRef = useRef(0);
-  const refreshGitState = useCallback(async () => {
+  const gitRefreshInFlightRef = useRef(false);
+  const gitFocusCooldownRef = useRef(createFocusCooldown());
+  const lastGitStateRef = useRef<GitRepoState | null>(null);
+  const refreshGitState = useCallback(async (): Promise<boolean> => {
     const projectPath = activeWorkingDir;
     const seq = ++gitRefreshSeqRef.current;
+    gitFocusCooldownRef.current.mark();
     if (!projectPath || !window.orion?.getGitState) {
+      gitRefreshInFlightRef.current = false;
+      const changed = lastGitStateRef.current !== null;
+      lastGitStateRef.current = null;
       setGitState(null);
       setGitLoading(false);
-      return;
+      return changed;
     }
 
+    gitRefreshInFlightRef.current = true;
     setGitLoading(true);
     try {
       const state = await window.orion.getGitState(projectPath);
-      if (seq !== gitRefreshSeqRef.current) return;
-      setGitState(state);
+      if (seq !== gitRefreshSeqRef.current) return false;
+      // Preserve reference equality when nothing changed so effects keyed on
+      // `gitState` (notably `refreshCloudState`) do not cascade on every focus.
+      const changed = !isSameGitState(lastGitStateRef.current, state);
+      if (changed) {
+        lastGitStateRef.current = state;
+        setGitState(state);
+      }
+      return changed;
     } catch (error) {
-      if (seq !== gitRefreshSeqRef.current) return;
-      setGitState({
+      if (seq !== gitRefreshSeqRef.current) return false;
+      const errorState = {
         ok: false,
         branches: [],
         hasUncommittedChanges: false,
         error: error instanceof Error ? error.message : 'Unable to read git state',
-      });
+      };
+      const changed = !isSameGitState(lastGitStateRef.current, errorState);
+      if (changed) {
+        lastGitStateRef.current = errorState;
+        setGitState(errorState);
+      }
+      return changed;
     } finally {
-      if (seq === gitRefreshSeqRef.current) setGitLoading(false);
+      if (seq === gitRefreshSeqRef.current) {
+        gitRefreshInFlightRef.current = false;
+        setGitLoading(false);
+      }
     }
   }, [activeWorkingDir]);
 
   useEffect(() => {
+    gitFocusCooldownRef.current.reset();
+    lastGitStateRef.current = null;
     void refreshGitState();
   }, [refreshGitState]);
-
-  // A checkout in an outside terminal doesn't notify the app; re-read when
-  // the window regains focus so the pill matches the repository's real HEAD.
-  useEffect(() => {
-    const onFocus = () => void refreshGitState();
-    window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
-  }, [refreshGitState]);
-
-  // An agent can switch branches (or leave its workspace) during a turn;
-  // re-read when the turn ends so the pill shows where the checkout is now.
-  const selectedThreadRunning = selectedThread?.status === 'running';
-  useEffect(() => {
-    if (!selectedThreadRunning) void refreshGitState();
-  }, [refreshGitState, selectedThreadRunning]);
 
   // Same stale-response race as refreshGitState: only the latest request may
   // write, so a slow read for the previous project can't repaint the cloud
   // pill after a project switch.
   const cloudRefreshSeqRef = useRef(0);
+  const cloudRefreshInFlightRef = useRef(false);
+  const cloudFocusCooldownRef = useRef(createFocusCooldown(CLOUD_FOCUS_COOLDOWN_MS));
   const refreshCloudState = useCallback(async () => {
     const projectPath = activeWorkingDir;
     const seq = ++cloudRefreshSeqRef.current;
+    cloudFocusCooldownRef.current.mark();
     if (!projectPath || !window.orion?.getCloudState) {
+      cloudRefreshInFlightRef.current = false;
       setCloudState(null);
       return;
     }
 
+    cloudRefreshInFlightRef.current = true;
     try {
       const state = await window.orion.getCloudState(projectPath);
       if (seq !== cloudRefreshSeqRef.current) return;
@@ -3662,7 +3747,15 @@ const App: React.FC = () => {
         ok: false,
         error: error instanceof Error ? error.message : 'Unable to read Durango Cloud state',
       });
+    } finally {
+      if (seq === cloudRefreshSeqRef.current) {
+        cloudRefreshInFlightRef.current = false;
+      }
     }
+  }, [activeWorkingDir]);
+
+  useEffect(() => {
+    cloudFocusCooldownRef.current.reset();
   }, [activeWorkingDir]);
 
   // Cloud state depends on both the account session and local git state
@@ -3670,6 +3763,52 @@ const App: React.FC = () => {
   useEffect(() => {
     void refreshCloudState();
   }, [refreshCloudState, accountState.authenticated, gitState]);
+
+  // An agent can switch branches, commit/push, or deploy during a turn;
+  // re-read git state when the turn ends, and refresh cloud state even if
+  // local git summary fields didn't change (e.g. deploy or commit+push in one turn).
+  const selectedThreadRunning = selectedThread?.status === 'running';
+  const prevRunningStateRef = useRef({ running: selectedThreadRunning, dir: activeWorkingDir });
+  useEffect(() => {
+    const prev = prevRunningStateRef.current;
+    prevRunningStateRef.current = { running: selectedThreadRunning, dir: activeWorkingDir };
+    if (prev.running && !selectedThreadRunning && prev.dir === activeWorkingDir) {
+      void refreshGitState().then((changed) => {
+        if (!changed) void refreshCloudState();
+      });
+    }
+  }, [activeWorkingDir, refreshCloudState, refreshGitState, selectedThreadRunning]);
+
+  // A checkout or remote push outside the app doesn't notify us; re-read git
+  // state on focus (leading + trailing 5s cooldown so quick terminal round-trips
+  // are never dropped). If git summary fields didn't change, still refresh
+  // cloud state on a 15s cooldown so remote pushes/deploys and local commits
+  // without an upstream don't go stale.
+  useEffect(() => {
+    const isVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
+    const onFocus = () => {
+      gitFocusCooldownRef.current.trigger(
+        () => {
+          void refreshGitState().then((changed) => {
+            if (changed || !isVisible()) return;
+            cloudFocusCooldownRef.current.trigger(
+              () => {
+                if (isVisible()) void refreshCloudState();
+              },
+              { isBusy: () => cloudRefreshInFlightRef.current }
+            );
+          });
+        },
+        { isBusy: () => gitRefreshInFlightRef.current }
+      );
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      gitFocusCooldownRef.current.cancel();
+      cloudFocusCooldownRef.current.cancel();
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [refreshCloudState, refreshGitState]);
 
   // The Orion Cloud app for the active project: whatever we've learned since
   // the last cloud-state refresh wins, because a deploy queued a second ago is
@@ -5375,7 +5514,7 @@ const App: React.FC = () => {
           });
         }
         if (result.mirrorWarning) toast.warning(result.mirrorWarning);
-        await refreshGitState();
+        if (!(await refreshGitState())) await refreshCloudState();
       } else {
         toast.error(result.error ?? 'Commit and push failed', {
           ...(result.errorDetail ? { description: result.errorDetail } : {}),

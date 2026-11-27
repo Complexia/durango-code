@@ -2,7 +2,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { readFile, realpath } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { loginShell, resolveCommandPath, runShellCommand, shellQuote } from './shell-env.js';
+import { loginShell, resolveCommandPath, resyncShellPath, runShellCommand, shellQuote } from './shell-env.js';
 import { readFxConnections } from './fx-provider.js';
 
 export const providerUpdaterConfigs = [
@@ -711,6 +711,29 @@ export const normalizeEnabledProviderIds = (input) => {
 export const checkProviderUpdate = async (config, enabledProviderIds = null) => {
   const commandPath = await resolveCommandPath(config.command);
   const enabled = !enabledProviderIds || enabledProviderIds.has(config.id);
+  if (!enabled) {
+    // Skip auth/version/mise/network checks for disabled providers so startup
+    // and periodic refreshes never spawn CLIs or hit registries for tools the
+    // user turned off.
+    return {
+      id: config.id,
+      label: config.label,
+      command: config.command,
+      enabled: false,
+      installed: Boolean(commandPath),
+      path: commandPath,
+      currentVersion: null,
+      latestVersion: null,
+      updateAvailable: false,
+      status: commandPath ? 'unknown' : 'missing',
+      auth: {
+        authenticated: null,
+        status: commandPath ? 'unknown' : 'missing',
+        label: 'Disabled',
+        detail: `${config.label} is disabled.`,
+      },
+    };
+  }
   const auth = await getProviderAuthStatus(config);
   const base = {
     id: config.id,
@@ -898,6 +921,9 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
     onPhase?.('updating');
     const { stdout, stderr } = await runUpdateCommand(updateCommand);
     const outputParts = [`${stdout}\n${stderr}`.trim()].filter(Boolean);
+    // A self-updater can move the CLI to a new bin dir (e.g. npm -> ~/.local/bin);
+    // refresh PATH and clear the command cache before verification or status checks.
+    await resyncShellPath();
     const manualInstallCommand = config.manualInstallCommandPattern
       ? outputParts[0]?.match(config.manualInstallCommandPattern)?.[1]?.trim()
       : null;
@@ -910,6 +936,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
       const manualResult = await runUpdateCommand(manualInstallCommand);
       const manualOutput = `${manualResult.stdout}\n${manualResult.stderr}`.trim();
       if (manualOutput) outputParts.push(manualOutput);
+      await resyncShellPath();
     }
 
     if (verifyAfterUpdate && expectedLatestVersion) {
@@ -927,6 +954,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
           const fallbackResult = await runUpdateCommand(config.fallbackInstallCommand);
           const fallbackOutput = `${fallbackResult.stdout}\n${fallbackResult.stderr}`.trim();
           if (fallbackOutput) outputParts.push(fallbackOutput);
+          await resyncShellPath();
         } catch (fallbackError) {
           // Cancellation propagates to the outer handler; any other failure
           // must not fall through to the catch block, which would run the
@@ -992,6 +1020,7 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
         onPhase?.('installing');
         const { stdout, stderr } = await runUpdateCommand(fallbackCommand);
         const fallbackOutput = `${stdout}\n${stderr}`.trim();
+        await resyncShellPath();
 
         if (config.verifyAfterUpdate && expectedLatestVersion) {
           onPhase?.('verifying');

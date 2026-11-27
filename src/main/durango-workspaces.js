@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { bundledCliCommand, bundledCliEntry, bundledCliError, runBundledCli } from './bundled-cli.js';
@@ -7,12 +7,116 @@ import { execFileAsync } from './shell-env.js';
 
 // Durango workspaces (docs/workspaces.md): an isolated checkout per thread,
 // owned by the bundled durango-code CLI. Main never edits the workspace
-// registry (~/.durango/workspaces.json) itself; it runs `ws new`, `ws rm`,
-// `ws serve`, `ws stop`, `change show` and `land` with --json and reads the
-// workspace's own `.durango/change.json` for the change it holds.
+// registry (~/.durango/workspaces.json) or server-slots.json itself; it runs
+// `ws new`, `ws rm`, `ws serve`, `ws stop`, `change show` and `land` with
+// --json, and reads ~/.durango/workspaces.json, ~/.durango/server-slots.json
+// and the workspace's own `.durango/change.json` directly (read-only) for
+// status lookups without spawning a CLI process on every poll.
 
 const WS_NEW_TIMEOUT_MS = 15 * 60_000;
 const LAND_TIMEOUT_MS = 3 * 60 * 60_000;
+
+const durangoHome = () => path.join(os.homedir(), '.durango');
+const registryPath = () => path.join(durangoHome(), 'workspaces.json');
+const slotsPath = () => path.join(durangoHome(), 'server-slots.json');
+
+const jsonFileCache = new Map(); // path -> { mtimeNs, ctimeNs, size, ino, data }
+const TRANSIENT_READ_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
+
+const readCachedJsonFile = (filePath) => {
+  const cached = jsonFileCache.get(filePath);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const stats = statSync(filePath, { bigint: true });
+      if (
+        cached &&
+        cached.mtimeNs === stats.mtimeNs &&
+        cached.ctimeNs === stats.ctimeNs &&
+        cached.size === stats.size &&
+        cached.ino === stats.ino
+      ) {
+        return cached.data;
+      }
+      const parsed = JSON.parse(readFileSync(filePath, 'utf8'));
+      jsonFileCache.set(filePath, {
+        mtimeNs: stats.mtimeNs,
+        ctimeNs: stats.ctimeNs,
+        size: stats.size,
+        ino: stats.ino,
+        data: parsed,
+      });
+      return parsed;
+    } catch (error) {
+      const code = error?.code;
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        jsonFileCache.delete(filePath);
+        return null;
+      }
+      if (TRANSIENT_READ_CODES.has(code)) {
+        if (attempt === 0) continue;
+        // On Windows, a concurrent atomic renameSync can briefly raise
+        // EBUSY/EPERM/EACCES; keep the last-known-good snapshot rather than
+        // flashing registered:false / server:null.
+        return cached ? cached.data : null;
+      }
+      jsonFileCache.delete(filePath);
+      return null;
+    }
+  }
+  return cached ? cached.data : null;
+};
+
+const pidAlive = (pid) => {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+};
+
+const groupAlive = (pgid) => {
+  if (typeof pgid !== 'number' || !Number.isInteger(pgid) || pgid <= 0) return false;
+  if (process.platform === 'win32') return pidAlive(pgid);
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === 'EPERM';
+  }
+};
+
+/** Read-only view of `~/.durango/workspaces.json` (written atomically by the CLI). */
+export const readWorkspaceRegistry = () => {
+  const parsed = readCachedJsonFile(registryPath());
+  return Array.isArray(parsed?.workspaces) ? parsed.workspaces.slice() : [];
+};
+
+/**
+ * Read-only view of `~/.durango/server-slots.json` with live PID/process-group
+ * filtering matching `cli/orion/src/server-slots.ts` (`pruneState`).
+ */
+export const readWorkspaceServerSlots = () => {
+  const parsed = readCachedJsonFile(slotsPath());
+  const running = new Set();
+  const queued = new Set();
+  if (Array.isArray(parsed?.running)) {
+    for (const server of parsed.running) {
+      if (server?.workspace && (pidAlive(server.pid) || groupAlive(server.childPid))) {
+        running.add(server.workspace);
+      }
+    }
+  }
+  if (Array.isArray(parsed?.queue)) {
+    for (const waiter of parsed.queue) {
+      if (waiter?.workspace && pidAlive(waiter.pid)) {
+        queued.add(waiter.workspace);
+      }
+    }
+  }
+  return { running, queued };
+};
 
 const realpath = (value) => {
   try {
@@ -101,17 +205,18 @@ export const createDurangoWorkspace = async ({ projectPath, name, threadId, env 
 
 /**
  * A workspace an agent made itself (`durango-code ws new` in a turn), by name,
- * from the project's base checkout's `ws list`. Null when the CLI doesn't know
- * it or it belongs to another repository.
+ * from the workspace registry (`~/.durango/workspaces.json`). Null when the
+ * CLI doesn't know it, its directory is gone, or it belongs to another repo.
  */
 export const findDurangoWorkspace = async ({ projectPath, name }) => {
   const project = await inspectDurangoWorkspaceProject(projectPath);
   if (!project.eligible) return { ok: true, workspace: null };
-  const result = await runBundledCli(['ws', 'list', '--json'], { cwd: project.baseRoot, timeout: 30_000 });
-  if (!result.json?.ok) return { ok: false, error: bundledCliError(result, 'durango-code ws list failed.') };
-  const entry = (result.json.workspaces ?? []).find(
+  const entry = readWorkspaceRegistry().find(
     (workspace) =>
-      workspace?.name === name && workspace.exists !== false && realpath(workspace.repo ?? '') === project.baseRoot
+      workspace?.name === name &&
+      typeof workspace.path === 'string' &&
+      existsSync(workspace.path) &&
+      realpath(workspace.repo ?? '') === project.baseRoot
   );
   return { ok: true, workspace: entry ? workspaceFromCli(entry, project.relativeDir) : null };
 };
@@ -195,22 +300,43 @@ const landRuns = new Map(); // workspace path -> { promise, startedAt }
 const serveRuns = new Map(); // workspace path -> { child, queued }
 
 /**
- * Everything the workspace bar shows. Local by default (the change file and
- * `ws list`); `remote` adds the change's Source status and URL, which needs
- * the network and a signed-in CLI.
+ * Everything the workspace bar shows. Local by default (reads
+ * `~/.durango/workspaces.json`, `~/.durango/server-slots.json`, and the
+ * workspace's `.durango/change.json` directly with zero subprocess spawns);
+ * `remote` adds the change's Source status and URL, which needs the network
+ * and a signed-in CLI.
  */
 export const durangoWorkspaceStatus = async ({ path: workspacePath, name, repo, remote = false, env }) => {
   const exists = typeof workspacePath === 'string' && existsSync(workspacePath);
   const local = exists ? readLocalChange(workspacePath) : {};
   const changeId = local.changeId ?? local.lastChangeId ?? null;
+  const registry = readWorkspaceRegistry();
+  let entry = registry.find(
+    (candidate) =>
+      candidate.path === workspacePath ||
+      (Boolean(name) && candidate.name === name && candidate.repo === repo)
+  );
+  if (!entry && ((typeof workspacePath === 'string' && workspacePath) || (Boolean(name) && Boolean(repo)))) {
+    // Fall back to canonical paths so symlinks (e.g. macOS /var vs /private/var)
+    // still match when a caller passes a non-canonical workspace or repo path.
+    const canonicalPath = typeof workspacePath === 'string' && workspacePath ? realpath(workspacePath) : null;
+    const canonicalRepo = typeof repo === 'string' && repo ? realpath(repo) : null;
+    entry = registry.find(
+      (candidate) =>
+        (canonicalPath !== null && typeof candidate.path === 'string' && candidate.path && realpath(candidate.path) === canonicalPath) ||
+        (Boolean(name) &&
+          candidate.name === name &&
+          canonicalRepo !== null &&
+          typeof candidate.repo === 'string' &&
+          candidate.repo &&
+          realpath(candidate.repo) === canonicalRepo)
+    );
+  }
   let server = null;
-  const list = await runBundledCli(['ws', 'list', '--json'], { cwd: exists ? workspacePath : os.homedir(), timeout: 30_000 }).catch(
-    () => null
-  );
-  const entry = list?.json?.workspaces?.find(
-    (candidate) => candidate.path === workspacePath || (candidate.name === name && candidate.repo === repo)
-  );
-  server = entry?.server ?? null;
+  if (entry?.name) {
+    const slots = readWorkspaceServerSlots();
+    server = slots.running.has(entry.name) ? 'running' : slots.queued.has(entry.name) ? 'queued' : null;
+  }
   const served = serveRuns.get(workspacePath);
   if (!server && served) server = served.queued ? 'queued' : 'starting';
   let change = changeId ? { changeId, status: local.status ?? null, url: null, title: null, rejection: null } : null;
@@ -277,11 +403,10 @@ const CHANGE_ID = /^chg_[a-z0-9]{8,40}$/;
  */
 export const locateDurangoChange = async (changeId) => {
   if (!CHANGE_ID.test(String(changeId ?? ''))) return null;
-  const list = await runBundledCli(['ws', 'list', '--json'], { cwd: os.homedir(), timeout: 30_000 }).catch(() => null);
-  const workspaces = (Array.isArray(list?.json?.workspaces) ? list.json.workspaces : []).filter(
+  const workspaces = readWorkspaceRegistry().filter(
     (entry) => typeof entry?.path === 'string' && existsSync(entry.path)
   );
-  const holder = workspaces.find((entry) => entry.changeId === changeId || readLocalChange(entry.path).changeId === changeId);
+  const holder = workspaces.find((entry) => readLocalChange(entry.path).changeId === changeId);
   const show = async (cwd) => {
     const shown = await runBundledCli(['change', 'show', changeId, '--json'], { cwd, timeout: 30_000 }).catch(() => null);
     return shown?.json?.ok ? { url: shown.json.url ?? null, status: shown.json.change?.status ?? null } : null;

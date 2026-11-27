@@ -102,9 +102,12 @@ export const normalizeReleaseNotes = (releaseNotes) => {
   return notes.length > 0 ? notes : null;
 };
 
+// In packaged builds this points inside app.asar (reusing the single icon
+// emitted alongside index.html); callers must read it via Electron APIs such
+// as `nativeImage.createFromPath()` or `fs`, not pass it to external OS tools.
 export const getAppIconPath = () => {
   if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'icon.png');
+    return path.join(app.getAppPath(), '.vite', 'renderer', 'main_window', 'icon.png');
   }
   return path.join(app.getAppPath(), 'assets', 'icon.png');
 };

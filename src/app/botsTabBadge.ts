@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { botIsWorking, type DesktopBot } from './bots';
+import { createFocusCooldown } from './focusCooldown';
 
 // The Bots tab's badge in the sidebar header (SidebarModeHeader.tsx): while
 // the Threads tab is open, the Bots tab shows when a bot has a new reply, is
@@ -50,8 +51,10 @@ export const useBotsTabBadge = (poll: boolean): BotsTabBadge => {
   useEffect(() => {
     if (!poll) return undefined;
     let stopped = false;
+    const focusCooldown = createFocusCooldown();
     const load = async () => {
       if (!visible()) return;
+      focusCooldown.mark();
       const result = await window.orion?.listBots?.().catch(() => null);
       if (stopped || !result) return;
       // Any failure (signed out, another account, no Claude Code here, offline)
@@ -60,12 +63,20 @@ export const useBotsTabBadge = (poll: boolean): BotsTabBadge => {
     };
     void load();
     const timer = window.setInterval(() => void load(), POLL_MS);
-    const onFocus = () => void load();
-    window.addEventListener('focus', onFocus);
+    const onResume = () => {
+      if (!visible()) return;
+      focusCooldown.trigger(() => {
+        if (!stopped && visible()) void load();
+      });
+    };
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
     return () => {
       stopped = true;
+      focusCooldown.cancel();
       window.clearInterval(timer);
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, [poll]);
   return current;

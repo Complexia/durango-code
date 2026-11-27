@@ -12,15 +12,22 @@ import { toast } from 'sonner';
 import type { ThreadDurangoWorkspace } from '../store';
 import type { DurangoWorkspaceStatus } from '../types';
 import { confirmDialog } from './ConfirmDialog';
+import { createFocusCooldown } from './focusCooldown';
 
 // Thread header pill for the thread's Durango workspace (docs/workspaces.md):
 // where it is, the change it holds, its dev server, landing, and removal. The
-// status is main-process state (the workspace's change file, `ws list`), so
-// the pill polls it while mounted and asks Durango Source for the change's
-// own status only when the menu opens. A workspace whose directory is gone is
-// handed back to the thread (onMissing), which then shows its branch again.
+// status is main-process state (direct reads of workspaces.json,
+// server-slots.json and the workspace's change file), so the pill refreshes it
+// while the window is visible (pausing when hidden, refreshing immediately on
+// return) and asks Durango Source for the change's own status only when
+// mounted or the menu opens. A workspace whose directory is gone is handed
+// back to the thread (onMissing), which then shows its branch again.
 
 const STATUS_POLL_MS = 10_000;
+const VISIBILITY_REFRESH_COOLDOWN_MS = 2_000;
+const FOCUS_REFRESH_COOLDOWN_MS = 5_000;
+
+const isDocumentVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
 
 const changeStatusLabel: Record<string, string> = {
   open: 'Open',
@@ -46,11 +53,15 @@ const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ wo
   const rootRef = React.useRef<HTMLDivElement>(null);
   const onMissingRef = React.useRef(onMissing);
   onMissingRef.current = onMissing;
+  const focusCooldownRef = React.useRef(createFocusCooldown(FOCUS_REFRESH_COOLDOWN_MS));
+  const visibilityCooldownRef = React.useRef(createFocusCooldown(VISIBILITY_REFRESH_COOLDOWN_MS));
   const lastPorts = workspace.portBase + workspace.portBlock - 1;
   const localUrl = `http://127.0.0.1:${workspace.portBase}`;
 
   const refresh = React.useCallback(
     async (remote = false) => {
+      focusCooldownRef.current.mark();
+      visibilityCooldownRef.current.mark();
       const next = await window.orion
         ?.durangoWorkspaceStatus?.({ path: workspace.path, name: workspace.name, repo: workspace.repo, remote })
         .catch(() => null);
@@ -76,15 +87,37 @@ const DurangoWorkspaceControl = React.memo(function DurangoWorkspaceControl({ wo
   );
 
   React.useEffect(() => {
+    focusCooldownRef.current.reset();
+    visibilityCooldownRef.current.reset();
     void refresh(true);
-    const timer = window.setInterval(() => void refresh(false), STATUS_POLL_MS);
+    const timer = window.setInterval(() => {
+      if (isDocumentVisible()) void refresh(false);
+    }, STATUS_POLL_MS);
+    const onVisibilityChange = () => {
+      if (!isDocumentVisible()) return;
+      visibilityCooldownRef.current.trigger(() => {
+        if (isDocumentVisible()) void refresh(false);
+      });
+    };
+    const onFocus = () => {
+      if (!isDocumentVisible()) return;
+      focusCooldownRef.current.trigger(() => {
+        if (isDocumentVisible()) void refresh(false);
+      });
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', onFocus);
     const unsubscribe = window.orion?.onDurangoWorkspaceServerExited?.(({ path, code, error }) => {
       if (path !== workspace.path) return;
       if (code) toast.error(`The ${workspace.name} dev server stopped`, { description: error ?? undefined });
       void refresh(false);
     });
     return () => {
+      focusCooldownRef.current.cancel();
+      visibilityCooldownRef.current.cancel();
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('focus', onFocus);
       unsubscribe?.();
     };
   }, [refresh, workspace.name, workspace.path]);

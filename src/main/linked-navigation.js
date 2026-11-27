@@ -90,12 +90,26 @@ export const linkedFileCandidates = (reference, baseDirs = [], homeDir = '') => 
 };
 
 export const externalWebUrl = (value) => {
+  if (typeof value !== 'string' && !(value instanceof URL)) return null;
+  const rawString = value instanceof URL ? value.toString() : value;
+  if (/[\u0000-\u001f\u007f]/.test(rawString)) return null;
+  const raw = rawString.trim();
+  if (!raw) return null;
   try {
-    const parsed = new URL(String(value));
-    return parsed.protocol === 'https:' || parsed.protocol === 'http:'
-      ? parsed.toString()
-      : null;
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    if (!parsed.hostname) return null;
+    return parsed.toString();
   } catch {
     return null;
   }
+};
+
+export const openExternalWebUrl = async (value, openExternal) => {
+  const safeUrl = externalWebUrl(value);
+  if (!safeUrl) {
+    throw new Error('Only http and https URLs can be opened externally.');
+  }
+  await openExternal(safeUrl);
+  return safeUrl;
 };

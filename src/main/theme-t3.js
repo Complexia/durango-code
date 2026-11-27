@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { durangoThemeToT3, looksLikeT3Theme, parseT3ThemeFile, t3BackdropImageAsset, t3ThemeAppearances, t3ThemeId, t3ThemeToDurango, T3_CSS_MAX_LENGTH } from '../t3-themes.js';
 import { getTheme, installTheme, listThemes, themeAssetPath } from './ui-themes-store.js';
+import { writeFileAtomic } from './atomic-write.js';
 
 // T3 Code themes in and out (src/t3-themes.js converts; docs/themes.md →
 // "T3 Code themes"). Import takes a T3 Code theme file (its Export, or the
@@ -178,8 +179,7 @@ export const exportThemeToT3 = async (id, filePath, { allowOverwrite = false } =
     if (!replaceable) throw new Error(`There is already a file at ${filePath} that is not a T3 Code theme; pass a new path.`);
   }
   const { file, notes } = await t3FileForTheme(id);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, `${JSON.stringify(file, null, 2)}\n`);
+  await writeFileAtomic(filePath, `${JSON.stringify(file, null, 2)}\n`);
   return { filePath, notes, name: file.name };
 };
 

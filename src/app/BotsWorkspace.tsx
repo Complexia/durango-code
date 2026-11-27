@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
+import { toast } from 'sonner';
+import { createFocusCooldown } from './focusCooldown';
 import {
   AlertCircle,
   Archive,
@@ -516,15 +518,28 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   }, []);
 
   useEffect(() => {
-    void loadBots();
+    const focusCooldown = createFocusCooldown();
+    const refresh = () => {
+      focusCooldown.mark();
+      void loadBots();
+    };
+    refresh();
     const timer = window.setInterval(() => {
-      if (visible()) void loadBots();
+      if (visible()) refresh();
     }, LIST_POLL_MS);
-    const onFocus = () => void loadBots();
-    window.addEventListener('focus', onFocus);
+    const onResume = () => {
+      if (!visible()) return;
+      focusCooldown.trigger(() => {
+        if (visible()) void loadBots();
+      });
+    };
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
     return () => {
+      focusCooldown.cancel();
       window.clearInterval(timer);
-      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, [loadBots]);
 
@@ -749,6 +764,23 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     },
     [expandProjectGroup, loadBots]
   );
+  const updateBotAsked = useCallback((targetBotId: string, asked: boolean) => {
+    setBots((current) => {
+      if (!current) return current;
+      let changed = false;
+      const next = current.map((item) => {
+        if (item.id !== targetBotId) return item;
+        const hasPendingRequest = Boolean(item.requests?.some((req) => req.status !== 'answering'));
+        const nextNeedsYou = asked || hasPendingRequest;
+        if (item.asked === asked && item.needsYou === nextNeedsYou) return item;
+        changed = true;
+        return { ...item, asked, needsYou: nextNeedsYou };
+      });
+      if (!changed) return current;
+      if (botListCache) botListCache = { ...botListCache, bots: next };
+      return next;
+    });
+  }, []);
 
   const botsRef = useRef(bots);
   botsRef.current = bots;
@@ -1361,6 +1393,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               claudeAvailable={claudeAvailable}
               machineReplies={!cloudOnly}
               onChanged={loadBots}
+              onAskedChange={updateBotAsked}
               onOpenProject={openProjectOfBot}
               onOpenThread={openBotThread}
               requests={selectedBot?.requests}
@@ -2934,6 +2967,7 @@ const BotPane: React.FC<{
   /** Whether this machine is configured to answer bots locally. */
   machineReplies: boolean;
   onChanged: () => void;
+  onAskedChange: (botId: string, asked: boolean) => void;
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
@@ -2950,6 +2984,7 @@ const BotPane: React.FC<{
   claudeAvailable,
   machineReplies,
   onChanged,
+  onAskedChange,
   onOpenProject,
   onOpenThread,
   requests,
@@ -3315,13 +3350,96 @@ const BotPane: React.FC<{
     [botId, poll, onChanged, toLatest]
   );
 
+  const dismissAsk = useCallback(
+    async (target: { messageId?: string; partId?: string; question: string }): Promise<boolean> => {
+      const previous = threadRef.current;
+      const previousAsked = previous?.bot.asked ?? previous?.bot.needsYou ?? false;
+      const normalizedTarget = target.question.replace(/\s+/g, ' ').trim();
+      const matchesCard = (card: { id: string; component: string; props: unknown }) => {
+        if (card.component !== 'bot-ask') return false;
+        if (target.partId) return card.id === target.partId;
+        const props = (card.props && typeof card.props === 'object' ? card.props : {}) as Record<string, unknown>;
+        return typeof props.question === 'string' && props.question.replace(/\s+/g, ' ').trim() === normalizedTarget;
+      };
+      let optimisticAsked = false;
+      if (previous) {
+        const patchedMessages = previous.messages.map((message) => {
+          if (target.messageId && message.id !== target.messageId) return message;
+          if (!message.cards?.some(matchesCard)) return message;
+          return {
+            ...message,
+            cards: message.cards.map((card) => {
+              if (!matchesCard(card)) return card;
+              const props = (card.props && typeof card.props === 'object' ? card.props : {}) as Record<string, unknown>;
+              return { ...card, props: { ...props, dismissed: true, dismissedAt: Date.now() } };
+            }),
+          };
+        });
+        for (let index = patchedMessages.length - 1; index >= 0; index -= 1) {
+          const message = patchedMessages[index];
+          if (message.role === 'user' && botInboxSource(message.authorLabel) === 'person') break;
+          if (message.role !== 'assistant' || !message.cards?.length) continue;
+          if (
+            message.cards.some((card) => {
+              if (card.component !== 'bot-ask') return false;
+              const props = (card.props && typeof card.props === 'object' ? card.props : {}) as Record<string, unknown>;
+              return props.dismissed !== true;
+            })
+          ) {
+            optimisticAsked = true;
+            break;
+          }
+        }
+        const hasPendingRequest = Boolean((requests ?? previous.bot.requests)?.some((req) => req.status !== 'answering'));
+        setThread(() => ({
+          ...previous,
+          messages: patchedMessages,
+          bot: { ...previous.bot, asked: optimisticAsked, needsYou: optimisticAsked || hasPendingRequest },
+        }));
+      }
+      onAskedChange(botId, optimisticAsked);
+      const result = await window.orion
+        ?.dismissBotAsk?.({
+          botId,
+          ...(target.messageId ? { messageId: target.messageId } : {}),
+          ...(target.partId ? { partId: target.partId } : {}),
+          question: target.question,
+        })
+        .catch((err: unknown) => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }));
+      if (!result?.ok) {
+        if (previous) setThread(() => previous);
+        onAskedChange(botId, previousAsked);
+        toast.error(result?.error ?? 'Couldn’t dismiss the question.');
+        return false;
+      }
+      if (typeof result.needsYou === 'boolean' && result.needsYou !== optimisticAsked) {
+        const finalAsked = result.needsYou;
+        onAskedChange(botId, finalAsked);
+        setThread((current) => {
+          if (!current) return current;
+          const hasPendingRequest = Boolean((requests ?? current.bot.requests)?.some((req) => req.status !== 'answering'));
+          return { ...current, bot: { ...current.bot, asked: finalAsked, needsYou: finalAsked || hasPendingRequest } };
+        });
+      }
+      onChanged();
+      return true;
+    },
+    [botId, onAskedChange, onChanged, requests, setThread]
+  );
+
   // What reply cards do: a button or an answer sends text as the person's message; Open thread opens it here.
   const sendRef = useRef(send);
   sendRef.current = send;
   const openThreadRef = useRef(onOpenThread);
   openThreadRef.current = onOpenThread;
+  const dismissAskRef = useRef(dismissAsk);
+  dismissAskRef.current = dismissAsk;
   const handlers = useMemo<BotActionHandlers>(
-    () => ({ onReply: (text) => void sendRef.current(text), onOpenThread: (threadId) => openThreadRef.current(threadId) }),
+    () => ({
+      onReply: (text) => void sendRef.current(text),
+      onOpenThread: (threadId) => openThreadRef.current(threadId),
+      onDismissAsk: (target) => dismissAskRef.current(target),
+    }),
     []
   );
   // Questions (ask_user cards) the person answered in this thread: question → answer.
@@ -4521,9 +4639,9 @@ const AssistantRow: React.FC<{ bot: DesktopBot; projectPath?: string | null; chi
   copy,
   onReplyTo,
 }) => (
-  <div className={`flex items-start gap-2.5${copy ? ' bot-msg agent' : ''}`}>
+  <div className="bot-msg agent flex items-start gap-2.5">
     <BotAvatar bot={bot} projectPath={projectPath} />
-    <div className="min-w-0 flex-1 text-[13.5px] leading-relaxed text-neutral-200">
+    <div className="min-w-0 flex-1 text-[13.5px] leading-relaxed text-[var(--text-primary)]">
       {children}
       {copy && (
         <div className="bot-msg-actions">
@@ -4560,7 +4678,7 @@ const BotMessage: React.FC<{
       <AssistantRow bot={bot} projectPath={projectPath} copy={copyText(message.content, message.files)} onReplyTo={replyTo}>
         <MarkdownContent content={message.content} pathPreviews={!showsFiles} refLinks />
         <BotFileGallery files={files} />
-        {message.cards?.length ? <BotCards cards={message.cards} handlers={handlers} answeredQuestions={answeredQuestions} /> : null}
+        {message.cards?.length ? <BotCards cards={message.cards} handlers={handlers} answeredQuestions={answeredQuestions} messageId={message.id} /> : null}
         {via && <div className="mt-1 text-[11px] text-neutral-600">{via}</div>}
       </AssistantRow>
     );

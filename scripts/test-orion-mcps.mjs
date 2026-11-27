@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +37,11 @@ let holdRefreshRequest = null;
 let holdCodeExchange = null;
 let rotateRefreshTokens = false;
 let acceptedRefreshToken = 'refresh-1';
+let customAuthorizationEndpoint = null;
+let authorizeError = null;
+let authorizeErrorDescription = null;
+let beforeFollowAuthorizeRedirect = null;
+let lastCallbackResponse = null;
 const legacyTransports = new Map();
 
 const makeMcpServer = () => {
@@ -83,7 +89,7 @@ const httpServer = http.createServer(async (req, res) => {
   if (url.pathname === '/.well-known/oauth-authorization-server/oauth-issuer') {
     return json(res, 200, {
       issuer: `${origin}/oauth-issuer`,
-      authorization_endpoint: `${origin}/authorize`,
+      authorization_endpoint: customAuthorizationEndpoint ?? `${origin}/authorize`,
       token_endpoint: `${origin}/oauth-token`,
       registration_endpoint: `${origin}/register`,
       response_types_supported: ['code'],
@@ -103,7 +109,14 @@ const httpServer = http.createServer(async (req, res) => {
   if (url.pathname === '/authorize') {
     assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
     const redirect = new URL(url.searchParams.get('redirect_uri'));
-    redirect.searchParams.set('code', 'auth-code');
+    if (authorizeError !== null || authorizeErrorDescription !== null) {
+      redirect.searchParams.set('error', authorizeError ?? 'access_denied');
+      if (authorizeErrorDescription !== null) {
+        redirect.searchParams.set('error_description', authorizeErrorDescription);
+      }
+    } else {
+      redirect.searchParams.set('code', 'auth-code');
+    }
     redirect.searchParams.set('state', url.searchParams.get('state'));
     res.writeHead(302, { Location: redirect.toString() });
     return res.end();
@@ -171,7 +184,13 @@ origin = `http://127.0.0.1:${httpServer.address().port}`;
 const openedUrls = [];
 shell.openExternal = async (url) => {
   openedUrls.push(url);
-  await fetch(url);
+  if (beforeFollowAuthorizeRedirect) await beforeFollowAuthorizeRedirect(url);
+  const response = await fetch(url);
+  lastCallbackResponse = {
+    status: response.status,
+    headers: Object.fromEntries(response.headers.entries()),
+    body: await response.text(),
+  };
 };
 
 try {
@@ -1263,6 +1282,95 @@ await server.connect(new StdioServerTransport());
   assert.doesNotMatch(runTurnSource, /withCodexOrionMcps\(/, 'Codex config never carries the run\'s servers');
   assert.match(runTurnSource, /withoutCodexNativeMcps\(\[\.\.\.orionMcps\.servers, \.\.\.accountMcps\], options\)/);
   assert.match(runTurnSource, /model\.providerId === 'codex'\s*\? await codexMcpServers\(\)\s*: \[\.\.\.orionMcps\.servers, \.\.\.accountMcps\]/);
+
+  // --- OAuth security hardening: scheme validation + escaped callback HTML ----
+  const xssHtml = orionMcps.callbackPage('Sign-in <failed>', '<img src=x onerror="alert(\'xss\')">&more');
+  assert.doesNotMatch(xssHtml, /<img\b|<failed>/i, 'callbackPage must escape HTML tags');
+  assert.match(xssHtml, /&lt;failed&gt;/);
+  assert.match(xssHtml, /&lt;img src=x onerror=&quot;alert\(&#39;xss&#39;\)&quot;&gt;&amp;more/);
+
+  // Non-http(s) authorization_endpoint from remote OAuth metadata must never reach shell.openExternal.
+  validTokens.clear();
+  for (const maliciousEndpoint of ['file:///Applications/Calculator.app', 'javascript:alert(1)', 'smb://attacker.example/share']) {
+    const beforeOpens = openedUrls.length;
+    customAuthorizationEndpoint = maliciousEndpoint;
+    try {
+      const rejected = await orionMcps.addOrionMcp({
+        nickname: 'evil-oauth',
+        transport: 'http',
+        url: `${origin}/secure/mcp`,
+      });
+      assert.equal(rejected.ok, false, `must reject authorization_endpoint ${maliciousEndpoint}`);
+      assert.equal(openedUrls.length, beforeOpens, `must never call shell.openExternal for ${maliciousEndpoint}`);
+    } finally {
+      customAuthorizationEndpoint = null;
+    }
+  }
+
+  // Loopback callback page must HTML-escape error_description, bound length,
+  // send hardening headers, and survive malformed request URLs without crashing.
+  lastCallbackResponse = null;
+  authorizeErrorDescription = `<script>alert("pwned")</script>${'A'.repeat(700)}`;
+  let malformedStatus = '';
+  let postStatus = 0;
+  let postAllow = '';
+  beforeFollowAuthorizeRedirect = async (authUrl) => {
+    const redirectUri = new URL(new URL(authUrl).searchParams.get('redirect_uri'));
+    const postRes = await fetch(redirectUri.toString(), { method: 'POST' });
+    postStatus = postRes.status;
+    postAllow = postRes.headers.get('allow') ?? '';
+    malformedStatus = await new Promise((resolve, reject) => {
+      const sock = net.connect(Number(redirectUri.port), '127.0.0.1', () => {
+        sock.write('GET //[ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+      });
+      let data = '';
+      sock.on('data', (chunk) => { data += chunk.toString('utf8'); });
+      sock.on('end', () => resolve(data));
+      sock.on('error', reject);
+    });
+  };
+  try {
+    const failedOauth = await orionMcps.addOrionMcp({
+      nickname: 'xss-oauth',
+      transport: 'http',
+      url: `${origin}/secure/mcp`,
+    });
+    assert.equal(failedOauth.ok, false);
+    assert.equal(postStatus, 405, 'non-GET callback request returns 405');
+    assert.equal(postAllow, 'GET');
+    assert.match(malformedStatus, /^HTTP\/1\.1 400 /, 'malformed callback URL returns 400 without crashing');
+    assert.ok(lastCallbackResponse, 'callback server survived malformed request and responded');
+    assert.equal(lastCallbackResponse.status, 400);
+    assert.doesNotMatch(lastCallbackResponse.body, /<script>/i, 'raw script tag must never appear in callback HTML');
+    assert.match(lastCallbackResponse.body, /&lt;script&gt;alert\(&quot;pwned&quot;\)&lt;\/script&gt;/);
+    assert.ok(failedOauth.error.length < 560, `oversized error_description is bounded (${failedOauth.error.length} chars)`);
+    assert.match(lastCallbackResponse.headers['content-security-policy'] ?? '', /default-src 'none'/);
+    assert.match(lastCallbackResponse.headers['content-security-policy'] ?? '', /frame-ancestors 'none'/);
+    assert.equal(lastCallbackResponse.headers['x-content-type-options'], 'nosniff');
+    assert.equal(lastCallbackResponse.headers['cache-control'], 'no-store');
+    assert.equal(lastCallbackResponse.headers['referrer-policy'], 'no-referrer');
+    assert.equal(lastCallbackResponse.headers['connection'], 'close');
+  } finally {
+    authorizeErrorDescription = null;
+    beforeFollowAuthorizeRedirect = null;
+  }
+
+  // Raw `error` param (when error_description is absent) must also be HTML-escaped.
+  lastCallbackResponse = null;
+  authorizeError = '<img src=x onerror=alert(1)>';
+  try {
+    const failedErrorParam = await orionMcps.addOrionMcp({
+      nickname: 'xss-error-param',
+      transport: 'http',
+      url: `${origin}/secure/mcp`,
+    });
+    assert.equal(failedErrorParam.ok, false);
+    assert.ok(lastCallbackResponse);
+    assert.doesNotMatch(lastCallbackResponse.body, /<img\b/i, 'raw error param must be HTML-escaped');
+    assert.match(lastCallbackResponse.body, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  } finally {
+    authorizeError = null;
+  }
 
   console.log('Orion MCP regression checks passed.');
 } finally {

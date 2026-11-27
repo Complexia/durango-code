@@ -11,6 +11,8 @@ import './main/rename-legacy-bundle-on-start.js';
 import { createRepositoryCredentials } from './main/repository-credentials.js';
 import { SOURCE_ATTACHMENT_PROTOCOL, createSourceAttachmentHandler } from './main/source-attachments.js';
 import { reloadWhenRendererGone } from './main/renderer-recovery.js';
+import { installProcessErrorHandlers } from './main/process-error-handlers.js';
+import { writeFileAtomic, writeFileAtomicSync } from './main/atomic-write.js';
 import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main/app-identity.js';
 import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
 import { isPreviewFilePath } from './app/codeFiles.ts';
@@ -196,7 +198,8 @@ import { createBrowserManager } from './main/browser/manager.js';
 import { browserScreenshotsDirectory } from './main/browser/security.js';
 import { browserModeFor, setBrowserManager } from './main/browser-tools.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
-import { externalWebUrl, linkedFileCandidates } from './main/linked-navigation.js';
+import { externalWebUrl, linkedFileCandidates, openExternalWebUrl } from './main/linked-navigation.js';
+import { rendererCspResponseHeaders } from './renderer-csp.js';
 import {
   canControlRemoteMachines,
   cancelRemotePairing,
@@ -288,6 +291,25 @@ import {
   shouldMirrorGithubLocally,
   switchSourceControlToOrion,
 } from './main/source-control.js';
+
+let hasCreatedWindow = false;
+
+installProcessErrorHandlers({
+  isReadyToStayAlive: () => hasCreatedWindow,
+  onFatal: ({ error, reason }) => {
+    if (reason === 'before-ready' && app.isReady() && !process.env.CI) {
+      try {
+        dialog.showErrorBox(
+          `${PRODUCT_DISPLAY_NAME} failed to start`,
+          error?.message ?? String(error)
+        );
+      } catch {}
+    }
+    // Exit through Electron's quit path so will-quit flushes state, cleans up
+    // child processes, and releases the single-instance lock.
+    app.quit();
+  },
+});
 
 // The internal app name ("Orion") and userData path are pinned by
 // ./main/pin-app-identity.js, imported first. The customer-facing name is
@@ -717,8 +739,11 @@ const writeAccountSession = async (session) => {
     expiresAt: session.expiresAt ?? null,
     createdAt: new Date().toISOString(),
   };
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
+  await writeFileAtomic(filePath, `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: 'utf-8',
+    mode: 0o600,
+    durable: true,
+  });
 };
 
 const repositoryCredentials = createRepositoryCredentials({
@@ -764,8 +789,7 @@ const getDurangoDeviceId = () => {
       if (/^[0-9a-f-]{36}$/i.test(existing)) return existing;
     } catch {}
     const id = crypto.randomUUID();
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, `${id}\n`, 'utf8');
+    await writeFileAtomic(target, `${id}\n`, { encoding: 'utf8' });
     return id;
   })().catch(() => {
     durangoDeviceIdPromise = null;
@@ -841,7 +865,7 @@ const themeOwnerKey = () => {
     const existing = (await fs.readFile(file, 'utf8').catch(() => '')).trim();
     if (/^[A-Za-z0-9_-]{32,128}$/.test(existing)) return existing;
     const key = crypto.randomBytes(32).toString('base64url');
-    await fs.writeFile(file, `${key}\n`, { mode: 0o600 });
+    await writeFileAtomic(file, `${key}\n`, { encoding: 'utf8', mode: 0o600, durable: true });
     return key;
   })().catch((error) => {
     themeOwnerKeyPromise = null;
@@ -1056,7 +1080,7 @@ const startDesktopAuth = async () => {
   };
 
   const url = buildDesktopAuthUrl(state, codeChallenge);
-  await shell.openExternal(url.toString());
+  await openExternalWebUrl(url, (target) => shell.openExternal(target));
   return { ok: true, url: url.toString() };
 };
 
@@ -1257,6 +1281,28 @@ app.on('open-url', (event, url) => {
   void handleDesktopAuthCallback(url);
 });
 
+const mainWindowWebContentsIds = new Set();
+const rendererCspSessions = new WeakSet();
+
+const attachMainWindowCsp = (mainWindow) => {
+  const wc = mainWindow.webContents;
+  const wcId = wc.id;
+  mainWindowWebContentsIds.add(wcId);
+  wc.once('destroyed', () => {
+    mainWindowWebContentsIds.delete(wcId);
+  });
+  const winSession = wc.session;
+  if (rendererCspSessions.has(winSession)) return;
+  rendererCspSessions.add(winSession);
+  winSession.webRequest.onHeadersReceived((details, callback) => {
+    const responseHeaders = rendererCspResponseHeaders(details, {
+      isMainWindow: (id) => mainWindowWebContentsIds.has(id),
+      devServerUrl: MAIN_WINDOW_VITE_DEV_SERVER_URL || null,
+    });
+    callback(responseHeaders ? { responseHeaders } : {});
+  });
+};
+
 const createWindow = () => {
   const macWindowChrome =
     process.platform === 'darwin'
@@ -1286,6 +1332,9 @@ const createWindow = () => {
       // Security best practices: nodeIntegration false, contextIsolation true (default)
     },
   });
+  hasCreatedWindow = true;
+
+  attachMainWindowCsp(mainWindow);
 
   // Never let an anchor replace Orion's only renderer document. Markdown
   // links are routed explicitly in the renderer, while this main-process
@@ -1771,6 +1820,19 @@ app.whenReady().then(async () => {
         });
     }
   });
+}).catch((error) => {
+  console.error('Fatal error during app startup:', error);
+  if (BrowserWindow.getAllWindows().length === 0) {
+    if (app.isReady() && !process.env.CI) {
+      try {
+        dialog.showErrorBox(
+          `${PRODUCT_DISPLAY_NAME} failed to start`,
+          error?.message ?? String(error)
+        );
+      } catch {}
+    }
+    app.quit();
+  }
 });
 
 // Quit when all windows are closed, except on macOS. There, it's common
@@ -1932,7 +1994,7 @@ const waitForPendingQuitWork = () =>
     // agent-device sessions and daemon (bounded; never rejects).
     shutdownDevices(),
   ])
-    .then(() => threadsSaveQueue.catch(() => {}));
+    .then(() => Promise.all([storageSaveQueue.catch(() => {}), threadsSaveQueue.catch(() => {})]));
 
 const appShutdownError = () =>
   appShutdownReason === 'update'
@@ -2110,17 +2172,53 @@ themeIpc('themes:takeInstallRequest', () => {
 });
 themeIpc('themes:openGallery', async (slug) => {
   const url = await communityGalleryUrl();
-  await shell.openExternal(typeof slug === 'string' && /^[a-z0-9]{10}$/.test(slug) ? `${url}/${slug}` : url);
+  const target = typeof slug === 'string' && /^[a-z0-9]{10}$/.test(slug) ? `${url}/${slug}` : url;
+  await openExternalWebUrl(target, (safeUrl) => shell.openExternal(safeUrl));
   return url;
 });
 
+const writeStoreSnapshotAtomically = async (storagePath, data, seq) => {
+  await writeFileAtomic(storagePath, data, { encoding: 'utf-8', durable: true });
+  if (seq >= storageCommittedSeq) {
+    storageCommittedSeq = seq;
+    return;
+  }
+  // A sync flush committed a newer snapshot while our rename was in flight and
+  // may have been overwritten by it. Keep reinstalling until no newer sync
+  // snapshot arrived while we were writing.
+  let installedSeq = seq;
+  while (storageSyncSnapshot && storageSyncSnapshot.seq > installedSeq) {
+    const snapshot = storageSyncSnapshot;
+    await writeFileAtomic(storagePath, snapshot.value, { encoding: 'utf-8', durable: true });
+    installedSeq = snapshot.seq;
+  }
+};
+
 ipcMain.handle('storage:load', async () => {
   try {
+    const readSeq = storageWriteSeq;
+    const readCommittedSeq = storageCommittedSeq;
     const storagePath = getStorageFilePath();
     const value = await fs.readFile(storagePath, 'utf-8');
     const sanitized = sanitizeStoreValue(value);
-    if (sanitized && sanitized !== value) {
-      await fs.writeFile(storagePath, sanitized, 'utf-8');
+    if (
+      sanitized &&
+      sanitized !== value &&
+      readCommittedSeq === readSeq &&
+      storageWriteSeq === readSeq &&
+      storageCommittedSeq === readSeq
+    ) {
+      const seq = ++storageWriteSeq;
+      const rewrite = storageSaveQueue.catch(() => {}).then(async () => {
+        if (storageWriteSeq !== seq || seq <= storageCommittedSeq) return;
+        await writeStoreSnapshotAtomically(storagePath, sanitized, seq);
+      });
+      storageSaveQueue = rewrite;
+      try {
+        await rewrite;
+      } catch (error) {
+        console.error('storage:load rewrite error', error);
+      }
     }
     return sanitized;
   } catch (error) {
@@ -2139,22 +2237,8 @@ ipcMain.handle('storage:save', async (_event, value) => {
   const save = storageSaveQueue.catch(() => {}).then(async () => {
     if (seq <= storageCommittedSeq) return; // superseded by the sync flush
     const storagePath = getStorageFilePath();
-    const tempPath = `${storagePath}.${process.pid}.tmp`;
     const sanitized = sanitizeStoreValue(value) ?? value;
-    await fs.mkdir(path.dirname(storagePath), { recursive: true });
-    await fs.writeFile(tempPath, sanitized, 'utf-8');
-    await fs.rename(tempPath, storagePath);
-    if (seq >= storageCommittedSeq) {
-      storageCommittedSeq = seq;
-      return;
-    }
-    // The sync flush committed a newer snapshot while this rename was in
-    // flight and may have been overwritten by it — reinstall the newer one.
-    const snapshot = storageSyncSnapshot;
-    if (snapshot && snapshot.seq > seq) {
-      await fs.writeFile(tempPath, snapshot.value, 'utf-8');
-      await fs.rename(tempPath, storagePath);
-    }
+    await writeStoreSnapshotAtomically(storagePath, sanitized, seq);
   });
   storageSaveQueue = save;
 
@@ -2548,10 +2632,7 @@ ipcMain.on('storage:saveSync', (event, value) => {
     const seq = ++storageWriteSeq;
     const storagePath = getStorageFilePath();
     const sanitized = sanitizeStoreValue(value) ?? value;
-    mkdirSync(path.dirname(storagePath), { recursive: true });
-    const tempPath = `${storagePath}.${process.pid}.sync.tmp`;
-    writeFileSync(tempPath, sanitized, 'utf-8');
-    renameSync(tempPath, storagePath);
+    writeFileAtomicSync(storagePath, sanitized, { encoding: 'utf-8', durable: true });
     storageCommittedSeq = seq;
     storageSyncSnapshot = { seq, value: sanitized };
     event.returnValue = true;
@@ -4320,9 +4401,9 @@ ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
       token: session.token,
     });
     if (!app?.url) return { ok: false, error: 'This project has no deployed app yet.' };
-    const parsed = new URL(app.url);
-    if (parsed.protocol !== 'https:') return { ok: false, error: 'Only https URLs can be opened.' };
-    await shell.openExternal(parsed.toString());
+    const safeUrl = externalWebUrl(app.url);
+    if (!safeUrl || !safeUrl.startsWith('https://')) return { ok: false, error: 'Only https URLs can be opened.' };
+    await shell.openExternal(safeUrl);
     return { ok: true, app };
   } catch (error) {
     return { ok: false, error: cloudErrorMessage(error) };
@@ -5664,7 +5745,7 @@ const readAutomationRequested = async () => {
 const markAutomationRequested = async () => {
   automationRequestedCache = true;
   try {
-    await fs.writeFile(computerUseStateFile(), JSON.stringify({ automationRequested: true }));
+    await writeFileAtomic(computerUseStateFile(), JSON.stringify({ automationRequested: true }));
   } catch {
     // best effort; worst case the row falls back to 'Request access'
   }
@@ -5812,8 +5893,8 @@ ipcMain.handle('computerUse:requestPermission', async (_event, kind) => {
     } else {
       return { ok: false, error: `Unknown permission: ${kind}`, state: await getComputerUsePermissions() };
     }
-    const pane = computerUseSettingsPanes[kind];
-    if (pane) await shell.openExternal(pane);
+    const pane = Object.hasOwn(computerUseSettingsPanes, kind) ? computerUseSettingsPanes[kind] : null;
+    if (pane && pane.startsWith('x-apple.systempreferences:')) await shell.openExternal(pane);
     return { ok: true, state: await getComputerUsePermissions() };
   } catch (error) {
     return { ok: false, error: getProcessErrorMessage(error), state: await getComputerUsePermissions() };
@@ -5859,7 +5940,7 @@ ipcMain.handle('cloud:openInBrowser', async (_event, projectPath) => {
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
     if (!link) return { ok: false, error: 'This repository is not linked to Durango Cloud yet.' };
-    await shell.openExternal(cloudRepoWebUrl(link.repoId));
+    await openExternalWebUrl(cloudRepoWebUrl(link.repoId), (target) => shell.openExternal(target));
     return { ok: true };
   } catch (error) {
     return { ok: false, error: cloudErrorMessage(error) };
@@ -6226,9 +6307,14 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
   const { result, completion } = await authenticateProviderTool(providerId);
   // Antigravity's sign-in waits for a code the user pastes from the page
   // this link lands on (submitAuthCode below).
-  if (result?.ok && result.codeRequired && result.url) {
-    void shell.openExternal(result.url).catch(() => {});
+  const safeAuthUrl = result?.url ? externalWebUrl(result.url) : null;
+  if (result?.ok && result.codeRequired && safeAuthUrl) {
+    void shell.openExternal(safeAuthUrl).catch(() => {});
   }
+  const safeResult =
+    result && typeof result === 'object' && 'url' in result
+      ? { ...result, url: safeAuthUrl ?? undefined }
+      : result;
   if (result?.ok) {
     invalidateAgentModelsCache();
     const sender = event.sender;
@@ -6244,7 +6330,7 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
       }
     });
   }
-  return result;
+  return safeResult;
 });
 
 ipcMain.handle('providers:submitAuthCode', async (_event, input) => {
@@ -7085,6 +7171,32 @@ ipcMain.handle('bots:send', async (_event, input) => {
   }
 });
 
+ipcMain.handle('bots:dismissAsk', async (_event, input) => {
+  const botId = typeof input?.botId === 'string' ? input.botId.trim().slice(0, 128) : '';
+  const messageId = typeof input?.messageId === 'string' ? input.messageId.trim().slice(0, 128) : undefined;
+  const partId = typeof input?.partId === 'string' ? input.partId.trim().slice(0, 128) : undefined;
+  const question = typeof input?.question === 'string' ? input.question.trim().slice(0, 500) : undefined;
+  if (!botId || (!partId && !question)) return { ok: false, error: 'Missing bot or question to dismiss.' };
+  if (await localBotsMode()) {
+    try {
+      return await localBots.dismissAsk(botId, { messageId, partId, question });
+    } catch (error) {
+      return localBotsIpcError(error);
+    }
+  }
+  try {
+    const account = await durangoAccountKey();
+    if (!account) return { ok: false, error: 'Sign in to Durango first.' };
+    return await durangoClient.dismissBotAsk(
+      botId,
+      { ...(messageId ? { messageId } : {}), ...(partId ? { partId } : {}), ...(question ? { question } : {}) },
+      { account }
+    );
+  } catch (error) {
+    return durangoIpcError(error);
+  }
+});
+
 ipcMain.handle('bots:attachmentStatuses', (_event, input) => {
   const botId = typeof input?.botId === 'string' ? input.botId.slice(0, 128) : undefined;
   return { ok: true, items: botAttachments.listStatuses({ ...(botId ? { botId } : {}) }) };
@@ -7786,6 +7898,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     let stderr = '';
     let stdoutSeen = false;
+    let fatalError = null;
     let fatalMeta = null;
     let acceptedCodexSessionId = resumeSessionId;
     let codexActionAccepted = false;
@@ -8066,7 +8179,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         ...(finalExitCode === 0
           ? {}
           : {
-              error: `${model.label} exited with code ${finalExitCode}.`,
+              error: fatalError || `${model.label} exited with code ${finalExitCode}.`,
               // Lets the renderer offer the right provider's Authenticate
               // button when the failure text reads as a logged-out CLI.
               providerId: model.providerId,
@@ -8217,14 +8330,14 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       },
       onFatal: (message, meta) => {
         if (finalized) return;
+        const text =
+          typeof message === 'string'
+            ? message.trim()
+            : typeof message?.message === 'string'
+              ? message.message.trim()
+              : '';
+        fatalError = text || null;
         fatalMeta = meta && typeof meta === 'object' ? meta : null;
-        stdoutSeen = true;
-        emitAgentEvent(event.sender, {
-          runId,
-          threadId: input.threadId,
-          type: 'chunk',
-          chunk: `${message}\n`,
-        });
         if (!persistentAntigravity) killAgentChild(child);
         finalizeRun(1);
       },
@@ -8654,7 +8767,19 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     });
     }
 
-    acpDriver?.start();
+    if (acpDriver) {
+      const handleAcpStartError = (error) => {
+        console.error('acpDriver.start error', error);
+        if (!finalized) {
+          sharedDriverCallbacks.onFatal(error?.message ?? String(error));
+        }
+      };
+      try {
+        Promise.resolve(acpDriver.start()).catch(handleAcpStartError);
+      } catch (error) {
+        handleAcpStartError(error);
+      }
+    }
     };
 
     // A stop/steer raced the startup above and aborted the run before any
@@ -10063,7 +10188,7 @@ ipcMain.handle('devServers:list', async (_event, input) => {
 
 ipcMain.handle('devServers:open', async (_event, input) => {
   try {
-    await shell.openExternal(devServerUrlForPort(input?.port));
+    await openExternalWebUrl(devServerUrlForPort(input?.port), (target) => shell.openExternal(target));
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

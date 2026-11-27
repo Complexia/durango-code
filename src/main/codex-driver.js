@@ -560,15 +560,22 @@ export const createCodexAppServerDriver = ({
   };
 
   const finishFailedTurn = (turn, fallbackError) => {
+    if (ended) return;
     const error = turn.error ?? fallbackError;
-    const message = error?.message ?? 'Codex turn failed.';
+    const errorText = (err) =>
+      (typeof err?.message === 'string' && err.message.trim() ? err.message : '') ||
+      codexErrorDetail(err);
+    const message =
+      errorText(error) ||
+      (error !== fallbackError ? errorText(fallbackError) : '') ||
+      'Codex turn failed.';
     callbacks.onActivity({
       type: 'error',
       title: 'Turn failed',
       detail: stringifySummary(message, 300),
       status: 'error',
     });
-    if (review) {
+    if (review || !goal) {
       fail(message);
       return;
     }
@@ -724,7 +731,7 @@ export const createCodexAppServerDriver = ({
         detail,
         status: 'error',
       });
-      finishFailedTurn(turn, restarted.error);
+      finishFailedTurn({ ...turn, error: restarted.error }, error);
       return;
     }
     failedTurnRolledBack = false;
@@ -735,6 +742,7 @@ export const createCodexAppServerDriver = ({
     activeTurnId = null;
     const turn = params.turn ?? {};
     if (typeof turn.id === 'string') lastCompletedTurnId = turn.id;
+    if (ended) return;
     if (turn.status === 'failed') {
       const error = isRecoverableCodexContextError(turn.error)
         ? turn.error
@@ -760,7 +768,6 @@ export const createCodexAppServerDriver = ({
       finishFailedTurn(turn, error);
       return;
     }
-    if (ended) return;
     if (review) {
       endRun();
       return;

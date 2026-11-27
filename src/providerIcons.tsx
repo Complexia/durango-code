@@ -1,6 +1,9 @@
 import type { SVGProps } from 'react';
-import orionIconUrl from '../assets/icon.png';
 import antigravityIconUrl from '../assets/antigravity-icon.png';
+
+// Reuses the single public/icon.png emitted next to index.html so the app
+// icon is not duplicated as a second hashed PNG inside app.asar.
+const orionIconUrl = './icon.png';
 
 export type ProviderIconProps = SVGProps<SVGSVGElement> & {
   size?: number;
@@ -112,7 +115,7 @@ export const OpenCodeBrandIcon = ({ size = 24, className, ...props }: ProviderIc
 );
 
 /**
- * Durango Code product mark (the app icon, assets/icon.png). The component
+ * Durango Code product mark (the app icon, public/icon.png). The component
  * keeps its internal Orion name. The viewBox crops the icon's transparent
  * margin so the squircle fills small provider/model slots.
  */

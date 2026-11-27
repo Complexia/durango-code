@@ -2,12 +2,41 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { markdownUrlTransform } from '../src/app/markdown.tsx';
-import { externalWebUrl, linkedFileCandidates } from '../src/main/linked-navigation.js';
+import { externalWebUrl, linkedFileCandidates, openExternalWebUrl } from '../src/main/linked-navigation.js';
 
 assert.equal(externalWebUrl('https://example.com/docs'), 'https://example.com/docs');
 assert.equal(externalWebUrl('http://localhost:4173/test'), 'http://localhost:4173/test');
+assert.equal(externalWebUrl(new URL('https://example.com/oauth?x=1')), 'https://example.com/oauth?x=1');
+assert.equal(externalWebUrl('  https://example.com/trimmed  '), 'https://example.com/trimmed');
 assert.equal(externalWebUrl('file:///tmp/test.ts'), null);
 assert.equal(externalWebUrl('javascript:alert(1)'), null);
+assert.equal(externalWebUrl('data:text/html,<script>alert(1)</script>'), null);
+assert.equal(externalWebUrl('smb://attacker.example/share/payload'), null);
+assert.equal(externalWebUrl('ssh://user@host.example'), null);
+assert.equal(externalWebUrl('ms-msdt:/id PCWDiagnostic'), null);
+assert.equal(externalWebUrl('x-apple.systempreferences:com.apple.preference.security'), null);
+assert.equal(externalWebUrl('orion://auth/callback'), null);
+assert.equal(externalWebUrl('ht\ntp://example.com'), null);
+assert.equal(externalWebUrl('https://example.com/\r\n'), null);
+assert.equal(externalWebUrl('http://'), null);
+assert.equal(externalWebUrl(''), null);
+assert.equal(externalWebUrl(null), null);
+assert.equal(externalWebUrl(undefined), null);
+assert.equal(externalWebUrl({ toString: () => 'https://example.com' }), null);
+
+const openedExternally = [];
+const opened = await openExternalWebUrl('https://example.com/ok', async (u) => {
+  openedExternally.push(u);
+});
+assert.equal(opened, 'https://example.com/ok');
+assert.deepEqual(openedExternally, ['https://example.com/ok']);
+await assert.rejects(
+  openExternalWebUrl('file:///Applications/Calculator.app', async (u) => {
+    openedExternally.push(u);
+  }),
+  /http and https/
+);
+assert.deepEqual(openedExternally, ['https://example.com/ok'], 'blocked scheme never reaches shell.openExternal');
 
 assert.deepEqual(
   linkedFileCandidates('/workspace/src/app.ts:42:7', ['/ignored'], '/Users/test'),

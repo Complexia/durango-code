@@ -13,6 +13,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import bundledPrices from './usage-prices.js';
+import { writeFileAtomic } from './atomic-write.js';
 
 export const USAGE_PRICES_URL = 'https://ai-gateway.vercel.sh/v1/models';
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -92,7 +93,7 @@ export const refreshUsagePrices = (userDataPath, { fetchImpl = globalThis.fetch 
       if (Object.keys(next.models).length < 20) return false;
       activeCatalog = next;
       activeSource = 'gateway';
-      await fs.writeFile(cachePath(userDataPath), JSON.stringify(next));
+      await writeFileAtomic(cachePath(userDataPath), JSON.stringify(next));
       return true;
     } catch {
       return false;
