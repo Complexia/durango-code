@@ -150,28 +150,56 @@ export const sanitizeTokenValue = (value) => {
   return depth === 0 ? trimmed : null;
 };
 
+const MAX_CSS_SANITIZE_PASSES = 16;
+
+const sanitizeThemeCssPass = (css) =>
+  css
+    // Strip NUL bytes and CSS escapes (backslash + hex sequence or single char,
+    // plus any trailing lone backslash). Replace with a space so stripped
+    // sequences cannot splice surrounding characters into a blocked token.
+    .replace(/\u0000/g, ' ')
+    .replace(/\\(?:[0-9a-f]{1,6}\s?|[\s\S])?/gi, ' ')
+    // Strip comments (including unclosed comments at EOF).
+    .replace(/\/\*[\s\S]*?(?:\*\/|$)/g, ' ')
+    // Strip <style> / </style> tags (including unclosed tags) so theme CSS
+    // cannot escape its <style> element.
+    .replace(/<\/?style(?:\s[^>]*)?>|<\/?style\b/gi, ' ')
+    // Drop @import and @namespace at-rules, respecting quoted strings that may
+    // contain ";". Replacing with a space prevents splice bypasses like
+    // `@imp@namespace;ort "https://...";`.
+    .replace(/@import(?:[^;"'\n}]|"[^"]*"|'[^']*')*;?/gi, ' ')
+    .replace(/@namespace(?:[^;"'\n}]|"[^"]*"|'[^']*')*;?/gi, ' ')
+    // Drop @font-face blocks (closed or unclosed) and any bare @font-face token.
+    .replace(/@font-face\s*\{(?:[^{}"']|"[^"]*"|'[^']*')*(?:\}|$)/gi, ' ')
+    .replace(/@font-face\b/gi, ' ')
+    // Disable other CSS resource-loading / dynamic functions.
+    .replace(
+      /(?:-webkit-)?image-set\s*\(|(?:-webkit-)?cross-fade\s*\(|\belement\s*\(|\bsrc\s*\(|\bimage\s*\(|\bexpression\s*\(/gi,
+      'none('
+    )
+    // Whatever the quoting (a quoted URL may contain ")"), only data images.
+    .replace(/\burl\s*\(\s*(?!['"]?\s*data:image\/)/gi, 'none(');
+
 /**
  * Extra CSS for the app document, made unable to load anything: CSS escapes
- * and comments removed first (they can spell any function name or URL), then
- * `@import`, `@font-face` and `@namespace` dropped, the other resource
- * functions (image-set, cross-fade, element, src) disabled, and every url()
- * that is not an inline data:image/ URI disabled. A theme's own files are
- * reached with theme-asset("name"), resolved after this (themeToCss); a raw
+ * and comments removed, `@import`, `@font-face` and `@namespace` dropped, the
+ * other resource functions (image-set, cross-fade, element, src, image)
+ * disabled, and every url() that is not an inline data:image/ URI disabled.
+ * Runs to a fixed point with space replacements so stripping one construct can
+ * never reassemble another. A theme's own files are reached with
+ * theme-asset("name"), resolved after this (themeToCss); a raw
  * orion-attachment: URL is refused like any other.
  */
 export const sanitizeThemeCss = (css) => {
   if (typeof css !== 'string') return '';
-  return css
-    .slice(0, THEME_LIMITS.css)
-    .replace(/\\(?:[0-9a-f]{1,6}\s?|[\s\S])/gi, '')
-    .replace(/\/\*[\s\S]*?(?:\*\/|$)/g, '')
-    .replace(/<\/?style[^>]*>/gi, '')
-    .replace(/@import[^;]*;?/gi, '')
-    .replace(/@namespace[^;]*;?/gi, '')
-    .replace(/@font-face\s*\{[^}]*\}/gi, '')
-    .replace(/(?:-webkit-)?image-set\s*\(|cross-fade\s*\(|\belement\s*\(|\bsrc\s*\(/gi, 'none(')
-    // Whatever the quoting (a quoted URL may contain ")"), only data images.
-    .replace(/url\s*\(\s*(?!['"]?\s*data:image\/)/gi, 'none(');
+  let current = css.slice(0, THEME_LIMITS.css);
+  for (let pass = 0; pass < MAX_CSS_SANITIZE_PASSES; pass += 1) {
+    const next = sanitizeThemeCssPass(current);
+    if (next === current) return next;
+    current = next;
+  }
+  // Input kept mutating past the pass limit (e.g. deeply nested splice payload): fail closed.
+  return '';
 };
 
 const sanitizeHtml = (html) => (typeof html === 'string' ? html.trim().slice(0, THEME_LIMITS.html) : '');

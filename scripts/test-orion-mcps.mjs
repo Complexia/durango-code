@@ -36,6 +36,9 @@ let holdRefreshRequest = null;
 let holdCodeExchange = null;
 let rotateRefreshTokens = false;
 let acceptedRefreshToken = 'refresh-1';
+let customAuthorizationEndpoint = null;
+let authorizeErrorDescription = null;
+let lastCallbackResponse = null;
 const legacyTransports = new Map();
 
 const makeMcpServer = () => {
@@ -83,7 +86,7 @@ const httpServer = http.createServer(async (req, res) => {
   if (url.pathname === '/.well-known/oauth-authorization-server/oauth-issuer') {
     return json(res, 200, {
       issuer: `${origin}/oauth-issuer`,
-      authorization_endpoint: `${origin}/authorize`,
+      authorization_endpoint: customAuthorizationEndpoint ?? `${origin}/authorize`,
       token_endpoint: `${origin}/oauth-token`,
       registration_endpoint: `${origin}/register`,
       response_types_supported: ['code'],
@@ -103,7 +106,12 @@ const httpServer = http.createServer(async (req, res) => {
   if (url.pathname === '/authorize') {
     assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
     const redirect = new URL(url.searchParams.get('redirect_uri'));
-    redirect.searchParams.set('code', 'auth-code');
+    if (authorizeErrorDescription !== null) {
+      redirect.searchParams.set('error', 'access_denied');
+      redirect.searchParams.set('error_description', authorizeErrorDescription);
+    } else {
+      redirect.searchParams.set('code', 'auth-code');
+    }
     redirect.searchParams.set('state', url.searchParams.get('state'));
     res.writeHead(302, { Location: redirect.toString() });
     return res.end();
@@ -171,7 +179,12 @@ origin = `http://127.0.0.1:${httpServer.address().port}`;
 const openedUrls = [];
 shell.openExternal = async (url) => {
   openedUrls.push(url);
-  await fetch(url);
+  const response = await fetch(url);
+  lastCallbackResponse = {
+    status: response.status,
+    headers: Object.fromEntries(response.headers.entries()),
+    body: await response.text(),
+  };
 };
 
 try {
@@ -1263,6 +1276,50 @@ await server.connect(new StdioServerTransport());
   assert.doesNotMatch(runTurnSource, /withCodexOrionMcps\(/, 'Codex config never carries the run\'s servers');
   assert.match(runTurnSource, /withoutCodexNativeMcps\(\[\.\.\.orionMcps\.servers, \.\.\.accountMcps\], options\)/);
   assert.match(runTurnSource, /model\.providerId === 'codex'\s*\? await codexMcpServers\(\)\s*: \[\.\.\.orionMcps\.servers, \.\.\.accountMcps\]/);
+
+  // --- OAuth security hardening: scheme validation + escaped callback HTML ----
+  const xssHtml = orionMcps.callbackPage('Sign-in <failed>', '<img src=x onerror="alert(\'xss\')">&more');
+  assert.doesNotMatch(xssHtml, /<img\b|<failed>/i, 'callbackPage must escape HTML tags');
+  assert.match(xssHtml, /&lt;failed&gt;/);
+  assert.match(xssHtml, /&lt;img src=x onerror=&quot;alert\(&#39;xss&#39;\)&quot;&gt;&amp;more/);
+
+  // Non-http(s) authorization_endpoint from remote OAuth metadata must never reach shell.openExternal.
+  validTokens.clear();
+  for (const maliciousEndpoint of ['file:///Applications/Calculator.app', 'javascript:alert(1)', 'smb://attacker.example/share']) {
+    const beforeOpens = openedUrls.length;
+    customAuthorizationEndpoint = maliciousEndpoint;
+    try {
+      const rejected = await orionMcps.addOrionMcp({
+        nickname: 'evil-oauth',
+        transport: 'http',
+        url: `${origin}/secure/mcp`,
+      });
+      assert.equal(rejected.ok, false, `must reject authorization_endpoint ${maliciousEndpoint}`);
+      assert.equal(openedUrls.length, beforeOpens, `must never call shell.openExternal for ${maliciousEndpoint}`);
+    } finally {
+      customAuthorizationEndpoint = null;
+    }
+  }
+
+  // Loopback callback page must HTML-escape error_description and send CSP + nosniff headers.
+  lastCallbackResponse = null;
+  authorizeErrorDescription = '<script>alert("pwned")</script>';
+  try {
+    const failedOauth = await orionMcps.addOrionMcp({
+      nickname: 'xss-oauth',
+      transport: 'http',
+      url: `${origin}/secure/mcp`,
+    });
+    assert.equal(failedOauth.ok, false);
+    assert.ok(lastCallbackResponse, 'callback server responded');
+    assert.equal(lastCallbackResponse.status, 400);
+    assert.doesNotMatch(lastCallbackResponse.body, /<script>/i, 'raw script tag must never appear in callback HTML');
+    assert.match(lastCallbackResponse.body, /&lt;script&gt;alert\(&quot;pwned&quot;\)&lt;\/script&gt;/);
+    assert.match(lastCallbackResponse.headers['content-security-policy'] ?? '', /default-src 'none'/);
+    assert.equal(lastCallbackResponse.headers['x-content-type-options'], 'nosniff');
+  } finally {
+    authorizeErrorDescription = null;
+  }
 
   console.log('Orion MCP regression checks passed.');
 } finally {

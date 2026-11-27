@@ -81,6 +81,7 @@
     "test:theme-community": "node --no-warnings scripts/test-theme-community.mjs",
     "test:t3-themes": "node --no-warnings scripts/test-t3-themes.mjs",
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
+    "test:renderer-security": "node --no-warnings scripts/test-renderer-security.mjs",
     "test:text-context-menu": "node --no-warnings scripts/test-text-context-menu.mjs",
     "test:renderer-recovery": "node --no-warnings scripts/test-renderer-recovery.mjs",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",

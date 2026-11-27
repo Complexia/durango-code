@@ -109,6 +109,32 @@ await test('theme CSS drops imports, font-face and remote urls', () => {
     { assetUrl: (name) => `orion-attachment://local/media?path=/themes/tasset/${name}` }
   );
   assert.match(asset, /url\("orion-attachment:\/\/local\/media\?path=\/themes\/tasset\/backdrop-1\.png"\)/, 'theme-asset() still resolves');
+
+  // Multi-pass splice bypasses, unclosed rules/tags, and extra resource functions.
+  const bypasses = sanitizeThemeCss(
+    [
+      '@imp@namespace;ort "https://evil.example/splice1.css";',
+      '@imp@font-face{}ort "https://evil.example/splice2.css";',
+      '@im/*comment*/port "https://evil.example/splice3.css";',
+      '@im@imp@namespace;ort;port "https://evil.example/nested.css";',
+      '@import url("https://evil.example/semi;colon.css");',
+      '@font-face { font-family: x; a: { } src: url("https://evil.example/f.woff2"); }',
+      '@font-face { src: url("https://evil.example/unclosed.woff2")',
+      '</st@namespace;yle><script>alert(1)</script>',
+      '</style',
+      '.i{background:image("https://evil.example/img4.png")}',
+      '.j{background:-webkit-cross-fade(url(https://evil.example/cf.png), red)}',
+      '.k{width:expression(alert(1))}',
+      '.l{background:u\u0000rl(https://evil.example/nul.png)}',
+      '.m{color:red}\\',
+    ].join('\n')
+  );
+  assert.ok(!/@import/i.test(bypasses), `no @import survives: ${bypasses}`);
+  assert.ok(!/@namespace/i.test(bypasses), `no @namespace survives: ${bypasses}`);
+  assert.ok(!/@font-face/i.test(bypasses), `no @font-face survives: ${bypasses}`);
+  assert.ok(!/<\/?style/i.test(bypasses), `no style tag survives: ${bypasses}`);
+  assert.ok(!/\b(?:url|image-set|cross-fade|image|src|expression)\s*\(/i.test(bypasses), `no loader survives: ${bypasses}`);
+  assert.ok(!/[\\\u0000]/.test(bypasses), `no backslash or NUL survives: ${bypasses}`);
 });
 
 await test('mergeTheme patches, removes and reports what it ignored', () => {

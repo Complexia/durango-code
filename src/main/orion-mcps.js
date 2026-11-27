@@ -7,6 +7,7 @@ import { auth, discoverOAuthServerInfo, extractWWWAuthenticateParams } from '@mo
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { externalWebUrl } from './linked-navigation.js';
 import { shellPathSyncPromise } from './shell-env.js';
 
 // ---------------------------------------------------------------------------
@@ -370,8 +371,12 @@ class OrionOAuthProvider {
   async redirectToAuthorization(authorizationUrl) {
     this.signal?.throwIfAborted();
     this.needsAuthorization = true;
+    const safeUrl = externalWebUrl(authorizationUrl);
+    if (!safeUrl) {
+      throw new Error('OAuth authorization URL must use http or https.');
+    }
     if (!this.interactive) return;
-    await shell.openExternal(authorizationUrl.toString());
+    await shell.openExternal(safeUrl);
   }
 
   saveCodeVerifier(verifier) {
@@ -402,10 +407,26 @@ class OrionOAuthProvider {
   }
 }
 
-const callbackPage = (title, detail) =>
-  `<!doctype html><meta charset="utf-8"><title>${title}</title>` +
-  '<body style="font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee;display:grid;place-items:center;height:100vh;margin:0">' +
-  `<div style="text-align:center"><h2 style="font-weight:600">${title}</h2><p style="color:#999">${detail}</p></div></body>`;
+const HTML_ESCAPE_MAP = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+};
+
+const escapeHtml = (value) =>
+  String(value ?? '').replace(/[&<>"']/g, (ch) => HTML_ESCAPE_MAP[ch]);
+
+export const callbackPage = (title, detail) => {
+  const safeTitle = escapeHtml(title);
+  const safeDetail = escapeHtml(detail);
+  return (
+    `<!doctype html><meta charset="utf-8"><title>${safeTitle}</title>` +
+    '<body style="font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee;display:grid;place-items:center;height:100vh;margin:0">' +
+    `<div style="text-align:center"><h2 style="font-weight:600">${safeTitle}</h2><p style="color:#999">${safeDetail}</p></div></body>`
+  );
+};
 
 // One loopback listener per sign-in. Resolves with the authorization code
 // once the browser returns with the state this flow generated.
@@ -429,6 +450,8 @@ const startOAuthCallbackServer = () =>
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
+      res.setHeader('X-Content-Type-Options', 'nosniff');
       if (!expectedState || state !== expectedState) {
         res.writeHead(400).end(callbackPage('Sign-in failed', 'This sign-in link is stale. Start again from Durango Code.'));
         return;

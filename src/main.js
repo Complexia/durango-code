@@ -196,7 +196,8 @@ import { createBrowserManager } from './main/browser/manager.js';
 import { browserScreenshotsDirectory } from './main/browser/security.js';
 import { browserModeFor, setBrowserManager } from './main/browser-tools.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
-import { externalWebUrl, linkedFileCandidates } from './main/linked-navigation.js';
+import { externalWebUrl, linkedFileCandidates, openExternalWebUrl } from './main/linked-navigation.js';
+import { rendererCspResponseHeaders } from './renderer-csp.js';
 import {
   canControlRemoteMachines,
   cancelRemotePairing,
@@ -1056,7 +1057,7 @@ const startDesktopAuth = async () => {
   };
 
   const url = buildDesktopAuthUrl(state, codeChallenge);
-  await shell.openExternal(url.toString());
+  await openExternalWebUrl(url, (target) => shell.openExternal(target));
   return { ok: true, url: url.toString() };
 };
 
@@ -1257,6 +1258,28 @@ app.on('open-url', (event, url) => {
   void handleDesktopAuthCallback(url);
 });
 
+const mainWindowWebContentsIds = new Set();
+const rendererCspSessions = new WeakSet();
+
+const attachMainWindowCsp = (mainWindow) => {
+  const wc = mainWindow.webContents;
+  const wcId = wc.id;
+  mainWindowWebContentsIds.add(wcId);
+  wc.once('destroyed', () => {
+    mainWindowWebContentsIds.delete(wcId);
+  });
+  const winSession = wc.session;
+  if (rendererCspSessions.has(winSession)) return;
+  rendererCspSessions.add(winSession);
+  winSession.webRequest.onHeadersReceived((details, callback) => {
+    const responseHeaders = rendererCspResponseHeaders(details, {
+      isMainWindow: (id) => mainWindowWebContentsIds.has(id),
+      devServerUrl: MAIN_WINDOW_VITE_DEV_SERVER_URL || null,
+    });
+    callback({ responseHeaders: responseHeaders ?? details.responseHeaders });
+  });
+};
+
 const createWindow = () => {
   const macWindowChrome =
     process.platform === 'darwin'
@@ -1286,6 +1309,8 @@ const createWindow = () => {
       // Security best practices: nodeIntegration false, contextIsolation true (default)
     },
   });
+
+  attachMainWindowCsp(mainWindow);
 
   // Never let an anchor replace Orion's only renderer document. Markdown
   // links are routed explicitly in the renderer, while this main-process
@@ -2110,7 +2135,8 @@ themeIpc('themes:takeInstallRequest', () => {
 });
 themeIpc('themes:openGallery', async (slug) => {
   const url = await communityGalleryUrl();
-  await shell.openExternal(typeof slug === 'string' && /^[a-z0-9]{10}$/.test(slug) ? `${url}/${slug}` : url);
+  const target = typeof slug === 'string' && /^[a-z0-9]{10}$/.test(slug) ? `${url}/${slug}` : url;
+  await openExternalWebUrl(target, (safeUrl) => shell.openExternal(safeUrl));
   return url;
 });
 
@@ -5812,8 +5838,8 @@ ipcMain.handle('computerUse:requestPermission', async (_event, kind) => {
     } else {
       return { ok: false, error: `Unknown permission: ${kind}`, state: await getComputerUsePermissions() };
     }
-    const pane = computerUseSettingsPanes[kind];
-    if (pane) await shell.openExternal(pane);
+    const pane = Object.hasOwn(computerUseSettingsPanes, kind) ? computerUseSettingsPanes[kind] : null;
+    if (pane && pane.startsWith('x-apple.systempreferences:')) await shell.openExternal(pane);
     return { ok: true, state: await getComputerUsePermissions() };
   } catch (error) {
     return { ok: false, error: getProcessErrorMessage(error), state: await getComputerUsePermissions() };
@@ -5859,7 +5885,7 @@ ipcMain.handle('cloud:openInBrowser', async (_event, projectPath) => {
     const gitRoot = await getGitRoot(projectPath);
     const link = await getCloudRepoLink(gitRoot);
     if (!link) return { ok: false, error: 'This repository is not linked to Durango Cloud yet.' };
-    await shell.openExternal(cloudRepoWebUrl(link.repoId));
+    await openExternalWebUrl(cloudRepoWebUrl(link.repoId), (target) => shell.openExternal(target));
     return { ok: true };
   } catch (error) {
     return { ok: false, error: cloudErrorMessage(error) };
@@ -6227,7 +6253,10 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
   // Antigravity's sign-in waits for a code the user pastes from the page
   // this link lands on (submitAuthCode below).
   if (result?.ok && result.codeRequired && result.url) {
-    void shell.openExternal(result.url).catch(() => {});
+    const authUrl = externalWebUrl(result.url);
+    if (authUrl) {
+      void shell.openExternal(authUrl).catch(() => {});
+    }
   }
   if (result?.ok) {
     invalidateAgentModelsCache();
@@ -10063,7 +10092,7 @@ ipcMain.handle('devServers:list', async (_event, input) => {
 
 ipcMain.handle('devServers:open', async (_event, input) => {
   try {
-    await shell.openExternal(devServerUrlForPort(input?.port));
+    await openExternalWebUrl(devServerUrlForPort(input?.port), (target) => shell.openExternal(target));
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
