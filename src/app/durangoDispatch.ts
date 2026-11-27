@@ -1,5 +1,5 @@
 import { clipMiddle, compactFileLinks, selectFinalMessage, type ClipMiddleOptions, type CompactFileLinksOptions } from '../report-clip.js';
-import type { AgentActivity, Message, Thread } from '../store';
+import type { AgentActivity, BotThreadTurn, Message, Thread } from '../store';
 
 // Renderer side of Durango Chat dispatch (main: src/main/durango-dispatch.js).
 
@@ -84,6 +84,100 @@ export type DurangoDispatchOutcome =
  */
 export const dispatchReportSeq = (position: number, waiting: boolean) => 2 * (position + 1) - (waiting ? 1 : 0);
 
+/** Sequence number for a bot-started thread's non-dispatched turn, shifted by `seqBase` after transcript edits. */
+export const botThreadTurnReportSeq = (position: number, waiting: boolean, seqBase = 0) =>
+  dispatchReportSeq(position + seqBase, waiting);
+
+const MAX_PENDING_BOT_THREAD_TURNS = 20;
+
+/**
+ * Stamps a newly started non-bot-dispatched turn onto a bot-started thread,
+ * preserving any earlier `botThreadTurn` that still has an unreported outcome
+ * in `pendingBotThreadTurns` (queued follow-ups, offline retries, sign-in sync).
+ */
+export const stampNextBotThreadTurn = (
+  thread: Pick<Thread, 'botThreadTurn' | 'pendingBotThreadTurns' | 'botThreadTurnSeqBase'>,
+  next: Omit<BotThreadTurn, 'seqBase'>
+): Pick<Thread, 'botThreadTurn' | 'pendingBotThreadTurns'> => {
+  const seqBase = thread.botThreadTurnSeqBase ?? 0;
+  const stamped: BotThreadTurn = seqBase > 0 ? { ...next, seqBase } : { ...next };
+  const pending = [...(thread.pendingBotThreadTurns ?? [])];
+  const prev = thread.botThreadTurn;
+  if (prev) {
+    const prevBase = prev.seqBase ?? 0;
+    const isEarlier = prev.runOffset < next.runOffset || prevBase < seqBase;
+    const prevLastPos = Math.max(prev.runOffset, next.runOffset - 1);
+    const needsReport =
+      !prev.reportedAt ||
+      (prev.reportedSeq !== undefined &&
+        (prev.reportedSeq % 2 === 1 || botThreadTurnReportSeq(prevLastPos, false, prevBase) > prev.reportedSeq));
+    if (isEarlier && needsReport) {
+      const sameKey = (candidate: BotThreadTurn) =>
+        candidate.runOffset === prev.runOffset && (candidate.seqBase ?? 0) === prevBase;
+      if (!pending.some(sameKey)) pending.push(prev);
+    }
+  }
+  const trimmed = pending.length > MAX_PENDING_BOT_THREAD_TURNS ? pending.slice(-MAX_PENDING_BOT_THREAD_TURNS) : pending;
+  return {
+    botThreadTurn: stamped,
+    pendingBotThreadTurns: trimmed.length > 0 ? trimmed : undefined,
+  };
+};
+
+/**
+ * Marks a bot-started thread turn reported (whether it is still the active
+ * `botThreadTurn` or was moved to `pendingBotThreadTurns` by a later turn).
+ * A superseded pending turn whose final (even) report landed is pruned.
+ */
+export const applyBotThreadTurnReported = (
+  thread: Pick<Thread, 'botThreadTurn' | 'pendingBotThreadTurns'>,
+  runOffset: number,
+  reported: { reportedAt: string; reportedSeq: number },
+  seqBase = 0
+): Partial<Pick<Thread, 'botThreadTurn' | 'pendingBotThreadTurns'>> | null => {
+  const same = (turn: BotThreadTurn | undefined) =>
+    Boolean(turn && turn.runOffset === runOffset && (turn.seqBase ?? 0) === seqBase);
+  if (same(thread.botThreadTurn)) {
+    return { botThreadTurn: { ...thread.botThreadTurn!, ...reported } };
+  }
+  const pending = thread.pendingBotThreadTurns ?? [];
+  const index = pending.findIndex((turn) => same(turn));
+  if (index === -1) return null;
+  const nextPending =
+    reported.reportedSeq % 2 === 0
+      ? pending.filter((_turn, idx) => idx !== index)
+      : pending.map((turn, idx) => (idx === index ? { ...turn, ...reported } : turn));
+  return { pendingBotThreadTurns: nextPending.length > 0 ? nextPending : undefined };
+};
+
+/**
+ * Updates a bot-started thread's turn-report tracking when the person edits an
+ * earlier message and truncates the transcript from `priorRunCount` to
+ * `keptRunCount`: advances `botThreadTurnSeqBase` so future turns never reuse
+ * an already-reported `seq`, and drops turns whose runs were truncated away.
+ */
+export const botThreadTurnStateAfterEdit = (
+  thread: Pick<Thread, 'botThreadTurn' | 'pendingBotThreadTurns' | 'botThreadTurnSeqBase'>,
+  priorRunCount: number,
+  keptRunCount: number
+): Pick<Thread, 'botThreadTurn' | 'pendingBotThreadTurns' | 'botThreadTurnSeqBase'> => {
+  const priorBase = thread.botThreadTurnSeqBase ?? 0;
+  const priorMaxSeq = Math.max(
+    thread.botThreadTurn?.reportedSeq ?? 0,
+    ...(thread.pendingBotThreadTurns ?? []).map((turn) => turn.reportedSeq ?? 0)
+  );
+  const priorMaxSlot = Math.max(priorRunCount + priorBase, Math.ceil(priorMaxSeq / 2));
+  const nextSeqBase = priorMaxSlot > keptRunCount ? Math.max(priorBase, priorMaxSlot - keptRunCount) : priorBase;
+  const keepTurn = (turn: BotThreadTurn) => turn.runOffset < keptRunCount;
+  const nextCurrent = thread.botThreadTurn && keepTurn(thread.botThreadTurn) ? thread.botThreadTurn : undefined;
+  const nextPending = (thread.pendingBotThreadTurns ?? []).filter(keepTurn);
+  return {
+    botThreadTurn: nextCurrent,
+    pendingBotThreadTurns: nextPending.length > 0 ? nextPending : undefined,
+    botThreadTurnSeqBase: nextSeqBase > 0 ? nextSeqBase : undefined,
+  };
+};
+
 /**
  * The dispatched run and the turns the thread then started on its own (a
  * background command it waited on finished, a subagent reported back, the
@@ -96,6 +190,52 @@ const dispatchRunPositions = (runs: Message[], offset: number) => {
   const positions = [offset];
   while (runs[positions.length + offset]?.continuation) positions.push(positions.length + offset);
   return positions;
+};
+
+/**
+ * Identifies the bot that started a Durango Code thread, so every later turn
+ * started by the person or the Ship button reports back to that bot's inbox.
+ * Returns null for threads not started by a bot, mirrored remote threads
+ * (only the host machine reports), and subagents.
+ */
+export type BotThreadOwner = {
+  mode: 'local' | 'durango';
+  botId?: string;
+  botName?: string;
+  originDispatchId?: string;
+};
+
+const localBotIdFromDispatchId = (dispatchId: string): string | undefined => {
+  if (!dispatchId.startsWith('localbot:')) return undefined;
+  const rest = dispatchId.slice('localbot:'.length);
+  const sep = rest.indexOf(':');
+  if (sep <= 0) return undefined;
+  const id = rest.slice(0, sep).trim();
+  return id || undefined;
+};
+
+export const botThreadOwner = (
+  thread: Pick<Thread, 'startedByBot' | 'startedByBotId' | 'startedByBotDispatchId' | 'durangoDispatch' | 'remote' | 'parentThreadId' | 'subagent'>
+): BotThreadOwner | null => {
+  if (thread.remote || thread.parentThreadId || thread.subagent) return null;
+  const originDispatchId =
+    thread.startedByBotDispatchId?.trim() ||
+    (!thread.durangoDispatch?.followUp && !thread.durangoDispatch?.runOffset ? thread.durangoDispatch?.id?.trim() : undefined) ||
+    undefined;
+  const recordedId = thread.startedByBotId?.trim() || undefined;
+  const recordedName = thread.startedByBot?.trim() || undefined;
+  const isLocalDispatch = Boolean(originDispatchId?.startsWith('localbot:'));
+  const isBotTaskDispatch = Boolean(originDispatchId?.startsWith('bottask:'));
+  if (!recordedId && !recordedName && !isLocalDispatch && !isBotTaskDispatch) return null;
+  const botId = recordedId ?? (originDispatchId ? localBotIdFromDispatchId(originDispatchId) : undefined);
+  const botName = recordedName && recordedName !== 'bot' ? recordedName : undefined;
+  const mode: 'local' | 'durango' = isLocalDispatch || (!isBotTaskDispatch && Boolean(botId?.startsWith('lb'))) ? 'local' : 'durango';
+  return {
+    mode,
+    ...(botId ? { botId } : {}),
+    ...(botName ? { botName } : {}),
+    ...(originDispatchId ? { originDispatchId } : {}),
+  };
 };
 
 /**
@@ -122,53 +262,87 @@ export const durangoDispatchLiveRun = (thread: Pick<Thread, 'status' | 'durangoD
   durangoDispatchLiveRunAt(thread, messages)?.run ?? null;
 
 /**
- * Whether `durangoDispatch` may have a report left to send (cheap: from the
- * thread's shell). A report that said the thread was waiting always may: its
- * wait can end without a new run.
+ * The run a running non-bot-dispatched turn (Ship button or person) in a
+ * bot-started thread is currently on, with its position among the thread's
+ * runs. Disjoint from `durangoDispatchLiveRunAt` because a bot-dispatched
+ * follow-up starts a non-continuation run at a newer offset.
  */
-export const durangoDispatchHasNewRuns = (dispatch: NonNullable<Thread['durangoDispatch']>, agentRunCount: number) =>
-  !dispatch.reportedAt ||
-  (dispatch.reportedSeq !== undefined && (dispatch.reportedSeq % 2 === 1 || dispatchReportSeq(agentRunCount - 1, false) > dispatch.reportedSeq));
+export const botThreadTurnLiveRunAt = (
+  thread: Pick<
+    Thread,
+    'status' | 'startedByBot' | 'startedByBotId' | 'startedByBotDispatchId' | 'durangoDispatch' | 'remote' | 'parentThreadId' | 'subagent' | 'botThreadTurn'
+  >,
+  messages: Message[]
+): { run: Message; position: number } | null => {
+  const turn = thread.botThreadTurn;
+  if (!turn || thread.status !== 'running' || !botThreadOwner(thread)) return null;
+  const runs = messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run');
+  const positions = dispatchRunPositions(runs, turn.runOffset);
+  const last = positions[positions.length - 1];
+  return last !== undefined && last === runs.length - 1 ? { run: runs[last], position: last } : null;
+};
 
 /**
- * How a dispatched thread's work ended, or null while it is still running
- * (or has not started, or this was already reported). The dispatched run
- * counts: the thread's first run, or for a follow-up dispatch the run at
- * `runOffset` (the runs it already had), together with the turns the thread
- * then resumed by itself; the report is the latest of those. A turn that ends
- * while the thread still waits on background work reports as `waiting`, and
- * the turn that resumes and settles later (or the end of that wait) reports
- * again. Turns the person starts are their own.
+ * Whether `durangoDispatch` or a `botThreadTurn` may have a report left to send
+ * (cheap: from the thread's shell). A report that said the thread was waiting
+ * always may: its wait can end without a new run.
  */
-export const durangoDispatchOutcome = (
-  thread: Pick<Thread, 'status' | 'durangoDispatch'> & Partial<Pick<Thread, 'id' | 'projectId' | 'durangoWorkspace' | 'userActions'>>,
+export const durangoDispatchHasNewRuns = (
+  tracked: { reportedAt?: string; reportedSeq?: number; seqBase?: number },
+  agentRunCount: number
+) =>
+  !tracked.reportedAt ||
+  (tracked.reportedSeq !== undefined &&
+    (tracked.reportedSeq % 2 === 1 || botThreadTurnReportSeq(agentRunCount - 1, false, tracked.seqBase ?? 0) > tracked.reportedSeq));
+
+const isBotDispatchThread = (
+  thread: Pick<Thread, 'durangoDispatch'> & Partial<Pick<Thread, 'startedByBot' | 'startedByBotId'>>
+) => {
+  const dispatch = thread.durangoDispatch;
+  if (!dispatch) return false;
+  return /^(bottask|localbot):/.test(dispatch.id) || Boolean(!dispatch.sourceUrl && (thread.startedByBot || thread.startedByBotId));
+};
+
+const runChainOutcome = (
+  thread: Pick<Thread, 'status'> & Partial<Pick<Thread, 'id' | 'durangoWorkspace' | 'userActions'>>,
   messages: Message[],
+  tracked: {
+    runOffset: number;
+    seqBase?: number;
+    reportedAt?: string;
+    reportedSeq?: number;
+    maxSummary: number;
+    superseded?: boolean;
+    includeThreadPointer?: boolean;
+  },
   options?: CompactFileLinksOptions
 ): DurangoDispatchOutcome | null => {
-  const dispatch = thread.durangoDispatch;
-  if (!dispatch) return null;
-  if (thread.status === 'running') return null;
+  const seqBase = tracked.seqBase ?? 0;
+  const superseded = tracked.superseded === true;
+  if (thread.status === 'running' && !superseded) return null;
   // Reported by a build before reports had sequence numbers: once, as it always was.
-  if (dispatch.reportedAt && dispatch.reportedSeq === undefined) return null;
-  const reportedSeq = dispatch.reportedAt ? (dispatch.reportedSeq ?? 0) : 0;
+  if (tracked.reportedAt && tracked.reportedSeq === undefined) return null;
+  const reportedSeq = tracked.reportedAt ? (tracked.reportedSeq ?? 0) : 0;
   const runs = messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run');
-  const offset = dispatch.runOffset ?? 0;
-  // The run message exists before `durangoDispatch` is stamped, so take the
-  // runs by position rather than filtering by time.
+  const offset = tracked.runOffset;
+  // The run message exists before tracking is stamped, so take the runs by position.
   const positions = dispatchRunPositions(runs, offset);
   if (positions.length === 0) {
-    if (dispatch.reportedAt) return null;
+    if (tracked.reportedAt || superseded) return null;
     // Start failures before any run message (rare): report the thread error.
-    if (thread.status === 'error') return { outcome: 'failed', error: 'The agent failed to start.', seq: dispatchReportSeq(offset, false) };
+    if (thread.status === 'error') return { outcome: 'failed', error: 'The agent failed to start.', seq: botThreadTurnReportSeq(offset, false, seqBase) };
     return null;
   }
   const position = positions[positions.length - 1];
+  const hasLaterRun = position < runs.length - 1;
+  // A superseded turn may settle while a newer turn is running only once that newer run exists.
+  if (thread.status === 'running' && !(superseded && hasLaterRun)) return null;
   // Nothing newer than the last report can come from an earlier run.
-  if (dispatchReportSeq(position, false) <= reportedSeq) return null;
+  if (botThreadTurnReportSeq(position, false, seqBase) <= reportedSeq) return null;
   const run = runs[position];
   if (run.status === 'running') return null;
-  const seq = dispatchReportSeq(position, false);
-  if (run.status === 'error' || (thread.status === 'error' && run.status !== 'done')) {
+  const seq = botThreadTurnReportSeq(position, false, seqBase);
+  if (run.status === 'error' || (!superseded && thread.status === 'error' && run.status !== 'done')) {
     return { outcome: 'failed', error: (run.error || run.statusText || 'The agent stopped with an error.').trim(), seq };
   }
   if (run.status === 'stopped') {
@@ -182,21 +356,22 @@ export const durangoDispatchOutcome = (
     };
   }
   if (run.status === 'done') {
-    const maxSummary = summaryMaxCharsFor(dispatch.id);
     const rootPaths = [...(options?.rootPaths ?? []), options?.rootPath, thread.durangoWorkspace?.path];
     const finalText = compactFileLinks(dispatchRunFinalText(run), { rootPaths });
-    const clipOptions = thread.id ? { threadId: thread.id } : undefined;
-    const summary = dispatchSummaryText(finalText, maxSummary, clipOptions) || 'The agent finished without a written summary.';
-    const waiting = dispatchWaitingOn(thread, messages, run);
+    // Only include the bot-oriented "call read_thread" pointer for bot reports,
+    // never for human-facing Chat / Tasks / API dispatch writebacks.
+    const clipOptions = tracked.includeThreadPointer && thread.id ? { threadId: thread.id } : undefined;
+    const summary = dispatchSummaryText(finalText, tracked.maxSummary, clipOptions) || 'The agent finished without a written summary.';
+    const waiting = dispatchWaitingOn(thread, messages, run, superseded && hasLaterRun);
     if (waiting.length) {
-      const waitingSeq = dispatchReportSeq(position, true);
+      const waitingSeq = botThreadTurnReportSeq(position, true, seqBase);
       return waitingSeq > reportedSeq ? { outcome: 'finished', summary, waiting, seq: waitingSeq } : null;
     }
     // This run reported it was waiting; that wait is over and no turn followed.
-    if (reportedSeq === dispatchReportSeq(position, true)) {
+    if (reportedSeq === botThreadTurnReportSeq(position, true, seqBase)) {
       return {
         outcome: 'finished',
-        summary: `${WAIT_ENDED_PREFIX}${dispatchSummaryText(finalText, maxSummary - WAIT_ENDED_PREFIX.length, clipOptions) || '(none)'}`,
+        summary: `${WAIT_ENDED_PREFIX}${dispatchSummaryText(finalText, tracked.maxSummary - WAIT_ENDED_PREFIX.length, clipOptions) || '(none)'}`,
         waitEnded: true,
         seq,
       };
@@ -204,6 +379,83 @@ export const durangoDispatchOutcome = (
     return { outcome: 'finished', summary, seq };
   }
   return null;
+};
+
+/**
+ * How a dispatched thread's work ended, or null while it is still running
+ * (or has not started, or this was already reported). The dispatched run
+ * counts: the thread's first run, or for a follow-up dispatch the run at
+ * `runOffset` (the runs it already had), together with the turns the thread
+ * then resumed by itself; the report is the latest of those. A turn that ends
+ * while the thread still waits on background work reports as `waiting`, and
+ * the turn that resumes and settles later (or the end of that wait) reports
+ * again. Turns the person starts are handled separately by `botThreadTurnOutcome`.
+ */
+export const durangoDispatchOutcome = (
+  thread: Pick<Thread, 'status' | 'durangoDispatch'> &
+    Partial<Pick<Thread, 'id' | 'projectId' | 'durangoWorkspace' | 'userActions' | 'startedByBot' | 'startedByBotId'>>,
+  messages: Message[],
+  options?: CompactFileLinksOptions
+): DurangoDispatchOutcome | null => {
+  const dispatch = thread.durangoDispatch;
+  if (!dispatch) return null;
+  return runChainOutcome(
+    thread,
+    messages,
+    {
+      runOffset: dispatch.runOffset ?? 0,
+      reportedAt: dispatch.reportedAt,
+      reportedSeq: dispatch.reportedSeq,
+      maxSummary: summaryMaxCharsFor(dispatch.id),
+      includeThreadPointer: isBotDispatchThread(thread),
+    },
+    options
+  );
+};
+
+const botThreadTurnOutcomeFor = (
+  thread: Pick<
+    Thread,
+    'status' | 'startedByBot' | 'startedByBotId' | 'startedByBotDispatchId' | 'durangoDispatch' | 'remote' | 'parentThreadId' | 'subagent'
+  > &
+    Partial<Pick<Thread, 'id' | 'projectId' | 'durangoWorkspace' | 'userActions'>>,
+  messages: Message[],
+  turn: BotThreadTurn,
+  { superseded = false, rootPath, rootPaths }: { superseded?: boolean } & CompactFileLinksOptions = {}
+): DurangoDispatchOutcome | null => {
+  if (!botThreadOwner(thread)) return null;
+  return runChainOutcome(
+    thread,
+    messages,
+    {
+      runOffset: turn.runOffset,
+      seqBase: turn.seqBase,
+      reportedAt: turn.reportedAt,
+      reportedSeq: turn.reportedSeq,
+      maxSummary: BOT_TASK_SUMMARY_MAX_CHARS,
+      superseded,
+      includeThreadPointer: true,
+    },
+    rootPath || rootPaths ? { rootPath, rootPaths } : undefined
+  );
+};
+
+/**
+ * How a non-bot-dispatched turn (Ship button, person, or external) in a
+ * bot-started thread ended, or null while running / not yet started / already reported.
+ */
+export const botThreadTurnOutcome = (
+  thread: Pick<
+    Thread,
+    'status' | 'startedByBot' | 'startedByBotId' | 'startedByBotDispatchId' | 'durangoDispatch' | 'remote' | 'parentThreadId' | 'subagent' | 'botThreadTurn'
+  > &
+    Partial<Pick<Thread, 'id' | 'projectId' | 'durangoWorkspace' | 'userActions'>>,
+  messages: Message[],
+  options?: CompactFileLinksOptions
+): DurangoDispatchOutcome | null => {
+  const turn = thread.botThreadTurn;
+  if (!turn) return null;
+  return botThreadTurnOutcomeFor(thread, messages, turn, options);
 };
 
 const clipLine = (text: string, max = 160) => {
@@ -214,14 +466,24 @@ const clipLine = (text: string, max = 160) => {
 /**
  * What a settled turn left the thread waiting on: background commands still
  * running after it (the "Left running in the background" card that follows
- * the run), and actions it asked the person for. Empty: the work is done.
+ * the run, before any later agent run), and actions it asked the person for.
+ * Empty: the work is done.
  */
 const dispatchWaitingOn = (
   thread: Partial<Pick<Thread, 'userActions'>>,
   messages: Message[],
-  run: Message
+  run: Message,
+  superseded = false
 ): string[] => {
-  const after = messages.slice(messages.indexOf(run) + 1);
+  const startIndex = messages.indexOf(run) + 1;
+  let endIndex = messages.length;
+  for (let index = startIndex; index < messages.length; index += 1) {
+    if (messages[index].role === 'agent' && messages[index].kind === 'agent-run') {
+      endIndex = index;
+      break;
+    }
+  }
+  const after = messages.slice(startIndex, endIndex);
   const commands = after
     .filter(
       (message) =>
@@ -231,11 +493,14 @@ const dispatchWaitingOn = (
     .flatMap((message) => message.claudeBackgroundIntervention?.tasks ?? [])
     .map((task) => `background command: ${clipLine(task)}`);
   // With the request's id, so the bot can press Done for the person (answer_thread_request).
-  const person = (thread.userActions ?? []).map((action) =>
-    action.secret
-      ? `the person (secret request ${action.id}, only they can answer it): ${clipLine(action.action)}`
-      : `the person (request ${action.id}): ${clipLine(action.action)}`
-  );
+  // A superseded earlier turn does not own current userActions cards.
+  const person = superseded
+    ? []
+    : (thread.userActions ?? []).map((action) =>
+        action.secret
+          ? `the person (secret request ${action.id}, only they can answer it): ${clipLine(action.action)}`
+          : `the person (request ${action.id}): ${clipLine(action.action)}`
+      );
   return [...new Set([...commands, ...person])].slice(0, 6);
 };
 
@@ -264,6 +529,24 @@ export type DispatchSettledInput = {
   seq?: number;
 };
 
+export type BotThreadTurnSettledInput = {
+  owner: BotThreadOwner;
+  threadId: string;
+  threadTitle?: string;
+  projectName?: string;
+  workspacePath?: string;
+  trigger: 'person' | 'ship_button' | 'external';
+  changeId?: string;
+  surface?: string;
+  promptPreview?: string;
+  outcome: 'finished' | 'failed';
+  summary?: string;
+  error?: string;
+  waiting?: string[];
+  later?: boolean;
+  seq: number;
+};
+
 export type DurangoDispatchReporterDeps = {
   getState: () => ReporterState;
   subscribe: (listener: (state: ReporterState, previous: ReporterState) => void) => () => void;
@@ -273,6 +556,17 @@ export type DurangoDispatchReporterDeps = {
   settle: (input: DispatchSettledInput) => Promise<unknown> | unknown;
   /** Persists `durangoDispatch.reportedAt / reportedSeq` (only if the thread still has that dispatch). */
   markReported: (threadId: string, dispatchId: string, reported: { reportedAt: string; reportedSeq: number }) => void;
+  /** Main's bots:threadTurnSettled for non-dispatched turns in bot-started threads. */
+  settleBotTurn?: (input: BotThreadTurnSettledInput) => Promise<unknown> | unknown;
+  /** Persists `botThreadTurn.reportedAt / reportedSeq` (or updates/prunes a matching pending turn). */
+  markBotTurnReported?: (
+    threadId: string,
+    runOffset: number,
+    reported: { reportedAt: string; reportedSeq: number },
+    seqBase?: number
+  ) => void;
+  /** Resolves a thread's project name for report footers. */
+  getProjectName?: (projectId: string | null) => string | undefined;
   setTimer?: (callback: () => void, ms: number) => unknown;
   clearTimer?: (timer: unknown) => void;
   now?: () => number;
@@ -292,6 +586,9 @@ export const startDurangoDispatchReporter = ({
   ensureTranscript,
   settle,
   markReported,
+  settleBotTurn,
+  markBotTurnReported,
+  getProjectName,
   setTimer = (callback, ms) => setTimeout(callback, ms),
   clearTimer = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
   now = () => Date.now(),
@@ -299,6 +596,7 @@ export const startDurangoDispatchReporter = ({
   retryMs = 60_000,
 }: DurangoDispatchReporterDeps) => {
   const inFlight = new Set<string>();
+  const botTurnInFlight = new Set<string>();
   const loading = new Set<string>();
   // Shells already looked at with no outcome (or an unreadable transcript).
   // An outcome can only appear when the shell changes (its status or
@@ -306,8 +604,13 @@ export const startDurangoDispatchReporter = ({
   // at most once. Except while a reported wait lasts: it ends in the
   // transcript (the background card settles), not the shell.
   const examined = new WeakSet<Thread>();
+  const botTurnExamined = new WeakSet<Thread>();
   const waitEndedSince = new Map<string, number>();
-  const waitReported = (thread: Thread) => (thread.durangoDispatch?.reportedSeq ?? 0) % 2 === 1;
+  const dispatchWaitReported = (thread: Thread) => (thread.durangoDispatch?.reportedSeq ?? 0) % 2 === 1;
+  const botTurnWaitReported = (thread: Thread) =>
+    (thread.botThreadTurn?.reportedSeq ?? 0) % 2 === 1 ||
+    (thread.pendingBotThreadTurns ?? []).some((turn) => (turn.reportedSeq ?? 0) % 2 === 1);
+  const waitReported = (thread: Thread) => dispatchWaitReported(thread) || botTurnWaitReported(thread);
   const timers = new Set<unknown>();
   let recheck: unknown = null;
   let stopped = false;
@@ -328,86 +631,183 @@ export const startDurangoDispatchReporter = ({
     }, delayMs);
   };
 
+  const loadTranscript = (thread: Thread, markExamined: WeakSet<Thread>) => {
+    if (loading.has(thread.id)) return;
+    loading.add(thread.id);
+    void Promise.resolve()
+      .then(() => ensureTranscript(thread.id))
+      .catch((error) => {
+        console.warn('Could not load a dispatched thread to report its outcome', error);
+        markExamined.add(thread);
+        return null;
+      })
+      .finally(() => {
+        loading.delete(thread.id);
+        check(getState().threads);
+      });
+  };
+
   const check = (threads: Thread[]) => {
     if (stopped) return;
     const { transcripts, projects } = getState();
     for (const thread of threads) {
+      // 1) Bot/Chat/Tasks/API dispatched run chain.
       const dispatch = thread.durangoDispatch;
-      if (!dispatch || inFlight.has(dispatch.id)) continue;
-      if (!durangoDispatchHasNewRuns(dispatch, thread.summary.agentRunCount)) continue;
-      if (thread.status === 'running' || (examined.has(thread) && !waitReported(thread))) continue;
-      // No dispatched run yet, and no start failure to report.
-      if (thread.summary.agentRunCount <= (dispatch.runOffset ?? 0) && thread.status !== 'error') {
-        examined.add(thread);
-        continue;
-      }
-      const transcript = transcripts[thread.id];
-      if (!transcript) {
-        // The outcome is in the transcript: load it, then look again.
-        if (loading.has(thread.id)) continue;
-        loading.add(thread.id);
-        void Promise.resolve()
-          .then(() => ensureTranscript(thread.id))
-          .catch((error) => {
-            console.warn('Could not load a dispatched thread to report its outcome', error);
-            examined.add(thread);
-            return null;
-          })
-          .finally(() => {
-            loading.delete(thread.id);
-            check(getState().threads);
-          });
-        continue;
-      }
       const projectPath = projects?.find((project) => project.id === thread.projectId)?.path;
-      const outcome = durangoDispatchOutcome(thread, transcript.messages, projectPath ? { rootPath: projectPath } : undefined);
-      if (!outcome) {
-        examined.add(thread);
-        continue;
-      }
-      if (outcome.outcome === 'finished' && outcome.waitEnded) {
-        const key = `${dispatch.id}:${outcome.seq}`;
-        const since = waitEndedSince.get(key) ?? now();
-        waitEndedSince.set(key, since);
-        if (now() - since < waitEndedGraceMs) {
-          checkSoon(waitEndedGraceMs - (now() - since) + 50);
-          continue;
-        }
-        waitEndedSince.delete(key);
-      }
-      inFlight.add(dispatch.id);
-      // An outcome counts as reported only once it was delivered: offline
-      // through every retry, it is tried again later (and on the next
-      // launch) instead of leaving a bot's task without its outcome.
-      const reported = { reportedAt: new Date(now()).toISOString(), reportedSeq: outcome.seq };
-      const { waitEnded: _waitEnded, ...report } = outcome as typeof outcome & { waitEnded?: boolean };
-      let settled: unknown;
-      try {
-        settled = settle({
-          dispatchId: dispatch.id,
-          threadId: thread.id,
-          ...(/^(bottask|localbot):/.test(dispatch.id) && thread.durangoWorkspace?.path ? { workspacePath: thread.durangoWorkspace.path } : {}),
-          ...report,
-        });
-      } catch (error) {
-        settled = Promise.reject(error);
-      }
-      void Promise.resolve(settled)
-        .then(
-          (result) => (result as { retry?: boolean } | undefined)?.retry !== true,
-          () => false
-        )
-        .then((delivered) => {
-          inFlight.delete(dispatch.id);
-          if (stopped) return;
-          if (delivered) {
-            markReported(thread.id, dispatch.id, reported);
-            // A turn that settled while this report was on its way.
-            checkSoon(0);
-            return;
+      const compactOptions = projectPath ? { rootPath: projectPath } : undefined;
+      if (
+        dispatch &&
+        !inFlight.has(dispatch.id) &&
+        durangoDispatchHasNewRuns(dispatch, thread.summary.agentRunCount) &&
+        thread.status !== 'running' &&
+        (!examined.has(thread) || dispatchWaitReported(thread))
+      ) {
+        if (thread.summary.agentRunCount <= (dispatch.runOffset ?? 0) && thread.status !== 'error') {
+          examined.add(thread);
+        } else {
+          const transcript = transcripts[thread.id];
+          if (!transcript) {
+            loadTranscript(thread, examined);
+          } else {
+            const outcome = durangoDispatchOutcome(thread, transcript.messages, compactOptions);
+            if (!outcome) {
+              examined.add(thread);
+            } else {
+              let delayed = false;
+              if (outcome.outcome === 'finished' && outcome.waitEnded) {
+                const key = `${dispatch.id}:${outcome.seq}`;
+                const since = waitEndedSince.get(key) ?? now();
+                waitEndedSince.set(key, since);
+                if (now() - since < waitEndedGraceMs) {
+                  checkSoon(waitEndedGraceMs - (now() - since) + 50);
+                  delayed = true;
+                } else {
+                  waitEndedSince.delete(key);
+                }
+              }
+              if (!delayed) {
+                inFlight.add(dispatch.id);
+                const reported = { reportedAt: new Date(now()).toISOString(), reportedSeq: outcome.seq };
+                const { waitEnded: _waitEnded, ...report } = outcome as typeof outcome & { waitEnded?: boolean };
+                let settled: unknown;
+                try {
+                  settled = settle({
+                    dispatchId: dispatch.id,
+                    threadId: thread.id,
+                    ...(/^(bottask|localbot):/.test(dispatch.id) && thread.durangoWorkspace?.path ? { workspacePath: thread.durangoWorkspace.path } : {}),
+                    ...report,
+                  });
+                } catch (error) {
+                  settled = Promise.reject(error);
+                }
+                void Promise.resolve(settled)
+                  .then(
+                    (result) => (result as { retry?: boolean } | undefined)?.retry !== true,
+                    () => false
+                  )
+                  .then((delivered) => {
+                    inFlight.delete(dispatch.id);
+                    if (stopped) return;
+                    if (delivered) {
+                      markReported(thread.id, dispatch.id, reported);
+                      checkSoon(0);
+                      return;
+                    }
+                    later(() => check(getState().threads), retryMs);
+                  });
+              }
+            }
           }
-          later(() => check(getState().threads), retryMs);
-        });
+        }
+      }
+
+      // 2) Non-bot-dispatched turns (Ship button, person typing on any surface, external)
+      //    in a bot-started thread, including earlier unreported turns preserved in `pendingBotThreadTurns`.
+      const botTurns: Array<{ turn: BotThreadTurn; superseded: boolean }> = [
+        ...(thread.pendingBotThreadTurns ?? []).map((turn) => ({ turn, superseded: true })),
+        ...(thread.botThreadTurn ? [{ turn: thread.botThreadTurn, superseded: false }] : []),
+      ];
+      const owner = botTurns.length > 0 && settleBotTurn ? botThreadOwner(thread) : null;
+      if (owner && settleBotTurn && (!botTurnExamined.has(thread) || botTurnWaitReported(thread) || Boolean(thread.pendingBotThreadTurns?.length))) {
+        let allExaminedWithoutOutcome = true;
+        for (const { turn, superseded } of botTurns) {
+          const seqBase = turn.seqBase ?? 0;
+          const turnKey = `${thread.id}:${seqBase}:${turn.runOffset}`;
+          if (botTurnInFlight.has(turnKey)) {
+            allExaminedWithoutOutcome = false;
+            continue;
+          }
+          if (!durangoDispatchHasNewRuns(turn, thread.summary.agentRunCount)) continue;
+          if (thread.status === 'running' && !superseded) {
+            allExaminedWithoutOutcome = false;
+            continue;
+          }
+          if (thread.summary.agentRunCount <= turn.runOffset && (superseded || thread.status !== 'error')) continue;
+          const transcript = transcripts[thread.id];
+          if (!transcript) {
+            allExaminedWithoutOutcome = false;
+            loadTranscript(thread, botTurnExamined);
+            break;
+          }
+          const outcome = botThreadTurnOutcomeFor(thread, transcript.messages, turn, { superseded, ...compactOptions });
+          if (!outcome) continue;
+          allExaminedWithoutOutcome = false;
+          let delayed = false;
+          if (outcome.outcome === 'finished' && outcome.waitEnded) {
+            const key = `botturn:${turnKey}:${outcome.seq}`;
+            const since = waitEndedSince.get(key) ?? now();
+            waitEndedSince.set(key, since);
+            if (now() - since < waitEndedGraceMs) {
+              checkSoon(waitEndedGraceMs - (now() - since) + 50);
+              delayed = true;
+            } else {
+              waitEndedSince.delete(key);
+            }
+          }
+          if (!delayed) {
+            botTurnInFlight.add(turnKey);
+            const reported = { reportedAt: new Date(now()).toISOString(), reportedSeq: outcome.seq };
+            const { waitEnded: _waitEnded, ...report } = outcome as typeof outcome & { waitEnded?: boolean };
+            const projectName = getProjectName?.(thread.projectId);
+            let settled: unknown;
+            try {
+              settled = settleBotTurn({
+                owner,
+                threadId: thread.id,
+                ...(thread.title ? { threadTitle: thread.title } : {}),
+                ...(projectName ? { projectName } : {}),
+                ...(thread.durangoWorkspace?.path ? { workspacePath: thread.durangoWorkspace.path } : {}),
+                trigger: turn.trigger,
+                ...(turn.changeId ? { changeId: turn.changeId } : {}),
+                ...(turn.surface ? { surface: turn.surface } : {}),
+                ...(turn.promptPreview ? { promptPreview: turn.promptPreview } : {}),
+                ...(turn.reportedAt ? { later: true } : {}),
+                ...report,
+              });
+            } catch (error) {
+              settled = Promise.reject(error);
+            }
+            void Promise.resolve(settled)
+              .then(
+                (result) => (result as { retry?: boolean } | undefined)?.retry !== true,
+                () => false
+              )
+              .then((delivered) => {
+                botTurnInFlight.delete(turnKey);
+                if (stopped) return;
+                if (delivered) {
+                  markBotTurnReported?.(thread.id, turn.runOffset, reported, seqBase);
+                  checkSoon(0);
+                  return;
+                }
+                later(() => check(getState().threads), retryMs);
+              });
+          }
+        }
+        if (allExaminedWithoutOutcome && !thread.pendingBotThreadTurns?.length) {
+          botTurnExamined.add(thread);
+        }
+      }
     }
   };
 
@@ -488,6 +888,20 @@ type NoticesState = {
   transcripts: Record<string, { messages: Message[] } | undefined>;
 };
 
+export type BotThreadTurnNoticeInput = {
+  owner: BotThreadOwner;
+  threadId: string;
+  threadTitle?: string;
+  projectName?: string;
+  trigger: 'person' | 'ship_button' | 'external';
+  changeId?: string;
+  surface?: string;
+  kind: 'input' | 'stuck';
+  key: string;
+  seq: number;
+  detail: string;
+};
+
 export type DurangoDispatchNoticesDeps = {
   getState: () => NoticesState;
   subscribe: (listener: (state: NoticesState, previous: NoticesState) => void) => () => void;
@@ -499,6 +913,10 @@ export type DurangoDispatchNoticesDeps = {
   runMessageId?: (runId: string) => string | undefined;
   /** Main's durango:dispatchNotice: `{ retry: true }` (or a throw) = not delivered. */
   notice: (input: DispatchNoticeInput) => Promise<unknown> | unknown;
+  /** Main's bots:threadTurnNotice for non-dispatched turns in bot-started threads. */
+  noticeBotTurn?: (input: BotThreadTurnNoticeInput) => Promise<unknown> | unknown;
+  /** Resolves a thread's project name for notice footers. */
+  getProjectName?: (projectId: string | null) => string | undefined;
   now?: () => number;
   setTimer?: (callback: () => void, ms: number) => unknown;
   clearTimer?: (timer: unknown) => void;
@@ -646,7 +1064,7 @@ const stuckText = (run: Message, quietMs: number, threadId?: string) => {
     [
       `No progress for ${minutes} minutes.`,
       step ? `The step in progress: ${stepText(step)} (what it runs is in the thread).` : 'No step is running: it is waiting on the model.',
-      words ? `Its last words so far: ${dispatchSummaryText(words, 400, threadId ? { threadId } : undefined)}` : '',
+      words ? `Its last words so far: ${dispatchSummaryText(words, 400)}` : '',
     ]
       .filter(Boolean)
       .join('\n'),
@@ -662,6 +1080,8 @@ export const startDurangoDispatchNotices = ({
   pendingInput,
   runMessageId,
   notice,
+  noticeBotTurn,
+  getProjectName,
   now = () => Date.now(),
   setTimer = (callback, ms) => setTimeout(callback, ms),
   clearTimer = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -690,14 +1110,42 @@ export const startDurangoDispatchNotices = ({
     return timer;
   };
 
-  type Live = { thread: Thread; run: Message; position: number };
+  type Live =
+    | { channel: 'dispatch'; dispatchId: string; thread: Thread; run: Message; position: number }
+    | {
+        channel: 'botTurn';
+        turnKey: string;
+        owner: BotThreadOwner;
+        turn: NonNullable<Thread['botThreadTurn']>;
+        thread: Thread;
+        run: Message;
+        position: number;
+      };
   const liveOf = (thread: Thread, transcripts: NoticesState['transcripts']): Live | null => {
-    if (!thread.durangoDispatch || thread.status !== 'running') return null;
+    if (thread.status !== 'running') return null;
     const messages = transcripts[thread.id]?.messages;
-    const live = messages ? durangoDispatchLiveRunAt(thread, messages) : null;
-    return live ? { thread, ...live } : null;
+    if (!messages) return null;
+    if (thread.durangoDispatch) {
+      const live = durangoDispatchLiveRunAt(thread, messages);
+      if (live) return { channel: 'dispatch', dispatchId: thread.durangoDispatch.id, thread, ...live };
+    }
+    if (noticeBotTurn && thread.botThreadTurn) {
+      const owner = botThreadOwner(thread);
+      const live = owner ? botThreadTurnLiveRunAt(thread, messages) : null;
+      if (owner && live) {
+        return {
+          channel: 'botTurn',
+          turnKey: `botturn:${thread.id}:${thread.botThreadTurn.seqBase ?? 0}:${thread.botThreadTurn.runOffset}`,
+          owner,
+          turn: thread.botThreadTurn,
+          thread,
+          ...live,
+        };
+      }
+    }
+    return null;
   };
-  /** Running threads a dispatch is still working for, with that run. */
+  /** Running threads a dispatch or bot-started turn is still working for, with that run. */
   const liveThreads = () => {
     const { threads, transcripts } = getState();
     const live: Live[] = [];
@@ -712,19 +1160,41 @@ export const startDurangoDispatchNotices = ({
     const thread = threads.find((candidate) => candidate.id === threadId);
     return thread ? liveOf(thread, transcripts) : null;
   };
+  const liveScopeKey = (live: Live) => (live.channel === 'dispatch' ? live.dispatchId : live.turnKey);
   const sameRun = (a: Live | null, b: Live | null) =>
-    Boolean(a && b && a.thread.durangoDispatch?.id === b.thread.durangoDispatch?.id && a.run.id === b.run.id);
+    Boolean(a && b && a.channel === b.channel && liveScopeKey(a) === liveScopeKey(b) && a.run.id === b.run.id);
 
   const send = (live: Live, kind: DispatchNoticeInput['kind'], key: string, detail: string) => {
-    const dispatchId = live.thread.durangoDispatch?.id;
-    if (!dispatchId) return;
-    const id = `${dispatchId}\n${key}`;
+    const scope = liveScopeKey(live);
+    if (!scope) return;
+    const id = `${scope}\n${key}`;
     if (sent.has(id)) return;
     sent.add(id);
     const threadId = live.thread.id;
+    const seq =
+      live.channel === 'botTurn'
+        ? botThreadTurnReportSeq(live.position, false, live.turn.seqBase ?? 0)
+        : dispatchReportSeq(live.position, false);
     let result: unknown;
     try {
-      result = notice({ dispatchId, threadId, kind, key, seq: dispatchReportSeq(live.position, false), detail });
+      if (live.channel === 'dispatch') {
+        result = notice({ dispatchId: live.dispatchId, threadId, kind, key, seq, detail });
+      } else {
+        const projectName = getProjectName?.(live.thread.projectId);
+        result = noticeBotTurn!({
+          owner: live.owner,
+          threadId,
+          ...(live.thread.title ? { threadTitle: live.thread.title } : {}),
+          ...(projectName ? { projectName } : {}),
+          trigger: live.turn.trigger,
+          ...(live.turn.changeId ? { changeId: live.turn.changeId } : {}),
+          ...(live.turn.surface ? { surface: live.turn.surface } : {}),
+          kind,
+          key,
+          seq,
+          detail,
+        });
+      }
     } catch (error) {
       result = Promise.reject(error);
     }
@@ -745,9 +1215,13 @@ export const startDurangoDispatchNotices = ({
       });
   };
 
+  const noticeThreadIdFor = (live: Live) =>
+    live.channel === 'botTurn' || isBotDispatchThread(live.thread) ? live.thread.id : undefined;
+
   // Actions the agent asked the person for (request_user_action) while it runs.
   const checkUserActions = (live: Live) => {
-    for (const action of live.thread.userActions ?? []) send(live, 'input', `action:${action.id}`, userActionText(action, live.thread.id));
+    const threadId = noticeThreadIdFor(live);
+    for (const action of live.thread.userActions ?? []) send(live, 'input', `action:${action.id}`, userActionText(action, threadId));
   };
 
   const checkStuck = (live: Live) => {
@@ -757,7 +1231,7 @@ export const startDurangoDispatchNotices = ({
     const quiet = now() - last;
     if (quiet < stuckAfterMs) return;
     // Once per quiet stretch: progress after it starts a new one.
-    send(live, 'stuck', `stuck:${run.id}:${last}`, stuckText(run, quiet, thread.id));
+    send(live, 'stuck', `stuck:${run.id}:${last}`, stuckText(run, quiet, noticeThreadIdFor(live)));
   };
 
   // Questions and approvals live in main: read them for this thread, then
@@ -781,10 +1255,11 @@ export const startDurangoDispatchNotices = ({
           const blocking = requests.filter((request) => !request.async);
           if (blocking.length) waitingOnPerson.add(threadId);
           else waitingOnPerson.delete(threadId);
+          const noticeThreadId = noticeThreadIdFor(live);
           for (const request of blocking) {
             const owner = request.runId && runMessageId ? runMessageId(request.runId) : undefined;
             if (owner !== undefined && owner !== live.run.id) continue;
-            send(live, 'input', `input:${request.requestId}`, pendingInputText(request, live.thread.id));
+            send(live, 'input', `input:${request.requestId}`, pendingInputText(request, noticeThreadId));
           }
           checkStuck(live);
         },

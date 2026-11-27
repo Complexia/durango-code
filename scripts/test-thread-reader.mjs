@@ -253,7 +253,7 @@ try {
     assert.doesNotMatch(auditPage, /\[message truncated/, 'final message under 34,000 chars is not truncated');
     assert.match(auditPage, /\[message details truncated\]/, 'huge tool activities are bounded separately from message content');
 
-    // A very long final message (> 34,000 chars) pages losslessly with char_offset.
+    // A very long final message (> 24,000 default / > 34,000 limit=1) pages losslessly with char_offset.
     const middleMarker = 'MIDDLE_FINDING_AT_35K';
     const endMarker = 'END_OF_45K_REPORT';
     const hugeFinal = `START_OF_45K_REPORT\n${'x'.repeat(34_500)}\n${middleMarker}\n${'y'.repeat(8_000)}\n${endMarker}`;
@@ -262,7 +262,8 @@ try {
       { role: 'agent', content: hugeFinal },
     ];
     await persistThread();
-    const chunk1 = await readThreadForAgent({ thread_id: thread.id });
+    // Single-message read (limit=1) gets 34,000 chars and pages to the remainder cleanly.
+    const chunk1 = await readThreadForAgent({ thread_id: thread.id, limit: 1 });
     const nextMatch = chunk1.match(/offset=(\d+), limit=1, char_offset=(\d+) to read more/);
     assert.ok(nextMatch, 'truncated long message prints exact char_offset continuation pointer');
     assert.equal(Number(nextMatch[1]), 2);
@@ -277,6 +278,35 @@ try {
     assert.ok(chunk2.includes(middleMarker), 'char_offset continuation includes middle past 34k');
     assert.ok(chunk2.includes(endMarker), 'char_offset continuation reaches end of message');
     assert.match(chunk2, /end of message\.\)/);
+
+    // Context eviction protection: 2-message thread with 4,500-char user prompt + 24,000-char
+    // final reply + 20 huge tool activities keeps Message 1/2 (user prompt) without evicting it.
+    thread.messages = [
+      { role: 'user', content: `USER_PROMPT_MARKER\n${'u'.repeat(4_500)}` },
+      {
+        role: 'agent',
+        content: `FINAL_24K_START\n${'f'.repeat(23_500)}\nFINAL_24K_END`,
+        activities: Array.from({ length: 20 }, (_, i) => ({
+          title: `Tool ${i + 1}`,
+          input: '🚀'.repeat(1_000),
+          output: '🚀'.repeat(2_000),
+        })),
+      },
+    ];
+    await persistThread();
+    const nonEvicted = await readThreadForAgent({ thread_id: thread.id });
+    assert.match(nonEvicted, /Showing messages 1–2 of 2/, 'user prompt is not evicted by final message details');
+    assert.ok(nonEvicted.includes('USER_PROMPT_MARKER'));
+    assert.ok(nonEvicted.includes('FINAL_24K_END'));
+    assert.equal(nonEvicted.isWellFormed(), true, 'emoji details truncation stays UTF-16 well-formed');
+
+    // Trailing lone low surrogate at content.length - 1 never produces an inverted char_offset range.
+    const loneLowTail = 'abc\udc00';
+    thread.messages = [{ role: 'agent', content: loneLowTail }];
+    await persistThread();
+    const loneLowPage = await readThreadForAgent({ thread_id: thread.id, offset: 1, limit: 1, char_offset: 4 });
+    assert.match(loneLowPage, /past the end of message 1/);
+    assert.doesNotMatch(loneLowPage, /5–4/);
 
     // Non-final long message: truncated at 6,000 on multi-message page with pointer,
     // and readable in full via offset + limit=1.

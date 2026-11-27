@@ -926,14 +926,18 @@ export const createDispatchWorker = ({
       if (entry.settled && running.get(dispatchId) !== entry) return { ok: true, skipped: true };
       entry.settled = true;
       release(entry);
+      const isBotDispatch = Boolean(entry.dispatch?.bot || entry.dispatch?.botId);
       const body =
         outcome === 'finished'
           ? {
               status: 'finished',
               ...(threadId || entry.threadId ? { codeThreadId: threadId || entry.threadId } : {}),
               summary:
-                clipMiddle(compactFileLinks(summary), DISPATCH_SUMMARY_MAX_CHARS, { threadId: threadId || entry.threadId }) ||
-                'The agent finished.',
+                clipMiddle(
+                  compactFileLinks(summary),
+                  DISPATCH_SUMMARY_MAX_CHARS,
+                  isBotDispatch ? { threadId: threadId || entry.threadId } : undefined
+                ) || 'The agent finished.',
               ...(Array.isArray(waiting) && waiting.length ? { waiting } : {}),
               ...(seq ? { reportSeq: seq } : {}),
             }

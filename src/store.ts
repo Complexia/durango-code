@@ -691,6 +691,20 @@ export type LinkedBoardTask = {
   lastStatus?: string;
 };
 
+export type BotThreadTurn = {
+  /** Agent runs the thread had before this turn started. */
+  runOffset: number;
+  /** Monotonic run-index offset added after transcript edits so `seq` never repeats. */
+  seqBase?: number;
+  trigger: 'person' | 'ship_button' | 'external';
+  changeId?: string;
+  surface?: string;
+  promptPreview?: string;
+  startedAt: string;
+  reportedAt?: string;
+  reportedSeq?: number;
+};
+
 export type Thread = {
   id: string;
   projectId: string;
@@ -732,6 +746,22 @@ export type Thread = {
   startedByBot?: string;
   /** Started by one of the person's bots (its id, stable across renames). */
   startedByBotId?: string;
+  /**
+   * Originating bot dispatch id (`bottask:…`, `localbot:…`, or cloud dispatch id).
+   * Preserved even after `durangoDispatch` is overwritten by a later follow-up.
+   */
+  startedByBotDispatchId?: string;
+  /**
+   * Latest non-bot-dispatched turn started in a bot-started thread (Ship button,
+   * person typing on desktop/web/phone/remote, or external agent/API): reported
+   * back to the starting bot's inbox when it settles and watched for
+   * NEEDS THE PERSON / LOOKS STUCK.
+   */
+  botThreadTurn?: BotThreadTurn;
+  /** Earlier unreported non-bot-dispatched turns kept until delivered (queued/offline turns). */
+  pendingBotThreadTurns?: BotThreadTurn[];
+  /** Monotonic run-index offset bumped when a message edit truncates the transcript so `seq` never repeats. */
+  botThreadTurnSeqBase?: number;
   /**
    * Set on threads imported from a Claude Code or Codex session the user ran
    * outside Orion. The session id doubles as the dedupe key for re-imports;

@@ -261,6 +261,109 @@ export const threadNoticeText = (title, kind, detail) => {
   return body ? `${head}\n\n${body}` : head;
 };
 
+const clipText = (value, max) => {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+};
+
+/**
+ * Title inside `Task: <title>` for a non-bot-dispatched turn in a bot-started
+ * thread (Ship button or the person typing in the thread). Durango's copy:
+ * chat/convex/botPolicy.ts botThreadTurnTitle.
+ */
+export const botThreadTurnTitle = (trigger, threadTitle, changeId) => {
+  const title = clipText(threadTitle, 60);
+  if (trigger === 'ship_button') {
+    const change = String(changeId ?? '').trim();
+    return title ? `Ship button — ${title}` : change ? `Ship button (${change})` : 'Ship button';
+  }
+  if (trigger === 'external') {
+    return title ? `External turn — ${title}` : 'External turn';
+  }
+  return title ? `Person in thread — ${title}` : 'Person in thread';
+};
+
+const botThreadTurnActor = (trigger, { threadTitle, changeId, surface } = {}) => {
+  const title = clipText(threadTitle, 120) || 'Durango Code thread';
+  if (trigger === 'ship_button') {
+    const change = String(changeId ?? '').trim();
+    return `The person tapped the Ship button${change ? ` for ${change}` : ''} in the thread "${title}" you started (not your own request).`;
+  }
+  const cleanSurface = String(surface ?? '').replace(/\s+/g, ' ').trim();
+  if (trigger === 'external') {
+    const by = cleanSurface ? ` (started by ${clipText(cleanSurface, 60)}, not your own request)` : ' (not your own request)';
+    return `Another turn ran in the thread "${title}" you started${by}.`;
+  }
+  const via = cleanSurface && cleanSurface.toLowerCase() !== 'desktop' ? ` (via ${clipText(cleanSurface, 60)})` : '';
+  return `The person sent a message directly in the thread "${title}" you started${via} (not your own request).`;
+};
+
+/**
+ * Report body for a non-bot-dispatched turn in a bot-started thread.
+ * Durango's copy: chat/convex/botPolicy.ts botThreadTurnReportText.
+ */
+export const botThreadTurnReportText = ({
+  trigger,
+  status,
+  report,
+  threadTitle,
+  changeId,
+  surface,
+  promptPreview,
+  waiting = [],
+  later = false,
+} = {}) => {
+  const stillWaiting = status === 'done' && Array.isArray(waiting) && waiting.length > 0;
+  const actor = botThreadTurnActor(trigger, { threadTitle, changeId, surface });
+  const preview = trigger !== 'ship_button' ? clipText(promptPreview, 240) : '';
+  const asked = preview ? `\n${trigger === 'external' ? 'What it asked' : 'What they asked'}: "${preview}"` : '';
+  const verb = status === 'done' ? 'finished' : 'failed';
+  const header = stillWaiting
+    ? `${actor} That turn isn't finished yet: the thread ended a turn but is still working in the background.${asked}\nIts update:`
+    : later
+      ? `${actor} The thread reported again after its earlier update: it has now ${verb}.${asked}\nIts report:`
+      : `${actor} That turn ${verb}.${asked}\nIts report:`;
+  const body = threadReportText({
+    summary: String(report ?? '').trim() || 'The thread finished without a written summary.',
+    waiting: stillWaiting ? waiting : [],
+  });
+  return `${header}\n\n${body}`;
+};
+
+/**
+ * Notice body while a person-, Ship-button-, or externally-started turn in a
+ * bot-started thread still runs and needs the person or looks stuck.
+ * Durango's copy: chat/convex/botPolicy.ts botThreadTurnNoticeText.
+ */
+export const botThreadTurnNoticeText = ({ trigger, kind, detail, threadTitle, changeId, surface } = {}) => {
+  const title = clipText(threadTitle, 120) || 'Durango Code thread';
+  const cleanSurface = String(surface ?? '').replace(/\s+/g, ' ').trim();
+  const via = cleanSurface && cleanSurface.toLowerCase() !== 'desktop' ? ` (via ${clipText(cleanSurface, 60)})` : '';
+  const change = String(changeId ?? '').trim();
+  const from =
+    trigger === 'ship_button'
+      ? `the person's Ship button${change ? ` for ${change}` : ''}`
+      : trigger === 'external'
+        ? (cleanSurface ? `an external turn started by ${clipText(cleanSurface, 60)}` : 'an external turn')
+        : `a message the person sent in the thread${via}`;
+  const head =
+    kind === 'input'
+      ? `NEEDS THE PERSON: the thread "${title}" (from ${from}, not your own request) is blocked: its thread is waiting for the person and does nothing until they answer. Tell the person now, in your reply, what it's waiting for; they answer it in that thread in Durango Code, or tell you. For a request with an id (ua_…), when they tell you they did it, mark it done yourself with answer_thread_request (answer "done"; "reply" with what they said otherwise). This isn't its report: it reports when its work ends.`
+      : `LOOKS STUCK: the thread "${title}" (from ${from}, not your own request) is still running but has shown no progress for a while, and it isn't waiting on anything it started itself (a command, a subagent, a background wait). Check before you assume it hung (read the thread, or send it a message), and tell the person if it needs them. This isn't its report.`;
+  const body = String(detail ?? '').trim();
+  return body ? `${head}\n\n${body}` : head;
+};
+
+export const botThreadTurnMessageId = (threadId, seq) => {
+  const safe = String(threadId ?? '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 80) || 'thread';
+  return `btt_${safe}_${seq}`;
+};
+
+export const botThreadTurnNoticeId = (threadId, key) => {
+  const safe = String(threadId ?? '').trim().replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 80) || 'thread';
+  return `btt_${safe}_n_${key}`;
+};
+
 const MAX_LISTED = 40;
 const MAX_MODELS_LISTED = 200;
 
@@ -302,7 +405,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'read_thread',
     description:
-      "Read a Durango Code thread's transcript (by id from list_threads or a task report): what was asked, what the agent did, changed files and its final answer, plus `needsYou`: the \"Needs you\" requests it waits on the person for. Returns the newest page by default (with the final message in full up to 34,000 chars). Pass offset/limit to browse earlier messages, or offset + limit=1 + char_offset to read the rest of a very long message.",
+      "Read a Durango Code thread's transcript (by id from list_threads or a task report): what was asked, what the agent did, changed files and its final answer, plus `needsYou`: the \"Needs you\" requests it waits on the person for. Returns the newest page by default (with the final message up to 24,000 chars). Pass limit=1 to fetch only the final message (up to 34,000 chars), offset/limit to browse earlier messages, or offset + limit=1 + char_offset to read the rest of a very long message.",
     inputSchema: {
       type: 'object',
       properties: {

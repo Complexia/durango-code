@@ -5151,13 +5151,15 @@ const botTaskReportRefs = async ({ threadId, workspacePath }) => {
 const withReportRefs = async (input) => {
   const summary = typeof input?.summary === 'string' ? input.summary : undefined;
   if (input?.outcome !== 'finished') return summary;
-  const refs = await botTaskReportRefs({ threadId: input?.threadId, workspacePath: input?.workspacePath }).catch(() => '');
-  const compacted = compactFileLinks(summary?.trim() || 'The thread finished without a written summary.', {
+  const compacted = compactFileLinks(summary?.trim() || '', {
     rootPath: input?.workspacePath,
   });
-  // The thread's words are clipped first, so the refs (and the thread footer
-  // reportBotTaskThread adds after them, within its 10,000-character clip) survive.
-  return refs ? `${clipMiddle(compacted, 9_000, { threadId: input?.threadId })}${refs}` : summary;
+  const refs = await botTaskReportRefs({ threadId: input?.threadId, workspacePath: input?.workspacePath }).catch(() => '');
+  if (!refs) return compacted || summary;
+  // Reserve room for refs inside reportBotTaskThread's 10,000-char ceiling so the
+  // report is never double-clipped with two conflicting middle-trimmed markers.
+  const bodyBudget = Math.max(4_000, Math.min(9_000, 10_000 - refs.length));
+  return `${clipMiddle(compacted || 'The thread finished without a written summary.', bodyBudget, { threadId: input?.threadId })}${refs}`;
 };
 
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
@@ -5238,6 +5240,217 @@ ipcMain.handle('durango:dispatchNotice', async (_event, input) => {
     return localBots.threadNotice({ key: dispatchId.slice(LOCAL_BOT_DISPATCH_PREFIX.length), threadId, kind, noticeKey: key, seq, detail });
   }
   return dispatchWorker.notice({ dispatchId, threadId, kind, key, seq, detail });
+});
+
+const botOwnerRefs = (owner) => {
+  const botId = typeof owner?.botId === 'string' && owner.botId.trim() ? owner.botId.trim().slice(0, 128) : undefined;
+  const botName = typeof owner?.botName === 'string' && owner.botName.trim() ? owner.botName.trim().slice(0, 80) : undefined;
+  const origin = typeof owner?.originDispatchId === 'string' ? owner.originDispatchId.trim() : '';
+  const taskId = origin.startsWith(BOT_TASK_DISPATCH_PREFIX)
+    ? origin.slice(BOT_TASK_DISPATCH_PREFIX.length).slice(0, 128)
+    : undefined;
+  const dispatchId =
+    origin && !origin.startsWith(BOT_TASK_DISPATCH_PREFIX) && !origin.startsWith(LOCAL_BOT_DISPATCH_PREFIX)
+      ? origin.slice(0, 128)
+      : undefined;
+  return {
+    ...(botId ? { botId } : {}),
+    ...(botName ? { botName } : {}),
+    ...(taskId ? { taskId } : {}),
+    ...(dispatchId ? { dispatchId } : {}),
+  };
+};
+
+// Reports a non-bot-dispatched turn (Ship button or person typing on any
+// surface) in a bot-started thread back to that bot's inbox on Durango.
+const reportBotThreadTurn = async (input) => {
+  const machineId = await getDurangoDeviceId().catch(() => null);
+  const refs = botOwnerRefs(input?.owner);
+  if (!machineId || (!refs.botId && !refs.taskId && !refs.dispatchId && !refs.botName)) {
+    return { ok: false, retry: !machineId };
+  }
+  const machineName = await getDispatchMachineName().catch(() => null);
+  const body = {
+    machineId,
+    ...refs,
+    threadId: input.threadId,
+    ...(typeof input.threadTitle === 'string' && input.threadTitle.trim() ? { threadTitle: input.threadTitle.trim().slice(0, 200) } : {}),
+    ...(typeof input.projectName === 'string' && input.projectName.trim() ? { project: input.projectName.trim().slice(0, 120) } : {}),
+    ...(machineName ? { machineName } : {}),
+    trigger: input.trigger,
+    ...(typeof input.changeId === 'string' && input.changeId.trim() ? { changeId: input.changeId.trim().slice(0, 64) } : {}),
+    ...(typeof input.surface === 'string' && input.surface.trim() ? { surface: input.surface.trim().slice(0, 80) } : {}),
+    ...(typeof input.promptPreview === 'string' && input.promptPreview.trim() ? { promptPreview: input.promptPreview.trim().slice(0, 300) } : {}),
+    outcome: input.outcome,
+    ...(input.summary ? { summary: clipMiddle(compactFileLinks(String(input.summary).trim()), 10_000, { threadId: input.threadId }) } : {}),
+    ...(input.error ? { error: clipMiddle(String(input.error).trim(), 10_000, { threadId: input.threadId }) } : {}),
+    ...(input.waiting?.length ? { waiting: input.waiting } : {}),
+    ...(input.later === true ? { later: true } : {}),
+    seq: input.seq,
+  };
+  for (const delay of [0, 2_000, 10_000, 30_000]) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try {
+      return await durangoClient.reportBotThreadTurn(body);
+    } catch (failure) {
+      console.warn('[durango bots] reporting a bot thread turn failed:', failure?.message ?? failure);
+      if (
+        failure instanceof DurangoError &&
+        failure.code === 'api' &&
+        failure.status &&
+        failure.status < 500 &&
+        failure.status !== 429 &&
+        failure.status !== 408
+      ) {
+        return { ok: false };
+      }
+    }
+  }
+  return { ok: false, retry: true };
+};
+
+const sendBotThreadTurnNotice = async (input) => {
+  const machineId = await getDurangoDeviceId().catch(() => null);
+  const refs = botOwnerRefs(input?.owner);
+  if (!machineId || (!refs.botId && !refs.taskId && !refs.dispatchId && !refs.botName)) {
+    return { ok: false, retry: !machineId };
+  }
+  const machineName = await getDispatchMachineName().catch(() => null);
+  const body = {
+    machineId,
+    ...refs,
+    threadId: input.threadId,
+    ...(typeof input.threadTitle === 'string' && input.threadTitle.trim() ? { threadTitle: input.threadTitle.trim().slice(0, 200) } : {}),
+    ...(typeof input.projectName === 'string' && input.projectName.trim() ? { project: input.projectName.trim().slice(0, 120) } : {}),
+    ...(machineName ? { machineName } : {}),
+    trigger: input.trigger,
+    ...(typeof input.changeId === 'string' && input.changeId.trim() ? { changeId: input.changeId.trim().slice(0, 64) } : {}),
+    ...(typeof input.surface === 'string' && input.surface.trim() ? { surface: input.surface.trim().slice(0, 80) } : {}),
+    notice: { kind: input.kind, key: input.key, seq: input.seq, detail: clipMiddle(String(input.detail ?? '').trim(), 3_000, { threadId: input.threadId }) },
+  };
+  try {
+    return await durangoClient.noticeBotThreadTurn(body);
+  } catch (failure) {
+    console.warn('[durango bots] a bot thread turn notice failed:', failure?.message ?? failure);
+    if (
+      failure instanceof DurangoError &&
+      failure.code === 'api' &&
+      failure.status &&
+      failure.status < 500 &&
+      failure.status !== 429 &&
+      failure.status !== 408
+    ) {
+      return { ok: false };
+    }
+    return { ok: false, retry: true };
+  }
+};
+
+// When a thread started by a signed-out local bot settles right after sign-in,
+// wait for the async local-bot upload (syncLocalBotsToDurango) so Convex has
+// its `localImportId` before we post; if unsynced local data remains, defer.
+const waitForLocalBotSyncBeforeDurangoReport = async (owner) => {
+  const isLocalOwned = owner?.mode === 'local' || (typeof owner?.botId === 'string' && owner.botId.trim().startsWith('lb'));
+  if (!isLocalOwned) return { ready: true };
+  if (localBotsSync) await localBotsSync.catch(() => {});
+  if (await localBots.hasDataToSync().catch(() => false)) {
+    void syncLocalBotsToDurango();
+    return { ready: false };
+  }
+  return { ready: true };
+};
+
+ipcMain.handle('bots:threadTurnSettled', async (_event, input) => {
+  const threadId = typeof input?.threadId === 'string' ? input.threadId.trim() : '';
+  const trigger = input?.trigger === 'ship_button' || input?.trigger === 'person' || input?.trigger === 'external' ? input.trigger : null;
+  const seq = dispatchSeq(input);
+  if (!threadId || !trigger || seq === undefined) return { ok: false };
+  const outcome = input?.outcome === 'finished' ? 'finished' : 'failed';
+  const summary = await withReportRefs({ ...input, outcome });
+  const waiting = dispatchWaiting({ ...input, outcome });
+  const error = typeof input?.error === 'string' ? input.error : undefined;
+  const payload = {
+    owner: input?.owner,
+    threadId,
+    threadTitle: typeof input?.threadTitle === 'string' ? input.threadTitle : undefined,
+    projectName: typeof input?.projectName === 'string' ? input.projectName : undefined,
+    trigger,
+    changeId: typeof input?.changeId === 'string' ? input.changeId : undefined,
+    surface: typeof input?.surface === 'string' ? input.surface : undefined,
+    promptPreview: typeof input?.promptPreview === 'string' ? input.promptPreview : undefined,
+    outcome,
+    summary,
+    error,
+    waiting,
+    later: input?.later === true,
+    seq,
+  };
+  if (await localBotsMode()) {
+    // Signed out: a thread owned by a Durango bot waits until sign-in; a local bot receives it here.
+    if (input?.owner?.mode === 'durango') return { ok: false, retry: true };
+    return localBots.threadTurnSettled({
+      botId: input?.owner?.botId,
+      botName: input?.owner?.botName,
+      threadId,
+      threadTitle: payload.threadTitle,
+      project: payload.projectName,
+      trigger,
+      changeId: payload.changeId,
+      surface: payload.surface,
+      promptPreview: payload.promptPreview,
+      outcome,
+      summary,
+      error,
+      waiting,
+      later: payload.later,
+      seq,
+    });
+  }
+  const syncReady = await waitForLocalBotSyncBeforeDurangoReport(input?.owner);
+  if (!syncReady.ready) return { ok: false, retry: true };
+  return reportBotThreadTurn(payload);
+});
+
+ipcMain.handle('bots:threadTurnNotice', async (_event, input) => {
+  const threadId = typeof input?.threadId === 'string' ? input.threadId.trim() : '';
+  const trigger = input?.trigger === 'ship_button' || input?.trigger === 'person' || input?.trigger === 'external' ? input.trigger : null;
+  const kind = input?.kind === 'input' || input?.kind === 'stuck' ? input.kind : null;
+  const key = typeof input?.key === 'string' ? input.key.trim().slice(0, 120) : '';
+  const seq = dispatchSeq(input);
+  const detail = typeof input?.detail === 'string' ? input.detail : '';
+  if (!threadId || !trigger || !kind || !key || seq === undefined) return { ok: false };
+  if (await localBotsMode()) {
+    if (input?.owner?.mode === 'durango') return { ok: false, retry: true };
+    return localBots.threadTurnNotice({
+      botId: input?.owner?.botId,
+      botName: input?.owner?.botName,
+      threadId,
+      threadTitle: typeof input?.threadTitle === 'string' ? input.threadTitle : undefined,
+      project: typeof input?.projectName === 'string' ? input.projectName : undefined,
+      trigger,
+      changeId: typeof input?.changeId === 'string' ? input.changeId : undefined,
+      surface: typeof input?.surface === 'string' ? input.surface : undefined,
+      kind,
+      noticeKey: key,
+      seq,
+      detail,
+    });
+  }
+  const syncReady = await waitForLocalBotSyncBeforeDurangoReport(input?.owner);
+  if (!syncReady.ready) return { ok: false, retry: true };
+  return sendBotThreadTurnNotice({
+    owner: input?.owner,
+    threadId,
+    threadTitle: typeof input?.threadTitle === 'string' ? input.threadTitle : undefined,
+    projectName: typeof input?.projectName === 'string' ? input.projectName : undefined,
+    trigger,
+    changeId: typeof input?.changeId === 'string' ? input.changeId : undefined,
+    surface: typeof input?.surface === 'string' ? input.surface : undefined,
+    kind,
+    key,
+    seq,
+    detail,
+  });
 });
 
 ipcMain.handle('app:openExternalUrl', async (_event, url) => {
@@ -6749,6 +6962,7 @@ ipcMain.handle('bots:shipChange', async (_event, input) => {
         threadId,
         prompt: `${SHIP_VIA_THREAD_MESSAGE}\n\n(The change: ${changeId}. The person confirmed shipping it with the Ship button on their bot's reply.)`,
         source: { machineId: 'durango-bot', machineName: 'Ship button' },
+        botTurnTrigger: { trigger: 'ship_button', changeId },
       },
       30_000
     ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));

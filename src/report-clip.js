@@ -10,11 +10,13 @@ const SHORT_CLOSING_MAX_CHARS = 200;
 const SUBSTANTIAL_PREV_MIN_CHARS = 300;
 const SUBSTANTIAL_PREV_RATIO = 3;
 
-const NON_COMPACT_ROOT_EXTENSIONS =
-  /\.(?:apng|avif|bmp|csv|docx?|gif|heic|ico|jpe?g|m4v|mov|mp3|mp4|ogg|pdf|png|pptx?|svg|tar|tiff?|wav|webm|webp|xlsx?|zip)$/i;
-
-const COMPACT_LINKS_TOKEN =
-  /(^|\n)[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:\n[ \t]*\2[ \t]*(?=\n|$)|$)|(`+)[^\n]*?\3|(!?)\[([^\]\n]+)\]\((?:<(file:\/\/[^>\n]+)>|(file:\/\/[^)\s]+))\)/g;
+const SOURCE_CODE_EXTENSIONS = new Set([
+  'astro', 'bash', 'c', 'cc', 'cjs', 'clj', 'cljs', 'cmake', 'conf', 'cpp', 'cs', 'css', 'cts', 'cxx',
+  'dart', 'dockerfile', 'env', 'erl', 'ex', 'exs', 'fish', 'go', 'gql', 'gradle', 'graphql', 'h', 'hpp',
+  'hs', 'ini', 'java', 'js', 'jsx', 'kt', 'kts', 'less', 'lua', 'makefile', 'mjs', 'ml', 'mts', 'nix',
+  'php', 'prisma', 'proto', 'py', 'r', 'rb', 'rs', 'sass', 'scala', 'scss', 'sh', 'sql', 'svelte', 'swift',
+  'tf', 'toml', 'ts', 'tsx', 'vue', 'yaml', 'yml', 'zig', 'zsh',
+]);
 
 const formatCharCount = (count) => String(Math.max(0, Math.round(count))).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
@@ -75,9 +77,19 @@ const normalizeRoots = (options) => {
     .sort((a, b) => b.length - a.length);
 };
 
+const isSourceCodePath = (filePath) => {
+  const base = filePath.replace(/\\/g, '/').split('/').pop() || '';
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0) return false;
+  return SOURCE_CODE_EXTENSIONS.has(base.slice(dot + 1).toLowerCase());
+};
+
 const stripMatchingRoot = (filePath, roots, hasLineRef) => {
   if (!roots.length) return filePath;
-  if (!hasLineRef && NON_COMPACT_ROOT_EXTENSIONS.test(filePath)) return filePath;
+  // Strip rootPath only for line-anchored references or unambiguous source-code files.
+  // Non-code artifacts without line refs (.png, .html, .md, .txt, .json, .tar.gz, .pdf, etc.)
+  // keep their full absolute path so attach_files still works.
+  if (!hasLineRef && !isSourceCodePath(filePath)) return filePath;
   const normalized = filePath.replace(/\\/g, '/');
   for (const root of roots) {
     if (normalized.startsWith(`${root}/`)) {
@@ -87,50 +99,224 @@ const stripMatchingRoot = (filePath, roots, hasLineRef) => {
   return filePath;
 };
 
-const labelMatchesPath = (rawLabel, fullPath, displayPath) => {
+const extractLabelLineRef = (rawLabel) => {
   const clean = rawLabel.trim().replace(/^`+|`+$/g, '').trim();
-  if (!clean) return true;
-  const baseLabel = clean
-    .replace(/\s*\((?:lines?\s*|L)\d+(?:\s*[-–]\s*L?\d+)?\)\s*$/i, '')
-    .replace(/(?::\d+(?:-\d+)?|#L?\d+(?:C\d+)?(?:-L?\d+(?:C\d+)?)?)$/i, '')
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '')
-    .toLowerCase();
-  if (!baseLabel) return true;
+  const parenMatch = /\s*\((?:lines?\s*|L)(\d+)(?:\s*[-–]\s*L?(\d+))?\)\s*$/i.exec(clean);
+  if (parenMatch) {
+    const lineRef =
+      parenMatch[2] && parenMatch[2] !== parenMatch[1] ? `:${parenMatch[1]}-${parenMatch[2]}` : `:${parenMatch[1]}`;
+    return { base: clean.slice(0, parenMatch.index).trim(), lineRef };
+  }
+  const suffixMatch = /(?::(\d+)(?:-(\d+))?|#L?(\d+)(?:C\d+)?(?:-L?(\d+)(?:C\d+)?)?)$/i.exec(clean);
+  if (suffixMatch) {
+    const start = suffixMatch[1] || suffixMatch[3];
+    const end = suffixMatch[2] || suffixMatch[4];
+    const lineRef = end && end !== start ? `:${start}-${end}` : `:${start}`;
+    return { base: clean.slice(0, suffixMatch.index).trim(), lineRef };
+  }
+  return { base: clean, lineRef: '' };
+};
+
+const labelBaseMatchesPath = (labelBase, fullPath) => {
+  if (!labelBase) return true;
+  const normalizedBase = labelBase.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+  if (!normalizedBase) return true;
   const normFull = fullPath.replace(/\\/g, '/').toLowerCase();
-  const normDisplay = displayPath.replace(/\\/g, '/').toLowerCase();
   const basename = normFull.slice(normFull.lastIndexOf('/') + 1);
-  return (
-    baseLabel === basename ||
-    baseLabel === normDisplay ||
-    baseLabel === normFull ||
-    normFull.endsWith(`/${baseLabel}`)
-  );
+  return normalizedBase === basename || normalizedBase === normFull || normFull.endsWith(`/${normalizedBase}`);
+};
+
+const findClosingInlineTicks = (line, start, tickLen) => {
+  let pos = start;
+  while (pos < line.length) {
+    if (line[pos] === '`') {
+      let runEnd = pos;
+      while (runEnd < line.length && line[runEnd] === '`') runEnd += 1;
+      if (runEnd - pos === tickLen) return runEnd;
+      pos = runEnd;
+    } else {
+      pos += 1;
+    }
+  }
+  return -1;
+};
+
+const findClosingBracket = (line, openPos) => {
+  let depth = 0;
+  let pos = openPos;
+  while (pos < line.length) {
+    const ch = line[pos];
+    if (ch === '\\' && pos + 1 < line.length) {
+      pos += 2;
+      continue;
+    }
+    if (ch === '`') {
+      let runEnd = pos;
+      while (runEnd < line.length && line[runEnd] === '`') runEnd += 1;
+      const close = findClosingInlineTicks(line, runEnd, runEnd - pos);
+      pos = close >= 0 ? close : runEnd;
+      continue;
+    }
+    if (ch === '[') {
+      depth += 1;
+    } else if (ch === ']') {
+      depth -= 1;
+      if (depth === 0) return pos;
+    }
+    pos += 1;
+  }
+  return -1;
+};
+
+const parseLinkDestination = (line, openParenPos) => {
+  let pos = openParenPos + 1;
+  if (pos >= line.length) return null;
+  if (line[pos] === '<') {
+    const closeAngle = line.indexOf('>', pos + 1);
+    if (closeAngle < 0 || line[closeAngle + 1] !== ')') return null;
+    return { rawUrl: line.slice(pos + 1, closeAngle), endPos: closeAngle + 2 };
+  }
+  let parenDepth = 0;
+  const urlStart = pos;
+  while (pos < line.length) {
+    const ch = line[pos];
+    if (ch === '\\' && pos + 1 < line.length) {
+      pos += 2;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t') return null;
+    if (ch === '(') {
+      parenDepth += 1;
+    } else if (ch === ')') {
+      if (parenDepth === 0) {
+        return { rawUrl: line.slice(urlStart, pos), endPos: pos + 1 };
+      }
+      parenDepth -= 1;
+    }
+    pos += 1;
+  }
+  return null;
+};
+
+const compactLineFileLinks = (line, roots) => {
+  if (!line.includes('file://')) return line;
+  let out = '';
+  let i = 0;
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === '\\' && i + 1 < line.length) {
+      out += line.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (ch === '`') {
+      let runEnd = i;
+      while (runEnd < line.length && line[runEnd] === '`') runEnd += 1;
+      const close = findClosingInlineTicks(line, runEnd, runEnd - i);
+      const end = close >= 0 ? close : runEnd;
+      out += line.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === '!' && line[i + 1] === '[') {
+      const closeBracket = findClosingBracket(line, i + 1);
+      if (closeBracket >= 0 && line[closeBracket + 1] === '(') {
+        const dest = parseLinkDestination(line, closeBracket + 1);
+        if (dest) {
+          out += line.slice(i, dest.endPos);
+          i = dest.endPos;
+          continue;
+        }
+      }
+      out += '!';
+      i += 1;
+      continue;
+    }
+    if (ch === '[') {
+      const closeBracket = findClosingBracket(line, i);
+      if (closeBracket > i + 1 && line[closeBracket + 1] === '(') {
+        const dest = parseLinkDestination(line, closeBracket + 1);
+        if (dest) {
+          const decoded = decodeFileUrl(dest.rawUrl);
+          if (decoded) {
+            const label = line.slice(i + 1, closeBracket);
+            const { base: labelBase, lineRef: labelLineRef } = extractLabelLineRef(label);
+            const matchesPath = labelBaseMatchesPath(labelBase, decoded.filePath);
+            const urlSuffix = formatLineFragment(decoded.fragment);
+            const suffix = urlSuffix || (matchesPath ? labelLineRef : '');
+            const hasLineRef = suffix.startsWith(':');
+            const pathPart = stripMatchingRoot(decoded.filePath, roots, hasLineRef);
+            const ref = `${pathPart}${suffix}`;
+            out += matchesPath ? ref : `${label} (${ref})`;
+            i = dest.endPos;
+            continue;
+          }
+        }
+      }
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+};
+
+const quoteInfoOf = (line) => {
+  const match = /^([ \t]*(?:>[ \t]?)*)(.*)$/.exec(line);
+  const prefix = match ? match[1] : '';
+  let depth = 0;
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (prefix[i] === '>') depth += 1;
+  }
+  return { depth, rest: match ? match[2] : line };
+};
+
+const isClosingFence = (rest, char, minLen) => {
+  const trimmed = rest.trim();
+  if (trimmed.length < minLen) return false;
+  for (let i = 0; i < trimmed.length; i += 1) {
+    if (trimmed[i] !== char) return false;
+  }
+  return true;
 };
 
 /**
  * Turn verbose `file://` markdown links (e.g. `[foo.js](file:///repo/foo.js#L12-L34)`)
  * into compact plain `path:line` references so link markup doesn't eat report budgets.
- * Skips fenced code blocks, inline code spans, image embeds (`![...](file://...)`),
- * and non-`file://` URLs. Keeps descriptive labels intact and preserves full paths for
- * media/document attachments even when `rootPath`/`rootPaths` is provided.
+ * Handles balanced parentheses in paths, balanced brackets in labels, label-only line
+ * ranges, blockquoted and variable-length CommonMark code fences, inline code spans,
+ * and image embeds (`![...](file://...)`). Preserves full paths for non-code files
+ * without line references so `attach_files` still receives absolute paths.
  */
 export const compactFileLinks = (value, options = undefined) => {
   const text = String(value ?? '');
   if (!text || !text.includes('file://')) return text;
   const roots = normalizeRoots(options);
-  return text.replace(COMPACT_LINKS_TOKEN, (match, _fenceLead, fence, inlineTick, bang, label, angleUrl, bareUrl) => {
-    if (fence || inlineTick || bang === '!') return match;
-    const rawUrl = angleUrl || bareUrl;
-    if (!rawUrl) return match;
-    const decoded = decodeFileUrl(rawUrl);
-    if (!decoded) return match;
-    const suffix = formatLineFragment(decoded.fragment);
-    const hasLineRef = suffix.startsWith(':');
-    const pathPart = stripMatchingRoot(decoded.filePath, roots, hasLineRef);
-    const ref = `${pathPart}${suffix}`;
-    return labelMatchesPath(label, decoded.filePath, pathPart) ? ref : `${label} (${ref})`;
-  });
+  const parts = text.split(/(\r?\n)/);
+  let fence = null;
+  for (let idx = 0; idx < parts.length; idx += 2) {
+    const line = parts[idx];
+    const { depth, rest } = quoteInfoOf(line);
+    if (fence) {
+      if (depth < fence.depth) {
+        fence = null;
+      } else {
+        if (depth === fence.depth && isClosingFence(rest, fence.char, fence.len)) {
+          fence = null;
+        }
+        continue;
+      }
+    }
+    const openMatch = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(rest);
+    if (openMatch) {
+      const fenceChar = openMatch[1][0];
+      if (fenceChar !== '`' || !openMatch[2].includes('`')) {
+        fence = { depth, char: fenceChar, len: openMatch[1].length };
+        continue;
+      }
+    }
+    parts[idx] = compactLineFileLinks(line, roots);
+  }
+  return parts.join('');
 };
 
 const trimLoneTrailingHighSurrogate = (value) => {

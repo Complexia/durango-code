@@ -11,11 +11,16 @@ export const READ_THREAD_MAX_LIMIT = 200;
 // Per-message and whole-reply caps so one giant transcript page can't blow
 // out the calling model's context. Dropped content is always announced.
 const MAX_MESSAGE_CONTENT_CHARS = 6000;
-// The newest message of a thread or a single-message read (limit=1 / char_offset)
-// gets a generous content budget so long final reports arrive intact in one call,
-// and messages longer than that can be paged through with char_offset.
-const MAX_FULL_MESSAGE_CONTENT_CHARS = 34_000;
+// Default multi-message read gives the newest message up to 24,000 chars (enough
+// for full audit reports without evicting the user prompt on short threads);
+// explicit single-message reads (limit=1 / char_offset) get 34,000 chars per page.
+const MAX_FINAL_MESSAGE_CONTENT_CHARS = 24_000;
+const MAX_SINGLE_MESSAGE_CONTENT_CHARS = 34_000;
 const MAX_MESSAGE_DETAILS_CHARS = 10_000;
+// When a message's text content is already large, shrink its tool/metadata details
+// so tool logs don't evict earlier messages or bloat bot sessions.
+const LARGE_CONTENT_DETAILS_THRESHOLD = 12_000;
+const MAX_LARGE_CONTENT_DETAILS_CHARS = 2_000;
 const MAX_OUTPUT_CHARS = 48_000;
 const MAX_ACTIVITIES_SHOWN = 12;
 const MAX_ACTIVITY_INPUT_CHARS = 2000;
@@ -25,6 +30,22 @@ const MAX_ATTACHMENTS_SHOWN = 20;
 const MAX_CHANGED_FILES_SHOWN = 50;
 
 const formatCharCount = (count) => String(Math.max(0, Math.round(count))).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+
+const isHighSurrogate = (code) => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code) => code >= 0xdc00 && code <= 0xdfff;
+
+/** Slice `[start, end)` without splitting a UTF-16 surrogate pair at either edge. */
+const sliceSafe = (text, start, end) => {
+  let safeStart = Math.max(0, Math.min(start, text.length));
+  let safeEnd = Math.max(safeStart, Math.min(end, text.length));
+  if (safeStart > 0 && safeStart < text.length && isLowSurrogate(text.charCodeAt(safeStart))) {
+    safeStart += 1;
+  }
+  if (safeEnd < text.length && safeEnd > safeStart && isHighSurrogate(text.charCodeAt(safeEnd - 1))) {
+    safeEnd -= 1;
+  }
+  return safeStart >= safeEnd ? '' : text.slice(safeStart, safeEnd);
+};
 
 const readJson = async (filePath) => {
   try {
@@ -57,45 +78,51 @@ const matchThreads = (threads, rawId) => {
 
 const truncate = (value, max) => {
   const text = String(value ?? '');
-  return text.length > max ? `${text.slice(0, max)}…` : text;
+  return text.length > max ? `${sliceSafe(text, 0, max)}…` : text;
 };
 
 const truncateBlock = (value, max, label) => {
   const text = String(value ?? '').trim();
   if (text.length <= max) return text;
-  return `${text.slice(0, max)}\n…[${label} truncated]`;
+  return `${sliceSafe(text, 0, max)}\n…[${label} truncated]`;
 };
 
 const indentBlock = (value) => value.split('\n').map((line) => `    ${line}`).join('\n');
 
-const formatMessage = (message, index, total, { toolCall = 'read_thread', fullContent = false, charOffset = 1 } = {}) => {
+const formatMessage = (
+  message,
+  index,
+  total,
+  { toolCall = 'read_thread', contentBudget = MAX_MESSAGE_CONTENT_CHARS, detailsBudget = MAX_MESSAGE_DETAILS_CHARS, charOffset = 1 } = {}
+) => {
   const role = message.role === 'user' ? 'User' : message.role === 'agent' ? 'Agent' : 'System';
   const status =
     typeof message.status === 'string' && message.status !== 'done' ? ` [${message.status}]` : '';
   const lines = [`### Message ${index + 1}/${total} — ${role}${message.ts ? ` (${message.ts})` : ''}${status}`];
   const content = typeof message.content === 'string' ? message.content.trim() : '';
   const startChar = Number.isInteger(charOffset) && charOffset > 1 ? charOffset - 1 : 0;
-  const contentBudget = fullContent ? MAX_FULL_MESSAGE_CONTENT_CHARS : MAX_MESSAGE_CONTENT_CHARS;
+  let shownContentChars = 0;
   if (content) {
-    if (startChar >= content.length) {
+    let safeStart = startChar;
+    if (safeStart > 0 && safeStart < content.length && isLowSurrogate(content.charCodeAt(safeStart))) {
+      safeStart += 1;
+    }
+    if (safeStart >= content.length) {
       lines.push(
         `Requested char_offset ${charOffset} is past the end of message ${index + 1} (${formatCharCount(content.length)} chars).`
       );
-    } else if (startChar > 0 || content.length > contentBudget) {
-      let safeStart = startChar;
-      if (safeStart > 0 && content.charCodeAt(safeStart) >= 0xdc00 && content.charCodeAt(safeStart) <= 0xdfff) {
-        safeStart += 1;
-      }
-      let endChar = Math.min(content.length, safeStart + contentBudget);
+    } else if (safeStart > 0 || content.length > contentBudget) {
+      let endChar = Math.min(content.length, safeStart + Math.max(1, contentBudget));
       if (
         endChar < content.length &&
         endChar > safeStart + 1 &&
-        content.charCodeAt(endChar - 1) >= 0xd800 &&
-        content.charCodeAt(endChar - 1) <= 0xdbff
+        isHighSurrogate(content.charCodeAt(endChar - 1))
       ) {
         endChar -= 1;
       }
-      lines.push(content.slice(safeStart, endChar));
+      const chunk = content.slice(safeStart, endChar);
+      shownContentChars = chunk.length;
+      lines.push(chunk);
       if (endChar < content.length) {
         lines.push(
           `…[message truncated: showing chars ${formatCharCount(safeStart + 1)}–${formatCharCount(endChar)} of ${formatCharCount(content.length)} — call ${toolCall} with offset=${index + 1}, limit=1, char_offset=${endChar + 1} to read more]`
@@ -106,13 +133,14 @@ const formatMessage = (message, index, total, { toolCall = 'read_thread', fullCo
         );
       }
     } else {
+      shownContentChars = content.length;
       lines.push(content);
     }
   } else if (startChar > 0) {
     lines.push(`Message ${index + 1} has no text content (requested char_offset ${charOffset}).`);
   }
   const detailLines = [];
-  if (startChar === 0) {
+  if (startChar === 0 && detailsBudget > 0) {
     const linkedTasks = Array.isArray(message.linkedTasks) ? message.linkedTasks : [];
     if (linkedTasks.length > 0) {
       detailLines.push(`Linked board ${linkedTasks.length === 1 ? 'task' : `tasks (${linkedTasks.length})`}:`);
@@ -171,11 +199,16 @@ const formatMessage = (message, index, total, { toolCall = 'read_thread', fullCo
   }
   if (detailLines.length > 0) {
     const details = detailLines.join('\n');
-    if (details.length <= MAX_MESSAGE_DETAILS_CHARS) {
+    const effectiveDetailsBudget =
+      shownContentChars > LARGE_CONTENT_DETAILS_THRESHOLD
+        ? Math.min(detailsBudget, MAX_LARGE_CONTENT_DETAILS_CHARS)
+        : detailsBudget;
+    if (details.length <= effectiveDetailsBudget) {
       lines.push(details);
     } else {
       const notice = '\n…[message details truncated]';
-      lines.push(`${details.slice(0, MAX_MESSAGE_DETAILS_CHARS - notice.length)}${notice}`);
+      const keep = Math.max(0, effectiveDetailsBudget - notice.length);
+      lines.push(`${sliceSafe(details, 0, keep)}${notice}`);
     }
   }
   if (lines.length === 1) lines.push('(empty message)');
@@ -338,13 +371,18 @@ export const formatThreadForAgent = (
 
   const page = messages.slice(startIndex, startIndex + limit);
 
+  const singleRequested = limit === 1;
+  const contentBudgetFor = (absIndex) => {
+    if (singleRequested || pagingSingleMessage) return MAX_SINGLE_MESSAGE_CONTENT_CHARS;
+    if (absIndex === total - 1) return MAX_FINAL_MESSAGE_CONTENT_CHARS;
+    return MAX_MESSAGE_CONTENT_CHARS;
+  };
   const formatted = page.map((message, index) => {
     const absIndex = startIndex + index;
-    const isFinalMessage = absIndex === total - 1;
-    const singleRequested = limit === 1;
     return formatMessage(message, absIndex, total, {
       toolCall,
-      fullContent: singleRequested || isFinalMessage,
+      contentBudget: contentBudgetFor(absIndex),
+      detailsBudget: MAX_MESSAGE_DETAILS_CHARS,
       charOffset: pagingSingleMessage ? charOffset : 1,
     });
   });
@@ -381,16 +419,49 @@ export const formatThreadForAgent = (
     prefix = buildReplyPrefix(shownCount);
   }
   const shownEntries = formatted.slice(dropped);
-  if (prefix.length + bodyLength > MAX_OUTPUT_CHARS) {
-    const notice = '\n…[message truncated to fit reply budget]';
-    const keep = Math.max(0, MAX_OUTPUT_CHARS - prefix.length - notice.length);
-    shownEntries[0] = `${shownEntries[0].slice(0, keep)}${notice}`;
+  if (prefix.length + bodyLength > MAX_OUTPUT_CHARS && shownEntries.length === 1) {
+    // Re-format the single remaining message with tighter details/content budgets
+    // so truncation pointers and surrogate pairs stay intact instead of slicing the tail off.
+    const absIndex = startIndex + dropped;
+    const message = page[dropped];
+    const available = Math.max(0, MAX_OUTPUT_CHARS - prefix.length);
+    const withoutDetails = formatMessage(message, absIndex, total, {
+      toolCall,
+      contentBudget: contentBudgetFor(absIndex),
+      detailsBudget: 0,
+      charOffset: pagingSingleMessage ? charOffset : 1,
+    });
+    if (withoutDetails.length <= available) {
+      const remainingForDetails = available - withoutDetails.length - 1;
+      shownEntries[0] =
+        remainingForDetails >= 120
+          ? formatMessage(message, absIndex, total, {
+              toolCall,
+              contentBudget: contentBudgetFor(absIndex),
+              detailsBudget: remainingForDetails,
+              charOffset: pagingSingleMessage ? charOffset : 1,
+            })
+          : withoutDetails;
+    } else {
+      const tightenedContent = Math.max(200, available - 300);
+      shownEntries[0] = formatMessage(message, absIndex, total, {
+        toolCall,
+        contentBudget: tightenedContent,
+        detailsBudget: 0,
+        charOffset: pagingSingleMessage ? charOffset : 1,
+      });
+    }
+    if (prefix.length + shownEntries[0].length > MAX_OUTPUT_CHARS) {
+      const notice = '\n…[message truncated to fit reply budget]';
+      const keep = Math.max(0, MAX_OUTPUT_CHARS - prefix.length - notice.length);
+      shownEntries[0] = `${sliceSafe(shownEntries[0], 0, keep)}${notice}`;
+    }
   }
   const reply = `${prefix}${shownEntries.join('\n\n')}`;
   // Defensive final cap for unexpectedly large thread metadata in the header.
   if (reply.length > MAX_OUTPUT_CHARS) {
     const notice = '\n…[reply truncated to fit reply budget]';
-    return `${reply.slice(0, MAX_OUTPUT_CHARS - notice.length)}${notice}`;
+    return `${sliceSafe(reply, 0, Math.max(0, MAX_OUTPUT_CHARS - notice.length))}${notice}`;
   }
   return reply;
 };
