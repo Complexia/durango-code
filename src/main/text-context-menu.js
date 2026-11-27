@@ -7,6 +7,8 @@
 // Elements with their own menu (the file tree) call preventDefault on the DOM
 // event, and Chromium then never emits 'context-menu' here.
 
+import { externalWebUrl } from './linked-navigation.js';
+
 const MAX_SUGGESTIONS = 6;
 const PREVIEW_CHARS = 24;
 
@@ -81,7 +83,7 @@ export function buildTextContextMenuTemplate(params, actions, platform = process
   return template;
 }
 
-export function attachTextContextMenu(window, { Menu, clipboard, shell, externalUrl = (url) => url }) {
+export function attachTextContextMenu(window, { Menu, clipboard, shell, externalUrl = externalWebUrl }) {
   const contents = window.webContents;
   contents.on('context-menu', (_event, params) => {
     const template = buildTextContextMenuTemplate(params, {

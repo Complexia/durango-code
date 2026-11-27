@@ -138,7 +138,7 @@ export const sanitizeTokenValue = (value) => {
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > THEME_LIMITS.tokenValue) return null;
   if (!TOKEN_VALUE_PATTERN.test(trimmed)) return null;
-  if (/url\s*\(|expression\s*\(|image-set|-webkit-image-set/i.test(trimmed)) return null;
+  if (/(?:-webkit-)?image-set\s*\(|(?:-webkit-)?cross-fade\s*\(|\b(?:url|element|src|image|expression)\s*\(/i.test(trimmed)) return null;
   // Quotes must pair up so a font name cannot swallow the rest of the rule.
   if ((trimmed.match(/'/g) ?? []).length % 2 || (trimmed.match(/"/g) ?? []).length % 2) return null;
   let depth = 0;

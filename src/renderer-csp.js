@@ -12,6 +12,10 @@
 // - `style-src 'self' 'unsafe-inline'`: required for Tailwind/React inline
 //   styles, Monaco dynamic stylesheets, and theme `<style>` injection; blocks
 //   remote stylesheets as defense in depth behind `sanitizeThemeCss`.
+// - `img-src` / `media-src`: allows app-local, `data:`, `blob:`,
+//   `orion-attachment:`, `orion-source-attachment:`, and `https:` (avatars,
+//   community theme previews, bot files, HTTPS Markdown media). Cleartext
+//   `http:` is excluded in production to block LAN/localhost/metadata probing.
 // - `worker-src 'self' blob:`: Shiki syntax-highlight module worker (`'self'`)
 //   and Monaco workers (`'self'` / `blob:`).
 // - `frame-src 'self' orion-attachment:`: `about:srcdoc` visuals/theme scenes
@@ -22,30 +26,49 @@
 
 const DEV_CONNECT_FALLBACK = [
   'http://localhost:*',
+  'https://localhost:*',
   'http://127.0.0.1:*',
+  'https://127.0.0.1:*',
+  'http://[::1]:*',
+  'https://[::1]:*',
   'ws://localhost:*',
+  'wss://localhost:*',
   'ws://127.0.0.1:*',
+  'wss://127.0.0.1:*',
+  'ws://[::1]:*',
+  'wss://[::1]:*',
 ];
 
-const devConnectOrigins = (devServerUrl) => {
-  if (!devServerUrl) return [];
-  try {
-    const parsed = new URL(String(devServerUrl));
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return [];
-    const wsProtocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
-    return [parsed.origin, `${wsProtocol}//${parsed.host}`];
-  } catch {
-    return [];
+const devConnectOrigins = (input) => {
+  const urls = Array.isArray(input) ? input : input ? [input] : [];
+  const origins = new Set();
+  for (const raw of urls) {
+    if (!raw) continue;
+    try {
+      const parsed = new URL(String(raw));
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+      const wsProtocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
+      origins.add(parsed.origin);
+      origins.add(`${wsProtocol}//${parsed.host}`);
+    } catch {
+      // Ignore malformed URL entries.
+    }
   }
+  return [...origins];
 };
 
 export const buildRendererCsp = ({
   devServerUrl = null,
+  devServerUrls = null,
   devMode = false,
   includeFrameAncestors = false,
 } = {}) => {
-  const extraConnect = devServerUrl
-    ? devConnectOrigins(devServerUrl)
+  const explicitDevOrigins = devConnectOrigins([
+    ...(Array.isArray(devServerUrls) ? devServerUrls : []),
+    ...(devServerUrl ? [devServerUrl] : []),
+  ]);
+  const extraConnect = explicitDevOrigins.length
+    ? explicitDevOrigins
     : devMode
       ? DEV_CONNECT_FALLBACK
       : [];
@@ -63,8 +86,8 @@ export const buildRendererCsp = ({
     "default-src 'self'",
     "script-src 'self' 'unsafe-inline'",
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: orion-attachment: orion-source-attachment: https: http:",
-    "media-src 'self' data: blob: orion-attachment: orion-source-attachment: https: http:",
+    "img-src 'self' data: blob: orion-attachment: orion-source-attachment: https:",
+    "media-src 'self' data: blob: orion-attachment: orion-source-attachment: https:",
     "font-src 'self' data:",
     `connect-src ${connectSrc}`,
     "worker-src 'self' blob:",
@@ -85,17 +108,24 @@ export const RENDERER_CSP_PROD = buildRendererCsp();
 
 export const RENDERER_CSP_DEV = buildRendererCsp({ devMode: true });
 
+export const rewriteIndexHtmlCsp = (html, csp) =>
+  String(html).replace(
+    /(<meta\b[^>]*\bhttp-equiv\s*=\s*"Content-Security-Policy"[^>]*\bcontent\s*=\s*")[^"]*(")/i,
+    `$1${csp}$2`
+  );
+
 /**
  * Returns updated responseHeaders with the renderer CSP applied when `details`
  * is a main-frame load belonging to one of our main renderer windows, or null
  * to leave the response untouched (subframes, browser-panel guests, assets).
+ * Fails closed (returns null) if `isMainWindow` is not provided.
  */
 export const rendererCspResponseHeaders = (
   details,
   { isMainWindow, devServerUrl = null } = {}
 ) => {
   if (!details || details.resourceType !== 'mainFrame') return null;
-  if (typeof isMainWindow === 'function' && !isMainWindow(details.webContentsId)) return null;
+  if (typeof isMainWindow !== 'function' || !isMainWindow(details.webContentsId)) return null;
   const csp = buildRendererCsp({
     devServerUrl,
     includeFrameAncestors: true,

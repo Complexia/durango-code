@@ -1,5 +1,6 @@
-// Renderer security hardening checks: CSP (prod & dev), theme CSS sanitizer
-// bypasses, and external URL scheme validation. Plain Node: no Electron needed.
+// Renderer security hardening checks: CSP (prod, Vite dev HMR across IPv4/IPv6/
+// HTTPS/LAN, header scoping), theme CSS & token sanitizer bypasses, and
+// exhaustive external URL scheme validation. Plain Node: no Electron needed.
 //
 //   node --no-warnings scripts/test-renderer-security.mjs
 
@@ -13,20 +14,26 @@ import {
   buildRendererCsp,
   rendererCspResponseHeaders,
 } from '../src/renderer-csp.js';
-import { sanitizeThemeCss } from '../src/ui-themes.js';
+import { rendererDevCspPlugin } from '../vite.renderer.config.mjs';
+import { sanitizeThemeCss, sanitizeTokenValue } from '../src/ui-themes.js';
 import { externalWebUrl, openExternalWebUrl } from '../src/main/linked-navigation.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const codeRoot = path.resolve(here, '..');
 
-// --- 1. Renderer CSP (index.html + main.js headers + Vite dev HMR) ----------
+// --- 1. Renderer CSP (index.html + Vite dev plugin + main.js headers) --------
 
 const indexHtml = await fs.readFile(path.join(codeRoot, 'index.html'), 'utf8');
-const metaMatch = indexHtml.match(
-  /<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]+)"\s*\/>/i
-);
-assert.ok(metaMatch, 'code/index.html declares a Content-Security-Policy meta tag');
-assert.equal(metaMatch[1], RENDERER_CSP_PROD, 'index.html meta CSP matches RENDERER_CSP_PROD verbatim');
+const extractMetaCsp = (html) => {
+  const match = html.match(
+    /<meta\b[^>]*\bhttp-equiv\s*=\s*"Content-Security-Policy"[^>]*\bcontent\s*=\s*"([^"]+)"[^>]*\/?>/i
+  );
+  return match?.[1] ?? null;
+};
+
+const prodMetaCsp = extractMetaCsp(indexHtml);
+assert.ok(prodMetaCsp, 'code/index.html declares a Content-Security-Policy meta tag');
+assert.equal(prodMetaCsp, RENDERER_CSP_PROD, 'index.html meta CSP matches RENDERER_CSP_PROD verbatim');
 
 // Production CSP directives.
 assert.match(RENDERER_CSP_PROD, /default-src 'self'/);
@@ -38,8 +45,12 @@ assert.match(RENDERER_CSP_PROD, /img-src[^;]*orion-attachment:/);
 assert.match(RENDERER_CSP_PROD, /img-src[^;]*orion-source-attachment:/);
 assert.match(RENDERER_CSP_PROD, /img-src[^;]*data:/);
 assert.match(RENDERER_CSP_PROD, /img-src[^;]*blob:/);
+assert.match(RENDERER_CSP_PROD, /img-src[^;]*https:/);
+assert.doesNotMatch(RENDERER_CSP_PROD, /img-src[^;]*\bhttp:/, 'prod img-src blocks cleartext http:');
 assert.match(RENDERER_CSP_PROD, /media-src[^;]*orion-attachment:/);
 assert.match(RENDERER_CSP_PROD, /media-src[^;]*blob:/);
+assert.match(RENDERER_CSP_PROD, /media-src[^;]*https:/);
+assert.doesNotMatch(RENDERER_CSP_PROD, /media-src[^;]*\bhttp:/, 'prod media-src blocks cleartext http:');
 assert.match(RENDERER_CSP_PROD, /worker-src 'self' blob:/);
 assert.match(RENDERER_CSP_PROD, /frame-src 'self' orion-attachment:/);
 assert.match(RENDERER_CSP_PROD, /object-src 'none'/);
@@ -48,16 +59,49 @@ assert.match(RENDERER_CSP_PROD, /form-action 'none'/);
 assert.doesNotMatch(RENDERER_CSP_PROD, /connect-src[^;]*https?:/, 'prod renderer cannot fetch remote origins directly');
 assert.doesNotMatch(RENDERER_CSP_PROD, /connect-src[^;]*wss?:/, 'prod renderer cannot open WebSockets');
 
-// Dev-mode CSP allows Vite HMR connections without relaxing script/style/object rules.
-assert.match(RENDERER_CSP_DEV, /connect-src[^;]*ws:\/\/localhost:\*/);
-assert.match(RENDERER_CSP_DEV, /connect-src[^;]*http:\/\/localhost:\*/);
+// Dev-mode CSP fallback covers IPv4, IPv6, HTTP, and HTTPS localhost/loopback.
+for (const expectedOrigin of [
+  'http://localhost:*',
+  'https://localhost:*',
+  'http://127.0.0.1:*',
+  'http://[::1]:*',
+  'ws://localhost:*',
+  'wss://localhost:*',
+  'ws://127.0.0.1:*',
+  'ws://[::1]:*',
+]) {
+  assert.ok(RENDERER_CSP_DEV.includes(expectedOrigin), `RENDERER_CSP_DEV includes ${expectedOrigin}`);
+}
 assert.doesNotMatch(RENDERER_CSP_DEV, /unsafe-eval/);
+
+// Exercise the actual Vite transformIndexHtml plugin against real code/index.html.
+const devPlugin = rendererDevCspPlugin();
+assert.equal(
+  extractMetaCsp(devPlugin.transformIndexHtml(indexHtml, {})),
+  RENDERER_CSP_PROD,
+  'prod build leaves index.html CSP untouched'
+);
+assert.equal(
+  extractMetaCsp(devPlugin.transformIndexHtml(indexHtml, { server: {} })),
+  RENDERER_CSP_DEV,
+  'dev serve without resolvedUrls falls back to RENDERER_CSP_DEV'
+);
+const ipv6DevHtml = devPlugin.transformIndexHtml(indexHtml, {
+  server: { resolvedUrls: { local: ['http://[::1]:5173/'], network: [] } },
+});
+assert.match(extractMetaCsp(ipv6DevHtml) ?? '', /connect-src[^;]*http:\/\/\[::1\]:5173 ws:\/\/\[::1\]:5173/);
+const httpsLanDevHtml = devPlugin.transformIndexHtml(indexHtml, {
+  server: { resolvedUrls: { local: ['https://localhost:5173/'], network: ['https://192.168.1.10:5173/'] } },
+});
+const httpsLanCsp = extractMetaCsp(httpsLanDevHtml) ?? '';
+assert.match(httpsLanCsp, /connect-src[^;]*https:\/\/localhost:5173 wss:\/\/localhost:5173/);
+assert.match(httpsLanCsp, /connect-src[^;]*https:\/\/192\.168\.1\.10:5173 wss:\/\/192\.168\.1\.10:5173/);
 
 const devFromUrl = buildRendererCsp({ devServerUrl: 'http://localhost:5173', includeFrameAncestors: true });
 assert.match(devFromUrl, /connect-src[^;]*http:\/\/localhost:5173 ws:\/\/localhost:5173/);
 assert.match(devFromUrl, /frame-ancestors 'none'/);
 
-// Header injection applies ONLY to main-frame responses of tracked main windows.
+// Header injection applies ONLY to main-frame responses of tracked main windows and fails closed.
 const mainHeaders = rendererCspResponseHeaders(
   {
     resourceType: 'mainFrame',
@@ -75,6 +119,11 @@ assert.equal(
 );
 
 assert.equal(
+  rendererCspResponseHeaders({ resourceType: 'mainFrame', webContentsId: 1, responseHeaders: {} }),
+  null,
+  'fails closed when isMainWindow predicate is omitted'
+);
+assert.equal(
   rendererCspResponseHeaders(
     { resourceType: 'subFrame', webContentsId: 1, responseHeaders: {} },
     { isMainWindow: (id) => id === 1 }
@@ -91,7 +140,7 @@ assert.equal(
   'never applies renderer CSP to built-in browser WebContentsViews'
 );
 
-// --- 2. sanitizeThemeCss multi-pass & splice bypasses -----------------------
+// --- 2. sanitizeThemeCss & sanitizeTokenValue bypasses ----------------------
 
 const spliceCases = [
   '@imp@namespace;ort "https://evil.example/a.css";',
@@ -131,7 +180,26 @@ assert.doesNotMatch(nestedOut, /@import|@namespace/i, 'deeply nested splice payl
 const safeCss = '.card { background: url("data:image/png;base64,iVBORw0KGgo="); color: var(--accent); }';
 assert.equal(sanitizeThemeCss(safeCss), safeCss);
 
-// --- 3. External URL scheme validation + source audit -----------------------
+// Token values reject all CSS resource/dynamic functions (including protocol-relative paths).
+for (const badToken of [
+  'url("//evil.example/x.png")',
+  'image("//evil.example/x.png")',
+  'cross-fade("//evil.example/x.png", red)',
+  '-webkit-cross-fade("//evil.example/x.png", red)',
+  'src("//evil.example/x.png")',
+  'element(#x)',
+  'image-set("//evil.example/x.png" 1x)',
+  '-webkit-image-set("//evil.example/x.png" 1x)',
+  'expression(1)',
+]) {
+  assert.equal(sanitizeTokenValue(badToken), null, `sanitizeTokenValue blocks ${badToken}`);
+}
+assert.equal(
+  sanitizeTokenValue('linear-gradient(180deg, #141416 0%, #111113 100%)'),
+  'linear-gradient(180deg, #141416 0%, #111113 100%)'
+);
+
+// --- 3. External URL scheme validation + exhaustive source audit ------------
 
 for (const safe of ['https://durango.sh/code', 'http://127.0.0.1:8080/authorize', new URL('https://example.com/a')]) {
   assert.ok(externalWebUrl(safe), `allows safe URL: ${safe}`);
@@ -161,13 +229,44 @@ await assert.rejects(
 );
 assert.equal(openerCalls, 0);
 
-// Static check: main.js and orion-mcps.js wire CSP and never pass unvalidated URLs to shell.openExternal.
-const [mainSource, mcpsSource] = await Promise.all([
-  fs.readFile(path.join(codeRoot, 'src/main.js'), 'utf8'),
-  fs.readFile(path.join(codeRoot, 'src/main/orion-mcps.js'), 'utf8'),
-]);
-assert.match(mainSource, /attachMainWindowCsp\(mainWindow\)/);
-assert.doesNotMatch(mainSource, /shell\.openExternal\(result\.url\)/, 'provider auth URL must be validated');
-assert.doesNotMatch(mcpsSource, /shell\.openExternal\(authorizationUrl\.toString\(\)\)/, 'OAuth authorization_endpoint must be validated');
+// Exhaustive audit: every shell.openExternal( call across code/src/ must be
+// guarded by externalWebUrl, openExternalWebUrl, or the explicit macOS
+// x-apple.systempreferences: allowlist.
+const walkFiles = async (dir) => {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files = [];
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...(await walkFiles(full)));
+    else if (/\.(?:js|mjs|cjs|ts|tsx)$/.test(entry.name)) files.push(full);
+  }
+  return files;
+};
 
-console.log('Renderer security checks passed.');
+const srcFiles = await walkFiles(path.join(codeRoot, 'src'));
+let totalOpenExternalCalls = 0;
+for (const file of srcFiles) {
+  const rel = path.relative(codeRoot, file);
+  const content = await fs.readFile(file, 'utf8');
+  const lines = content.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!lines[i].includes('shell.openExternal(')) continue;
+    totalOpenExternalCalls += 1;
+    const context = lines.slice(Math.max(0, i - 6), i + 1).join('\n');
+    const isGuarded =
+      /openExternalWebUrl\(/.test(context) ||
+      /externalWebUrl\(/.test(context) ||
+      /externalUrl\(/.test(context) ||
+      /startsWith\('x-apple\.systempreferences:'\)/.test(context);
+    assert.ok(
+      isGuarded,
+      `Unvalidated shell.openExternal call at ${rel}:${i + 1}:\n${context}`
+    );
+  }
+}
+assert.ok(totalOpenExternalCalls >= 10, `expected to audit all shell.openExternal sites (found ${totalOpenExternalCalls})`);
+
+const mainSource = await fs.readFile(path.join(codeRoot, 'src/main.js'), 'utf8');
+assert.match(mainSource, /attachMainWindowCsp\(mainWindow\)/);
+
+console.log(`Renderer security checks passed (${totalOpenExternalCalls} shell.openExternal sites audited).`);

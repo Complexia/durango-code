@@ -1,17 +1,37 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { RENDERER_CSP_DEV } from './src/renderer-csp.js';
+import { buildRendererCsp, rewriteIndexHtmlCsp } from './src/renderer-csp.js';
+
+const devServerUrlsFromContext = (ctx) => {
+  const urls = [];
+  const resolved = ctx?.server?.resolvedUrls;
+  if (Array.isArray(resolved?.local)) urls.push(...resolved.local);
+  if (Array.isArray(resolved?.network)) urls.push(...resolved.network);
+  if (urls.length > 0) return urls;
+  const addr = ctx?.server?.httpServer?.address?.();
+  if (addr && typeof addr === 'object' && addr.port) {
+    const protocol = ctx?.server?.config?.server?.https ? 'https' : 'http';
+    const host =
+      addr.address === '::' || addr.address === '0.0.0.0'
+        ? 'localhost'
+        : addr.address.includes(':')
+          ? `[${addr.address}]`
+          : addr.address;
+    urls.push(`${protocol}://${host}:${addr.port}`);
+  }
+  return urls;
+};
 
 // During `vite serve`, relax only `connect-src` in the index.html meta CSP so
-// Vite HMR WebSockets work; production builds keep the strict policy verbatim.
-const rendererDevCspPlugin = () => ({
+// Vite HMR WebSockets work (including IPv6, HTTPS, and custom dev hosts);
+// production builds keep the strict policy verbatim.
+export const rendererDevCspPlugin = () => ({
   name: 'durango-renderer-dev-csp',
   transformIndexHtml(html, ctx) {
     if (!ctx?.server) return html;
-    return html.replace(
-      /(<meta\s+http-equiv="Content-Security-Policy"\s+content=")[^"]*(")/i,
-      `$1${RENDERER_CSP_DEV}$2`
-    );
+    const devServerUrls = devServerUrlsFromContext(ctx);
+    const csp = buildRendererCsp({ devServerUrls, devMode: true });
+    return rewriteIndexHtmlCsp(html, csp);
   },
 });
 

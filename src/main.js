@@ -1276,7 +1276,7 @@ const attachMainWindowCsp = (mainWindow) => {
       isMainWindow: (id) => mainWindowWebContentsIds.has(id),
       devServerUrl: MAIN_WINDOW_VITE_DEV_SERVER_URL || null,
     });
-    callback({ responseHeaders: responseHeaders ?? details.responseHeaders });
+    callback(responseHeaders ? { responseHeaders } : {});
   });
 };
 
@@ -4346,9 +4346,9 @@ ipcMain.handle('cloud:openAppInBrowser', async (_event, projectPath) => {
       token: session.token,
     });
     if (!app?.url) return { ok: false, error: 'This project has no deployed app yet.' };
-    const parsed = new URL(app.url);
-    if (parsed.protocol !== 'https:') return { ok: false, error: 'Only https URLs can be opened.' };
-    await shell.openExternal(parsed.toString());
+    const safeUrl = externalWebUrl(app.url);
+    if (!safeUrl || !safeUrl.startsWith('https://')) return { ok: false, error: 'Only https URLs can be opened.' };
+    await shell.openExternal(safeUrl);
     return { ok: true, app };
   } catch (error) {
     return { ok: false, error: cloudErrorMessage(error) };
@@ -6252,12 +6252,14 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
   const { result, completion } = await authenticateProviderTool(providerId);
   // Antigravity's sign-in waits for a code the user pastes from the page
   // this link lands on (submitAuthCode below).
-  if (result?.ok && result.codeRequired && result.url) {
-    const authUrl = externalWebUrl(result.url);
-    if (authUrl) {
-      void shell.openExternal(authUrl).catch(() => {});
-    }
+  const safeAuthUrl = result?.url ? externalWebUrl(result.url) : null;
+  if (result?.ok && result.codeRequired && safeAuthUrl) {
+    void shell.openExternal(safeAuthUrl).catch(() => {});
   }
+  const safeResult =
+    result && typeof result === 'object' && 'url' in result
+      ? { ...result, url: safeAuthUrl ?? undefined }
+      : result;
   if (result?.ok) {
     invalidateAgentModelsCache();
     const sender = event.sender;
@@ -6273,7 +6275,7 @@ ipcMain.handle('providers:authenticate', async (event, providerId) => {
       }
     });
   }
-  return result;
+  return safeResult;
 });
 
 ipcMain.handle('providers:submitAuthCode', async (_event, input) => {

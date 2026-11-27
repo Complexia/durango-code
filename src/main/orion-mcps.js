@@ -428,6 +428,16 @@ export const callbackPage = (title, detail) => {
   );
 };
 
+const MAX_OAUTH_ERROR_DETAIL_CHARS = 500;
+
+const setCallbackHeaders = (res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+};
+
 // One loopback listener per sign-in. Resolves with the authorization code
 // once the browser returns with the state this flow generated.
 const startOAuthCallbackServer = () =>
@@ -441,7 +451,14 @@ const startOAuthCallbackServer = () =>
     codePromise.catch(() => {});
     let expectedState = null;
     const server = http.createServer((req, res) => {
-      const url = new URL(req.url || '/', 'http://127.0.0.1');
+      let url;
+      try {
+        url = new URL(req.url || '/', 'http://127.0.0.1');
+      } catch {
+        setCallbackHeaders(res);
+        res.writeHead(400).end(callbackPage('Sign-in failed', 'Invalid sign-in callback request.'));
+        return;
+      }
       if (url.pathname !== '/callback') {
         res.writeHead(404).end();
         return;
@@ -449,15 +466,14 @@ const startOAuthCallbackServer = () =>
       const error = url.searchParams.get('error');
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
-      res.setHeader('X-Content-Type-Options', 'nosniff');
+      setCallbackHeaders(res);
       if (!expectedState || state !== expectedState) {
         res.writeHead(400).end(callbackPage('Sign-in failed', 'This sign-in link is stale. Start again from Durango Code.'));
         return;
       }
       if (error || !code) {
-        const detail = url.searchParams.get('error_description') || error || 'No authorization code was returned.';
+        const rawDetail = url.searchParams.get('error_description') || error || 'No authorization code was returned.';
+        const detail = rawDetail.slice(0, MAX_OAUTH_ERROR_DETAIL_CHARS);
         res.writeHead(400).end(callbackPage('Sign-in failed', detail));
         failCode(new Error(`Sign-in failed: ${detail}`));
         return;
