@@ -2688,14 +2688,15 @@ export const createLocalBotEngine = ({
         }
         case 'message_thread': {
           if (!threadTools || !startThreadFollowUp) throw new Error('Follow-ups are not available here.');
-          const { entry: thread } = await threadTools.findThread(input.thread_id);
+          const found = await threadTools.findThread(input.thread_id);
+          const { entry: thread } = found;
           const message = str(input.message).trim();
           if (!message) throw new Error('message_thread needs a message.');
           // A thread waiting on a "Needs you" request takes the message as the
           // reply to it; one running a turn is refused before a task exists.
           const routed =
             typeof threadTools.routeMessage === 'function'
-              ? await threadTools.routeMessage(thread, { message, botName: self.bot.name })
+              ? await threadTools.routeMessage(found, { message, botName: self.bot.name })
               : { running: threadTools.isRunning?.(thread.id) === true };
           if (routed.result) {
             if (!routed.result.ok) throw new Error(routed.result.error);
@@ -2711,10 +2712,16 @@ export const createLocalBotEngine = ({
             if (hasSettings) {
               throw new Error('Cannot change model, effort, or access_mode while steering a running turn; stop the turn or wait for it to finish first.');
             }
+            const steerPrompt = `${message}\n\n(Steered by your bot "${self.bot.name}")`;
+            if (found.remote && typeof threadTools.steerRemote === 'function') {
+              const remoteSteer = await threadTools.steerRemote(found, steerPrompt);
+              if (!remoteSteer.ok) throw new Error(remoteSteer.error);
+              return remoteSteer;
+            }
             const steered = await Promise.resolve(
               startThreadFollowUp({
                 threadId: thread.id,
-                prompt: `${message}\n\n(Steered by your bot "${self.bot.name}")`,
+                prompt: steerPrompt,
                 botName: self.bot.name,
                 steer: true,
               })
@@ -2724,6 +2731,10 @@ export const createLocalBotEngine = ({
           }
           if (routed.running || threadTools.isRunning?.(thread.id)) {
             throw new Error('That thread is currently running a turn. Pass `steer: true` to steer it mid-turn, or wait until it finishes.');
+          }
+          // A follow-up turn on another machine goes through Durango (it records the task and reports it back).
+          if (found.remote) {
+            throw new Error(`That thread runs on ${found.remote.machineName}: sign in to Durango so your bots can send it follow-ups there.`);
           }
           const choice = resolveThreadModelChoice({
             model: input.model,

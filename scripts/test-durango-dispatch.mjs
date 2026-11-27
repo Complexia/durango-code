@@ -1129,7 +1129,7 @@ try {
     }
     // End-to-end refs + footer pipeline (9,000 + refs -> 10,000 + footer -> 12,000) keeps opening, refs and footer.
     const refs = '\n\n---\nThread: @thread:t_99\nChange: chg_abc123456 (open) https://durango.sh/c/chg_abc123456\nWorkspace: /tmp/ws';
-    const footer = '(Durango Code thread t_99, on Mac. Follow up there, e.g. to ship it, with message_thread thread_id "t_99".)';
+    const footer = '(Durango Code thread t_99, on Mac. Read it with read_thread and follow up there, e.g. to ship it, with message_thread thread_id "t_99".)';
     const rawReport = `OPENING REPORT\n${'body line\n'.repeat(1_500)}CLOSING SUMMARY`;
     const withRefs = `${clipMiddle(rawReport, 9_000, { threadId: 't_99' })}${refs}`;
     const withFooter = `${clipMiddle(withRefs, 10_000, { threadId: 't_99' })}\n\n${footer}`;

@@ -197,6 +197,7 @@ import { browserModeFor, setBrowserManager } from './main/browser-tools.js';
 import { fetchRelayApiJson, fetchRemotePairingProofJson } from './main/remote-api.js';
 import { externalWebUrl, linkedFileCandidates } from './main/linked-navigation.js';
 import {
+  canControlRemoteMachines,
   cancelRemotePairing,
   configureRemoteControl,
   connectRemoteMachine,
@@ -237,7 +238,7 @@ import {
   waitForRemoteControlPersistence,
 } from './main/remote-control.js';
 import { configureMachineTools, remoteThreadSpawner } from './main/machine-tools.js';
-import { readThreadForAgent, setThreadReaderRemoteFetch } from './main/thread-reader.js';
+import { formatThreadForAgent, readThreadForAgent, setThreadReaderRemoteFetch } from './main/thread-reader.js';
 import {
   configureWorkspaceSync,
   getWorkspaceSyncStatus,
@@ -4832,10 +4833,53 @@ const startBotThreadFollowUp =
 // machine's threads in the projects bots may use. manage_thread works on any
 // thread (whether started by a bot or by the person); the renderer still
 // refuses settling or configuring a running turn.
+// The person's other machines this one controls (remote control): their
+// threads are the bots' too, read live from them and driven like this
+// sidebar's mirrors of them.
+const botRemoteThreads = {
+  hosts: async () => {
+    await remoteControlReady.catch(() => {});
+    const state = getRemoteControlState();
+    return state?.available && canControlRemoteMachines()
+      ? (state.machines ?? []).map((machine) => ({ id: machine.id, name: machine.name }))
+      : [];
+  },
+  snapshot: (machineId) => fetchRemoteSnapshot({ machineId }),
+  readThread: async ({ machineId, threadId, offset, limit, char_offset }) => {
+    const machine = (getRemoteControlState()?.machines ?? []).find((candidate) => candidate.id === machineId);
+    const name = machine?.name ?? 'another machine';
+    const fetched = await fetchRemoteThread({ machineId, threadId }).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+    if (!fetched?.ok || !fetched.thread) return `Could not read that thread on ${name}: ${fetched?.error ?? 'no transcript'}.`;
+    return formatThreadForAgent(fetched.thread, {
+      offset,
+      limit,
+      charOffset: char_offset,
+      extraHeader: [`machine: ${name} (this thread runs there; transcript read from it just now)`],
+      link: false,
+    });
+  },
+  steer: ({ machineId, threadId, prompt }) => steerRemoteTurn({ machineId, threadId, prompt }),
+  stop: ({ machineId, threadId }) => stopRemoteTurn({ machineId, threadId }),
+  setState: ({ machineId, threadId, state }) => setRemoteThreadState({ machineId, threadId, state }),
+  userAction: ({ machineId, threadId, actionId, op, reply, botName }) =>
+    remoteUserAction({
+      machineId,
+      threadId,
+      actionId,
+      op,
+      ...(op === 'reply' ? { reply: String(reply ?? '').slice(0, 16_000) } : {}),
+      answeredBy: { botName: typeof botName === 'string' && botName.trim() ? botName.trim() : 'your bot' },
+    }),
+};
+
 const botThreadTools = createBotThreadTools({
   readIndex: () => readThreadsIndex(),
   readThread: (args) => readThreadForAgent(args),
   getProjects: () => botProjects(),
+  // No allowlist: threads outside a project, and other machines' threads in any project, are the bots' too.
+  allProjectsAllowed: () => botAllowedProjectIds === null || botAllowedProjectIds === undefined,
+  machineName: () => getDispatchMachineName(),
+  remote: botRemoteThreads,
   listModels: listDispatchModels,
   manageThread: ({ threadId, action, title, modelId, reasoningEffort, accessMode, codexServiceTier, claudeContextWindow }) => {
     const source = { machineId: 'durango-bot', machineName: 'your bot' };

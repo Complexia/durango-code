@@ -2757,6 +2757,11 @@ const handleHostRequest = async (session, message) => {
             ...(op === 'reply' ? { reply: String(message?.reply ?? '').slice(0, 200_000), attachments } : {}),
             ...(op === 'watch' ? { watching: message?.watching === true } : {}),
             ...(secretAnswer ? { secretAnswer } : {}),
+            // A bot of the controller answering for the person (answer_thread_request):
+            // shown with the answer, and never a secret card's.
+            ...(op !== 'secret' && op !== 'watch' && typeof message?.answeredBy?.botName === 'string' && message.answeredBy.botName.trim()
+              ? { answeredBy: { botName: message.answeredBy.botName.trim().slice(0, 80) } }
+              : {}),
             source: { machineId: session.deviceId, machineName: session.device?.name ?? 'Remote' },
           },
           Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS,
@@ -4951,7 +4956,7 @@ export const answerRemoteQuestion = async ({ machineId, threadId, runId, request
  * Done, Reply (with files), Dismiss or Watch on an action a host thread asked
  * the user for (request_user_action).
  */
-export const remoteUserAction = async ({ machineId, threadId, actionId, op, reply, attachments, watching, secretAnswer } = {}) => {
+export const remoteUserAction = async ({ machineId, threadId, actionId, op, reply, attachments, watching, secretAnswer, answeredBy } = {}) => {
   try {
     const targetMachineId = String(machineId ?? '');
     const uploaded =
@@ -4976,6 +4981,7 @@ export const remoteUserAction = async ({ machineId, threadId, actionId, op, repl
             : {}),
           ...(op === 'watch' ? { watching: watching === true } : {}),
           ...(op === 'secret' ? { secretAnswer } : {}),
+          ...(typeof answeredBy?.botName === 'string' && answeredBy.botName ? { answeredBy: { botName: answeredBy.botName.slice(0, 80) } } : {}),
         },
         (Number.isFinite(deps?.requestTimeoutMs) ? Math.max(1, deps.requestTimeoutMs) : REQUEST_TIMEOUT_MS) +
           (Number.isFinite(deps?.clientResponseGraceMs) ? Math.max(0, deps.clientResponseGraceMs) : CLIENT_RESPONSE_GRACE_MS),

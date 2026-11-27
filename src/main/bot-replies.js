@@ -8,7 +8,7 @@ import { selectFinalMessage } from '../report-clip.js';
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
 import { recordClaudeRateLimit } from './usage-limits.js';
-import { BOT_THREAD_ACCESS_MODES, SHIP_VIA_THREAD_MESSAGE, resolveThreadModelChoice } from './bot-thread-tools.js';
+import { BOT_THREAD_ACCESS_MODES, SHIP_VIA_THREAD_MESSAGE, machineNameKey, resolveThreadModelChoice } from './bot-thread-tools.js';
 
 // What a thread action from Durango (the claim's threadActions / legacy
 // settleThreads) can't ever do here: acknowledged at once. Anything else (no
@@ -16,7 +16,7 @@ import { BOT_THREAD_ACCESS_MODES, SHIP_VIA_THREAD_MESSAGE, resolveThreadModelCho
 // THREAD_ACTION_ATTEMPTS times. (`a bot started|can only settle` stays for
 // backwards compatibility with older desktop error messages.)
 const THREAD_ACTION_FINAL_ERROR =
-  /^No thread |matches several threads|matches several models|a bot started|can only settle|running a turn|still running|no running turn|title is required|requires at least one of|has no model|takes effort|has no effort setting|isn't available on|cannot be selected remotely|could not be branched|branching a thread that runs on|unsupported (?:thread action|access[_ ]mode|codex_service_tier|claude_context_window)|runs on another machine|not found on this machine|not available here|no pending (?:request|"Needs you")|secret request|waits on \d+ requests|unsupported answer|needs `reply`|no longer waiting/i;
+  /^No thread |matches several threads|matches several models|a bot started|can only settle|running a turn|still running|no running turn|title is required|requires at least one of|has no model|takes effort|has no effort setting|isn't available on|cannot be selected remotely|could not be branched|branching a thread that runs on|unsupported (?:thread action|access[_ ]mode|codex_service_tier|claude_context_window)|runs on another machine|has to run there|not found on this machine|not available here|no pending (?:request|"Needs you")|secret request|waits on \d+ requests|unsupported answer|needs `reply`|no longer waiting/i;
 const THREAD_ACTION_ATTEMPTS = 5;
 
 // A Durango bot's manage_thread on a machine: as on Durango, it can name the
@@ -145,6 +145,16 @@ export const BOT_THREAD_ACTIONS_FEATURE = 'thread-actions';
 export const BOT_THREAD_CONFIGURE_FEATURE = 'thread-configure';
 /** Claim feature: this machine answers threads' "Needs you" requests (queued answer_thread_request). */
 export const BOT_THREAD_REQUESTS_FEATURE = 'thread-requests';
+/**
+ * Claim feature: this machine runs thread tools for a bot's reply elsewhere
+ * (the claim's threadCalls: list_threads, read_thread, locate_thread,
+ * steer_thread, manage_thread, answer_thread_request) over its threads and
+ * the threads of machines it controls, and posts each result back.
+ */
+export const BOT_THREAD_CALLS_FEATURE = 'thread-calls';
+// A thread call's result, at most (JSON characters): a transcript page is
+// clipped to fit (Durango keeps 300 KB).
+const THREAD_CALL_RESULT_MAX_CHARS = 280_000;
 // A reply's messages before its final answer, at most (Durango's
 // BOT_REPLY_MESSAGES_MAX): past it, the text goes into the final answer.
 export const BOT_REPLY_MESSAGES_MAX = 30;
@@ -293,8 +303,8 @@ export const botProjectsNote = ({ projects, accessMode, threads }) => {
   ];
   if (threads) {
     lines.push(
-      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. You can pick any available model (`model`), reasoning effort (`effort`), and `access_mode` — call list_thread_models to see the exact model ids and supported effort levels on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). See where a project stands with list_threads and read_thread (the person\'s threads too), steer or follow up in a thread with message_thread (switching `model`/`effort` if needed, or `steer: true` to steer a running turn), and manage any thread (bot-started or the person\'s own) with manage_thread: settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, configure (change model/effort/access_mode), branch (fork a copy), stop, or delete when explicitly asked.',
-      `To ship a change (land, deploy, merge, release), message the thread that made it (message_thread; its id is in the task report) with something like "${SHIP_VIA_THREAD_MESSAGE}": it knows how its project ships. A thread on another of the person's machines: delegate_task with \`thread_id\` (and no \`project\`). Land or deploy yourself only when the person explicitly tells you to.`
+      'For real work in a project (code changes, builds, tests, investigations, anything longer than a few steps), start a Durango Code thread there with delegate_task and `project` set to the project name: it starts on this computer. You can pick any available model (`model`), reasoning effort (`effort`), and `access_mode` — call list_thread_models to see the exact model ids and supported effort levels on this computer. It is an ordinary Durango Code thread: every tool a thread has, the person can watch and continue it in the app, and its result comes back to your inbox. It sees nothing of this conversation, but reads the project itself (its code, AGENTS.md, the project\'s notes with project_notes). The thread tools cover every one of the person\'s machines, not just this one: list_threads lists this computer\'s threads and those of each machine it reaches (each with its `machine`), read_thread reads any of them live (running turns included), message_thread follows up or steers one wherever it runs, and manage_thread / answer_thread_request work on any of them — pass the id as listed or reported and the tools find where it lives. See where a project stands with list_threads and read_thread (the person\'s threads too), steer or follow up in a thread with message_thread (switching `model`/`effort` if needed, or `steer: true` to steer a running turn), and manage any thread (bot-started or the person\'s own) with manage_thread: settle (archive), unsettle (restore), snooze, unsnooze (wake), pin, unpin, rename, configure (change model/effort/access_mode), branch (fork a copy), stop, or delete when explicitly asked.',
+      `To ship a change (land, deploy, merge, release), message the thread that made it (message_thread; its id is in the task report) with something like "${SHIP_VIA_THREAD_MESSAGE}": it knows how its project ships. That works for a thread on another of the person's machines too (message_thread with its id; it runs there). Land or deploy yourself only when the person explicitly tells you to.`
     );
   }
   return lines.join('\n');
@@ -1723,7 +1733,7 @@ export const createBotReplyWorker = ({
       settling.add(threadId);
       void Promise.resolve()
         // Turned off or signed out meanwhile: left for a later poll.
-        .then(() => (isCurrent() ? threadTools.settle({ thread_id: threadId }, { exact: true }) : null))
+        .then(() => (isCurrent() ? threadTools.settle({ thread_id: threadId }, { exact: true, matchHostIds: false }) : null))
         .catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
         .then((result) => {
           if (!result) return;
@@ -1770,7 +1780,7 @@ export const createBotReplyWorker = ({
                   ...(item.requestId ? { request_id: item.requestId } : {}),
                   ...(item.reply ? { reply: item.reply } : {}),
                 },
-                { exact: true, botName: typeof item.botName === 'string' ? item.botName : '' }
+                { exact: true, matchHostIds: false, botName: typeof item.botName === 'string' ? item.botName : '' }
               )
             : { ok: false, error: 'Answering thread requests is not available here.' }
           : typeof threadTools.manage === 'function'
@@ -1783,10 +1793,11 @@ export const createBotReplyWorker = ({
                 ...(item.reasoningEffort ? { reasoningEffort: item.reasoningEffort } : {}),
                 ...(item.accessMode ? { accessMode: item.accessMode } : {}),
               },
-              { exact: true }
+              // Durango hands it to every machine that may have it: a mirror leaves its host's thread to the host.
+              { exact: true, matchHostIds: false }
             )
           : action === 'settle' && typeof threadTools.settle === 'function'
-            ? threadTools.settle({ thread_id: threadId }, { exact: true })
+            ? threadTools.settle({ thread_id: threadId }, { exact: true, matchHostIds: false })
             : { ok: false, error: `Managing threads (${action}) is not available here.` };
       runningThreadActions.add(id);
       const prev = threadActionChains.get(threadId) ?? Promise.resolve();
@@ -1815,6 +1826,92 @@ export const createBotReplyWorker = ({
           if (threadActionChains.get(threadId) === step) threadActionChains.delete(threadId);
         });
       threadActionChains.set(threadId, step);
+    }
+  };
+  // Thread tools a bot's reply elsewhere runs here (Durango's thread calls):
+  // this machine answers for its own threads and for the paired machines it
+  // controls that weren't asked themselves (`skipHosts`). Each result is
+  // posted once; one this machine doesn't have says `notHere`.
+  const threadCallsSeen = new Set();
+  const runThreadCall = async (call) => {
+    const input = call.input ?? {};
+    const options = { skipHosts: call.skipHosts ?? [] };
+    switch (call.tool) {
+      case 'list_threads':
+        return threadTools.list(input, { ...options, quiet: true });
+      case 'read_thread':
+        // Full ids only: Durango asks several machines, and a prefix could name a different thread on each.
+        return threadTools.read(input, { ...options, exact: true });
+      case 'locate_thread':
+        return threadTools.locate(input, options);
+      case 'steer_thread': {
+        const message = String(input.message ?? '').trim();
+        if (!message) return { ok: false, error: 'steer needs a message.' };
+        const found = await threadTools.findThread(input.thread_id, { exact: true, ...options });
+        // Waiting on one "Needs you" request: the message is the person's reply to it, as on a
+        // machine, without the steer's "(Steered by your bot …)" line Durango adds.
+        const reply = message.replace(/\n*\(Steered by your bot "[^"\n]*"\)\s*$/, '').trim() || message;
+        const routed = await threadTools.routeMessage(found, { message: reply, botName: call.botName || '' });
+        if (routed.result) return routed.result;
+        if (found.remote) return threadTools.steerRemote(found, message);
+        if (!startThreadFollowUp) return { ok: false, error: 'Steering is not available here.' };
+        const steered = await Promise.resolve(
+          startThreadFollowUp({ threadId: found.entry.id, prompt: message, botName: call.botName || 'your bot', steer: true })
+        ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+        return steered?.ok
+          ? { ok: true, threadId: found.entry.id, machine: found.machine, steered: true, note: 'Steered the running turn in that thread.' }
+          : { ok: false, error: steered?.error || 'That turn could not be steered.' };
+      }
+      case 'manage_thread':
+        return threadTools.manage(input, { exact: true, ...options });
+      case 'answer_thread_request':
+        return threadTools.answer(input, { exact: true, botName: call.botName || '', ...options });
+      default:
+        return { ok: false, error: `Unsupported thread call "${call.tool}". Update Durango Code on this machine.` };
+    }
+  };
+  const fitThreadCallResult = (result) => {
+    let text = JSON.stringify(result ?? { ok: false, error: 'No result.' });
+    if (text.length <= THREAD_CALL_RESULT_MAX_CHARS) return result;
+    if (typeof result?.transcript === 'string') {
+      const over = text.length - THREAD_CALL_RESULT_MAX_CHARS + 200;
+      const keep = Math.max(0, result.transcript.length - over);
+      const clipped = { ...result, transcript: `${result.transcript.slice(0, keep)}\n…[transcript clipped: page with offset/limit/char_offset]` };
+      text = JSON.stringify(clipped);
+      if (text.length <= THREAD_CALL_RESULT_MAX_CHARS) return clipped;
+    }
+    if (Array.isArray(result?.threads)) {
+      const threads = [...result.threads];
+      while (threads.length && JSON.stringify({ ...result, threads }).length > THREAD_CALL_RESULT_MAX_CHARS) threads.pop();
+      return { ...result, threads, truncated: true };
+    }
+    return { ok: false, error: 'The result was too large to send.' };
+  };
+  const runThreadCalls = (calls, isCurrent = () => true) => {
+    for (const call of Array.isArray(calls) ? calls : []) {
+      if (!call?.id || threadCallsSeen.has(call.id)) continue;
+      threadCallsSeen.add(call.id);
+      while (threadCallsSeen.size > 500) threadCallsSeen.delete(threadCallsSeen.keys().next().value);
+      void (async () => {
+        let result;
+        try {
+          result =
+            !threadTools || !isCurrent()
+              ? { ok: false, error: 'Durango Code here is not answering bots right now.' }
+              : await runThreadCall(call);
+        } catch (error) {
+          result = {
+            ok: false,
+            // Where it runs, when this machine knows (a mirror): Durango asks that machine instead.
+            ...(error?.notHere ? { notHere: true, ...(error.elsewhere ? { elsewhere: error.elsewhere } : {}) } : {}),
+            error: error?.message ?? String(error),
+          };
+        }
+        const machineId = (await getMachineId().catch(() => null)) ?? undefined;
+        await withRetries(() => client.completeBotThreadCall({ machineId, callId: call.id, result: fitThreadCallResult(result) })).catch((error) =>
+          log(`thread call ${call.tool} ${call.id} result not delivered:`, error?.message ?? error)
+        );
+      })();
     }
   };
   const stopTaskThread = (taskId, threadId) => {
@@ -2151,9 +2248,47 @@ export const createBotReplyWorker = ({
       };
     };
 
-    // message_thread: a follow-up turn (or live steer) in a thread here, recorded as a task.
+    // A Durango tool for a paired machine's thread (its rename, a follow-up
+    // turn there): Durango hands it to that machine and records it. → the result.
+    // Each call to Durango has its own tool call id (Durango records a call's
+    // result under it: a retry under the same id would get the first result back).
+    const forwarder = (toolCallId) => async (name, input, { attempt = 0 } = {}) =>
+      (
+        await callServerTool({
+          name,
+          input,
+          ...(toolCallId ? { toolCallId: `${toolCallId}:${name}${attempt ? `:retry${attempt}` : ''}` } : {}),
+        })
+      )?.result ?? { ok: false, error: 'Durango did not answer.' };
+
+    // A follow-up turn in a thread that runs on another of the person's
+    // machines: Durango sends it there as a task (an agent dispatch that
+    // continues the thread) and its outcome comes back to the inbox like
+    // any task's.
+    const followUpElsewhere = async (found, input, message, toolCallId) => {
+      const accessMode = input?.access_mode === 'read-only' || input?.access_mode === 'full-access' ? input.access_mode : undefined;
+      const body = {
+        title: String(input?.title ?? '').trim() || `Follow-up: ${found.entry.title || 'thread'}`.slice(0, 80),
+        instructions: message,
+        thread_id: found.remote.hostThreadId,
+        ...(String(input?.model ?? '').trim() ? { model: String(input.model).trim() } : {}),
+        ...(String(input?.effort ?? input?.reasoning_effort ?? '').trim() ? { effort: String(input.effort ?? input.reasoning_effort).trim() } : {}),
+        ...(accessMode ? { access_mode: accessMode } : {}),
+      };
+      // By the machine's name (Durango knows it by its own id); Durango finds it by the thread's history otherwise.
+      let response = await callServerTool({ name: 'delegate_task', input: { ...body, run_on: found.remote.machineName }, toolCallId });
+      if (response?.result?.ok === false && /no machine called|unknown machine/i.test(String(response.result.error ?? ''))) {
+        response = await callServerTool({ name: 'delegate_task', input: body, ...(toolCallId ? { toolCallId: `${toolCallId}:retry` } : {}) });
+      }
+      const result = response?.result ?? { ok: false, error: 'Durango did not answer.' };
+      return result.ok ? { ...result, threadId: found.entry.id, hostThreadId: found.remote.hostThreadId, machine: found.remote.machineName } : result;
+    };
+
+    // message_thread: a follow-up turn (or live steer) in a thread here or on
+    // a paired machine, recorded as a task.
     const messageThreadHere = async (input, toolCallId) => {
-      const { entry } = await threadTools.findThread(input?.thread_id);
+      const found = await threadTools.findThread(input?.thread_id);
+      const { entry } = found;
       const message = String(input?.message ?? '').trim();
       if (!message) return { ok: false, error: 'message_thread needs a message.' };
       // A thread waiting on a "Needs you" request takes the message as the
@@ -2161,7 +2296,7 @@ export const createBotReplyWorker = ({
       // a refusal never leaves a failed task card in the bot's chat.
       const routed =
         typeof threadTools.routeMessage === 'function'
-          ? await threadTools.routeMessage(entry, { message, botName: lane.botName })
+          ? await threadTools.routeMessage(found, { message, botName: lane.botName })
           : { running: threadTools.isRunning?.(entry.id) === true };
       if (routed.result) return routed.result;
       if (input?.steer === true) {
@@ -2177,10 +2312,12 @@ export const createBotReplyWorker = ({
             error: 'Cannot change model, effort, or access_mode while steering a running turn; stop the turn or wait for it to finish first.',
           };
         }
+        const steerPrompt = `${message}\n\n(Steered by your bot "${lane.botName}")`;
+        if (found.remote) return threadTools.steerRemote(found, steerPrompt);
         const steered = await Promise.resolve(
           startThreadFollowUp({
             threadId: entry.id,
-            prompt: `${message}\n\n(Steered by your bot "${lane.botName}")`,
+            prompt: steerPrompt,
             botName: lane.botName,
             steer: true,
           })
@@ -2190,12 +2327,13 @@ export const createBotReplyWorker = ({
         }
         return { ok: true, threadId: entry.id, steered: true, note: 'Steered the running turn in that thread.' };
       }
-      if (routed.running || threadTools.isRunning?.(entry.id)) {
+      if (routed.running || (!found.remote && threadTools.isRunning?.(entry.id))) {
         return {
           ok: false,
           error: 'That thread is currently running a turn. Pass `steer: true` to steer it mid-turn, or wait until it finishes.',
         };
       }
+      if (found.remote) return followUpElsewhere(found, input, message, toolCallId);
       const choice = resolveThreadModelChoice({
         model: input?.model,
         effort: input?.effort ?? input?.reasoning_effort,
@@ -2260,78 +2398,167 @@ export const createBotReplyWorker = ({
       };
     };
 
-    const callTool = async ({ name, input, toolCallId, message }) => {
-      // manage_thread (and legacy settle_thread): a thread here is updated here;
-      // one elsewhere goes to Durango, which hands it to the machine that has it.
-      if (name === 'manage_thread' || name === 'settle_thread') {
-        const normalized = name === 'settle_thread' ? { ...(input ?? {}), action: 'settle' } : (input ?? {});
-        const isDelete = String(normalized?.action ?? '').trim().toLowerCase() === 'delete';
-        const here = threadTools ? await threadTools.findThread(input?.thread_id, { exact: isDelete }).catch(() => null) : null;
-        if (!here) return callServerTool({ name, input, toolCallId });
-        try {
-          const outcome =
-            typeof threadTools.manage === 'function'
-              ? await threadTools.manage({ ...normalized, thread_id: here.entry.id })
-              : await threadTools.settle({ ...normalized, thread_id: here.entry.id });
-          return { result: outcome };
-        } catch (error) {
-          return { result: { ok: false, error: error?.message ?? String(error) } };
-        }
+    // A thread on a machine this one doesn't control (or can't reach through
+    // remote control now): Durango's own thread tools reach it (its machines
+    // answer thread calls). A follow-up goes as delegate_task with thread_id,
+    // which every Durango takes. `notHere.elsewhere`: the thread's id on the
+    // machine that runs it, when this machine knows it (a mirror).
+    const elsewhereThreadTool = async (name, input, toolCallId, notHere) => {
+      const where = notHere?.elsewhere ?? null;
+      const threadId = where?.threadId ?? String(input.thread_id ?? '');
+      const runOn = where?.machine ? { run_on: where.machine } : input.run_on ? { run_on: input.run_on } : {};
+      const steer = name === 'message_thread' && input.steer === true;
+      const [serverName, serverInput] =
+        name === 'message_thread' && !steer
+          ? [
+              'delegate_task',
+              {
+                title: String(input.title ?? '').trim() || 'Follow-up',
+                instructions: String(input.message ?? ''),
+                thread_id: threadId,
+                ...runOn,
+                ...(input.model ? { model: input.model } : {}),
+                ...(input.effort ?? input.reasoning_effort ? { effort: input.effort ?? input.reasoning_effort } : {}),
+                ...(input.access_mode === 'read-only' || input.access_mode === 'full-access' ? { access_mode: input.access_mode } : {}),
+              },
+            ]
+          : [name, { ...input, thread_id: threadId, ...(name === 'read_thread' ? {} : runOn) }];
+      const ask = (body, id) =>
+        callServerTool({ name: serverName, input: body, ...(id ? { toolCallId: id } : {}) }).catch((error) => ({
+          result: { ok: false, error: error?.message ?? String(error) },
+        }));
+      let response = await ask(serverInput, toolCallId);
+      // Durango may know that machine by another name: it then finds the thread itself (its own call id).
+      if (serverInput.run_on && response?.result?.ok === false && /no machine called|unknown machine/i.test(String(response.result.error ?? ''))) {
+        const { run_on: _runOn, ...withoutRunOn } = serverInput;
+        response = await ask(withoutRunOn, toolCallId ? `${toolCallId}:retry` : null);
       }
-      // answer_thread_request: a thread here is answered here; one elsewhere
-      // goes to Durango, which hands it to the machine that has it.
-      if (name === 'answer_thread_request') {
-        const here = threadTools?.answer ? await threadTools.findThread(input?.thread_id).catch(() => null) : null;
-        if (!here) return callServerTool({ name, input, toolCallId });
-        try {
-          return { result: await threadTools.answer({ ...(input ?? {}), thread_id: here.entry.id }, { botName: lane.botName }) };
-        } catch (error) {
-          return { result: { ok: false, error: error?.message ?? String(error) } };
-        }
+      const result = response?.result;
+      // A Durango without these tools: what this machine knows.
+      if (!result || (result.ok === false && /unknown tool|no (?:such )?tool|not available/i.test(String(result.error ?? '')))) {
+        return { result: { ok: false, error: notHere?.message ?? 'That thread is not reachable from here.' } };
+      }
+      return { result };
+    };
+
+    // `run_on` naming a machine this one neither is nor controls: Durango's.
+    const runOnElsewhere = async (input) => {
+      const named = machineNameKey(input?.run_on);
+      if (!named || !threadTools || typeof threadTools.machines !== 'function') return false;
+      const { here, hosts } = await threadTools.machines();
+      return named !== machineNameKey(here) && !hosts.some((host) => machineNameKey(host.name) === named);
+    };
+
+    /**
+     * A thread tool on a thread here or on a paired machine (`run`), else
+     * through Durango: not found here (or its machine is out of remote
+     * control's reach), or `run_on` names a machine this one doesn't control.
+     * Other errors (an ambiguous prefix) come back as they are.
+     */
+    const threadToolHereOrElsewhere = async (name, input, toolCallId, run) => {
+      if (await runOnElsewhere(input)) return elsewhereThreadTool(name, input, toolCallId, null);
+      try {
+        return { result: await run() };
+      } catch (error) {
+        if (error?.notHere) return elsewhereThreadTool(name, input, toolCallId, error);
+        return { result: { ok: false, error: error?.message ?? String(error) } };
+      }
+    };
+
+    // list_threads: this machine's and its paired machines' threads at once,
+    // plus what Durango's other machines list (a few seconds at most), merged.
+    // A `machine` this one is (or controls) is listed here only; any other
+    // machine is Durango's to list (its `run_on`).
+    const LIST_ELSEWHERE_WAIT_MS = 8_000;
+    const listEverywhere = async (input, toolCallId) => {
+      const named = machineNameKey(input.machine);
+      const { here: hereName, hosts } = typeof threadTools.machines === 'function' ? await threadTools.machines() : { here: '', hosts: [] };
+      const knownHere = named && (named === machineNameKey(hereName) || hosts.some((host) => machineNameKey(host.name) === named));
+      const { machine: _machine, ...rest } = input;
+      const serverInput = named ? { ...rest, run_on: input.machine } : rest;
+      const elsewhere = knownHere
+        ? Promise.resolve(null)
+        : new Promise((resolve) => {
+            const timer = setTimeout(() => resolve(null), LIST_ELSEWHERE_WAIT_MS);
+            timer.unref?.();
+            callServerTool({ name: 'list_threads', input: serverInput, toolCallId })
+              .then((response) => resolve(response?.result ?? null), () => resolve(null))
+              .finally(() => clearTimeout(timer));
+          });
+      const [here, there] = await Promise.all([named && !knownHere ? null : threadTools.list(input), elsewhere]);
+      const thereOk = there?.ok === true && Array.isArray(there.threads);
+      if (!here?.ok) return thereOk ? there : here ?? there ?? { ok: false, error: `No machine "${input.machine}" answered.` };
+      if (!thereOk) return here;
+      const keyOf = (thread) => thread?.hostThreadId ?? thread?.id;
+      const fresh = new Map(there.threads.filter(Boolean).map((thread) => [keyOf(thread), thread]));
+      // A row this machine only knows as last seen gives way to its machine's live one.
+      const local = here.threads.map((thread) => (thread.stale && fresh.has(keyOf(thread)) ? { ...fresh.get(keyOf(thread)), id: thread.id, hostThreadId: keyOf(thread) } : thread));
+      const seen = new Set(local.flatMap((thread) => [thread.id, keyOf(thread)]));
+      const added = there.threads.filter((thread) => thread && !seen.has(thread.id) && !seen.has(keyOf(thread)));
+      const limit = Math.min(40, Math.max(1, Number.isInteger(input.limit) ? input.limit : 15));
+      const time = (thread) => Date.parse(thread?.lastActivity ?? '') || 0;
+      const threads = [...local, ...added].sort((left, right) => time(right) - time(left));
+      const stillStale = threads.slice(0, limit).some((thread) => thread.stale);
+      return {
+        ...here,
+        threads: threads.slice(0, limit),
+        ...(threads.length > limit ? { more: (here.more ?? 0) + threads.length - limit } : {}),
+        ...(stillStale ? {} : { unreachable: undefined, note: undefined }),
+      };
+    };
+
+    const callTool = async ({ name, input, toolCallId, message }) => {
+      // manage_thread (and legacy settle_thread): a thread here (or on a machine
+      // this one controls) is updated from here; one elsewhere goes to Durango,
+      // which hands it to the machine that has it.
+      if (threadTools && (name === 'manage_thread' || name === 'settle_thread')) {
+        const normalized = name === 'settle_thread' ? { ...(input ?? {}), action: 'settle' } : (input ?? {});
+        return threadToolHereOrElsewhere('manage_thread', normalized, toolCallId, () =>
+          typeof threadTools.manage === 'function'
+            ? threadTools.manage(normalized, { forward: forwarder(toolCallId) })
+            : threadTools.settle(normalized)
+        );
+      }
+      // answer_thread_request: the same way.
+      if (threadTools?.answer && name === 'answer_thread_request') {
+        return threadToolHereOrElsewhere(name, input ?? {}, toolCallId, () => threadTools.answer(input ?? {}, { botName: lane.botName }));
       }
       if (threadTools && (name === 'list_thread_models' || name === 'list_threads' || name === 'read_thread' || name === 'message_thread')) {
-        try {
-          if (name === 'list_thread_models') {
-            return {
-              result:
-                typeof threadTools.listModels === 'function'
-                  ? await threadTools.listModels(input ?? {})
-                  : { ok: false, error: 'Model catalog is not available here.' },
-            };
-          }
-          if (name === 'list_threads') return { result: await threadTools.list(input ?? {}) };
-          if (name === 'read_thread') return { result: await threadTools.read(input ?? {}) };
-          if (!startThreadFollowUp) return { result: { ok: false, error: 'Follow-ups are not available here.' } };
-          return { result: await messageThreadHere(input ?? {}, toolCallId) };
-        } catch (error) {
-          return { result: { ok: false, error: error?.message ?? String(error) } };
+        if (name === 'list_thread_models') {
+          return {
+            result:
+              typeof threadTools.listModels === 'function'
+                ? await threadTools.listModels(input ?? {}).catch((error) => ({ ok: false, error: error?.message ?? String(error) }))
+                : { ok: false, error: 'Model catalog is not available here.' },
+          };
         }
+        if (name === 'list_threads') {
+          try {
+            return { result: await listEverywhere(input ?? {}, toolCallId) };
+          } catch (error) {
+            return { result: { ok: false, error: error?.message ?? String(error) } };
+          }
+        }
+        if (name === 'read_thread') return threadToolHereOrElsewhere(name, input ?? {}, toolCallId, () => threadTools.read(input ?? {}));
+        if (!startThreadFollowUp) return { result: { ok: false, error: 'Follow-ups are not available here.' } };
+        return threadToolHereOrElsewhere(name, input ?? {}, toolCallId, () => messageThreadHere(input ?? {}, toolCallId));
       }
       // delegate_task with `thread_id` (a follow-up in an existing thread, e.g.
-      // to ship its change): a thread here is a message_thread; one on another
-      // machine goes to Durango, which sends it there.
+      // to ship its change): a thread here (or on a machine this one controls)
+      // is a message_thread; any other goes to Durango, which sends it there.
       if (name === 'delegate_task' && String(input?.thread_id ?? '').trim()) {
-        const here = threadTools && startThreadFollowUp ? await threadTools.findThread(input.thread_id).catch(() => null) : null;
-        if (!here) return callServerTool({ name, input, toolCallId });
-        try {
-          return {
-            result: await messageThreadHere(
-              {
-                thread_id: here.entry.id,
-                message: input.instructions,
-                title: input.title,
-                model: input.model,
-                effort: input.effort ?? input.reasoning_effort,
-                access_mode: input.access_mode,
-                codex_service_tier: input.codex_service_tier,
-                claude_context_window: input.claude_context_window,
-              },
-              toolCallId
-            ),
-          };
-        } catch (error) {
-          return { result: { ok: false, error: error?.message ?? String(error) } };
-        }
+        if (!threadTools || !startThreadFollowUp || (await runOnElsewhere(input))) return callServerTool({ name, input, toolCallId });
+        const followUp = {
+          thread_id: input.thread_id,
+          message: input.instructions,
+          title: input.title,
+          model: input.model,
+          effort: input.effort ?? input.reasoning_effort,
+          access_mode: input.access_mode,
+          codex_service_tier: input.codex_service_tier,
+          claude_context_window: input.claude_context_window,
+        };
+        return threadToolHereOrElsewhere('message_thread', followUp, toolCallId, () => messageThreadHere(followUp, toolCallId));
       }
       if (name === 'delegate_task' && startProjectThread) {
         try {
@@ -2362,7 +2589,8 @@ export const createBotReplyWorker = ({
       void send(false); // started: the first heartbeat
       try {
         // Threads in a project start here (delegate_task `project`); the
-        // thread tools list models, read, follow up and manage this machine's threads.
+        // thread tools list models, read, follow up and manage this machine's
+        // threads and the threads of the machines it controls (remote control).
         // This machine's thread tools replace Durango's (manage_thread / legacy settle_thread).
         const replacedNames = threadTools ? new Set([...threadTools.names, 'settle_thread']) : null;
         const tools = threadTools
@@ -2510,6 +2738,7 @@ export const createBotReplyWorker = ({
             BOT_THREAD_ACTIONS_FEATURE,
             BOT_THREAD_CONFIGURE_FEATURE,
             BOT_THREAD_REQUESTS_FEATURE,
+            ...(threadTools ? [BOT_THREAD_CALLS_FEATURE] : []),
           ],
           waitMs: claimWaitMs,
           signal,
@@ -2531,6 +2760,7 @@ export const createBotReplyWorker = ({
       if (current()) {
         settleQueuedThreads(claimed?.settleThreads, current);
         runQueuedThreadActions(claimed?.threadActions, current);
+        runThreadCalls(claimed?.threadCalls, current);
       }
       // No bots on the account: nothing to answer, so check back much later
       // (wake() — a bot made or messaged here — or a sign-in restarts sooner).

@@ -159,7 +159,7 @@ test("a reply's cards and file ids count as changes when merging (its row redraw
 });
 
 test('task reports: Ship goes to the thread the report came from; the footers stay out of the text', () => {
-  const footer = '(Durango Code thread t_42, project durango, on Mac. Follow up there, e.g. to ship it, with message_thread thread_id "t_42".)';
+  const footer = '(Durango Code thread t_42, project durango, on Mac. Read it with read_thread and follow up there, e.g. to ship it, with message_thread thread_id "t_42".)';
   const report = `Done: sorted projects.\n\n---\nThread: @thread:t_42\nChange: chg_abcdefgh12 (open) https://durango.sh/source/x/changes/chg_abcdefgh12\nWorkspace: /ws/x\n\n${footer}`;
   assert.deepEqual(taskReportActions(report), [
     { kind: 'ship_change', change_id: 'chg_abcdefgh12', thread_id: 't_42', url: 'https://durango.sh/source/x/changes/chg_abcdefgh12' },

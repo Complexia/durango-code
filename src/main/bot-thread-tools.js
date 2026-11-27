@@ -2,9 +2,12 @@ import path from 'node:path';
 import { dispatchEffort, resolveDispatchModel } from './durango-dispatch.js';
 
 // A bot's Durango Code thread tools, run on this machine (bot-replies.js for
-// a Durango bot's reply here, local-bots.js signed out): list available models
-// and reasoning efforts, list the threads of this machine's projects, read one,
-// send a follow-up (or steer a running turn), and manage any thread
+// a Durango bot's reply here, local-bots.js signed out, and Durango's own
+// thread calls for a reply in the cloud): list available models and reasoning
+// efforts, list the threads of this machine's projects and of every paired
+// machine it reaches (remote control: its mirrors and the host's live listing),
+// read one (live from the machine it runs on), send a follow-up (or steer a
+// running turn), and manage any thread
 // (settle/archive, unsettle/restore, snooze, unsnooze/wake, pin, unpin, rename,
 // configure model/effort/access, branch, stop, delete). A follow-up is an
 // ordinary turn in that thread (it runs like a message the person sends), and
@@ -207,15 +210,15 @@ export const BOT_THREAD_REQUEST_RULE = `"Needs you" requests: a Durango Code thr
  * The line a thread's report to a bot ends with: which thread it was, so the
  * bot can follow up there (message_thread), e.g. to ship the change.
  */
-// `cloud`: the bot is a Durango one, whose replies may also run in the cloud
-// (where a follow-up is delegate_task with thread_id; Durango's own copy is
-// threadReportFooter in chat/convex/botPolicy.ts).
+// Durango's own copy is threadReportFooter in chat/convex/botPolicy.ts (the
+// thread tools work from the cloud and every machine, so one text for all).
 export const threadReportFooter = ({ threadId, project, machine, cloud = false } = {}) => {
   const id = String(threadId ?? '').trim();
   if (!id) return '';
   const where = [project ? `project ${project}` : null, machine ? `on ${machine}` : null].filter(Boolean).join(', ');
-  const how = cloud ? `message_thread thread_id "${id}", or delegate_task thread_id "${id}" from the cloud` : `message_thread thread_id "${id}"`;
-  return `(Durango Code thread ${id}${where ? `, ${where}` : ''}. Follow up there, e.g. to ship it, with ${how}.)`;
+  // Same text as Durango's: the thread tools reach a thread from anywhere (`cloud` is kept for callers).
+  void cloud;
+  return `(Durango Code thread ${id}${where ? `, ${where}` : ''}. Read it with read_thread and follow up there, e.g. to ship it, with message_thread thread_id "${id}".)`;
 };
 
 /** A thread's report with its footer (threadReportFooter) after it. */
@@ -371,7 +374,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'list_thread_models',
     description:
-      'List the Durango Code agent models available on this computer (Claude, Codex, Antigravity/Gemini, Grok, Muse, OpenCode…) with each model\'s exact `id`, `label`, `provider`, and supported reasoning `efforts`. Use these ids and efforts with delegate_task (`project`), message_thread, or manage_thread (`action: "configure"`).',
+      'List the Durango Code agent models available on this computer (Claude, Codex, Antigravity/Gemini, Grok, Muse, OpenCode…) with each model\'s exact `id`, `label`, `provider`, and supported reasoning `efforts`. Use these ids and efforts with delegate_task (`project`), message_thread, or manage_thread (`action: "configure"`). A thread on another machine runs on that machine\'s models (list_machines with `include_models` shows them; that machine checks the choice).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -384,11 +387,12 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'list_threads',
     description:
-      "List Durango Code threads on this computer, newest first: the threads in the person's sidebar, their own and the ones bots started. Filter by project (name) or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), model, reasoning effort, accessMode, sidebar flags (settled, snoozed, pinned), last activity, and `needsYou`: the \"Needs you\" requests it waits on the person for (answer them with answer_thread_request). Subagent threads (ones a thread spawned, e.g. reviews) aren't in the sidebar and aren't listed: their parent shows how many it has (`subagents`); they come and go with it, so there's nothing to settle there. Pass include_subagents to list them too (each with its parentThreadId).",
+      "List Durango Code threads on all of the person's machines, newest first: this computer's and every paired machine's it can reach (read live from each), the threads in the person's sidebar, their own and the ones bots started. Each has `machine` (where it runs); every thread tool takes its id as is, wherever it runs. Filter by project (name), machine, or sidebar state (active, settled, snoozed, pinned) to see where a project stands; each has its id, title, project, status (running, idle, error…), model, reasoning effort, accessMode, sidebar flags (settled, snoozed, pinned), last activity, and `needsYou`: the \"Needs you\" requests it waits on the person for (answer them with answer_thread_request). Subagent threads (ones a thread spawned, e.g. reviews) aren't in the sidebar and aren't listed: their parent shows how many it has (`subagents`); they come and go with it, so there's nothing to settle there. Pass include_subagents to list them too (each with its parentThreadId).",
     inputSchema: {
       type: 'object',
       properties: {
-        project: { type: 'string', maxLength: 200, description: 'Only threads in this project (by name). Omit for all projects.' },
+        project: { type: 'string', maxLength: 200, description: 'Only threads in this project (by name; "No project" for threads outside one). Omit for all projects.' },
+        machine: { type: 'string', maxLength: 120, description: 'Only threads on this machine (its name, as in `machine`). Omit for all machines.' },
         state: {
           type: 'string',
           enum: ['all', 'active', 'settled', 'snoozed', 'pinned'],
@@ -405,7 +409,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'read_thread',
     description:
-      "Read a Durango Code thread's transcript (by id from list_threads or a task report): what was asked, what the agent did, changed files and its final answer, plus `needsYou`: the \"Needs you\" requests it waits on the person for. Returns the newest page by default (with the final message up to 24,000 chars). Pass limit=1 to fetch only the final message (up to 34,000 chars), offset/limit to browse earlier messages, or offset + limit=1 + char_offset to read the rest of a very long message.",
+      "Read a Durango Code thread's transcript (by id from list_threads or a task report), on any of the person's machines: a thread on another machine is read live from it, running turn included. What was asked, what the agent did, changed files and its final answer, plus `needsYou`: the \"Needs you\" requests it waits on the person for. Returns the newest page by default (with the final message up to 24,000 chars). Pass limit=1 to fetch only the final message (up to 34,000 chars), offset/limit to browse earlier messages, or offset + limit=1 + char_offset to read the rest of a very long message.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -420,7 +424,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'message_thread',
     description:
-      "Send a follow-up message into an existing Durango Code thread on this computer (by id, from list_threads or a task report), as the person would: e.g. answer its question, ask for a fix, tell it to continue or wrap up. Also how you ship a change (land, deploy, merge, release): message the thread that made it and let it ship the change the way its project ships, rather than landing or deploying it yourself. Optionally pass `model`, `effort`, or `access_mode` to switch the thread's settings before running the turn (ids and efforts from list_thread_models). Don't send a normal follow-up to a thread that is running right now — pass `steer: true` to steer a running turn mid-flight instead (without changing model/effort/access_mode). A thread waiting on a \"Needs you\" request takes the message as the person's reply to it (no new turn or task); to press Done on it, use answer_thread_request.",
+      "Send a follow-up message into an existing Durango Code thread on any of the person's machines (by id, from list_threads or a task report; it runs where the thread lives), as the person would: e.g. answer its question, ask for a fix, tell it to continue or wrap up. Also how you ship a change (land, deploy, merge, release): message the thread that made it and let it ship the change the way its project ships, rather than landing or deploying it yourself. Optionally pass `model`, `effort`, or `access_mode` to switch the thread's settings before running the turn (ids and efforts from list_thread_models). Don't send a normal follow-up to a thread that is running right now — pass `steer: true` to steer a running turn mid-flight instead (without changing model/effort/access_mode). A thread waiting on a \"Needs you\" request takes the message as the person's reply to it (no new turn or task); to press Done on it, use answer_thread_request.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -438,7 +442,7 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'manage_thread',
     description:
-      "Manage any Durango Code thread on this computer (by id, from list_threads or a task report) — whether started by a bot or by the person: settle (archive), unsettle (restore/unarchive), snooze, unsnooze (wake), pin, unpin, rename (with `title`), configure (change `model`, `effort`, `access_mode`, `codex_service_tier`, or `claude_context_window` without sending a message), branch (fork a copy of the thread and return the new thread's id), stop (stop a running turn), or delete (permanent — requires the full thread_id, and only when the person explicitly asks). Cannot settle or configure a thread while a turn is running.",
+      "Manage any Durango Code thread on any of the person's machines (by id, from list_threads or a task report) — whether started by a bot or by the person: settle (archive), unsettle (restore/unarchive), snooze, unsnooze (wake), pin, unpin, rename (with `title`), configure (change `model`, `effort`, `access_mode`, `codex_service_tier`, or `claude_context_window` without sending a message), branch (fork a copy of the thread and return the new thread's id), stop (stop a running turn), or delete (permanent — requires the full thread_id, and only when the person explicitly asks). Cannot settle or configure a thread while a turn is running.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -479,7 +483,44 @@ export const BOT_THREAD_TOOLS = [
 
 const projectKey = (value) => String(value ?? '').trim().toLowerCase();
 
-const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+// The saved index keeps times as ISO strings (older shapes: epoch ms).
+const timeMs = (value) => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const parsed = Date.parse(String(value ?? ''));
+  return Number.isFinite(parsed) ? parsed : null;
+};
+const iso = (value) => {
+  const ms = timeMs(value);
+  return ms === null ? null : new Date(ms).toISOString();
+};
+/** When a thread last moved: its activity, else its last update or message, else its creation. */
+export const threadActivityMs = (entry) =>
+  timeMs(entry?.activityAt) ??
+  timeMs(entry?.updatedAt) ??
+  timeMs(entry?.summary?.lastMessage?.ts) ??
+  timeMs(entry?.createdAt) ??
+  timeMs(entry?.shell?.createdAt) ??
+  0;
+
+const NO_PROJECT_ID = 'orion:no-project';
+const NO_PROJECT_NAME = 'No project';
+
+/** A remote-control mirror's link to the thread on its host (`remote: { machineId, machineName, threadId }`), or null. */
+export const mirrorRemoteOf = (entry) => {
+  const remote = entry?.shell?.remote ?? entry?.remote;
+  return remote && typeof remote.machineId === 'string' && remote.machineId && typeof remote.threadId === 'string' && remote.threadId
+    ? remote
+    : null;
+};
+
+/** Machine names compared loosely ("Roma’s MacBook Air" ~ "romas-macbook-air.local"). */
+export const machineNameKey = (value) =>
+  String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.local$/, '')
+    .replace(/['’`]/g, '')
+    .replace(/[^a-z0-9]+/g, '');
 
 const ACTION_NOTES = {
   settle: 'Settled: it moved to Settled in the sidebar; a new message brings it back.',
@@ -606,11 +647,60 @@ const REQUEST_ANSWER_NOTES = {
 // in the terminal, so the sidebar always shows it.
 const CLAUDE_CODE_CLI_MODEL_ID = 'claude:claude-code-cli';
 
+
+// A paired machine's listing (remote-control snapshot) is reused for a few
+// seconds, so list_threads then read_thread or message_thread asks it once.
+const SNAPSHOT_TTL_MS = 3_000;
+const SNAPSHOT_TIMEOUT_MS = 10_000;
+
+const withTimeout = (promise, ms, message) =>
+  new Promise((resolve) => {
+    const timer = setTimeout(() => resolve({ ok: false, error: message }), ms);
+    timer.unref?.();
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        resolve({ ok: false, error: error?.message ?? String(error) });
+      }
+    );
+  });
+
+/** The thread isn't on this machine nor on one it reaches (Durango's thread calls answer `notHere`). */
+export class ThreadNotHereError extends Error {
+  /** `elsewhere`: where the thread runs, when this machine knows (its id there and that machine's name). */
+  constructor(message, elsewhere = null) {
+    super(message);
+    this.notHere = true;
+    if (elsewhere?.threadId) this.elsewhere = elsewhere;
+  }
+}
+
+// A host's thread action a paired controller can't run there through remote
+// control (renaming, configuring, branching or deleting it): Durango hands it
+// to that machine instead (manage_thread with run_on).
+const FORWARDED_ACTIONS = new Set(['rename', 'configure', 'branch', 'delete']);
+const SIDEBAR_STATE_FOR_ACTION = {
+  settle: (now) => ({ settledAt: now }),
+  unsettle: () => ({ settledAt: null }),
+  snooze: (now) => ({ settledAt: null, snoozedAt: now }),
+  unsnooze: () => ({ snoozedAt: null }),
+  pin: (now) => ({ pinnedAt: now }),
+  unpin: () => ({ pinnedAt: null }),
+};
+
 /**
  * deps:
  * - readIndex(): { entries } (thread-storage.js readThreadsIndex)
- * - readThread(args): transcript page text (thread-reader.js readThreadForAgent)
+ * - readThread(args): transcript page text (thread-reader.js readThreadForAgent; a mirror is read from its host)
  * - getProjects(): this machine's projects the bot may use ([{ id, name, path }])
+ * - allProjectsAllowed(): whether bots may use every project here (no allowlist):
+ *   then threads outside a project ("No project") and other machines' threads
+ *   in projects this machine doesn't have are theirs too (optional, default false)
+ * - machineName(): this machine's name as the person's machines list shows it (optional)
  * - listModels(): available agent models on this computer ([{ id, label, slug?, providerId?, provider, efforts, available }])
  * - liveStatus(threadId): the renderer's status for a thread now, or null (optional)
  * - manageThread({ threadId, action, title?, modelId?, reasoningEffort?, accessMode?, codexServiceTier?, claudeContextWindow? }):
@@ -620,17 +710,29 @@ const CLAUDE_CODE_CLI_MODEL_ID = 'claude:claude-code-cli';
  *   secretIds } (optional: without it, or when it fails, the saved index and liveStatus stand in)
  * - answerRequest({ threadId, actionId, op: 'done' | 'reply' | 'dismiss', reply?, botName? }): presses that button on
  *   a thread's "Needs you" card → { ok, error? } (answer_thread_request)
+ * - remote: the person's other machines this one controls (remote control), optional:
+ *   { hosts(): [{ id, name }], snapshot(machineId) → { ok, snapshot } | { ok: false, error },
+ *     readThread({ machineId, threadId, offset?, limit?, char_offset? }) → text,
+ *     steer({ machineId, threadId, prompt }), stop({ machineId, threadId }),
+ *     setState({ machineId, threadId, state }), userAction({ machineId, threadId, actionId, op, reply? }) → { ok, error? } }
+ *
+ * A thread found here (findThread) is `{ entry, project, projectName, machine, remote }`: `remote` is null for this
+ * machine's own thread, else `{ machineId, machineName, hostThreadId, mirrorId }` for one that runs on a paired
+ * machine (a mirror in this sidebar, `mirrorId`, or only in that machine's live listing, `mirrorId: null`).
  */
 export const createBotThreadTools = ({
   readIndex,
   readThread,
   getProjects,
+  allProjectsAllowed = () => false,
+  machineName = () => null,
   listModels = null,
   liveStatus = () => null,
   manageThread = null,
   settleThread = null,
   threadTurnState = null,
   answerRequest = null,
+  remote = null,
 }) => {
   const projectsById = async () => {
     const list = (await Promise.resolve(getProjects()).catch(() => [])) ?? [];
@@ -643,25 +745,231 @@ export const createBotThreadTools = ({
     return Array.isArray(list) ? list : [];
   };
 
-  /** The thread (by exact id, or a unique prefix unless `exact`) if it belongs to an allowed project. */
-  const findThread = async (rawId, { exact = false } = {}) => {
+  const thisMachine = async () => {
+    const name = await Promise.resolve(typeof machineName === 'function' ? machineName() : null).catch(() => null);
+    return typeof name === 'string' && name.trim() ? name.trim() : 'this computer';
+  };
+
+  /** Which projects' threads a bot sees: this machine's allowed ones, and (no allowlist) every other one. */
+  const projectView = async () => {
+    const projects = await projectsById();
+    const all = (await Promise.resolve(typeof allProjectsAllowed === 'function' ? allProjectsAllowed() : false).catch(() => false)) === true;
+    const allowedNames = new Set([...projects.values()].map((project) => projectKey(project.name)));
+    return {
+      projects,
+      localOk: (projectId) => projects.has(projectId) || (all && projectId === NO_PROJECT_ID),
+      localName: (projectId) => (projectId === NO_PROJECT_ID ? NO_PROJECT_NAME : projects.get(projectId)?.name ?? null),
+      remoteOk: (name) => all || (Boolean(name) && allowedNames.has(projectKey(name))),
+    };
+  };
+
+  // --- other machines (remote control) ---------------------------------------------------
+
+  const remoteHosts = async (skipHosts = []) => {
+    if (!remote || typeof remote.hosts !== 'function') return [];
+    const skip = new Set((Array.isArray(skipHosts) ? skipHosts : []).map(machineNameKey).filter(Boolean));
+    const list = (await Promise.resolve(remote.hosts()).catch(() => [])) ?? [];
+    return (Array.isArray(list) ? list : []).filter(
+      (host) => host && typeof host.id === 'string' && host.id && !skip.has(machineNameKey(host.name))
+    );
+  };
+
+  const snapshotCache = new Map(); // machineId -> { at, promise }
+  const hostSnapshot = (host, { fresh = false } = {}) => {
+    const cached = snapshotCache.get(host.id);
+    if (!fresh && cached && Date.now() - cached.at < SNAPSHOT_TTL_MS) return cached.promise;
+    const promise = withTimeout(
+      Promise.resolve(remote.snapshot(host.id)),
+      SNAPSHOT_TIMEOUT_MS,
+      `${host.name || 'That machine'} did not answer in time.`
+    ).then((result) =>
+      result?.ok && result.snapshot ? { snapshot: result.snapshot } : { error: result?.error || `Could not reach ${host.name || 'that machine'}.` }
+    );
+    snapshotCache.set(host.id, { at: Date.now(), promise });
+    return promise;
+  };
+
+  const snapshotProjectName = (snapshot, projectId) => {
+    if (projectId === NO_PROJECT_ID) return NO_PROJECT_NAME;
+    return (snapshot?.projects ?? []).find((project) => project?.id === projectId)?.name ?? null;
+  };
+
+  // A host's listing marks subagent threads (a spawn_subagent child, a
+  // provider's own subagent) and threads an agent of a paired machine started
+  // there (machine_run_agent, listed under that machine's thread).
+  const isSnapshotChild = (thread) => Boolean(thread?.parentThreadId || thread?.subagent || thread?.spawnedBy);
+  const isSnapshotDraft = (thread) =>
+    thread?.messageCount === 0 &&
+    thread?.status !== 'running' &&
+    !thread?.settledAt &&
+    !thread?.snoozedAt &&
+    !thread?.pinnedAt &&
+    thread?.modelId !== CLAUDE_CODE_CLI_MODEL_ID;
+
+  /** A host thread's "Needs you" requests, from its listing (rolled up from its subagents). */
+  const snapshotRequests = (thread) => {
+    const requests = [];
+    const secretIds = [];
+    for (const action of Array.isArray(thread?.userActions) ? thread.userActions : []) {
+      if (!action || typeof action.id !== 'string' || !action.id) continue;
+      if (action.secret) secretIds.push(action.id);
+      else if (typeof action.action === 'string') {
+        requests.push(publicRequest({ ...action, threadId: action.ownerThreadId ?? thread.id }, thread.id));
+      }
+    }
+    return { requests, secretIds };
+  };
+
+  /** The host's current listing entry for a remote thread, or null when it can't be reached. */
+  const hostThreadNow = async (ref, { fresh = true } = {}) => {
+    if (!ref?.remote || !remote) return null;
+    const { snapshot } = await hostSnapshot({ id: ref.remote.machineId, name: ref.remote.machineName }, { fresh });
+    return snapshot ? (snapshot.threads ?? []).find((thread) => thread?.id === ref.remote.hostThreadId) ?? null : null;
+  };
+
+  /** A thread of another machine as a found ref (no mirror of it here). */
+  const snapshotRef = (host, snapshot, thread) => ({
+    entry: {
+      id: thread.id,
+      title: thread.title,
+      projectId: thread.projectId,
+      status: thread.status,
+      modelId: thread.modelId,
+      messageCount: thread.messageCount,
+      updatedAt: thread.updatedAt,
+      shell: { ...(thread.settings ?? {}), modelId: thread.modelId, settledAt: thread.settledAt, snoozedAt: thread.snoozedAt, pinnedAt: thread.pinnedAt },
+    },
+    project: null,
+    projectName: snapshotProjectName(snapshot, thread.projectId),
+    machine: host.name,
+    remote: { machineId: host.id, machineName: host.name, hostThreadId: thread.id, mirrorId: null, reachable: true },
+  });
+
+  // --- finding a thread ------------------------------------------------------------------
+
+  /**
+   * The thread a bot means (by exact id, or a unique prefix unless `exact`):
+   * this machine's own (in a project bots may use), a mirror of another
+   * machine's (by its id here or its id there), or one only in a paired
+   * machine's live listing. An exact id anywhere wins over a prefix anywhere;
+   * prefixes are matched across all of them at once (several → ambiguous).
+   * `skipHosts`: names of machines Durango asked themselves (thread calls):
+   * their threads are left to them, except that a mirror here still answers
+   * to its own id here (only this machine knows that id).
+   * `matchHostIds: false`: a mirror answers to its id here only, not to its
+   * host's id (a queued action Durango hands every machine: the host runs it).
+   */
+  const findThread = async (rawId, { exact = false, skipHosts = [], matchHostIds = true } = {}) => {
     const id = String(rawId ?? '').trim();
     if (!id) throw new Error('thread_id is required.');
-    const [{ entries }, projects] = await Promise.all([readIndex(), projectsById()]);
-    const visible = entries.filter((entry) => !isProviderSubagent(entry) && projects.has(entry.projectId));
-    const matches = visible.filter((entry) => entry.id === id);
-    const found = matches.length || exact ? matches : visible.filter((entry) => entry.id.startsWith(id));
-    if (found.length !== 1) {
-      throw new Error(found.length ? `"${id}" matches several threads: use the full id.` : `No thread "${id}" in this computer's projects.`);
+    const [{ entries }, view, here, paired] = await Promise.all([
+      readIndex(),
+      projectView(),
+      thisMachine(),
+      remoteHosts().then((hosts) => new Set(hosts.map((host) => host.id))),
+    ]);
+    const skip = new Set((Array.isArray(skipHosts) ? skipHosts : []).map(machineNameKey).filter(Boolean));
+    const candidates = [];
+    const mirroredHostIds = new Set();
+    for (const entry of entries) {
+      if (isProviderSubagent(entry)) continue;
+      const mirror = mirrorRemoteOf(entry);
+      if (mirror) {
+        const projectName = view.localName(entry.projectId) ?? mirror.projectName ?? null;
+        if (!view.localOk(entry.projectId) && !view.remoteOk(mirror.projectName)) continue;
+        const hostAsked = skip.has(machineNameKey(mirror.machineName));
+        if (!hostAsked) mirroredHostIds.add(`${mirror.machineId}\u0000${mirror.threadId}`);
+        candidates.push({
+          ids: matchHostIds && !hostAsked ? [entry.id, mirror.threadId] : [entry.id],
+          ref: {
+            entry,
+            project: view.projects.get(entry.projectId) ?? null,
+            projectName,
+            machine: mirror.machineName || 'another machine',
+            remote: {
+              machineId: mirror.machineId,
+              machineName: mirror.machineName || 'another machine',
+              hostThreadId: mirror.threadId,
+              mirrorId: entry.id,
+              // Remote control reaches its machine from here (paired, turned on).
+              reachable: paired.has(mirror.machineId),
+            },
+          },
+        });
+      } else if (view.localOk(entry.projectId)) {
+        candidates.push({
+          ids: [entry.id],
+          ref: { entry, project: view.projects.get(entry.projectId) ?? null, projectName: view.localName(entry.projectId), machine: here, remote: null },
+        });
+      }
     }
-    return { entry: found[0], project: projects.get(found[0].projectId) };
+    // A paired machine's threads this sidebar has no mirror of yet, from its live listing (only when needed).
+    let listed = null;
+    const hostListed = async () => {
+      if (listed) return listed;
+      if (!remote || !matchHostIds) return (listed = []);
+      const hosts = await remoteHosts(skipHosts);
+      const lists = await Promise.all(
+        hosts.map(async (host) => {
+          const { snapshot } = await hostSnapshot(host);
+          return (snapshot?.threads ?? [])
+            .filter((thread) => thread && typeof thread.id === 'string' && !thread.subagent)
+            .filter((thread) => !mirroredHostIds.has(`${host.id}\u0000${thread.id}`))
+            .filter((thread) => view.remoteOk(snapshotProjectName(snapshot, thread.projectId)))
+            .map((thread) => ({ ids: [thread.id], ref: snapshotRef(host, snapshot, thread) }));
+        })
+      );
+      return (listed = lists.flat());
+    };
+    const exactly = (list) => list.filter((candidate) => candidate.ids.includes(id));
+    const byPrefix = (list) => list.filter((candidate) => candidate.ids.some((candidateId) => candidateId.startsWith(id)));
+    let found = exactly(candidates);
+    if (found.length === 0) found = exactly(await hostListed());
+    if (found.length === 0 && !exact) found = [...byPrefix(candidates), ...byPrefix(await hostListed())];
+    if (found.length !== 1) {
+      if (found.length) throw new Error(`"${id}" matches several threads: use the full id.`);
+      throw new ThreadNotHereError(`No thread "${id}" on ${here} or the machines it reaches.`);
+    }
+    return found[0].ref;
+  };
+
+  /**
+   * A thread of another machine that remote control can't reach from here
+   * (its pairing is off or gone): an action on it goes through Durango, which
+   * asks the person's machines (the error names the thread there).
+   */
+  const requireReachable = (ref) => {
+    if (ref?.remote && ref.remote.reachable === false) {
+      throw new ThreadNotHereError(`That thread runs on ${ref.remote.machineName}, which this machine can't reach through remote control now.`, {
+        threadId: ref.remote.hostThreadId,
+        machine: ref.remote.machineName,
+      });
+    }
+  };
+
+  /** A found ref, or a bare index entry (older callers). */
+  const refOf = async (value) => {
+    if (value?.entry) return value;
+    return findThread(value?.id, { exact: true });
   };
 
   /**
    * Whether a thread runs a turn now, and the "Needs you" requests it waits
-   * on: the renderer's live state, or the saved index when that isn't there.
+   * on: the renderer's live state (another machine's thread: that machine's
+   * listing now), or the saved index when that isn't there.
    */
-  const turnState = async (entry) => {
+  const turnState = async (refOrEntry) => {
+    const ref = await refOf(refOrEntry);
+    const { entry } = ref;
+    if (ref.remote) {
+      const thread = await hostThreadNow(ref);
+      if (thread) return { running: thread.status === 'running', ...snapshotRequests(thread) };
+      const { entries } = await readIndex();
+      return {
+        running: (liveStatus(entry.id) ?? entry.status) === 'running',
+        ...(ref.remote.mirrorId ? indexThreadRequests(entries, entry.id) : { requests: [], secretIds: [] }),
+      };
+    }
     const live = typeof threadTurnState === 'function' ? await Promise.resolve(threadTurnState(entry.id)).catch(() => null) : null;
     if (live?.ok) {
       const requests = (Array.isArray(live.requests) ? live.requests : [])
@@ -674,28 +982,49 @@ export const createBotThreadTools = ({
     return { running: (liveStatus(entry.id) ?? entry.status) === 'running', ...indexThreadRequests(entries, entry.id) };
   };
 
-  const pressRequest = async ({ entry, request, op, reply, botName }) => {
+  const pressRequest = async ({ ref, request, op, reply, botName }) => {
+    if (ref.remote) {
+      requireReachable(ref);
+      if (!remote || typeof remote.userAction !== 'function') {
+        return { ok: false, error: `Answering requests of threads on ${ref.remote.machineName} is not available here.` };
+      }
+      return Promise.resolve(
+        remote.userAction({
+          machineId: ref.remote.machineId,
+          threadId: ref.remote.hostThreadId,
+          actionId: request.id,
+          op,
+          ...(op === 'reply' ? { reply } : {}),
+          botName,
+        })
+      ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+    }
     if (typeof answerRequest !== 'function') return { ok: false, error: 'Answering thread requests is not available here.' };
     return Promise.resolve(
-      answerRequest({ threadId: entry.id, actionId: request.id, op, ...(op === 'reply' ? { reply } : {}), botName })
+      answerRequest({ threadId: ref.entry.id, actionId: request.id, op, ...(op === 'reply' ? { reply } : {}), botName })
     ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
   };
+
+  // Where a thread of another machine runs (results about this machine's own threads stay as they were).
+  const machineFields = (ref) => (ref.remote ? { machine: ref.machine, hostThreadId: ref.remote.hostThreadId } : {});
 
   /**
    * answer_thread_request: Done, Reply or dismiss on a thread's "Needs you"
    * card, for the person. `exact`: the full thread id only (a request queued
    * on Durango). `botName`: shown to the thread with the answer.
    */
-  const answer = async (input = {}, { exact = false, botName = '' } = {}) => {
+  const answer = async (input = {}, { exact = false, botName = '', skipHosts = [], matchHostIds = true } = {}) => {
     const op = String(input.answer ?? '').trim().toLowerCase();
     if (!BOT_REQUEST_ANSWERS.includes(op)) {
       return { ok: false, error: `Unsupported answer "${input.answer ?? ''}". Use one of: ${BOT_REQUEST_ANSWERS.join(', ')}.` };
     }
     const reply = String(input.reply ?? '').trim();
     if (op === 'reply' && !reply) return { ok: false, error: 'answer "reply" needs `reply`: what the person said.' };
-    if (typeof answerRequest !== 'function') return { ok: false, error: 'Answering thread requests is not available here.' };
-    const { entry } = await findThread(input.thread_id, { exact });
-    const { requests, secretIds } = await turnState(entry);
+    const ref = await findThread(input.thread_id, { exact, skipHosts, matchHostIds });
+    // Its machine out of remote control's reach: this copy's requests may be stale, so Durango answers it there.
+    requireReachable(ref);
+    if (!ref.remote && typeof answerRequest !== 'function') return { ok: false, error: 'Answering thread requests is not available here.' };
+    const { requests, secretIds } = await turnState(ref);
     const wanted = String(input.request_id ?? '').trim();
     let request = null;
     if (wanted) {
@@ -723,22 +1052,31 @@ export const createBotThreadTools = ({
           : 'That thread has no pending "Needs you" request: it was answered or cleared already.',
       };
     }
-    const result = await pressRequest({ entry, request, op, reply, botName });
+    const result = await pressRequest({ ref, request, op, reply, botName });
     if (!result?.ok) return { ok: false, error: result?.error || 'The request could not be answered.' };
-    return { ok: true, threadId: entry.id, requestId: request.id, answer: op, request: request.action, note: REQUEST_ANSWER_NOTES[op] };
+    return {
+      ok: true,
+      threadId: ref.entry.id,
+      ...machineFields(ref),
+      requestId: request.id,
+      answer: op,
+      request: request.action,
+      note: REQUEST_ANSWER_NOTES[op],
+    };
   };
 
   /**
-   * Before a bot's message_thread (or steer) to `entry`: a thread waiting on
-   * one "Needs you" request takes the message as the reply to it, as the
-   * person's Reply button would (it carries on in its own turn, and its own
-   * task reports as usual), rather than refusing it as busy.
+   * Before a bot's message_thread (or steer) to a thread: one waiting on one
+   * "Needs you" request takes the message as the reply to it, as the person's
+   * Reply button would (it carries on in its own turn, and its own task
+   * reports as usual), rather than refusing it as busy.
    * → `{ result }` when that settled it (the tool's result), else
    *   `{ running }` for an ordinary follow-up or steer.
    */
-  const routeMessage = async (entry, { message, botName = '' } = {}) => {
-    const state = await turnState(entry);
-    if (!state.requests.length || typeof answerRequest !== 'function') return { running: state.running };
+  const routeMessage = async (refOrEntry, { message, botName = '' } = {}) => {
+    const ref = await refOf(refOrEntry);
+    const state = await turnState(ref);
+    if (!state.requests.length || (!ref.remote && typeof answerRequest !== 'function')) return { running: state.running };
     if (state.requests.length > 1) {
       return {
         result: {
@@ -748,7 +1086,7 @@ export const createBotThreadTools = ({
       };
     }
     const [request] = state.requests;
-    const result = await pressRequest({ entry, request, op: 'reply', reply: message, botName });
+    const result = await pressRequest({ ref, request, op: 'reply', reply: message, botName });
     if (!result?.ok) {
       // Answered meanwhile (by the person, its check, the agent): an ordinary message then.
       if (/no longer waiting/i.test(String(result?.error ?? ''))) return { running: state.running };
@@ -757,7 +1095,8 @@ export const createBotThreadTools = ({
     return {
       result: {
         ok: true,
-        threadId: entry.id,
+        threadId: ref.entry.id,
+        ...machineFields(ref),
         answeredRequest: request.id,
         request: request.action,
         note: "That thread was waiting on the person for this request, so your message went to it as their reply (as the Reply button on its card would): it carries on from there. No new task was started; the thread's own task reports as usual. When the person says they did what it asked, answer_thread_request with answer \"done\" is the plainer signal.",
@@ -765,21 +1104,96 @@ export const createBotThreadTools = ({
     };
   };
 
-  const manage = async (input = {}, { exact = false } = {}) => {
+  /** Steer the running turn of a thread on another machine (message_thread `steer`), through remote control. */
+  const steerRemote = async (ref, prompt) => {
+    requireReachable(ref);
+    if (!remote || typeof remote.steer !== 'function') {
+      return { ok: false, error: `Steering threads on ${ref.remote.machineName} is not available here.` };
+    }
+    const result = await Promise.resolve(
+      remote.steer({ machineId: ref.remote.machineId, threadId: ref.remote.hostThreadId, prompt })
+    ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+    if (!result?.ok) return { ok: false, error: result?.error || 'That turn could not be steered.' };
+    return { ok: true, threadId: ref.entry.id, ...machineFields(ref), steered: true, note: `Steered the running turn in that thread (on ${ref.remote.machineName}).` };
+  };
+
+  /**
+   * manage_thread on a thread of another machine: filing it (settle, snooze,
+   * pin and their undo) and stopping it go to that machine through remote
+   * control, like this sidebar's own buttons on it; renaming, configuring,
+   * branching and deleting it are that machine's own, so `forward` hands them
+   * to Durango for it (a reply here), or the result says where (`elsewhere`).
+   */
+  const manageRemote = async (ref, action, input, { forward = null } = {}) => {
+    const where = ref.remote.machineName;
+    if (FORWARDED_ACTIONS.has(action)) {
+      const elsewhere = { machine: where, threadId: ref.remote.hostThreadId };
+      if (typeof forward !== 'function') {
+        return { ok: false, elsewhere, error: `That thread runs on ${where}: "${action}" has to run there.` };
+      }
+      const send = (body, attempt) =>
+        Promise.resolve(forward('manage_thread', body, { attempt })).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+      const body = { ...input, action, thread_id: ref.remote.hostThreadId };
+      let forwarded = await send({ ...body, run_on: where }, 0);
+      // Durango may know that machine by another name: it then finds it by the thread
+      // (a second call of its own, not the first one's recorded result).
+      if (forwarded?.ok === false && /no machine called|unknown machine/i.test(String(forwarded.error ?? ''))) forwarded = await send(body, 1);
+      if (!forwarded?.ok) return forwarded ?? { ok: false, error: 'Durango did not take it.' };
+      // A branch answers with the new thread (on that machine): keep its id.
+      if (action === 'branch') return { ...forwarded, branchedFrom: ref.entry.id, machine: where };
+      return { ...forwarded, threadId: ref.entry.id, ...machineFields(ref) };
+    }
+    requireReachable(ref);
+    if (!remote) return { ok: false, error: `Managing threads on ${where} is not available here.` };
+    if (action === 'stop') {
+      const result = await Promise.resolve(remote.stop({ machineId: ref.remote.machineId, threadId: ref.remote.hostThreadId })).catch(
+        (error) => ({ ok: false, error: error?.message ?? String(error) })
+      );
+      if (!result?.ok) return { ok: false, error: result?.error || 'No running turn on that thread.' };
+      return { ok: true, threadId: ref.entry.id, ...machineFields(ref), action, note: `${ACTION_NOTES.stop} (on ${where})` };
+    }
+    const toState = SIDEBAR_STATE_FOR_ACTION[action];
+    if (!toState) return { ok: false, error: `Unsupported thread action "${action}".` };
+    if (action === 'settle') {
+      const thread = await hostThreadNow(ref);
+      if ((thread?.status ?? ref.entry.status) === 'running') {
+        return { ok: false, error: 'That thread is running a turn: settle it only once its work is finished.' };
+      }
+    }
+    const result = await Promise.resolve(
+      remote.setState({ machineId: ref.remote.machineId, threadId: ref.remote.hostThreadId, state: toState(new Date().toISOString()) })
+    ).catch((error) => ({ ok: false, error: error?.message ?? String(error) }));
+    if (!result?.ok) return { ok: false, error: result?.error || `The thread could not be updated (${action}).` };
+    return {
+      ok: true,
+      threadId: ref.entry.id,
+      ...machineFields(ref),
+      action,
+      ...(action === 'settle' ? { settled: true } : {}),
+      note: `${ACTION_NOTES[action]} (on ${where}, and in every sidebar that shows it)`,
+    };
+  };
+
+  const manage = async (input = {}, { exact = false, skipHosts = [], forward = null, matchHostIds = true } = {}) => {
     const action = String(input.action ?? '').trim().toLowerCase();
     if (!BOT_THREAD_ACTIONS.includes(action)) {
       return { ok: false, error: `Unsupported thread action "${action}". Use one of: ${BOT_THREAD_ACTIONS.join(', ')}.` };
-    }
-    const runner = manageThread ?? (action === 'settle' && settleThread ? ({ threadId }) => settleThread(threadId) : null);
-    if (!runner) {
-      return { ok: false, error: action === 'settle' ? 'Settling threads is not available here.' : `Managing threads (${action}) is not available here.` };
     }
     const title = action === 'rename' ? String(input.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 200) : '';
     if (action === 'rename' && !title) {
       return { ok: false, error: 'A new title is required to rename a thread.' };
     }
+    const runner = manageThread ?? (action === 'settle' && settleThread ? ({ threadId }) => settleThread(threadId) : null);
+    const unavailable = {
+      ok: false,
+      error: action === 'settle' ? 'Settling threads is not available here.' : `Managing threads (${action}) is not available here.`,
+    };
+    if (!runner && !remote) return unavailable;
     // Destructive deletes always require the exact full thread id (never a prefix).
-    const { entry } = await findThread(input.thread_id, { exact: exact || action === 'delete' });
+    const ref = await findThread(input.thread_id, { exact: exact || action === 'delete', skipHosts, matchHostIds });
+    if (ref.remote) return manageRemote(ref, action, { ...input, ...(title ? { title } : {}) }, { forward });
+    if (!runner) return unavailable;
+    const { entry } = ref;
     // The renderer refuses a running thread too (the index's status can be stale).
     if (action === 'settle' && liveStatus(entry.id) === 'running') {
       return { ok: false, error: 'That thread is running a turn: settle it only once its work is finished.' };
@@ -866,10 +1280,281 @@ export const createBotThreadTools = ({
     };
   };
 
+  // --- listing ---------------------------------------------------------------------------
+
+  const stateMatches = (flags, stateFilter) => {
+    if (stateFilter === 'active') return !flags.settled && !flags.snoozed;
+    if (stateFilter === 'settled') return flags.settled;
+    if (stateFilter === 'snoozed') return flags.snoozed;
+    if (stateFilter === 'pinned') return flags.pinned;
+    return true;
+  };
+
+  /**
+   * list_threads: this machine's threads and every reachable paired machine's, newest first.
+   * `own_only` (input): this machine's own only (Durango asked this machine alone).
+   * `quiet` (option): a project or machine this machine doesn't know is an empty
+   * list, not an error (Durango's thread calls: another machine may have it).
+   */
+  const list = async (input = {}, { skipHosts = [], quiet = false } = {}) => {
+    const [{ entries }, view, here] = await Promise.all([readIndex(), projectView(), thisMachine()]);
+    const wantedProject = projectKey(input.project);
+    const wantedMachine = machineNameKey(input.machine);
+    const stateFilter = String(input.state ?? 'all').trim().toLowerCase();
+    const limit = Math.min(MAX_LISTED, Math.max(1, Number.isInteger(input.limit) ? input.limit : 15));
+    const withSubagents = input.include_subagents === true;
+    const projectMatches = (name, folder) =>
+      !wantedProject || projectKey(name) === wantedProject || (folder && projectKey(path.basename(folder)) === wantedProject);
+    const machineMatches = (name) => !wantedMachine || machineNameKey(name) === wantedMachine;
+
+    const rows = [];
+    // This machine's own threads: only what the sidebar shows (sidebarThreadRoots);
+    // a subagent thread is counted on the thread it sits under, or listed with
+    // include_subagents. A provider's own subagent (isProviderSubagent) runs
+    // inside its parent's session and can't be read or messaged: never listed.
+    const own = entries.filter((entry) => !mirrorRemoteOf(entry));
+    const rootFor = sidebarThreadRoots(own);
+    const roots = new Map();
+    const subagentCounts = new Map();
+    for (const entry of own) {
+      const root = rootFor(entry);
+      if (!root) continue;
+      roots.set(entry.id, root);
+      if (root !== entry && !isProviderSubagent(entry)) subagentCounts.set(root.id, (subagentCounts.get(root.id) ?? 0) + 1);
+    }
+    if (machineMatches(here)) {
+      for (const entry of own) {
+        if (isProviderSubagent(entry) || !view.localOk(entry.projectId)) continue;
+        const project = view.projects.get(entry.projectId);
+        if (!projectMatches(view.localName(entry.projectId), project?.path)) continue;
+        const root = roots.get(entry.id);
+        if (!root || (root !== entry && !withSubagents)) continue;
+        // A subagent thread is filed with its parent: its parent's flags.
+        const flags = entrySidebarFlags(root);
+        if (!stateMatches(flags, stateFilter)) continue;
+        const subagents = subagentCounts.get(entry.id) ?? 0;
+        const shell = entry.shell ?? entry;
+        const model = entry.modelId ?? shell?.modelId ?? null;
+        const effort = threadActiveEffort({ ...shell, ...(model ? { modelId: model } : {}) });
+        const accessMode = typeof shell?.accessMode === 'string' && shell.accessMode ? shell.accessMode : null;
+        const { requests } = indexThreadRequests(entries, entry.id);
+        rows.push({
+          at: threadActivityMs(entry),
+          thread: {
+            id: entry.id,
+            title: entry.title || '(untitled)',
+            project: view.localName(entry.projectId),
+            machine: here,
+            status: liveStatus(entry.id) ?? entry.status ?? 'idle',
+            ...(model ? { model } : {}),
+            ...(effort ? { effort } : {}),
+            ...(accessMode ? { accessMode } : {}),
+            ...(root !== entry ? { subagent: true, parentThreadId: entry.parentThreadId ?? entry.shell?.parentThreadId ?? null } : {}),
+            ...(flags.settled ? { settled: true } : {}),
+            ...(flags.snoozed ? { snoozed: true } : {}),
+            ...(flags.pinned ? { pinned: true } : {}),
+            ...(subagents ? { subagents } : {}),
+            ...(requests.length ? { needsYou: requests } : {}),
+            messages: entry.messageCount ?? null,
+            lastActivity: iso(threadActivityMs(entry) || null),
+          },
+        });
+      }
+    }
+
+    // Other machines: each one's live listing (its own sidebar), under the
+    // id of this sidebar's mirror of a thread when there is one; the mirrors
+    // as last fetched when that machine can't be reached now.
+    const mirrorsByHost = new Map();
+    for (const entry of entries) {
+      const mirror = mirrorRemoteOf(entry);
+      if (!mirror || isProviderSubagent(entry)) continue;
+      if (!mirrorsByHost.has(mirror.machineId)) mirrorsByHost.set(mirror.machineId, new Map());
+      mirrorsByHost.get(mirror.machineId).set(mirror.threadId, entry);
+    }
+    const unreachable = [];
+    const skip = new Set((Array.isArray(skipHosts) ? skipHosts : []).map(machineNameKey).filter(Boolean));
+    const ownOnly = input.own_only === true;
+    const hosts = ownOnly ? [] : (await remoteHosts(skipHosts)).filter((host) => machineMatches(host.name));
+    // Machines this sidebar mirrors but can't reach through remote control now
+    // (turned off, unpaired since): their mirrors as last seen.
+    const reachableIds = new Set(hosts.map((host) => host.id));
+    const pairedIds = new Set((await remoteHosts()).map((host) => host.id));
+    const mirroredOnly = [...mirrorsByHost.entries()]
+      .filter(([machineId]) => !reachableIds.has(machineId) && !pairedIds.has(machineId))
+      .map(([machineId, mirrors]) => ({ id: machineId, name: mirrorRemoteOf(mirrors.values().next().value)?.machineName || 'another machine', offline: true }))
+      .filter((host) => !ownOnly && !skip.has(machineNameKey(host.name)) && machineMatches(host.name));
+    await Promise.all(
+      [...hosts, ...mirroredOnly].map(async (host) => {
+        const mirrors = mirrorsByHost.get(host.id) ?? new Map();
+        const { snapshot, error } = host.offline
+          ? { error: 'remote control does not reach it from here now' }
+          : await hostSnapshot(host, { fresh: true });
+        if (snapshot) {
+          const threads = (snapshot.threads ?? []).filter((thread) => thread && typeof thread.id === 'string' && !thread.subagent);
+          const childCounts = new Map();
+          for (const thread of threads) {
+            if (thread.parentThreadId) childCounts.set(thread.parentThreadId, (childCounts.get(thread.parentThreadId) ?? 0) + 1);
+          }
+          const byId = new Map(threads.map((thread) => [thread.id, thread]));
+          for (const thread of threads) {
+            const child = isSnapshotChild(thread);
+            if (child && !withSubagents) continue;
+            if (!child && isSnapshotDraft(thread)) continue;
+            const projectName = snapshotProjectName(snapshot, thread.projectId);
+            if (!view.remoteOk(projectName)) continue;
+            const folder = (snapshot.projects ?? []).find((project) => project?.id === thread.projectId)?.path;
+            if (!projectMatches(projectName, folder)) continue;
+            const parent = thread.parentThreadId ? byId.get(thread.parentThreadId) : null;
+            const filed = parent ?? thread;
+            const flags = { settled: Boolean(filed.settledAt), snoozed: Boolean(filed.snoozedAt && !filed.settledAt), pinned: Boolean(filed.pinnedAt) };
+            if (!stateMatches(flags, stateFilter)) continue;
+            const mirror = mirrors.get(thread.id);
+            const effort = threadActiveEffort({ ...(thread.settings ?? {}), modelId: thread.modelId });
+            const accessMode = typeof thread.settings?.accessMode === 'string' ? thread.settings.accessMode : null;
+            const { requests } = snapshotRequests(thread);
+            const subagents = childCounts.get(thread.id) ?? 0;
+            rows.push({
+              at: timeMs(thread.updatedAt) ?? 0,
+              thread: {
+                id: mirror?.id ?? thread.id,
+                ...(mirror ? { hostThreadId: thread.id } : {}),
+                title: thread.title || '(untitled)',
+                project: projectName,
+                machine: host.name,
+                status: thread.status ?? 'idle',
+                ...(thread.modelId ? { model: thread.modelId } : {}),
+                ...(effort ? { effort } : {}),
+                ...(accessMode ? { accessMode } : {}),
+                ...(child ? { subagent: true, parentThreadId: mirrors.get(thread.parentThreadId)?.id ?? thread.parentThreadId ?? null } : {}),
+                ...(flags.settled ? { settled: true } : {}),
+                ...(flags.snoozed ? { snoozed: true } : {}),
+                ...(flags.pinned ? { pinned: true } : {}),
+                ...(subagents ? { subagents } : {}),
+                ...(requests.length ? { needsYou: requests } : {}),
+                ...(thread.workspaceName ? { workspace: thread.workspaceName } : {}),
+                messages: Number.isInteger(thread.messageCount) ? thread.messageCount : null,
+                lastActivity: iso(thread.updatedAt),
+              },
+            });
+          }
+          return;
+        }
+        unreachable.push({ machine: host.name, error });
+        for (const entry of mirrors.values()) {
+          const mirror = mirrorRemoteOf(entry);
+          const projectName = view.localName(entry.projectId) ?? mirror.projectName ?? null;
+          if (!view.localOk(entry.projectId) && !view.remoteOk(mirror.projectName)) continue;
+          if (!projectMatches(projectName, view.projects.get(entry.projectId)?.path)) continue;
+          if (entry.parentThreadId ?? entry.shell?.parentThreadId) continue;
+          if (entry.messageCount === 0) continue;
+          const flags = entrySidebarFlags(entry);
+          if (!stateMatches(flags, stateFilter)) continue;
+          rows.push({
+            at: threadActivityMs(entry),
+            thread: {
+              id: entry.id,
+              hostThreadId: mirror.threadId,
+              title: entry.title || '(untitled)',
+              project: projectName,
+              machine: host.name,
+              status: entry.status ?? 'idle',
+              ...(entry.modelId ? { model: entry.modelId } : {}),
+              ...(flags.settled ? { settled: true } : {}),
+              ...(flags.snoozed ? { snoozed: true } : {}),
+              ...(flags.pinned ? { pinned: true } : {}),
+              messages: entry.messageCount ?? null,
+              lastActivity: iso(threadActivityMs(entry) || null),
+              stale: true,
+            },
+          });
+        }
+      })
+    );
+
+    if (wantedProject && rows.length === 0) {
+      const known = new Set([...view.projects.values()].map((project) => project.name));
+      for (const host of hosts) {
+        const { snapshot } = await hostSnapshot(host);
+        for (const project of snapshot?.projects ?? []) if (project?.name && project.id !== NO_PROJECT_ID) known.add(project.name);
+      }
+      if (![...known].some((name) => projectKey(name) === wantedProject)) {
+        // Durango tells "no such project here" apart from "nothing matches".
+        if (quiet) return { ok: true, threads: [], unknownProject: true };
+        return { ok: false, error: `No project "${input.project}" on the person's machines. Projects: ${[...known].join(', ') || 'none'}.` };
+      }
+    }
+    if (wantedMachine && !machineMatches(here) && hosts.length === 0) {
+      if (quiet) return { ok: true, threads: [] };
+      const names = [here, ...(await remoteHosts()).map((host) => host.name)];
+      return { ok: false, error: `No machine "${input.machine}" reachable from here. Machines: ${names.join(', ')}.` };
+    }
+    rows.sort((left, right) => right.at - left.at);
+    return {
+      ok: true,
+      threads: rows.slice(0, limit).map((row) => row.thread),
+      ...(rows.length > limit ? { more: rows.length - limit } : {}),
+      ...(unreachable.length
+        ? {
+            unreachable,
+            note: `Couldn't reach ${unreachable.map((item) => item.machine).join(', ')} just now: its threads are listed as last seen here (stale).`,
+          }
+        : {}),
+    };
+  };
+
+  /** read_thread, from the machine the thread runs on (live). */
+  const read = async (input = {}, { skipHosts = [], exact = false } = {}) => {
+    const ref = await findThread(input.thread_id, { skipHosts, exact });
+    // Its machine out of remote control's reach: read it there through Durango, not this machine's last copy.
+    requireReachable(ref);
+    const page = {
+      ...(Number.isInteger(input.offset) ? { offset: input.offset } : {}),
+      ...(Number.isInteger(input.limit) ? { limit: input.limit } : {}),
+      ...(Number.isInteger(input.char_offset) ? { char_offset: input.char_offset } : {}),
+    };
+    const transcript =
+      ref.remote && !ref.remote.mirrorId
+        ? remote && typeof remote.readThread === 'function'
+          ? remote.readThread({ machineId: ref.remote.machineId, threadId: ref.remote.hostThreadId, ...page })
+          : Promise.resolve(`Reading threads on ${ref.remote.machineName} is not available here.`)
+        : readThread({ thread_id: ref.entry.id, ...page });
+    const [text, state] = await Promise.all([transcript, turnState(ref).catch(() => ({ requests: [], secretIds: [] }))]);
+    return {
+      ok: true,
+      threadId: ref.entry.id,
+      ...machineFields(ref),
+      transcript: text,
+      ...(state.requests.length ? { needsYou: state.requests } : {}),
+      ...(state.secretIds.length ? { secretRequests: state.secretIds.length } : {}),
+    };
+  };
+
+  /**
+   * Where a thread runs (Durango's thread calls, before a follow-up or another
+   * change): by its full id only, as a mutation it leads to must never act on a guess.
+   */
+  const locate = async (input = {}, { skipHosts = [] } = {}) => {
+    const ref = await findThread(input.thread_id, { exact: true, skipHosts });
+    const state = await turnState(ref).catch(() => ({ running: false, requests: [] }));
+    return {
+      ok: true,
+      own: !ref.remote,
+      threadId: ref.entry.id,
+      hostThreadId: ref.remote ? ref.remote.hostThreadId : ref.entry.id,
+      machine: ref.machine,
+      title: ref.entry.title || '(untitled)',
+      project: ref.projectName ?? null,
+      running: state.running === true,
+      ...(state.requests?.length ? { needsYou: state.requests } : {}),
+    };
+  };
+
   return {
     names: BOT_THREAD_TOOL_NAMES,
     definitions: BOT_THREAD_TOOLS,
     findThread,
+    turnState,
     isRunning: (threadId) => liveStatus(threadId) === 'running',
     async listModels(input = {}) {
       if (typeof listModels !== 'function') {
@@ -905,107 +1590,25 @@ export const createBotThreadTools = ({
         ...(filtered.length > models.length ? { truncated: true } : {}),
       };
     },
-    async list(input = {}) {
-      const [{ entries }, projects] = await Promise.all([readIndex(), projectsById()]);
-      const wanted = projectKey(input.project);
-      const project = wanted
-        ? [...projects.values()].find((candidate) => projectKey(candidate.name) === wanted || projectKey(path.basename(candidate.path ?? '')) === wanted)
-        : null;
-      if (wanted && !project) {
-        return {
-          ok: false,
-          error: `No project "${input.project}" on this computer. Projects: ${[...projects.values()].map((candidate) => candidate.name).join(', ') || 'none'}.`,
-        };
-      }
-      const stateFilter = String(input.state ?? 'all').trim().toLowerCase();
-      const limit = Math.min(MAX_LISTED, Math.max(1, Number.isInteger(input.limit) ? input.limit : 15));
-      const withSubagents = input.include_subagents === true;
-      // Only what the sidebar shows (sidebarThreadRoots); a subagent thread
-      // is counted on the thread it sits under, or listed with
-      // include_subagents. A provider's own subagent (isProviderSubagent) runs
-      // inside its parent's session and can't be read or messaged: never listed.
-      const rootFor = sidebarThreadRoots(entries);
-      const roots = new Map();
-      const subagentCounts = new Map();
-      for (const entry of entries) {
-        const root = rootFor(entry);
-        if (!root) continue;
-        roots.set(entry.id, root);
-        if (root !== entry && !isProviderSubagent(entry)) subagentCounts.set(root.id, (subagentCounts.get(root.id) ?? 0) + 1);
-      }
-      const threads = entries
-        .filter((entry) => {
-          if (isProviderSubagent(entry) || !projects.has(entry.projectId)) return false;
-          if (project && entry.projectId !== project.id) return false;
-          const root = roots.get(entry.id);
-          if (!root || (root !== entry && !withSubagents)) return false;
-          const flags = entrySidebarFlags(root);
-          if (stateFilter === 'active') return !flags.settled && !flags.snoozed;
-          if (stateFilter === 'settled') return flags.settled;
-          if (stateFilter === 'snoozed') return flags.snoozed;
-          if (stateFilter === 'pinned') return flags.pinned;
-          return true;
-        })
-        .sort((a, b) => (b.activityAt ?? b.updatedAt ?? 0) - (a.activityAt ?? a.updatedAt ?? 0))
-        .slice(0, limit)
-        .map((entry) => {
-          const root = roots.get(entry.id);
-          // A subagent thread is filed with its parent: its parent's flags.
-          const flags = entrySidebarFlags(root);
-          const subagents = subagentCounts.get(entry.id) ?? 0;
-          const shell = entry.shell ?? entry;
-          const model = entry.modelId ?? shell?.modelId ?? null;
-          const effort = threadActiveEffort({ ...shell, ...(model ? { modelId: model } : {}) });
-          const accessMode = typeof shell?.accessMode === 'string' && shell.accessMode ? shell.accessMode : null;
-          return {
-            id: entry.id,
-            title: entry.title || '(untitled)',
-            project: projects.get(entry.projectId)?.name ?? null,
-            status: liveStatus(entry.id) ?? entry.status ?? 'idle',
-            ...(model ? { model } : {}),
-            ...(effort ? { effort } : {}),
-            ...(accessMode ? { accessMode } : {}),
-            ...(root !== entry ? { subagent: true, parentThreadId: entry.parentThreadId ?? entry.shell?.parentThreadId ?? null } : {}),
-            ...(flags.settled ? { settled: true } : {}),
-            ...(flags.snoozed ? { snoozed: true } : {}),
-            ...(flags.pinned ? { pinned: true } : {}),
-            ...(subagents ? { subagents } : {}),
-            ...(() => {
-              const { requests } = indexThreadRequests(entries, entry.id);
-              return requests.length ? { needsYou: requests } : {};
-            })(),
-            messages: entry.messageCount ?? null,
-            lastActivity: iso(entry.activityAt ?? entry.updatedAt),
-          };
-        });
-      return { ok: true, threads };
-    },
-    async read(input = {}) {
-      const { entry } = await findThread(input.thread_id);
-      const [text, state] = await Promise.all([
-        readThread({
-          thread_id: entry.id,
-          ...(Number.isInteger(input.offset) ? { offset: input.offset } : {}),
-          ...(Number.isInteger(input.limit) ? { limit: input.limit } : {}),
-          ...(Number.isInteger(input.char_offset) ? { char_offset: input.char_offset } : {}),
-        }),
-        turnState(entry).catch(() => ({ requests: [], secretIds: [] })),
-      ]);
-      return {
-        ok: true,
-        transcript: text,
-        ...(state.requests.length ? { needsYou: state.requests } : {}),
-        ...(state.secretIds.length ? { secretRequests: state.secretIds.length } : {}),
-      };
+    list,
+    read,
+    locate,
+    /** This machine's name and the paired machines remote control reaches from here. */
+    async machines() {
+      return { here: await thisMachine(), hosts: await remoteHosts() };
     },
     /** answer_thread_request (Done / Reply / dismiss on a "Needs you" card). */
     answer,
     /** message_thread's check for a thread waiting on a request (see routeMessage). */
     routeMessage,
+    /** message_thread `steer` for a thread on another machine. */
+    steerRemote,
     /**
      * manage_thread: settle, unsettle, snooze, unsnooze, pin, unpin, rename,
-     * configure, branch, stop or delete any thread here. `exact`: the full id
-     * only (a request from Durango, which every machine of the person may get).
+     * configure, branch, stop or delete any thread here or on a paired
+     * machine. `exact`: the full id only (a request from Durango, which every
+     * machine of the person may get). `forward(tool, input)`: hands a paired
+     * machine's rename/configure/branch/delete to Durango for it.
      */
     manage,
     /** Legacy helper for queued settleThreads from Durango. */

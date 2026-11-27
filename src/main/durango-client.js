@@ -816,6 +816,25 @@ export const createDurangoClient = ({
                 ...(typeof item.modelId === 'string' && item.modelId ? { modelId: item.modelId } : {}),
                 ...(typeof item.reasoningEffort === 'string' && item.reasoningEffort ? { reasoningEffort: item.reasoningEffort } : {}),
                 ...(typeof item.accessMode === 'string' && item.accessMode ? { accessMode: item.accessMode } : {}),
+                // answer_request: the card button to press for the person (answer_thread_request from elsewhere).
+                ...(typeof item.answer === 'string' && item.answer ? { answer: item.answer } : {}),
+                ...(typeof item.requestId === 'string' && item.requestId ? { requestId: item.requestId } : {}),
+                ...(typeof item.reply === 'string' && item.reply ? { reply: item.reply } : {}),
+                ...(typeof item.botName === 'string' && item.botName ? { botName: item.botName } : {}),
+              }))
+          : [],
+        // Thread tools a bot's reply elsewhere (the cloud) runs here: list_threads,
+        // read_thread, locate_thread, steer_thread, manage_thread, answer_thread_request.
+        threadCalls: Array.isArray(data.threadCalls)
+          ? data.threadCalls
+              .filter((item) => item && typeof item === 'object' && typeof item.id === 'string' && item.id && typeof item.tool === 'string' && item.tool)
+              .slice(0, 10)
+              .map((item) => ({
+                id: item.id,
+                tool: item.tool,
+                input: item.input && typeof item.input === 'object' && !Array.isArray(item.input) ? item.input : {},
+                botName: typeof item.botName === 'string' ? item.botName.slice(0, 80) : '',
+                skipHosts: Array.isArray(item.skipHosts) ? item.skipHosts.filter((name) => typeof name === 'string').slice(0, 20) : [],
               }))
           : [],
         // The account has no bots: ask again only after this long.
@@ -870,6 +889,11 @@ export const createDurangoClient = ({
     /** Outcome of a person- or Ship-button-started turn in a bot-started thread → `{ ok }`. */
     async reportBotThreadTurn(body = {}) {
       const data = await request('POST', '/code/bots/threads/report', { body });
+      return { ok: data.ok === true };
+    },
+    /** A thread call's result (claim `threadCalls`): `{ machineId, callId, result }` → `{ ok }`. */
+    async completeBotThreadCall({ signal, ...body } = {}) {
+      const data = await request('POST', '/code/bots/threads/calls', { body, signal });
       return { ok: data.ok === true };
     },
     /** Notice while a person- or Ship-button-started turn in a bot-started thread needs the person or looks stuck. */
@@ -1545,6 +1569,10 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000, botLanesFile 
     },
     async reportBotThreadTurn() {
       return { ok: false };
+    },
+    async completeBotThreadCall(body = {}) {
+      mockLog({ kind: 'threadCall', ...body });
+      return { ok: true };
     },
     async noticeBotThreadTurn() {
       return { ok: false };

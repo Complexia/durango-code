@@ -173,7 +173,7 @@ export const taskReportActions = (content: string): BotAction[] => {
   // The refs line, else the thread footer (reports of threads Durango started have only that).
   const thread =
     /^Thread: @thread:([A-Za-z0-9_-]{1,128})\s*$/m.exec(content) ??
-    /\(Durango Code thread ([A-Za-z0-9_-]{1,128})(?=[,.])[^\n]*Follow up there[^\n]*\)/.exec(content);
+    /\(Durango Code thread ([A-Za-z0-9_-]{1,128})(?=[,.])[^\n]*[Ff]ollow up there[^\n]*\)/.exec(content);
   const change = /^Change: (chg_[a-z0-9]{8,40})(?: \((\w+)\))?(?: (https?:\/\/\S+))?\s*$/m.exec(content);
   if (change) {
     const status = change[2];
@@ -499,7 +499,7 @@ export const relativeBotTime = (ms: number, now = Date.now()) => {
  * bot-thread-tools.js threadReportFooter), in either order.
  */
 const REPORT_REFS = /\n+---\n(?:(?:Thread|Change|Workspace): [^\n]*(?:\n|$))+\s*$/;
-const REPORT_FOOTER = /\n*\(Durango Code thread [A-Za-z0-9_-]{1,128}(?=[,.])[^\n]*Follow up there[^\n]*\)\s*$/;
+const REPORT_FOOTER = /\n*\(Durango Code thread [A-Za-z0-9_-]{1,128}(?=[,.])[^\n]*[Ff]ollow up there[^\n]*\)\s*$/;
 export const taskReportBody = (content: string) => {
   let body = content;
   for (let pass = 0; pass < 2; pass += 1) body = body.replace(REPORT_FOOTER, '').replace(REPORT_REFS, '');

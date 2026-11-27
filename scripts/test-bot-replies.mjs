@@ -1480,7 +1480,11 @@ try {
     assert.equal(tasks.length, 0, 'no task (and no failed task card) for answers or refusals');
     assert.equal(reports.length, 0);
     assert.deepEqual(followUps.map((input) => [input.threadId, input.steer === true]), [['thread_busy', true]]);
-    assert.deepEqual(client.calls.tool.map((call) => [call.name, call.input.thread_id]), [['answer_thread_request', 'thread_on_omarchy']], 'a thread not here: Durango hands it to its machine');
+    assert.deepEqual(
+      client.calls.tool.filter((call) => call.name !== 'list_threads').map((call) => [call.name, call.input.thread_id]),
+      [['answer_thread_request', 'thread_on_omarchy']],
+      'a thread not here: Durango hands it to its machine (list_threads also asks Durango for other machines)'
+    );
   });
 
   await test('"Needs you" requests: a follow-up the renderer turned into the reply to a fresh request ends its task at once; queued answers from Durango run with the bot name', async () => {
@@ -1742,14 +1746,548 @@ try {
     assert.match((await noManage.manage({ thread_id: 'x', action: 'snooze' })).error, /not available/);
   });
 
+  // --- threads on the person's other machines (remote control) ------------------------
+  const remoteFixture = () => {
+    const calls = { snapshot: 0, read: [], steer: [], stop: [], setState: [], userAction: [] };
+    const hostThreads = [
+      {
+        id: 'host_build',
+        projectId: 'hp_fm',
+        title: 'Build FutureMail Agent Channel',
+        status: 'running',
+        modelId: 'antigravity:gemini-4-neon',
+        updatedAt: '2026-11-27T06:20:00.000Z',
+        messageCount: 3,
+        settings: { accessMode: 'full-access', antigravityReasoningEffort: 'high' },
+        userActions: [{ id: 'ua_login', action: 'Sign in to Railway', ownerThreadId: 'host_build_sub' }],
+      },
+      { id: 'host_build_sub', projectId: 'hp_fm', parentThreadId: 'host_build', title: 'Review', status: 'idle', updatedAt: '2026-11-27T06:21:00.000Z', messageCount: 2 },
+      { id: 'host_new', projectId: 'hp_fm', title: 'Not mirrored yet', status: 'idle', updatedAt: '2026-11-27T05:00:00.000Z', messageCount: 4 },
+      { id: 'host_np', projectId: 'orion:no-project', title: 'Quick question', status: 'done', updatedAt: '2026-11-27T04:00:00.000Z', messageCount: 2, settledAt: '2026-11-27T04:30:00.000Z' },
+      { id: 'host_draft', projectId: 'hp_fm', title: 'Blank', status: 'idle', updatedAt: '2026-11-27T07:00:00.000Z', messageCount: 0 },
+      { id: 'host_other', projectId: 'hp_secret', title: 'Elsewhere project', status: 'idle', updatedAt: '2026-11-27T03:00:00.000Z', messageCount: 2 },
+    ];
+    const entries = [
+      // This machine's own thread: the index keeps ISO times (never epoch ms).
+      { id: 'own_old', projectId: 'p_fm', title: 'Older here', status: 'done', messageCount: 3, activityAt: '2026-11-26T10:00:00.000Z' },
+      { id: 'own_new', projectId: 'p_fm', title: 'Newer here', status: 'done', messageCount: 3, activityAt: '2026-11-27T06:10:00.000Z' },
+      // This sidebar's mirror of the host thread (its own id here).
+      {
+        id: 'mirror_build',
+        projectId: 'p_fm',
+        title: 'Build FutureMail Agent Channel',
+        status: 'running',
+        messageCount: 3,
+        activityAt: '2026-11-27T06:17:11.058Z',
+        shell: { remote: { machineId: 'rc_omarchy', machineName: 'omarchy', threadId: 'host_build', projectName: 'futuremail' } },
+      },
+    ];
+    let reachable = true;
+    const remote = {
+      hosts: () => [{ id: 'rc_omarchy', name: 'omarchy' }],
+      snapshot: async () => {
+        calls.snapshot += 1;
+        if (!reachable) return { ok: false, error: 'offline' };
+        return {
+          ok: true,
+          snapshot: {
+            machine: { id: 'rc_omarchy', name: 'omarchy' },
+            projects: [
+              { id: 'hp_fm', name: 'futuremail', path: '/home/me/futuremail' },
+              { id: 'hp_secret', name: 'secret', path: '/home/me/secret' },
+            ],
+            threads: hostThreads,
+          },
+        };
+      },
+      readThread: async (args) => {
+        calls.read.push(args);
+        return `host transcript of ${args.threadId}`;
+      },
+      steer: async (args) => {
+        calls.steer.push(args);
+        return { ok: true };
+      },
+      stop: async (args) => {
+        calls.stop.push(args);
+        return { ok: true };
+      },
+      setState: async (args) => {
+        calls.setState.push(args);
+        return { ok: true };
+      },
+      userAction: async (args) => {
+        calls.userAction.push(args);
+        return { ok: true };
+      },
+    };
+    const localReads = [];
+    const local = [];
+    const tools = (options = {}) =>
+      createBotThreadTools({
+        readIndex: async () => ({ entries }),
+        readThread: async (args) => {
+          localReads.push(args);
+          return `local read of ${args.thread_id}`;
+        },
+        getProjects: () => [{ id: 'p_fm', name: 'futuremail', path: '/Users/me/futuremail' }],
+        machineName: () => 'Roma’s MacBook Air',
+        manageThread: async (req) => {
+          local.push(req);
+          return { ok: true };
+        },
+        remote,
+        ...options,
+      });
+    return { calls, entries, hostThreads, remote, tools, localReads, local, setReachable: (value) => (reachable = value) };
+  };
+
+  await test('thread tools across machines: list_threads lists this machine and every reachable machine, newest first, with `machine`', async () => {
+    const fx = remoteFixture();
+    const listed = await fx.tools().list({});
+    assert.equal(listed.ok, true);
+    assert.deepEqual(
+      listed.threads.map((thread) => [thread.id, thread.machine, thread.status]),
+      [
+        ['mirror_build', 'omarchy', 'running'],
+        ['own_new', 'Roma’s MacBook Air', 'done'],
+        ['host_new', 'omarchy', 'idle'],
+        ['own_old', 'Roma’s MacBook Air', 'done'],
+      ],
+      'ISO times sort newest first; the mirror is listed once, under its id here, from the host listing; drafts, other projects and no-project threads stay out under an allowlist'
+    );
+    const build = listed.threads[0];
+    assert.equal(build.hostThreadId, 'host_build');
+    assert.equal(build.project, 'futuremail');
+    assert.equal(build.effort, 'high');
+    assert.equal(build.subagents, 1);
+    assert.deepEqual(build.needsYou, [{ id: 'ua_login', action: 'Sign in to Railway', threadId: 'host_build_sub' }]);
+    assert.equal(listed.threads[1].lastActivity, '2026-11-27T06:10:00.000Z', 'lastActivity is no longer null for ISO index times');
+    // No allowlist: threads outside a project and other machines' projects are listed too.
+    const all = await fx.tools({ allProjectsAllowed: () => true }).list({ limit: 40 });
+    assert.deepEqual(all.threads.map((thread) => thread.id).sort(), ['host_new', 'host_np', 'host_other', 'mirror_build', 'own_new', 'own_old']);
+    assert.equal(all.threads.find((thread) => thread.id === 'host_np').project, 'No project');
+    // Filters: by machine, by project, subagents.
+    assert.deepEqual((await fx.tools().list({ machine: 'omarchy' })).threads.map((thread) => thread.id), ['mirror_build', 'host_new']);
+    assert.deepEqual((await fx.tools().list({ machine: 'romas macbook air' })).threads.map((thread) => thread.id), ['own_new', 'own_old']);
+    assert.ok((await fx.tools().list({ include_subagents: true })).threads.some((thread) => thread.id === 'host_build_sub' && thread.parentThreadId === 'mirror_build'));
+    // A machine asked itself (Durango's skipHosts, by name) is left to it.
+    assert.deepEqual((await fx.tools().list({}, { skipHosts: ['Omarchy'] })).threads.map((thread) => thread.id), ['own_new', 'own_old']);
+    // Unreachable: its mirrors as last seen, marked stale.
+    fx.setReachable(false);
+    const offline = await fx.tools().list({});
+    assert.deepEqual(offline.threads.map((thread) => [thread.id, thread.stale ?? false]), [
+      ['mirror_build', true],
+      ['own_new', false],
+      ['own_old', false],
+    ]);
+    assert.match(offline.note, /Couldn't reach omarchy/);
+  });
+
+  await test('thread tools across machines: ids here or there resolve; read is live from the host; requests, settle, stop, steer go there', async () => {
+    const fx = remoteFixture();
+    const tools = fx.tools();
+    // The host's id (from a task report) finds this sidebar's mirror.
+    const byHostId = await tools.findThread('host_build');
+    assert.equal(byHostId.entry.id, 'mirror_build');
+    assert.deepEqual(byHostId.remote, { machineId: 'rc_omarchy', machineName: 'omarchy', hostThreadId: 'host_build', mirrorId: 'mirror_build', reachable: true });
+    // A host thread with no mirror here is found in the host's listing.
+    const unmirrored = await tools.findThread('host_new');
+    assert.equal(unmirrored.remote.mirrorId, null);
+    await assert.rejects(tools.findThread('host_other'), /No thread "host_other"/, 'a project bots may not use stays out');
+    await assert.rejects(tools.findThread('host_build', { skipHosts: ['omarchy'] }), (error) => error.notHere === true);
+
+    // Mirror: read through this machine's reader (it fetches from the host); no mirror: from the host directly.
+    const read = await tools.read({ thread_id: 'host_build', limit: 1 });
+    assert.equal(read.transcript, 'local read of mirror_build');
+    assert.equal(read.machine, 'omarchy');
+    assert.deepEqual(read.needsYou, [{ id: 'ua_login', action: 'Sign in to Railway', threadId: 'host_build_sub' }]);
+    assert.equal((await tools.read({ thread_id: 'host_new' })).transcript, 'host transcript of host_new');
+    assert.deepEqual(fx.calls.read, [{ machineId: 'rc_omarchy', threadId: 'host_new' }]);
+
+    const answered = await tools.answer({ thread_id: 'mirror_build', answer: 'done' });
+    assert.equal(answered.ok, true);
+    assert.deepEqual(fx.calls.userAction, [{ machineId: 'rc_omarchy', threadId: 'host_build', actionId: 'ua_login', op: 'done', botName: '' }]);
+    const routed = await tools.routeMessage(byHostId, { message: 'I signed in' });
+    assert.equal(routed.result.answeredRequest, 'ua_login');
+    assert.equal(fx.calls.userAction[1].op, 'reply');
+
+    assert.match((await tools.manage({ thread_id: 'host_build', action: 'settle' })).error, /running a turn/, 'the host says it runs');
+    const pinned = await tools.manage({ thread_id: 'host_build', action: 'pin' });
+    assert.equal(pinned.ok, true);
+    assert.equal(fx.calls.setState[0].threadId, 'host_build');
+    assert.ok(fx.calls.setState[0].state.pinnedAt);
+    assert.equal((await tools.manage({ thread_id: 'host_new', action: 'settle' })).ok, true);
+    assert.deepEqual(Object.keys(fx.calls.setState[1].state), ['settledAt']);
+    assert.equal((await tools.manage({ thread_id: 'mirror_build', action: 'stop' })).ok, true);
+    assert.deepEqual(fx.calls.stop, [{ machineId: 'rc_omarchy', threadId: 'host_build' }]);
+    assert.equal(fx.local.length, 0, 'nothing ran on this machine\'s renderer');
+    // Rename/configure/branch/delete are the host's own: forwarded to Durango, or reported as elsewhere.
+    const elsewhere = await tools.manage({ thread_id: 'host_build', action: 'rename', title: 'New name' });
+    assert.deepEqual(elsewhere.elsewhere, { machine: 'omarchy', threadId: 'host_build' });
+    const forwarded = [];
+    const viaDurango = await tools.manage(
+      { thread_id: 'host_build', action: 'rename', title: 'New name' },
+      { forward: async (name, input) => (forwarded.push({ name, input }), { ok: true, status: 'queued' }) }
+    );
+    assert.equal(viaDurango.ok, true);
+    assert.deepEqual(forwarded, [{ name: 'manage_thread', input: { thread_id: 'host_build', action: 'rename', title: 'New name', run_on: 'omarchy' } }]);
+    const steered = await tools.steerRemote(byHostId, 'Also check the docs');
+    assert.equal(steered.ok, true);
+    assert.deepEqual(fx.calls.steer, [{ machineId: 'rc_omarchy', threadId: 'host_build', prompt: 'Also check the docs' }]);
+    const located = await tools.locate({ thread_id: 'mirror_build' });
+    assert.deepEqual(
+      { own: located.own, threadId: located.threadId, hostThreadId: located.hostThreadId, machine: located.machine, running: located.running },
+      { own: false, threadId: 'mirror_build', hostThreadId: 'host_build', machine: 'omarchy', running: true }
+    );
+    assert.equal((await tools.locate({ thread_id: 'own_new' })).own, true);
+    await assert.rejects(tools.locate({ thread_id: 'mirror_b' }), (error) => error.notHere === true, 'locate (before a mutation from Durango) takes full ids only');
+    // A queued action Durango hands every machine: a mirror answers to its own id, never its host's (the host runs it).
+    await assert.rejects(tools.manage({ thread_id: 'host_build', action: 'pin' }, { exact: true, matchHostIds: false }), /No thread/);
+    assert.equal((await tools.manage({ thread_id: 'mirror_build', action: 'unpin' }, { exact: true, matchHostIds: false })).ok, true);
+    // Durango knows the host by another name: the forward is sent again without run_on.
+    const sentForwards = [];
+    const renamed = await tools.manage(
+      { thread_id: 'host_build', action: 'rename', title: 'X' },
+      {
+        forward: async (name, input) => {
+          sentForwards.push(input);
+          return input.run_on ? { ok: false, error: 'No machine called "omarchy". Known: omarchy-linux.' } : { ok: true, status: 'queued' };
+        },
+      }
+    );
+    assert.equal(renamed.ok, true);
+    assert.deepEqual(sentForwards.map((input) => input.run_on ?? null), ['omarchy', null]);
+  });
+
+  await test('review fixes: mirror ids with skipHosts, forwarded branch, prefixes, own_only, unreachable mirrors', async () => {
+    const fx = remoteFixture();
+    const tools = fx.tools();
+    // omarchy answers for itself (skipHosts): this machine still knows its own mirror id, and says where it runs.
+    const located = await tools.locate({ thread_id: 'mirror_build' }, { skipHosts: ['omarchy'] });
+    assert.deepEqual({ own: located.own, hostThreadId: located.hostThreadId, machine: located.machine }, { own: false, hostThreadId: 'host_build', machine: 'omarchy' });
+    await assert.rejects(tools.locate({ thread_id: 'host_build' }, { skipHosts: ['omarchy'] }), (error) => error.notHere === true, 'its id there is omarchy\'s to answer');
+    // A forwarded branch keeps the new fork's id (not the original's).
+    const branched = await tools.manage(
+      { thread_id: 'mirror_build', action: 'branch' },
+      { forward: async () => ({ ok: true, threadId: 'host_fork', branchedFrom: 'host_build', action: 'branch' }) }
+    );
+    assert.equal(branched.threadId, 'host_fork');
+    assert.equal(branched.branchedFrom, 'mirror_build');
+    assert.equal(branched.hostThreadId, undefined);
+    // The retry without run_on is a separate attempt (its own tool call id upstream).
+    const attempts = [];
+    await tools.manage(
+      { thread_id: 'mirror_build', action: 'rename', title: 'Y' },
+      { forward: async (name, input, options) => (attempts.push(options.attempt), input.run_on ? { ok: false, error: 'No machine called "omarchy".' } : { ok: true }) }
+    );
+    assert.deepEqual(attempts, [0, 1]);
+    // An exact id on a paired machine wins over a prefix here.
+    fx.entries.push({ id: 'host_new_extra', projectId: 'p_fm', title: 'Shadow', status: 'idle', messageCount: 2, activityAt: '2026-11-20T00:00:00.000Z' });
+    assert.equal((await tools.findThread('host_new')).entry.id, 'host_new', 'exact on omarchy beats a local prefix');
+    await assert.rejects(tools.findThread('host_n'), /matches several threads/, 'prefixes across machines are ambiguous');
+    fx.entries.pop();
+    // own_only: Durango asked this machine alone.
+    assert.deepEqual((await tools.list({ own_only: true })).threads.map((thread) => thread.machine), ['Roma’s MacBook Air', 'Roma’s MacBook Air']);
+    // quiet: a project only another machine has is an empty list for Durango.
+    assert.deepEqual(await tools.list({ project: 'studio-only' }, { quiet: true }), { ok: true, threads: [], unknownProject: true });
+    assert.deepEqual(await tools.list({ project: 'futuremail', state: 'pinned' }, { quiet: true }), { ok: true, threads: [] }, 'a known project with nothing matching is not unknown');
+    assert.equal((await tools.list({ project: 'studio-only' })).ok, false);
+    // A mirror of a machine remote control doesn't reach (pairing gone): actions say where it runs, so Durango can take them.
+    const unpaired = fx.tools({ remote: { ...fx.remote, hosts: () => [] } });
+    await assert.rejects(unpaired.manage({ thread_id: 'mirror_build', action: 'pin' }), (error) => error.notHere && error.elsewhere?.threadId === 'host_build' && error.elsewhere.machine === 'omarchy');
+    assert.equal((await unpaired.manage({ thread_id: 'mirror_build', action: 'rename', title: 'Z' })).elsewhere.threadId, 'host_build', 'rename is the host\'s anyway');
+    // Its "Needs you" requests and transcript here may be stale: answers and reads go there too.
+    await assert.rejects(unpaired.answer({ thread_id: 'mirror_build', answer: 'done' }), (error) => error.notHere && error.elsewhere?.threadId === 'host_build');
+    await assert.rejects(unpaired.read({ thread_id: 'mirror_build' }), (error) => error.notHere && error.elsewhere?.machine === 'omarchy');
+    assert.equal(fx.calls.userAction.length, 0);
+    assert.equal(fx.calls.setState.length, 0);
+  });
+
+  await test('machine lane review fixes: retries get their own call ids; list_threads machine/project filters; unreachable mirrors go through Durango', async () => {
+    const fx = remoteFixture();
+    fx.hostThreads[0].status = 'idle';
+    fx.hostThreads[0].userActions = [];
+    // Durango records each tool call's result by its id: the same id again gets the first result back.
+    const recorded = new Map();
+    const served = [];
+    const client = createFakeClient({
+      claim: laneClaims([makeLane()]),
+      tool: (input) => {
+        if (recorded.has(input.toolCallId)) return recorded.get(input.toolCallId);
+        served.push([input.name, input.input]);
+        let result;
+        if (input.name === 'delegate_task') {
+          result = input.input.run_on ? { ok: false, error: 'No machine called "omarchy". Known: omarchy-linux.' } : { ok: true, taskId: 'task_x', threadId: input.input.thread_id, status: 'queued' };
+        } else if (input.name === 'list_threads') {
+          result = input.input.run_on === 'Studio' || input.input.project === 'studio-only'
+            ? { ok: true, threads: [{ id: 'studio_1', title: 'Studio thing', machine: 'Studio', status: 'idle', lastActivity: '2026-11-27T06:30:00.000Z' }] }
+            : { ok: true, threads: [{ id: 'host_build', title: 'Build', machine: 'omarchy', status: 'running', lastActivity: '2026-11-27T06:40:00.000Z' }] };
+        } else if (input.name === 'manage_thread') {
+          result = { ok: true, threadId: input.input.thread_id, status: 'queued' };
+        } else if (input.name === 'message_thread') {
+          result = input.input.run_on ? { ok: false, error: 'No machine called "omarchy". Known: omarchy-linux.' } : { ok: true, threadId: input.input.thread_id, steered: true };
+        } else {
+          result = { ok: false, error: 'No tool named x.' };
+        }
+        const response = { result };
+        recorded.set(input.toolCallId, response);
+        return response;
+      },
+    });
+    let results;
+    const unpairedRemote = { ...fx.remote, hosts: () => [] };
+    startWorker({
+      client,
+      threadTools: fx.tools(),
+      startThreadFollowUp: async () => ({ ok: true }),
+      runLane: async (lane, ctx) => {
+        const call = (name, input, id) => ctx.callTool({ name, input, toolCallId: id }).then((out) => out.result);
+        results = {
+          followUp: await call('message_thread', { thread_id: 'mirror_build', message: 'Ship it' }, 't1'),
+          onOmarchy: await call('list_threads', { machine: 'omarchy' }, 't2'),
+          onStudio: await call('list_threads', { machine: 'Studio' }, 't3'),
+          studioProject: await call('list_threads', { project: 'studio-only' }, 't4'),
+          // A thread on a machine this one doesn't control, named by a name Durango doesn't know: sent again without it.
+          farSteer: await call('message_thread', { thread_id: 'far_9', message: 'Go', steer: true, run_on: 'omarchy' }, 't5'),
+        };
+        return { text: 'ok' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(results.followUp.ok, true, 'the retry without run_on really ran');
+    assert.deepEqual(served.filter(([name]) => name === 'delegate_task').map(([, input]) => input.run_on ?? null), ['omarchy', null]);
+    assert.ok(results.onOmarchy.threads.every((thread) => thread.machine === 'omarchy'), 'a machine this one controls is listed from here only');
+    assert.ok(!served.some(([name, input]) => name === 'list_threads' && input.run_on === 'omarchy'));
+    assert.deepEqual(results.onStudio.threads.map((thread) => thread.id), ['studio_1'], 'another machine is Durango\'s to list (run_on), nothing from here');
+    assert.ok(served.some(([name, input]) => name === 'list_threads' && input.run_on === 'Studio' && !('machine' in input)));
+    assert.deepEqual(results.studioProject.threads.map((thread) => thread.id), ['studio_1'], 'a project only another machine has: Durango\'s list');
+    assert.equal(results.farSteer.steered, true);
+    assert.deepEqual(served.filter(([name]) => name === 'message_thread').map(([, input]) => input.run_on ?? null), ['omarchy', null]);
+
+    // A mirror whose machine remote control can't reach: Durango takes the action, with the thread's id there.
+    const client2 = createFakeClient({ claim: laneClaims([makeLane({ laneId: 'lane_2' })]), tool: () => ({ result: { ok: true, status: 'queued' } }) });
+    let pinned;
+    startWorker({
+      client: client2,
+      threadTools: fx.tools({ remote: unpairedRemote }),
+      startThreadFollowUp: async () => ({ ok: true }),
+      runLane: async (lane, ctx) => {
+        pinned = (await ctx.callTool({ name: 'manage_thread', input: { thread_id: 'mirror_build', action: 'pin' }, toolCallId: 'p1' })).result;
+        return { text: 'ok' };
+      },
+    });
+    await waitFor(() => client2.calls.finish.length === 1, { label: 'finish 2' });
+    assert.equal(pinned.ok, true);
+    assert.deepEqual(client2.calls.tool.map((call) => [call.name, call.input.thread_id, call.input.run_on]), [['manage_thread', 'host_build', 'omarchy']]);
+  });
+
+  await test('a steer from Durango to a thread waiting on one "Needs you" request answers it', async () => {
+    const fx = remoteFixture();
+    const posted = [];
+    let claims = 0;
+    const client = createFakeClient({
+      claim: async (input) => {
+        claims += 1;
+        if (claims === 1) {
+          return {
+            lane: null,
+            threadCalls: [
+              { id: 'tc_steer', tool: 'steer_thread', input: { thread_id: 'mirror_build', message: 'I signed in\n\n(Steered by your bot "Scout")' }, botName: 'Scout', skipHosts: [] },
+            ],
+          };
+        }
+        return laneClaims([])(input);
+      },
+    });
+    client.completeBotThreadCall = async (body) => (posted.push(body), { ok: true });
+    startWorker({ client, threadTools: fx.tools(), startThreadFollowUp: async () => ({ ok: true }), runLane: async () => ({ text: '' }) });
+    await waitFor(() => posted.length === 1, { label: 'steer result' });
+    assert.equal(posted[0].result.answeredRequest, 'ua_login');
+    assert.equal(fx.calls.steer.length, 0);
+    assert.deepEqual(fx.calls.userAction.map((call) => [call.op, call.reply]), [['reply', 'I signed in']], 'the answer goes without the steer line');
+
+    // A thread call on a mirror this machine can't reach: notHere, with where it runs.
+    const unpairedPosted = [];
+    let unpairedClaims = 0;
+    const client2 = createFakeClient({
+      claim: async (input) => {
+        unpairedClaims += 1;
+        if (unpairedClaims === 1) return { lane: null, threadCalls: [{ id: 'tc_pin', tool: 'manage_thread', input: { thread_id: 'mirror_build', action: 'pin' }, botName: 'Scout', skipHosts: [] }] };
+        return laneClaims([])(input);
+      },
+    });
+    client2.completeBotThreadCall = async (body) => (unpairedPosted.push(body), { ok: true });
+    startWorker({ client: client2, threadTools: fx.tools({ remote: { ...fx.remote, hosts: () => [] } }), runLane: async () => ({ text: '' }) });
+    await waitFor(() => unpairedPosted.length === 1, { label: 'unpaired result' });
+    assert.equal(unpairedPosted[0].result.notHere, true);
+    assert.deepEqual(unpairedPosted[0].result.elsewhere, { threadId: 'host_build', machine: 'omarchy' });
+  });
+
+  await test('message_thread to a thread on another machine: steers it there, or sends the follow-up through Durango to that machine', async () => {
+    const fx = remoteFixture();
+    fx.hostThreads[0].status = 'idle';
+    fx.hostThreads[0].userActions = [];
+    const client = createFakeClient({
+      claim: laneClaims([makeLane()]),
+      tool: (input) =>
+        input.name === 'delegate_task'
+          ? { result: { ok: true, taskId: 'task_remote', threadId: input.input.thread_id, status: 'queued' } }
+          : { result: { ok: true } },
+    });
+    client.createBotLaneTask = async () => {
+      throw new Error('a follow-up elsewhere is Durango\'s task, not this machine\'s');
+    };
+    const followUps = [];
+    let results;
+    startWorker(
+      {
+        client,
+        getMachineInfo: async () => ({ name: 'Roma’s MacBook Air', projects: [], models: [] }),
+        startProjectThread: async () => ({ ok: true, threadId: 'unused' }),
+        startThreadFollowUp: async (input) => (followUps.push(input), { ok: true }),
+        threadTools: fx.tools(),
+        runLane: async (lane, ctx) => {
+          const call = (name, input) => ctx.callTool({ name, input, toolCallId: `t_${name}` }).then((out) => out.result);
+          results = {
+            followUp: await call('message_thread', { thread_id: 'mirror_build', message: 'Ship it', model: 'antigravity:gemini-4-neon', access_mode: 'workspace-write' }),
+            steer: await call('message_thread', { thread_id: 'host_build', message: 'Wrap up', steer: true }),
+            shipByDelegate: await call('delegate_task', { title: 'Ship', instructions: 'Ship this change now.', thread_id: 'host_build' }),
+            rename: await call('manage_thread', { thread_id: 'host_build', action: 'rename', title: 'Agent Channel' }),
+            stop: await call('manage_thread', { thread_id: 'host_build', action: 'stop' }),
+          };
+          return { text: 'Done.' };
+        },
+      },
+      { accessMode: 'full-access' }
+    );
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(followUps.length, 0, 'nothing runs in this machine\'s renderer');
+    assert.equal(results.followUp.ok, true);
+    assert.equal(results.followUp.threadId, 'mirror_build');
+    assert.equal(results.followUp.hostThreadId, 'host_build');
+    assert.equal(results.followUp.machine, 'omarchy');
+    const sent = client.calls.tool.map((call) => [call.name, call.input]);
+    assert.deepEqual(sent[0], [
+      'delegate_task',
+      { title: 'Follow-up: Build FutureMail Agent Channel', instructions: 'Ship it', thread_id: 'host_build', model: 'antigravity:gemini-4-neon', run_on: 'omarchy' },
+    ]);
+    assert.equal(results.steer.ok, true);
+    assert.match(fx.calls.steer[0].prompt, /^Wrap up\n\n\(Steered by your bot "Scout"\)$/);
+    assert.equal(sent[1][0], 'delegate_task');
+    assert.equal(sent[1][1].thread_id, 'host_build');
+    assert.deepEqual(sent[2], ['manage_thread', { thread_id: 'host_build', action: 'rename', title: 'Agent Channel', run_on: 'omarchy' }]);
+    assert.equal(results.stop.ok, true);
+    assert.equal(fx.calls.stop.length, 1);
+    assert.equal(sent[2][0], 'manage_thread');
+    assert.ok(client.calls.tool[2].toolCallId.startsWith('t_manage_thread'), 'a forward keeps its tool call id');
+  });
+
+  await test('a thread on a machine this one does not reach: read and follow up through Durango; list_threads adds what Durango lists', async () => {
+    const fx = remoteFixture();
+    const client = createFakeClient({
+      claim: laneClaims([makeLane()]),
+      tool: (input) => {
+        if (input.name === 'read_thread') return { result: { ok: true, threadId: 'far_1', machine: 'Studio', transcript: 'far away' } };
+        if (input.name === 'delegate_task') return { result: { ok: true, taskId: 'task_far', threadId: input.input.thread_id, status: 'queued' } };
+        if (input.name === 'list_threads') {
+          return {
+            result: {
+              ok: true,
+              threads: [
+                { id: 'far_1', title: 'On the studio Mac', machine: 'Studio', status: 'idle', lastActivity: '2026-11-27T06:15:00.000Z' },
+                // What this machine told Durango itself, and omarchy's own row of the mirrored thread: not twice.
+                { id: 'own_new', title: 'Newer here', machine: 'Roma’s MacBook Air', status: 'done', lastActivity: '2026-11-27T06:10:00.000Z' },
+                { id: 'host_build', title: 'Build', machine: 'omarchy', status: 'running', lastActivity: '2026-11-27T06:20:00.000Z' },
+              ],
+            },
+          };
+        }
+        return { result: { ok: false, error: 'No tool named x.' } };
+      },
+    });
+    let results;
+    startWorker({
+      client,
+      threadTools: fx.tools(),
+      startThreadFollowUp: async () => ({ ok: true }),
+      runLane: async (lane, ctx) => {
+        const call = (name, input) => ctx.callTool({ name, input, toolCallId: `t_${name}` }).then((out) => out.result);
+        results = {
+          read: await call('read_thread', { thread_id: 'far_1' }),
+          message: await call('message_thread', { thread_id: 'far_1', message: 'Ship it', title: 'Ship' }),
+          list: await call('list_threads', { limit: 10 }),
+        };
+        return { text: 'ok' };
+      },
+    });
+    await waitFor(() => client.calls.finish.length === 1, { label: 'finish' });
+    assert.equal(results.read.transcript, 'far away');
+    assert.equal(results.message.ok, true);
+    assert.deepEqual(client.calls.tool.find((call) => call.name === 'delegate_task').input, { title: 'Ship', instructions: 'Ship it', thread_id: 'far_1' });
+    assert.deepEqual(results.list.threads.map((thread) => thread.id), ['mirror_build', 'far_1', 'own_new', 'host_new', 'own_old']);
+  });
+
+  await test('thread calls from Durango (a cloud reply): run here, results posted once, notHere for a thread this machine does not have', async () => {
+    const fx = remoteFixture();
+    const posted = [];
+    let claims = 0;
+    const client = createFakeClient({
+      claim: async (input) => {
+        claims += 1;
+        if (claims === 1) {
+          assert.ok(input.features.includes('thread-calls'));
+          const call = (id, tool, callInput, extra = {}) => ({ id, tool, input: callInput, botName: 'Scout', skipHosts: [], ...extra });
+          return {
+            lane: null,
+            threadCalls: [
+              call('tc_list', 'list_threads', { limit: 5 }, { skipHosts: ['Roma’s MacBook Air'] }),
+              call('tc_read', 'read_thread', { thread_id: 'host_build' }),
+              call('tc_locate', 'locate_thread', { thread_id: 'host_build' }),
+              call('tc_steer_own', 'steer_thread', { thread_id: 'own_new', message: 'Hurry' }),
+              call('tc_missing', 'read_thread', { thread_id: 'nope' }),
+              call('tc_answer', 'answer_thread_request', { thread_id: 'host_build', answer: 'done' }),
+            ],
+          };
+        }
+        // The same calls again (a lost ack): run once only.
+        if (claims === 2) return { lane: null, threadCalls: [{ id: 'tc_list', tool: 'list_threads', input: {} }] };
+        return laneClaims([])(input);
+      },
+    });
+    client.completeBotThreadCall = async (body) => (posted.push(body), { ok: true });
+    const followUps = [];
+    startWorker({
+      client,
+      threadTools: fx.tools(),
+      startThreadFollowUp: async (input) => (followUps.push(input), { ok: true }),
+      runLane: async () => ({ text: '' }),
+    });
+    await waitFor(() => posted.length >= 6 && claims >= 3, { label: 'thread call results' });
+    const byId = Object.fromEntries(posted.map((item) => [item.callId, item.result]));
+    assert.equal(posted.length, 6, 'each call is answered once');
+    assert.equal(posted[0].machineId, 'machine-1');
+    assert.deepEqual(byId.tc_list.threads.map((thread) => thread.machine), ['omarchy', 'Roma’s MacBook Air', 'omarchy', 'Roma’s MacBook Air']);
+    assert.equal(byId.tc_read.ok, true);
+    assert.equal(byId.tc_read.machine, 'omarchy');
+    assert.equal(byId.tc_locate.hostThreadId, 'host_build');
+    assert.equal(byId.tc_locate.own, false);
+    assert.equal(byId.tc_steer_own.ok, true);
+    assert.deepEqual(followUps, [{ threadId: 'own_new', prompt: 'Hurry', botName: 'Scout', steer: true }]);
+    assert.equal(byId.tc_missing.ok, false);
+    assert.equal(byId.tc_missing.notHere, true);
+    assert.equal(byId.tc_answer.ok, true);
+    assert.equal(fx.calls.userAction[0].threadId, 'host_build');
+  });
+
   await test('thread reports end with the thread id for message_thread', () => {
     assert.equal(threadReportFooter({}), '');
     assert.equal(
       threadReportFooter({ threadId: 't1', project: 'Site', machine: 'Mac' }),
-      '(Durango Code thread t1, project Site, on Mac. Follow up there, e.g. to ship it, with message_thread thread_id "t1".)'
+      '(Durango Code thread t1, project Site, on Mac. Read it with read_thread and follow up there, e.g. to ship it, with message_thread thread_id "t1".)'
     );
-    assert.match(threadReportFooter({ threadId: 't1', cloud: true }), /or delegate_task thread_id "t1" from the cloud/);
-    assert.equal(withThreadReportFooter('Done.', { threadId: 't1' }), 'Done.\n\n(Durango Code thread t1. Follow up there, e.g. to ship it, with message_thread thread_id "t1".)');
+    assert.equal(threadReportFooter({ threadId: 't1', cloud: true }), threadReportFooter({ threadId: 't1' }), 'one text for the cloud and machines');
+    assert.equal(withThreadReportFooter('Done.', { threadId: 't1' }), 'Done.\n\n(Durango Code thread t1. Read it with read_thread and follow up there, e.g. to ship it, with message_thread thread_id "t1".)');
     assert.equal(withThreadReportFooter('Done.', {}), 'Done.');
   });
 
