@@ -3961,6 +3961,43 @@ body {
   animation: none;
 }
 
+/* Over themed scene/image backdrops, give assistant runs and bot replies a
+   quiet translucent reading veil (zero backdrop-filter cost) so body prose,
+   lists and subtle inline code stay crisp over bright or busy areas of the
+   wallpaper. Uses --bg-raised directly (already translucent at surfaceOpacity)
+   so opacity is never compounded. Wrapped in :where() so custom theme CSS on
+   .message.agent wins. */
+:where(html.has-theme-backdrop) .message.agent-run:where(:not(:empty)) {
+  padding: 16px 20px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+}
+
+:where(html.has-theme-backdrop) .message.agent-run.agent-run-part-empty:where(:not(:empty)) {
+  padding: 10px 16px;
+}
+
+:where(html.has-theme-backdrop .thread-pane.split) .message.agent-run:where(:not(:empty)) {
+  padding: 12px 14px;
+}
+
+:where(html.has-theme-backdrop) .message.agent-run .message-copy-btn {
+  right: 10px;
+  bottom: 10px;
+}
+
+:where(html.has-theme-backdrop) .bot-msg.agent {
+  padding: 12px 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+}
+
+:where(html.has-theme-backdrop) .bot-msg.agent .bot-msg-actions {
+  margin-bottom: -4px;
+}
+
 .message.system {
   align-self: center;
   max-width: 85%;
@@ -5036,9 +5073,9 @@ body {
 
 
 .markdown-content {
-  color: #d6d6d6;
+  color: var(--text-primary);
   font-size: 14px;
-  line-height: 1.6;
+  line-height: 1.65;
   overflow-wrap: anywhere;
 }
 
@@ -5056,34 +5093,48 @@ body {
 .markdown-content table,
 .markdown-content pre,
 .markdown-content blockquote {
-  margin: 0.75em 0;
+  margin: 0.7em 0;
+}
+
+.markdown-content strong {
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .markdown-content h1,
 .markdown-content h2,
 .markdown-content h3,
 .markdown-content h4 {
-  color: #f1f1f1;
-  line-height: 1.25;
-  margin: 1em 0 0.45em;
-  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  margin: 1.35em 0 0.5em;
+  font-weight: 650;
+}
+
+.markdown-content :is(h1, h2, h3) + :is(h2, h3, h4) {
+  margin-top: 0.55em;
 }
 
 .markdown-content h1 {
-  font-size: 22px;
+  font-size: 20px;
 }
 
 .markdown-content h2 {
-  font-size: 18px;
+  font-size: 17px;
 }
 
 .markdown-content h3 {
-  font-size: 16px;
+  font-size: 15px;
+}
+
+.markdown-content h4 {
+  font-size: 14px;
 }
 
 .markdown-content ul,
 .markdown-content ol {
-  padding-left: 22px;
+  padding-left: 1.5em;
 }
 
 /* Tailwind's preflight sets `list-style: none` on every list. */
@@ -5105,35 +5156,47 @@ body {
 }
 
 .markdown-content li::marker {
-  color: #8a8a90;
+  color: var(--text-secondary);
+  font-weight: 500;
 }
 
 .markdown-content li + li {
-  margin-top: 0.25em;
+  margin-top: 0.35em;
 }
 
 /* Nested lists sit tight under their item, like the items themselves. */
 .markdown-content li > ul,
 .markdown-content li > ol {
-  margin: 0.25em 0;
+  margin: 0.3em 0 0.15em;
+}
+
+.markdown-content li > p {
+  margin: 0.35em 0;
 }
 
 .markdown-content blockquote {
-  padding-left: 12px;
-  border-left: 3px solid #3a3a40;
-  color: #aaaab0;
+  padding: 0.25em 0 0.25em 14px;
+  border-left: 2.5px solid color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+  color: var(--text-secondary);
 }
 
 .markdown-content hr {
   margin: 1.25em 0;
   border: 0;
-  border-top: 1px solid #343438;
+  border-top: 1px solid var(--border-default);
 }
 
 .markdown-content a {
   color: var(--link);
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-decoration-color: color-mix(in srgb, currentColor 42%, transparent);
+  text-underline-offset: 2.5px;
+  text-decoration-thickness: 1px;
+  transition: text-decoration-color var(--transition-fast);
+}
+
+.markdown-content a:hover {
+  text-decoration-color: currentColor;
 }
 
 .markdown-content .markdown-media {
@@ -5141,9 +5204,9 @@ body {
   max-width: min(100%, 520px);
   max-height: 420px;
   margin: 0.75em 0;
-  border: 1px solid #303034;
+  border: 1px solid var(--border-default);
   border-radius: 8px;
-  background: #151516;
+  background: var(--bg-surface);
 }
 
 .markdown-content img.markdown-media,
@@ -5154,18 +5217,62 @@ body {
 
 .markdown-content img.markdown-media:hover,
 .message-attachment img[data-lightbox]:hover {
-  border-color: rgb(255 255 255 / 28%);
+  border-color: var(--border-strong);
   filter: brightness(1.06);
 }
 
-.markdown-content code {
-  border: 1px solid #3a3a3d;
-  border-radius: 5px;
-  background: #1b1b1d;
-  color: #e8e8e8;
-  padding: 0.12em 0.32em;
+/* Inline code: quiet translucent tint from the active theme's ink (never a
+   solid black pill), optical monospace scale, and cloned box caps so long
+   paths and URLs wrap cleanly across lines without colliding. */
+.markdown-content > code,
+.markdown-content :where(:not(pre)) > code {
+  padding: 0.1em 0.36em;
+  border: 0;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text-primary) 9%, transparent);
+  color: color-mix(in srgb, var(--text-primary) 88%, var(--link));
   font-family: var(--font-mono);
-  font-size: 0.9em;
+  font-size: 0.875em;
+  font-weight: 450;
+  word-break: normal;
+  hyphens: none;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.markdown-content a code {
+  color: inherit;
+  background: color-mix(in srgb, currentColor 11%, transparent);
+}
+
+.markdown-content :is(h1, h2, h3, h4) code {
+  font-size: 0.88em;
+  font-weight: inherit;
+}
+
+.markdown-content strong code {
+  font-weight: inherit;
+}
+
+:where(html.theme-light) .markdown-content > code,
+:where(html.theme-light) .markdown-content :where(:not(pre)) > code {
+  background: color-mix(in srgb, var(--text-primary) 6.5%, transparent);
+  color: color-mix(in srgb, var(--text-primary) 84%, var(--accent));
+}
+
+:where(html.theme-light) .markdown-content a code {
+  color: inherit;
+  background: color-mix(in srgb, currentColor 9%, transparent);
+}
+
+:where(html.has-theme-backdrop) .markdown-content > code,
+:where(html.has-theme-backdrop) .markdown-content :where(:not(pre)) > code {
+  background: color-mix(in srgb, var(--text-primary) 10.5%, transparent);
+}
+
+:where(html.has-theme-backdrop.theme-light) .markdown-content > code,
+:where(html.has-theme-backdrop.theme-light) .markdown-content :where(:not(pre)) > code {
+  background: color-mix(in srgb, var(--text-primary) 7.5%, transparent);
 }
 
 /* Release notes (AppUpdateUi: the update button's card, What's new, Settings):
@@ -5207,8 +5314,8 @@ html.theme-light .setting-row .release-notes-list {
 }
 
 .code-block {
-  --code-background: #141416;
-  --code-foreground: #d4d4d8;
+  --code-background: color-mix(in srgb, var(--bg-surface) 58%, var(--bg-base));
+  --code-foreground: var(--text-primary);
   --code-token-comment: #6b6f7a;
   --code-token-keyword: #c792ea;
   --code-token-string: #a5d6a7;
@@ -5239,6 +5346,45 @@ html.theme-light .setting-row .release-notes-list {
   --code-ansi-bright-white: #f4f4f5;
 }
 
+:where(html.theme-light) .code-block {
+  --code-background: color-mix(in srgb, var(--bg-raised) 65%, var(--bg-surface));
+  --code-foreground: var(--text-primary);
+  --code-token-comment: #6e7781;
+  --code-token-keyword: #8250df;
+  --code-token-string: #0a6e38;
+  --code-token-string-expression: #0a6e38;
+  --code-token-constant: #953800;
+  --code-token-function: #0969da;
+  --code-token-parameter: #7c4d00;
+  --code-token-punctuation: #57606a;
+  --code-token-link: #0969da;
+  --code-token-inserted: #116329;
+  --code-token-deleted: #cf222e;
+  --code-token-changed: #9a6700;
+  --code-ansi-black: #24292f;
+  --code-ansi-red: #cf222e;
+  --code-ansi-green: #116329;
+  --code-ansi-yellow: #9a6700;
+  --code-ansi-blue: #0969da;
+  --code-ansi-magenta: #8250df;
+  --code-ansi-cyan: #1b7c83;
+  --code-ansi-white: #6e7781;
+  --code-ansi-bright-black: #57606a;
+  --code-ansi-bright-red: #a40e26;
+  --code-ansi-bright-green: #1a7f37;
+  --code-ansi-bright-yellow: #7d4e00;
+  --code-ansi-bright-blue: #218bff;
+  --code-ansi-bright-magenta: #a475f9;
+  --code-ansi-bright-cyan: #3192aa;
+  --code-ansi-bright-white: #24292f;
+}
+
+/* Placed after theme-light so both dark and light backdrop themes use the
+   higher-opacity --bg-surface token instead of compounding translucency. */
+:where(html.has-theme-backdrop) .code-block {
+  --code-background: var(--bg-surface);
+}
+
 .code-block-header {
   display: flex;
   align-items: center;
@@ -5247,6 +5393,7 @@ html.theme-light .setting-row .release-notes-list {
   min-height: 32px;
   padding: 0 6px 0 12px;
   border-bottom: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1;
@@ -5258,7 +5405,7 @@ html.theme-light .setting-row .release-notes-list {
   align-items: center;
   gap: 8px;
   overflow: hidden;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5277,7 +5424,7 @@ html.theme-light .setting-row .release-notes-list {
   margin-right: auto;
   padding-right: 8px;
   overflow: hidden;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -5393,7 +5540,7 @@ html.theme-light .setting-row .release-notes-list {
   border-radius: 0;
   background: transparent;
   color: var(--code-foreground);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.6;
   tab-size: 2;
@@ -5422,6 +5569,9 @@ html.theme-light .setting-row .release-notes-list {
   background: transparent;
   color: inherit;
   font-size: inherit;
+  font-weight: inherit;
+  -webkit-box-decoration-break: slice;
+  box-decoration-break: slice;
 }
 
 /* Tables: column widths follow whole words (the prose's `overflow-wrap: anywhere`
@@ -5434,6 +5584,7 @@ html.theme-light .setting-row .release-notes-list {
   overflow-x: auto;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--text-primary) 2%, transparent);
 }
 
 .markdown-content table {
@@ -5463,7 +5614,7 @@ html.theme-light .setting-row .release-notes-list {
 }
 
 .markdown-content th {
-  background: rgb(255 255 255 / 3%);
+  background: color-mix(in srgb, var(--text-primary) 4.5%, transparent);
   border-bottom-color: var(--border-default);
   color: var(--text-primary);
   font-size: 12px;
@@ -5475,25 +5626,35 @@ html.theme-light .setting-row .release-notes-list {
 }
 
 .markdown-content tbody tr:hover td {
-  background: rgb(255 255 255 / 1.5%);
+  background: color-mix(in srgb, var(--text-primary) 2.5%, transparent);
 }
 
-/* Mermaid diagrams (Pele). --pele-bg must match what's behind the diagram:
-   edge labels are painted with it. */
+/* Mermaid diagrams (Pele). --pele-bg must stay opaque and match the frame
+   behind the diagram: edge labels are painted with it to mask connector lines.
+   --bg-elevated is never turned translucent by ui-themes.js. */
+.markdown-diagram-frame,
+.markdown-diagram-dialog {
+  --code-background: color-mix(in srgb, var(--bg-elevated) 72%, black);
+}
+
+:where(html.theme-light) :is(.markdown-diagram-frame, .markdown-diagram-dialog) {
+  --code-background: color-mix(in srgb, var(--bg-elevated) 95%, black);
+}
+
 .markdown-diagram {
-  --pele-bg: var(--code-background, #141416);
+  --pele-bg: var(--code-background);
   --pele-fg: var(--text-primary);
   --pele-muted: var(--text-secondary);
-  --pele-line: #8a8a94;
+  --pele-line: color-mix(in srgb, var(--text-secondary) 72%, var(--text-muted));
   --pele-surface: var(--bg-surface);
   --pele-surface-alt: var(--bg-elevated);
-  --pele-border: rgb(255 255 255 / 22%);
+  --pele-border: var(--border-strong);
   --pele-accent: var(--accent);
   --pele-critical: var(--danger);
   --pele-error: var(--danger);
   --pele-radius: 6px;
-  --pele-font: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --pele-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --pele-font: var(--font-ui);
+  --pele-font-mono: var(--font-mono);
   --pele-series-1: #7fa0e0;
   --pele-series-2: #8fc79a;
   --pele-series-3: #e0b46f;
@@ -5564,7 +5725,6 @@ html.theme-light .setting-row .release-notes-list {
 }
 
 .markdown-diagram-dialog {
-  --code-background: #141416;
   display: flex;
   flex-direction: column;
   width: min(1200px, 100%);
@@ -7161,7 +7321,11 @@ html.theme-light .setting-row .release-notes-list {
   height: 100%;
   overflow: auto;
   padding: 54px clamp(24px, 6vw, 76px) 72px;
-  background: #1e1e1e;
+  background: var(--bg-base);
+}
+
+:where(html.has-theme-backdrop) .markdown-preview {
+  background: var(--bg-raised);
 }
 
 .markdown-preview > .markdown-content {
@@ -7173,26 +7337,26 @@ html.theme-light .setting-row .release-notes-list {
 
 .markdown-preview .markdown-content h1 {
   padding-bottom: 0.35em;
-  border-bottom: 1px solid #343438;
+  border-bottom: 1px solid var(--border-default);
   font-size: 28px;
 }
 
 .markdown-preview .markdown-content h2 {
   padding-bottom: 0.3em;
-  border-bottom: 1px solid #303034;
+  border-bottom: 1px solid var(--border-subtle);
   font-size: 22px;
 }
 
 .markdown-preview .markdown-content blockquote {
   padding-left: 14px;
   border-left: 3px solid var(--accent);
-  color: #aaaab0;
+  color: var(--text-secondary);
 }
 
 .markdown-preview .markdown-content hr {
   margin: 24px 0;
   border: 0;
-  border-top: 1px solid #343438;
+  border-top: 1px solid var(--border-default);
 }
 
 .markdown-preview .markdown-content input[type='checkbox'] {
@@ -7200,9 +7364,9 @@ html.theme-light .setting-row .release-notes-list {
   height: 14px;
   margin: 0 7px 0 -20px;
   appearance: none;
-  border: 1px solid #66666c;
+  border: 1px solid var(--border-strong);
   border-radius: 3px;
-  background: #202023;
+  background: var(--bg-surface);
   vertical-align: -2px;
 }
 
@@ -9955,9 +10119,6 @@ html.theme-static-frost .thread-pane-header {
    with fixed dark values follow the theme's tokens instead. A light theme
    imported from T3 Code (t3-themes.js) showed these first: grey reply text
    and a sidebar fading in from near-black. */
-html.theme-light .markdown-content {
-  color: color-mix(in srgb, var(--text-primary) 92%, var(--bg-base));
-}
 html.theme-light .agents-sidebar {
   background: var(--bg-raised);
 }

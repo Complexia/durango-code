@@ -4521,9 +4521,9 @@ const AssistantRow: React.FC<{ bot: DesktopBot; projectPath?: string | null; chi
   copy,
   onReplyTo,
 }) => (
-  <div className={`flex items-start gap-2.5${copy ? ' bot-msg agent' : ''}`}>
+  <div className="bot-msg agent flex items-start gap-2.5">
     <BotAvatar bot={bot} projectPath={projectPath} />
-    <div className="min-w-0 flex-1 text-[13.5px] leading-relaxed text-neutral-200">
+    <div className="min-w-0 flex-1 text-[13.5px] leading-relaxed text-[var(--text-primary)]">
       {children}
       {copy && (
         <div className="bot-msg-actions">
