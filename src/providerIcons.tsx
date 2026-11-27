@@ -115,7 +115,7 @@ export const OpenCodeBrandIcon = ({ size = 24, className, ...props }: ProviderIc
 );
 
 /**
- * Durango Code product mark (the app icon, assets/icon.png). The component
+ * Durango Code product mark (the app icon, public/icon.png). The component
  * keeps its internal Orion name. The viewBox crops the icon's transparent
  * margin so the squircle fills small provider/model slots.
  */

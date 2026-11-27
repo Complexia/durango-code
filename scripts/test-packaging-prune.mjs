@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const {
@@ -41,9 +42,13 @@ const createFakeNodePtySource = (root) => {
     'README.md': 'readme',
     'binding.gyp': '{}',
     'lib/index.js': 'module.exports = {};',
+    'lib/index.js.map': '{}',
     'lib/unixTerminal.js': 'module.exports = {};',
+    'lib/unixTerminal.test.js': 'test',
+    'lib/unixTerminal.test.js.map': '{}',
     'lib/windowsPtyAgent.js': 'module.exports = {};',
     'lib/worker/conoutSocketWorker.js': '',
+    'lib/worker/conoutSocketWorker.js.map': '{}',
     'src/unix/pty.cc': '',
     'deps/winpty/src/winpty.cc': '',
     'third_party/conpty/1.23/win10-x64/conpty.dll': 'dup',
@@ -85,7 +90,7 @@ try {
   const srcRoot = path.join(tmpRoot, 'source');
   const ptySrc = createFakeNodePtySource(srcRoot);
 
-  // 1. Linux x64: no prebuilds kept, rebuilt build/Release/pty.node kept, node-addon-api removed.
+  // 1. Linux x64: no prebuilds kept, rebuilt build/Release/pty.node kept, lib tests/maps & node-addon-api removed.
   {
     const buildPath = path.join(tmpRoot, 'build-linux-x64');
     const ptyDest = path.join(buildPath, 'node_modules', 'node-pty');
@@ -122,7 +127,7 @@ try {
     ]);
   }
 
-  // 2. macOS arm64: keeps darwin-arm64 prebuild + rebuilt build/Release/{pty.node,spawn-helper} with 0755; drops win32 + darwin-x64.
+  // 2. macOS arm64 (rebuilt): keeps build/Release/{pty.node,spawn-helper} with 0755; drops unreachable prebuilds/.
   {
     const buildPath = path.join(tmpRoot, 'build-darwin-arm64');
     const ptyDest = path.join(buildPath, 'node_modules', 'node-pty');
@@ -156,25 +161,22 @@ try {
       'lib/windowsPtyAgent.js',
       'lib/worker/conoutSocketWorker.js',
       'package.json',
-      'prebuilds/darwin-arm64/pty.node',
-      'prebuilds/darwin-arm64/spawn-helper',
     ]);
     if (process.platform !== 'win32') {
       assert.equal(fs.statSync(path.join(ptyDest, 'build/Release/spawn-helper')).mode & 0o777, 0o755);
-      assert.equal(fs.statSync(path.join(ptyDest, 'prebuilds/darwin-arm64/spawn-helper')).mode & 0o777, 0o755);
     }
   }
 
-  // 3. macOS universal: keeps both darwin-arm64 and darwin-x64, drops win32-*.
+  // 3. macOS arm64 (prebuild fallback when build/Release is absent): keeps only darwin-arm64 prebuild with 0755.
   {
-    const buildPath = path.join(tmpRoot, 'build-darwin-universal');
+    const buildPath = path.join(tmpRoot, 'build-darwin-arm64-prebuild');
     const ptyDest = path.join(buildPath, 'node_modules', 'node-pty');
     fs.cpSync(ptySrc, ptyDest, {
       recursive: true,
       dereference: true,
-      filter: (entryPath) => shouldCopyNodePtyEntry(ptySrc, entryPath, 'darwin', 'universal'),
+      filter: (entryPath) => shouldCopyNodePtyEntry(ptySrc, entryPath, 'darwin', 'arm64'),
     });
-    prunePackagedBuild(buildPath, 'darwin', 'universal');
+    prunePackagedBuild(buildPath, 'darwin', 'arm64');
     assert.deepEqual(listRelativeFiles(ptyDest), [
       'LICENSE',
       'lib/index.js',
@@ -184,12 +186,13 @@ try {
       'package.json',
       'prebuilds/darwin-arm64/pty.node',
       'prebuilds/darwin-arm64/spawn-helper',
-      'prebuilds/darwin-x64/pty.node',
-      'prebuilds/darwin-x64/spawn-helper',
     ]);
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(path.join(ptyDest, 'prebuilds/darwin-arm64/spawn-helper')).mode & 0o777, 0o755);
+    }
   }
 
-  // 4. Windows x64: keeps only win32-x64 runtime binaries (including conpty/conpty.dll + OpenConsole.exe), drops .pdb, win32-arm64, darwin-*, third_party/.
+  // 4. Windows x64: skips build-only dirs during copy; keeps only win32-x64 runtime binaries (including conpty/conpty.dll + OpenConsole.exe), drops .pdb, win32-arm64, darwin-*.
   {
     const buildPath = path.join(tmpRoot, 'build-win32-x64');
     const ptyDest = path.join(buildPath, 'node_modules', 'node-pty');
@@ -198,6 +201,8 @@ try {
       dereference: true,
       filter: (entryPath) => shouldCopyNodePtyEntry(ptySrc, entryPath, 'win32', 'x64'),
     });
+    assert.ok(!fs.existsSync(path.join(ptyDest, 'third_party')), 'win32 copy skips build-only third_party/');
+    assert.ok(!fs.existsSync(path.join(ptyDest, 'deps')), 'win32 copy skips build-only deps/');
     prunePackagedBuild(buildPath, 'win32', 'x64');
     assert.deepEqual(listRelativeFiles(ptyDest), [
       'LICENSE',
@@ -216,14 +221,27 @@ try {
     ]);
   }
 
-  // 5. Verify forge.config.js does not ship icon.png as an extraResource and registers packageAfterPrune.
+  // 5. Verify forge.config.js invariants and icon source parity.
   {
     const forgeConfig = require('../forge.config.js');
     assert.ok(
       !forgeConfig.packagerConfig.extraResource.some((entry) => path.basename(entry) === 'icon.png'),
       'extraResource must not duplicate icon.png',
     );
+    assert.notEqual(
+      forgeConfig.packagerConfig.prune,
+      false,
+      'packagerConfig.prune must stay enabled so packageAfterPrune runs',
+    );
     assert.equal(typeof forgeConfig.hooks.packageAfterPrune, 'function', 'packageAfterPrune hook must be registered');
+
+    const codeDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const assetsIcon = fs.readFileSync(path.join(codeDir, 'assets', 'icon.png'));
+    const publicIcon = fs.readFileSync(path.join(codeDir, 'public', 'icon.png'));
+    assert.ok(
+      assetsIcon.equals(publicIcon),
+      'assets/icon.png (dev/deb) and public/icon.png (packaged/renderer) must stay identical',
+    );
   }
 
   console.log('Packaging prune tests passed.');
