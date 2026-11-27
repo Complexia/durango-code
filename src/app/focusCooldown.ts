@@ -3,6 +3,7 @@
 // refreshes back-to-back without leaving state stale after quick round-trips.
 
 export const DEFAULT_FOCUS_COOLDOWN_MS = 5_000;
+export const DEFAULT_EVENT_DEDUPE_MS = 250;
 
 export type FocusCooldown = {
   /** Record that a refresh ran at `at` (defaults to `now()`), cancelling any queued trailing retry. */
@@ -15,8 +16,10 @@ export type FocusCooldown = {
   tryRun: (at?: number) => boolean;
   /**
    * Leading + trailing throttle: runs `fn` immediately when cooldown has
-   * elapsed and `isBusy?.()` is false; otherwise coalesces into one trailing
-   * call once the cooldown finishes (re-checking `isBusy?.()`).
+   * elapsed and `isBusy?.()` is false; ignores paired burst events within
+   * `dedupeMs` of the last run (e.g. visibilitychange + focus firing together)
+   * when not busy; otherwise coalesces into one trailing call once the
+   * cooldown finishes (re-checking `isBusy?.()`).
    */
   trigger: (fn: () => void, options?: { isBusy?: () => boolean }) => boolean;
 };
@@ -29,10 +32,12 @@ export function createFocusCooldown(
   timers: {
     setTimer?: (fn: () => void, ms: number) => TimerHandle;
     clearTimer?: (handle: TimerHandle) => void;
+    dedupeMs?: number;
   } = {}
 ): FocusCooldown {
   const setTimer = timers.setTimer ?? ((fn, ms) => globalThis.setTimeout(fn, ms));
   const clearTimer = timers.clearTimer ?? ((handle) => globalThis.clearTimeout(handle));
+  const dedupeMs = Math.min(timers.dedupeMs ?? DEFAULT_EVENT_DEDUPE_MS, cooldownMs);
   let lastRunAt = -Infinity;
   let timer: TimerHandle | null = null;
   let pendingFn: (() => void) | null = null;
@@ -55,6 +60,12 @@ export function createFocusCooldown(
       lastRunAt = current;
       fn();
       return true;
+    }
+    // Paired OS events (visibilitychange + focus, or initial mount + focus)
+    // arrive milliseconds apart; ignore the immediate echo so it does not
+    // schedule a redundant trailing refresh.
+    if (elapsed >= 0 && elapsed < dedupeMs && timer === null && !options?.isBusy?.()) {
+      return false;
     }
     pendingFn = fn;
     pendingIsBusy = options?.isBusy;

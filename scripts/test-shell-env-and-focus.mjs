@@ -5,9 +5,10 @@ import path from 'node:path';
 
 import {
   commandPathCache,
+  execFileAsync,
   findExecutableInPath,
   resolveCommandPath,
-  runShellCommand,
+  resyncShellPath,
   parseCommandPath,
   shellPathProbeCommand,
   startShellPathSync,
@@ -156,15 +157,24 @@ try {
     'Windows does not treat extensionless absolute shims as runnable executables'
   );
 
-  // Parity with login shell `command -v` after startShellPathSync().
+  // Parity with `command -v` against the synced process.env.PATH (avoids macOS
+  // `/etc/zprofile` path_helper reordering between `-ilc` and `-lc`).
   await startShellPathSync();
   for (const cmd of ['sh', 'git', 'node']) {
     commandPathCache.clear();
     const direct = await resolveCommandPath(cmd);
-    const { stdout } = await runShellCommand(`command -v '${cmd}'`, 4000);
+    const { stdout } = await execFileAsync('/bin/sh', ['-c', `command -v '${cmd}'`], {
+      env: process.env,
+      timeout: 4000,
+    });
     const shellResolved = parseCommandPath(stdout);
-    assert.equal(direct, shellResolved, `resolveCommandPath(${cmd}) matches command -v`);
+    assert.equal(direct, shellResolved, `resolveCommandPath(${cmd}) matches command -v on synced PATH`);
   }
+
+  // resyncShellPath() clears cached entries and prevents stale lookups from sticking.
+  commandPathCache.set('resync-sentinel', { path: '/stale/path', expiresAt: Date.now() + 60_000 });
+  await resyncShellPath();
+  assert.equal(commandPathCache.has('resync-sentinel'), false, 'resyncShellPath clears commandPathCache');
 } finally {
   await rm(fixtureDir, { recursive: true, force: true });
 }
@@ -230,6 +240,25 @@ assert.equal(triggerCount, 1, 'still deferred while busy');
 busy = false;
 flushTimersTo(20_500);
 assert.equal(triggerCount, 2, 'runs once busy clears');
+
+// Paired OS events (e.g. visibilitychange + focus within < 250 ms) do not
+// schedule a duplicate trailing refresh when idle.
+let dedupeCount = 0;
+const paired = createFocusCooldown(5000, () => fakeNow, fakeTimers);
+fakeNow = 40_000;
+assert.equal(paired.trigger(() => { dedupeCount += 1; }), true, 'leading event fires immediately');
+fakeNow = 40_010;
+assert.equal(paired.trigger(() => { dedupeCount += 1; }), false, 'paired echo within 250ms is ignored');
+flushTimersTo(46_000);
+assert.equal(dedupeCount, 1, 'paired echo did not schedule a duplicate trailing refresh');
+
+// A real human return after >= 250 ms (still inside 5s cooldown) DOES schedule a trailing refresh.
+fakeNow = 46_000;
+assert.equal(paired.trigger(() => { dedupeCount += 1; }), true);
+fakeNow = 47_500;
+assert.equal(paired.trigger(() => { dedupeCount += 1; }), false);
+flushTimersTo(51_000);
+assert.equal(dedupeCount, 3, 'return after dedupe window schedules one trailing refresh');
 
 // Explicit mark() cancels any queued trailing retry; cancel() prevents firing.
 fakeNow = 21_000;

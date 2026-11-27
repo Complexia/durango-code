@@ -3087,14 +3087,6 @@ const App: React.FC = () => {
   }, [refreshAgentModels]);
 
   useEffect(() => {
-    if (!window.orion?.onProviderAuthenticated) return undefined;
-    return window.orion.onProviderAuthenticated(() => {
-      void refreshAgentModels(true);
-      if (useOrionStore.persist.hasHydrated()) void refreshProviderUpdates();
-    });
-  }, [refreshAgentModels, refreshProviderUpdates]);
-
-  useEffect(() => {
     let active = true;
     void window.orion?.getActiveProviderUpdate?.().then(
       (progress) => {
@@ -3294,6 +3286,16 @@ const App: React.FC = () => {
     if (!storeHydrated || providerUpdatesCheckedOnceRef.current || providerUpdatesCheckingRef.current) return;
     if (settingsOpen && settingsTab === 'providers') void refreshProviderUpdates();
   }, [storeHydrated, settingsOpen, settingsTab, refreshProviderUpdates]);
+  // Re-check models and provider updates after sign-in completes, gated on
+  // `storeHydrated` so `refreshProviderUpdates` always captures post-hydration
+  // `enabledProviderIds`.
+  useEffect(() => {
+    if (!window.orion?.onProviderAuthenticated) return undefined;
+    return window.orion.onProviderAuthenticated(() => {
+      void refreshAgentModels(true);
+      if (storeHydrated) void refreshProviderUpdates();
+    });
+  }, [refreshAgentModels, refreshProviderUpdates, storeHydrated]);
   // Drafts saved by the last session list their threads again, like ones
   // typed into this session.
   useEffect(() => {
@@ -3716,18 +3718,6 @@ const App: React.FC = () => {
     void refreshGitState();
   }, [refreshGitState]);
 
-  // An agent can switch branches (or leave its workspace) during a turn;
-  // re-read when the turn ends so the pill shows where the checkout is now.
-  const selectedThreadRunning = selectedThread?.status === 'running';
-  const prevRunningStateRef = useRef({ running: selectedThreadRunning, dir: activeWorkingDir });
-  useEffect(() => {
-    const prev = prevRunningStateRef.current;
-    prevRunningStateRef.current = { running: selectedThreadRunning, dir: activeWorkingDir };
-    if (prev.running && !selectedThreadRunning && prev.dir === activeWorkingDir) {
-      void refreshGitState();
-    }
-  }, [activeWorkingDir, refreshGitState, selectedThreadRunning]);
-
   // Same stale-response race as refreshGitState: only the latest request may
   // write, so a slow read for the previous project can't repaint the cloud
   // pill after a project switch.
@@ -3771,6 +3761,21 @@ const App: React.FC = () => {
   useEffect(() => {
     void refreshCloudState();
   }, [refreshCloudState, accountState.authenticated, gitState]);
+
+  // An agent can switch branches, commit/push, or deploy during a turn;
+  // re-read git state when the turn ends, and refresh cloud state even if
+  // local git summary fields didn't change (e.g. deploy or commit+push in one turn).
+  const selectedThreadRunning = selectedThread?.status === 'running';
+  const prevRunningStateRef = useRef({ running: selectedThreadRunning, dir: activeWorkingDir });
+  useEffect(() => {
+    const prev = prevRunningStateRef.current;
+    prevRunningStateRef.current = { running: selectedThreadRunning, dir: activeWorkingDir };
+    if (prev.running && !selectedThreadRunning && prev.dir === activeWorkingDir) {
+      void refreshGitState().then((changed) => {
+        if (!changed) void refreshCloudState();
+      });
+    }
+  }, [activeWorkingDir, refreshCloudState, refreshGitState, selectedThreadRunning]);
 
   // A checkout or remote push outside the app doesn't notify us; re-read git
   // state on focus (leading + trailing 5s cooldown so quick terminal round-trips
@@ -5507,7 +5512,7 @@ const App: React.FC = () => {
           });
         }
         if (result.mirrorWarning) toast.warning(result.mirrorWarning);
-        await refreshGitState();
+        if (!(await refreshGitState())) await refreshCloudState();
       } else {
         toast.error(result.error ?? 'Commit and push failed', {
           ...(result.errorDetail ? { description: result.errorDetail } : {}),

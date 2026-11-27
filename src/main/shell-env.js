@@ -10,8 +10,13 @@ export let shellPathSyncPromise = Promise.resolve();
 export const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
 
 const SHELL_PATH_RETRY_COOLDOWN_MS = 30_000;
+const MAX_INTERACTIVE_SYNC_RETRIES = 2;
 let shellPathSynced = process.platform === 'win32';
+let shellPathInteractiveSynced = process.platform === 'win32';
+let shellPathInteractiveRetries = 0;
+let shellPathSyncInFlight = false;
 let lastShellPathSyncAttemptAt = 0;
+let commandPathCacheEpoch = 0;
 
 export const shellPathProbeCommand = (shell = loginShell) => {
   const name = path.basename(String(shell || '')).toLowerCase();
@@ -41,6 +46,11 @@ const readShellPath = async (flags, timeout = 8000, shell = loginShell) => {
   return match?.[1]?.trim() || '';
 };
 
+const needsShellPathRetry = () =>
+  process.platform !== 'win32' &&
+  (!shellPathSynced ||
+    (!shellPathInteractiveSynced && shellPathInteractiveRetries < MAX_INTERACTIVE_SYNC_RETRIES));
+
 // Finder-launched apps inherit launchd's minimal PATH, and most CLI
 // installers (nvm, bun, grok, ...) export PATH from ~/.zshrc, which only
 // interactive shells source. Capture the interactive login shell's PATH once
@@ -48,33 +58,41 @@ const readShellPath = async (flags, timeout = 8000, shell = loginShell) => {
 export const syncPathFromUserShell = async () => {
   if (process.platform === 'win32') {
     shellPathSynced = true;
+    shellPathInteractiveSynced = true;
     return true;
   }
   lastShellPathSyncAttemptAt = Date.now();
-  let shellPath = '';
+  shellPathSyncInFlight = true;
   try {
-    shellPath = await readShellPath('-ilc', 8000);
-  } catch {
-    // Interactive init files (e.g. a slow or broken ~/.zshrc) can fail or time
-    // out; fall back once to a non-interactive login shell so ~/.zprofile /
-    // Homebrew paths are still captured.
-  }
-  if (!shellPath) {
+    let shellPath = '';
     try {
-      shellPath = await readShellPath('-lc', 4000);
+      shellPath = await readShellPath('-ilc', 8000);
+      if (shellPath) shellPathInteractiveSynced = true;
     } catch {
-      // Keep the inherited PATH; a rate-limited retry runs on subsequent misses.
+      // Interactive init files (e.g. a slow or broken ~/.zshrc) can fail or time
+      // out; fall back once to a non-interactive login shell so ~/.zprofile /
+      // Homebrew paths are still captured.
     }
+    if (!shellPath) {
+      shellPathInteractiveRetries += 1;
+      try {
+        shellPath = await readShellPath('-lc', 4000);
+      } catch {
+        // Keep the inherited PATH; a rate-limited retry runs on subsequent misses.
+      }
+    }
+    if (!shellPath) return false;
+    const merged = [
+      ...new Set([...shellPath.split(':'), ...String(process.env.PATH || '').split(':')]),
+    ]
+      .filter(Boolean)
+      .join(':');
+    process.env.PATH = merged;
+    shellPathSynced = true;
+    return true;
+  } finally {
+    shellPathSyncInFlight = false;
   }
-  if (!shellPath) return false;
-  const merged = [
-    ...new Set([...shellPath.split(':'), ...String(process.env.PATH || '').split(':')]),
-  ]
-    .filter(Boolean)
-    .join(':');
-  process.env.PATH = merged;
-  shellPathSynced = true;
-  return true;
 };
 
 export const runShellCommand = async (command, timeout = 30000, env = {}) => {
@@ -206,16 +224,21 @@ export const resolveCommandPath = (command) => {
   const existing = commandPathPromises.get(command);
   if (existing) return existing;
 
+  const epoch = commandPathCacheEpoch;
   const lookup = shellPathSyncPromise
     .then(async () => {
       const found = await findExecutableInPath(command);
       if (found) return found;
-      // If startup login-shell sync failed or timed out (e.g. heavy macOS login
-      // load), retry once per cooldown window until it succeeds so CLIs do not
-      // stay permanently "Not found" until restart.
+      // If another miss already kicked off a PATH resync, wait for it so
+      // concurrent lookups don't cache false misses before PATH updates.
+      if (shellPathSyncInFlight) {
+        await shellPathSyncPromise;
+        return findExecutableInPath(command);
+      }
+      // If startup login-shell sync failed or only captured `-lc`, retry once
+      // per cooldown window (bounded for `-ilc`) so slow-boot machines recover.
       if (
-        process.platform !== 'win32' &&
-        !shellPathSynced &&
+        needsShellPathRetry() &&
         Date.now() - lastShellPathSyncAttemptAt >= SHELL_PATH_RETRY_COOLDOWN_MS
       ) {
         await startShellPathSync();
@@ -226,12 +249,14 @@ export const resolveCommandPath = (command) => {
     .catch(() => null);
   const sharedLookup = lookup
     .then((resolvedPath) => {
-      commandPathCache.set(command, {
-        path: resolvedPath,
-        expiresAt:
-          Date.now() +
-          (resolvedPath ? COMMAND_PATH_CACHE_TTL_MS : COMMAND_PATH_MISS_CACHE_TTL_MS),
-      });
+      if (epoch === commandPathCacheEpoch) {
+        commandPathCache.set(command, {
+          path: resolvedPath,
+          expiresAt:
+            Date.now() +
+            (resolvedPath ? COMMAND_PATH_CACHE_TTL_MS : COMMAND_PATH_MISS_CACHE_TTL_MS),
+        });
+      }
       return resolvedPath;
     })
     .finally(() => {
@@ -246,11 +271,17 @@ export const resolveCommandPath = (command) => {
 export const checkCommandAvailable = async (command) => Boolean(await resolveCommandPath(command));
 
 export const startShellPathSync = () => {
+  if (shellPathSyncInFlight) return shellPathSyncPromise;
   shellPathSyncPromise = syncPathFromUserShell();
   return shellPathSyncPromise;
 };
 
 export const resyncShellPath = async () => {
-  await startShellPathSync();
+  commandPathCacheEpoch += 1;
   commandPathCache.clear();
+  commandPathPromises.clear();
+  await startShellPathSync();
+  commandPathCacheEpoch += 1;
+  commandPathCache.clear();
+  commandPathPromises.clear();
 };

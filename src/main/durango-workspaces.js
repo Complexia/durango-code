@@ -316,18 +316,19 @@ export const durangoWorkspaceStatus = async ({ path: workspacePath, name, repo, 
       candidate.path === workspacePath ||
       (Boolean(name) && candidate.name === name && candidate.repo === repo)
   );
-  if (!entry && typeof workspacePath === 'string') {
+  if (!entry && ((typeof workspacePath === 'string' && workspacePath) || (Boolean(name) && Boolean(repo)))) {
     // Fall back to canonical paths so symlinks (e.g. macOS /var vs /private/var)
     // still match when a caller passes a non-canonical workspace or repo path.
-    const canonicalPath = realpath(workspacePath);
+    const canonicalPath = typeof workspacePath === 'string' && workspacePath ? realpath(workspacePath) : null;
     const canonicalRepo = typeof repo === 'string' && repo ? realpath(repo) : null;
     entry = registry.find(
       (candidate) =>
-        (typeof candidate.path === 'string' && realpath(candidate.path) === canonicalPath) ||
+        (canonicalPath !== null && typeof candidate.path === 'string' && candidate.path && realpath(candidate.path) === canonicalPath) ||
         (Boolean(name) &&
           candidate.name === name &&
-          Boolean(canonicalRepo) &&
+          canonicalRepo !== null &&
           typeof candidate.repo === 'string' &&
+          candidate.repo &&
           realpath(candidate.repo) === canonicalRepo)
     );
   }

@@ -921,6 +921,9 @@ export const updateProviderTool = async (config, expectedLatestVersion = null, o
     onPhase?.('updating');
     const { stdout, stderr } = await runUpdateCommand(updateCommand);
     const outputParts = [`${stdout}\n${stderr}`.trim()].filter(Boolean);
+    // A self-updater can move the CLI to a new bin dir (e.g. npm -> ~/.local/bin);
+    // refresh PATH and clear the command cache before verification or status checks.
+    await resyncShellPath();
     const manualInstallCommand = config.manualInstallCommandPattern
       ? outputParts[0]?.match(config.manualInstallCommandPattern)?.[1]?.trim()
       : null;

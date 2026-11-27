@@ -102,33 +102,32 @@ try {
   // Direct reads of server-slots.json and .durango/change.json reflect running,
   // queued, dead-PID pruned, and local change state without spawning the CLI.
   const slotsFile = path.join(process.env.HOME, '.durango', 'server-slots.json');
-  await fs.writeFile(
-    slotsFile,
-    JSON.stringify({
-      version: 1,
-      running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: process.pid, childPid: null, startedAt: new Date().toISOString() }],
-      queue: [],
-    })
-  );
+  const writeJsonAtomic = async (filePath, payload) => {
+    const tmp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(payload));
+    await fs.rename(tmp, filePath);
+  };
+  await writeJsonAtomic(slotsFile, {
+    version: 1,
+    running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: process.pid, childPid: null, startedAt: new Date().toISOString() }],
+    queue: [],
+  });
   assert.equal(
     (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
     'running',
     'alive server-slot pid reports running'
   );
-  await fs.writeFile(
-    slotsFile,
-    JSON.stringify({
-      version: 1,
-      running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: 99999999, childPid: null, startedAt: new Date().toISOString() }],
-      queue: [{ workspace: workspace.name, pid: process.pid, since: new Date().toISOString() }],
-    })
-  );
+  await writeJsonAtomic(slotsFile, {
+    version: 1,
+    running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: 99999999, childPid: null, startedAt: new Date().toISOString() }],
+    queue: [{ workspace: workspace.name, pid: process.pid, since: new Date().toISOString() }],
+  });
   assert.equal(
     (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
     'queued',
     'dead running pid is pruned and alive queued pid reports queued'
   );
-  await fs.writeFile(slotsFile, JSON.stringify({ version: 1, running: [], queue: [] }));
+  await writeJsonAtomic(slotsFile, { version: 1, running: [], queue: [] });
   assert.equal(
     (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
     null,
@@ -142,14 +141,11 @@ try {
     stdio: 'ignore',
   });
   try {
-    await fs.writeFile(
-      slotsFile,
-      JSON.stringify({
-        version: 1,
-        running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: 99999999, childPid: detachedChild.pid, startedAt: new Date().toISOString() }],
-        queue: [],
-      })
-    );
+    await writeJsonAtomic(slotsFile, {
+      version: 1,
+      running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: 99999999, childPid: detachedChild.pid, startedAt: new Date().toISOString() }],
+      queue: [],
+    });
     assert.equal(
       (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
       'running',
@@ -168,7 +164,28 @@ try {
     null,
     'once childPid process group exits, server status clears without rewriting slots file'
   );
-  await fs.writeFile(slotsFile, JSON.stringify({ version: 1, running: [], queue: [] }));
+
+  // Corrupt JSON and deleted server-slots.json evict cleanly without crashing.
+  await fs.writeFile(slotsFile, '{broken-json');
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
+    null,
+    'corrupt server-slots.json degrades gracefully to null'
+  );
+  await fs.rm(slotsFile, { force: true });
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
+    null,
+    'missing server-slots.json degrades gracefully to null'
+  );
+  await writeJsonAtomic(slotsFile, { version: 1, running: [], queue: [] });
+
+  // Empty workspacePath must not spuriously resolve to process.cwd().
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: '' })).registered,
+    false,
+    'empty path does not match a workspace via process.cwd()'
+  );
 
   // Direct registry lookup (`findDurangoWorkspace`) + symlink path matching + cache immutability.
   const found = await workspaces.findDurangoWorkspace({ projectPath: path.join(repo, 'app'), name: workspace.name });
@@ -206,6 +223,9 @@ try {
     title: null,
     rejection: null,
   });
+  const located = await workspaces.locateDurangoChange('chg_test12345678');
+  assert.equal(located?.workspace, workspace.path, 'locateDurangoChange finds holder directly from workspaces.json');
+  assert.equal(located?.repo, repo);
   await fs.rm(path.join(workspace.path, '.durango', 'change.json'), { force: true });
 
   // --- ws rm ---------------------------------------------------------------------
