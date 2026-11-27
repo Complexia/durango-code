@@ -2474,6 +2474,11 @@ const App: React.FC = () => {
 
   const activeThreadProject = selectedThreadProject ?? defaultNewThreadProject;
   const activeIsNoProject = isNoProjectId(activeThreadProject?.id);
+  // The header breadcrumb's project label. Another machine's thread whose project isn't here: its name there.
+  const breadcrumbProjectName =
+    activeIsNoProject && selectedThread?.remote?.projectName
+      ? selectedThread.remote.projectName
+      : (activeThreadProject?.name ?? '');
 
   // The directory the repository controls act on: the selected thread's
   // Durango workspace when it has one, otherwise the project.
@@ -11972,7 +11977,7 @@ const App: React.FC = () => {
                       activeWorkspaceUnavailable ||
                       (!!selectedThread && !canChangeSelectedThreadProject)
                     }
-                    title={
+                    title={`${breadcrumbProjectName}\n${
                       repositoryOperationBusy
                         ? 'Repository operation in progress'
                         : activeWorkspaceUnavailable
@@ -11984,7 +11989,7 @@ const App: React.FC = () => {
                             : activeIsNoProject
                               ? 'Not tied to a project'
                               : activeThreadProject.path
-                    }
+                    }`}
                     aria-haspopup="dialog"
                   >
                     {activeIsNoProject ? (
@@ -11992,12 +11997,7 @@ const App: React.FC = () => {
                     ) : (
                       <ProjectBadge project={activeThreadProject} size={16} />
                     )}
-                    <span className="truncate">
-                      {/* Another machine's thread whose project isn't here: its name there. */}
-                      {activeIsNoProject && selectedThread?.remote?.projectName
-                        ? selectedThread.remote.projectName
-                        : activeThreadProject.name}
-                    </span>
+                    <span className="truncate">{breadcrumbProjectName}</span>
                     {(!selectedThread || canChangeSelectedThreadProject) && (
                       <ChevronDown size={13} className={`project-pill-chevron ${projectPickerOpen ? 'open' : ''}`} />
                     )}
@@ -12020,7 +12020,7 @@ const App: React.FC = () => {
                     onCancel={() => setThreadRenameKey(null)}
                   />
                 ) : (
-                  <span className="shell-title truncate">{shellTitle}</span>
+                  <span className="shell-title truncate" title={shellTitle}>{shellTitle}</span>
                 )}
                 <button
                   type="button"
@@ -12084,7 +12084,7 @@ const App: React.FC = () => {
               // Sidebar v3 showing a bot: its pane fills this spot with its own header.
               <div ref={setBotsShellSlot} className="shell-bot-slot bots-font" />
             ) : (
-              <span className="shell-title truncate">{shellTitle}</span>
+              <span className="shell-title truncate" title={shellTitle}>{shellTitle}</span>
             )}
             {activeTab === 'agents' && !v3AwayFromThread && selectedThread?.goal && (
               <div className="goal-chip-wrap" ref={goalMenuRef}>
