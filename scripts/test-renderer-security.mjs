@@ -13,6 +13,7 @@ import {
   RENDERER_CSP_PROD,
   buildRendererCsp,
   rendererCspResponseHeaders,
+  rewriteIndexHtmlCsp,
 } from '../src/renderer-csp.js';
 import { rendererDevCspPlugin } from '../vite.renderer.config.mjs';
 import { sanitizeThemeCss, sanitizeTokenValue } from '../src/ui-themes.js';
@@ -98,8 +99,25 @@ assert.match(httpsLanCsp, /connect-src[^;]*https:\/\/localhost:5173 wss:\/\/loca
 assert.match(httpsLanCsp, /connect-src[^;]*https:\/\/192\.168\.1\.10:5173 wss:\/\/192\.168\.1\.10:5173/);
 
 const devFromUrl = buildRendererCsp({ devServerUrl: 'http://localhost:5173', includeFrameAncestors: true });
-assert.match(devFromUrl, /connect-src[^;]*http:\/\/localhost:5173 ws:\/\/localhost:5173/);
+assert.match(devFromUrl, /connect-src[^;]*http:\/\/localhost:5173/);
+assert.match(devFromUrl, /connect-src[^;]*ws:\/\/localhost:5173/);
+assert.match(devFromUrl, /connect-src[^;]*ws:\/\/127\.0\.0\.1:\*/);
+assert.match(devFromUrl, /connect-src[^;]*ws:\/\/\[::1\]:\*/);
+assert.match(devFromUrl, /img-src[^;]*http:\/\/localhost:\*/);
+assert.match(devFromUrl, /media-src[^;]*http:\/\/127\.0\.0\.1:\*/);
 assert.match(devFromUrl, /frame-ancestors 'none'/);
+
+// HTTP dev header and Vite <meta> CSP share loopback origins even when dev hostnames differ.
+const devHeader = rendererCspResponseHeaders(
+  { resourceType: 'mainFrame', webContentsId: 1, responseHeaders: {} },
+  { isMainWindow: (id) => id === 1, devServerUrl: 'http://localhost:5173' }
+);
+assert.match(devHeader['Content-Security-Policy'][0], /connect-src[^;]*ws:\/\/127\.0\.0\.1:\*/);
+assert.match(devHeader['Content-Security-Policy'][0], /connect-src[^;]*ws:\/\/\[::1\]:\*/);
+
+// rewriteIndexHtmlCsp uses a function replacer so "$" sequences in CSP are never interpreted.
+const dollarRewritten = rewriteIndexHtmlCsp(indexHtml, "default-src 'self' $& $1");
+assert.equal(extractMetaCsp(dollarRewritten), "default-src 'self' $& $1");
 
 // Header injection applies ONLY to main-frame responses of tracked main windows and fails closed.
 const mainHeaders = rendererCspResponseHeaders(
@@ -180,7 +198,7 @@ assert.doesNotMatch(nestedOut, /@import|@namespace/i, 'deeply nested splice payl
 const safeCss = '.card { background: url("data:image/png;base64,iVBORw0KGgo="); color: var(--accent); }';
 assert.equal(sanitizeThemeCss(safeCss), safeCss);
 
-// Token values reject all CSS resource/dynamic functions (including protocol-relative paths).
+// Token values reject CSS resource/dynamic functions, comments, and interleaved quotes.
 for (const badToken of [
   'url("//evil.example/x.png")',
   'image("//evil.example/x.png")',
@@ -191,9 +209,18 @@ for (const badToken of [
   'image-set("//evil.example/x.png" 1x)',
   '-webkit-image-set("//evil.example/x.png" 1x)',
   'expression(1)',
+  '#111 /*',
+  '*/ #111',
+  '#111 /* comment */',
+  "'a\"b' c\"",
+  '"a\'b" c\'',
 ]) {
   assert.equal(sanitizeTokenValue(badToken), null, `sanitizeTokenValue blocks ${badToken}`);
 }
+assert.equal(
+  sanitizeTokenValue("'Avenir Next', \"Segoe UI\", sans-serif"),
+  "'Avenir Next', \"Segoe UI\", sans-serif"
+);
 assert.equal(
   sanitizeTokenValue('linear-gradient(180deg, #141416 0%, #111113 100%)'),
   'linear-gradient(180deg, #141416 0%, #111113 100%)'

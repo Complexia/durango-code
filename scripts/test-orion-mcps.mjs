@@ -1312,8 +1312,13 @@ await server.connect(new StdioServerTransport());
   lastCallbackResponse = null;
   authorizeErrorDescription = `<script>alert("pwned")</script>${'A'.repeat(700)}`;
   let malformedStatus = '';
+  let postStatus = 0;
+  let postAllow = '';
   beforeFollowAuthorizeRedirect = async (authUrl) => {
     const redirectUri = new URL(new URL(authUrl).searchParams.get('redirect_uri'));
+    const postRes = await fetch(redirectUri.toString(), { method: 'POST' });
+    postStatus = postRes.status;
+    postAllow = postRes.headers.get('allow') ?? '';
     malformedStatus = await new Promise((resolve, reject) => {
       const sock = net.connect(Number(redirectUri.port), '127.0.0.1', () => {
         sock.write('GET //[ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
@@ -1331,6 +1336,8 @@ await server.connect(new StdioServerTransport());
       url: `${origin}/secure/mcp`,
     });
     assert.equal(failedOauth.ok, false);
+    assert.equal(postStatus, 405, 'non-GET callback request returns 405');
+    assert.equal(postAllow, 'GET');
     assert.match(malformedStatus, /^HTTP\/1\.1 400 /, 'malformed callback URL returns 400 without crashing');
     assert.ok(lastCallbackResponse, 'callback server survived malformed request and responded');
     assert.equal(lastCallbackResponse.status, 400);
@@ -1342,6 +1349,7 @@ await server.connect(new StdioServerTransport());
     assert.equal(lastCallbackResponse.headers['x-content-type-options'], 'nosniff');
     assert.equal(lastCallbackResponse.headers['cache-control'], 'no-store');
     assert.equal(lastCallbackResponse.headers['referrer-policy'], 'no-referrer');
+    assert.equal(lastCallbackResponse.headers['connection'], 'close');
   } finally {
     authorizeErrorDescription = null;
     beforeFollowAuthorizeRedirect = null;

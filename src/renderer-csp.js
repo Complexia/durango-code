@@ -15,14 +15,22 @@
 // - `img-src` / `media-src`: allows app-local, `data:`, `blob:`,
 //   `orion-attachment:`, `orion-source-attachment:`, and `https:` (avatars,
 //   community theme previews, bot files, HTTPS Markdown media). Cleartext
-//   `http:` is excluded in production to block LAN/localhost/metadata probing.
+//   `http:` is excluded in production to block LAN/localhost/metadata probing;
+//   dev mode adds loopback `http:` origins for local Durango stacks.
 // - `worker-src 'self' blob:`: Shiki syntax-highlight module worker (`'self'`)
 //   and Monaco workers (`'self'` / `blob:`).
 // - `frame-src 'self' orion-attachment:`: `about:srcdoc` visuals/theme scenes
 //   and Code-tab PDF preview iframes (`orion-attachment://`).
 // - `connect-src`: no external network in production (the renderer talks to
-//   main over IPC); dev mode adds the Vite dev server HTTP + WebSocket origins
-//   for HMR.
+//   main over IPC); dev mode adds loopback + configured Vite dev server HTTP
+//   and WebSocket origins for HMR so the HTTP header and `<meta>` CSP always
+//   intersect cleanly across IPv4, IPv6, HTTPS, and custom HMR hosts/ports.
+
+const DEV_LOOPBACK_HTTP = [
+  'http://localhost:*',
+  'http://127.0.0.1:*',
+  'http://[::1]:*',
+];
 
 const DEV_CONNECT_FALLBACK = [
   'http://localhost:*',
@@ -67,11 +75,11 @@ export const buildRendererCsp = ({
     ...(Array.isArray(devServerUrls) ? devServerUrls : []),
     ...(devServerUrl ? [devServerUrl] : []),
   ]);
-  const extraConnect = explicitDevOrigins.length
-    ? explicitDevOrigins
-    : devMode
-      ? DEV_CONNECT_FALLBACK
-      : [];
+  const isDev = Boolean(devMode || explicitDevOrigins.length > 0);
+  const extraConnect = isDev
+    ? [...new Set([...DEV_CONNECT_FALLBACK, ...explicitDevOrigins])]
+    : [];
+  const extraMedia = isDev ? DEV_LOOPBACK_HTTP : [];
 
   const connectSrc = [
     "'self'",
@@ -82,12 +90,22 @@ export const buildRendererCsp = ({
     ...extraConnect,
   ].join(' ');
 
+  const mediaOrigins = [
+    "'self'",
+    'data:',
+    'blob:',
+    'orion-attachment:',
+    'orion-source-attachment:',
+    'https:',
+    ...extraMedia,
+  ].join(' ');
+
   const directives = [
     "default-src 'self'",
     "script-src 'self' 'unsafe-inline'",
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: orion-attachment: orion-source-attachment: https:",
-    "media-src 'self' data: blob: orion-attachment: orion-source-attachment: https:",
+    `img-src ${mediaOrigins}`,
+    `media-src ${mediaOrigins}`,
     "font-src 'self' data:",
     `connect-src ${connectSrc}`,
     "worker-src 'self' blob:",
@@ -111,7 +129,7 @@ export const RENDERER_CSP_DEV = buildRendererCsp({ devMode: true });
 export const rewriteIndexHtmlCsp = (html, csp) =>
   String(html).replace(
     /(<meta\b[^>]*\bhttp-equiv\s*=\s*"Content-Security-Policy"[^>]*\bcontent\s*=\s*")[^"]*(")/i,
-    `$1${csp}$2`
+    (_match, before, after) => `${before}${csp}${after}`
   );
 
 /**
@@ -128,6 +146,7 @@ export const rendererCspResponseHeaders = (
   if (typeof isMainWindow !== 'function' || !isMainWindow(details.webContentsId)) return null;
   const csp = buildRendererCsp({
     devServerUrl,
+    devMode: Boolean(devServerUrl),
     includeFrameAncestors: true,
   });
   const nextHeaders = {};

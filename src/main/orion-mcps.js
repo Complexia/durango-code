@@ -430,11 +430,23 @@ export const callbackPage = (title, detail) => {
 
 const MAX_OAUTH_ERROR_DETAIL_CHARS = 500;
 
-const setCallbackHeaders = (res) => {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'");
+const statesEqual = (actual, expected) => {
+  if (typeof actual !== 'string' || typeof expected !== 'string' || !expected) return false;
+  const a = Buffer.from(actual, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+};
+
+const setCallbackBaseHeaders = (res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Connection', 'close');
+};
+
+const setCallbackHeaders = (res) => {
+  setCallbackBaseHeaders(res);
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'");
   res.setHeader('Referrer-Policy', 'no-referrer');
 };
 
@@ -450,7 +462,15 @@ const startOAuthCallbackServer = () =>
     });
     codePromise.catch(() => {});
     let expectedState = null;
+    let settled = false;
+    let closed = false;
     const server = http.createServer((req, res) => {
+      if (req.method !== 'GET') {
+        setCallbackBaseHeaders(res);
+        res.setHeader('Allow', 'GET');
+        res.writeHead(405).end();
+        return;
+      }
       let url;
       try {
         url = new URL(req.url || '/', 'http://127.0.0.1');
@@ -460,6 +480,7 @@ const startOAuthCallbackServer = () =>
         return;
       }
       if (url.pathname !== '/callback') {
+        setCallbackBaseHeaders(res);
         res.writeHead(404).end();
         return;
       }
@@ -467,10 +488,12 @@ const startOAuthCallbackServer = () =>
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
       setCallbackHeaders(res);
-      if (!expectedState || state !== expectedState) {
+      if (settled || !statesEqual(state, expectedState)) {
         res.writeHead(400).end(callbackPage('Sign-in failed', 'This sign-in link is stale. Start again from Durango Code.'));
         return;
       }
+      settled = true;
+      expectedState = null;
       if (error || !code) {
         const rawDetail = url.searchParams.get('error_description') || error || 'No authorization code was returned.';
         const detail = rawDetail.slice(0, MAX_OAUTH_ERROR_DETAIL_CHARS);
@@ -481,6 +504,13 @@ const startOAuthCallbackServer = () =>
       res.writeHead(200).end(callbackPage('Connected to Durango Code', 'You can close this tab and return to Durango Code.'));
       settleCode(code);
     });
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      expectedState = null;
+      server.closeAllConnections?.();
+      server.close();
+    };
     server.on('error', reject);
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
@@ -491,7 +521,7 @@ const startOAuthCallbackServer = () =>
         },
         code: codePromise,
         fail: failCode,
-        close: () => server.close(),
+        close,
       });
     });
   });
@@ -564,6 +594,7 @@ const runInteractiveOAuth = async (server, { resourceMetadataUrl, scope, signal 
       OAUTH_TIMEOUT_MS
     );
     const code = await callback.code;
+    callback.close();
     const second = await auth(provider, { ...options, authorizationCode: code });
     signal?.throwIfAborted();
     if (second !== 'AUTHORIZED') throw new Error('The server did not accept the sign-in.');
