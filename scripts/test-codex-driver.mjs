@@ -1145,6 +1145,410 @@ await astraDriver.dispose();
   assert.deepEqual(goalFailedWithSnapshot.fatalErrors, []);
   assert.equal(goalFailedWithSnapshot.runEnds, 1);
   assert.equal(goalFailedWithSnapshot.goals.at(-1)?.status, 'paused');
+
+  // 7. Blank/whitespace turn.error.message falls back to codexErrorDetail, then
+  // lastTerminalTurnError, then the default message when both are absent.
+  const blankWithInfo = await runFailedTurnScenario({
+    turnError: { message: '   ', codexErrorInfo: 'usageLimitExceeded' },
+  });
+  assert.deepEqual(blankWithInfo.fatalErrors, ['usage limit exceeded']);
+
+  const blankFallsBackToNotification = await runFailedTurnScenario({
+    preTurnMessages: [
+      {
+        method: 'error',
+        params: {
+          threadId: 'failed-turn-thread',
+          error: { message: 'Quota exhausted from notification' },
+          willRetry: false,
+        },
+      },
+    ],
+    turnError: { message: '   ' },
+  });
+  assert.deepEqual(blankFallsBackToNotification.fatalErrors, ['Quota exhausted from notification']);
+
+  const missingBothErrors = await runFailedTurnScenario({});
+  assert.deepEqual(missingBothErrors.fatalErrors, ['Codex turn failed.']);
+
+  // 8. Late failed turn/completed arriving after dispose() must not emit
+  // activities/onFatal or start context recovery (which would roll back history).
+  {
+    const lateWire = [];
+    const lateActivities = [];
+    const lateFatals = [];
+    let lateRunEnds = 0;
+    let resolveInterrupt = null;
+    let lateDriver;
+    lateDriver = createCodexAppServerDriver({
+      child: {
+        stdin: {
+          write(line) {
+            const message = JSON.parse(line);
+            lateWire.push(message);
+            if (message.id === undefined) return;
+            if (message.method === 'turn/interrupt') {
+              resolveInterrupt = () => lateDriver.handleMessage({ jsonrpc: '2.0', id: message.id, result: {} });
+              return;
+            }
+            const result =
+              message.method === 'thread/resume'
+                ? { thread: { id: 'late-failed-thread' } }
+                : message.method === 'turn/start'
+                  ? { turn: { id: 'late-turn-1' } }
+                  : {};
+            queueMicrotask(() => {
+              lateDriver.handleMessage({ jsonrpc: '2.0', id: message.id, result });
+              if (message.method === 'turn/start') {
+                lateDriver.handleMessage({
+                  jsonrpc: '2.0',
+                  method: 'turn/started',
+                  params: { threadId: 'late-failed-thread', turn: { id: 'late-turn-1' } },
+                });
+              }
+            });
+          },
+        },
+      },
+      cwd: '/tmp/project',
+      model,
+      input: { prompt: 'stop while failing' },
+      resumeSessionId: 'late-failed-thread',
+      accessMode: 'full-access',
+      callbacks: {
+        onActivity: (activity) => lateActivities.push(activity),
+        onActionAccepted: () => {},
+        onFatal: (error) => lateFatals.push(error),
+        onGoal: () => {},
+        onReasoning: () => {},
+        onRunEnd: () => {
+          lateRunEnds += 1;
+        },
+        onSessionId: () => {},
+        onStats: () => {},
+        onText: () => {},
+      },
+    });
+    await lateDriver.start();
+    const disposing = lateDriver.dispose();
+    // Simulate a recoverable failed turn/completed arriving on the open socket
+    // while dispose() is still awaiting turn/interrupt.
+    lateDriver.handleMessage({
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: 'late-failed-thread',
+        turn: {
+          id: 'late-turn-1',
+          status: 'failed',
+          error: { message: 'context window exceeded', codexErrorInfo: 'contextWindowExceeded' },
+        },
+      },
+    });
+    resolveInterrupt?.();
+    await disposing;
+    assert.equal(lateWire.some((m) => m.method === 'thread/rollback'), false, 'late failure after dispose must not roll back history');
+    assert.equal(lateWire.some((m) => m.method === 'thread/compact/start'), false);
+    assert.deepEqual(lateActivities, []);
+    assert.deepEqual(lateFatals, []);
+    assert.equal(lateRunEnds, 0);
+  }
+
+  // 9. When context recovery compacts successfully but turn/start retry fails,
+  // report the retry failure rather than the stale pre-compaction turn.error.
+  {
+    const retryFailFatals = [];
+    let retryFailRunEnds = 0;
+    let retryTurnStarts = 0;
+    let retryFailDriver;
+    retryFailDriver = createCodexAppServerDriver({
+      child: {
+        stdin: {
+          write(line) {
+            const message = JSON.parse(line);
+            if (message.id === undefined) return;
+            if (message.method === 'turn/start') {
+              retryTurnStarts += 1;
+              if (retryTurnStarts === 2) {
+                queueMicrotask(() => {
+                  retryFailDriver.handleMessage({
+                    jsonrpc: '2.0',
+                    id: message.id,
+                    error: { message: 'Retry rejected by server' },
+                  });
+                });
+                return;
+              }
+            }
+            const result =
+              message.method === 'thread/resume'
+                ? { thread: { id: 'retry-fail-thread' } }
+                : message.method === 'turn/start'
+                  ? { turn: { id: 'retry-turn-1' } }
+                  : {};
+            queueMicrotask(() => {
+              retryFailDriver.handleMessage({ jsonrpc: '2.0', id: message.id, result });
+              if (message.method === 'turn/start' && retryTurnStarts === 1) {
+                retryFailDriver.handleMessage({
+                  jsonrpc: '2.0',
+                  method: 'turn/started',
+                  params: { threadId: 'retry-fail-thread', turn: { id: 'retry-turn-1' } },
+                });
+                retryFailDriver.handleMessage({
+                  jsonrpc: '2.0',
+                  method: 'turn/completed',
+                  params: {
+                    threadId: 'retry-fail-thread',
+                    turn: {
+                      id: 'retry-turn-1',
+                      status: 'failed',
+                      error: { message: 'context window exceeded', codexErrorInfo: 'contextWindowExceeded' },
+                    },
+                  },
+                });
+              } else if (message.method === 'thread/compact/start') {
+                retryFailDriver.handleMessage({
+                  jsonrpc: '2.0',
+                  method: 'turn/started',
+                  params: { threadId: 'retry-fail-thread', turn: { id: 'retry-compact-turn' } },
+                });
+                retryFailDriver.handleMessage({
+                  jsonrpc: '2.0',
+                  method: 'turn/completed',
+                  params: { threadId: 'retry-fail-thread', turn: { id: 'retry-compact-turn', status: 'completed' } },
+                });
+              }
+            });
+          },
+        },
+      },
+      cwd: '/tmp/project',
+      model,
+      input: { prompt: 'retry after compact' },
+      resumeSessionId: 'retry-fail-thread',
+      accessMode: 'full-access',
+      callbacks: {
+        onActivity: () => {},
+        onActionAccepted: () => {},
+        onFatal: (error) => retryFailFatals.push(error),
+        onGoal: () => {},
+        onReasoning: () => {},
+        onRunEnd: () => {
+          retryFailRunEnds += 1;
+        },
+        onSessionId: () => {},
+        onStats: () => {},
+        onText: () => {},
+      },
+    });
+    await retryFailDriver.start();
+    for (let attempt = 0; attempt < 50 && retryFailFatals.length === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await retryFailDriver.dispose();
+    assert.deepEqual(
+      retryFailFatals,
+      ['Retry rejected by server'],
+      'failed recovery retry must report the retry error, not the stale pre-compaction error'
+    );
+    assert.equal(retryFailRunEnds, 0);
+  }
+
+  // 10. Failed non-goal turns clear pending blocking & async questions without
+  // retaining async questions for later answers.
+  {
+    const qWire = [];
+    const qFatals = [];
+    const retainedOnFail = [];
+    let qDriver;
+    qDriver = createCodexAppServerDriver({
+      child: {
+        stdin: {
+          write(line) {
+            const message = JSON.parse(line);
+            qWire.push(message);
+            if (message.id === undefined) return;
+            const result =
+              message.method === 'thread/start'
+                ? { thread: { id: 'q-fail-thread' } }
+                : message.method === 'turn/start'
+                  ? { turn: { id: 'q-fail-turn' } }
+                  : {};
+            queueMicrotask(() => {
+              qDriver.handleMessage({ jsonrpc: '2.0', id: message.id, result });
+              if (message.method === 'turn/start') {
+                qDriver.handleMessage({
+                  jsonrpc: '2.0',
+                  method: 'turn/started',
+                  params: { threadId: 'q-fail-thread', turn: { id: 'q-fail-turn' } },
+                });
+              }
+            });
+          },
+        },
+      },
+      cwd: '/tmp/project',
+      model: astra,
+      input: { threadId: 'orion-q-fail', prompt: 'ask then fail' },
+      accessMode: 'full-access',
+      callbacks: {
+        onActivity: () => {},
+        onActionAccepted: () => {},
+        onFatal: (error) => qFatals.push(error),
+        onGoal: () => {},
+        onReasoning: () => {},
+        onRetainUserInputs: (items) => retainedOnFail.push(...items),
+        onRunEnd: () => assert.fail('failed turn must not call onRunEnd'),
+        onSessionId: () => {},
+        onStats: () => {},
+        onText: () => {},
+        onUserInput: () => {},
+      },
+    });
+    await qDriver.start();
+    qDriver.handleMessage({
+      method: 'item/completed',
+      params: {
+        threadId: 'q-fail-thread',
+        item: { ...asyncItem, id: 'fail-async-q' },
+      },
+    });
+    qDriver.handleMessage({
+      id: 'fail-blocking-q',
+      method: 'item/tool/requestUserInput',
+      params: {
+        threadId: 'q-fail-thread',
+        turnId: 'q-fail-turn',
+        isBlocking: true,
+        itemId: 'ask-fail',
+        questions: [{ id: 'choice', header: 'Design', question: 'Which design?', options: [{ label: 'A', description: '' }] }],
+      },
+    });
+    assert.equal(qDriver.getUserInputs().length, 2);
+    qDriver.handleMessage({
+      method: 'turn/completed',
+      params: {
+        threadId: 'q-fail-thread',
+        turn: { id: 'q-fail-turn', status: 'failed', error: { message: 'Stream failed' } },
+      },
+    });
+    assert.deepEqual(qFatals, ['Stream failed']);
+    assert.equal(qDriver.getUserInputs().length, 0);
+    assert.deepEqual(
+      qWire.find((m) => m.id === 'fail-blocking-q' && m.result)?.result,
+      { answers: {} },
+      'blocking question must be settled on failure'
+    );
+    assert.deepEqual(retainedOnFail, [], 'async questions must not be retained on failed turns');
+    await qDriver.dispose();
+  }
+
+  // 11. Exercise main.js's actual onFatal -> finalizeRunInner wiring to ensure
+  // the real driver error reaches event.error (error banners, subagents, dispatch)
+  // without emitting a duplicate error chunk, and falls back to exit code when absent.
+  {
+    const finalizeStart = mainSource.indexOf('const finalizeRun = async (exitCode, options = {}) => {');
+    const finalizeEnd = mainSource.indexOf('const maybeEmitSessionId = (parsed) => {', finalizeStart);
+    const onFatalStart = mainSource.indexOf('onFatal: (message, meta) => {', finalizeEnd);
+    const onFatalEnd = mainSource.indexOf('    // The driver\'s completion signal:', onFatalStart);
+    assert.ok(finalizeStart > 0 && finalizeEnd > finalizeStart && onFatalStart > finalizeEnd && onFatalEnd > onFatalStart);
+    const runMainFatalWiring = (invoke) => {
+      const emitted = [];
+      let killed = 0;
+      const harness = new Function(
+        'event',
+        'runId',
+        'input',
+        'model',
+        'child',
+        'beforeSnapshot',
+        'emitAgentEvent',
+        'summarizeChangedFiles',
+        'killAgentChild',
+        'finalizingAgentRuns',
+        'activeAgentRuns',
+        'stoppedAgentRuns',
+        'codexGoalRunDrivers',
+        'codexSteerableRunDrivers',
+        'fxSteerableRunDrivers',
+        'antigravityRunDrivers',
+        'subagentTracker',
+        'finishReasoningActivity',
+        `
+        let stderr = '';
+        let stdoutSeen = false;
+        let fatalError = null;
+        let fatalMeta = null;
+        let finalized = false;
+        let exitFallbackTimer = null;
+        let terminalEventTimer = null;
+        let runStats = null;
+        let antigravitySessionBroken = false;
+        let jsonMode = false;
+        let jsonBuffer = '';
+        let useCodexGoal = false;
+        let persistentAntigravity = false;
+        let antigravityLease = null;
+        let acpDriver = null;
+        let orionMcp = null;
+        let codexAppServerLease = null;
+        let codexSpawnWatcher = null;
+        let kimiSpawnWatcher = null;
+        const clearFinalizeTimers = () => {};
+        ${mainSource.slice(finalizeStart, finalizeEnd)}
+        const callbacks = {
+          ${mainSource.slice(onFatalStart, onFatalEnd).replace(/\};\s*$/, '')}
+        };
+        return { callbacks, finalizeRun };
+        `
+      )(
+        { sender: {} },
+        'run-1',
+        { threadId: 'thread-1', projectPath: '/tmp/project' },
+        model,
+        {},
+        null,
+        (_sender, payload) => emitted.push(payload),
+        async () => [],
+        () => {
+          killed += 1;
+        },
+        new Set(),
+        new Map(),
+        new Set(),
+        new Map(),
+        new Map(),
+        new Map(),
+        new Map(),
+        { dispose: () => {} },
+        () => {}
+      );
+      return Promise.resolve(invoke(harness)).then(() => ({ emitted, killed }));
+    };
+
+    const fromOnFatal = await runMainFatalWiring(async ({ callbacks }) => {
+      callbacks.onFatal('Rate limit exceeded', { retryable: true, resumeWith: 'continue' });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    assert.ok(fromOnFatal.killed >= 1);
+    assert.equal(
+      fromOnFatal.emitted.some((ev) => ev.type === 'chunk'),
+      false,
+      'onFatal must not emit a duplicate chunk once the real error is carried in event.error'
+    );
+    const fatalEvent = fromOnFatal.emitted.find((ev) => ev.type === 'error');
+    assert.equal(fatalEvent?.exitCode, 1);
+    assert.equal(fatalEvent?.error, 'Rate limit exceeded');
+    assert.equal(fatalEvent?.providerId, 'codex');
+    assert.equal(fatalEvent?.retryable, true);
+    assert.equal(fatalEvent?.resumeWith, 'continue');
+
+    const fromExitCodeOnly = await runMainFatalWiring(async ({ finalizeRun }) => {
+      await finalizeRun(1);
+    });
+    const exitEvent = fromExitCodeOnly.emitted.find((ev) => ev.type === 'error');
+    assert.equal(exitEvent?.error, `${model.label} exited with code 1.`);
+  }
 }
 assert.equal(codexAppServerActivityFromItem({ id: 'sleep-1', type: 'sleep', durationMs: 5000 }, false).title, 'Waiting');
 assert.match(codexAppServerActivityFromItem({ id: 'call-1', type: 'functionCallOutput', name: 'exec', namespace: 'functions', output: 'completed' }, true).title, /functions.exec/);

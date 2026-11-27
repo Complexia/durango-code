@@ -7786,6 +7786,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
 
     let stderr = '';
     let stdoutSeen = false;
+    let fatalError = null;
     let fatalMeta = null;
     let acceptedCodexSessionId = resumeSessionId;
     let codexActionAccepted = false;
@@ -8066,7 +8067,7 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
         ...(finalExitCode === 0
           ? {}
           : {
-              error: `${model.label} exited with code ${finalExitCode}.`,
+              error: fatalError || `${model.label} exited with code ${finalExitCode}.`,
               // Lets the renderer offer the right provider's Authenticate
               // button when the failure text reads as a logged-out CLI.
               providerId: model.providerId,
@@ -8217,14 +8218,14 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
       },
       onFatal: (message, meta) => {
         if (finalized) return;
+        const text =
+          typeof message === 'string'
+            ? message.trim()
+            : typeof message?.message === 'string'
+              ? message.message.trim()
+              : '';
+        fatalError = text || null;
         fatalMeta = meta && typeof meta === 'object' ? meta : null;
-        stdoutSeen = true;
-        emitAgentEvent(event.sender, {
-          runId,
-          threadId: input.threadId,
-          type: 'chunk',
-          chunk: `${message}\n`,
-        });
         if (!persistentAntigravity) killAgentChild(child);
         finalizeRun(1);
       },

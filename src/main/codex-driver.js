@@ -731,7 +731,7 @@ export const createCodexAppServerDriver = ({
         detail,
         status: 'error',
       });
-      finishFailedTurn(turn, restarted.error);
+      finishFailedTurn({ ...turn, error: restarted.error }, error);
       return;
     }
     failedTurnRolledBack = false;
@@ -742,6 +742,7 @@ export const createCodexAppServerDriver = ({
     activeTurnId = null;
     const turn = params.turn ?? {};
     if (typeof turn.id === 'string') lastCompletedTurnId = turn.id;
+    if (ended) return;
     if (turn.status === 'failed') {
       const error = isRecoverableCodexContextError(turn.error)
         ? turn.error
@@ -767,7 +768,6 @@ export const createCodexAppServerDriver = ({
       finishFailedTurn(turn, error);
       return;
     }
-    if (ended) return;
     if (review) {
       endRun();
       return;
