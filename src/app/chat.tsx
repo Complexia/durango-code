@@ -18,6 +18,12 @@ import {
 } from './markdown';
 import { linkedTaskStatusLabel } from './promptContext';
 import { usePendingTurn } from './pendingTurns';
+import {
+  pendingRemoteSteerMessage,
+  pendingRemoteSteers,
+  reconcileRemoteSteers,
+  usePendingRemoteSteers,
+} from './pendingRemoteSteers';
 import { isSteer, workStartedAt } from './threadLists';
 
 export const CopyMessageButton: React.FC<{ text: string; className?: string }> = ({ text, className }) => {
@@ -573,9 +579,17 @@ const noop = () => {};
  * read it, for drivers that report it (reportsSteerReads); a plain "sent"
  * for the others. Gone once the run is over.
  */
-const SteeredMessageReceipt: React.FC<{ state: 'pending' | 'seen' | 'sent' }> = ({ state }) => (
+const SteeredMessageReceipt: React.FC<{ state: 'sending' | 'pending' | 'seen' | 'sent'; machineName?: string }> = ({
+  state,
+  machineName,
+}) => (
   <div key={state} className={`steer-receipt ${state}`} role="status">
-    {state === 'seen' ? (
+    {state === 'sending' ? (
+      <>
+        <span className="steer-receipt-dot" aria-hidden="true" />
+        Sending to {machineName ?? 'the other machine'}…
+      </>
+    ) : state === 'seen' ? (
       <>
         <Check size={12} /> Seen
       </>
@@ -685,7 +699,16 @@ export const ChatMessage = React.memo(function ChatMessage({
   }
 
   return (
-    <div className={`message ${message.role}${message.role === 'user' && message.steer ? ' steered' : ''}`}>
+    <div
+      className={`message ${message.role}${
+        message.role === 'user' && message.steer
+          ? // Another machine's copy of a steer shown from here: already on screen.
+            pendingRemoteSteers.isAdoptedEcho(message.id)
+            ? ' steered steer-adopted'
+            : ' steered'
+          : ''
+      }`}
+    >
       {message.role === 'agent' ? (
         <StreamingMarkdownContent content={message.content} refLinks />
       ) : (
@@ -1172,6 +1195,19 @@ export const ChatTranscript = React.memo(function ChatTranscript({
         : storedMessages,
     [pendingTurn, hasThread, storedMessages]
   );
+  // Steers on their way to the machine this thread runs on: shown from here
+  // until that machine's copy of each is in the transcript, which takes its
+  // place in this same render (never both, never neither).
+  const remoteSteers = usePendingRemoteSteers(threadId);
+  const remoteSteerView = useMemo(() => {
+    const view = reconcileRemoteSteers(remoteSteers, storedMessages);
+    // Before the transcript draws them: the echoes don't rise in again.
+    pendingRemoteSteers.adopt(view.echoes.values());
+    return view;
+  }, [remoteSteers, storedMessages]);
+  useEffect(() => {
+    pendingRemoteSteers.settle(threadId, remoteSteerView.echoes);
+  }, [remoteSteerView, threadId]);
   // A thread on another machine whose copy hasn't been read here yet (a
   // subagent there opened for the first time, say): it fills in once that
   // machine answers (useRemoteThreadSync). Until then it shows a skeleton,
@@ -1431,6 +1467,7 @@ export const ChatTranscript = React.memo(function ChatTranscript({
     isSending,
     messages,
     thread?.queuedMessages,
+    remoteSteers,
     btwExchanges,
     setWindowStartId,
   ]);
@@ -1661,6 +1698,16 @@ export const ChatTranscript = React.memo(function ChatTranscript({
               messages.at(-1)?.kind !== 'claude-background-intervention' && (
               <div className="message agent opacity-70">Starting agent...</div>
             )}
+
+            {remoteSteerView.visible.map((steer) => (
+              <React.Fragment key={steer.id}>
+                <ChatMessage message={pendingRemoteSteerMessage(steer)} />
+                <SteeredMessageReceipt
+                  state={steer.state === 'sending' ? 'sending' : 'sent'}
+                  machineName={shell?.remote?.machineName}
+                />
+              </React.Fragment>
+            ))}
 
             {(thread.queuedMessages ?? []).map((queued) => (
               <div key={queued.id} className="message user queued">

@@ -93,6 +93,7 @@ import { createThreadSteeringCoordinator } from './app/thread-steering';
 import { setSourceAttachmentAccount } from './app/sourceAttachments';
 import { Toaster, toast } from 'sonner';
 import { pendingTurns, type PendingTurn } from './app/pendingTurns';
+import { pendingRemoteSteers, remoteSteerContent, steeredMessageIds } from './app/pendingRemoteSteers';
 import {
   agentProviders,
   antigravityReasoningOptionsForModel,
@@ -321,6 +322,9 @@ const loadedMessages = (threadId: string): Message[] | undefined =>
 
 // How long a thread's queue waits after a queued message couldn't start.
 const QUEUE_RETRY_DELAY_MS = 30_000;
+// How long a steer another machine took stays shown from here at most, if
+// that machine's copy of the thread never shows it.
+const REMOTE_STEER_ECHO_TIMEOUT_MS = 60_000;
 
 const TRANSCRIPT_UNAVAILABLE_ERROR =
   "This thread's transcript could not be read from disk, so nothing was sent. Try again in a moment.";
@@ -8538,10 +8542,25 @@ const App: React.FC = () => {
     // What followed it, to go back in front of (an index would drift while
     // other steers are out of the queue too).
     const followers = queue.slice(index + 1).map((queued) => queued.id);
+    // Shown at once as a steered message that is sending, in the same update
+    // that takes it out of the queue (or the composer): it stays on screen
+    // until that machine's copy of it replaces it (pendingRemoteSteers).
+    const steerContent = remoteSteerContent(message.text, message.attachments ?? []);
+    pendingRemoteSteers.add(threadId, {
+      id: message.id,
+      content: steerContent,
+      attachments: message.attachments ?? [],
+      ts: new Date().toISOString(),
+      state: 'sending',
+      earlierIds: steeredMessageIds(useOrionStore.getState().transcripts[threadId]?.messages, steerContent),
+    });
     if (queuedId) removeQueuedThreadMessage(threadId, queuedId);
     const pending = pendingRemoteSteersRef.current;
     pending.set(threadId, (pending.get(threadId) ?? 0) + 1);
     const restore = (cancelled: boolean) => {
+      // Back where it came from, in the same update: the text never leaves
+      // the screen.
+      pendingRemoteSteers.remove(threadId, message.id);
       if (cancelled) {
         // Stopped meanwhile: like the rest of the queue at Stop, back to
         // the composer rather than out to that machine as a new turn.
@@ -8571,8 +8590,12 @@ const App: React.FC = () => {
           })
           .catch((error: unknown) => ({ ok: false, error: error instanceof Error ? error.message : undefined }));
         if (result?.ok) {
-          // The steered message shows once the mirror has that machine's copy.
+          // In the turn there: shown as sent until the mirror has that
+          // machine's copy, which then takes its place. A copy that never
+          // shows it (an older machine) doesn't leave it up for good.
+          pendingRemoteSteers.markSent(threadId, message.id);
           remoteThreadSyncRef.current?.refreshSoon(threadId, { force: true });
+          window.setTimeout(() => pendingRemoteSteers.remove(threadId, message.id), REMOTE_STEER_ECHO_TIMEOUT_MS);
           return;
         }
         restore(cancelled());

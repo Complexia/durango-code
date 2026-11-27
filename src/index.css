@@ -3657,6 +3657,12 @@ body {
   animation: steer-in 420ms var(--ease-out) both;
 }
 
+/* That machine's copy of a steer already shown from here (a remote thread):
+   it takes the place of the one on screen without rising in again. */
+.message.user.steered.steer-adopted {
+  animation: none;
+}
+
 @keyframes steer-in {
   from {
     opacity: 0;
