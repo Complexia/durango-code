@@ -4429,13 +4429,35 @@ const BotComposer: React.FC<{
   const draftSaver = useBotDraftSaver(draftKey);
   useEffect(() => draftSaver.save(text, files), [draftSaver, text, files]);
   const [dragging, setDragging] = useState(false);
+  const [scrolling, setScrolling] = useState(false);
   const [attachError, setAttachError] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const scrollTimerRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    },
+    []
+  );
+  const markScrolling = () => {
+    setScrolling(true);
+    if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = window.setTimeout(() => {
+      scrollTimerRef.current = null;
+      setScrolling(false);
+    }, 900);
+  };
   useLayoutEffect(() => {
     const element = ref.current;
     if (!element) return;
+    const prevScrollTop = element.scrollTop;
+    const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 2;
     element.style.height = '0px';
-    element.style.height = `${Math.min(element.scrollHeight, 200)}px`;
+    const nextHeight = Math.min(element.scrollHeight, 200);
+    element.style.height = `${nextHeight}px`;
+    if (nextHeight >= 200) {
+      element.scrollTop = atBottom ? element.scrollHeight : prevScrollTop;
+    }
   }, [text]);
   // Thumbnails still in the box when it goes away are released (sent ones belong to their message).
   const filesRef = useRef(files);
@@ -4487,8 +4509,8 @@ const BotComposer: React.FC<{
       <div className="mx-auto w-full max-w-[760px]">
         {paused && <div className="mb-1.5 text-center text-[11.5px] text-neutral-500">{botName} is paused: messages wait until you resume it.</div>}
         <div
-          className={`rounded-2xl border bg-white/[0.035] px-3.5 py-2 transition-colors focus-within:border-white/20 ${
-            dragging ? 'border-sky-400/60 bg-sky-400/[0.06]' : 'border-white/10'
+          className={`bot-composer rounded-2xl border bg-white/[0.035] px-3.5 py-2 transition-colors focus-within:border-white/20 ${
+            dragging ? 'is-dragging border-sky-400/60 bg-sky-400/[0.06]' : 'border-white/10'
           }`}
           onDragOver={(event) => {
             if (!event.dataTransfer.types.includes('Files')) return;
@@ -4544,7 +4566,7 @@ const BotComposer: React.FC<{
               aria-label="Attach files"
               title="Attach files (or paste, or drop them here)"
               onClick={() => void pick()}
-              className="mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/[0.08] hover:text-neutral-100"
+              className="bot-composer-attach mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/[0.08] hover:text-neutral-100"
             >
               <Paperclip size={15} />
             </button>
@@ -4554,6 +4576,7 @@ const BotComposer: React.FC<{
               rows={1}
               placeholder={`Message ${botName}`}
               onChange={(event) => setText(event.target.value)}
+              onScroll={markScrolling}
               onPaste={(event) => {
                 if (!event.clipboardData.files.length) return;
                 event.preventDefault();
@@ -4565,14 +4588,16 @@ const BotComposer: React.FC<{
                   submit();
                 }
               }}
-              className="max-h-[200px] min-h-[22px] flex-1 resize-none bg-transparent py-1 text-[13.5px] leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-500"
+              className={`bot-composer-input max-h-[200px] min-h-[22px] flex-1 resize-none bg-transparent py-1 pr-2 text-[13.5px] leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-500 ${
+                scrolling ? 'is-scrolling' : ''
+              }`}
             />
             <button
               type="button"
               aria-label="Send"
               onClick={submit}
               disabled={!text.trim() && !files.length}
-              className="mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-neutral-100 text-neutral-900 transition-opacity disabled:opacity-25"
+              className="bot-composer-send mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-neutral-100 text-neutral-900 transition-opacity disabled:opacity-25"
             >
               <ArrowUp size={14} strokeWidth={2.4} />
             </button>

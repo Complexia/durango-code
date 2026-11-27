@@ -7245,6 +7245,79 @@ html.theme-light .setting-row .release-notes-list {
   background: #555;
 }
 
+/* Bots view message composer (src/app/BotsWorkspace.tsx BotComposer):
+   Keep a reserved scrollbar gutter so text wrapping and buttons never shift
+   when the draft overflows max-height, and render a thin, rounded translucent
+   thumb that stays subtle at rest and shows clearly while hovering or scrolling. */
+.bot-composer-input {
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.bot-composer-input::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.bot-composer-input::-webkit-scrollbar-track,
+.bot-composer-input::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.bot-composer-input::-webkit-scrollbar-track {
+  margin: 2px 0;
+}
+
+.bot-composer-input::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--text-primary) 8%, transparent);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-radius: 9999px;
+  min-height: 28px;
+}
+
+.bot-composer:hover .bot-composer-input::-webkit-scrollbar-thumb,
+.bot-composer-input:hover::-webkit-scrollbar-thumb,
+.bot-composer-input.is-scrolling::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--text-primary) 26%, transparent);
+}
+
+.bot-composer-input::-webkit-scrollbar-thumb:hover,
+.bot-composer-input::-webkit-scrollbar-thumb:active {
+  background-color: color-mix(in srgb, var(--text-primary) 44%, transparent);
+}
+
+html.theme-light .bot-composer:not(.is-dragging) {
+  background: var(--bg-raised);
+  border-color: var(--border-default);
+}
+
+html.theme-light .bot-composer:not(.is-dragging):focus-within {
+  border-color: var(--border-strong);
+}
+
+html.theme-light .bot-composer-input {
+  color: var(--text-primary);
+}
+
+html.theme-light .bot-composer-input::placeholder {
+  color: var(--text-muted);
+}
+
+html.theme-light .bot-composer-attach {
+  color: var(--text-secondary);
+}
+
+html.theme-light .bot-composer-attach:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+html.theme-light .bot-composer-send {
+  background: var(--text-primary);
+  color: var(--bg-raised);
+}
+
 /* ============ Linked board tasks (Orion web kanban) ============ */
 
 .composer-task-row {
