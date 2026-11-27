@@ -4452,10 +4452,9 @@ const BotComposer: React.FC<{
     if (!element) return;
     const prevScrollTop = element.scrollTop;
     const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 2;
-    element.style.height = '0px';
-    const nextHeight = Math.min(element.scrollHeight, 200);
-    element.style.height = `${nextHeight}px`;
-    if (nextHeight >= 200) {
+    element.style.height = 'auto';
+    element.style.height = `${element.scrollHeight}px`;
+    if (element.scrollHeight > element.clientHeight) {
       element.scrollTop = atBottom ? element.scrollHeight : prevScrollTop;
     }
   }, [text]);
@@ -4507,11 +4506,9 @@ const BotComposer: React.FC<{
   return (
     <div className="shrink-0 px-4 pb-4 pt-2">
       <div className="mx-auto w-full max-w-[760px]">
-        {paused && <div className="mb-1.5 text-center text-[11.5px] text-neutral-500">{botName} is paused: messages wait until you resume it.</div>}
+        {paused && <div className="mb-1.5 text-center text-[11.5px] text-[var(--text-muted)]">{botName} is paused: messages wait until you resume it.</div>}
         <div
-          className={`bot-composer rounded-2xl border bg-white/[0.035] px-3.5 py-2 transition-colors focus-within:border-white/20 ${
-            dragging ? 'is-dragging border-sky-400/60 bg-sky-400/[0.06]' : 'border-white/10'
-          }`}
+          className={`composer-shell bot-composer${dragging ? ' is-dragging' : ''}`}
           onDragOver={(event) => {
             if (!event.dataTransfer.types.includes('Files')) return;
             event.preventDefault();
@@ -4528,10 +4525,10 @@ const BotComposer: React.FC<{
           }}
         >
           {files.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap items-end gap-1.5 pt-0.5">
+            <div className="composer-attachments">
               {files.map((file) =>
                 file.preview ? (
-                  <span key={file.path} className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-lg ring-1 ring-white/[0.1]" title={`${file.name} · ${formatFileSize(file.size)}`}>
+                  <span key={file.path} className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-[var(--border-default)]" title={`${file.name} · ${formatFileSize(file.size)}`}>
                     <img src={file.preview} alt={file.name} onClick={handleLightboxImageClick} className="h-full w-full cursor-zoom-in object-cover" />
                     <button
                       type="button"
@@ -4543,67 +4540,66 @@ const BotComposer: React.FC<{
                     </button>
                   </span>
                 ) : (
-                <span key={file.path} className="inline-flex max-w-[240px] items-center gap-1.5 rounded-lg bg-white/[0.06] py-1 pl-2.5 pr-1 text-[12px] text-neutral-200 ring-1 ring-white/[0.08]">
-                  <Paperclip size={12} className="shrink-0 text-neutral-500" />
-                  <span className="truncate">{file.name}</span>
-                  <span className="shrink-0 text-neutral-500">{formatFileSize(file.size)}</span>
-                  <button
-                    type="button"
-                    aria-label={`Remove ${file.name}`}
-                    onClick={() => remove(file)}
-                    className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-neutral-500 hover:bg-white/[0.08] hover:text-neutral-200"
-                  >
-                    <X size={11} />
-                  </button>
-                </span>
+                  <span key={file.path} className="inline-flex max-w-[240px] items-center gap-1.5 rounded-lg border border-[var(--border-default)] bg-[var(--bg-surface)] py-1 pl-2.5 pr-1 text-[12px] text-[var(--text-primary)]">
+                    <Paperclip size={12} className="shrink-0 text-[var(--text-muted)]" />
+                    <span className="truncate">{file.name}</span>
+                    <span className="shrink-0 text-[var(--text-muted)]">{formatFileSize(file.size)}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${file.name}`}
+                      onClick={() => remove(file)}
+                      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                    >
+                      <X size={11} />
+                    </button>
+                  </span>
                 )
               )}
             </div>
           )}
-          <div className="flex items-end gap-2">
+          <textarea
+            ref={ref}
+            value={text}
+            rows={2}
+            placeholder={`Message ${botName}`}
+            onChange={(event) => setText(event.target.value)}
+            onScroll={markScrolling}
+            onPaste={(event) => {
+              if (!event.clipboardData.files.length) return;
+              event.preventDefault();
+              void addFiles(event.clipboardData.files);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                submit();
+              }
+            }}
+            className={`chat-input min-h-[52px]${scrolling ? ' is-scrolling' : ''}`}
+          />
+          <div className="composer-controls">
             <button
               type="button"
               aria-label="Attach files"
               title="Attach files (or paste, or drop them here)"
               onClick={() => void pick()}
-              className="bot-composer-attach mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-white/[0.08] hover:text-neutral-100"
+              className="attachment-trigger ml-auto"
             >
               <Paperclip size={15} />
             </button>
-            <textarea
-              ref={ref}
-              value={text}
-              rows={1}
-              placeholder={`Message ${botName}`}
-              onChange={(event) => setText(event.target.value)}
-              onScroll={markScrolling}
-              onPaste={(event) => {
-                if (!event.clipboardData.files.length) return;
-                event.preventDefault();
-                void addFiles(event.clipboardData.files);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  submit();
-                }
-              }}
-              className={`bot-composer-input max-h-[200px] min-h-[22px] flex-1 resize-none bg-transparent py-1 pr-2 text-[13.5px] leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-500 ${
-                scrolling ? 'is-scrolling' : ''
-              }`}
-            />
             <button
               type="button"
               aria-label="Send"
+              title="Send"
               onClick={submit}
               disabled={!text.trim() && !files.length}
-              className="bot-composer-send mb-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-neutral-100 text-neutral-900 transition-opacity disabled:opacity-25"
+              className="send-button"
             >
-              <ArrowUp size={14} strokeWidth={2.4} />
+              <ArrowUp size={16} strokeWidth={2.5} />
             </button>
           </div>
         </div>
-        {attachError && <div className="mt-1 px-1 text-[11.5px] text-red-300">{attachError}</div>}
+        {attachError && <div className="mt-1 px-1 text-[11.5px] text-red-400">{attachError}</div>}
       </div>
     </div>
   );

@@ -322,12 +322,34 @@ export const Composer = ({
     setSlashDismissedDraft(null);
   }, [draftKey]);
 
+  const [scrolling, setScrolling] = useState(false);
+  const scrollTimerRef = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    },
+    []
+  );
+  const markScrolling = useCallback(() => {
+    setScrolling(true);
+    if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
+    scrollTimerRef.current = window.setTimeout(() => {
+      scrollTimerRef.current = null;
+      setScrolling(false);
+    }, 900);
+  }, []);
+
   // Autosize the composer to its content. The height lives as an inline style
   // on the textarea, so it is lost with the DOM node on every unmount.
   const resizeChatInput = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
+    const prevScrollTop = el.scrollTop;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
+    if (el.scrollHeight > el.clientHeight) {
+      el.scrollTop = atBottom ? el.scrollHeight : prevScrollTop;
+    }
   }, []);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   // The composer unmounts whenever the shell swaps views — Settings, the Code
@@ -1310,7 +1332,8 @@ export const Composer = ({
         ref={setChatInputRef}
         className={`chat-input min-h-[52px]${
           offeredPromptSuggestion ? ' placeholder:!text-transparent' : ''
-        }`}
+        }${scrolling ? ' is-scrolling' : ''}`}
+        onScroll={markScrolling}
         disabled={isNativeSubagentThread || workspaceUnavailable}
         placeholder={
           offeredPromptSuggestion
