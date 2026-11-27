@@ -733,6 +733,27 @@ export type Thread = {
   /** Started by one of the person's bots (its id, stable across renames). */
   startedByBotId?: string;
   /**
+   * Originating bot dispatch id (`bottask:…`, `localbot:…`, or cloud dispatch id).
+   * Preserved even after `durangoDispatch` is overwritten by a later follow-up.
+   */
+  startedByBotDispatchId?: string;
+  /**
+   * Latest non-bot-dispatched turn started in a bot-started thread (Ship button,
+   * person typing on desktop/web/phone/remote): reported back to the starting
+   * bot's inbox when it settles and watched for NEEDS THE PERSON / LOOKS STUCK.
+   */
+  botThreadTurn?: {
+    /** Agent runs the thread had before this turn started. */
+    runOffset: number;
+    trigger: 'person' | 'ship_button';
+    changeId?: string;
+    surface?: string;
+    promptPreview?: string;
+    startedAt: string;
+    reportedAt?: string;
+    reportedSeq?: number;
+  };
+  /**
    * Set on threads imported from a Claude Code or Codex session the user ran
    * outside Orion. The session id doubles as the dedupe key for re-imports;
    * agentSessionIds carries the same id so the next turn resumes it.

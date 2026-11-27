@@ -10,6 +10,11 @@ import {
   BOT_THREAD_ACCESS_MODES,
   BOT_THREAD_REQUEST_RULE,
   BOT_THREAD_TOOLS,
+  botThreadTurnMessageId,
+  botThreadTurnNoticeId,
+  botThreadTurnNoticeText,
+  botThreadTurnReportText,
+  botThreadTurnTitle,
   resolveThreadModelChoice,
   threadNoticeText,
   threadReportFooter,
@@ -128,6 +133,7 @@ Routines and reports:
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
 - A task report that starts "NOT FINISHED YET" (or says the task isn't finished yet) is an update, not the outcome: the thread is still working in the background and reports again when it finishes. Tell the person briefly where it stands if it matters, don't report it as done, and don't start the work again.
 - "NEEDS THE PERSON" from a task's thread: it is blocked on the person (an approval, a question, an action) and stays blocked until they answer in that thread. Tell them right away what it needs, in a line or two. "LOOKS STUCK": check the thread before you cancel or redo the work.
+- A task report labelled "Ship button — …" or "Person in thread — …" (saying the person tapped the Ship button or sent a message directly in a thread you started, not your own request) is an automatic update so you stay in sync with what happened there. Never echo or re-send that request back into the thread; note the outcome briefly for the person (and settle the thread if its work is now truly finished).
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
 
 Show, don't point: your thread renders rich replies, so use them.
@@ -1021,7 +1027,15 @@ export const createLocalBotEngine = ({
     if (!runtime) {
       // reportedThreads: threads that already reported (key → task), for the reports of turns they resume by themselves.
       // reportedSeqs: each thread's latest report number (key → seq): a notice for a run that already reported is dropped.
-      runtime = { replies: new Map(), tasks: new Map(), threads: new Map(), reportedThreads: new Map(), reportedSeqs: new Map(), pendingChecks: 0 };
+      runtime = {
+        replies: new Map(),
+        tasks: new Map(),
+        threads: new Map(),
+        reportedThreads: new Map(),
+        reportedSeqs: new Map(),
+        threadTurnReportedSeqs: new Map(),
+        pendingChecks: 0,
+      };
       runtimes.set(botId, runtime);
     }
     return runtime;
@@ -3190,6 +3204,146 @@ export const createLocalBotEngine = ({
       const onDisk = () => entries.get(botId) !== entry || !entry.messages.includes(message) || entry.disk?.messages?.get(message.id) === message;
       let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
       // A retry of a notice whose save failed (or hasn't run): save it again.
+      if (!saved) saved = (await persistBot(entry)) && onDisk();
+      return saved ? { ok: true } : { ok: false, retry: true };
+    },
+    /**
+     * Outcome of a turn started by the person or the Ship button in a thread
+     * originally started by a local bot. Goes back to that bot's inbox as a
+     * labelled task report (idempotent per threadId + seq).
+     */
+    async threadTurnSettled({
+      botId,
+      botName,
+      threadId,
+      threadTitle,
+      project,
+      trigger,
+      changeId,
+      surface,
+      promptPreview,
+      outcome,
+      summary,
+      error,
+      waiting,
+      later = false,
+      seq,
+    } = {}) {
+      await ensureLoaded();
+      const cleanThreadId = str(threadId).trim();
+      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' ? trigger : null;
+      if (!cleanThreadId || !cleanTrigger || !Number.isSafeInteger(seq) || seq <= 0) return { ok: false };
+      let entry = str(botId).trim() ? entries.get(str(botId).trim()) : null;
+      if (!entry && str(botName).trim()) {
+        const wanted = str(botName).trim().toLowerCase();
+        const matches = [...entries.values()].filter((candidate) => candidate.bot.name.trim().toLowerCase() === wanted);
+        if (matches.length === 1) entry = matches[0];
+      }
+      if (!entry) return { ok: false };
+      const runtime = runtimeFor(entry.bot.id);
+      const stillWaiting = outcome === 'finished' && Array.isArray(waiting) && waiting.length > 0;
+      const reported = runtime.threadTurnReportedSeqs.get(cleanThreadId) ?? 0;
+      if (stillWaiting && seq % 2 === 1 && (reported >= seq + 1 || entry.messages.some((m) => m.id === botThreadTurnMessageId(cleanThreadId, seq + 1)))) {
+        return { ok: true };
+      }
+      runtime.threadTurnReportedSeqs.set(cleanThreadId, Math.max(seq, reported));
+      while (runtime.threadTurnReportedSeqs.size > 200) {
+        runtime.threadTurnReportedSeqs.delete(runtime.threadTurnReportedSeqs.keys().next().value);
+      }
+      const thread = { threadId: cleanThreadId, project: str(project).trim() || null };
+      const footer = threadReportFooter(thread);
+      const bodyMax = Math.max(200, LOCAL_BOT_TASK_RESULT_MAX_CHARS - (footer ? footer.length + 2 : 0));
+      const rawReport =
+        outcome === 'finished'
+          ? str(summary).trim() || 'The thread finished without a written summary.'
+          : `The Durango Code thread didn't finish: ${clip(oneLine(error) || 'it stopped.', 300)}`;
+      const report = withThreadReportFooter(
+        clipMiddle(
+          botThreadTurnReportText({
+            trigger: cleanTrigger,
+            status: outcome === 'finished' ? 'done' : 'failed',
+            report: rawReport,
+            threadTitle,
+            changeId,
+            surface,
+            promptPreview,
+            waiting: stillWaiting ? waiting : [],
+            later: later === true,
+          }),
+          bodyMax
+        ),
+        thread
+      );
+      const title = botThreadTurnTitle(cleanTrigger, threadTitle, changeId);
+      const message = appendInbox(entry, {
+        id: botThreadTurnMessageId(cleanThreadId, seq),
+        content: report,
+        authorLabel: inboxLabel('task', title),
+      });
+      const onDisk = () =>
+        entries.get(entry.bot.id) !== entry || !entry.messages.includes(message) || entry.disk?.messages?.get(message.id) === message;
+      let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
+      if (!saved) saved = (await persistBot(entry)) && onDisk();
+      return saved ? { ok: true } : { ok: false, retry: true };
+    },
+    /**
+     * Notice while a person- or Ship-button-started turn in a local-bot-started
+     * thread still runs and needs the person or looks stuck.
+     */
+    async threadTurnNotice({
+      botId,
+      botName,
+      threadId,
+      threadTitle,
+      project,
+      trigger,
+      changeId,
+      surface,
+      kind,
+      noticeKey,
+      seq,
+      detail,
+    } = {}) {
+      await ensureLoaded();
+      const cleanThreadId = str(threadId).trim();
+      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' ? trigger : null;
+      const id = str(noticeKey).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120);
+      if (!cleanThreadId || !cleanTrigger || !id || (kind !== 'input' && kind !== 'stuck')) return { ok: false };
+      let entry = str(botId).trim() ? entries.get(str(botId).trim()) : null;
+      if (!entry && str(botName).trim()) {
+        const wanted = str(botName).trim().toLowerCase();
+        const matches = [...entries.values()].filter((candidate) => candidate.bot.name.trim().toLowerCase() === wanted);
+        if (matches.length === 1) entry = matches[0];
+      }
+      if (!entry) return { ok: false };
+      const runtime = runtimeFor(entry.bot.id);
+      const reported = runtime.threadTurnReportedSeqs.get(cleanThreadId);
+      if (
+        (reported !== undefined && Number.isSafeInteger(seq) && seq <= reported) ||
+        (Number.isSafeInteger(seq) && seq > 0 && entry.messages.some((m) => m.id === botThreadTurnMessageId(cleanThreadId, seq)))
+      ) {
+        return { ok: true, stale: true };
+      }
+      const thread = { threadId: cleanThreadId, project: str(project).trim() || null };
+      const title = botThreadTurnTitle(cleanTrigger, threadTitle, changeId);
+      const message = appendInbox(entry, {
+        id: botThreadTurnNoticeId(cleanThreadId, id),
+        content: withThreadReportFooter(
+          botThreadTurnNoticeText({
+            trigger: cleanTrigger,
+            kind,
+            detail: clipMiddle(str(detail), 4_000),
+            threadTitle,
+            changeId,
+            surface,
+          }),
+          thread
+        ),
+        authorLabel: inboxLabel('task', title),
+      });
+      const onDisk = () =>
+        entries.get(entry.bot.id) !== entry || !entry.messages.includes(message) || entry.disk?.messages?.get(message.id) === message;
+      let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
       if (!saved) saved = (await persistBot(entry)) && onDisk();
       return saved ? { ok: true } : { ok: false, retry: true };
     },

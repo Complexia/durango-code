@@ -38,6 +38,9 @@ import {
   DISPATCH_STUCK_AFTER_MS,
   DISPATCH_SUMMARY_MAX_CHARS as RENDERER_DISPATCH_SUMMARY_MAX_CHARS,
   activityToolName,
+  botThreadOwner,
+  botThreadTurnLiveRunAt,
+  botThreadTurnOutcome,
   dispatchRunFinalText,
   durangoDispatchHasNewRuns,
   durangoDispatchLiveRun,
@@ -1776,6 +1779,280 @@ try {
     assert.equal(notices('disp_n').length, before + 1, 'one attempt: the renderer resends only if it still holds');
     server.on('POST', '/api/v1/code/dispatches/disp_n/notice', () => ({ status: 404, json: { error: { message: 'Not found' } } }));
     assert.deepEqual(await worker.notice({ dispatchId: 'disp_n', threadId: 'thread-9', kind: 'stuck', key: 's', seq: 2, detail: 'd' }), { ok: false }, 'a Durango without notices: final');
+  });
+
+  // ======================================================================================
+  // Bot-started threads: later Ship-button and person turns report back to the starting bot
+  // ======================================================================================
+
+  await test('botThreadOwner identifies machine, cloud, local and legacy bot-started threads and ignores person/remote/subagent threads', () => {
+    assert.deepEqual(
+      botThreadOwner({ startedByBot: 'durango-bots', startedByBotId: 'bot_1', startedByBotDispatchId: 'bottask:t1', durangoDispatch: { id: 'bottask:t2', followUp: true, runOffset: 1 } }),
+      { mode: 'durango', botId: 'bot_1', botName: 'durango-bots', originDispatchId: 'bottask:t1' }
+    );
+    assert.deepEqual(
+      botThreadOwner({ startedByBot: 'durango-bots', startedByBotId: 'bot_cloud', durangoDispatch: { id: 'disp_cloud_1' } }),
+      { mode: 'durango', botId: 'bot_cloud', botName: 'durango-bots', originDispatchId: 'disp_cloud_1' }
+    );
+    assert.deepEqual(
+      botThreadOwner({ startedByBot: 'Local Bot', startedByBotId: 'lb_1', durangoDispatch: { id: 'localbot:lb_1:lt_1' } }),
+      { mode: 'local', botId: 'lb_1', botName: 'Local Bot', originDispatchId: 'localbot:lb_1:lt_1' }
+    );
+    // Legacy pre-startedByBot thread with bottask:/localbot: prefix still resolves.
+    assert.deepEqual(
+      botThreadOwner({ durangoDispatch: { id: 'bottask:t_legacy' } }),
+      { mode: 'durango', originDispatchId: 'bottask:t_legacy' }
+    );
+    assert.deepEqual(
+      botThreadOwner({ durangoDispatch: { id: 'localbot:lb_old:lt_old' } }),
+      { mode: 'local', botId: 'lb_old', originDispatchId: 'localbot:lb_old:lt_old' }
+    );
+    // Person-started thread that only got a bot follow-up is NOT bot-started.
+    assert.equal(botThreadOwner({ durangoDispatch: { id: 'bottask:follow', followUp: true, runOffset: 1 } }), null);
+    // Durango Chat dispatch is NOT bot-started.
+    assert.equal(botThreadOwner({ durangoDispatch: { id: 'disp_chat_1' } }), null);
+    // Mirrored remote thread and subagent never report from this machine.
+    assert.equal(botThreadOwner({ startedByBot: 'durango-bots', startedByBotId: 'bot_1', remote: { machineId: 'm2', machineName: 'Other' } }), null);
+    assert.equal(botThreadOwner({ startedByBot: 'durango-bots', startedByBotId: 'bot_1', parentThreadId: 'parent_1' }), null);
+  });
+
+  await test('botThreadTurn: Ship button + person typing turns report to starting bot with waiting/continuation, without double-reporting bot dispatches', async () => {
+    const dispatchSent = [];
+    const botTurnSent = [];
+    let state = { threads: [], transcripts: {} };
+    const listeners = new Set();
+    let clock = 0;
+    const timers = [];
+    const set = (patch) => {
+      const previous = state;
+      state = { ...state, ...patch };
+      for (const listener of [...listeners]) listener(state, previous);
+    };
+    const putThread = (next) => set({ threads: [...state.threads.filter((t) => t.id !== next.id), next] });
+    const stop = startDurangoDispatchReporter({
+      getState: () => state,
+      subscribe: (listener) => (listeners.add(listener), () => listeners.delete(listener)),
+      ensureTranscript: async () => null,
+      settle: async (input) => {
+        dispatchSent.push(input);
+        return { ok: true };
+      },
+      markReported: (threadId, dispatchId, reported) => {
+        const current = state.threads.find((t) => t.id === threadId);
+        if (current?.durangoDispatch?.id === dispatchId) putThread({ ...current, durangoDispatch: { ...current.durangoDispatch, ...reported } });
+      },
+      settleBotTurn: async (input) => {
+        botTurnSent.push(input);
+        return { ok: true };
+      },
+      markBotTurnReported: (threadId, runOffset, reported) => {
+        const current = state.threads.find((t) => t.id === threadId);
+        if (current?.botThreadTurn?.runOffset === runOffset) putThread({ ...current, botThreadTurn: { ...current.botThreadTurn, ...reported } });
+      },
+      getProjectName: (projectId) => (projectId === 'proj_durango' ? 'durango' : undefined),
+      setTimer: (callback, ms) => {
+        const timer = { at: clock + ms, callback };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => timers.splice(timers.indexOf(timer), 1),
+      now: () => clock,
+    });
+    const tick = async (ms = 0) => {
+      clock += ms;
+      for (const timer of timers.filter((t) => t.at <= clock)) {
+        timers.splice(timers.indexOf(timer), 1);
+        timer.callback();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    const threadId = '5a58e503-07aa-4815-9102-012d3b7a3f6f';
+    const baseThread = {
+      id: threadId,
+      projectId: 'proj_durango',
+      title: 'Fix bot attribution',
+      status: 'done',
+      startedByBot: 'durango-bots',
+      startedByBotId: 'bot_durango_bots',
+      startedByBotDispatchId: 'bottask:task_0',
+      durangoWorkspace: { path: '/tmp/ws/fix' },
+      durangoDispatch: { id: 'bottask:task_0', sourceUrl: null, startedAt: 't0' },
+      summary: { agentRunCount: 1 },
+    };
+
+    // 1) Initial bot-dispatched turn (run 0): reported ONLY via durangoDispatch, NOT botThreadTurn.
+    const run0 = agentRun({ status: 'done', content: 'Opened chg_62ci2dyvpsf7suikernh.' });
+    set({ transcripts: { [threadId]: { messages: [run0] } } });
+    putThread(baseThread);
+    await tick(0);
+    assert.equal(dispatchSent.length, 1);
+    assert.equal(botTurnSent.length, 0, 'bot-dispatched initial turn is never double-reported');
+
+    // 2) Person taps Ship button (run 1): leaves background deploy running -> NOT FINISHED YET, then resumes (run 2 continuation) and finishes.
+    const run1 = agentRun({ status: 'done', content: 'Landing chg_62ci2dyvpsf7suikernh.' });
+    const shipTurn = { runOffset: 1, trigger: 'ship_button', changeId: 'chg_62ci2dyvpsf7suikernh', startedAt: 't1' };
+    set({ transcripts: { [threadId]: { messages: [run0, run1, card('pending')] } } });
+    putThread({ ...state.threads[0], status: 'done', botThreadTurn: shipTurn, summary: { agentRunCount: 2 } });
+    await tick(0);
+    assert.equal(dispatchSent.length, 1, 'durangoDispatch ignores non-continuation Ship turn');
+    assert.equal(botTurnSent.length, 1);
+    assert.equal(botTurnSent[0].trigger, 'ship_button');
+    assert.equal(botTurnSent[0].changeId, 'chg_62ci2dyvpsf7suikernh');
+    assert.equal(botTurnSent[0].projectName, 'durango');
+    assert.equal(botTurnSent[0].workspacePath, '/tmp/ws/fix');
+    assert.deepEqual(botTurnSent[0].waiting, ['background command: watch']);
+    assert.equal(botTurnSent[0].seq, 3);
+    assert.equal(botTurnSent[0].later, undefined);
+
+    const run2 = agentRun({ status: 'done', content: 'Deploys succeeded.', continuation: true });
+    set({ transcripts: { [threadId]: { messages: [run0, run1, card('settled'), run2] } } });
+    putThread({ ...state.threads[0], status: 'done', summary: { agentRunCount: 3 } });
+    await tick(0);
+    assert.equal(botTurnSent.length, 2);
+    assert.equal(botTurnSent[1].summary, 'Deploys succeeded.');
+    assert.equal(botTurnSent[1].later, true);
+    assert.equal(botTurnSent[1].seq, 6);
+
+    // 3) Person types directly from phone ("so basically land and cut the desktop release", run 3).
+    const run3 = agentRun({ status: 'done', content: 'Landed and released Durango Code 1.0.236.' });
+    const personTurn = { runOffset: 3, trigger: 'person', surface: 'iPhone', promptPreview: 'so basically land and cut the desktop release', startedAt: 't2' };
+    set({ transcripts: { [threadId]: { messages: [run0, run1, card('settled'), run2, run3] } } });
+    putThread({ ...state.threads[0], status: 'done', botThreadTurn: personTurn, summary: { agentRunCount: 4 } });
+    await tick(0);
+    assert.equal(botTurnSent.length, 3);
+    assert.equal(botTurnSent[2].trigger, 'person');
+    assert.equal(botTurnSent[2].surface, 'iPhone');
+    assert.equal(botTurnSent[2].promptPreview, 'so basically land and cut the desktop release');
+    assert.equal(botTurnSent[2].later, undefined);
+    assert.equal(botTurnSent[2].seq, 8);
+    assert.equal(dispatchSent.length, 1);
+
+    // 4) Bot then sends message_thread follow-up (run 4): reported ONLY via durangoDispatch, NOT botThreadTurn.
+    const run4 = agentRun({ status: 'done', content: 'Verified release.' });
+    set({ transcripts: { [threadId]: { messages: [run0, run1, card('settled'), run2, run3, run4] } } });
+    putThread({
+      ...state.threads[0],
+      status: 'done',
+      durangoDispatch: { id: 'bottask:task_followup', sourceUrl: null, startedAt: 't3', runOffset: 4, followUp: true },
+      summary: { agentRunCount: 5 },
+    });
+    await tick(0);
+    assert.equal(dispatchSent.length, 2, 'bot follow-up reports once via durangoDispatch');
+    assert.equal(dispatchSent[1].dispatchId, 'bottask:task_followup');
+    assert.equal(botTurnSent.length, 3, 'bot follow-up is NOT double-reported via botThreadTurn');
+
+    stop();
+  });
+
+  await test('botThreadTurn notices: NEEDS THE PERSON and LOOKS STUCK fire for Ship/person turns without firing on bot-dispatched runs', async () => {
+    const dispatchNotices = [];
+    const botTurnNotices = [];
+    let cards = [];
+    let state = { threads: [], transcripts: {} };
+    const listeners = new Set();
+    const eventListeners = new Set();
+    let clock = 2_000_000;
+    const timers = [];
+    const set = (patch) => {
+      const previous = state;
+      state = { ...state, ...patch };
+      for (const listener of [...listeners]) listener(state, previous);
+    };
+    const stop = startDurangoDispatchNotices({
+      getState: () => state,
+      subscribe: (listener) => (listeners.add(listener), () => listeners.delete(listener)),
+      onTurnEvent: (listener) => (eventListeners.add(listener), () => eventListeners.delete(listener)),
+      pendingInput: async () => cards,
+      notice: (input) => {
+        dispatchNotices.push(input);
+        return { ok: true };
+      },
+      noticeBotTurn: (input) => {
+        botTurnNotices.push(input);
+        return { ok: true };
+      },
+      getProjectName: () => 'durango',
+      setTimer: (callback, ms) => {
+        const timer = { at: clock + ms, callback };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => timers.splice(timers.indexOf(timer), 1),
+      now: () => clock,
+    });
+    const flush = async () => {
+      for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+    const tick = async (ms) => {
+      const until = clock + ms;
+      for (;;) {
+        const due = timers.filter((t) => t.at <= until).sort((a, b) => a.at - b.at)[0];
+        if (!due) break;
+        timers.splice(timers.indexOf(due), 1);
+        clock = due.at;
+        due.callback();
+        await flush();
+      }
+      clock = until;
+      await flush();
+    };
+
+    const run0 = agentRun({ id: 'r0', status: 'done', content: 'Done.' });
+    const run1 = agentRun({ id: 'r1', status: 'running', startedAt: iso(2_000_000), activities: [] });
+    const thread = {
+      id: 't1',
+      projectId: 'p1',
+      title: 'Release desktop',
+      status: 'running',
+      startedByBot: 'durango-bots',
+      startedByBotId: 'bot_1',
+      startedByBotDispatchId: 'bottask:task_0',
+      durangoDispatch: { id: 'bottask:task_0', sourceUrl: null, startedAt: 'x', reportedAt: 'x', reportedSeq: 2 },
+      botThreadTurn: { runOffset: 1, trigger: 'ship_button', changeId: 'chg_62ci2dyvpsf7suikernh', startedAt: 'x' },
+      summary: { agentRunCount: 2 },
+    };
+    assert.deepEqual(botThreadTurnLiveRunAt(thread, [run0, run1]), { run: run1, position: 1 });
+    assert.equal(durangoDispatchLiveRunAt(thread, [run0, run1]), null, 'disjoint from durangoDispatch');
+    set({ threads: [thread], transcripts: { t1: { messages: [run0, run1] } } });
+    await flush();
+
+    // Approval prompt -> NEEDS THE PERSON via noticeBotTurn (not dispatch notice).
+    cards = [approvalCard({ requestId: 'req-ship' })];
+    for (const listener of [...eventListeners]) listener({ threadId: 't1', type: 'user-input' });
+    await flush();
+    assert.equal(dispatchNotices.length, 0);
+    assert.equal(botTurnNotices.length, 1);
+    assert.equal(botTurnNotices[0].trigger, 'ship_button');
+    assert.equal(botTurnNotices[0].kind, 'input');
+    assert.equal(botTurnNotices[0].seq, 4);
+
+    // Clear approval and go quiet for 15 min -> LOOKS STUCK via noticeBotTurn.
+    cards = [];
+    for (const listener of [...eventListeners]) listener({ threadId: 't1', type: 'chunk' });
+    await flush();
+    await tick(DISPATCH_STUCK_AFTER_MS + 60_000);
+    assert.equal(dispatchNotices.length, 0);
+    assert.equal(botTurnNotices.length, 2);
+    assert.equal(botTurnNotices[1].kind, 'stuck');
+    assert.equal(botTurnNotices[1].seq, 4);
+    stop();
+  });
+
+  await test('durangoClient: reportBotThreadTurn and noticeBotThreadTurn post to /api/v1/code/bots/threads/*', async () => {
+    server.on('POST', '/api/v1/code/bots/threads/report', (_req, body) => {
+      assert.equal(body.threadId, 't_9');
+      assert.equal(body.trigger, 'ship_button');
+      assert.equal(body.seq, 4);
+      return { json: { ok: true } };
+    });
+    server.on('POST', '/api/v1/code/bots/threads/notice', (_req, body) => {
+      assert.equal(body.threadId, 't_9');
+      assert.equal(body.notice.kind, 'input');
+      return { json: { ok: true, stale: true } };
+    });
+    assert.deepEqual(await client.reportBotThreadTurn({ machineId: 'm1', botId: 'b1', threadId: 't_9', trigger: 'ship_button', outcome: 'finished', summary: 'Shipped.', seq: 4 }), { ok: true });
+    assert.deepEqual(await client.noticeBotThreadTurn({ machineId: 'm1', botId: 'b1', threadId: 't_9', trigger: 'ship_button', notice: { kind: 'input', key: 'k', seq: 4, detail: 'd' } }), { ok: true, stale: true });
   });
 
 } finally {

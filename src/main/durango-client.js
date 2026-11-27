@@ -859,6 +859,16 @@ export const createDurangoClient = ({
       const data = await request('POST', `/code/bots/tasks/${encodeURIComponent(str(taskId))}/notice`, { body });
       return { ok: data.ok === true, ...(data.stale === true ? { stale: true } : {}) };
     },
+    /** Outcome of a person- or Ship-button-started turn in a bot-started thread → `{ ok }`. */
+    async reportBotThreadTurn(body = {}) {
+      const data = await request('POST', '/code/bots/threads/report', { body });
+      return { ok: data.ok === true };
+    },
+    /** Notice while a person- or Ship-button-started turn in a bot-started thread needs the person or looks stuck. */
+    async noticeBotThreadTurn(body = {}) {
+      const data = await request('POST', '/code/bots/threads/notice', { body });
+      return { ok: data.ok === true, ...(data.stale === true ? { stale: true } : {}) };
+    },
     // --- Bots (Sidebar v3): the person's Durango bots and their threads ---------
     /** Whether the connected Durango server supports non-blocking pending bot attachments (null before listBots). */
     supportsPendingBotAttachments() {
@@ -1477,6 +1487,12 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000 } = {}) => {
       return { ok: false };
     },
     async noticeBotTask() {
+      return { ok: false };
+    },
+    async reportBotThreadTurn() {
+      return { ok: false };
+    },
+    async noticeBotThreadTurn() {
       return { ok: false };
     },
     async chatUrl(chatId) {

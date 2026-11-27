@@ -182,7 +182,7 @@ import {
   remoteThreadRuntime,
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
-import { dispatchProjectsPayload, startDurangoDispatchNotices, startDurangoDispatchReporter } from './app/durangoDispatch';
+import { botThreadOwner, dispatchProjectsPayload, startDurangoDispatchNotices, startDurangoDispatchReporter } from './app/durangoDispatch';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
 import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
@@ -1248,7 +1248,8 @@ const App: React.FC = () => {
         claimStart?: (threadId?: string) => Promise<boolean>,
         applyClaimedSettings?: () => void,
         extraContext?: string,
-        fromAgent?: boolean
+        fromAgent?: boolean,
+        botTurnTrigger?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
       ) => Promise<ThreadTurnStartResult>)
     | null
   >(null);
@@ -5863,6 +5864,43 @@ const App: React.FC = () => {
     [markWorkspaceThreads, updateThread]
   );
 
+  // When a non-bot-dispatched turn (Ship button, or a message the person typed
+  // on desktop, web, phone or remote) starts in a bot-started thread, record
+  // its run offset so its outcome and NEEDS THE PERSON / LOOKS STUCK notices
+  // report back to that bot's inbox. Bot-dispatched turns pass `null` and
+  // continuations keep the current chain's tracker, so nothing double-reports.
+  const stampBotThreadTurn = useCallback(
+    (
+      threadId: string,
+      promptText: string,
+      triggerOpt?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
+    ) => {
+      if (triggerOpt === null || continuationTurnsRef.current.has(threadId)) return;
+      const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+      if (!current || !botThreadOwner(current)) return;
+      const loaded = loadedMessages(threadId);
+      const runOffset = loaded
+        ? loaded.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length
+        : current.summary.agentRunCount;
+      const trigger = triggerOpt?.trigger ?? 'person';
+      const surface = triggerOpt?.surface ?? (trigger === 'person' ? 'desktop' : undefined);
+      const changeId = triggerOpt?.changeId;
+      const promptPreview =
+        trigger === 'person' ? promptText.replace(/\s+/g, ' ').trim().slice(0, 240) || undefined : undefined;
+      updateThread(threadId, {
+        botThreadTurn: {
+          runOffset,
+          trigger,
+          ...(changeId ? { changeId } : {}),
+          ...(surface ? { surface } : {}),
+          ...(promptPreview ? { promptPreview } : {}),
+          startedAt: new Date().toISOString(),
+        },
+      });
+    },
+    [updateThread]
+  );
+
   // Internal turn setup. The wrapper below owns the per-thread reservation
   // across this whole promise, including every asynchronous preflight.
   const startTurnForThreadUnlocked = useCallback(
@@ -5877,7 +5915,10 @@ const App: React.FC = () => {
       extraContext?: string,
       // An agent sent this turn (machine_run_agent from another machine);
       // it counts as the agent's only in a thread that agent created.
-      fromAgent?: boolean
+      fromAgent?: boolean,
+      // Null for bot-dispatched turns (reported by durangoDispatch); omitted for
+      // local person turns; explicit for Ship button / remote turns.
+      botTurnTrigger?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
     ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
       if (claimStart && !(await claimRemoteThreadStart(() => claimStart(threadId), applyClaimedSettings))) {
@@ -6204,6 +6245,7 @@ const App: React.FC = () => {
       });
       updateThread(threadId, { status: 'running' });
       pushLinkedTaskStatus(threadId, 'running');
+      stampBotThreadTurn(threadId, promptText, botTurnTrigger);
 
       const messageId = addMessageToThread(threadId, {
         ...(shownTurn ? { id: shownTurn.runMessage.id } : {}),
@@ -6342,6 +6384,7 @@ const App: React.FC = () => {
       pushLinkedTaskStatus,
       refreshLinkedTasksBeforeDispatch,
       ensureThreadDurangoWorkspace,
+      stampBotThreadTurn,
     ]
   );
 
@@ -6361,7 +6404,8 @@ const App: React.FC = () => {
       extraContext?: string,
       // An agent sent this turn (machine_run_agent from another machine);
       // it counts as the agent's only in a thread that agent created.
-      fromAgent?: boolean
+      fromAgent?: boolean,
+      botTurnTrigger?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
     ): Promise<ThreadTurnStartResult> => {
       // A thread on another machine starts its turns there, whichever path
       // (retry, follow-up, composer) asked for one.
@@ -6390,7 +6434,8 @@ const App: React.FC = () => {
               claimStart,
               applyClaimedSettings,
               extraContext,
-              fromAgent
+              fromAgent,
+              botTurnTrigger
             );
           } finally {
             release();
@@ -7002,6 +7047,7 @@ const App: React.FC = () => {
         );
       }
 
+      stampBotThreadTurn(threadId, rawText);
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
@@ -7081,6 +7127,7 @@ const App: React.FC = () => {
       updateThreadMessage,
       clearActiveRun,
       resolveUtilityTurn,
+      stampBotThreadTurn,
     ]
   );
 
@@ -7112,7 +7159,8 @@ const App: React.FC = () => {
         base?: string;
         commit?: string;
         instructions?: string;
-      }
+      },
+      botTurnTrigger?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
@@ -7163,6 +7211,7 @@ const App: React.FC = () => {
         updateThread(threadId, { title: 'Review Changes' });
       }
 
+      stampBotThreadTurn(threadId, rawText, botTurnTrigger);
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
         role: 'agent',
@@ -7239,19 +7288,25 @@ const App: React.FC = () => {
       updateThread,
       updateThreadMessage,
       clearActiveRun,
+      stampBotThreadTurn,
     ]
   );
 
   // The run's context comes from the transcript: load it (and keep it
   // loaded) first, and refuse rather than run without it.
   const startReviewForThread = useCallback(
-    async (threadId: string, rawText: string, review: Parameters<typeof startReviewForThreadLoaded>[2]): Promise<{ ok: boolean; error?: string }> => {
+    async (
+      threadId: string,
+      rawText: string,
+      review: Parameters<typeof startReviewForThreadLoaded>[2],
+      botTurnTrigger?: Parameters<typeof startReviewForThreadLoaded>[3]
+    ): Promise<{ ok: boolean; error?: string }> => {
       const release = holdThreadTranscript(threadId);
       try {
         if (!(await loadThreadMessages(threadId)) && findThread(useOrionStore.getState().threads, threadId)) {
           return { ok: false, error: TRANSCRIPT_UNAVAILABLE_ERROR };
         }
-        return startReviewForThreadLoaded(threadId, rawText, review);
+        return startReviewForThreadLoaded(threadId, rawText, review, botTurnTrigger);
       } finally {
         release();
       }
@@ -9289,7 +9344,14 @@ const App: React.FC = () => {
                 : 'Thread not found on this machine.',
             };
           }
-          const result = await startReviewForThread(threadId, promptText, reviewCommand.review);
+          const reviewBotTrigger =
+            command.durangoDispatch?.origin === 'bot'
+              ? null
+              : command.botTurnTrigger ?? {
+                  trigger: 'person' as const,
+                  surface: command.source?.machineName?.trim() || 'remote',
+                };
+          const result = await startReviewForThread(threadId, promptText, reviewCommand.review, reviewBotTrigger);
           if (!result.ok && createdThread) useOrionStore.getState().deleteThread(threadId);
           return result.ok
             ? { ok: true, threadId }
@@ -9372,6 +9434,7 @@ const App: React.FC = () => {
             updateThread(threadId, {
               ...(botName ? { startedByBot: botName } : !botId ? { startedByBot: 'bot' } : {}),
               ...(botId ? { startedByBotId: botId } : {}),
+              startedByBotDispatchId: dispatch.id,
             });
           }
           const accessLabel =
@@ -9397,6 +9460,13 @@ const App: React.FC = () => {
             void window.orion?.unlinkBoardTask?.({ taskId: dispatchLinkedTaskId, threadId }).catch(() => {});
           }
         };
+        const remoteBotTurnTrigger =
+          dispatch?.origin === 'bot'
+            ? null
+            : command.botTurnTrigger ?? {
+                trigger: 'person' as const,
+                surface: command.source?.machineName?.trim() || 'remote',
+              };
         const start = thread
           ? startTurnForThreadRef.current?.(
               threadId,
@@ -9406,7 +9476,8 @@ const App: React.FC = () => {
               claimStart,
               applyClaimedSettings,
               typeof command.context === 'string' ? command.context : undefined,
-              command.fromAgent === true
+              command.fromAgent === true,
+              remoteBotTurnTrigger
             )
           : undefined;
         if (!start) {
@@ -9936,10 +10007,12 @@ const App: React.FC = () => {
   );
 
   // Durango Chat dispatch and bots: report each dispatched thread's outcome
-  // back to whoever started it (app/durangoDispatchReporter.ts).
+  // back to whoever started it, plus every later person / Ship-button turn in
+  // a bot-started thread back to the starting bot (app/durangoDispatch.ts).
   useEffect(() => {
     const settle = window.orion?.durangoDispatchSettled;
     if (!settle) return undefined;
+    const settleBotTurn = window.orion?.botThreadTurnSettled;
     return startDurangoDispatchReporter({
       getState: () => useOrionStore.getState(),
       subscribe: (listener) => useOrionStore.subscribe(listener),
@@ -9949,14 +10022,27 @@ const App: React.FC = () => {
         const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.durangoDispatch;
         if (current?.id === dispatchId) updateThread(threadId, { durangoDispatch: { ...current, ...reported } });
       },
+      ...(settleBotTurn
+        ? {
+            settleBotTurn: (input) => settleBotTurn(input),
+            markBotTurnReported: (threadId, runOffset, reported) => {
+              const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.botThreadTurn;
+              if (current?.runOffset === runOffset) updateThread(threadId, { botThreadTurn: { ...current, ...reported } });
+            },
+          }
+        : {}),
+      getProjectName: (projectId) =>
+        projectId ? useOrionStore.getState().projects.find((project) => project.id === projectId)?.name : undefined,
     });
   }, [updateThread]);
 
-  // While a dispatched thread (a bot's task) still runs, its bot hears at once
-  // when it needs the person or looks stuck (startDurangoDispatchNotices).
+  // While a dispatched thread (a bot's task) or a later person / Ship-button
+  // turn in a bot-started thread still runs, its bot hears at once when it
+  // needs the person or looks stuck (startDurangoDispatchNotices).
   useEffect(() => {
     const notice = window.orion?.durangoDispatchNotice;
     if (!notice) return undefined;
+    const noticeBotTurn = window.orion?.botThreadTurnNotice;
     return startDurangoDispatchNotices({
       getState: () => useOrionStore.getState(),
       subscribe: (listener) => useOrionStore.subscribe(listener),
@@ -9970,6 +10056,9 @@ const App: React.FC = () => {
       },
       runMessageId: (runId) => runOutputMessages.current.get(runId)?.messageId,
       notice: (input) => notice(input),
+      ...(noticeBotTurn ? { noticeBotTurn: (input) => noticeBotTurn(input) } : {}),
+      getProjectName: (projectId) =>
+        projectId ? useOrionStore.getState().projects.find((project) => project.id === projectId)?.name : undefined,
     });
   }, []);
 

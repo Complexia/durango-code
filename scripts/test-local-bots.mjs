@@ -2314,6 +2314,107 @@ test('reorder persists project group order and per-project bot order across rest
   assert.equal(exportedA4?.sortOrder, undefined);
 });
 
+test('local bot threadTurnSettled and threadTurnNotice report Ship button and person turns with waiting/notices and idempotency', async () => {
+  const { engine, runner } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+
+  // 1) Ship button turn ends still waiting -> NOT FINISHED YET, wakes bot once.
+  const waiting = await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'ship_button',
+    changeId: 'chg_62ci2dyvpsf7suikernh',
+    outcome: 'finished',
+    summary: 'Waiting for deploy.',
+    waiting: ['background command: durango-code deploys --watch'],
+    seq: 3,
+  });
+  assert.equal(waiting.ok, true);
+  await waitFor(() => runner.lanes.length === 1);
+  assert.match(runner.lanes[0].lane.prompt, /\[Task: Ship button — Release 1\.0\.236\]:/);
+  assert.match(runner.lanes[0].lane.prompt, /tapped the Ship button for chg_62ci2dyvpsf7suikernh/);
+  assert.match(runner.lanes[0].lane.prompt, /NOT FINISHED YET/);
+  assert.match(runner.lanes[0].lane.prompt, /Durango Code thread thread_ship_1, project durango/);
+  runner.lanes[0].finish({ text: 'Watching the deploy.' });
+  await engine.idle();
+
+  // Retry of the same seq is idempotent and does not wake another lane.
+  await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'ship_button',
+    changeId: 'chg_62ci2dyvpsf7suikernh',
+    outcome: 'finished',
+    summary: 'Waiting for deploy.',
+    waiting: ['background command: durango-code deploys --watch'],
+    seq: 3,
+  });
+  await delay(5);
+  assert.equal(runner.lanes.length, 1);
+
+  // 2) Notice while the Ship turn still runs (seq 4 > 3) reaches the bot.
+  const noticed = await engine.threadTurnNotice({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'ship_button',
+    changeId: 'chg_62ci2dyvpsf7suikernh',
+    kind: 'input',
+    noticeKey: 'input:req-1',
+    seq: 4,
+    detail: 'It is waiting for the person to approve a Bash call in the thread.',
+  });
+  assert.equal(noticed.ok, true);
+  assert.equal(noticed.stale, undefined);
+  await waitFor(() => runner.lanes.length === 2);
+  assert.match(runner.lanes[1].lane.prompt, /NEEDS THE PERSON:/);
+  assert.match(runner.lanes[1].lane.prompt, /Ship button for chg_62ci2dyvpsf7suikernh, not your own request/);
+  runner.lanes[1].finish({ text: 'Heads up: approve the Bash call.' });
+  await engine.idle();
+
+  // 3) Person types directly in the thread -> labelled "Person in thread — …" with prompt preview.
+  const person = await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'person',
+    surface: 'iPhone',
+    promptPreview: 'so basically land and cut the desktop release',
+    outcome: 'finished',
+    summary: 'Released 1.0.236.',
+    seq: 6,
+  });
+  assert.equal(person.ok, true);
+  await waitFor(() => runner.lanes.length === 3);
+  assert.match(runner.lanes[2].lane.prompt, /\[Task: Person in thread — Release 1\.0\.236\]:/);
+  assert.match(runner.lanes[2].lane.prompt, /sent a message directly in the thread "Release 1\.0\.236" you started \(via iPhone\)/);
+  assert.match(runner.lanes[2].lane.prompt, /What they asked: "so basically land and cut the desktop release"/);
+  assert.match(runner.lanes[2].lane.prompt, /Released 1\.0\.236\./);
+  runner.lanes[2].finish({ text: 'Nice — 1.0.236 is out.' });
+  await engine.idle();
+
+  // Stale notice after seq 6 is dropped.
+  const stale = await engine.threadTurnNotice({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    trigger: 'person',
+    kind: 'stuck',
+    noticeKey: 'stuck:late',
+    seq: 6,
+    detail: 'No progress.',
+  });
+  assert.deepEqual(stale, { ok: true, stale: true });
+  await delay(5);
+  assert.equal(runner.lanes.length, 3);
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 let failed = 0;
