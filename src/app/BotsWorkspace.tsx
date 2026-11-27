@@ -4359,7 +4359,19 @@ const BotMessage: React.FC<{
       <div className="flex items-center gap-1.5 text-neutral-400">
         <Icon size={12} />
         <span className="truncate font-medium text-neutral-300">{message.authorLabel}</span>
-        <span className="ml-auto text-[10.5px] text-neutral-600">{relativeBotTime(message.createdAt)}</span>
+        <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10.5px] text-neutral-600">
+          {message.silentRead && (
+            <span
+              className="inline-flex items-center gap-0.5 text-neutral-500"
+              title={message.silentRead.reason ? `Read without replying: ${message.silentRead.reason}` : 'Read without replying'}
+            >
+              <Check size={10} />
+              Read
+            </span>
+          )}
+          {message.silentRead && <span aria-hidden="true">·</span>}
+          <span>{relativeBotTime(message.createdAt)}</span>
+        </span>
       </div>
       <div className="mt-1 line-clamp-4 whitespace-pre-wrap text-neutral-400">{source === 'task' ? taskReportBody(message.content) : message.content}</div>
       {actions.length > 0 && <BotActionsRow actions={actions} handlers={handlers} />}

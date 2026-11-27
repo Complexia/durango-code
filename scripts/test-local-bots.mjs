@@ -161,7 +161,7 @@ test('a message while idle starts a reply; live progress and the stored reply', 
     [
       'ask_user', 'create_bot', 'delegate_task', 'forget_project_note', 'manage_routine', 'message_bot', 'notify_user',
       'project_notes', 'read_bot', 'read_project_file', 'remember_project', 'save_project_file', 'search_history', 'show_actions',
-      'show_html', 'update_bot',
+      'show_html', 'stay_silent', 'update_bot',
     ]
   );
 
@@ -2312,6 +2312,77 @@ test('reorder persists project group order and per-project bot order across rest
   assert.equal(exportedA3?.sortOrder, 0);
   assert.equal(exportedA1?.sortOrder, 2);
   assert.equal(exportedA4?.sortOrder, undefined);
+});
+
+test('silent turns (stay_silent): marks inbox card Read with no message/unread, refuses person DMs, surfaces empty replies without stay_silent, and exports silentRead', async () => {
+  const dir = path.join(testRoot, 'silent-turns-clean');
+  let mode = 'silent';
+  let refusedPerson = null;
+  let watcherId = null;
+  const { engine: eng3 } = makeEngine({
+    dir,
+    runner: {
+      runLane: async (lane, ctx) => {
+        if (lane.botName === 'Durango') {
+          await ctx.callTool({ name: 'message_bot', input: { bot_id: watcherId, message: 'Interim update #1' } });
+          return { text: 'Relayed.' };
+        }
+        if (mode === 'silent') {
+          const res = await ctx.callTool({ name: 'stay_silent', input: { reason: 'Waiting for all tasks' } });
+          assert.equal(res.result.ok, true);
+          assert.equal(res.result.silent, true);
+          return { text: '', silent: true, silentReason: 'Waiting for all tasks' };
+        }
+        if (mode === 'person') {
+          refusedPerson = await ctx.callTool({ name: 'stay_silent', input: { reason: 'nope' } });
+          return { text: 'Answering your direct message.' };
+        }
+        return { text: '' };
+      },
+    },
+  });
+  const primary3 = await eng3.ensurePrimary();
+  const watcher3 = await eng3.createBot({ name: 'QuietBot', job: 'Stay quiet on interim updates.' });
+  watcherId = watcher3.id;
+  mode = 'silent';
+  await eng3.send(primary3.id, { content: 'Ping QuietBot' });
+  await eng3.idle();
+
+  const t1 = await eng3.thread(watcher3.id);
+  assert.equal(t1.messages.filter((m) => m.role === 'assistant').length, 0, 'no assistant message posted on silent turn');
+  assert.equal(t1.bot.unread, 0, 'unread stays 0 on silent turn');
+  assert.equal(t1.messages.length, 1);
+  assert.equal(t1.messages[0].silentRead?.reason, 'Waiting for all tasks');
+  // afterSeq poll at seq 0 still returns the recently silent-read message.
+  const polled = await eng3.thread(watcher3.id, { afterSeq: t1.messages[0].seq });
+  assert.equal(polled.messages.some((m) => m.id === t1.messages[0].id && m.silentRead?.reason === 'Waiting for all tasks'), true);
+
+  // Persists across reload and exports in exportForSync.
+  await eng3.flush();
+  const { engine: reloaded3 } = makeEngine({ dir });
+  const tReloaded = await reloaded3.thread(watcher3.id);
+  assert.equal(tReloaded.messages[0].silentRead?.reason, 'Waiting for all tasks');
+  const synced = await reloaded3.exportForSync();
+  const exportedQuiet = synced.bots.find((b) => b.localId === watcher3.id);
+  assert.equal(exportedQuiet?.messages[0]?.silentRead?.reason, 'Waiting for all tasks');
+
+  // 2. Direct message from the person: stay_silent is refused, reply is posted.
+  mode = 'person';
+  await eng3.send(watcher3.id, { content: 'Are you there?' });
+  await eng3.idle();
+  assert.equal(refusedPerson?.result?.ok, false);
+  assert.match(refusedPerson?.result?.error ?? '', /direct message from the person/);
+  const t2 = await eng3.thread(watcher3.id);
+  assert.equal(t2.messages.at(-1)?.role, 'assistant');
+  assert.equal(t2.messages.at(-1)?.content, 'Answering your direct message.');
+
+  // 3. Accidental empty reply without stay_silent surfaces an error message (never counts as silent).
+  mode = 'empty';
+  await eng3.send(primary3.id, { content: 'Ping QuietBot again' });
+  await eng3.idle();
+  const t3 = await eng3.thread(watcher3.id);
+  assert.equal(t3.messages.at(-1)?.role, 'assistant');
+  assert.match(t3.messages.at(-1)?.content ?? '', /no reply was produced/);
 });
 
 // --- run -------------------------------------------------------------------------------------

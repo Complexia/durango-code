@@ -71,6 +71,8 @@ export type DesktopBotMessage = {
   content: string;
   /** Inbox source labels ("Routine: …", "Task: …", "Bot: …") or "via <machine>" on replies. */
   authorLabel: string | null;
+  /** Set on an inbox item when the bot explicitly chose stay_silent (no reply posted). */
+  silentRead?: { at: number; reason?: string } | null;
   createdAt: number;
   /** Files sent with it (signed in: their library ids; signed out: their paths here). */
   files?: BotMessageFile[];

@@ -111,9 +111,9 @@ How your inbox works:
 How your replies show: like texting, as messages you choose to send.
 - Whatever you write right before calling tools is sent at once as its own message. What you write after your last tool call is your final answer, its own message too. Nothing you send is merged, shortened or taken back, so write each message once, as the person should read it.
 - Your thinking is never shown. Anything the person should read must be in a message you write, never only in your thinking.
-- First, acknowledge: when a reply needs any tool call, start with one short line that shows you got it and what you're doing ("Nice one on the call. Checking SF weather now."), before the first call. A quick answer that needs no tools is just the answer.
+- First, acknowledge: when replying to the person and you need any tool call, start with one short line that shows you got it and what you're doing ("Nice one on the call. Checking SF weather now."), before the first call. A quick answer that needs no tools is just the answer. When waking up on a routine, task report, or bot message that might not need a reply, skip the opening line so you can stay silent if nothing needs saying.
 - Then progress, when it's worth it: during long or multi-step work, send a short update when there's something worth knowing (what you found, what you're on next, a step done), not before every tool call. Quick one- or two-step work needs none.
-- Last, the final answer: once the work is done, write the whole answer as your last message, after your last tool call. Every reply ends with it: never end on a tool call, and never leave the answer in your thinking or only in an earlier progress line.
+- Last, the final answer: once the work is done, write the whole answer as your last message, after your last tool call — never leave an answer in your thinking or only in an earlier progress line, and never end on a tool call unless you explicitly end the turn silently with \`stay_silent\`.
 - Cards go on the message you write them with: buttons (show_actions), pages (show_html) and questions (ask_user) attach to the text you wrote right before the call in the same step; called with no text before it, they go on the next message you write; files (attach_files) go with your final answer. For buttons under your final answer: call show_actions first (no text before it), then write the answer; don't mention the buttons.
 
 Stay responsive:
@@ -124,7 +124,8 @@ Stay responsive:
 - Your older messages are condensed into your summary. When it lacks a detail you need (exact wording, a link, a number, what was said or decided when), look it up with search_history instead of guessing or asking again.
 
 Routines and reports:
-- A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
+- Deciding whether to speak (\`stay_silent\`): not every wake-up needs a message in the thread — use your own judgment. When nothing needs to be said, do any quiet bookkeeping you need (memory, project notes, settling a finished thread, messaging another bot) and call \`stay_silent\` (with a brief \`reason\`) with no text before or after it. Everything you read stays in your history and memory for later turns; no message is posted, no notification is sent, and the person only sees a small "Read" mark on the inbox item. Good times to stay silent: a routine run that found nothing worth saying, an interim task report when the person asked to hear only when everything is done (or a routine "NOT FINISHED YET" status update that doesn't need their attention), a duplicate report or notice, or internal bot-to-bot coordination that needs nothing from the person. Never use \`stay_silent\` on the person's own direct messages — their direct messages should always get an answer. Don't call \`stay_silent\` after sending a message or card in the same turn, and never call \`notify_user\` on a silent turn.
+- A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, call \`stay_silent\` instead of posting filler.
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
 - A task report that starts "NOT FINISHED YET" (or says the task isn't finished yet) is an update, not the outcome: the thread is still working in the background and reports again when it finishes. Tell the person briefly where it stands if it matters, don't report it as done, and don't start the work again.
 - "NEEDS THE PERSON" from a task's thread: it is blocked on the person (an approval, a question, an action) and stays blocked until they answer in that thread. Tell them right away what it needs, in a line or two. "LOOKS STUCK": check the thread before you cancel or redo the work.
@@ -174,6 +175,17 @@ const clip = (value, max) => {
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 };
 const oneLine = (value) => str(value).replace(/\s+/g, ' ').trim();
+const normalizeLocalSilentReason = (value) => {
+  const clean = oneLine(value);
+  return clean ? clip(clean, 200) : null;
+};
+const localSilentReadNote = (silentRead) => {
+  if (!silentRead || typeof silentRead !== 'object') return '';
+  const reason = normalizeLocalSilentReason(silentRead.reason);
+  return reason
+    ? `(You already read this earlier and chose to stay silent: ${reason})`
+    : '(You already read this earlier and chose to stay silent.)';
+};
 const newId = (prefix) => `${prefix}${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`;
 const finite = (value, fallback) => (Number.isFinite(value) ? value : fallback);
 
@@ -565,6 +577,21 @@ export const LOCAL_BOT_TOOLS = [
       required: ['question', 'options'],
     },
   },
+  {
+    name: 'stay_silent',
+    description:
+      "End this turn silently without posting any message or sending any notification. The incoming inbox item still stays in your history and memory for later turns, and the person only sees a small 'Read' mark on the inbox item. Use this when nothing needs to be posted in the thread — e.g. a routine run with nothing worth saying, an interim task report when the person asked to hear only when everything is done, a duplicate report or notice, or quiet bookkeeping. Never use this when the person wrote a direct message, after already sending a message or card in this turn, or alongside notify_user. Call it with no text before or after it.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        reason: {
+          type: 'string',
+          maxLength: 200,
+          description: "Optional brief note on why you stayed silent (e.g. 'Waiting for remaining tasks', 'Routine found nothing new'). Shown only when the person inspects the Read mark, never posted as a message.",
+        },
+      },
+    },
+  },
   ...LOCAL_PROJECT_TOOLS,
 ];
 
@@ -940,6 +967,15 @@ const normalizeMessage = (raw) =>
               cards: raw.cards
                 .filter((card) => card && typeof card.id === 'string' && typeof card.component === 'string' && card.props && typeof card.props === 'object')
                 .map((card) => ({ id: card.id, component: card.component, props: card.props })),
+            }
+          : {}),
+        // Inbox item handled silently (stay_silent).
+        ...(raw.silentRead && typeof raw.silentRead === 'object' && Number.isFinite(raw.silentRead.at)
+          ? {
+              silentRead: {
+                at: raw.silentRead.at,
+                ...(normalizeLocalSilentReason(raw.silentRead.reason) ? { reason: normalizeLocalSilentReason(raw.silentRead.reason) } : {}),
+              },
             }
           : {}),
       }
@@ -1507,6 +1543,8 @@ export const createLocalBotEngine = ({
     ].sort((a, b) => a - b);
     entry.bot.inFlight = [...new Set([...(entry.bot.inFlight ?? []), ...seqs])];
     for (const message of items) reply.claimSeqs.push(message.seq);
+    reply.silent = false;
+    reply.silentReason = null;
     if (beforeFinish) {
       // The draft final answer is replaced instead of posted, so clear its
       // reserved place and live text; the rewritten answer places below these.
@@ -1583,7 +1621,7 @@ export const createLocalBotEngine = ({
       });
     }
     if (counts.person === 0) {
-      lines.push({ text: "The person didn't write this time: reply only as much as the items need, and use notify_user only for something worth their attention." });
+      lines.push({ text: "The person didn't write this time: decide whether this warrants a message in the thread. If nothing needs to be said (e.g. a routine with nothing new, an interim task report while waiting for the rest, or a duplicate), do any quiet bookkeeping you need and call stay_silent with no text instead of posting. Use notify_user only when posting something worth their attention." });
     }
     if (counts.bot > 0) {
       lines.push({
@@ -1681,7 +1719,7 @@ export const createLocalBotEngine = ({
         id: message.id,
         seq: message.seq,
         role: message.role,
-        text: [message.content.trim(), files].filter(Boolean).join('\n'),
+        text: [message.content.trim(), files, localSilentReadNote(message.silentRead)].filter(Boolean).join('\n'),
         ...(message.role === 'user' && message.authorLabel ? { label: message.authorLabel } : {}),
       };
     };
@@ -1804,6 +1842,8 @@ export const createLocalBotEngine = ({
     reply.seq = undefined;
     reply.cards = [];
     reply.text = '';
+    reply.silent = false;
+    reply.silentReason = null;
     reply.sent = [...(reply.sent ?? []), id];
     reply.firstSeq ??= message.seq;
     insertMessage(entry, message);
@@ -1849,6 +1889,12 @@ export const createLocalBotEngine = ({
         accessMode: getAccessMode() || 'read-only',
         update: ({ text, activeTool } = {}) => {
           if (reply.cleared || reply.abort.signal.aborted) return;
+          if (reply.silent) {
+            reply.text = '';
+            reply.activeTool = activeTool || null;
+            changed();
+            return;
+          }
           if (typeof text === 'string') reply.text = text;
           // The reply takes its place in the thread when it first shows text:
           // what the person sends after that comes below it.
@@ -1862,10 +1908,43 @@ export const createLocalBotEngine = ({
         },
         takeInbox: async (options) => (reply.abort.signal.aborted ? [] : claim(entry, reply, options).map(inboxItem)),
         callTool: async ({ name, input, message }) => {
+          if (name === 'stay_silent') {
+            if ((reply.sent?.length ?? 0) > 0) {
+              return { result: { ok: false, error: 'You already sent a message in this turn — write a brief closing reply instead of staying silent.' } };
+            }
+            if ((reply.cards?.length ?? 0) > 0) {
+              return { result: { ok: false, error: 'You already showed a card in this turn — write a reply instead of staying silent.' } };
+            }
+            const hasPerson = reply.claimSeqs.some((seq) => {
+              const msg = entry.messages.find((item) => item.seq === seq);
+              return Boolean(msg && msg.role === 'user' && inboxSourceOf(msg.authorLabel) === 'person');
+            });
+            if (hasPerson) {
+              return { result: { ok: false, error: 'This turn includes a direct message from the person — always reply to them instead of staying silent.' } };
+            }
+            reply.silent = true;
+            reply.silentReason = normalizeLocalSilentReason(input?.reason);
+            reply.text = '';
+            reply.seq = undefined;
+            changed();
+            return {
+              result: {
+                ok: true,
+                silent: true,
+                note: 'Turn marked silent. Nothing from this turn will be posted to the person. Do not call stay_silent again — stop now (if your runtime requires a brief closing word like "Done", it will be discarded).',
+              },
+            };
+          }
+          if (name === 'notify_user' || name === 'ask_user') {
+            reply.silent = false;
+            reply.silentReason = null;
+          }
           // A card goes on the message it was made with (or the reply's next one).
           const shown = localCard(name, input, `ui-${reply.id}-${cardCount}`);
           if (!shown) return { result: await callTool(entry, name, input) };
           if (shown.error) return { result: { ok: false, error: shown.error } };
+          reply.silent = false;
+          reply.silentReason = null;
           const id = Number.isInteger(message) ? botReplyMessageId(reply.id, message) : null;
           if (!addReplyCards(entry, reply, [shown.card], id)) return { result: { ok: false, error: 'This message already shows as much as it can.' } };
           cardCount += 1;
@@ -1882,8 +1961,15 @@ export const createLocalBotEngine = ({
     // move its cursor past the reply, and a new message would start a reply
     // that doesn't see this one).
     const sentIds = reply.sent ?? [];
+    const text = str(outcome?.text).trim();
+    const failure = outcome?.failure ? clip(oneLine(outcome.failure), 300) : null;
+    const hasPersonClaim = reply.claimSeqs.some((seq) => {
+      const msg = entry.messages.find((item) => item.seq === seq);
+      return Boolean(msg && msg.role === 'user' && inboxSourceOf(msg.authorLabel) === 'person');
+    });
+    const silentEnd = !reply.abort.signal.aborted && !outcome?.aborted && !failure && !sentIds.length && !hasPersonClaim && (reply.silent === true || outcome?.silent === true);
     const attachments =
-      !reply.abort.signal.aborted && !outcome?.aborted && (str(outcome?.text).trim() || sentIds.length)
+      !reply.abort.signal.aborted && !outcome?.aborted && !silentEnd && (text || sentIds.length)
         ? await copyReplyFiles(reply.id, outcome?.files)
         : [];
     runtime.replies.delete(reply.id);
@@ -1901,9 +1987,22 @@ export const createLocalBotEngine = ({
       return;
     }
     settleClaims();
-    const text = str(outcome?.text).trim();
-    const failure = outcome?.failure ? clip(oneLine(outcome.failure), 300) : null;
-    const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : '');
+    if (silentEnd) {
+      const reason = normalizeLocalSilentReason(outcome?.silentReason) ?? reply.silentReason ?? null;
+      const silentRead = { at: now(), ...(reason ? { reason } : {}) };
+      let marked = false;
+      for (const seq of reply.claimSeqs) {
+        const msg = entry.messages.find((item) => item.seq === seq);
+        if (!msg || msg.role !== 'user' || inboxSourceOf(msg.authorLabel) === 'person') continue;
+        if (replaceMessage(entry, msg.id, () => ({ silentRead }))) marked = true;
+      }
+      persistBot(entry, { messages: marked });
+      changed();
+      if (!runtime.replies.size && hasUnclaimed(entry) && active && !entry.bot.paused) startReply(entry);
+      await compactIfNeeded(entry, { force: outcome?.compact === true });
+      return;
+    }
+    const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : !sentIds.length ? "Couldn't reply on this computer: no reply was produced." : '');
     // Its last message came before its last tool call: that is the answer, and
     // the files and cards made after it go with it.
     const last =
@@ -2734,6 +2833,7 @@ export const createLocalBotEngine = ({
             : message.content,
           authorLabel: message.authorLabel,
           createdAt: message.createdAt,
+          ...(message.silentRead ? { silentRead: message.silentRead } : {}),
           // Not answered here yet: Durango answers it after the upload.
           ...(message.role === 'user' &&
           (message.seq > bot.processedSeq || (bot.requeue ?? []).includes(message.seq) || (bot.inFlight ?? []).includes(message.seq))
@@ -3049,10 +3149,19 @@ export const createLocalBotEngine = ({
         end = Number.isInteger(beforeSeq) ? indexAfter(beforeSeq - 1) : all.length;
         start = Math.max(0, end - count);
       }
+      let slice = all.slice(start, end);
+      if (Number.isInteger(afterSeq)) {
+        const cutoff = now() - 5 * 60_000;
+        const seen = new Set(slice.map((message) => message.id));
+        const recentSilent = all
+          .slice(Math.max(0, start - 30), start)
+          .filter((message) => message.silentRead && message.silentRead.at >= cutoff && !seen.has(message.id));
+        if (recentSilent.length) slice = [...recentSilent, ...slice];
+      }
       return {
         bot: toDesktopBot(entry),
         ...(hasNewer !== undefined ? { hasNewer } : {}),
-        messages: all.slice(start, end).map(({ attachments, ...message }) => ({
+        messages: slice.map(({ attachments, ...message }) => ({
           ...message,
           // On this device: the files themselves (Durango Code shows images from their path).
           ...(attachments?.length
