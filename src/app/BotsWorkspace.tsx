@@ -38,6 +38,7 @@ import {
   Pause,
   Pin,
   Plus,
+  Reply,
   RotateCw,
   Search,
   SquarePen,
@@ -103,6 +104,7 @@ import {
   type ThreadStarter,
 } from './bots';
 import { applyOptimisticBotOrder, reorderList, sortProjectBots, sortProjectGroups } from './botOrder';
+import { botReplyDisplayAuthor, botReplyTarget, parseBotReplyQuote, withBotReplyQuote, type BotReplyTarget } from './botReplyQuote';
 import {
   computeDropIndicatorOffset,
   computeItemDisplacement,
@@ -2857,6 +2859,9 @@ const BotRow: React.FC<{
 };
 
 /** One bot's conversation: messages, live replies at the bottom, and a composer that never blocks. */
+/** The message each bot's next message replies to (Reply on a message), while the app runs. */
+const botReplyTargets = new Map<string, BotReplyTarget>();
+
 const BotPane: React.FC<{
   botId: string;
   /** Latest profile fields from the sidebar list so edits show in the header at once. */
@@ -3119,7 +3124,7 @@ const BotPane: React.FC<{
 
   const messageIds = useMemo(() => thread?.messages.map((message) => message.id) ?? [], [thread?.messages]);
   const stored = useMemo(() => new Set(messageIds), [messageIds]);
-  const { range, onScroll: onWindowScroll, toLatest, settle, loadingOlder } = useBotMessageWindow({
+  const { range, onScroll: onWindowScroll, toLatest, settle, reveal, loadingOlder } = useBotMessageWindow({
     ids: messageIds,
     scrollRef,
     hasMore: thread?.hasMore === true,
@@ -3132,10 +3137,69 @@ const BotPane: React.FC<{
   const face = useMemo(() => thread?.bot ?? null, [faceKey]);
   const pending = outgoing.filter((message) => !stored.has(message.id));
 
+  // The message the next one replies to (Reply on a message): kept per bot while the app runs.
+  const [replyTarget, setReplyTargetState] = useState<BotReplyTarget | null>(() => botReplyTargets.get(botId) ?? null);
+  const setReplyTarget = useCallback(
+    (target: BotReplyTarget | null) => {
+      if (target) botReplyTargets.set(botId, target);
+      else botReplyTargets.delete(botId);
+      setReplyTargetState(target);
+    },
+    [botId]
+  );
+  const botNameRef = useRef(thread?.bot.name ?? botHint?.name ?? 'Bot');
+  botNameRef.current = thread?.bot.name ?? botHint?.name ?? botNameRef.current;
+  const replyToMessage = useCallback(
+    (message: DesktopBotMessage) => setReplyTarget(botReplyTarget(message, botNameRef.current)),
+    [setReplyTarget]
+  );
+
+  // A reply quote clicked: the message it answers, scrolled into view and
+  // briefly highlighted (older pages are loaded until it is found).
+  const [jumpTarget, setJumpTarget] = useState<{ id: string; at: number } | null>(null);
+  const jumpingRef = useRef(false);
+  const jumpTo = useCallback(
+    async (seq: number) => {
+      if (jumpingRef.current) return;
+      jumpingRef.current = true;
+      try {
+        for (let page = 0; page < 20; page += 1) {
+          const found = threadRef.current?.messages.find((message) => message.seq === seq);
+          if (found) {
+            stick.current = false;
+            if (reveal(found.id)) setJumpTarget({ id: found.id, at: Date.now() });
+            return;
+          }
+          const oldest = threadRef.current?.messages[0];
+          if (!oldest || oldest.seq < seq || threadRef.current?.hasMore !== true) return;
+          if (!(await loadOlder())) return;
+        }
+      } finally {
+        jumpingRef.current = false;
+      }
+    },
+    [loadOlder, reveal]
+  );
+  const jumpToMessage = useCallback((seq: number) => void jumpTo(seq), [jumpTo]);
+  useLayoutEffect(() => {
+    if (!jumpTarget) return;
+    const row = scrollRef.current?.querySelector<HTMLElement>(`[data-bot-row="${CSS.escape(jumpTarget.id)}"]`);
+    if (!row) return;
+    row.scrollIntoView({ block: 'center' });
+    row.classList.remove('bot-row-flash');
+    // Restart the highlight's animation when the same message is jumped to again.
+    void row.offsetWidth;
+    row.classList.add('bot-row-flash');
+    const timer = window.setTimeout(() => row.classList.remove('bot-row-flash'), 1600);
+    return () => window.clearTimeout(timer);
+  }, [jumpTarget, range.start, range.end]);
+
   const send = useCallback(
-    async (text: string, files: BotAttachmentFile[] = [], id = newBotMessageId()) => {
-      const content = text.trim();
-      if (!content && !files.length) return;
+    async (text: string, files: BotAttachmentFile[] = [], id = newBotMessageId(), replyTo: BotReplyTarget | null = null) => {
+      const typed = text.trim();
+      if (!typed && !files.length) return;
+      // A reply carries the message it answers as a quote line in front (botReplyQuote.ts).
+      const content = replyTo ? withBotReplyQuote(typed, replyTo) : typed;
       stick.current = true;
       toLatest();
       rememberSentPreviews(id, files);
@@ -3354,6 +3418,8 @@ const BotPane: React.FC<{
                   answeredQuestions={answeredQuestions}
                   uploadStatuses={row.message.role === 'user' && row.message.files?.some((file) => file.pendingId) ? uploadStatuses : undefined}
                   onRetryAttachment={retryAttachment}
+                  onReplyTo={replyToMessage}
+                  onJumpTo={jumpToMessage}
                 />
               </div>
             ) : (
@@ -3364,6 +3430,7 @@ const BotPane: React.FC<{
             <PersonBubble
               key={message.id}
               content={message.content}
+              onJumpTo={jumpToMessage}
               files={message.files?.map((file, index) => {
                 const pendingId = message.pendingIds?.[index];
                 const liveStatus = pendingId ? uploadStatuses.get(pendingId) : undefined;
@@ -3414,7 +3481,19 @@ const BotPane: React.FC<{
         </button>
       )}
       </div>
-      <BotComposer draftKey={botDraftKey(bot.id)} botName={bot.name} paused={bot.paused} onSend={(text, files) => void send(text, files)} />
+      <BotComposer
+        draftKey={botDraftKey(bot.id)}
+        botName={bot.name}
+        paused={bot.paused}
+        replyTo={replyTarget}
+        onClearReply={() => setReplyTarget(null)}
+        onJumpTo={jumpToMessage}
+        onSend={(text, files) => {
+          const target = replyTarget;
+          setReplyTarget(null);
+          void send(text, files, undefined, target);
+        }}
+      />
     </div>
   );
 };
@@ -4190,7 +4269,45 @@ type BubbleFile = {
   onRetry?: () => void;
 };
 
-const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: React.ReactNode; copyable?: boolean }> = ({ content, files, meta, copyable = true }) => {
+/** Reply: quote this message in the composer (next to Copy, on hover). */
+const ReplyMessageButton: React.FC<{ onClick: () => void; className?: string }> = ({ onClick, className }) => (
+  <button
+    type="button"
+    className={`message-copy-btn bot-reply-btn${className ? ` ${className}` : ''}`}
+    onClick={onClick}
+    aria-label="Reply to this message"
+    title="Reply"
+  >
+    <Reply size={14} />
+  </button>
+);
+
+/** The message a reply answers, above its text: who wrote it and how it starts; clicking jumps to it. */
+const ReplyQuoteHeader: React.FC<{ author: string; excerpt: string; seq: number; onJump?: (seq: number) => void }> = ({ author, excerpt, seq, onJump }) => (
+  <button
+    type="button"
+    onClick={() => onJump?.(seq)}
+    disabled={!onJump}
+    title={onJump ? 'Show the message this replies to' : undefined}
+    className="bot-reply-quote mb-1.5 flex w-full min-w-0 items-center gap-1.5 rounded-md border-l-2 border-sky-400/50 bg-white/[0.04] py-1 pl-2 pr-2.5 text-left text-[12px] leading-snug text-neutral-400 transition-colors duration-75 enabled:hover:bg-white/[0.07] enabled:hover:text-neutral-300"
+  >
+    <Reply size={11} className="shrink-0 text-sky-400/80" />
+    <span className="shrink-0 font-medium text-neutral-300">{botReplyDisplayAuthor(author)}</span>
+    <span className="min-w-0 truncate">{excerpt}</span>
+  </button>
+);
+
+const PersonBubble: React.FC<{
+  content: string;
+  files?: BubbleFile[];
+  meta?: React.ReactNode;
+  copyable?: boolean;
+  onReplyTo?: () => void;
+  onJumpTo?: (seq: number) => void;
+}> = ({ content: stored, files, meta, copyable = true, onReplyTo, onJumpTo }) => {
+  // A reply to an earlier message: its quote line is drawn as a compact header.
+  const quote = parseBotReplyQuote(stored);
+  const content = quote ? quote.text : stored;
   const answer = /^> \*\*Answering:\*\* (.+)\n\n([\s\S]+)$/.exec(content);
   const images = files?.filter((file) => file.preview) ?? [];
   const others = files?.filter((file) => !file.preview) ?? [];
@@ -4302,9 +4419,10 @@ const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: Rea
           ))}
         </div>
       )}
-      {content.trim() !== '' && (
-        <div className="bot-msg user relative max-w-[85%]">
+      {(content.trim() !== '' || quote) && (
+        <div className={`bot-msg user relative max-w-[85%]${quote ? ' min-w-[220px]' : ''}`}>
           <div className="whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-white/[0.08] px-3.5 py-2 text-[13.5px] leading-relaxed text-neutral-100">
+            {quote && <ReplyQuoteHeader author={quote.author} excerpt={quote.excerpt} seq={quote.seq} onJump={onJumpTo} />}
             {answer ? (
               <>
                 <span className="mb-1 block border-l-2 border-sky-400/50 pl-2 text-[12px] text-neutral-400">{answer[1]}</span>
@@ -4315,6 +4433,7 @@ const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: Rea
             )}
           </div>
           {copyable && <CopyMessageButton text={copyText(content, files)} />}
+          {onReplyTo && <ReplyMessageButton onClick={onReplyTo} />}
         </div>
       )}
       {meta && <span className="pr-1 text-[11px] text-neutral-500">{meta}</span>}
@@ -4322,11 +4441,12 @@ const PersonBubble: React.FC<{ content: string; files?: BubbleFile[]; meta?: Rea
   );
 };
 
-const AssistantRow: React.FC<{ bot: DesktopBot; projectPath?: string | null; children: React.ReactNode; copy?: string }> = ({
+const AssistantRow: React.FC<{ bot: DesktopBot; projectPath?: string | null; children: React.ReactNode; copy?: string; onReplyTo?: () => void }> = ({
   bot,
   projectPath,
   children,
   copy,
+  onReplyTo,
 }) => (
   <div className={`flex items-start gap-2.5${copy ? ' bot-msg agent' : ''}`}>
     <BotAvatar bot={bot} projectPath={projectPath} />
@@ -4335,6 +4455,7 @@ const AssistantRow: React.FC<{ bot: DesktopBot; projectPath?: string | null; chi
       {copy && (
         <div className="bot-msg-actions">
           <CopyMessageButton text={copy} />
+          {onReplyTo && <ReplyMessageButton onClick={onReplyTo} />}
         </div>
       )}
     </div>
@@ -4351,14 +4472,19 @@ const BotMessage: React.FC<{
   answeredQuestions: ReadonlyMap<string, string>;
   uploadStatuses?: ReadonlyMap<string, BotAttachmentUploadStatus>;
   onRetryAttachment?: (messageId: string, pendingId: string) => void;
-}> = React.memo(({ bot, projectPath, message, handlers, answeredQuestions, uploadStatuses, onRetryAttachment }) => {
+  /** Reply to this message (the composer quotes it); stable across redraws. */
+  onReplyTo?: (message: DesktopBotMessage) => void;
+  /** A reply quote was clicked: show the message it answers. */
+  onJumpTo?: (seq: number) => void;
+}> = React.memo(({ bot, projectPath, message, handlers, answeredQuestions, uploadStatuses, onRetryAttachment, onReplyTo, onJumpTo }) => {
   const files = useMessageFiles(message.files);
+  const replyTo = onReplyTo ? () => onReplyTo(message) : undefined;
   if (message.role === 'assistant') {
     const via = message.authorLabel?.startsWith('via ') ? message.authorLabel : null;
     // Files it attached show under the text (a path it names would show twice).
     const showsFiles = files.length > 0 || Boolean(message.cards?.some((card) => card.component === 'asset-gallery'));
     return (
-      <AssistantRow bot={bot} projectPath={projectPath} copy={copyText(message.content, message.files)}>
+      <AssistantRow bot={bot} projectPath={projectPath} copy={copyText(message.content, message.files)} onReplyTo={replyTo}>
         <MarkdownContent content={message.content} pathPreviews={!showsFiles} refLinks />
         <BotFileGallery files={files} />
         {message.cards?.length ? <BotCards cards={message.cards} handlers={handlers} answeredQuestions={answeredQuestions} /> : null}
@@ -4372,6 +4498,8 @@ const BotMessage: React.FC<{
       <PersonBubble
         content={message.content}
         files={withSentPreviews(message.id, personFiles(message.id, message.files, files, uploadStatuses, onRetryAttachment))}
+        onReplyTo={replyTo}
+        onJumpTo={onJumpTo}
       />
     );
   }
@@ -4379,7 +4507,8 @@ const BotMessage: React.FC<{
   // A task report carries its thread and change: open or ship them from here.
   const actions = source === 'task' ? taskReportActions(message.content) : [];
   return (
-    <div className="mx-auto w-full max-w-[92%] rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-[12.5px]">
+    <div className="bot-msg inbox mx-auto w-full max-w-[92%] rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-[12.5px]">
+      {replyTo && <ReplyMessageButton onClick={replyTo} />}
       <div className="flex items-center gap-1.5 text-neutral-400">
         <Icon size={12} />
         <span className="truncate font-medium text-neutral-300">{message.authorLabel}</span>
@@ -4456,8 +4585,12 @@ const BotComposer: React.FC<{
   draftKey: string;
   botName: string;
   paused: boolean;
+  /** The message this one replies to: quoted above the box until sent or dismissed. */
+  replyTo?: BotReplyTarget | null;
+  onClearReply?: () => void;
+  onJumpTo?: (seq: number) => void;
   onSend: (text: string, files: BotAttachmentFile[]) => void;
-}> = ({ draftKey, botName, paused, onSend }) => {
+}> = ({ draftKey, botName, paused, replyTo = null, onClearReply, onJumpTo, onSend }) => {
   // The unsent draft (text and files) comes back after switching bots, tabs or threads, and after a restart.
   const [initialDraft] = useState(() => loadBotDraft(draftKey));
   const [text, setText] = useState(initialDraft.text);
@@ -4470,6 +4603,16 @@ const BotComposer: React.FC<{
   const ref = useRef<HTMLTextAreaElement>(null);
   const scrollTimerRef = useRef<number | null>(null);
   const atBottomRef = useRef(true);
+  // Reply picked on a message: type the answer straight away.
+  const replyKey = replyTo ? `${replyTo.id}:${replyTo.seq}` : '';
+  useEffect(() => {
+    if (!replyKey) return;
+    const element = ref.current;
+    if (!element) return;
+    element.focus();
+    const end = element.value.length;
+    element.setSelectionRange(end, end);
+  }, [replyKey]);
   useEffect(
     () => () => {
       if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
@@ -4618,6 +4761,35 @@ const BotComposer: React.FC<{
             void addFiles(event.dataTransfer.files);
           }}
         >
+          {replyTo && (
+            <div className="bot-reply-preview flex items-start gap-2 px-3 pb-0.5 pt-2.5">
+              <Reply size={13} className="mt-[3px] shrink-0 text-sky-400/90" />
+              <button
+                type="button"
+                onClick={() => onJumpTo?.(replyTo.seq)}
+                title="Show the message you're replying to"
+                className="min-w-0 flex-1 rounded-md border-l-2 border-sky-400/50 bg-white/[0.04] py-1 pl-2 pr-2 text-left transition-colors duration-75 hover:bg-white/[0.07]"
+              >
+                <span className="block text-[11.5px] font-medium leading-snug text-[var(--text-secondary)]">
+                  Replying to {replyTo.author === 'my message' ? 'your message' : replyTo.author}
+                  {replyTo.when ? <span className="font-normal text-[var(--text-muted)]"> · {replyTo.when}</span> : null}
+                </span>
+                <span className="line-clamp-2 block text-[12px] leading-snug text-[var(--text-muted)]">{replyTo.excerpt}</span>
+              </button>
+              <button
+                type="button"
+                aria-label="Don't reply to this message"
+                title="Cancel reply (Esc)"
+                onClick={() => {
+                  onClearReply?.();
+                  ref.current?.focus();
+                }}
+                className="mt-0.5 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-muted)] transition-colors duration-75 hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              >
+                <X size={13} />
+              </button>
+            </div>
+          )}
           {files.length > 0 && (
             <div className="composer-attachments items-end">
               {files.map((file) =>
@@ -4655,7 +4827,7 @@ const BotComposer: React.FC<{
             ref={ref}
             value={text}
             rows={2}
-            placeholder={`Message ${botName}`}
+            placeholder={replyTo ? `Reply to ${replyTo.author === 'my message' ? 'your message' : replyTo.author}` : `Message ${botName}`}
             onChange={(event) => setText(event.target.value)}
             onScroll={handleScroll}
             onPaste={(event) => {
@@ -4667,6 +4839,10 @@ const BotComposer: React.FC<{
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
                 submit();
+              } else if (event.key === 'Escape' && replyTo && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                event.stopPropagation();
+                onClearReply?.();
               }
             }}
             className={`chat-input min-h-[52px]${scrolling ? ' is-scrolling' : ''}`}

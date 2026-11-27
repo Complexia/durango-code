@@ -131,6 +131,14 @@ export const botWindowStep = (count: number, range: BotWindow, direction: 'up' |
   return { start, end, following: end === count };
 };
 
+/** The window that shows the message at `index` with some context around it (BOT_WINDOW_INITIAL rows). */
+export const botWindowAround = (count: number, index: number): BotWindow => {
+  const half = Math.floor(BOT_WINDOW_INITIAL / 2);
+  const end = Math.min(count, Math.max(index + 1 + half, Math.min(count, BOT_WINDOW_INITIAL)));
+  const start = Math.max(0, Math.min(index - half, end - BOT_WINDOW_INITIAL));
+  return { start, end, following: end === count };
+};
+
 type Anchor = { id: string; top: number };
 
 /**
@@ -231,6 +239,25 @@ export const useBotMessageWindow = ({
     setState({ key: live.current.resetKey, startId: null, endId: null });
   }, []);
 
+  /**
+   * Mounts the rows around message `id` (a reply quote jumping to the message
+   * it answers), so the caller can scroll it into view once they are drawn.
+   * → false when it isn't loaded.
+   */
+  const reveal = useCallback((id: string) => {
+    const { ids: all, resetKey: key } = live.current;
+    const index = all.indexOf(id);
+    if (index < 0) return false;
+    anchor.current = null;
+    const next = botWindowAround(all.length, index);
+    setState({
+      key,
+      startId: next.following && next.end - next.start <= BOT_WINDOW_INITIAL ? null : all[next.start] ?? null,
+      endId: next.following ? null : all[next.end - 1] ?? null,
+    });
+    return true;
+  }, []);
+
   /** Back at the bottom while following: let a window grown by reading back shrink again. */
   const settle = useCallback(() => {
     const { range: shown } = live.current;
@@ -261,5 +288,5 @@ export const useBotMessageWindow = ({
     if (Math.abs(delta) >= 1) element.scrollTop += delta;
   }, [range.start, range.end, ids, scrollRef]);
 
-  return { range, onScroll, toLatest, settle, loadingOlder };
+  return { range, onScroll, toLatest, settle, reveal, loadingOlder };
 };
