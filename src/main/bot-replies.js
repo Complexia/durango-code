@@ -95,7 +95,9 @@ import {
 
 export { createBotSessionStore };
 
-// Bot replies: a Durango bot's reply, run here on the person's own Claude Code.
+// Bot replies: a Durango bot's reply, run here on the person's own Claude Code
+// (Claude models; other models run on this machine's Codex, Antigravity, Grok
+// or Muse: bot-harness-lanes.js, the same worker and contract).
 //
 // Durango bots are always-on assistants with a chat thread on Durango. While
 // the person is signed in, Claude Code is available here and "Answer your
@@ -314,6 +316,12 @@ export const presenceOf = (info) => ({
     .slice(0, 100)
     .map((project) => ({ name: project.name, id: project.id, repoId: typeof project.repoId === 'string' && project.repoId ? project.repoId : null })),
   models: (Array.isArray(info?.models) ? info.models : []).filter((model) => typeof model === 'string' && model).slice(0, 20),
+  // The Durango bot models this machine answers with on its harnesses
+  // (bot-harness-models.js localBotModelIds): Durango routes a bot here only
+  // when its models are among them.
+  ...(Array.isArray(info?.localModels)
+    ? { localModels: info.localModels.filter((model) => typeof model === 'string' && model).slice(0, 80) }
+    : {}),
 });
 
 /** The bot's working directory: `<botsDir>/<botId>`, the id made path-safe. */

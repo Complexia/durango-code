@@ -87,7 +87,7 @@ import { createKimiAcpDriver, handleKimiSubagentLine, kimiPlanModeOneShot, kimiS
 import { guardVisualFrames } from './main/visual-tools.js';
 import { attachTextContextMenu } from './main/text-context-menu.js';
 import { subagentReportsMessage } from './main/background-subagents.js';
-import { closeMcpBridge, handleSubagentResult, handleSubagentStarted, legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpHttpMcpServers, orionAcpMcpServers, pendingSubagentStops, takeSubagentReports, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
+import { closeMcpBridge, registerBotToolsBridge, handleSubagentResult, handleSubagentStarted, legacyMcpCleanupPromise, openCodeMcpConfigContent, orionAcpHttpMcpServers, orionAcpMcpServers, pendingSubagentStops, takeSubagentReports, providerSupportsRunPlugin, providerSupportsThreadReader, registerMcpBridgeForRun, startLegacyMcpCleanup, writeMuseMcpConfigRoot } from './main/mcp-bridge.js';
 import { isEffectiveThreadReaderBridgeReady, isMcpBridgeProvider, isRequiredThreadReaderBridgeMissing } from './main/thread-reader-routing.js';
 import { DurangoError, accountKeyOf, createDurangoClient, createDurangoCredentials, createMockDurangoClient } from './main/durango-client.js';
 import { createBoardTasks, durangoTasksEnabled } from './main/board-tasks.js';
@@ -106,6 +106,9 @@ import {
   normalizeBotSettings,
 } from './main/bot-replies.js';
 import { createBotAttachmentManager } from './main/bot-attachments.js';
+import { mergeDesktopBotModelCatalog } from './main/bot-models.js';
+import { harnessModelFor, localBotModelHarnesses, localBotModelIds } from './main/bot-harness-models.js';
+import { createAcpBotHarness, createCodexBotHarness, createHarnessLaneRunner, createMuseBotHarness } from './main/bot-harness-lanes.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
 import { clipMiddle } from './report-clip.js';
@@ -126,8 +129,13 @@ import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, 
 import { convertHeicToJpeg, isHeicInput, jpegNameForHeic } from './main/heic.js';
 import {
   configureAgentModelsCache,
+  antigravityReasoningEffortForModel,
+  antigravityWireModelId,
+  clampReasoningEffort,
+  codexReasoningEffortForModel,
   getAgentModels,
   invalidateAgentModelsCache,
+  listClaudeModels,
   listAgentModelsWithAvailability,
   onAgentModelsChanged,
   resolveLegacyAntigravityModelId,
@@ -4654,6 +4662,82 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
   sessions: botSessions,
 });
 
+// Bot replies on a model that isn't Claude run on this machine's harness for
+// it (bot-harness-lanes.js): Codex for GPT, Antigravity for Gemini, Grok and
+// Muse, each through its own supported interface. The bot's tools come from
+// a `durango_bot` MCP server on the app's bridge (mcp-bridge.js).
+// A harness that just failed for a reason a retry won't fix soon (signed out,
+// a usage limit) is left out of this machine's presence for a while, so
+// Durango sends those bots' replies elsewhere meanwhile.
+const BOT_HARNESS_DOWN_MS = 10 * 60_000;
+const botHarnessDownUntil = new Map(); // providerId -> until
+const isBotHarnessDown = (providerId) => (botHarnessDownUntil.get(providerId) ?? 0) > Date.now();
+const spawnBotHarness = (argv, { cwd, env } = {}) => {
+  const child = spawn(loginShell, ['-lc', argv.map(shellQuote).join(' ')], {
+    cwd: cwd || os.homedir(),
+    env: withClaudeEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1', ...(env ?? {}) }),
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  // SIGTERM, then SIGKILL if it lingers (run-registry.js).
+  const kill = child.kill.bind(child);
+  child.kill = (signal) => (signal ? kill(signal) : (killAgentChild(child), true));
+  return child;
+};
+const GROK_BOT_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
+const MUSE_BOT_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const resolveBotHarnessModel = async (lane) => {
+  const found = harnessModelFor(await listDispatchModels(), lane.modelId);
+  if (!found || isBotHarnessDown(found.providerId)) return null;
+  const models = await getAgentModels();
+  const model = models.find((candidate) => candidate.id === found.model.id);
+  if (!model) return null;
+  const wanted = lane.reasoningEffort || null;
+  switch (found.providerId) {
+    case 'codex':
+      return { providerId: 'codex', model, effort: codexReasoningEffortForModel(model, wanted) };
+    case 'antigravity': {
+      const effort = antigravityReasoningEffortForModel(model, wanted) ?? null;
+      return { providerId: 'antigravity', model: { ...model, acpModelId: antigravityWireModelId(model, effort) }, effort };
+    }
+    case 'grok':
+      return { providerId: 'grok', model, effort: clampReasoningEffort(wanted, Array.isArray(model.reasoningEfforts) && model.reasoningEfforts.length ? model.reasoningEfforts : GROK_BOT_EFFORTS, null) };
+    case 'muse':
+      return { providerId: 'muse', model, effort: clampReasoningEffort(wanted, MUSE_BOT_EFFORTS, 'high') };
+    default:
+      return null;
+  }
+};
+const harnessBotLaneRunner = createHarnessLaneRunner({
+  resolveModel: resolveBotHarnessModel,
+  harnesses: {
+    codex: createCodexBotHarness({ spawnProcess: spawnBotHarness, clientVersion: app.getVersion() }),
+    antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: spawnBotHarness }),
+    grok: createAcpBotHarness({ provider: 'grok', spawnProcess: spawnBotHarness }),
+    muse: createMuseBotHarness({
+      spawnProcess: spawnBotHarness,
+      // Muse reads MCP servers only from its settings file: a private config root per reply.
+      museEnv: async (mcp) => {
+        const root = mcp ? await writeMuseMcpConfigRoot(mcp, { serverName: 'durango_bot' }) : null;
+        return root ? { XDG_CONFIG_HOME: root } : {};
+      },
+    }),
+  },
+  registerTools: ({ tools, call }) => registerBotToolsBridge({ tools, call }),
+  botsDir: () => path.join(app.getPath('userData'), 'bots'),
+  getProjects: botProjects,
+  resolveLocalAttachment: (item) => botAttachments.resolveLocalPath(item),
+  sessions: botSessions,
+  onUnavailable: (providerId, reason) => {
+    botHarnessDownUntil.set(providerId, Date.now() + BOT_HARNESS_DOWN_MS);
+    botMachineInfoCache = null;
+    console.warn(`[bot replies] ${providerId} can't answer bots now (left out for 10 minutes):`, String(reason).slice(0, 300));
+  },
+});
+// A reply runs on Claude Code for a Claude model (or a Durango that names no
+// modelId), else on the harness for its model.
+const botLaneRunner = (lane, ctx) =>
+  lane.modelId && !lane.modelId.startsWith('anthropic/') ? harnessBotLaneRunner(lane, ctx) : claudeBotLaneRunner(lane, ctx);
+
 // A Durango Code thread a bot started in a project here (delegate_task
 // `project`), opened in the app's window like an agent from Durango Chat. The
 // renderer's dispatch settle watcher reports its outcome under the dispatch id
@@ -4810,12 +4894,15 @@ const BOT_MACHINE_INFO_TTL_MS = 2 * 60_000;
 let botMachineInfoCache = null;
 const botMachineInfo = async () => {
   if (botMachineInfoCache && Date.now() - botMachineInfoCache.at < BOT_MACHINE_INFO_TTL_MS) return botMachineInfoCache.info;
+  const dispatchModels = await listDispatchModels().catch(() => []);
   const info = {
     name: await getDispatchMachineName(),
     projects: await botProjectsWithKeys({ local: false }),
-    models: (await listDispatchModels().catch(() => []))
+    models: dispatchModels
       .filter((model) => model.providerId === 'claude' && model.available !== false)
       .map((model) => model.slug || model.id),
+    // Every bot model a harness here answers with (Claude Code: any Claude model).
+    localModels: localBotModelIds(dispatchModels, { down: isBotHarnessDown }),
   };
   botMachineInfoCache = { at: Date.now(), info };
   return info;
@@ -4831,8 +4918,9 @@ const botReplyWorker = createBotReplyWorker({
   platform: process.platform,
   isSignedIn: isDispatchSignedIn,
   isOnline: () => net.isOnline(),
-  isAvailable: botRepliesAvailable,
-  runLane: claudeBotLaneRunner,
+  // Claude Code or another harness can answer here.
+  isAvailable: async () => (await botRepliesAvailable()) || localBotModelIds(await listDispatchModels(), { down: isBotHarnessDown }).length > 0,
+  runLane: botLaneRunner,
   getMachineInfo: () => botMachineInfo(),
   listModels: listDispatchModels,
   startProjectThread: startBotProjectThread(BOT_TASK_DISPATCH_PREFIX),
@@ -6003,12 +6091,19 @@ ipcMain.handle('bots:mode', async () => ({
 }));
 
 ipcMain.handle('bots:list', async () => {
+  const localClaudePromise = listClaudeModels().catch(() => []);
   if (await localBotsMode()) {
     if (!(await botRepliesAvailable().catch(() => false))) {
       return { ok: false, code: 'claude_unavailable', error: LOCAL_BOTS_CLAUDE_UNAVAILABLE };
     }
     try {
-      return { ok: true, ...(await localBots.list()), projectKeys: await botProjectKeys({ local: true }), account: 'local' };
+      const [listed, localClaudeModels] = await Promise.all([localBots.list(), localClaudePromise]);
+      const modelCatalog = mergeDesktopBotModelCatalog({
+        mode: 'local',
+        modelChoices: listed.modelChoices,
+        localClaudeModels,
+      });
+      return { ok: true, ...listed, modelCatalog, projectKeys: await botProjectKeys({ local: true }), account: 'local' };
     } catch (error) {
       return localBotsIpcError(error);
     }
@@ -6016,12 +6111,29 @@ ipcMain.handle('bots:list', async () => {
   try {
     // Which account this list is for (no secret: a hash), so the Bots view
     // drops what it kept for another account.
-    const before = await durangoAccountKey();
-    const list = await durangoClient.listBots();
-    const after = await durangoAccountKey();
+    // DURANGO_MOCK has no account: its fixture bots stand in for one.
+    const before = durangoMock ? 'mock' : await durangoAccountKey();
+    const [list, localClaudeModels, dispatchModels] = await Promise.all([
+      durangoClient.listBots(),
+      localClaudePromise,
+      listDispatchModels().catch(() => []),
+    ]);
+    const after = durangoMock ? 'mock' : await durangoAccountKey();
     if (!before || before !== after) return { ok: false, code: 'account_changed', error: 'The Durango account changed. Try again.' };
     const account = crypto.createHash('sha256').update(before).digest('hex').slice(0, 16);
-    return { ok: true, ...list, projectKeys: await botProjectKeys({ local: false }), account };
+    const modelCatalog =
+      list.modelChoices?.length || list.modelCatalog?.length
+        ? mergeDesktopBotModelCatalog({
+            mode: 'durango',
+            modelChoices: list.modelChoices,
+            modelCatalog: list.modelCatalog,
+            localClaudeModels,
+            // Models this machine's Codex, Antigravity, Grok or Muse answer with
+            // (the picker says when machine replies are off).
+            localHarnessModels: localBotModelHarnesses(dispatchModels, { down: isBotHarnessDown }),
+          })
+        : null;
+    return { ok: true, ...list, modelCatalog, projectKeys: await botProjectKeys({ local: false }), account };
   } catch (error) {
     return durangoIpcError(error);
   }

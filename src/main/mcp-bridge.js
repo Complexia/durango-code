@@ -219,6 +219,20 @@ export const dispatchBridgeToolCall = async (session, tool, rawArgs) => {
   const finish = (ok, text, extra) =>
     redactSecrets({ ok, text, ...(extra ?? {}) }, { alsoValues });
 
+  // A Durango bot's reply on Codex, Antigravity, Grok or Muse
+  // (registerBotToolsBridge): the server lists the bot's tools and nothing of
+  // Durango Code's own; each call goes to the reply (bot-harness-lanes.js).
+  if (session.bot) {
+    if (tool === '__tools') return finish(true, '', { tools: session.bot.tools });
+    if (!session.bot.tools.some((definition) => definition.name === tool)) return finish(false, `Unknown tool: ${tool}`);
+    try {
+      const result = await session.bot.call(tool, args);
+      return finish(result?.ok !== false, String(result?.text ?? ''));
+    } catch (error) {
+      return finish(false, `The ${tool} tool failed: ${error?.message ?? error}`);
+    }
+  }
+
   // The shim's tools/list (and the HTTP handler) asks which tools this run
   // gets beyond its fixed set, so the browser_* schemas live only in
   // browser-tools.js.
@@ -518,6 +532,7 @@ const authenticateMcpHttpSession = (authHeader) => {
 const getHttpMcpHandler = (session) => {
   if (!session.httpMcpHandler) {
     session.httpMcpHandler = createOrionMcpBridgeHandler({
+      botTools: Boolean(session.bot),
       devicesEnabled: session.devicesEnabled === true,
       compactTools:
         session.compactTools !== undefined
@@ -1067,6 +1082,60 @@ export const registerMcpBridgeForRun = async ({
   }
 };
 
+/**
+ * The MCP server a Durango bot's reply on Codex, Antigravity, Grok or Muse
+ * gets (bot-harness-lanes.js): `durango_bot`, listing only the bot's tools
+ * (`tools`: [{ name, description, inputSchema }]), each call answered by
+ * `call(name, args)` → { ok, text }. Served like Durango Code's own bridge:
+ * the stdio shim over the socket (`command`/`args`), or the loopback HTTP
+ * endpoint with a bearer token (`httpUrl`/`httpHeaders`) for ACP agents that
+ * advertise HTTP MCP. `tokenRoot` is a private directory for the run (Muse's
+ * config root). → null when the bridge can't start.
+ */
+export const BOT_TOOLS_SERVER_NAME = 'durango_bot';
+export const registerBotToolsBridge = async ({ tools, call }) => {
+  try {
+    const [{ shimPath, socketPath }, httpBridge] = await Promise.all([
+      ensureMcpBridge(),
+      ensureMcpHttpBridge().catch(() => null),
+    ]);
+    const token = crypto.randomUUID();
+    const tokenRoot = path.join(app.getPath('userData'), 'orion-mcp-runs', token);
+    await fs.mkdir(tokenRoot, { recursive: true, mode: 0o700 });
+    const session = {
+      bot: { tools: Array.isArray(tools) ? tools : [], call },
+      providerId: 'bot',
+      accessMode: 'full-access',
+      abortController: new AbortController(),
+      released: false,
+      turnGeneration: 1,
+    };
+    mcpBridgeSessions.set(token, session);
+    return {
+      name: BOT_TOOLS_SERVER_NAME,
+      token,
+      command: process.execPath,
+      args: [shimPath, '--socket', socketPath, '--token', token, '--bot-tools'],
+      env: { ELECTRON_RUN_AS_NODE: '1' },
+      tokenRoot,
+      userServers: [],
+      ...(httpBridge
+        ? { httpUrl: httpBridge.httpUrl, httpHeaders: [{ name: 'Authorization', value: `Bearer ${token}` }] }
+        : {}),
+      release: () => {
+        session.released = true;
+        mcpBridgeSessions.delete(token);
+        session.httpMcpHandler = null;
+        session.abortController.abort();
+        void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});
+      },
+    };
+  } catch (error) {
+    console.error('Durango bot tools bridge unavailable:', error);
+    return null;
+  }
+};
+
 // Muse reads MCP servers only from `<config root>/muse/settings.json`
 // (`mcp_servers`, a map of Claude-style {transport, command, args, env}
 // entries) and `muse exec` has no per-run config flag — so each muse run gets
@@ -1081,7 +1150,7 @@ export const registerMcpBridgeForRun = async ({
 export const museUserConfigRoot = () =>
   process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
 
-export const writeMuseMcpConfigRoot = async (orionMcp) => {
+export const writeMuseMcpConfigRoot = async (orionMcp, { serverName = 'orion' } = {}) => {
   if (!orionMcp?.tokenRoot) return null;
   const userServers = museOrionMcpServers(orionMcp.userServers);
   try {
@@ -1124,7 +1193,7 @@ export const writeMuseMcpConfigRoot = async (orionMcp) => {
           mcp_servers: {
             ...(isPlainRecord(settings.mcp_servers) ? settings.mcp_servers : {}),
             ...userServers,
-            orion: {
+            [serverName]: {
               transport: 'stdio',
               command: orionMcp.command,
               args: orionMcp.args,

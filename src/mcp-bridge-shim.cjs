@@ -729,6 +729,9 @@ const serverInstructions = (all) => {
 // in-process HTTP MCP endpoint (src/main/mcp-bridge.js) so tool schemas,
 // compact listing, schema validation, and server instructions never diverge.
 const createOrionMcpBridgeHandler = ({
+  // A Durango bot's reply (src/main/mcp-bridge.js registerBotToolsBridge):
+  // only the bot's own tools, all from the app (`__tools`), listed in full.
+  botTools = false,
   devicesEnabled = false,
   compactTools = false,
   describeServer = false,
@@ -736,7 +739,8 @@ const createOrionMcpBridgeHandler = ({
   cacheExtraTools = true,
   callOrion,
 } = {}) => {
-  const tools = buildStaticBridgeTools({ devicesEnabled, backgroundSubagents });
+  if (botTools) compactTools = false;
+  const tools = botTools ? [] : buildStaticBridgeTools({ devicesEnabled, backgroundSubagents });
   const toolNames = new Set(tools.map((tool) => tool.name));
   // Tools whose full definition this run has been given (load_tools, or a
   // call refused for its arguments).
@@ -774,8 +778,8 @@ const createOrionMcpBridgeHandler = ({
       return reply(message.id, {
         protocolVersion: typeof requested === 'string' && requested ? requested : '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'orion', version: '1.0.0' },
-        ...(describeServer ? { instructions: serverInstructions([...tools, ...(await loadExtraTools())]) } : {}),
+        serverInfo: { name: botTools ? 'durango_bot' : 'orion', version: '1.0.0' },
+        ...(describeServer && !botTools ? { instructions: serverInstructions([...tools, ...(await loadExtraTools())]) } : {}),
       });
     }
     if (method === 'tools/list') {
@@ -850,6 +854,8 @@ const startStdioShim = () => {
   // returns once the subthread starts and wait_subagents collects the reports
   // (src/main/background-subagents.js).
   const backgroundSubagents = argv.includes('--background-subagents');
+  // A Durango bot's reply: only the bot's tools (see createOrionMcpBridgeHandler).
+  const botTools = argv.includes('--bot-tools');
 
   const write = (message) => {
     try {
@@ -908,6 +914,7 @@ const startStdioShim = () => {
     });
 
   const handler = createOrionMcpBridgeHandler({
+    botTools,
     devicesEnabled,
     compactTools,
     describeServer,

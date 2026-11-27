@@ -233,8 +233,10 @@ export type BotsListResult = {
   projectKeys?: Record<string, string>;
   /** Whose bots these are ("local", or a hash of the Durango account): cached data of another account is dropped. */
   account?: string;
-  /** The models a bot can be set to; null or absent (an older Durango): no picker. */
+  /** The recommended models a bot can be set to; null or absent (an older Durango): no picker. */
   modelChoices?: BotModelChoice[] | null;
+  /** The full searchable catalog (recommended + cloud catalog + local Claude models). */
+  modelCatalog?: BotModelChoice[] | null;
   error?: string;
   code?: string;
 };
@@ -249,12 +251,20 @@ export type ReorderBotsInput = {
 };
 export type ReorderBotsResult = { ok: boolean; projectOrder?: string[]; error?: string; code?: string };
 
-/** A model a bot can be set to. `claude`: it can also reply on a machine's Claude Code (others reply from Durango's cloud). */
+/** A model a bot can be set to. `claude` / `local`: it can reply on this machine's Claude Code (others reply from Durango's cloud). */
 export type BotModelChoice = {
   id: string;
   label: string;
   note: string;
   claude: boolean;
+  provider?: string;
+  lab?: string;
+  recommended?: boolean;
+  legacy?: boolean;
+  /** True when this model can run locally on one of this machine's harnesses (Claude Code, Codex, Antigravity, Grok, Muse). */
+  local?: boolean;
+  /** The harness that runs it here ("Claude Code", "Codex", "Antigravity", "Grok", "Muse"). */
+  localVia?: string;
   efforts?: readonly string[];
   defaultEffort?: string;
 };
@@ -289,7 +299,8 @@ export const botModelLabel = (model: string, choices: readonly BotModelChoice[] 
 /** Supported reasoning efforts for a bot model. */
 export const botModelEfforts = (model: string, choices: readonly BotModelChoice[] | null | undefined): readonly string[] => {
   const choice = choices?.find((item) => item.id === model);
-  if (choice?.efforts?.length) return choice.efforts;
+  if (choice && Array.isArray(choice.efforts)) return choice.efforts;
+  if (/gemini-4-neon/i.test(model)) return ['low', 'medium', 'high', 'xhigh'];
   if (/gemini/i.test(model)) return ['low', 'medium', 'high'];
   if (/gpt-6-luna/i.test(model)) return ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
   return DEFAULT_BOT_EFFORTS;
@@ -298,6 +309,7 @@ export const botModelEfforts = (model: string, choices: readonly BotModelChoice[
 /** Default reasoning effort for a bot model when none is explicitly set. */
 export const defaultBotReasoningEffort = (model: string, choices: readonly BotModelChoice[] | null | undefined): string => {
   const choice = choices?.find((item) => item.id === model);
+  if (choice && Array.isArray(choice.efforts) && choice.efforts.length === 0) return '';
   if (choice?.defaultEffort) return choice.defaultEffort;
   if (/haiku/i.test(model)) return 'medium';
   if (choice?.claude || /claude/i.test(model)) return 'high';
@@ -311,6 +323,7 @@ export const effectiveBotReasoningEffort = (
   choices: readonly BotModelChoice[] | null | undefined
 ): string => {
   const supported = botModelEfforts(model, choices);
+  if (supported.length === 0) return '';
   const clean = typeof effort === 'string' ? effort.trim().toLowerCase() : '';
   if (!clean) return defaultBotReasoningEffort(model, choices);
   if (supported.includes(clean)) return clean;
