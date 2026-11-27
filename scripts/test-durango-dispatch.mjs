@@ -51,7 +51,7 @@ import {
   startDurangoDispatchReporter,
   userActionText,
 } from '../src/app/durangoDispatch.ts';
-import { clipMiddle } from '../src/report-clip.js';
+import { clipMiddle, compactFileLinks } from '../src/report-clip.js';
 // stream-adapters.js as a plain Node module (its one Electron import is a seam):
 // the Claude driver builds a run's steps with it.
 const { extractActivitiesFromJsonEvent } = await import(
@@ -504,7 +504,7 @@ try {
     assert.ok(finished.summary.length <= DISPATCH_SUMMARY_MAX_CHARS);
     assert.ok(finished.summary.startsWith('OPENING SUMMARY:'), 'keeps opening summary');
     assert.ok(finished.summary.endsWith('CLOSING RESULT'), 'keeps closing result');
-    assert.match(finished.summary, /…\[middle trimmed\]…/);
+    assert.match(finished.summary, /…\[middle trimmed: [\d,]+ chars omitted — full report is in thread thread-1; call read_thread to read it in full\]…/);
     await waitUntil(() => claimsSoFar().length > claimsWhileBusy, 'claiming resumes after the run settles');
 
     // Sign-out stops the loop at once.
@@ -1096,30 +1096,98 @@ try {
     assert.ok(trimmed.length <= 1_000);
     assert.ok(trimmed.startsWith('Shipped chg_abc123 and deployed convex-prod + andromedus.'));
     assert.ok(trimmed.endsWith('Verified live on durango.sh.\nChange: chg_abc123 https://durango.sh/c/chg_abc123'));
-    assert.ok(trimmed.includes('\n\n…[middle trimmed]…\n\n'));
+    assert.match(trimmed, /\n\n…\[middle trimmed: [\d,]+ chars omitted\]…\n\n/);
+    const trimmedWithThread = clipMiddle(multiline, 1_000, { threadId: 'cbb36805-9f56-4cfd-b81b-f7d27137e65b' });
+    assert.ok(trimmedWithThread.length <= 1_000);
+    assert.match(
+      trimmedWithThread,
+      /\n\n…\[middle trimmed: [\d,]+ chars omitted — full report is in thread cbb36805-9f56-4cfd-b81b-f7d27137e65b; call read_thread to read it in full\]…\n\n/
+    );
     assert.equal(clipMiddle('short', 100), 'short');
     assert.equal(clipMiddle('   ', 100), '');
     assert.equal(clipMiddle('abc', 1), '…');
     assert.equal(clipMiddle('abc', 2), 'a…');
     assert.equal(clipMiddle('abc', 0), '');
+    assert.equal(clipMiddle('START ' + 'a'.repeat(100) + ' THE END', 20), 'START aaaaaa…THE END');
     // Never splits UTF-16 surrogate pairs (e.g. emojis) at clip boundaries.
     const emojis = '🚀'.repeat(3_000);
     for (const limit of [2, 3, 20, 119, 120, 4_001]) {
       const clipped = clipMiddle(emojis, limit);
       assert.ok(clipped.length <= limit, `emoji clip <= ${limit}`);
       assert.equal(clipped.isWellFormed(), true, `emoji clip well-formed at limit ${limit}`);
+      const clippedWithThread = clipMiddle(emojis, limit, { threadId: 'cbb36805-9f56-4cfd-b81b-f7d27137e65b' });
+      assert.ok(clippedWithThread.length <= limit, `emoji thread clip <= ${limit}`);
+      assert.equal(clippedWithThread.isWellFormed(), true, `emoji thread clip well-formed at limit ${limit}`);
     }
     // End-to-end refs + footer pipeline (9,000 + refs -> 10,000 + footer -> 12,000) keeps opening, refs and footer.
     const refs = '\n\n---\nThread: @thread:t_99\nChange: chg_abc123456 (open) https://durango.sh/c/chg_abc123456\nWorkspace: /tmp/ws';
     const footer = '(Durango Code thread t_99, on Mac. Follow up there, e.g. to ship it, with message_thread thread_id "t_99".)';
     const rawReport = `OPENING REPORT\n${'body line\n'.repeat(1_500)}CLOSING SUMMARY`;
-    const withRefs = `${clipMiddle(rawReport, 9_000)}${refs}`;
-    const withFooter = `${clipMiddle(withRefs, 10_000)}\n\n${footer}`;
-    const inInbox = clipMiddle(withFooter, 12_000);
+    const withRefs = `${clipMiddle(rawReport, 9_000, { threadId: 't_99' })}${refs}`;
+    const withFooter = `${clipMiddle(withRefs, 10_000, { threadId: 't_99' })}\n\n${footer}`;
+    const inInbox = clipMiddle(withFooter, 12_000, { threadId: 't_99' });
     assert.ok(inInbox.length <= 12_000);
     assert.ok(inInbox.startsWith('OPENING REPORT'));
+    assert.ok(inInbox.includes('full report is in thread t_99; call read_thread to read it in full'));
     assert.ok(inInbox.includes('Change: chg_abc123456 (open)'));
     assert.ok(inInbox.endsWith(footer));
+
+    // compactFileLinks: turns verbose file:// links into plain path:line safely.
+    assert.equal(
+      compactFileLinks(
+        'See [antigravity-driver.js](file:///Users/me/durango/code/src/main/antigravity-driver.js#L211-L1893) and [main.js](file:///Users/me/durango/code/src/main.js#L8291).',
+        { rootPath: '/Users/me/durango' }
+      ),
+      'See code/src/main/antigravity-driver.js:211-1893 and code/src/main.js:8291.'
+    );
+    // Descriptive labels, media paths, image embeds, web links, and code blocks stay safe.
+    assert.equal(
+      compactFileLinks('Read [the audit guide](file:///Users/me/durango/docs/audit.md#L12) now.', { rootPath: '/Users/me/durango' }),
+      'Read the audit guide (docs/audit.md:12) now.'
+    );
+    assert.equal(
+      compactFileLinks('Shot: [shot.png](file:///Users/me/durango/tmp/shot.png) and ![alt](file:///Users/me/durango/tmp/shot.png)', {
+        rootPath: '/Users/me/durango',
+      }),
+      'Shot: /Users/me/durango/tmp/shot.png and ![alt](file:///Users/me/durango/tmp/shot.png)'
+    );
+    const fencedAndWeb = [
+      'Web: [PR](https://durango.sh/c/chg_123)',
+      'Inline: `[foo.js](file:///Users/me/durango/foo.js#L1)`',
+      '```md',
+      '[bar.js](file:///Users/me/durango/bar.js#L2)',
+      '```',
+    ].join('\n');
+    assert.equal(compactFileLinks(fencedAndWeb, { rootPath: '/Users/me/durango' }), fencedAndWeb);
+
+    // Real-world Antigravity ACP audit case: a report over 9,000 chars because of file:// links
+    // compacts to plain path:line and fits whole under BOT_TASK_SUMMARY_MAX_CHARS.
+    const auditRoot = '/Users/complexia/Desktop/projects/durango';
+    const auditBody = [
+      '### 1. Does every Antigravity path go through ACP?\nNo — 12 non-ACP paths remain.',
+      ...Array.from(
+        { length: 65 },
+        (_, i) =>
+          `- Path ${i + 1}: [antigravity-driver-${i}.js](file://${auditRoot}/code/src/main/antigravity-driver-${i}.js#L${10 + i}-L${40 + i}) reads local config.`
+      ),
+      '### 4. Dead code: none left after 71b83f90.',
+    ].join('\n');
+    assert.ok(auditBody.length > BOT_TASK_SUMMARY_MAX_CHARS, 'raw audit report exceeds 9,000 chars due to file:// links');
+    const compactedAudit = compactFileLinks(auditBody, { rootPath: auditRoot });
+    assert.ok(compactedAudit.length < BOT_TASK_SUMMARY_MAX_CHARS, 'compacted audit report fits under 9,000 chars');
+    assert.ok(!compactedAudit.includes('file://'), 'no file:// markup left');
+    assert.ok(compactedAudit.includes('code/src/main/antigravity-driver-32.js:42-72'), 'middle item preserved intact');
+    const auditOutcome = durangoDispatchOutcome(
+      {
+        id: 'cbb36805-9f56-4cfd-b81b-f7d27137e65b',
+        status: 'done',
+        durangoDispatch: { id: 'bottask:t_audit', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' },
+      },
+      [run({ status: 'done', content: auditBody })],
+      { rootPath: auditRoot }
+    );
+    assert.equal(auditOutcome.outcome, 'finished');
+    assert.equal(auditOutcome.summary, compactedAudit, 'audit report arrives intact without middle trimming');
   });
 
   await test('renderer outcome: prefers final message over earlier progress lines and uses server-aligned limits', () => {
@@ -1198,13 +1266,21 @@ try {
     const large = 'HEAD: ' + 'b'.repeat(7_500) + ' :TAIL';
     assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: large })], durangoDispatch: botDispatch }).summary, large);
     assert.equal(outcomeOf({ status: 'done', messages: [run({ status: 'done', content: large })], durangoDispatch: localDispatch }).summary, large);
-    // Over 9,000 chars on a bot task: middle-trimmed, keeping opening summary and closing outcome.
+    // Over 9,000 chars on a bot task: middle-trimmed with char count and thread id pointer.
     const huge = 'OPENING REPORT\n' + 'z'.repeat(11_000) + '\nCLOSING LINK';
-    const hugeOutcome = outcomeOf({ status: 'done', messages: [run({ status: 'done', content: huge })], durangoDispatch: botDispatch });
+    const hugeOutcome = outcomeOf({
+      id: 'cbb36805-9f56-4cfd-b81b-f7d27137e65b',
+      status: 'done',
+      messages: [run({ status: 'done', content: huge })],
+      durangoDispatch: botDispatch,
+    });
     assert.ok(hugeOutcome.summary.length <= BOT_TASK_SUMMARY_MAX_CHARS);
     assert.ok(hugeOutcome.summary.startsWith('OPENING REPORT'));
     assert.ok(hugeOutcome.summary.endsWith('CLOSING LINK'));
-    assert.ok(hugeOutcome.summary.includes('…[middle trimmed]…'));
+    assert.match(
+      hugeOutcome.summary,
+      /…\[middle trimmed: [\d,]+ chars omitted — full report is in thread cbb36805-9f56-4cfd-b81b-f7d27137e65b; call read_thread to read it in full\]…/
+    );
   });
   await test('renderer outcome: the turns a thread resumes by itself report, the latest run is the report', () => {
     const dispatch = { id: 'd1', sourceUrl: null, startedAt: '2026-10-13T00:00:00.000Z' };
@@ -1679,7 +1755,7 @@ try {
     assert.doesNotMatch(narrating.sent[0].detail, /Earlier progress line/);
     assert.match(narrating.sent[0].detail, /Its last words so far: Latest status:/);
     assert.match(narrating.sent[0].detail, /waiting on deploy\.$/);
-    assert.match(narrating.sent[0].detail, /…\[middle trimmed\]…/);
+    assert.match(narrating.sent[0].detail, /…\[middle trimmed: [\d,]+ chars omitted — full report is in thread t1; call read_thread to read it in full\]…/);
     narrating.stop();
   });
 

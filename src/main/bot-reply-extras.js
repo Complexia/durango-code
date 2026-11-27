@@ -17,9 +17,9 @@ import { fileURLToPath } from 'node:url';
 
 export const REPLY_FILES_MAX = 10;
 
-/** Added to the report a thread a bot started writes, so the bot can show what it made. */
+/** Added to the report a thread a bot started writes, so the bot gets compact, complete outcomes. */
 export const BOT_REPORT_GUIDE =
-  'In the report, name every screenshot or file the person should see by its full path, and give the id and link of any Durango Source change you opened.';
+  'Keep the report compact: use plain `path:line` code references (not `file://` markdown links), leave long detail in the thread or a saved file, name every screenshot or file the person should see by its full path, and give the id and link of any Durango Source change you opened.';
 export const REPLY_FILE_MAX_BYTES = 25 * 1024 * 1024;
 
 export const ATTACH_FILES_TOOL = Object.freeze({

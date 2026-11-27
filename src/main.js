@@ -108,7 +108,7 @@ import {
 import { createBotAttachmentManager } from './main/bot-attachments.js';
 import { createLocalBotEngine, localProjectKey } from './main/local-bots.js';
 import { SHIP_VIA_THREAD_MESSAGE, createBotThreadTools, withThreadReportFooter } from './main/bot-thread-tools.js';
-import { clipMiddle } from './report-clip.js';
+import { clipMiddle, compactFileLinks } from './report-clip.js';
 import { botThreadTitle } from './main/bot-thread-title.js';
 import { titleFromResponseText, utilityReplyFromOutput } from './main/utility-reply.js';
 import {
@@ -4879,7 +4879,7 @@ const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error, 
   if (threadId) {
     const thread = { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true };
     // Kept short enough that Durango's clip of the report never cuts the footer.
-    const head = (text) => clipMiddle(String(text ?? '').trim(), 10_000);
+    const head = (text) => clipMiddle(compactFileLinks(String(text ?? '').trim()), 10_000, { threadId });
     if (outcome === 'finished') summary = withThreadReportFooter(head(summary) || 'The Durango Code thread finished without a written summary.', thread);
     else error = withThreadReportFooter(head(error) || 'it stopped.', thread);
   }
@@ -4889,6 +4889,7 @@ const reportBotTaskThread = async ({ taskId, threadId, outcome, summary, error, 
       return await durangoClient.reportBotTask({
         taskId,
         machineId,
+        ...(threadId ? { threadId } : {}),
         outcome,
         ...(summary ? { summary } : {}),
         ...(error ? { error } : {}),
@@ -5151,9 +5152,12 @@ const withReportRefs = async (input) => {
   const summary = typeof input?.summary === 'string' ? input.summary : undefined;
   if (input?.outcome !== 'finished') return summary;
   const refs = await botTaskReportRefs({ threadId: input?.threadId, workspacePath: input?.workspacePath }).catch(() => '');
+  const compacted = compactFileLinks(summary?.trim() || 'The thread finished without a written summary.', {
+    rootPath: input?.workspacePath,
+  });
   // The thread's words are clipped first, so the refs (and the thread footer
   // reportBotTaskThread adds after them, within its 10,000-character clip) survive.
-  return refs ? `${clipMiddle(summary?.trim() || 'The thread finished without a written summary.', 9_000)}${refs}` : summary;
+  return refs ? `${clipMiddle(compacted, 9_000, { threadId: input?.threadId })}${refs}` : summary;
 };
 
 // The renderer saw a dispatched thread settle (finished / failed / stopped).
@@ -5208,10 +5212,10 @@ const sendBotTaskNotice = async ({ taskId, threadId, kind, key, seq, detail }) =
   const machineId = await getDurangoDeviceId().catch(() => null);
   if (!machineId || !taskId) return { ok: false, retry: true };
   const thread = threadId ? { threadId, machine: await getDispatchMachineName().catch(() => null), cloud: true } : null;
-  const text = clipMiddle(String(detail ?? '').trim(), 3_000);
+  const text = clipMiddle(String(detail ?? '').trim(), 3_000, { threadId });
   const notice = { kind, key, seq, detail: thread ? withThreadReportFooter(text, thread) : text };
   try {
-    return await durangoClient.noticeBotTask({ taskId, machineId, notice });
+    return await durangoClient.noticeBotTask({ taskId, machineId, ...(threadId ? { threadId } : {}), notice });
   } catch (failure) {
     console.warn('[durango bots] a bot task notice failed:', failure?.message ?? failure);
     // 4xx (a Durango without notices answers 404): final.

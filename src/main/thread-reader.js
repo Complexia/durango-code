@@ -11,7 +11,11 @@ export const READ_THREAD_MAX_LIMIT = 200;
 // Per-message and whole-reply caps so one giant transcript page can't blow
 // out the calling model's context. Dropped content is always announced.
 const MAX_MESSAGE_CONTENT_CHARS = 6000;
-const MAX_FORMATTED_MESSAGE_CHARS = 12_000;
+// The newest message of a thread or a single-message read (limit=1 / char_offset)
+// gets a generous content budget so long final reports arrive intact in one call,
+// and messages longer than that can be paged through with char_offset.
+const MAX_FULL_MESSAGE_CONTENT_CHARS = 34_000;
+const MAX_MESSAGE_DETAILS_CHARS = 10_000;
 const MAX_OUTPUT_CHARS = 48_000;
 const MAX_ACTIVITIES_SHOWN = 12;
 const MAX_ACTIVITY_INPUT_CHARS = 2000;
@@ -19,6 +23,8 @@ const MAX_ACTIVITY_OUTPUT_CHARS = 4000;
 const MAX_LINKED_TASKS_SHOWN = 10;
 const MAX_ATTACHMENTS_SHOWN = 20;
 const MAX_CHANGED_FILES_SHOWN = 50;
+
+const formatCharCount = (count) => String(Math.max(0, Math.round(count))).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 
 const readJson = async (filePath) => {
   try {
@@ -62,79 +68,118 @@ const truncateBlock = (value, max, label) => {
 
 const indentBlock = (value) => value.split('\n').map((line) => `    ${line}`).join('\n');
 
-const formatMessage = (message, index, total) => {
+const formatMessage = (message, index, total, { toolCall = 'read_thread', fullContent = false, charOffset = 1 } = {}) => {
   const role = message.role === 'user' ? 'User' : message.role === 'agent' ? 'Agent' : 'System';
   const status =
     typeof message.status === 'string' && message.status !== 'done' ? ` [${message.status}]` : '';
   const lines = [`### Message ${index + 1}/${total} — ${role}${message.ts ? ` (${message.ts})` : ''}${status}`];
   const content = typeof message.content === 'string' ? message.content.trim() : '';
+  const startChar = Number.isInteger(charOffset) && charOffset > 1 ? charOffset - 1 : 0;
+  const contentBudget = fullContent ? MAX_FULL_MESSAGE_CONTENT_CHARS : MAX_MESSAGE_CONTENT_CHARS;
   if (content) {
-    lines.push(
-      content.length > MAX_MESSAGE_CONTENT_CHARS
-        ? `${content.slice(0, MAX_MESSAGE_CONTENT_CHARS)}\n…[message truncated]`
-        : content
-    );
-  }
-  const linkedTasks = Array.isArray(message.linkedTasks) ? message.linkedTasks : [];
-  if (linkedTasks.length > 0) {
-    lines.push(`Linked board ${linkedTasks.length === 1 ? 'task' : `tasks (${linkedTasks.length})`}:`);
-    for (const task of linkedTasks.slice(0, MAX_LINKED_TASKS_SHOWN)) {
-      lines.push(`- ${truncate(task?.title || '(untitled task)', 500)}`);
-      const description = truncateBlock(task?.description, 4000, 'task description');
-      if (description) lines.push(indentBlock(description));
-    }
-    if (linkedTasks.length > MAX_LINKED_TASKS_SHOWN) {
-      lines.push(`- …${linkedTasks.length - MAX_LINKED_TASKS_SHOWN} more linked tasks omitted`);
-    }
-  }
-  const activities = Array.isArray(message.activities) ? message.activities : [];
-  if (activities.length > 0) {
-    lines.push(`Tool activity (${activities.length} steps):`);
-    for (const activity of activities.slice(0, MAX_ACTIVITIES_SHOWN)) {
-      const detail = activity?.detail ? `: ${truncate(activity.detail, 200)}` : '';
-      lines.push(`- ${truncate(activity?.title ?? '', 200)}${detail}`);
-      if (activity?.input) {
+    if (startChar >= content.length) {
+      lines.push(
+        `Requested char_offset ${charOffset} is past the end of message ${index + 1} (${formatCharCount(content.length)} chars).`
+      );
+    } else if (startChar > 0 || content.length > contentBudget) {
+      let safeStart = startChar;
+      if (safeStart > 0 && content.charCodeAt(safeStart) >= 0xdc00 && content.charCodeAt(safeStart) <= 0xdfff) {
+        safeStart += 1;
+      }
+      let endChar = Math.min(content.length, safeStart + contentBudget);
+      if (
+        endChar < content.length &&
+        endChar > safeStart + 1 &&
+        content.charCodeAt(endChar - 1) >= 0xd800 &&
+        content.charCodeAt(endChar - 1) <= 0xdbff
+      ) {
+        endChar -= 1;
+      }
+      lines.push(content.slice(safeStart, endChar));
+      if (endChar < content.length) {
         lines.push(
-          '  Input:',
-          indentBlock(truncateBlock(activity.input, MAX_ACTIVITY_INPUT_CHARS, 'activity input'))
+          `…[message truncated: showing chars ${formatCharCount(safeStart + 1)}–${formatCharCount(endChar)} of ${formatCharCount(content.length)} — call ${toolCall} with offset=${index + 1}, limit=1, char_offset=${endChar + 1} to read more]`
+        );
+      } else {
+        lines.push(
+          `(Showing chars ${formatCharCount(safeStart + 1)}–${formatCharCount(endChar)} of ${formatCharCount(content.length)}; end of message.)`
         );
       }
-      if (activity?.output) {
-        lines.push(
-          '  Output:',
-          indentBlock(truncateBlock(activity.output, MAX_ACTIVITY_OUTPUT_CHARS, 'activity output'))
-        );
+    } else {
+      lines.push(content);
+    }
+  } else if (startChar > 0) {
+    lines.push(`Message ${index + 1} has no text content (requested char_offset ${charOffset}).`);
+  }
+  const detailLines = [];
+  if (startChar === 0) {
+    const linkedTasks = Array.isArray(message.linkedTasks) ? message.linkedTasks : [];
+    if (linkedTasks.length > 0) {
+      detailLines.push(`Linked board ${linkedTasks.length === 1 ? 'task' : `tasks (${linkedTasks.length})`}:`);
+      for (const task of linkedTasks.slice(0, MAX_LINKED_TASKS_SHOWN)) {
+        detailLines.push(`- ${truncate(task?.title || '(untitled task)', 500)}`);
+        const description = truncateBlock(task?.description, 4000, 'task description');
+        if (description) detailLines.push(indentBlock(description));
+      }
+      if (linkedTasks.length > MAX_LINKED_TASKS_SHOWN) {
+        detailLines.push(`- …${linkedTasks.length - MAX_LINKED_TASKS_SHOWN} more linked tasks omitted`);
       }
     }
-    if (activities.length > MAX_ACTIVITIES_SHOWN) {
-      lines.push(`- …${activities.length - MAX_ACTIVITIES_SHOWN} more steps omitted`);
+    const activities = Array.isArray(message.activities) ? message.activities : [];
+    if (activities.length > 0) {
+      detailLines.push(`Tool activity (${activities.length} steps):`);
+      for (const activity of activities.slice(0, MAX_ACTIVITIES_SHOWN)) {
+        const detail = activity?.detail ? `: ${truncate(activity.detail, 200)}` : '';
+        detailLines.push(`- ${truncate(activity?.title ?? '', 200)}${detail}`);
+        if (activity?.input) {
+          detailLines.push(
+            '  Input:',
+            indentBlock(truncateBlock(activity.input, MAX_ACTIVITY_INPUT_CHARS, 'activity input'))
+          );
+        }
+        if (activity?.output) {
+          detailLines.push(
+            '  Output:',
+            indentBlock(truncateBlock(activity.output, MAX_ACTIVITY_OUTPUT_CHARS, 'activity output'))
+          );
+        }
+      }
+      if (activities.length > MAX_ACTIVITIES_SHOWN) {
+        detailLines.push(`- …${activities.length - MAX_ACTIVITIES_SHOWN} more steps omitted`);
+      }
+    }
+    const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+    if (attachments.length > 0) {
+      detailLines.push(`Attachments (${attachments.length}):`);
+      for (const attachment of attachments.slice(0, MAX_ATTACHMENTS_SHOWN)) {
+        detailLines.push(`- ${truncate(attachment?.name ?? 'file', 200)} (${truncate(attachment?.path ?? 'no path', 500)})`);
+      }
+      if (attachments.length > MAX_ATTACHMENTS_SHOWN) {
+        detailLines.push(`- …${attachments.length - MAX_ATTACHMENTS_SHOWN} more attachments omitted`);
+      }
+    }
+    const changedFiles = Array.isArray(message.changedFiles) ? message.changedFiles : [];
+    if (changedFiles.length > 0) {
+      detailLines.push(`Changed files (${changedFiles.length}):`);
+      for (const file of changedFiles.slice(0, MAX_CHANGED_FILES_SHOWN)) {
+        detailLines.push(`- ${truncate(file?.path ?? '(unknown path)', 500)} (${truncate(file?.status ?? 'unknown', 100)})`);
+      }
+      if (changedFiles.length > MAX_CHANGED_FILES_SHOWN) {
+        detailLines.push(`- …${changedFiles.length - MAX_CHANGED_FILES_SHOWN} more changed files omitted`);
+      }
     }
   }
-  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
-  if (attachments.length > 0) {
-    lines.push(`Attachments (${attachments.length}):`);
-    for (const attachment of attachments.slice(0, MAX_ATTACHMENTS_SHOWN)) {
-      lines.push(`- ${truncate(attachment?.name ?? 'file', 200)} (${truncate(attachment?.path ?? 'no path', 500)})`);
-    }
-    if (attachments.length > MAX_ATTACHMENTS_SHOWN) {
-      lines.push(`- …${attachments.length - MAX_ATTACHMENTS_SHOWN} more attachments omitted`);
-    }
-  }
-  const changedFiles = Array.isArray(message.changedFiles) ? message.changedFiles : [];
-  if (changedFiles.length > 0) {
-    lines.push(`Changed files (${changedFiles.length}):`);
-    for (const file of changedFiles.slice(0, MAX_CHANGED_FILES_SHOWN)) {
-      lines.push(`- ${truncate(file?.path ?? '(unknown path)', 500)} (${truncate(file?.status ?? 'unknown', 100)})`);
-    }
-    if (changedFiles.length > MAX_CHANGED_FILES_SHOWN) {
-      lines.push(`- …${changedFiles.length - MAX_CHANGED_FILES_SHOWN} more changed files omitted`);
+  if (detailLines.length > 0) {
+    const details = detailLines.join('\n');
+    if (details.length <= MAX_MESSAGE_DETAILS_CHARS) {
+      lines.push(details);
+    } else {
+      const notice = '\n…[message details truncated]';
+      lines.push(`${details.slice(0, MAX_MESSAGE_DETAILS_CHARS - notice.length)}${notice}`);
     }
   }
   if (lines.length === 1) lines.push('(empty message)');
-  const formatted = lines.join('\n');
-  if (formatted.length <= MAX_FORMATTED_MESSAGE_CHARS) return formatted;
-  const notice = '\n…[message details truncated]';
-  return `${formatted.slice(0, MAX_FORMATTED_MESSAGE_CHARS - notice.length)}${notice}`;
+  return lines.join('\n');
 };
 
 // A thread listed here that runs on another machine (a remote-control mirror,
@@ -214,6 +259,7 @@ export const readThreadForAgent = async (args = {}) => {
       project,
       offset: args.offset,
       limit: args.limit,
+      charOffset: args.char_offset,
       extraHeader: [
         fetched
           ? `machine: ${machineName} (this thread runs there; transcript read from it just now)`
@@ -221,7 +267,7 @@ export const readThreadForAgent = async (args = {}) => {
       ],
     });
   }
-  return formatThreadForAgent(thread, { project, offset: args.offset, limit: args.limit });
+  return formatThreadForAgent(thread, { project, offset: args.offset, limit: args.limit, charOffset: args.char_offset });
 };
 
 const EFFORT_FIELD_BY_PROVIDER = {
@@ -248,15 +294,19 @@ const activeReasoningEffortOf = (thread) => {
  */
 export const formatThreadForAgent = (
   thread,
-  { project, offset, limit: requestedLimit, toolCall = 'read_thread', extraHeader = [], link = true } = {}
+  { project, offset, limit: requestedLimit, charOffset: requestedCharOffset, toolCall = 'read_thread', extraHeader = [], link = true } = {}
 ) => {
   const args = { offset, limit: requestedLimit };
   const messages = Array.isArray(thread.messages) ? thread.messages : [];
   const total = messages.length;
-  const limit = Math.min(
-    READ_THREAD_MAX_LIMIT,
-    Math.max(1, Number.isInteger(args.limit) ? args.limit : READ_THREAD_DEFAULT_LIMIT)
-  );
+  const charOffset = Number.isInteger(requestedCharOffset) && requestedCharOffset >= 1 ? requestedCharOffset : 1;
+  const pagingSingleMessage = charOffset > 1;
+  const limit = pagingSingleMessage
+    ? 1
+    : Math.min(
+        READ_THREAD_MAX_LIMIT,
+        Math.max(1, Number.isInteger(args.limit) ? args.limit : READ_THREAD_DEFAULT_LIMIT)
+      );
   const startIndex = Number.isInteger(args.offset)
     ? Math.max(args.offset - 1, 0)
     : Math.max(0, total - limit);
@@ -288,7 +338,16 @@ export const formatThreadForAgent = (
 
   const page = messages.slice(startIndex, startIndex + limit);
 
-  const formatted = page.map((message, index) => formatMessage(message, startIndex + index, total));
+  const formatted = page.map((message, index) => {
+    const absIndex = startIndex + index;
+    const isFinalMessage = absIndex === total - 1;
+    const singleRequested = limit === 1;
+    return formatMessage(message, absIndex, total, {
+      toolCall,
+      fullContent: singleRequested || isFinalMessage,
+      charOffset: pagingSingleMessage ? charOffset : 1,
+    });
+  });
   // Trim oldest entries in the page if it still exceeds the reply budget.
   let dropped = 0;
   const buildRangeLines = (shownCount) => {

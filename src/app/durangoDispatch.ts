@@ -1,4 +1,4 @@
-import { clipMiddle, selectFinalMessage } from '../report-clip.js';
+import { clipMiddle, compactFileLinks, selectFinalMessage, type ClipMiddleOptions, type CompactFileLinksOptions } from '../report-clip.js';
 import type { AgentActivity, Message, Thread } from '../store';
 
 // Renderer side of Durango Chat dispatch (main: src/main/durango-dispatch.js).
@@ -48,7 +48,8 @@ export const dispatchRunFinalText = (run: Pick<Message, 'content' | 'activities'
 };
 
 /** Keep the opening summary and the closing outcome/links when a report exceeds `max`. */
-export const dispatchSummaryText = (content: string, max = DISPATCH_SUMMARY_MAX_CHARS) => clipMiddle(content, max);
+export const dispatchSummaryText = (content: string, max = DISPATCH_SUMMARY_MAX_CHARS, options?: ClipMiddleOptions) =>
+  clipMiddle(content, max, options);
 
 const WAIT_ENDED_PREFIX =
   'The background work it was waiting on has ended (it finished, was stopped, or Durango Code quit) without the thread taking another turn. Its last words:\n\n';
@@ -140,8 +141,9 @@ export const durangoDispatchHasNewRuns = (dispatch: NonNullable<Thread['durangoD
  * again. Turns the person starts are their own.
  */
 export const durangoDispatchOutcome = (
-  thread: Pick<Thread, 'status' | 'durangoDispatch'> & Partial<Pick<Thread, 'userActions'>>,
-  messages: Message[]
+  thread: Pick<Thread, 'status' | 'durangoDispatch'> & Partial<Pick<Thread, 'id' | 'projectId' | 'durangoWorkspace' | 'userActions'>>,
+  messages: Message[],
+  options?: CompactFileLinksOptions
 ): DurangoDispatchOutcome | null => {
   const dispatch = thread.durangoDispatch;
   if (!dispatch) return null;
@@ -181,8 +183,10 @@ export const durangoDispatchOutcome = (
   }
   if (run.status === 'done') {
     const maxSummary = summaryMaxCharsFor(dispatch.id);
-    const finalText = dispatchRunFinalText(run);
-    const summary = dispatchSummaryText(finalText, maxSummary) || 'The agent finished without a written summary.';
+    const rootPaths = [...(options?.rootPaths ?? []), options?.rootPath, thread.durangoWorkspace?.path];
+    const finalText = compactFileLinks(dispatchRunFinalText(run), { rootPaths });
+    const clipOptions = thread.id ? { threadId: thread.id } : undefined;
+    const summary = dispatchSummaryText(finalText, maxSummary, clipOptions) || 'The agent finished without a written summary.';
     const waiting = dispatchWaitingOn(thread, messages, run);
     if (waiting.length) {
       const waitingSeq = dispatchReportSeq(position, true);
@@ -192,7 +196,7 @@ export const durangoDispatchOutcome = (
     if (reportedSeq === dispatchReportSeq(position, true)) {
       return {
         outcome: 'finished',
-        summary: `${WAIT_ENDED_PREFIX}${dispatchSummaryText(finalText, maxSummary - WAIT_ENDED_PREFIX.length) || '(none)'}`,
+        summary: `${WAIT_ENDED_PREFIX}${dispatchSummaryText(finalText, maxSummary - WAIT_ENDED_PREFIX.length, clipOptions) || '(none)'}`,
         waitEnded: true,
         seq,
       };
@@ -246,6 +250,7 @@ const dispatchWaitingOn = (
 type ReporterState = {
   threads: Thread[];
   transcripts: Record<string, { messages: Message[] } | undefined>;
+  projects?: Array<{ id: string; path?: string }>;
 };
 
 export type DispatchSettledInput = {
@@ -325,7 +330,7 @@ export const startDurangoDispatchReporter = ({
 
   const check = (threads: Thread[]) => {
     if (stopped) return;
-    const { transcripts } = getState();
+    const { transcripts, projects } = getState();
     for (const thread of threads) {
       const dispatch = thread.durangoDispatch;
       if (!dispatch || inFlight.has(dispatch.id)) continue;
@@ -354,7 +359,8 @@ export const startDurangoDispatchReporter = ({
           });
         continue;
       }
-      const outcome = durangoDispatchOutcome(thread, transcript.messages);
+      const projectPath = projects?.find((project) => project.id === thread.projectId)?.path;
+      const outcome = durangoDispatchOutcome(thread, transcript.messages, projectPath ? { rootPath: projectPath } : undefined);
       if (!outcome) {
         examined.add(thread);
         continue;
@@ -500,7 +506,7 @@ export type DurangoDispatchNoticesDeps = {
   checkEveryMs?: number;
 };
 
-const clipNotice = (text: string, max: number) => clipMiddle(text, max);
+const clipNotice = (text: string, max: number, threadId?: string) => clipMiddle(text, max, threadId ? { threadId } : undefined);
 
 const isApproval = (request: PendingInputRequest) =>
   Boolean(request.approval) || (request.questions.length === 1 && request.questions[0]?.id === 'permission');
@@ -533,7 +539,7 @@ export const safeApprovalReason = (request: PendingInputRequest) => {
 const plainToolName = (name: string) => name.trim().split('__').pop()?.split('.').pop()?.trim() || '';
 
 /** What a pending card asks of the person, for the bot to pass on. Never the call itself (see above). */
-export const pendingInputText = (request: PendingInputRequest) => {
+export const pendingInputText = (request: PendingInputRequest, threadId?: string) => {
   if (isApproval(request)) {
     const tool = plainToolName(request.approval?.toolName || request.questions[0]?.header || '') || 'a tool';
     const reason = safeApprovalReason(request);
@@ -544,14 +550,15 @@ export const pendingInputText = (request: PendingInputRequest) => {
       ]
         .filter(Boolean)
         .join('\n'),
-      DETAIL_MAX_CHARS
+      DETAIL_MAX_CHARS,
+      threadId
     );
   }
   const lines = request.questions.map((question) => {
     const options = (question.options ?? []).map((option) => option.label).filter(Boolean);
     return `- ${question.question}${options.length ? ` (options: ${options.join(' / ')})` : ''}`;
   });
-  return clipNotice(`It asked the person:\n${lines.join('\n')}`, DETAIL_MAX_CHARS);
+  return clipNotice(`It asked the person:\n${lines.join('\n')}`, DETAIL_MAX_CHARS, threadId);
 };
 
 /**
@@ -559,7 +566,7 @@ export const pendingInputText = (request: PendingInputRequest) => {
  * query string or fragment), and the request's id, which a bot answers it by
  * (answer_thread_request) when the person tells it they did it.
  */
-export const userActionText = (action: { id?: string; action: string; url?: string; secret?: unknown }) => {
+export const userActionText = (action: { id?: string; action: string; url?: string; secret?: unknown }, threadId?: string) => {
   let page = '';
   if (action.url) {
     try {
@@ -575,7 +582,7 @@ export const userActionText = (action: { id?: string; action: string; url?: stri
       : `\n(Request ${action.id}: when the person says they did it, mark it done with answer_thread_request.)`
     : '';
   // The id goes last but is never clipped away.
-  return `${clipNotice(`It asked the person to: ${action.action}${page ? `\n${page}` : ''}`, DETAIL_MAX_CHARS - id.length)}${id}`;
+  return `${clipNotice(`It asked the person to: ${action.action}${page ? `\n${page}` : ''}`, DETAIL_MAX_CHARS - id.length, threadId)}${id}`;
 };
 
 // Tools an agent waits on by its own choice: a background wait it set up, a
@@ -630,7 +637,7 @@ const stepText = (activity: AgentActivity) => {
   return tool ? `the ${tool} tool` : 'a tool call';
 };
 
-const stuckText = (run: Message, quietMs: number) => {
+const stuckText = (run: Message, quietMs: number, threadId?: string) => {
   const minutes = Math.round(quietMs / 60_000);
   const step = [...(run.activities ?? [])].reverse().find((activity) => activity.status === 'running');
   // Its latest words so far, preferring the current message over earlier progress lines.
@@ -639,11 +646,12 @@ const stuckText = (run: Message, quietMs: number) => {
     [
       `No progress for ${minutes} minutes.`,
       step ? `The step in progress: ${stepText(step)} (what it runs is in the thread).` : 'No step is running: it is waiting on the model.',
-      words ? `Its last words so far: ${dispatchSummaryText(words, 400)}` : '',
+      words ? `Its last words so far: ${dispatchSummaryText(words, 400, threadId ? { threadId } : undefined)}` : '',
     ]
       .filter(Boolean)
       .join('\n'),
-    DETAIL_MAX_CHARS
+    DETAIL_MAX_CHARS,
+    threadId
   );
 };
 
@@ -739,7 +747,7 @@ export const startDurangoDispatchNotices = ({
 
   // Actions the agent asked the person for (request_user_action) while it runs.
   const checkUserActions = (live: Live) => {
-    for (const action of live.thread.userActions ?? []) send(live, 'input', `action:${action.id}`, userActionText(action));
+    for (const action of live.thread.userActions ?? []) send(live, 'input', `action:${action.id}`, userActionText(action, live.thread.id));
   };
 
   const checkStuck = (live: Live) => {
@@ -749,7 +757,7 @@ export const startDurangoDispatchNotices = ({
     const quiet = now() - last;
     if (quiet < stuckAfterMs) return;
     // Once per quiet stretch: progress after it starts a new one.
-    send(live, 'stuck', `stuck:${run.id}:${last}`, stuckText(run, quiet));
+    send(live, 'stuck', `stuck:${run.id}:${last}`, stuckText(run, quiet, thread.id));
   };
 
   // Questions and approvals live in main: read them for this thread, then
@@ -776,7 +784,7 @@ export const startDurangoDispatchNotices = ({
           for (const request of blocking) {
             const owner = request.runId && runMessageId ? runMessageId(request.runId) : undefined;
             if (owner !== undefined && owner !== live.run.id) continue;
-            send(live, 'input', `input:${request.requestId}`, pendingInputText(request));
+            send(live, 'input', `input:${request.requestId}`, pendingInputText(request, live.thread.id));
           }
           checkStuck(live);
         },

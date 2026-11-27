@@ -125,7 +125,7 @@ const waitSubagentsTool = {
 const readThreadTool = {
   name: 'read_thread',
   description:
-    'Read the transcript of another Durango Code thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Durango Code work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit.',
+    'Read the transcript of another Durango Code thread (a separate agent conversation in this app) by thread_id — use it when the user @-mentions a thread (the [Thread mentions] context block carries the ids) or when you need context from prior Durango Code work. Returns thread metadata plus a page of its messages, the newest page by default; browse earlier messages with offset/limit, or page through a very long message with offset, limit=1, and char_offset.',
   // Genuinely read-only: reads persisted transcripts and mutates nothing.
   // Mirrored in main's in-process SDK server for Claude runs; keep in sync.
   annotations: { readOnlyHint: true },
@@ -148,6 +148,12 @@ const readThreadTool = {
         minimum: 1,
         maximum: 200,
         description: 'Maximum number of messages to return (default 30)',
+      },
+      char_offset: {
+        type: 'integer',
+        minimum: 1,
+        description:
+          '1-based character offset into a long message\'s content (use with offset and limit=1 when a message was truncated).',
       },
     },
     required: ['thread_id'],

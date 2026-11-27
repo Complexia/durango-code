@@ -2234,11 +2234,14 @@ test('local bots: delegated tasks request finalMessageOnly and middle-trim huge 
   const researchPrompt = runner.lanes[2].lane.prompt;
   assert.match(researchPrompt, /RESEARCH START/);
   assert.match(researchPrompt, /RESEARCH END/);
-  assert.match(researchPrompt, /…\[middle trimmed\]…/);
+  assert.match(researchPrompt, /…\[middle trimmed: [\d,]+ chars omitted\]…/);
   runner.lanes[2].finish({ text: 'Reported research.' });
   await waitFor(() => runner.running().length === 0);
 
-  // Project thread settled with > 12,000 chars: middle-trimmed, footer preserved.
+  // Project thread settled with > 12,000 chars: middle-trimmed with thread pointer, footer preserved.
+  // Also verifies bot instructions tell it to call read_thread on trimmed reports, and dispatched
+  // thread prompts ask for plain path:line references (not file:// links).
+  assert.match(started[0].prompt, /plain `path:line` code references \(not `file:\/\/` markdown links\)/);
   await engine.threadSettled({
     key: started[0].key,
     threadId: 'thread_99',
@@ -2247,12 +2250,106 @@ test('local bots: delegated tasks request finalMessageOnly and middle-trim huge 
   });
   await waitFor(() => runner.lanes.length === 4);
   const shipPrompt = runner.lanes[3].lane.prompt;
+  const shipSystemPrompt = runner.lanes[3].lane.systemPrompt;
   assert.match(shipPrompt, /SHIP SUMMARY/);
   assert.match(shipPrompt, /Change: chg_999/);
   assert.match(shipPrompt, /Durango Code thread thread_99/);
-  assert.match(shipPrompt, /…\[middle trimmed\]…/);
+  assert.match(shipPrompt, /…\[middle trimmed: [\d,]+ chars omitted — full report is in thread thread_99; call read_thread to read it in full\]…/);
+  assert.match(shipSystemPrompt, /Call read_thread with the thread id named in the marker/);
+  assert.match(shipSystemPrompt, /Never pass on a partial list or trimmed finding as if it were complete/);
   runner.lanes[3].finish({ text: 'Done.' });
   await engine.idle();
+
+  // End-to-end audit case: a bot receives a trimmed report with a thread pointer and calls
+  // read_thread (with char_offset forwarding through createBotThreadTools) to fetch the full text.
+  const coreMiddleFinding = 'NON-ACP PATH #7: code/src/main/usage-stats.js:412 reads ~/.gemini/antigravity-cli/brain';
+  const hugeAuditTailFinding = 'LATE AUDIT FINDING PAST 34K: code/src/main/antigravity-models-probe.js:120';
+  const fullAuditMessage = [
+    '### 1. Audit Summary: 12 non-ACP paths found.',
+    'A'.repeat(16_000),
+    coreMiddleFinding,
+    'B'.repeat(20_000),
+    hugeAuditTailFinding,
+  ].join('\n');
+  const auditThreadId = 'cbb36805-9f56-4cfd-b81b-f7d27137e65b';
+  const readCalls = [];
+  const realThreadTools = createBotThreadTools({
+    readIndex: async () => ({
+      entries: [{ id: auditThreadId, projectId: 'p1', title: 'Audit Antigravity integration', status: 'done', messageCount: 2 }],
+    }),
+    readThread: async (args) => {
+      readCalls.push(args);
+      const start = Math.max(0, (args.char_offset ?? 1) - 1);
+      const end = Math.min(fullAuditMessage.length, start + 34_000);
+      const slice = fullAuditMessage.slice(start, end);
+      return end < fullAuditMessage.length
+        ? `${slice}\n…[message truncated: showing chars ${start + 1}–${end} of ${fullAuditMessage.length} — call read_thread with offset=2, limit=1, char_offset=${end + 1} to read more]`
+        : `${slice}\n(Showing chars ${start + 1}–${end} of ${fullAuditMessage.length}; end of message.)`;
+    },
+    getProjects: async () => [{ id: 'p1', name: 'Durango', path: '/tmp/durango' }],
+  });
+  const auditStarted = [];
+  const auditDir = path.join(testRoot, `bots-audit-e2e-${(dirCount += 1)}`);
+  const { engine: auditEngine, runner: auditRunner } = makeEngine({
+    dir: auditDir,
+    listProjects: async () => [{ id: 'p1', name: 'Durango', path: '/tmp/durango' }],
+    threadTools: realThreadTools,
+    startProjectThread: async (input) => {
+      auditStarted.push(input);
+      return { ok: true, threadId: auditThreadId };
+    },
+  });
+  const [auditBot] = (await auditEngine.list()).bots;
+  await auditEngine.send(auditBot.id, { messageId: 'audit_m1', content: 'Audit Antigravity.' });
+  await waitFor(() => auditRunner.lanes.length === 1);
+  await auditRunner.lanes[0].ctx.callTool({
+    name: 'delegate_task',
+    input: { title: 'Audit Antigravity', instructions: 'Check ACP coverage.', project: 'Durango' },
+    toolCallId: 'audit_t1',
+  });
+  auditRunner.lanes[0].finish({ text: 'Started audit.' });
+  await waitFor(() => auditRunner.lanes[0].done);
+
+  await auditEngine.threadSettled({
+    key: auditStarted[0].key,
+    threadId: auditThreadId,
+    outcome: 'finished',
+    summary: fullAuditMessage,
+  });
+  await waitFor(() => auditRunner.lanes.length === 2);
+  const auditPrompt = auditRunner.lanes[1].lane.prompt;
+  assert.doesNotMatch(auditPrompt, new RegExp(coreMiddleFinding.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'core finding was in the trimmed middle');
+  assert.match(
+    auditPrompt,
+    /…\[middle trimmed: [\d,]+ chars omitted — full report is in thread cbb36805-9f56-4cfd-b81b-f7d27137e65b; call read_thread to read it in full\]…/
+  );
+  // Bot follows the marker and calls read_thread, then pages with char_offset to get the entire final message.
+  const page1 = (
+    await auditRunner.lanes[1].ctx.callTool({
+      name: 'read_thread',
+      input: { thread_id: auditThreadId },
+      toolCallId: 'read_1',
+    })
+  ).result;
+  assert.equal(page1.ok, true);
+  assert.ok(page1.transcript.includes(coreMiddleFinding), 'bot recovers the trimmed middle finding via read_thread');
+  const nextPtr = page1.transcript.match(/offset=(\d+), limit=1, char_offset=(\d+)/);
+  assert.ok(nextPtr, 'read_thread provides exact char_offset for the remainder past 34k');
+  const page2 = (
+    await auditRunner.lanes[1].ctx.callTool({
+      name: 'read_thread',
+      input: { thread_id: auditThreadId, offset: Number(nextPtr[1]), limit: 1, char_offset: Number(nextPtr[2]) },
+      toolCallId: 'read_2',
+    })
+  ).result;
+  assert.equal(page2.ok, true);
+  assert.ok(page2.transcript.includes(hugeAuditTailFinding), 'bot recovers the tail past 34k via char_offset');
+  assert.deepEqual(readCalls, [
+    { thread_id: auditThreadId },
+    { thread_id: auditThreadId, offset: 2, limit: 1, char_offset: 34_001 },
+  ]);
+  auditRunner.lanes[1].finish({ text: 'Complete audit reported.' });
+  await auditEngine.idle();
 });
 
 test('reorder persists project group order and per-project bot order across restarts, exportForSync, and primary changes', async () => {

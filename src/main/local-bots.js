@@ -16,7 +16,7 @@ import {
   threadReportText,
   withThreadReportFooter,
 } from './bot-thread-tools.js';
-import { clipMiddle } from '../report-clip.js';
+import { clipMiddle, compactFileLinks } from '../report-clip.js';
 import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
@@ -126,6 +126,7 @@ Stay responsive:
 Routines and reports:
 - A routine run is an instruction you gave yourself on a schedule. Do it. If nothing is worth the person's attention, reply with one short line (they may not read it) and don't notify them.
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
+- Trimmed task reports ("…[middle trimmed: …]…"): when a report was trimmed, the omitted middle is often the core detail. Call read_thread with the thread id named in the marker (and page with offset/limit/char_offset if a message is still truncated) to read the full final message before summarizing or acting on it. Never pass on a partial list or trimmed finding as if it were complete.
 - A task report that starts "NOT FINISHED YET" (or says the task isn't finished yet) is an update, not the outcome: the thread is still working in the background and reports again when it finishes. Tell the person briefly where it stands if it matters, don't report it as done, and don't start the work again.
 - "NEEDS THE PERSON" from a task's thread: it is blocked on the person (an approval, a question, an action) and stays blocked until they answer in that thread. Tell them right away what it needs, in a line or two. "LOOKS STUCK": check the thread before you cancel or redo the work.
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
@@ -161,7 +162,7 @@ export const LOCAL_TASK_PROMPT = `## You are running a task for a Durango bot
 
 A bot handed you this task. It runs in the background on this computer through Claude Code. Work through it fully and on your own: there is no one to answer questions mid-task, so make sensible assumptions and note them. Use your tools as needed.
 
-Your final reply is the report the bot receives: lead with the outcome or answer, then the details that matter (links, numbers, names, drafts), concise and complete. If something couldn't be done, say exactly what and why. Don't send, post, buy, apply or delete anything unless the task explicitly says to.`;
+Your final reply is the report the bot receives: lead with the outcome or answer, then the details that matter (links, numbers, names, drafts), concise and complete. Keep it compact: use plain path:line code references (not file:// markdown links) and leave long detail in a saved file when needed. If something couldn't be done, say exactly what and why. Don't send, post, buy, apply or delete anything unless the task explicitly says to.`;
 
 /** The summarizer's instructions: the summary chain (bot-memory.js). */
 export const LOCAL_COMPACTION_PROMPT = COMPACTION_PROMPT;
@@ -2016,7 +2017,7 @@ export const createLocalBotEngine = ({
         }
         runtime.tasks.delete(task.id);
         if (myGeneration !== generation || entries.get(entry.bot.id) !== entry || task.abort.signal.aborted || outcome?.aborted) return;
-        const text = clipMiddle(str(outcome?.text), LOCAL_BOT_TASK_RESULT_MAX_CHARS);
+        const text = clipMiddle(compactFileLinks(str(outcome?.text)), LOCAL_BOT_TASK_RESULT_MAX_CHARS);
         const report = text || `The task couldn't finish: ${clip(oneLine(outcome?.failure) || 'it ended without a report.', 300)}`;
         appendInbox(entry, { content: report, authorLabel: inboxLabel('task', task.title) });
       })()
@@ -3146,12 +3147,15 @@ export const createLocalBotEngine = ({
         outcome === 'finished'
           ? withThreadReportFooter(
               clipMiddle(
-                threadReportText({
-                  summary: str(summary).trim() || 'The thread finished without a written summary.',
-                  waiting: stillWaiting ? waiting : [],
-                  later: !running && Boolean(task),
-                }),
-                bodyMax
+                compactFileLinks(
+                  threadReportText({
+                    summary: str(summary).trim() || 'The thread finished without a written summary.',
+                    waiting: stillWaiting ? waiting : [],
+                    later: !running && Boolean(task),
+                  })
+                ),
+                bodyMax,
+                { threadId: thread.threadId }
               ),
               thread
             )
@@ -3183,7 +3187,10 @@ export const createLocalBotEngine = ({
       const thread = { threadId: str(threadId).trim() || task?.threadId || '', project: task?.project ?? null };
       const message = appendInbox(entry, {
         id: `notice_${str(key).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120)}_${id}`,
-        content: withThreadReportFooter(threadNoticeText(title, kind, clipMiddle(str(detail), 4_000)), thread),
+        content: withThreadReportFooter(
+          threadNoticeText(title, kind, clipMiddle(str(detail), 4_000, { threadId: thread.threadId })),
+          thread
+        ),
         authorLabel: inboxLabel('task', title),
       });
       // On disk: in the saved transcript, or (trimmed past the cap) no longer kept at all.

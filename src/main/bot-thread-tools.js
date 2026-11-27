@@ -302,13 +302,14 @@ export const BOT_THREAD_TOOLS = [
   {
     name: 'read_thread',
     description:
-      "Read a Durango Code thread's transcript (by id from list_threads or a task report): what was asked, what the agent did, changed files and its final answer, plus `needsYou`: the \"Needs you\" requests it waits on the person for. Long threads come in pages: pass offset to read more.",
+      "Read a Durango Code thread's transcript (by id from list_threads or a task report): what was asked, what the agent did, changed files and its final answer, plus `needsYou`: the \"Needs you\" requests it waits on the person for. Returns the newest page by default (with the final message in full up to 34,000 chars). Pass offset/limit to browse earlier messages, or offset + limit=1 + char_offset to read the rest of a very long message.",
     inputSchema: {
       type: 'object',
       properties: {
         thread_id: { type: 'string', minLength: 1, maxLength: 200 },
         offset: { type: 'integer', minimum: 0, description: 'Message offset (see the page header).' },
         limit: { type: 'integer', minimum: 1, maximum: 200 },
+        char_offset: { type: 'integer', minimum: 1, description: '1-based character offset into a long message\'s text (use with offset and limit=1 when a message was truncated).' },
       },
       required: ['thread_id'],
     },
@@ -883,6 +884,7 @@ export const createBotThreadTools = ({
           thread_id: entry.id,
           ...(Number.isInteger(input.offset) ? { offset: input.offset } : {}),
           ...(Number.isInteger(input.limit) ? { limit: input.limit } : {}),
+          ...(Number.isInteger(input.char_offset) ? { char_offset: input.char_offset } : {}),
         }),
         turnState(entry).catch(() => ({ requests: [], secretIds: [] })),
       ]);
