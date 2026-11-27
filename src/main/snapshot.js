@@ -15,6 +15,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline';
 import { getAttachmentDirectoryPath } from './paths.js';
+import { writeFileAtomic } from './atomic-write.js';
 import {
   SNAPSHOT_DEFAULT_ACCELERATOR,
   SNAPSHOT_MAX_PNG_BYTES,
@@ -259,7 +260,7 @@ const readSettingsFile = async () => {
 
 const writeSettingsFile = async (next) => {
   try {
-    await fs.writeFile(settingsFile(), JSON.stringify(next, null, 2));
+    await writeFileAtomic(settingsFile(), JSON.stringify(next, null, 2));
   } catch (error) {
     console.error('Could not save SnapShot settings', error);
   }

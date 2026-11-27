@@ -461,6 +461,37 @@ try {
   resetThreadStorageStateForTests();
   assert.equal((await entryOf(fifth.id)).title, 'Fifth after recovery');
 
+  // Missing manifest.json (ENOENT): rebuild from manifest.prev.json + thread files
+  // instead of throwing and blocking thread persistence.
+  await writeThreadsPatch({ version: 2, upserts: [], shells: [{ ...shellOnly(fifth), title: 'Fifth before vanish' }], deletes: [] });
+  await fs.rm(fileOf('manifest.json'));
+  resetThreadStorageStateForTests();
+  const rebuiltMissing = await readThreadsIndex();
+  assert.deepEqual(rebuiltMissing.entries.map((entry) => entry.id).sort(), idsBefore, 'missing manifest rebuilds every thread');
+  assert.equal((await entryOf(fifth.id)).title, 'Fifth before vanish', 'keeps newest verified shell when manifest.json is missing');
+  await fs.access(fileOf('manifest.json'));
+  assert.equal(JSON.parse(await readThreadShells({ ids: [] })).present, true);
+
+  // Missing both manifest.json and manifest.prev.json: rebuild from thread files alone.
+  await fs.rm(fileOf('manifest.json'));
+  await fs.rm(fileOf('manifest.prev.json'), { force: true });
+  resetThreadStorageStateForTests();
+  assert.deepEqual(
+    (await readThreadsIndex()).entries.map((entry) => entry.id).sort(),
+    idsBefore,
+    'missing both roots still rebuilds every thread from files'
+  );
+  assert.equal((await entryOf(fifth.id)).title, 'Fifth before vanish');
+  await writeThreadsPatch({ version: 2, upserts: [], shells: [{ ...shellOnly(fifth), title: 'Fifth after missing recovery' }], deletes: [] });
+  assert.equal((await entryOf(fifth.id)).title, 'Fifth after missing recovery');
+
+  // Sync path (quit-time flush/read) also rebuilds a missing manifest instead of throwing.
+  await fs.rm(fileOf('manifest.json'));
+  resetThreadStorageStateForTests();
+  writeThreadsPatchSync({ version: 2, upserts: [], shells: [{ ...shellOnly(fifth), title: 'Fifth sync after missing' }], deletes: [] });
+  assert.equal((await entryOf(fifth.id)).title, 'Fifth sync after missing');
+  assert.equal(JSON.parse(readThreadRawSync(fifth.id)).title, 'Fifth sync after missing');
+
   // Damaged copies protect only the threads they name, and only for a week:
   // cleanup is never stuck.
   for (const name of await fs.readdir(getThreadsDirectoryPath())) {

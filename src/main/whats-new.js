@@ -2,6 +2,7 @@ import { app } from 'electron';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getStorageFilePath } from './paths.js';
+import { writeFileAtomic } from './atomic-write.js';
 
 // "What's new" after an update: the release notes scripts/deploy.mjs baked
 // into this build, and whether this version's notice has been dismissed yet.
@@ -32,8 +33,7 @@ const readSeenVersion = async () => {
 };
 
 export const markWhatsNewSeen = async (version = app.getVersion()) => {
-  await fs.mkdir(app.getPath('userData'), { recursive: true });
-  await fs.writeFile(getWhatsNewFilePath(), `${JSON.stringify({ seenVersion: version })}\n`);
+  await writeFileAtomic(getWhatsNewFilePath(), `${JSON.stringify({ seenVersion: version })}\n`);
 };
 
 const fileExists = (filePath) => fs.access(filePath).then(() => true, () => false);

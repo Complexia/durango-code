@@ -83,6 +83,7 @@
     "test:link-navigation": "bun scripts/test-link-navigation.mjs",
     "test:text-context-menu": "node --no-warnings scripts/test-text-context-menu.mjs",
     "test:renderer-recovery": "node --no-warnings scripts/test-renderer-recovery.mjs",
+    "test:crash-protection": "bun scripts/test-crash-protection.tsx",
     "test:thread-titles": "node --no-warnings --experimental-strip-types scripts/test-thread-titles.mjs",
     "test:thread-branching": "node --no-warnings --experimental-strip-types scripts/test-thread-branching.mjs",
     "test:subagent-trackers": "node scripts/test-subagent-trackers.mjs",

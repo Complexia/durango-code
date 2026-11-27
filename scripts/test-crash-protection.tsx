@@ -1,0 +1,222 @@
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+
+import {
+  AppCrashFallback,
+  AppErrorBoundary,
+  formatErrorDetails,
+} from '../src/app/AppErrorBoundary';
+import { writeFileAtomic, writeFileAtomicSync } from '../src/main/atomic-write.js';
+import { installProcessErrorHandlers } from '../src/main/process-error-handlers.js';
+
+// 1. React ErrorBoundary & fallback UI
+{
+  const err = new TypeError('Cannot read properties of undefined (reading "id")');
+  const formatted = formatErrorDetails(err, '\n    at Sidebar\n    at App');
+  assert.match(formatted.summary, /TypeError: Cannot read properties of undefined/);
+  assert.match(formatted.details, /Component stack:/);
+  assert.match(formatted.details, /at Sidebar/);
+
+  const nonError = formatErrorDetails('raw string failure');
+  assert.equal(nonError.summary, 'Error: raw string failure');
+  assert.equal(nonError.details, 'Error: raw string failure');
+
+  // Normal children render through AppErrorBoundary untouched.
+  const okHtml = renderToStaticMarkup(
+    <AppErrorBoundary>
+      <div data-testid="healthy-child">hello world</div>
+    </AppErrorBoundary>
+  );
+  assert.match(okHtml, /data-testid="healthy-child"/);
+  assert.match(okHtml, /hello world/);
+
+  // Fallback screen renders reload option, retry option, copy button, and error details.
+  const fallbackHtml = renderToStaticMarkup(
+    <AppCrashFallback
+      error={err}
+      componentStack={'\n    at ChatPane\n    at App'}
+      onReload={() => {}}
+      onRetry={() => {}}
+    />
+  );
+  assert.match(fallbackHtml, /role="alert"/);
+  assert.match(fallbackHtml, /data-testid="app-error-boundary"/);
+  assert.match(fallbackHtml, /data-testid="app-error-reload"/);
+  assert.match(fallbackHtml, />Reload window<\/button>/);
+  assert.match(fallbackHtml, /data-testid="app-error-retry"/);
+  assert.match(fallbackHtml, /data-testid="app-error-copy"/);
+  assert.match(fallbackHtml, /data-testid="app-error-message"/);
+  assert.match(fallbackHtml, /data-testid="app-error-details"/);
+  assert.match(fallbackHtml, /Cannot read properties of undefined/);
+  assert.match(fallbackHtml, /at ChatPane/);
+
+  // Lifecycle transitions: getDerivedStateFromError -> componentDidCatch -> retry / reload.
+  let reloaded = 0;
+  let reported: { error: Error; stack: string } | null = null;
+  const boundary = new AppErrorBoundary({
+    children: <span>ok</span>,
+    onReload: () => {
+      reloaded += 1;
+    },
+    onError: (error, info) => {
+      reported = { error, stack: info.componentStack ?? '' };
+    },
+  });
+  const derived = AppErrorBoundary.getDerivedStateFromError(err);
+  assert.equal(derived.hasError, true);
+  assert.equal(derived.error, err);
+  boundary.state = { ...boundary.state, ...derived };
+
+  let lastStateUpdate: Record<string, unknown> | null = null;
+  boundary.setState = ((partial: Record<string, unknown>) => {
+    lastStateUpdate = partial;
+    boundary.state = { ...boundary.state, ...partial };
+  }) as typeof boundary.setState;
+
+  const originalConsoleError = console.error;
+  const logged: unknown[][] = [];
+  console.error = (...args: unknown[]) => logged.push(args);
+  try {
+    boundary.componentDidCatch(err, { componentStack: '\n    at BrokenView' });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(logged.length, 1);
+  assert.equal(reported?.error, err);
+  assert.match(reported?.stack ?? '', /at BrokenView/);
+  assert.equal(lastStateUpdate?.componentStack, '\n    at BrokenView');
+
+  const renderedFallback = boundary.render() as React.ReactElement<{
+    onReload: () => void;
+    onRetry: () => void;
+  }>;
+  assert.equal(renderedFallback.type, AppCrashFallback);
+  renderedFallback.props.onReload();
+  assert.equal(reloaded, 1);
+  renderedFallback.props.onRetry();
+  assert.equal(boundary.state.hasError, false);
+  assert.equal(boundary.state.error, null);
+}
+
+// 2. Main-process uncaughtException & unhandledRejection handlers
+{
+  const fakeProcess = new EventEmitter();
+  const logs: unknown[][] = [];
+  const observed: unknown[] = [];
+  const uninstall = installProcessErrorHandlers({
+    processRef: fakeProcess,
+    log: { error: (...args: unknown[]) => logs.push(args) },
+    onError: (payload: unknown) => observed.push(payload),
+  });
+
+  const boom = new Error('unexpected main failure');
+  fakeProcess.emit('uncaughtException', boom, 'uncaughtException');
+  fakeProcess.emit('unhandledRejection', new Error('driver start failed'), Promise.resolve());
+
+  assert.equal(logs.length, 2);
+  assert.match(String(logs[0][0]), /Uncaught exception/);
+  assert.match(String(logs[0][1]), /unexpected main failure/);
+  assert.match(String(logs[1][0]), /Unhandled promise rejection/);
+  assert.match(String(logs[1][1]), /driver start failed/);
+  assert.equal(observed.length, 2);
+
+  // Broken stdout/stderr (EPIPE) or throwing observer never crashes the handler.
+  const brokenProcess = new EventEmitter();
+  const stopBroken = installProcessErrorHandlers({
+    processRef: brokenProcess,
+    log: {
+      error: () => {
+        throw Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+      },
+    },
+    onError: () => {
+      throw new Error('observer threw');
+    },
+  });
+  assert.doesNotThrow(() => {
+    brokenProcess.emit('uncaughtException', new Error('inner'), 'uncaughtException');
+    brokenProcess.emit('unhandledRejection', 'rejected reason', Promise.resolve());
+  });
+  stopBroken();
+
+  // Uninstall removes both listeners cleanly.
+  uninstall();
+  assert.equal(fakeProcess.listenerCount('uncaughtException'), 0);
+  assert.equal(fakeProcess.listenerCount('unhandledRejection'), 0);
+}
+
+// 3. Atomic file writes (async + sync, mode 0o600, failure cleanup, concurrency)
+{
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-atomic-write-'));
+  try {
+    const nestedFile = path.join(tmpDir, 'nested', 'account-session.json');
+    await writeFileAtomic(nestedFile, '{"token":"secret"}\n', { encoding: 'utf8', mode: 0o600 });
+    assert.equal(await fs.readFile(nestedFile, 'utf8'), '{"token":"secret"}\n');
+    if (process.platform !== 'win32') {
+      assert.equal((await fs.stat(nestedFile)).mode & 0o777, 0o600);
+    }
+
+    // Existing file with loose permissions is tightened atomically to 0o600.
+    const looseFile = path.join(tmpDir, 'loose-session.json');
+    await fs.writeFile(looseFile, '{"old":true}\n', { mode: 0o644 });
+    await writeFileAtomic(looseFile, '{"new":true}\n', { encoding: 'utf8', mode: 0o600 });
+    assert.equal(await fs.readFile(looseFile, 'utf8'), '{"new":true}\n');
+    if (process.platform !== 'win32') {
+      assert.equal((await fs.stat(looseFile)).mode & 0o777, 0o600);
+    }
+
+    // Sync atomic write works and leaves no temp files.
+    const syncFile = path.join(tmpDir, 'sync-dir', 'store.json');
+    writeFileAtomicSync(syncFile, '{"ok":1}', { encoding: 'utf8', mode: 0o600 });
+    assert.equal(await fs.readFile(syncFile, 'utf8'), '{"ok":1}');
+    if (process.platform !== 'win32') {
+      assert.equal((await fs.stat(syncFile)).mode & 0o777, 0o600);
+    }
+
+    // Rename failure (target is a non-empty directory) cleans up its temp file.
+    const blockerDir = path.join(tmpDir, 'dir-target');
+    await fs.mkdir(blockerDir);
+    await fs.writeFile(path.join(blockerDir, 'keep'), 'x');
+    await assert.rejects(() => writeFileAtomic(blockerDir, 'data'));
+    assert.throws(() => writeFileAtomicSync(blockerDir, 'data'));
+
+    // Concurrent writes do not collide on temp names or leave .tmp files behind.
+    const racingFile = path.join(tmpDir, 'racing.json');
+    await Promise.all(
+      Array.from({ length: 12 }, (_, index) =>
+        writeFileAtomic(racingFile, JSON.stringify({ index }))
+      )
+    );
+    const finalParsed = JSON.parse(await fs.readFile(racingFile, 'utf8'));
+    assert.equal(typeof finalParsed.index, 'number');
+
+    const leftovers = [
+      ...(await fs.readdir(tmpDir)),
+      ...(await fs.readdir(path.join(tmpDir, 'nested'))),
+      ...(await fs.readdir(path.join(tmpDir, 'sync-dir'))),
+    ].filter((name) => name.endsWith('.tmp'));
+    assert.deepEqual(leftovers, [], 'atomic writes must not leak .tmp files');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+// 4. Wiring checks in renderer.tsx and main.js
+{
+  const srcDir = new URL('../src', import.meta.url).pathname;
+  const [rendererSource, mainSource] = await Promise.all([
+    fs.readFile(path.join(srcDir, 'renderer.tsx'), 'utf8'),
+    fs.readFile(path.join(srcDir, 'main.js'), 'utf8'),
+  ]);
+  assert.match(rendererSource, /<AppErrorBoundary>[\s\S]*<App \/>[\s\S]*<\/AppErrorBoundary>/);
+  assert.match(mainSource, /installProcessErrorHandlers\(\)/);
+  assert.match(mainSource, /writeFileAtomic\(filePath,[\s\S]*?mode:\s*0o600/);
+  assert.match(mainSource, /Promise\.resolve\(acpDriver\.start\(\)\)\.catch\(/);
+}
+
+console.log('crash protection tests passed');

@@ -7,6 +7,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { writeFileAtomicSync } from './atomic-write.js';
 
 let resolveDir = null;
 let filePath = null;
@@ -72,7 +73,7 @@ export const recordClaudeRateLimit = (message, now = Date.now()) => {
   saveTimer = setTimeout(() => {
     saveTimer = null;
     try {
-      fs.writeFileSync(filePath, JSON.stringify(limits));
+      writeFileAtomicSync(filePath, JSON.stringify(limits));
     } catch {
       // Best effort: the next event writes again.
     }

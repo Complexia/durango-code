@@ -11,6 +11,8 @@ import './main/rename-legacy-bundle-on-start.js';
 import { createRepositoryCredentials } from './main/repository-credentials.js';
 import { SOURCE_ATTACHMENT_PROTOCOL, createSourceAttachmentHandler } from './main/source-attachments.js';
 import { reloadWhenRendererGone } from './main/renderer-recovery.js';
+import { installProcessErrorHandlers } from './main/process-error-handlers.js';
+import { writeFileAtomic, writeFileAtomicSync } from './main/atomic-write.js';
 import { INTERNAL_APP_NAME, PRODUCT_DISPLAY_NAME, devUserDataPath } from './main/app-identity.js';
 import { DEFAULT_DEV_WEB_URL, DEFAULT_PACKAGED_WEB_URL } from './main/web-origin.js';
 import { isPreviewFilePath } from './app/codeFiles.ts';
@@ -288,6 +290,8 @@ import {
   shouldMirrorGithubLocally,
   switchSourceControlToOrion,
 } from './main/source-control.js';
+
+installProcessErrorHandlers();
 
 // The internal app name ("Orion") and userData path are pinned by
 // ./main/pin-app-identity.js, imported first. The customer-facing name is
@@ -717,8 +721,10 @@ const writeAccountSession = async (session) => {
     expiresAt: session.expiresAt ?? null,
     createdAt: new Date().toISOString(),
   };
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
+  await writeFileAtomic(filePath, `${JSON.stringify(payload, null, 2)}\n`, {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
 };
 
 const repositoryCredentials = createRepositoryCredentials({
@@ -2120,7 +2126,21 @@ ipcMain.handle('storage:load', async () => {
     const value = await fs.readFile(storagePath, 'utf-8');
     const sanitized = sanitizeStoreValue(value);
     if (sanitized && sanitized !== value) {
-      await fs.writeFile(storagePath, sanitized, 'utf-8');
+      const seq = ++storageWriteSeq;
+      const rewrite = storageSaveQueue.catch(() => {}).then(async () => {
+        if (seq <= storageCommittedSeq) return; // superseded by a newer save
+        await writeFileAtomic(storagePath, sanitized, { encoding: 'utf-8' });
+        if (seq >= storageCommittedSeq) {
+          storageCommittedSeq = seq;
+          return;
+        }
+        const snapshot = storageSyncSnapshot;
+        if (snapshot && snapshot.seq > seq) {
+          await writeFileAtomic(storagePath, snapshot.value, { encoding: 'utf-8' });
+        }
+      });
+      storageSaveQueue = rewrite;
+      await rewrite;
     }
     return sanitized;
   } catch (error) {
@@ -2139,11 +2159,8 @@ ipcMain.handle('storage:save', async (_event, value) => {
   const save = storageSaveQueue.catch(() => {}).then(async () => {
     if (seq <= storageCommittedSeq) return; // superseded by the sync flush
     const storagePath = getStorageFilePath();
-    const tempPath = `${storagePath}.${process.pid}.tmp`;
     const sanitized = sanitizeStoreValue(value) ?? value;
-    await fs.mkdir(path.dirname(storagePath), { recursive: true });
-    await fs.writeFile(tempPath, sanitized, 'utf-8');
-    await fs.rename(tempPath, storagePath);
+    await writeFileAtomic(storagePath, sanitized, { encoding: 'utf-8' });
     if (seq >= storageCommittedSeq) {
       storageCommittedSeq = seq;
       return;
@@ -2152,8 +2169,7 @@ ipcMain.handle('storage:save', async (_event, value) => {
     // flight and may have been overwritten by it — reinstall the newer one.
     const snapshot = storageSyncSnapshot;
     if (snapshot && snapshot.seq > seq) {
-      await fs.writeFile(tempPath, snapshot.value, 'utf-8');
-      await fs.rename(tempPath, storagePath);
+      await writeFileAtomic(storagePath, snapshot.value, { encoding: 'utf-8' });
     }
   });
   storageSaveQueue = save;
@@ -2548,10 +2564,7 @@ ipcMain.on('storage:saveSync', (event, value) => {
     const seq = ++storageWriteSeq;
     const storagePath = getStorageFilePath();
     const sanitized = sanitizeStoreValue(value) ?? value;
-    mkdirSync(path.dirname(storagePath), { recursive: true });
-    const tempPath = `${storagePath}.${process.pid}.sync.tmp`;
-    writeFileSync(tempPath, sanitized, 'utf-8');
-    renameSync(tempPath, storagePath);
+    writeFileAtomicSync(storagePath, sanitized, { encoding: 'utf-8' });
     storageCommittedSeq = seq;
     storageSyncSnapshot = { seq, value: sanitized };
     event.returnValue = true;
@@ -8654,7 +8667,19 @@ ipcMain.handle('agent:runTurn', async (event, input) => {
     });
     }
 
-    acpDriver?.start();
+    if (acpDriver) {
+      const handleAcpStartError = (error) => {
+        console.error('acpDriver.start error', error);
+        if (!finalized) {
+          sharedDriverCallbacks.onFatal(error?.message ?? String(error));
+        }
+      };
+      try {
+        Promise.resolve(acpDriver.start()).catch(handleAcpStartError);
+      } catch (error) {
+        handleAcpStartError(error);
+      }
+    }
     };
 
     // A stop/steer raced the startup above and aborted the run before any
