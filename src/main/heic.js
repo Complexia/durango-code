@@ -95,8 +95,8 @@ export const convertHeicToJpeg = async (inputPath, outputPath) => {
       await convertWithSips(inputPath, outputPath);
       return;
     } catch (error) {
-      console.warn('sips could not convert HEIC; falling back to libheif', error);
       await fs.rm(outputPath, { force: true });
+      throw error;
     }
   }
   await convertWithLibheif(inputPath, outputPath);

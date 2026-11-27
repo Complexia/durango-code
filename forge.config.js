@@ -3,6 +3,11 @@ const os = require('node:os');
 const path = require('node:path');
 const { FusesPlugin } = require('@electron-forge/plugin-fuses');
 const { FuseV1Options, FuseVersion } = require('@electron/fuses');
+const {
+  prunePackagedBuild,
+  restoreSpawnHelperPermissions,
+  shouldCopyNodePtyEntry,
+} = require('./scripts/packaging-prune.cjs');
 
 const macSigningIdentity = process.env.ORION_MAC_SIGN_IDENTITY
   || 'Developer ID Application: R&R Unicorns, LLC (KV46DBU287)';
@@ -38,7 +43,6 @@ module.exports = {
     tmpdir: packagerTmpdir,
     ...(isLinuxBuild ? { executableName: linuxExecutableName } : {}),
     extraResource: [
-      path.join(__dirname, 'assets', 'icon.png'),
       path.join(__dirname, 'assets', 'bundled-skills'),
       // Tells electron-updater to update Linux installs through the .deb.
       ...(isLinuxBuild ? [path.join(__dirname, 'build', 'linux', 'package-type')] : []),
@@ -77,11 +81,12 @@ module.exports = {
     },
     // The Vite plugin packages only the `.vite` bundle (everything else is
     // ignored), so runtime externals must be copied into the app manually.
-    // node-pty stays external (native module) — copy it and restore the
+    // node-pty stays external (native module) — copy only the target
+    // platform/arch prebuilds (omitting debug `.pdb` symbols) and restore the
     // exec bit on its spawn-helper, which npm strips from prebuilds. Its gyp
-    // file resolves node-addon-api while Forge rebuilds the copied module, so
-    // that transitive dependency must be present in the otherwise-minimal
-    // Vite package too.
+    // file resolves node-addon-api while Forge rebuilds the copied module on
+    // macOS/Linux, so packageAfterCopy stages it and packageAfterPrune strips
+    // it (along with node-pty's build-only files) once rebuild finishes.
     packageAfterCopy: async (_forgeConfig, buildPath, _electronVersion, platform, arch) => {
       const fs = require('node:fs');
       // Vite bundles the SDK JavaScript, but its Claude Code executable must
@@ -91,35 +96,37 @@ module.exports = {
       const claudeTarget = path.join(buildPath, 'node_modules', claudePackage);
       fs.cpSync(claudeSource, claudeTarget, { recursive: true, dereference: true });
       if (platform !== 'win32') fs.chmodSync(path.join(claudeTarget, 'claude'), 0o755);
-      const nodeAddonApiSrc = path.join(__dirname, 'node_modules', 'node-addon-api');
-      const nodeAddonApiDest = path.join(buildPath, 'node_modules', 'node-addon-api');
-      fs.cpSync(nodeAddonApiSrc, nodeAddonApiDest, { recursive: true, dereference: true });
+      if (process.platform !== 'win32') {
+        const nodeAddonApiSrc = path.join(__dirname, 'node_modules', 'node-addon-api');
+        const nodeAddonApiDest = path.join(buildPath, 'node_modules', 'node-addon-api');
+        fs.cpSync(nodeAddonApiSrc, nodeAddonApiDest, { recursive: true, dereference: true });
+      }
       const src = path.join(__dirname, 'node_modules', 'node-pty');
       const dest = path.join(buildPath, 'node_modules', 'node-pty');
-      fs.cpSync(src, dest, { recursive: true, dereference: true });
-      const prebuilds = path.join(dest, 'prebuilds');
-      if (fs.existsSync(prebuilds)) {
-        for (const dir of fs.readdirSync(prebuilds)) {
-          const helper = path.join(prebuilds, dir, 'spawn-helper');
-          if (fs.existsSync(helper)) fs.chmodSync(helper, 0o755);
-        }
-      }
+      fs.cpSync(src, dest, {
+        recursive: true,
+        dereference: true,
+        filter: (entryPath) => shouldCopyNodePtyEntry(src, entryPath, platform, arch),
+      });
+      restoreSpawnHelperPermissions(dest, platform);
 
       // libheif (WebAssembly HEIC decoder for attachments on Windows/Linux,
       // see src/main/heic.js) is LGPL, so it ships as its own replaceable
-      // module rather than inside the main bundle. Only the self-contained
-      // wasm bundle and the licenses are needed.
-      const libheifSource = path.join(__dirname, 'node_modules', 'libheif-js');
-      const libheifTarget = path.join(buildPath, 'node_modules', 'libheif-js');
-      for (const file of [
-        'package.json',
-        'LICENSE',
-        'wasm-bundle.js',
-        'libheif-wasm/libheif-bundle.js',
-        'libheif-wasm/LICENSE',
-      ]) {
-        fs.mkdirSync(path.dirname(path.join(libheifTarget, file)), { recursive: true });
-        fs.copyFileSync(path.join(libheifSource, file), path.join(libheifTarget, file));
+      // module rather than inside the main bundle. macOS decodes HEIC natively
+      // via /usr/bin/sips, so libheif is omitted on darwin.
+      if (platform !== 'darwin') {
+        const libheifSource = path.join(__dirname, 'node_modules', 'libheif-js');
+        const libheifTarget = path.join(buildPath, 'node_modules', 'libheif-js');
+        for (const file of [
+          'package.json',
+          'LICENSE',
+          'wasm-bundle.js',
+          'libheif-wasm/libheif-bundle.js',
+          'libheif-wasm/LICENSE',
+        ]) {
+          fs.mkdirSync(path.dirname(path.join(libheifTarget, file)), { recursive: true });
+          fs.copyFileSync(path.join(libheifSource, file), path.join(libheifTarget, file));
+        }
       }
 
       // The durango-code CLI (dependency-free JavaScript) ships with the app:
@@ -130,6 +137,11 @@ module.exports = {
         path.join(buildPath, 'node_modules', 'durango-code'),
         { recursive: true, dereference: true },
       );
+    },
+    // Runs after @electron/rebuild finishes and before @electron/packager packs
+    // app.asar: removes node-addon-api headers and node-pty build-only files.
+    packageAfterPrune: async (_forgeConfig, buildPath, _electronVersion, platform, arch) => {
+      prunePackagedBuild(buildPath, platform, arch);
     },
   },
   makers: [

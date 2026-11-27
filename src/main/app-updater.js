@@ -104,7 +104,7 @@ export const normalizeReleaseNotes = (releaseNotes) => {
 
 export const getAppIconPath = () => {
   if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'icon.png');
+    return path.join(app.getAppPath(), '.vite', 'renderer', 'main_window', 'icon.png');
   }
   return path.join(app.getAppPath(), 'assets', 'icon.png');
 };

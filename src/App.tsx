@@ -132,8 +132,10 @@ import {
   type MuseReasoningEffort,
 } from './agentCatalog';
 import { ClaudeBrandIcon, CodexBrandIcon } from './providerIcons';
-import orionIconUrl from '../assets/icon.png';
 import { removeBootSkeleton } from './app/bootSkeleton';
+
+// Reuses public/icon.png emitted next to index.html (avoids a duplicate PNG in app.asar).
+const orionIconUrl = './icon.png';
 import { CodeWorkspace } from './app/CodeWorkspace';
 import { SavedViewsSection, THREAD_DRAG_MIME } from './app/SavedViewsSection';
 import { SidebarV2, type SidebarV2Actions } from './app/SidebarV2';
