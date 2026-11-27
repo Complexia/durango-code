@@ -1,5 +1,18 @@
 import React from 'react';
 
+const THEME_STYLE_ID = 'durango-ui-theme';
+
+const clearInjectedThemeOverrides = () => {
+  if (typeof document === 'undefined') return;
+  try {
+    document.getElementById(THEME_STYLE_ID)?.remove();
+    const root = document.documentElement;
+    root.classList.remove('durango-themed', 'has-theme-backdrop', 'theme-static-frost', 'theme-panel-blur');
+  } catch {
+    // Best effort: never let DOM cleanup mask the crash fallback.
+  }
+};
+
 export type FormattedErrorDetails = {
   summary: string;
   details: string;
@@ -56,20 +69,38 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
   onCopy,
 }) => {
   const [copied, setCopied] = React.useState(false);
+  const copyTimerRef = React.useRef<number | null>(null);
   const { summary, details } = formatErrorDetails(error, componentStack);
 
-  const handleCopy = () => {
-    setCopied(true);
-    const copy =
-      onCopy ??
-      ((text: string) => {
-        if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-          return navigator.clipboard.writeText(text);
-        }
-      });
-    void Promise.resolve(copy(details)).catch(() => {});
-    if (typeof window !== 'undefined') {
-      window.setTimeout(() => setCopied(false), 2000);
+  React.useEffect(() => {
+    clearInjectedThemeOverrides();
+    return () => {
+      if (copyTimerRef.current !== null && typeof window !== 'undefined') {
+        window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopy = async () => {
+    try {
+      if (onCopy) {
+        await onCopy(details);
+      } else if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(details);
+      } else {
+        return;
+      }
+      setCopied(true);
+      if (typeof window !== 'undefined') {
+        if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = window.setTimeout(() => {
+          copyTimerRef.current = null;
+          setCopied(false);
+        }, 2000);
+      }
+    } catch {
+      setCopied(false);
     }
   };
 
@@ -79,27 +110,30 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
       aria-live="assertive"
       data-testid="app-error-boundary"
       style={{
-        minHeight: '100vh',
+        position: 'fixed',
+        inset: 0,
+        zIndex: 2147483647,
+        height: '100vh',
         width: '100vw',
         boxSizing: 'border-box',
         display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
+        overflowY: 'auto',
         padding: '24px',
-        background: 'var(--bg-base, #101012)',
-        color: 'var(--text-primary, #ececef)',
+        background: '#101012',
+        color: '#ececef',
         fontFamily:
-          'var(--font-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif)',
+          '-apple-system, BlinkMacSystemFont, "Inter Variable", "Segoe UI", Roboto, sans-serif',
       }}
     >
       <div
         style={{
+          margin: 'auto',
           width: '100%',
           maxWidth: '580px',
-          borderRadius: 'var(--radius-lg, 14px)',
-          border: '1px solid var(--border-default, rgb(255 255 255 / 10%))',
-          background: 'var(--bg-surface, #1d1d21)',
-          boxShadow: 'var(--shadow-lg, 0 16px 48px rgb(0 0 0 / 42%))',
+          borderRadius: '14px',
+          border: '1px solid rgb(255 255 255 / 12%)',
+          background: '#1d1d21',
+          boxShadow: '0 16px 48px rgb(0 0 0 / 48%)',
           padding: '24px',
           WebkitAppRegion: 'no-drag',
         } as React.CSSProperties}
@@ -118,7 +152,7 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
               width: '10px',
               height: '10px',
               borderRadius: '9999px',
-              background: 'var(--danger, #f87171)',
+              background: '#f87171',
               flexShrink: 0,
             }}
           />
@@ -128,7 +162,7 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
               fontSize: '17px',
               fontWeight: 700,
               lineHeight: 1.3,
-              color: 'var(--text-primary, #ececef)',
+              color: '#ececef',
             }}
           >
             Durango Code ran into an unexpected error
@@ -139,7 +173,7 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
             margin: '0 0 16px 0',
             fontSize: '13px',
             lineHeight: 1.5,
-            color: 'var(--text-secondary, #a0a0a8)',
+            color: '#a0a0a8',
           }}
         >
           Your threads and projects are saved on disk. Reload the window to recover.
@@ -149,13 +183,15 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
           data-testid="app-error-message"
           style={{
             marginBottom: '12px',
+            maxHeight: '84px',
+            overflowY: 'auto',
             padding: '10px 12px',
-            borderRadius: 'var(--radius-sm, 6px)',
-            border: '1px solid rgb(248 113 113 / 28%)',
-            background: 'rgb(248 113 113 / 8%)',
-            color: 'var(--danger, #f87171)',
+            borderRadius: '6px',
+            border: '1px solid rgb(248 113 113 / 32%)',
+            background: 'rgb(248 113 113 / 10%)',
+            color: '#fca5a5',
             fontFamily:
-              'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
+              'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
             fontSize: '12px',
             lineHeight: 1.45,
             wordBreak: 'break-word',
@@ -168,9 +204,9 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
           open
           style={{
             marginBottom: '18px',
-            borderRadius: 'var(--radius-sm, 6px)',
-            border: '1px solid var(--border-subtle, rgb(255 255 255 / 7%))',
-            background: 'var(--bg-base, #101012)',
+            borderRadius: '6px',
+            border: '1px solid rgb(255 255 255 / 9%)',
+            background: '#101012',
             padding: '8px 12px',
           }}
         >
@@ -179,7 +215,7 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
               cursor: 'pointer',
               fontSize: '12px',
               fontWeight: 600,
-              color: 'var(--text-secondary, #a0a0a8)',
+              color: '#a0a0a8',
               userSelect: 'none',
             }}
           >
@@ -189,15 +225,15 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
             data-testid="app-error-details"
             style={{
               margin: '8px 0 0 0',
-              maxHeight: '220px',
+              maxHeight: '140px',
               overflow: 'auto',
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
               fontFamily:
-                'var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace)',
+                'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
               fontSize: '11.5px',
               lineHeight: 1.5,
-              color: 'var(--text-secondary, #a0a0a8)',
+              color: '#c4c4cc',
             }}
           >
             {details}
@@ -216,13 +252,18 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
           <button
             type="button"
             data-testid="app-error-copy"
-            onClick={handleCopy}
+            onClick={() => {
+              void handleCopy();
+            }}
             style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               cursor: 'pointer',
-              borderRadius: 'var(--radius-sm, 6px)',
-              border: '1px solid var(--border-default, rgb(255 255 255 / 12%))',
+              borderRadius: '6px',
+              border: '1px solid rgb(255 255 255 / 14%)',
               background: 'transparent',
-              color: 'var(--text-secondary, #a0a0a8)',
+              color: '#c4c4cc',
               padding: '8px 14px',
               fontSize: '12.5px',
               fontWeight: 500,
@@ -236,11 +277,14 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
               data-testid="app-error-retry"
               onClick={onRetry}
               style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
                 cursor: 'pointer',
-                borderRadius: 'var(--radius-sm, 6px)',
-                border: '1px solid var(--border-default, rgb(255 255 255 / 12%))',
-                background: 'var(--bg-hover, #303036)',
-                color: 'var(--text-primary, #ececef)',
+                borderRadius: '6px',
+                border: '1px solid rgb(255 255 255 / 14%)',
+                background: '#303036',
+                color: '#ececef',
                 padding: '8px 14px',
                 fontSize: '12.5px',
                 fontWeight: 500,
@@ -254,12 +298,14 @@ export const AppCrashFallback: React.FC<AppCrashFallbackProps> = ({
             data-testid="app-error-reload"
             onClick={onReload}
             style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               cursor: 'pointer',
-              borderRadius: 'var(--radius-sm, 6px)',
+              borderRadius: '6px',
               border: 0,
-              background:
-                'linear-gradient(135deg, var(--accent-strong, #3b7aed), var(--accent-deep, #2563eb))',
-              color: 'var(--on-accent, #ffffff)',
+              background: 'linear-gradient(135deg, #3b7aed, #2563eb)',
+              color: '#ffffff',
               padding: '8px 16px',
               fontSize: '12.5px',
               fontWeight: 600,
@@ -301,6 +347,7 @@ export class AppErrorBoundary extends React.Component<
 
   componentDidCatch(error: Error, info: React.ErrorInfo): void {
     const componentStack = info?.componentStack ?? null;
+    clearInjectedThemeOverrides();
     console.error('Durango Code renderer error:', error, componentStack ?? '');
     this.setState({ componentStack });
     this.props.onError?.(error, info);

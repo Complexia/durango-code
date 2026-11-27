@@ -13,6 +13,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -172,7 +173,7 @@ const parseLegacyManifest = (value) => validateEntries(JSON.parse(value));
 const emptyManifest = () => ({ version: MANIFEST_VERSION, revision: 0, entries: [] });
 
 const writeAtomic = async (filePath, value, suffix = 'tmp') => {
-  const tempPath = `${filePath}.${process.pid}.${suffix}`;
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.${suffix}`;
   try {
     await fs.writeFile(tempPath, value, 'utf8');
     await fs.rename(tempPath, filePath);
@@ -1203,9 +1204,9 @@ const THREAD_FILE =
 // they really are leftovers.
 const SWEEP_MIN_AGE_MS = 10 * 60 * 1000;
 const LEGACY_THREAD_FILE = /^[A-Za-z0-9_-]+\.[0-9a-f]{64}\.(?:json|json\.search)$/;
-// `<file>.<pid>.<kind>.tmp`: a write that never got renamed into place
+// `<file>.<pid>.[<rand>.]<kind>.tmp`: a write that never got renamed into place
 // (a crash, a full disk). Swept once old enough to belong to no live write.
-const TEMP_FILE = /\.\d+\.[a-z.]*tmp$/;
+const TEMP_FILE = /\.\d+\.(?:[0-9a-f]+\.)?[a-z.-]*tmp$/;
 // The files a manifest names, for the sweep: the current one's and the
 // previous root's (still the fallback).
 const keptFiles = (manifest) => {
@@ -1361,6 +1362,17 @@ export const retireLegacyThreadFiles = async () => {
   return retired;
 };
 
+const hasRecoverableManifestState = (directory) =>
+  existsSync(previousManifestPath(directory)) || threadFilesOnDisk(directory).size > 0;
+
+const isDisposableEmptyThreadsDir = (directory) => {
+  try {
+    return readdirSync(directory).every((name) => TEMP_FILE.test(name));
+  } catch {
+    return false;
+  }
+};
+
 const ensureManifest = async ({ create = false } = {}) => {
   let manifest = null;
   try {
@@ -1374,8 +1386,10 @@ const ensureManifest = async ({ create = false } = {}) => {
     return manifest;
   }
   // A threads directory without its commit-point manifest is an interrupted
-  // or damaged write. Rebuild the manifest from manifest.prev.json and the
-  // verified thread files on disk instead of throwing and blocking persistence.
+  // or damaged write. Rebuild the manifest when recoverable state exists on
+  // disk; if the directory is empty (e.g. a crash right after mkdir before any
+  // commit), avoid committing an empty manifest on read so legacy migration
+  // and pre-split store hydration stay intact.
   const directory = getThreadsDirectoryPath();
   if (existsSync(directory)) {
     if (initializingStorage) return create ? emptyManifest() : null;
@@ -1383,11 +1397,24 @@ const ensureManifest = async ({ create = false } = {}) => {
       manifest = readManifestFileSync();
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
-      manifest = recoverManifestSync(directory, new Error('manifest.json is missing'));
+      if (hasRecoverableManifestState(directory)) {
+        manifest = recoverManifestSync(directory, new Error('manifest.json is missing'));
+      }
     }
-    if (manifest?.version === LEGACY_MANIFEST_VERSION) manifest = await migrateFromV2(manifest);
-    sweepUnreferencedFiles(manifest);
-    return manifest;
+    if (manifest) {
+      if (manifest.version === LEGACY_MANIFEST_VERSION) manifest = await migrateFromV2(manifest);
+      sweepUnreferencedFiles(manifest);
+      return manifest;
+    }
+    if (existsSync(getThreadsFilePath()) && isDisposableEmptyThreadsDir(directory)) {
+      await fs.rm(directory, { recursive: true, force: true });
+      const migrated = await migrateLegacy();
+      if (migrated) return migrated;
+    }
+    if (!create) return null;
+    initializingStorage = true;
+    await fs.mkdir(directory, { recursive: true });
+    return emptyManifest();
   }
   const migrated = await migrateLegacy();
   if (migrated) return migrated;
@@ -1412,9 +1439,20 @@ const ensureManifestSync = ({ create = false } = {}) => {
   const directory = getThreadsDirectoryPath();
   if (existsSync(directory)) {
     if (initializingStorage) return create ? emptyManifest() : null;
-    manifest = recoverManifestSync(directory, new Error('manifest.json is missing'));
-    sweepUnreferencedFiles(manifest);
-    return manifest;
+    if (hasRecoverableManifestState(directory)) {
+      manifest = recoverManifestSync(directory, new Error('manifest.json is missing'));
+      sweepUnreferencedFiles(manifest);
+      return manifest;
+    }
+    if (existsSync(getThreadsFilePath()) && isDisposableEmptyThreadsDir(directory)) {
+      rmSync(directory, { recursive: true, force: true });
+      const migrated = migrateLegacySync();
+      if (migrated) return migrated;
+    }
+    if (!create) return null;
+    initializingStorage = true;
+    mkdirSync(directory, { recursive: true });
+    return emptyManifest();
   }
   const migrated = migrateLegacySync();
   if (migrated) return migrated;
@@ -1537,7 +1575,14 @@ const keepRootAsPrevious = () => {
       linkSync(manifestPath(), linkPath);
     } catch (error) {
       if (error?.code === 'ENOENT') return;
+      // Preserve the original root's mtime on the copy fallback so
+      // recoverManifestSync's `shell.mtimeMs > previousTime` invariant still
+      // detects threads written after the previous root.
+      const sourceStat = statSync(manifestPath());
       copyFileSync(manifestPath(), linkPath);
+      try {
+        utimesSync(linkPath, sourceStat.atime, sourceStat.mtime);
+      } catch {}
     }
     renameSync(linkPath, previousManifestPath());
   } catch (error) {

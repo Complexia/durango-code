@@ -1991,7 +1991,11 @@ export const antigravityReadOnlyOneShot = async (
         abort();
         return;
       }
-      driver.start();
+      try {
+        Promise.resolve(driver.start()).catch(() => finish(false));
+      } catch {
+        finish(false);
+      }
     });
   } finally {
     if (capturedSessionId) {

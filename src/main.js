@@ -291,7 +291,24 @@ import {
   switchSourceControlToOrion,
 } from './main/source-control.js';
 
-installProcessErrorHandlers();
+let hasCreatedWindow = false;
+
+installProcessErrorHandlers({
+  isReadyToStayAlive: () => hasCreatedWindow,
+  onFatal: ({ error, reason }) => {
+    if (reason === 'before-ready' && app.isReady() && !process.env.CI) {
+      try {
+        dialog.showErrorBox(
+          `${PRODUCT_DISPLAY_NAME} failed to start`,
+          error?.message ?? String(error)
+        );
+      } catch {}
+    }
+    // Exit through Electron's quit path so will-quit flushes state, cleans up
+    // child processes, and releases the single-instance lock.
+    app.quit();
+  },
+});
 
 // The internal app name ("Orion") and userData path are pinned by
 // ./main/pin-app-identity.js, imported first. The customer-facing name is
@@ -724,6 +741,7 @@ const writeAccountSession = async (session) => {
   await writeFileAtomic(filePath, `${JSON.stringify(payload, null, 2)}\n`, {
     encoding: 'utf-8',
     mode: 0o600,
+    durable: true,
   });
 };
 
@@ -770,8 +788,7 @@ const getDurangoDeviceId = () => {
       if (/^[0-9a-f-]{36}$/i.test(existing)) return existing;
     } catch {}
     const id = crypto.randomUUID();
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.writeFile(target, `${id}\n`, 'utf8');
+    await writeFileAtomic(target, `${id}\n`, { encoding: 'utf8' });
     return id;
   })().catch(() => {
     durangoDeviceIdPromise = null;
@@ -847,7 +864,7 @@ const themeOwnerKey = () => {
     const existing = (await fs.readFile(file, 'utf8').catch(() => '')).trim();
     if (/^[A-Za-z0-9_-]{32,128}$/.test(existing)) return existing;
     const key = crypto.randomBytes(32).toString('base64url');
-    await fs.writeFile(file, `${key}\n`, { mode: 0o600 });
+    await writeFileAtomic(file, `${key}\n`, { encoding: 'utf8', mode: 0o600, durable: true });
     return key;
   })().catch((error) => {
     themeOwnerKeyPromise = null;
@@ -1292,6 +1309,7 @@ const createWindow = () => {
       // Security best practices: nodeIntegration false, contextIsolation true (default)
     },
   });
+  hasCreatedWindow = true;
 
   // Never let an anchor replace Orion's only renderer document. Markdown
   // links are routed explicitly in the renderer, while this main-process
@@ -1777,6 +1795,19 @@ app.whenReady().then(async () => {
         });
     }
   });
+}).catch((error) => {
+  console.error('Fatal error during app startup:', error);
+  if (BrowserWindow.getAllWindows().length === 0) {
+    if (app.isReady() && !process.env.CI) {
+      try {
+        dialog.showErrorBox(
+          `${PRODUCT_DISPLAY_NAME} failed to start`,
+          error?.message ?? String(error)
+        );
+      } catch {}
+    }
+    app.quit();
+  }
 });
 
 // Quit when all windows are closed, except on macOS. There, it's common
@@ -1938,7 +1969,7 @@ const waitForPendingQuitWork = () =>
     // agent-device sessions and daemon (bounded; never rejects).
     shutdownDevices(),
   ])
-    .then(() => threadsSaveQueue.catch(() => {}));
+    .then(() => Promise.all([storageSaveQueue.catch(() => {}), threadsSaveQueue.catch(() => {})]));
 
 const appShutdownError = () =>
   appShutdownReason === 'update'
@@ -2120,27 +2151,46 @@ themeIpc('themes:openGallery', async (slug) => {
   return url;
 });
 
+const writeStoreSnapshotAtomically = async (storagePath, data, seq) => {
+  await writeFileAtomic(storagePath, data, { encoding: 'utf-8', durable: true });
+  if (seq >= storageCommittedSeq) {
+    storageCommittedSeq = seq;
+    return;
+  }
+  // A sync flush committed a newer snapshot while our rename was in flight and
+  // may have been overwritten by it. Keep reinstalling until no newer sync
+  // snapshot arrived while we were writing.
+  let installedSeq = seq;
+  while (storageSyncSnapshot && storageSyncSnapshot.seq > installedSeq) {
+    const snapshot = storageSyncSnapshot;
+    await writeFileAtomic(storagePath, snapshot.value, { encoding: 'utf-8', durable: true });
+    installedSeq = snapshot.seq;
+  }
+};
+
 ipcMain.handle('storage:load', async () => {
   try {
+    const readSeq = storageWriteSeq;
     const storagePath = getStorageFilePath();
     const value = await fs.readFile(storagePath, 'utf-8');
     const sanitized = sanitizeStoreValue(value);
-    if (sanitized && sanitized !== value) {
+    if (
+      sanitized &&
+      sanitized !== value &&
+      storageWriteSeq === readSeq &&
+      storageCommittedSeq === readSeq
+    ) {
       const seq = ++storageWriteSeq;
       const rewrite = storageSaveQueue.catch(() => {}).then(async () => {
-        if (seq <= storageCommittedSeq) return; // superseded by a newer save
-        await writeFileAtomic(storagePath, sanitized, { encoding: 'utf-8' });
-        if (seq >= storageCommittedSeq) {
-          storageCommittedSeq = seq;
-          return;
-        }
-        const snapshot = storageSyncSnapshot;
-        if (snapshot && snapshot.seq > seq) {
-          await writeFileAtomic(storagePath, snapshot.value, { encoding: 'utf-8' });
-        }
+        if (storageWriteSeq !== seq || seq <= storageCommittedSeq) return;
+        await writeStoreSnapshotAtomically(storagePath, sanitized, seq);
       });
       storageSaveQueue = rewrite;
-      await rewrite;
+      try {
+        await rewrite;
+      } catch (error) {
+        console.error('storage:load rewrite error', error);
+      }
     }
     return sanitized;
   } catch (error) {
@@ -2160,17 +2210,7 @@ ipcMain.handle('storage:save', async (_event, value) => {
     if (seq <= storageCommittedSeq) return; // superseded by the sync flush
     const storagePath = getStorageFilePath();
     const sanitized = sanitizeStoreValue(value) ?? value;
-    await writeFileAtomic(storagePath, sanitized, { encoding: 'utf-8' });
-    if (seq >= storageCommittedSeq) {
-      storageCommittedSeq = seq;
-      return;
-    }
-    // The sync flush committed a newer snapshot while this rename was in
-    // flight and may have been overwritten by it — reinstall the newer one.
-    const snapshot = storageSyncSnapshot;
-    if (snapshot && snapshot.seq > seq) {
-      await writeFileAtomic(storagePath, snapshot.value, { encoding: 'utf-8' });
-    }
+    await writeStoreSnapshotAtomically(storagePath, sanitized, seq);
   });
   storageSaveQueue = save;
 
@@ -2564,7 +2604,7 @@ ipcMain.on('storage:saveSync', (event, value) => {
     const seq = ++storageWriteSeq;
     const storagePath = getStorageFilePath();
     const sanitized = sanitizeStoreValue(value) ?? value;
-    writeFileAtomicSync(storagePath, sanitized, { encoding: 'utf-8' });
+    writeFileAtomicSync(storagePath, sanitized, { encoding: 'utf-8', durable: true });
     storageCommittedSeq = seq;
     storageSyncSnapshot = { seq, value: sanitized };
     event.returnValue = true;
@@ -5677,7 +5717,7 @@ const readAutomationRequested = async () => {
 const markAutomationRequested = async () => {
   automationRequestedCache = true;
   try {
-    await fs.writeFile(computerUseStateFile(), JSON.stringify({ automationRequested: true }));
+    await writeFileAtomic(computerUseStateFile(), JSON.stringify({ automationRequested: true }));
   } catch {
     // best effort; worst case the row falls back to 'Request access'
   }

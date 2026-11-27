@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
@@ -35,7 +36,8 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   assert.match(okHtml, /data-testid="healthy-child"/);
   assert.match(okHtml, /hello world/);
 
-  // Fallback screen renders reload option, retry option, copy button, and error details.
+  // Fallback screen renders fixed scrollable container, hardcoded high-contrast
+  // colors (immune to broken custom theme vars), reload/retry/copy buttons, and error details.
   const fallbackHtml = renderToStaticMarkup(
     <AppCrashFallback
       error={err}
@@ -46,6 +48,9 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   );
   assert.match(fallbackHtml, /role="alert"/);
   assert.match(fallbackHtml, /data-testid="app-error-boundary"/);
+  assert.match(fallbackHtml, /position:fixed/);
+  assert.match(fallbackHtml, /overflow-y:auto/);
+  assert.doesNotMatch(fallbackHtml, /var\(--/, 'fallback styling must not depend on custom theme CSS variables');
   assert.match(fallbackHtml, /data-testid="app-error-reload"/);
   assert.match(fallbackHtml, />Reload window<\/button>/);
   assert.match(fallbackHtml, /data-testid="app-error-retry"/);
@@ -55,7 +60,8 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   assert.match(fallbackHtml, /Cannot read properties of undefined/);
   assert.match(fallbackHtml, /at ChatPane/);
 
-  // Lifecycle transitions: getDerivedStateFromError -> componentDidCatch -> retry / reload.
+  // Lifecycle transitions: getDerivedStateFromError -> componentDidCatch -> retry / reload,
+  // including stripping any injected custom theme style element.
   let reloaded = 0;
   let reported: { error: Error; stack: string } | null = null;
   const boundary = new AppErrorBoundary({
@@ -78,6 +84,19 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
     boundary.state = { ...boundary.state, ...partial };
   }) as typeof boundary.setState;
 
+  let themeRemoved = false;
+  const removedClasses: string[] = [];
+  const prevDocument = (globalThis as { document?: unknown }).document;
+  (globalThis as { document?: unknown }).document = {
+    getElementById: (id: string) =>
+      id === 'durango-ui-theme' ? { remove: () => { themeRemoved = true; } } : null,
+    documentElement: {
+      classList: {
+        remove: (...names: string[]) => removedClasses.push(...names),
+      },
+    },
+  };
+
   const originalConsoleError = console.error;
   const logged: unknown[][] = [];
   console.error = (...args: unknown[]) => logged.push(args);
@@ -85,7 +104,11 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
     boundary.componentDidCatch(err, { componentStack: '\n    at BrokenView' });
   } finally {
     console.error = originalConsoleError;
+    if (prevDocument === undefined) delete (globalThis as { document?: unknown }).document;
+    else (globalThis as { document?: unknown }).document = prevDocument;
   }
+  assert.equal(themeRemoved, true, 'componentDidCatch must strip #durango-ui-theme so broken themes cannot hide recovery UI');
+  assert.ok(removedClasses.includes('durango-themed'));
   assert.equal(logged.length, 1);
   assert.equal(reported?.error, err);
   assert.match(reported?.stack ?? '', /at BrokenView/);
@@ -103,9 +126,15 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   assert.equal(boundary.state.error, null);
 }
 
-// 2. Main-process uncaughtException & unhandledRejection handlers
+// 2. Main-process uncaughtException, unhandledRejection, stdio EPIPE, and fatal guard
 {
-  const fakeProcess = new EventEmitter();
+  const makeFakeProcess = () =>
+    Object.assign(new EventEmitter(), {
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    });
+
+  const fakeProcess = makeFakeProcess();
   const logs: unknown[][] = [];
   const observed: unknown[] = [];
   const uninstall = installProcessErrorHandlers({
@@ -125,8 +154,47 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   assert.match(String(logs[1][1]), /driver start failed/);
   assert.equal(observed.length, 2);
 
-  // Broken stdout/stderr (EPIPE) or throwing observer never crashes the handler.
-  const brokenProcess = new EventEmitter();
+  // Async EPIPE on stderr silences stdio logging and prevents an infinite uncaughtException spin.
+  let logCallsAfterPipeBreak = 0;
+  const epipeProcess = makeFakeProcess();
+  const stopEpipe = installProcessErrorHandlers({
+    processRef: epipeProcess,
+    log: {
+      error: () => {
+        logCallsAfterPipeBreak += 1;
+        // Simulate libuv emitting async EPIPE on stderr on the next microtask.
+        queueMicrotask(() => {
+          epipeProcess.stderr.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+        });
+      },
+    },
+  });
+  epipeProcess.emit('uncaughtException', new Error('first error'), 'uncaughtException');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  epipeProcess.emit('uncaughtException', new Error('second error after broken pipe'), 'uncaughtException');
+  epipeProcess.emit('uncaughtException', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }), 'uncaughtException');
+  assert.equal(logCallsAfterPipeBreak, 1, 'once stderr emits EPIPE, further writes to broken stdio must stop');
+  stopEpipe();
+
+  // Re-entrancy guard prevents synchronous recursion when an observer triggers another exception.
+  let reentrantObserved = 0;
+  const reentrantProcess = makeFakeProcess();
+  const stopReentrant = installProcessErrorHandlers({
+    processRef: reentrantProcess,
+    log: { error: () => {} },
+    onError: () => {
+      reentrantObserved += 1;
+      if (reentrantObserved === 1) {
+        reentrantProcess.emit('uncaughtException', new Error('nested'), 'uncaughtException');
+      }
+    },
+  });
+  reentrantProcess.emit('uncaughtException', new Error('outer'), 'uncaughtException');
+  assert.equal(reentrantObserved, 1, 'synchronous re-entrant uncaughtException must be suppressed');
+  stopReentrant();
+
+  // Broken stdout/stderr (synchronous throw) or throwing observer never crashes the handler.
+  const brokenProcess = makeFakeProcess();
   const stopBroken = installProcessErrorHandlers({
     processRef: brokenProcess,
     log: {
@@ -144,18 +212,62 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   });
   stopBroken();
 
-  // Uninstall removes both listeners cleanly.
+  // Pre-window uncaughtException triggers onFatal once so startup failures don't leave a headless zombie.
+  const startupProcess = makeFakeProcess();
+  const fatals: Array<{ reason: string }> = [];
+  const stopStartup = installProcessErrorHandlers({
+    processRef: startupProcess,
+    log: { error: () => {} },
+    isReadyToStayAlive: () => false,
+    onFatal: (payload: { reason: string }) => fatals.push(payload),
+  });
+  startupProcess.emit('uncaughtException', new Error('boot failure'), 'uncaughtException');
+  startupProcess.emit('uncaughtException', new Error('second boot failure'), 'uncaughtException');
+  assert.equal(fatals.length, 1);
+  assert.equal(fatals[0].reason, 'before-ready');
+  stopStartup();
+
+  // Repeated post-startup uncaughtExceptions in a tight burst trigger onFatal once.
+  const burstProcess = makeFakeProcess();
+  const burstFatals: Array<{ reason: string }> = [];
+  let clock = 1000;
+  const stopBurst = installProcessErrorHandlers({
+    processRef: burstProcess,
+    log: { error: () => {} },
+    isReadyToStayAlive: () => true,
+    burstLimit: 3,
+    burstWindowMs: 5_000,
+    now: () => clock,
+    onFatal: (payload: { reason: string }) => burstFatals.push(payload),
+  });
+  burstProcess.emit('uncaughtException', new Error('e1'), 'uncaughtException');
+  clock += 100;
+  burstProcess.emit('uncaughtException', new Error('e2'), 'uncaughtException');
+  assert.equal(burstFatals.length, 0);
+  clock += 100;
+  burstProcess.emit('uncaughtException', new Error('e3'), 'uncaughtException');
+  assert.equal(burstFatals.length, 1);
+  assert.equal(burstFatals[0].reason, 'burst');
+  stopBurst();
+
+  // Uninstall removes process and stdio listeners cleanly.
   uninstall();
   assert.equal(fakeProcess.listenerCount('uncaughtException'), 0);
   assert.equal(fakeProcess.listenerCount('unhandledRejection'), 0);
+  assert.equal(fakeProcess.stdout.listenerCount('error'), 0);
+  assert.equal(fakeProcess.stderr.listenerCount('error'), 0);
 }
 
-// 3. Atomic file writes (async + sync, mode 0o600, failure cleanup, concurrency)
+// 3. Atomic file writes (async + sync, mode 0o600, durable fsync, win32 rename retry, failure cleanup, concurrency)
 {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orion-atomic-write-'));
   try {
     const nestedFile = path.join(tmpDir, 'nested', 'account-session.json');
-    await writeFileAtomic(nestedFile, '{"token":"secret"}\n', { encoding: 'utf8', mode: 0o600 });
+    await writeFileAtomic(nestedFile, '{"token":"secret"}\n', {
+      encoding: 'utf8',
+      mode: 0o600,
+      durable: true,
+    });
     assert.equal(await fs.readFile(nestedFile, 'utf8'), '{"token":"secret"}\n');
     if (process.platform !== 'win32') {
       assert.equal((await fs.stat(nestedFile)).mode & 0o777, 0o600);
@@ -170,13 +282,43 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
       assert.equal((await fs.stat(looseFile)).mode & 0o777, 0o600);
     }
 
-    // Sync atomic write works and leaves no temp files.
+    // Sync atomic write with durable + mode works and leaves no temp files.
     const syncFile = path.join(tmpDir, 'sync-dir', 'store.json');
-    writeFileAtomicSync(syncFile, '{"ok":1}', { encoding: 'utf8', mode: 0o600 });
+    writeFileAtomicSync(syncFile, '{"ok":1}', { encoding: 'utf8', mode: 0o600, durable: true });
     assert.equal(await fs.readFile(syncFile, 'utf8'), '{"ok":1}');
     if (process.platform !== 'win32') {
       assert.equal((await fs.stat(syncFile)).mode & 0o777, 0o600);
     }
+
+    // Windows transient EPERM/EBUSY rename failures are retried (async + sync).
+    const retryAsyncFile = path.join(tmpDir, 'win-retry-async.json');
+    let asyncAttempts = 0;
+    await writeFileAtomic(retryAsyncFile, '{"retried":true}', {
+      platform: 'win32',
+      sleepImpl: async () => {},
+      renameImpl: async (from, to) => {
+        asyncAttempts += 1;
+        if (asyncAttempts < 3) throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
+        await fs.rename(from, to);
+      },
+    });
+    assert.equal(asyncAttempts, 3);
+    assert.equal(await fs.readFile(retryAsyncFile, 'utf8'), '{"retried":true}');
+
+    const retrySyncFile = path.join(tmpDir, 'win-retry-sync.json');
+    let syncAttempts = 0;
+    const { renameSync } = await import('node:fs');
+    writeFileAtomicSync(retrySyncFile, '{"retriedSync":true}', {
+      platform: 'win32',
+      pauseImpl: () => {},
+      renameImpl: (from, to) => {
+        syncAttempts += 1;
+        if (syncAttempts < 3) throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+        renameSync(from, to);
+      },
+    });
+    assert.equal(syncAttempts, 3);
+    assert.equal(await fs.readFile(retrySyncFile, 'utf8'), '{"retriedSync":true}');
 
     // Rename failure (target is a non-empty directory) cleans up its temp file.
     const blockerDir = path.join(tmpDir, 'dir-target');
@@ -206,17 +348,24 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   }
 }
 
-// 4. Wiring checks in renderer.tsx and main.js
+// 4. Wiring checks in renderer.tsx, main.js, and one-shot ACP drivers
 {
-  const srcDir = new URL('../src', import.meta.url).pathname;
-  const [rendererSource, mainSource] = await Promise.all([
+  const srcDir = fileURLToPath(new URL('../src', import.meta.url));
+  const [rendererSource, mainSource, agySource, fxSource, kimiSource] = await Promise.all([
     fs.readFile(path.join(srcDir, 'renderer.tsx'), 'utf8'),
     fs.readFile(path.join(srcDir, 'main.js'), 'utf8'),
+    fs.readFile(path.join(srcDir, 'main', 'antigravity-driver.js'), 'utf8'),
+    fs.readFile(path.join(srcDir, 'main', 'fx-driver.js'), 'utf8'),
+    fs.readFile(path.join(srcDir, 'main', 'kimi-driver.js'), 'utf8'),
   ]);
   assert.match(rendererSource, /<AppErrorBoundary>[\s\S]*<App \/>[\s\S]*<\/AppErrorBoundary>/);
-  assert.match(mainSource, /installProcessErrorHandlers\(\)/);
-  assert.match(mainSource, /writeFileAtomic\(filePath,[\s\S]*?mode:\s*0o600/);
+  assert.match(mainSource, /installProcessErrorHandlers\(\{/);
+  assert.match(mainSource, /writeFileAtomic\(filePath,[\s\S]*?mode:\s*0o600[\s\S]*?durable:\s*true/);
   assert.match(mainSource, /Promise\.resolve\(acpDriver\.start\(\)\)\.catch\(/);
+  assert.match(mainSource, /app\.whenReady\(\)\.then\([\s\S]*?\.catch\(/);
+  assert.match(agySource, /Promise\.resolve\(driver\.start\(\)\)\.catch\(\(\) => finish\(false\)\)/);
+  assert.match(fxSource, /Promise\.resolve\(driver\.start\(\)\)\.catch\(\(\) => finish\(false\)\)/);
+  assert.match(kimiSource, /Promise\.resolve\(driver\.start\(\)\)\.catch\(\(\) => finish\(false\)\)/);
 }
 
 console.log('crash protection tests passed');

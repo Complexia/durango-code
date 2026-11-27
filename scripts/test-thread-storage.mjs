@@ -492,6 +492,29 @@ try {
   assert.equal((await entryOf(fifth.id)).title, 'Fifth sync after missing');
   assert.equal(JSON.parse(readThreadRawSync(fifth.id)).title, 'Fifth sync after missing');
 
+  // Newly created thread written just before manifest.json disappears must be
+  // recovered even when manifest.prev.json was created earlier (verifies the
+  // mtime invariant for keepRootAsPrevious's link and copyFileSync fallback).
+  const brandNew = {
+    ...second,
+    id: 'thread-brand-new-missing-manifest',
+    title: 'Brand new before vanish',
+    messages: [{ id: 'bn1', role: 'user', content: 'brand new', ts: '2026-08-08T00:00:00.000Z' }],
+  };
+  await sleep(25);
+  await writeThreadsPatch({ version: 2, upserts: [brandNew], deletes: [] });
+  await fs.rm(fileOf('manifest.json'));
+  resetThreadStorageStateForTests();
+  const [concurrentA, concurrentB] = await Promise.all([readThreadsIndex(), readThreadsIndex()]);
+  assert.equal(concurrentA.entries.some((entry) => entry.id === brandNew.id), true, 'newly created thread survives missing manifest');
+  assert.deepEqual(
+    concurrentA.entries.map((entry) => entry.id),
+    concurrentB.entries.map((entry) => entry.id),
+    'concurrent readers agree on rebuilt manifest'
+  );
+  assert.equal((await readThreadById(brandNew.id)).title, 'Brand new before vanish');
+  await writeThreadsPatch({ version: 2, upserts: [], deletes: [brandNew.id] });
+
   // Damaged copies protect only the threads they name, and only for a week:
   // cleanup is never stuck.
   for (const name of await fs.readdir(getThreadsDirectoryPath())) {
@@ -733,6 +756,21 @@ try {
   const absent = JSON.parse(await readThreadShells({ ids: [] }));
   assert.equal(absent.present, false, 'absent storage must remain distinct from a failed read');
   assert.deepEqual(absent.shells, []);
+
+  // An empty orion-threads/ directory with no manifest.json (e.g. crash right
+  // after mkdir before the first commit) must NOT commit an empty manifest on
+  // read (which would report present:true and wipe pre-split store threads),
+  // and must still allow migrating a sibling legacy orion-threads.json.
+  await fs.mkdir(getThreadsDirectoryPath(), { recursive: true });
+  resetThreadStorageStateForTests();
+  const emptyDirRead = JSON.parse(await readThreadShells({ ids: [] }));
+  assert.equal(emptyDirRead.present, false, 'empty threads dir without manifest must report present:false');
+  await assert.rejects(fs.access(fileOf('manifest.json')), 'reading an empty threads dir must not commit an empty manifest');
+  await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [first] }), 'utf8');
+  resetThreadStorageStateForTests();
+  assert.deepEqual(await readAllThreads(), [first], 'legacy v1 file still migrates even if an empty threads dir exists');
+  await clearThreadsStorage();
+  resetThreadStorageStateForTests();
 
   console.log('Thread storage migration, startup loading, and incremental persistence checks passed.');
 } finally {

@@ -899,6 +899,10 @@ export const kimiPlanModeOneShot = (model, promptText, cwd, { signal, threadId }
     child.stderr.resume();
     child.on('error', () => finish(false));
     child.on('close', () => finish(false));
-    driver.start();
+    try {
+      Promise.resolve(driver.start()).catch(() => finish(false));
+    } catch {
+      finish(false);
+    }
   });
 };
