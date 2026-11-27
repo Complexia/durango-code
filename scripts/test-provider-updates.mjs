@@ -167,6 +167,16 @@ assert.equal(
 );
 assert.match(
   appSource,
+  /const PROVIDER_UPDATE_BOOT_DELAY_MS = \d[\d_]*;/,
+  'initial provider update check should be delayed past startup'
+);
+assert.match(
+  appSource,
+  /window\.setTimeout\(\(\) => \{\s*if \(!providerUpdatesCheckedOnceRef\.current\) void refreshProviderUpdates\(\);\s*\}, PROVIDER_UPDATE_BOOT_DELAY_MS\);/,
+  'initial provider update check should run after PROVIDER_UPDATE_BOOT_DELAY_MS once hydrated'
+);
+assert.match(
+  appSource,
   /const interval = window\.setInterval\(\(\) => \{\s*void refreshProviderUpdates\(\);\s*\}, PROVIDER_UPDATE_CHECK_INTERVAL_MS\);[\s\S]*?return \(\) => \{\s*window\.clearInterval\(interval\);\s*\};/,
   'provider update checks should repeat during a long-running renderer and clean up their timer'
 );
@@ -234,6 +244,42 @@ sleep 2
     await readCliVersion(fixtureCommand),
     null,
     'the fixture should reject an unguarded version read'
+  );
+
+  const disabledLog = path.join(fixtureDir, 'disabled-invoked.log');
+  const disabledCommand = path.join(fixtureDir, 'disabled-provider');
+  await writeFile(
+    disabledCommand,
+    `#!/bin/sh
+printf 'invoked:%s\n' "$*" >> '${disabledLog}'
+exit 0
+`,
+    'utf8'
+  );
+  await chmod(disabledCommand, 0o755);
+  let latestVersionCalled = false;
+  const disabledState = await checkProviderUpdate(
+    {
+      id: 'fixture-disabled',
+      label: 'Disabled Fixture Provider',
+      command: disabledCommand,
+      statusCommand: ['status'],
+      readLatestVersion: async () => {
+        latestVersionCalled = true;
+        return '9.9.9';
+      },
+    },
+    new Set(['claude'])
+  );
+  assert.equal(disabledState.enabled, false, 'disabled providers should be marked disabled');
+  assert.equal(disabledState.installed, true, 'disabled providers should still report installation via PATH');
+  assert.equal(disabledState.updateAvailable, false, 'disabled providers should not flag updates');
+  assert.equal(disabledState.currentVersion, null, 'disabled providers should skip version checks');
+  assert.equal(latestVersionCalled, false, 'disabled providers should skip network version lookups');
+  await assert.rejects(
+    readFile(disabledLog, 'utf8'),
+    { code: 'ENOENT' },
+    'disabled providers must not spawn CLI processes for auth or version checks'
   );
 
   const controller = new AbortController();

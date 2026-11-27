@@ -711,6 +711,29 @@ export const normalizeEnabledProviderIds = (input) => {
 export const checkProviderUpdate = async (config, enabledProviderIds = null) => {
   const commandPath = await resolveCommandPath(config.command);
   const enabled = !enabledProviderIds || enabledProviderIds.has(config.id);
+  if (!enabled) {
+    // Skip auth/version/mise/network checks for disabled providers so startup
+    // and periodic refreshes never spawn CLIs or hit registries for tools the
+    // user turned off.
+    return {
+      id: config.id,
+      label: config.label,
+      command: config.command,
+      enabled: false,
+      installed: Boolean(commandPath),
+      path: commandPath,
+      currentVersion: null,
+      latestVersion: null,
+      updateAvailable: false,
+      status: commandPath ? 'unknown' : 'missing',
+      auth: {
+        authenticated: null,
+        status: commandPath ? 'unknown' : 'missing',
+        label: 'Disabled',
+        detail: `${config.label} is disabled.`,
+      },
+    };
+  }
   const auth = await getProviderAuthStatus(config);
   const base = {
     id: config.id,

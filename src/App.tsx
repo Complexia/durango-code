@@ -160,6 +160,7 @@ import { DeviceCard } from './app/DeviceCard';
 import { ImageLightbox } from './app/imageLightbox';
 import { ProjectBadge } from './app/ProjectBadge';
 import DurangoWorkspaceControl from './app/DurangoWorkspaceControl';
+import { createFocusCooldown, isSameGitState } from './app/focusCooldown';
 import { TaskPickerPopover } from './app/TaskPickerPopover';
 import {
   Composer,
@@ -518,6 +519,7 @@ const legacyAntigravityEffortForThread = (
 const CLOUD_DEPLOY_POLL_INTERVAL_MS = 4000;
 // Match the packaged app update scheduler so both update banners stay fresh.
 const PROVIDER_UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
+const PROVIDER_UPDATE_BOOT_DELAY_MS = 15_000;
 const CLOUD_DEPLOY_POLL_TIMEOUT_MS = 20 * 60 * 1000;
 
 const cloudAppHost = (url: string) => {
@@ -1636,7 +1638,9 @@ const App: React.FC = () => {
   const orionMcpsRef = useRef<OrionMcpEntry[]>([]);
   useEffect(() => {
     let active = true;
+    const focusCooldown = createFocusCooldown(10_000);
     const load = async () => {
+      focusCooldown.mark();
       try {
         const result = await window.orion?.listOrionMcps?.();
         if (active && result?.ok) {
@@ -1647,13 +1651,16 @@ const App: React.FC = () => {
         // Keep the last known list; the composer simply offers fewer mentions.
       }
     };
+    const onFocus = () => {
+      if (focusCooldown.tryRun()) void load();
+    };
     void load();
     window.addEventListener(ORION_MCPS_CHANGED_EVENT, load);
-    window.addEventListener('focus', load);
+    window.addEventListener('focus', onFocus);
     return () => {
       active = false;
       window.removeEventListener(ORION_MCPS_CHANGED_EVENT, load);
-      window.removeEventListener('focus', load);
+      window.removeEventListener('focus', onFocus);
     };
   }, []);
   const attachedOrionMcps = useMemo(() => {
@@ -2792,13 +2799,25 @@ const App: React.FC = () => {
   // A workspace removed outside its thread (by another thread's agent, or in a
   // terminal) is released from every thread that still points at it.
   useEffect(() => {
-    const check = () => void releaseMissingDurangoWorkspaces();
+    const focusCooldown = createFocusCooldown(10_000);
+    const isVisible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
+    const check = () => {
+      focusCooldown.mark();
+      void releaseMissingDurangoWorkspaces();
+    };
+    const onResume = () => {
+      if (isVisible() && focusCooldown.tryRun()) void releaseMissingDurangoWorkspaces();
+    };
     check();
-    const timer = window.setInterval(check, WORKSPACE_PRESENCE_POLL_MS);
-    window.addEventListener('focus', check);
+    const timer = window.setInterval(() => {
+      if (isVisible()) check();
+    }, WORKSPACE_PRESENCE_POLL_MS);
+    window.addEventListener('focus', onResume);
+    document.addEventListener('visibilitychange', onResume);
     return () => {
       window.clearInterval(timer);
-      window.removeEventListener('focus', check);
+      window.removeEventListener('focus', onResume);
+      document.removeEventListener('visibilitychange', onResume);
     };
   }, []);
 
@@ -3011,8 +3030,10 @@ const App: React.FC = () => {
     }
   }, []);
 
+  const providerUpdatesCheckedOnceRef = useRef(false);
   const refreshProviderUpdates = useCallback(async () => {
     if (!window.orion?.checkProviderUpdates) return;
+    providerUpdatesCheckedOnceRef.current = true;
     setProviderUpdatesChecking(true);
     try {
       setProviderUpdateState(await window.orion.checkProviderUpdates({ enabledProviderIds }));
@@ -3025,8 +3046,9 @@ const App: React.FC = () => {
 
   useEffect(() => {
     void refreshAgentModels();
-    void refreshProviderUpdates();
+  }, [refreshAgentModels]);
 
+  useEffect(() => {
     const interval = window.setInterval(() => {
       void refreshProviderUpdates();
     }, PROVIDER_UPDATE_CHECK_INTERVAL_MS);
@@ -3034,7 +3056,7 @@ const App: React.FC = () => {
     return () => {
       window.clearInterval(interval);
     };
-  }, [refreshAgentModels, refreshProviderUpdates]);
+  }, [refreshProviderUpdates]);
 
   // Background discovery refreshes the main-process catalog; pick up the
   // cached result whenever it changes.
@@ -3229,6 +3251,27 @@ const App: React.FC = () => {
     // Runs after the hydrated frame commits: the real sidebar is underneath.
     if (storeHydrated) removeBootSkeleton();
   }, [storeHydrated]);
+  // Defer the initial provider update check until after store hydration and
+  // startup settle (so disabled providers are skipped and boot I/O is not
+  // crowded). Subsequent changes to enabled providers refresh immediately.
+  useEffect(() => {
+    if (!storeHydrated) return undefined;
+    if (providerUpdatesCheckedOnceRef.current) {
+      void refreshProviderUpdates();
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      if (!providerUpdatesCheckedOnceRef.current) void refreshProviderUpdates();
+    }, PROVIDER_UPDATE_BOOT_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [storeHydrated, refreshProviderUpdates]);
+  // Opening Settings → Providers before the boot delay fires checks right away.
+  useEffect(() => {
+    if (!storeHydrated || providerUpdatesCheckedOnceRef.current) return;
+    if (settingsOpen && settingsTab === 'providers') void refreshProviderUpdates();
+  }, [storeHydrated, settingsOpen, settingsTab, refreshProviderUpdates]);
   // Drafts saved by the last session list their threads again, like ones
   // typed into this session.
   useEffect(() => {
@@ -3594,41 +3637,57 @@ const App: React.FC = () => {
   // just switched to, and would overwrite the pill and picker with the wrong
   // repository's branches. Only the latest request may write state.
   const gitRefreshSeqRef = useRef(0);
+  const gitRefreshInFlightRef = useRef(false);
+  const gitFocusCooldownRef = useRef(createFocusCooldown());
   const refreshGitState = useCallback(async () => {
     const projectPath = activeWorkingDir;
     const seq = ++gitRefreshSeqRef.current;
+    gitFocusCooldownRef.current.mark();
     if (!projectPath || !window.orion?.getGitState) {
+      gitRefreshInFlightRef.current = false;
       setGitState(null);
       setGitLoading(false);
       return;
     }
 
+    gitRefreshInFlightRef.current = true;
     setGitLoading(true);
     try {
       const state = await window.orion.getGitState(projectPath);
       if (seq !== gitRefreshSeqRef.current) return;
-      setGitState(state);
+      // Preserve reference equality when nothing changed so effects keyed on
+      // `gitState` (notably `refreshCloudState`) do not cascade on every focus.
+      setGitState((previous) => (isSameGitState(previous, state) ? previous : state));
     } catch (error) {
       if (seq !== gitRefreshSeqRef.current) return;
-      setGitState({
+      const errorState = {
         ok: false,
         branches: [],
         hasUncommittedChanges: false,
         error: error instanceof Error ? error.message : 'Unable to read git state',
-      });
+      };
+      setGitState((previous) => (isSameGitState(previous, errorState) ? previous : errorState));
     } finally {
-      if (seq === gitRefreshSeqRef.current) setGitLoading(false);
+      if (seq === gitRefreshSeqRef.current) {
+        gitRefreshInFlightRef.current = false;
+        setGitLoading(false);
+      }
     }
   }, [activeWorkingDir]);
 
   useEffect(() => {
+    gitFocusCooldownRef.current.reset();
     void refreshGitState();
   }, [refreshGitState]);
 
   // A checkout in an outside terminal doesn't notify the app; re-read when
-  // the window regains focus so the pill matches the repository's real HEAD.
+  // the window regains focus (with a cooldown) so the pill matches HEAD
+  // without spawning a git burst on rapid focus flips.
   useEffect(() => {
-    const onFocus = () => void refreshGitState();
+    const onFocus = () => {
+      if (gitRefreshInFlightRef.current || !gitFocusCooldownRef.current.tryRun()) return;
+      void refreshGitState();
+    };
     window.addEventListener('focus', onFocus);
     return () => window.removeEventListener('focus', onFocus);
   }, [refreshGitState]);
@@ -3636,8 +3695,11 @@ const App: React.FC = () => {
   // An agent can switch branches (or leave its workspace) during a turn;
   // re-read when the turn ends so the pill shows where the checkout is now.
   const selectedThreadRunning = selectedThread?.status === 'running';
+  const wasSelectedThreadRunningRef = useRef(selectedThreadRunning);
   useEffect(() => {
-    if (!selectedThreadRunning) void refreshGitState();
+    const wasRunning = wasSelectedThreadRunningRef.current;
+    wasSelectedThreadRunningRef.current = selectedThreadRunning;
+    if (wasRunning && !selectedThreadRunning) void refreshGitState();
   }, [refreshGitState, selectedThreadRunning]);
 
   // Same stale-response race as refreshGitState: only the latest request may

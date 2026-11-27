@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
+import { createFocusCooldown } from './focusCooldown';
 import {
   AlertCircle,
   Archive,
@@ -516,11 +517,18 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   }, []);
 
   useEffect(() => {
-    void loadBots();
+    const focusCooldown = createFocusCooldown();
+    const refresh = () => {
+      focusCooldown.mark();
+      void loadBots();
+    };
+    refresh();
     const timer = window.setInterval(() => {
-      if (visible()) void loadBots();
+      if (visible()) refresh();
     }, LIST_POLL_MS);
-    const onFocus = () => void loadBots();
+    const onFocus = () => {
+      if (focusCooldown.tryRun()) void loadBots();
+    };
     window.addEventListener('focus', onFocus);
     return () => {
       window.clearInterval(timer);

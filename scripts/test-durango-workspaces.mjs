@@ -99,6 +99,56 @@ try {
   assert.equal(status.landing, false);
   assert.deepEqual(workspaces.missingDurangoWorkspaces([workspace.path]), []);
 
+  // Direct reads of server-slots.json and .durango/change.json reflect running,
+  // queued, dead-PID pruned, and local change state without spawning the CLI.
+  const slotsFile = path.join(process.env.HOME, '.durango', 'server-slots.json');
+  await fs.writeFile(
+    slotsFile,
+    JSON.stringify({
+      version: 1,
+      running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: process.pid, childPid: null, startedAt: new Date().toISOString() }],
+      queue: [],
+    })
+  );
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
+    'running',
+    'alive server-slot pid reports running'
+  );
+  await fs.writeFile(
+    slotsFile,
+    JSON.stringify({
+      version: 1,
+      running: [{ workspace: workspace.name, path: workspace.path, ports: [3100, 3109], command: 'dev', pid: 99999999, childPid: null, startedAt: new Date().toISOString() }],
+      queue: [{ workspace: workspace.name, pid: process.pid, since: new Date().toISOString() }],
+    })
+  );
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
+    'queued',
+    'dead running pid is pruned and alive queued pid reports queued'
+  );
+  await fs.writeFile(slotsFile, JSON.stringify({ version: 1, running: [], queue: [] }));
+  assert.equal(
+    (await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo })).server,
+    null,
+    'empty slots reports null'
+  );
+  await fs.mkdir(path.join(workspace.path, '.durango'), { recursive: true });
+  await fs.writeFile(
+    path.join(workspace.path, '.durango', 'change.json'),
+    JSON.stringify({ changeId: 'chg_test12345678', status: 'open' })
+  );
+  const withChange = await workspaces.durangoWorkspaceStatus({ path: workspace.path, name: workspace.name, repo });
+  assert.deepEqual(withChange.change, {
+    changeId: 'chg_test12345678',
+    status: 'open',
+    url: null,
+    title: null,
+    rejection: null,
+  });
+  await fs.rm(path.join(workspace.path, '.durango', 'change.json'), { force: true });
+
   // --- ws rm ---------------------------------------------------------------------
   await fs.writeFile(path.join(workspace.workingDir, 'new.js'), 'export {};\n');
   const refused = await workspaces.removeDurangoWorkspace({ name: workspace.name, repo });
