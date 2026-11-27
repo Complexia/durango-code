@@ -524,6 +524,8 @@ contextBridge.exposeInMainWorld('orion', {
   durangoDispatchNotice: (input) => ipcRenderer.invoke('durango:dispatchNotice', input),
   botThreadTurnSettled: (input) => ipcRenderer.invoke('bots:threadTurnSettled', input),
   botThreadTurnNotice: (input) => ipcRenderer.invoke('bots:threadTurnNotice', input),
+  syncBotThreadRequests: (input) => ipcRenderer.invoke('bots:syncThreadRequests', input),
+  answerBotThreadRequest: (input) => ipcRenderer.invoke('bots:answerThreadRequest', input),
   onDurangoDispatchState: (callback) => {
     const listener = (_event, data) => callback(data);
     ipcRenderer.on('durango:dispatchState', listener);

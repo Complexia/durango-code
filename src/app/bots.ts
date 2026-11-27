@@ -27,7 +27,12 @@ export type DesktopBot = {
   lastActivityAt: number;
   lastPreview: string | null;
   unread: number;
+  /** It asked the person something (ask_user), or a thread it started waits on them ("Needs you"). */
   needsYou: boolean;
+  /** Just the ask_user part of `needsYou` (absent from older Durango servers). */
+  asked?: boolean;
+  /** What the threads it started wait on the person for (botThreadRequests.ts), oldest first. */
+  requests?: import('./botThreadRequests').BotThreadRequest[];
   createdAt?: number;
   /** A project bot's project (Durango's key: the Source repo, or a machine's project). */
   project?: { key: string; name: string; repoId: string | null } | null;

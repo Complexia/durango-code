@@ -2240,6 +2240,23 @@ type OrionCodexBrowserIntegrationStatus = {
         seq: number;
         detail: string;
       }) => Promise<{ ok: boolean; skipped?: boolean; stale?: boolean; retry?: boolean }>;
+      /** This machine's bot-started threads' "Needs you" requests → Durango; answers given in a bot's chat come back. */
+      syncBotThreadRequests?: (
+        input: import('./app/botThreadRequests').BotThreadRequestSyncInput
+      ) => Promise<{
+        ok: boolean;
+        code?: string;
+        error?: string;
+        answers?: import('./app/botThreadRequests').BotThreadRequestAnswer[];
+        ended?: Array<{ threadId: string; requestId: string }>;
+      }>;
+      /** Answers a bot-started thread's request from the bot's chat, for a thread not on this computer. */
+      answerBotThreadRequest?: (input: {
+        requestId: string;
+        op: 'done' | 'reply' | 'dismiss' | 'save' | 'decline';
+        reply?: string;
+        sealed?: string;
+      }) => Promise<{ ok: boolean; error?: string; machineName?: string | null; online?: boolean; at?: number }>;
       onDurangoDispatchState?: (cb: (state: DurangoDispatchState) => void) => () => void;
       onDurangoFocusThread?: (cb: (payload: { threadId: string }) => void) => () => void;
       workspaceSyncConfigure?: (

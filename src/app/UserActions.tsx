@@ -34,10 +34,19 @@ const SecretRequestCard = ({
   action,
   currentThreadId,
   onAnswer,
+  source,
+  note,
+  unavailable,
 }: {
   action: PendingUserAction;
   currentThreadId: string;
   onAnswer: (threadId: string, actionId: string, answer: SecretAnswer) => Promise<string | undefined>;
+  /** Replaces the "From subagent" line (a bot's chat: which thread and machine asked). */
+  source?: React.ReactNode;
+  /** Replaces the note under the input (where the value goes). */
+  note?: string;
+  /** Why the value can't be entered here (the input stays disabled). */
+  unavailable?: string;
 }) => {
   const secret = action.secret!;
   const [value, setValue] = useState('');
@@ -68,14 +77,17 @@ const SecretRequestCard = ({
             <KeyRound size={13} className="shrink-0 text-amber-300" />
             <span className="min-w-0 truncate">{secret.label}</span>
           </div>
-          <div className="mt-0.5 text-[12.5px] leading-snug text-[var(--text-secondary)] [&_.markdown-content]:text-[12.5px] [&_.markdown-content>:first-child]:mt-0 [&_.markdown-content>:last-child]:mb-0">
-            <MarkdownContent content={secret.reason} />
-          </div>
-          {action.threadId !== currentThreadId && (
-            <div className="mt-0.5 truncate text-[11.5px] text-[var(--text-secondary)]">
-              From subagent {action.threadTitle}
+          {secret.reason.trim() && (
+            <div className="mt-0.5 text-[12.5px] leading-snug text-[var(--text-secondary)] [&_.markdown-content]:text-[12.5px] [&_.markdown-content>:first-child]:mt-0 [&_.markdown-content>:last-child]:mb-0">
+              <MarkdownContent content={secret.reason} />
             </div>
           )}
+          {source ??
+            (action.threadId !== currentThreadId && (
+              <div className="mt-0.5 truncate text-[11.5px] text-[var(--text-secondary)]">
+                From subagent {action.threadTitle}
+              </div>
+            ))}
         </div>
         {action.url && (
           <button
@@ -92,10 +104,10 @@ const SecretRequestCard = ({
       <div className="mt-2 flex items-center gap-1.5">
         <div className="relative min-w-0 flex-1">
           <input
-            autoFocus
+            autoFocus={!source}
             type={revealed ? 'text' : 'password'}
             value={value}
-            disabled={busy}
+            disabled={busy || Boolean(unavailable)}
             placeholder={secret.placeholder ?? 'Paste or type the value'}
             aria-label={secret.label}
             autoComplete="off"
@@ -128,7 +140,7 @@ const SecretRequestCard = ({
         </div>
         <button
           type="submit"
-          disabled={busy || !value.trim()}
+          disabled={busy || Boolean(unavailable) || !value.trim()}
           className="inline-flex shrink-0 items-center gap-1 rounded-md bg-amber-300 px-2.5 py-1.5 text-[12px] font-medium text-neutral-950 hover:bg-amber-200 disabled:opacity-40 disabled:hover:bg-amber-300"
         >
           {busy ? <LoaderCircle size={12} className="animate-spin" /> : <Lock size={12} />}
@@ -149,6 +161,10 @@ const SecretRequestCard = ({
         <div role="alert" className="mt-1 text-[11.5px] text-red-300">
           {error}
         </div>
+      ) : unavailable ? (
+        <div className="mt-1 text-[11.5px] text-amber-200/80">{unavailable}</div>
+      ) : note ? (
+        <div className="mt-1 text-[11.5px] text-[var(--text-secondary)]">{note}</div>
       ) : (
         <div className="mt-1 text-[11.5px] text-[var(--text-secondary)]">
           {secret.delivery === 'ref'
@@ -182,6 +198,12 @@ export const UserActionCards = React.memo(function UserActionCards({
   onDismiss,
   onWatch,
   onSecretAnswer,
+  source,
+  secretNote,
+  secretUnavailable,
+  allowFiles,
+  extra,
+  extraCount = 0,
 }: {
   actions: PendingUserAction[];
   currentThreadId: string;
@@ -190,6 +212,20 @@ export const UserActionCards = React.memo(function UserActionCards({
   onDismiss: (threadId: string, actionId: string) => void;
   onWatch: (threadId: string, actionId: string, watching: boolean) => void;
   onSecretAnswer: (threadId: string, actionId: string, answer: SecretAnswer) => Promise<string | undefined>;
+  /**
+   * Shown with the cards elsewhere than their own thread (a bot's chat): the
+   * line under each card naming where it comes from, in place of "From subagent".
+   */
+  source?: (action: PendingUserAction) => React.ReactNode;
+  /** A secret card's note on where its value goes, when not this computer's thread. */
+  secretNote?: (action: PendingUserAction) => string | undefined;
+  /** Why a secret card's value can't be entered here. */
+  secretUnavailable?: (action: PendingUserAction) => string | undefined;
+  /** Whether a card's reply may carry files (only where the thread is on this computer). */
+  allowFiles?: (action: PendingUserAction) => boolean;
+  /** More rows inside the panel, after the cards (and how many count in its header). */
+  extra?: React.ReactNode;
+  extraCount?: number;
 }) {
   const [replyingTo, setReplyingTo] = useState<string | null>(null);
   const [reply, setReply] = useState('');
@@ -202,7 +238,8 @@ export const UserActionCards = React.memo(function UserActionCards({
   // closed or moved to another action are dropped.
   const replyingToRef = useRef(replyingTo);
   replyingToRef.current = replyingTo;
-  if (actions.length === 0) return null;
+  const total = actions.length + extraCount;
+  if (total === 0) return null;
   const openReply = (key: string | null) => {
     setReplyingTo(key);
     setReply('');
@@ -234,21 +271,30 @@ export const UserActionCards = React.memo(function UserActionCards({
     >
       <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-amber-300">
         <Hand size={13} className="shrink-0" />
-        {actions.length === 1 ? 'Needs you' : `Needs you · ${actions.length}`}
+        {total === 1 ? 'Needs you' : `Needs you · ${total}`}
       </div>
       {actions.map((action) => {
         const key = `${action.threadId}:${action.id}`;
         if (action.secret) {
           return (
-            <SecretRequestCard key={key} action={action} currentThreadId={currentThreadId} onAnswer={onSecretAnswer} />
+            <SecretRequestCard
+              key={key}
+              action={action}
+              currentThreadId={currentThreadId}
+              onAnswer={onSecretAnswer}
+              source={source?.(action)}
+              note={secretNote?.(action)}
+              unavailable={secretUnavailable?.(action)}
+            />
           );
         }
+        const filesOk = allowFiles ? allowFiles(action) : true;
         return (
           <div
             key={key}
             className={`mt-1.5 rounded-lg ${dropTarget === key ? 'outline outline-1 outline-offset-4 outline-amber-300/60' : ''}`}
             onDragOver={(event) => {
-              if (!hasFiles(event)) return;
+              if (!filesOk || !hasFiles(event)) return;
               event.preventDefault();
               event.dataTransfer.dropEffect = 'copy';
               if (dropTarget !== key) setDropTarget(key);
@@ -257,7 +303,7 @@ export const UserActionCards = React.memo(function UserActionCards({
               if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null);
             }}
             onDrop={(event) => {
-              if (!hasFiles(event)) return;
+              if (!filesOk || !hasFiles(event)) return;
               // The app's root drop handler skips a drop taken here.
               event.preventDefault();
               setDropTarget(null);
@@ -267,11 +313,13 @@ export const UserActionCards = React.memo(function UserActionCards({
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1 [&_.markdown-content]:text-[13.5px] [&_.markdown-content>:first-child]:mt-0 [&_.markdown-content>:last-child]:mb-0">
                 <MarkdownContent content={action.action} />
-                {action.threadId !== currentThreadId && (
-                  <div className="mt-0.5 truncate text-[11.5px] text-[var(--text-secondary)]">
-                    From subagent {action.threadTitle}
-                  </div>
-                )}
+                {source
+                  ? source(action)
+                  : action.threadId !== currentThreadId && (
+                      <div className="mt-0.5 truncate text-[11.5px] text-[var(--text-secondary)]">
+                        From subagent {action.threadTitle}
+                      </div>
+                    )}
                 {action.check && (
                   <div className="mt-1 flex min-w-0 items-center gap-1.5 text-[11.5px] text-[var(--text-secondary)]">
                     {action.watching ? (
@@ -402,7 +450,7 @@ export const UserActionCards = React.memo(function UserActionCards({
                   onChange={(event) => setReply(event.target.value)}
                   onPaste={(event) => {
                     const files = Array.from(event.clipboardData.files);
-                    if (files.length === 0) return;
+                    if (!filesOk || files.length === 0) return;
                     event.preventDefault();
                     void addFiles(key, files);
                   }}
@@ -415,17 +463,19 @@ export const UserActionCards = React.memo(function UserActionCards({
                       openReply(null);
                     }
                   }}
-                  className="block w-full resize-none rounded-md border border-white/15 bg-black/20 py-1.5 pl-2.5 pr-[4.25rem] text-[13px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)] focus:border-amber-300/50"
+                  className={`block w-full resize-none rounded-md border border-white/15 bg-black/20 py-1.5 pl-2.5 ${filesOk ? 'pr-[4.25rem]' : 'pr-9'} text-[13px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-secondary)] focus:border-amber-300/50`}
                 />
-                <button
-                  type="button"
-                  title="Attach files (or paste or drop them here)"
-                  aria-label="Attach files"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="absolute bottom-1.5 right-8 inline-flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
-                >
-                  <Paperclip size={13} />
-                </button>
+                {filesOk && (
+                  <button
+                    type="button"
+                    title="Attach files (or paste or drop them here)"
+                    aria-label="Attach files"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="absolute bottom-1.5 right-8 inline-flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-white/[0.06] hover:text-[var(--text-primary)]"
+                  >
+                    <Paperclip size={13} />
+                  </button>
+                )}
                 <button
                   type="button"
                   title="Send (Enter)"
@@ -441,6 +491,7 @@ export const UserActionCards = React.memo(function UserActionCards({
           </div>
         );
       })}
+      {extra}
     </div>
   );
 });

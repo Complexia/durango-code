@@ -919,6 +919,26 @@ export const createDurangoClient = ({
         pendingAttachments: pendingBotAttachmentsSupported,
       };
     },
+    /**
+     * What this machine's bot-started threads wait on the person for, as a
+     * whole set (Durango drops the ones not listed), so their bots' chats show
+     * the cards: `{ machineId, machineName?, threads, failed? }` → `{ answers }`:
+     * the person's answers given in a bot's chat, for this machine to apply.
+     */
+    async syncBotThreadRequests({ signal, ...body } = {}) {
+      const data = await request('POST', '/code/bots/thread-requests', { body, signal });
+      return { ok: data.ok === true, answers: Array.isArray(data.answers) ? data.answers : [] };
+    },
+    /** The person answers a bot-started thread's request from the bot's chat: `{ requestId, op, reply?, sealed? }` → `{ ok, machineName, online }`. */
+    async answerBotThreadRequest(body = {}) {
+      const data = await request('POST', '/bots/thread-requests/answer', { body });
+      return {
+        ok: data.ok === true,
+        machineName: typeof data.machineName === 'string' ? data.machineName : null,
+        online: data.online === true,
+        ...(Number.isFinite(data.at) ? { at: data.at } : {}),
+      };
+    },
     /** Saves the person's manual Bots sidebar ordering (project groups and/or bots within one project) → `{ ok, projectOrder }`. */
     async reorderBots({ projectOrder, projectKey, botIds } = {}) {
       const body = {
@@ -1588,6 +1608,12 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000, botLanesFile 
         modelChoices: mockBots?.modelChoices ?? null,
         modelCatalog: mockBots?.modelCatalog ?? null,
       };
+    },
+    async syncBotThreadRequests() {
+      return { ok: true, answers: [] };
+    },
+    async answerBotThreadRequest() {
+      return { ok: true, machineName: null, online: true };
     },
     async reorderBots({ projectOrder } = {}) {
       return { ok: true, ...(Array.isArray(projectOrder) ? { projectOrder } : {}) };

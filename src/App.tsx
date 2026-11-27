@@ -192,6 +192,7 @@ import {
   startDurangoDispatchNotices,
   startDurangoDispatchReporter,
 } from './app/durangoDispatch';
+import { startBotThreadRequestSync } from './app/botThreadRequests';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
 import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
@@ -10270,6 +10271,68 @@ const App: React.FC = () => {
     });
   }, []);
 
+  // A bot-started thread's "Needs you" cards show in its bot's chat on every
+  // device (app/botThreadRequests.ts): this machine tells Durango what its
+  // bot-started threads wait on, and presses the card buttons the person
+  // pressed in a bot's chat elsewhere, as the card here would.
+  const userActionHandlersRef = useRef({ onUserActionDone, onUserActionReply, onUserActionDismiss, dismissUserAction });
+  useLayoutEffect(() => {
+    userActionHandlersRef.current = { onUserActionDone, onUserActionReply, onUserActionDismiss, dismissUserAction };
+  });
+  useEffect(() => {
+    const sync = window.orion?.syncBotThreadRequests;
+    if (!sync) return undefined;
+    const FLAG = 'orion.botThreadRequests.pending';
+    return startBotThreadRequestSync({
+      getState: () => useOrionStore.getState(),
+      subscribe: (listener) => useOrionStore.subscribe(listener),
+      onTurnEvent: (listener) => window.orion?.onAgentTurnEvent?.(listener),
+      pendingInput: async (threadId) => {
+        const [codex, claude] = await Promise.all([
+          window.orion?.getCodexQuestions?.(threadId),
+          window.orion?.getClaudeQuestions?.(threadId),
+        ]);
+        return [...(codex ?? []), ...(claude ?? [])].filter((request) => request.threadId === threadId);
+      },
+      sync: (input) => sync(input),
+      // Not before the saved threads are loaded: an empty set would clear Durango's copy.
+      whenReady: () =>
+        useOrionStore.persist.hasHydrated()
+          ? Promise.resolve()
+          : new Promise<void>((resolve) => {
+              const unsubscribe = useOrionStore.persist.onFinishHydration(() => {
+                unsubscribe();
+                resolve();
+              });
+            }),
+      // A secret request that ended before its answer arrived: its card goes, as in the thread view.
+      dropCard: (threadId, requestId) => userActionHandlersRef.current.dismissUserAction(threadId, requestId),
+      apply: (answer) => {
+        const handlers = userActionHandlersRef.current;
+        if (answer.op === 'done') handlers.onUserActionDone(answer.actionThreadId, answer.requestId);
+        else if (answer.op === 'reply') handlers.onUserActionReply(answer.actionThreadId, answer.requestId, answer.reply ?? '', []);
+        else handlers.onUserActionDismiss(answer.actionThreadId, answer.requestId);
+      },
+      projectName: (projectId) =>
+        projectId ? useOrionStore.getState().projects.find((project) => project.id === projectId)?.name : undefined,
+      hadRequests: () => window.localStorage.getItem(FLAG) === '1',
+      setHadRequests: (value) => {
+        if (value) window.localStorage.setItem(FLAG, '1');
+        else window.localStorage.removeItem(FLAG);
+      },
+    });
+  }, []);
+  const botUserActionHandlers = useMemo(
+    () => ({
+      onDone: onUserActionDone,
+      onReply: onUserActionReply,
+      onDismiss: onUserActionDismiss,
+      onWatch: onUserActionWatch,
+      onSecretAnswer,
+    }),
+    [onSecretAnswer, onUserActionDismiss, onUserActionDone, onUserActionReply, onUserActionWatch]
+  );
+
   // A thread on another machine ends its turn there and its synced copy
   // brings the new status here: the linked tasks that turn carried leave
   // "running" on the board, as they do when a local turn ends.
@@ -12355,6 +12418,7 @@ const App: React.FC = () => {
                 threadActions={sidebarV2Actions}
                 attentionThreadIds={attentionThreadIds}
                 paneThreadIds={paneThreadIds}
+                userActionHandlers={botUserActionHandlers}
               />
             </React.Suspense>
           )}

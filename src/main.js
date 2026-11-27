@@ -61,6 +61,7 @@ import { withClaudeEnv } from './main/claude-env.js';
 import { claudeSdkSessions, createClaudeInputQueue, discardClaudeBackgroundShellTasks, disposeAllClaudeSdkSessions, disposeClaudeSdkSession, disposeClaudeSdkSessionAndWait, interruptClaudeSdkRun, listClaudeSlashCommands, loadClaudeSdk, loadZod, notifyClaudeSession, resolveClaudeBinary, runClaudeSdkTurn, steerClaudeSdkRun } from './main/claude-driver.js';
 import { unwatchUserActions, watchUserAction } from './main/user-actions.js';
 import { answerSecretRequest, listPendingSecretRequests, startSecretFileSweeps } from './main/secret-requests.js';
+import { createBotThreadRequestsBridge } from './main/bot-thread-requests.js';
 import { devServerUrlForPort, killDevServers, listDevServers } from './main/dev-servers.js';
 import { buildUsageReport, createUsageStore, latestCodexLimits } from './main/usage-stats.js';
 import { loadUsagePrices, refreshUsagePrices, usagePricesInfo } from './main/usage-pricing.js';
@@ -6355,6 +6356,18 @@ const localBotsMode = async () => {
   localBots.setActive(true);
   return true;
 };
+// "Needs you" requests of this machine's bot-started threads, mirrored into
+// their bots' chats (src/main/bot-thread-requests.js): the renderer hands
+// over what they wait on, Durango hands back answers given in a bot's chat.
+const botThreadRequests = createBotThreadRequestsBridge({
+  client: durangoClient,
+  getMachineId: () => getDurangoDeviceId(),
+  getMachineName: () => getDispatchMachineName(),
+  signedOut: async () => !(await isDispatchSignedIn()),
+  answerSecretRequest,
+});
+ipcMain.handle('bots:syncThreadRequests', (_event, input) => botThreadRequests.sync(input ?? {}));
+ipcMain.handle('bots:answerThreadRequest', (_event, input) => botThreadRequests.answer(input ?? {}));
 const localBotsIpcError = (error) => ({
   ok: false,
   ...(typeof error?.code === 'string' ? { code: error.code } : {}),
@@ -7197,6 +7210,9 @@ ipcMain.handle('durango:profileMemory', async () => {
 });
 
 ipcMain.handle('account:signOut', async () => {
+  // While still signed in: Durango drops this machine's "Needs you" cards
+  // from bot chats (no machine would answer them).
+  await botThreadRequests.clear().catch(() => undefined);
   await clearAccountSession();
   return publishAccountState(null);
 });

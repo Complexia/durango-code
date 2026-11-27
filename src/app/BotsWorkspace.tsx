@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import {
   AlertCircle,
@@ -32,6 +32,7 @@ import {
   Library,
   ListChecks,
   Loader2,
+  MessageCircleQuestion,
   MessagesSquare,
   NotebookPen,
   Paperclip,
@@ -112,6 +113,8 @@ import {
   useSidebarDragReorder,
 } from './useSidebarDragReorder';
 import { BotModelMenu } from './BotModelMenu';
+import { BotNeedsYouPanel, type UserActionHandlers } from './BotNeedsYou';
+import { allBotCards, botSentAnswers, threadCardsKey, withNeedsYouNow, type BotThreadRequest } from './botThreadRequests';
 
 // The sidebar's Bots tab (once "Sidebar v3" in Settings → Experimental): the
 // sidebar lists the person's Durango bots under the shared header
@@ -205,6 +208,8 @@ const bumpBotThreadEpoch = (botId: string) => {
 const clearBotCaches = () => {
   botCacheGeneration += 1;
   botListCache = null;
+  // Answers sent from the old account's bot chats don't apply to the next one.
+  botSentAnswers.clear();
   botThreadCache.clear();
   botThreadEpochs.clear();
   botProjectCache.clear();
@@ -252,6 +257,8 @@ const BotAvatar: React.FC<{ bot: FaceBot; size?: 'sm' | 'md'; projectPath?: stri
 
 type WorkspaceProps = {
   sidebarFooterProps: SidebarFooterProps;
+  /** The thread view's "Needs you" card handlers: a bot's chat answers its threads' cards with them. */
+  userActionHandlers?: UserActionHandlers;
   /** The usual thread view (App's agents panel), shown when a thread is open here. */
   threadPanel: React.ReactNode;
   /** Starts a new thread in a project; returns its id. */
@@ -353,6 +360,7 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   onNewThread,
   threadActions,
   attentionThreadIds,
+  userActionHandlers,
 }: WorkspaceProps) {
   const v3 = useOrionStore((state) => state.sidebarV3Settings);
   const selectedBotId = v3?.selectedBotId ?? null;
@@ -363,7 +371,19 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
   const threads = useOrionStore((state) => state.threads);
   const { sidebarRef, resizeHandle } = useSidebarResize({ storageKey: AGENTS_SIDEBAR_STORAGE_KEY, label: 'Agents sidebar' });
   const sidebarScrollRef = useRef<HTMLDivElement>(null);
-  const [bots, setBots] = useState<DesktopBot[] | null>(() => botListCache?.bots ?? null);
+  const [listedBots, setBots] = useState<DesktopBot[] | null>(() => botListCache?.bots ?? null);
+  // "Needs you" as it stands here now: a thread here asking makes its bot
+  // stand out before Durango's next list (and signed out, where only this
+  // computer knows); a card answered here clears it at once.
+  const sentAnswers = useSyncExternalStore(botSentAnswers.subscribe, botSentAnswers.get);
+  const cardsKey = useMemo(() => threadCardsKey(threads), [threads]);
+  const threadsRef = useRef(threads);
+  threadsRef.current = threads;
+  const bots = useMemo(
+    () => withNeedsYouNow(listedBots, threadsRef.current, sentAnswers),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [listedBots, cardsKey, sentAnswers]
+  );
   const [projectOrder, setProjectOrder] = useState<string[]>(() => botListCache?.projectOrder ?? []);
   const [projectKeys, setProjectKeys] = useState<Record<string, string>>(() => botListCache?.projectKeys ?? {});
   const [modelChoices, setModelChoices] = useState<BotModelChoice[] | null>(() => botListCache?.modelChoices ?? null);
@@ -410,6 +430,16 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
     [setSidebarV3Settings]
   );
   const [allowed, setAllowed] = useState(() => botListCache?.allowed ?? true);
+  // Answers sent from a bot chat here are checked against every listed bot's
+  // cards (whichever bot is open): forgotten once taken, failed or re-opened.
+  useEffect(() => {
+    botSentAnswers.reconcile(allBotCards(listedBots, threadsRef.current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listedBots, cardsKey, sentAnswers]);
+  // The Bots tab's badge reads "Needs you" as the sidebar shows it.
+  useEffect(() => {
+    if (allowed && bots) noteBotList(bots);
+  }, [allowed, bots]);
   const [mode, setMode] = useState<'local' | 'durango' | null>(() => botListCache?.mode ?? null);
   // Signed in with Claude Code here, but bot replies on this machine are
   // turned off (Settings → Durango): they run in Durango's cloud instead.
@@ -1113,9 +1143,9 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                             aria-roledescription={groupCanReorder ? 'sortable project group' : undefined}
                             aria-description={groupCanReorder ? `Drag or press ${reorderShortcutHint} to reorder project groups` : undefined}
                             title={groupCanReorder ? `${group.name} · drag or ${reorderShortcutHint} to reorder` : group.name}
-                            className={`flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left transition-colors duration-75 hover:bg-white/[0.04] ${
-                              groupCanReorder ? 'cursor-grab active:cursor-grabbing' : ''
-                            }`}
+                            className={`flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 text-left transition-colors duration-75 ${
+                              !expanded && groupNeedsYou ? 'bg-amber-400/[0.09] hover:bg-amber-400/[0.13]' : 'hover:bg-white/[0.04]'
+                            } ${groupCanReorder ? 'cursor-grab active:cursor-grabbing' : ''}`}
                           >
                             {groupCanReorder && (
                               <GripVertical
@@ -1139,12 +1169,12 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
                             </span>
                             {!expanded && (
                               <span className="flex shrink-0 items-center">
-                                {groupUnread > 0 ? (
+                                {groupNeedsYou ? (
+                                  <BotNeedsYouLabel compact />
+                                ) : groupUnread > 0 ? (
                                   <span className="rounded-full bg-sky-500 px-1.5 text-[10px] font-semibold leading-[16px] text-white">{groupUnread}</span>
                                 ) : groupWorking ? (
                                   <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
-                                ) : groupNeedsYou ? (
-                                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
                                 ) : (
                                   <span className="text-[10px] tabular-nums text-neutral-600">{group.bots.length}</span>
                                 )}
@@ -1333,6 +1363,8 @@ export const BotsWorkspace = React.memo(function BotsWorkspace({
               onChanged={loadBots}
               onOpenProject={openProjectOfBot}
               onOpenThread={openBotThread}
+              requests={selectedBot?.requests}
+              userActionHandlers={userActionHandlers}
             />
           ) : (
             <div className="empty-state">
@@ -2280,10 +2312,10 @@ const ProjectBotBox: React.FC<{
   const name = bot?.name ?? entry.name;
   const faceBot: FaceBot = bot ?? { emoji: null, name: entry.name, role: 'bot', faceSeed: entry.key ?? entry.id };
   const status = bot
-    ? botIsWorking(bot)
-      ? <span className="text-sky-300">working</span>
-      : bot.needsYou
-        ? <span className="text-amber-300">waiting on you</span>
+    ? bot.needsYou
+      ? <span className="text-amber-300">needs you</span>
+      : botIsWorking(bot)
+        ? <span className="text-sky-300">working</span>
         : <>active {relativeBotTime(bot.lastActivityAt)}</>
     : null;
 
@@ -2353,12 +2385,12 @@ const ProjectBotBox: React.FC<{
                     Primary
                   </span>
                 )}
-                {candidate.unread > 0 ? (
+                {candidate.needsYou ? (
+                  <BotNeedsYouLabel compact />
+                ) : candidate.unread > 0 ? (
                   <span className="rounded-full bg-sky-500 px-1 text-[10px] font-semibold leading-[15px] text-white">{candidate.unread}</span>
                 ) : candidateWorking ? (
                   <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-sky-400" />
-                ) : candidate.needsYou ? (
-                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
                 ) : null}
               </button>
             );
@@ -2709,12 +2741,12 @@ const BotDragPreview: React.FC<{ bot: DesktopBot; projectPath?: string | null }>
           Primary
         </span>
       )}
-      {bot.unread > 0 ? (
+      {bot.needsYou ? (
+        <BotNeedsYouLabel />
+      ) : bot.unread > 0 ? (
         <span className="shrink-0 rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
       ) : working ? (
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
-      ) : bot.needsYou ? (
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
       ) : null}
     </div>
   );
@@ -2740,12 +2772,12 @@ const ProjectGroupDragPreview: React.FC<{ group: SidebarProjectGroup; expanded: 
         <span className="shrink-0 rounded-full bg-white/[0.08] px-1.5 text-[10px] tabular-nums leading-[16px] text-neutral-300">
           {group.bots.length} {group.bots.length === 1 ? 'bot' : 'bots'}
         </span>
+      ) : groupNeedsYou ? (
+        <BotNeedsYouLabel compact />
       ) : groupUnread > 0 ? (
         <span className="shrink-0 rounded-full bg-sky-500 px-1.5 text-[10px] font-semibold leading-[16px] text-white">{groupUnread}</span>
       ) : groupWorking ? (
         <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-sky-400" />
-      ) : groupNeedsYou ? (
-        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-400" />
       ) : (
         <span className="shrink-0 text-[10px] tabular-nums text-neutral-400">{group.bots.length}</span>
       )}
@@ -2753,7 +2785,22 @@ const ProjectGroupDragPreview: React.FC<{ group: SidebarProjectGroup; expanded: 
   );
 };
 
-/** A compact one-line sidebar row: icon, name, hover menu, and unread count or a working / waiting dot. */
+/**
+ * A bot that waits on the person (it asked something, or a thread it started
+ * needs them): the amber "Needs you" a thread row shows, louder than an
+ * unread count or a working dot.
+ */
+const BotNeedsYouLabel: React.FC<{ compact?: boolean }> = ({ compact = false }) => (
+  <span
+    className={`inline-flex shrink-0 items-center gap-1 font-medium text-amber-300 ${compact ? 'text-[10.5px]' : 'text-[11.5px]'}`}
+    aria-label="Needs you"
+  >
+    <MessageCircleQuestion size={compact ? 11 : 13} className="shrink-0" />
+    Needs you
+  </span>
+);
+
+/** A compact one-line sidebar row: icon, name, hover menu, and a "Needs you", unread count or working dot. */
 const BotRow: React.FC<{
   bot: DesktopBot;
   projectPath?: string | null;
@@ -2815,7 +2862,15 @@ const BotRow: React.FC<{
       aria-description={sortable && reorderHint ? `Drag or press ${reorderHint} to reorder within this project` : undefined}
       className={`group relative flex h-9 w-full items-center gap-2.5 rounded-lg px-2 text-left transition-colors duration-75 ${
         sortable ? 'cursor-pointer' : 'cursor-pointer'
-      } ${active ? 'bg-white/[0.08]' : menuOpen ? 'bg-white/[0.06]' : 'hover:bg-white/[0.045]'}`}
+      } ${
+        bot.needsYou
+          ? `bg-amber-400/[0.09] hover:bg-amber-400/[0.13] ${active ? 'ring-1 ring-inset ring-white/[0.12]' : ''}`
+          : active
+            ? 'bg-white/[0.08]'
+            : menuOpen
+              ? 'bg-white/[0.06]'
+              : 'hover:bg-white/[0.045]'
+      }`}
     >
       {sortable && (
         <GripVertical
@@ -2837,12 +2892,12 @@ const BotRow: React.FC<{
         </span>
       )}
       <span className={`shrink-0 items-center ${menuOpen ? 'hidden' : 'flex group-hover:hidden group-focus-within:hidden'}`}>
-        {bot.unread > 0 ? (
+        {bot.needsYou ? (
+          <BotNeedsYouLabel />
+        ) : bot.unread > 0 ? (
           <span className="rounded-full bg-sky-500 px-1.5 text-[11px] font-semibold leading-[18px] text-white">{bot.unread}</span>
         ) : working ? (
           <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-sky-400" />
-        ) : bot.needsYou ? (
-          <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
         ) : bot.paused ? (
           <Pause size={11} className="text-neutral-600" />
         ) : null}
@@ -2882,7 +2937,24 @@ const BotPane: React.FC<{
   onOpenProject: (bot: DesktopBot) => void;
   /** Opens a Durango Code thread here in the usual thread view; false when it isn't on this computer. */
   onOpenThread: (threadId: string) => boolean;
-}> = ({ botId, botHint, projectPath, modelChoices, modelCatalog, local, claudeAvailable, machineReplies, onChanged, onOpenProject, onOpenThread }) => {
+  /** What the threads it started wait on the person for (Durango's list). */
+  requests?: BotThreadRequest[];
+  userActionHandlers?: UserActionHandlers;
+}> = ({
+  botId,
+  botHint,
+  projectPath,
+  modelChoices,
+  modelCatalog,
+  local,
+  claudeAvailable,
+  machineReplies,
+  onChanged,
+  onOpenProject,
+  onOpenThread,
+  requests,
+  userActionHandlers,
+}) => {
   // `thread.messages`: every message loaded so far (the newest page, older
   // pages scrolled back to, and what polls brought), in seq order; unchanged
   // messages keep their objects so their rows don't redraw (botThreadWindow.ts).
@@ -3481,6 +3553,7 @@ const BotPane: React.FC<{
         </button>
       )}
       </div>
+      <BotNeedsYouPanel botId={bot.id} requests={requests} handlers={userActionHandlers} onOpenThread={onOpenThread} />
       <BotComposer
         draftKey={botDraftKey(bot.id)}
         botName={bot.name}
