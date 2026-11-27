@@ -65,6 +65,7 @@ import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { sortProjectsByLatestThreadStart } from './projectOrder';
 import { useSidebarResize } from './useSidebarResize';
 import { useBotsShellSlot } from './botsShellSlot';
+import { registerBotFileDropHandler } from './rootFileDrop';
 import { AGENTS_SIDEBAR_STORAGE_KEY, SidebarModeHeader } from './SidebarModeHeader';
 import { noteBotList } from './botsTabBadge';
 import {
@@ -4463,6 +4464,16 @@ const BotComposer: React.FC<{
     if (ok.length < picked.length) setAttachError('Some files couldn’t be attached.');
     add(ok);
   };
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+  useEffect(
+    () =>
+      registerBotFileDropHandler({
+        botName,
+        onDrop: (dropped) => void addFilesRef.current(dropped),
+      }),
+    [botName]
+  );
   const pick = async () => {
     const result = await window.orion?.pickBotAttachments?.();
     if (!result) return;

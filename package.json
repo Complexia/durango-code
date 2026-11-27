@@ -97,6 +97,7 @@
     "test:claude-foreground-wait": "node --no-warnings scripts/test-claude-foreground-wait.mjs",
     "test:claude-capabilities": "node scripts/run-electron-test.mjs scripts/test-claude-capabilities.mjs",
     "test:attachments": "bun scripts/test-attachments.tsx",
+    "test:root-file-drop": "bun scripts/test-root-file-drop.tsx",
     "test:heic-attachments": "node scripts/run-electron-test.mjs scripts/test-heic-attachments.mjs",
     "test:snapshot": "node --no-warnings scripts/test-snapshot.mjs",
     "build:snapshot-helper": "node scripts/build-snapshot-helper.mjs",

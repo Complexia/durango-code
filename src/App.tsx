@@ -275,6 +275,14 @@ const BotsWorkspace = React.lazy(() => loadBotsWorkspace().then((module) => ({ d
 import ThemeLayer from './app/themes/ThemeLayer';
 import { CommunityInstallDialog } from './app/themes/CommunityThemes';
 import { setBotsShellSlot } from './app/botsShellSlot';
+import {
+  getBotFileDropHandler,
+  hasFileDrag,
+  hasOpenModalDialog,
+  resolveRootFileDropTarget,
+  rootFileDropOverlayLabel,
+  useBotFileDropHandler,
+} from './app/rootFileDrop';
 import { useBotRefLinks } from './app/botRefLinks';
 import { BotsTabLoading, loadBotsWorkspace } from './app/SidebarModeHeader';
 // Remote control is opt-in and rarely on screen; keep its view out of the
@@ -5690,6 +5698,20 @@ const App: React.FC = () => {
     [composerDraft]
   );
 
+  const attachFilesToThread = useCallback(
+    async (threadId: string, files: FileList | File[]) => {
+      const selectedFiles = Array.from(files);
+      if (selectedFiles.length === 0) return false;
+
+      const savedAttachments = await saveFilesAsAttachments(selectedFiles);
+      if (!savedAttachments) return true;
+      appendComposerAttachments(threadId, savedAttachments);
+
+      return true;
+    },
+    [appendComposerAttachments]
+  );
+
   const attachFiles = useCallback(
     async (files: FileList | File[]) => {
       const selectedFiles = Array.from(files);
@@ -5698,13 +5720,9 @@ const App: React.FC = () => {
       const targetThreadId = resolveComposerTarget();
       if (!targetThreadId) return true;
 
-      const savedAttachments = await saveFilesAsAttachments(selectedFiles);
-      if (!savedAttachments) return true;
-      appendComposerAttachments(targetThreadId, savedAttachments);
-
-      return true;
+      return attachFilesToThread(targetThreadId, selectedFiles);
     },
-    [appendComposerAttachments, resolveComposerTarget]
+    [attachFilesToThread, resolveComposerTarget]
   );
 
   // SnapShot captures (src/main/snapshot.js) wait in main until collected:
@@ -5754,21 +5772,87 @@ const App: React.FC = () => {
     return useOrionStore.persist.onFinishHydration(push);
   }, [snapShotSettings]);
 
-  const handleRootDragEnter = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
-    event.preventDefault();
-    dragDepth.current += 1;
-    setDraggingFiles(true);
-  }, []);
+  const botFileDropHandler = useBotFileDropHandler();
+  const canAttachToVisibleThread =
+    Boolean(selectedThread) &&
+    (paneThreadIds.length === 0 || paneThreadIds.includes(selectedThread!.id)) &&
+    !isNativeSubagentThread &&
+    !selectedThreadWorkspaceUnavailable;
 
-  const handleRootDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = 'copy';
-  }, []);
+  const resolveCurrentRootFileDropTarget = useCallback(
+    () =>
+      resolveRootFileDropTarget({
+        settingsOpen,
+        activeTab,
+        botsTabOpen,
+        sidebarV3View,
+        hasModalOpen: hasOpenModalDialog(),
+        canAttachToThread: canAttachToVisibleThread,
+        hasBotDropHandler: Boolean(getBotFileDropHandler()),
+      }),
+    [activeTab, botsTabOpen, canAttachToVisibleThread, settingsOpen, sidebarV3View]
+  );
+
+  const rootFileDropTarget = resolveRootFileDropTarget({
+    settingsOpen,
+    activeTab,
+    botsTabOpen,
+    sidebarV3View,
+    hasModalOpen: false,
+    canAttachToThread: canAttachToVisibleThread,
+    hasBotDropHandler: Boolean(botFileDropHandler),
+  });
+  const rootFileDropLabel = rootFileDropOverlayLabel(rootFileDropTarget, botFileDropHandler?.botName);
+
+  useEffect(() => {
+    if (!draggingFiles) return undefined;
+    if (rootFileDropTarget === 'none') {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+      return undefined;
+    }
+    const clear = () => {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+    };
+    window.addEventListener('dragend', clear);
+    window.addEventListener('blur', clear);
+    return () => {
+      window.removeEventListener('dragend', clear);
+      window.removeEventListener('blur', clear);
+    };
+  }, [draggingFiles, rootFileDropTarget]);
+
+  const handleRootDragEnter = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDrag(event.dataTransfer)) return;
+      if (resolveCurrentRootFileDropTarget() === 'none') return;
+      event.preventDefault();
+      dragDepth.current += 1;
+      setDraggingFiles(true);
+    },
+    [resolveCurrentRootFileDropTarget]
+  );
+
+  const handleRootDragOver = useCallback(
+    (event: React.DragEvent<HTMLDivElement>) => {
+      if (!hasFileDrag(event.dataTransfer)) return;
+      if (resolveCurrentRootFileDropTarget() === 'none') {
+        if (dragDepth.current !== 0) {
+          dragDepth.current = 0;
+          setDraggingFiles(false);
+        }
+        return;
+      }
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    },
+    [resolveCurrentRootFileDropTarget]
+  );
 
   const handleRootDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+    if (!hasFileDrag(event.dataTransfer)) return;
+    if (dragDepth.current === 0) return;
     dragDepth.current = Math.max(0, dragDepth.current - 1);
     if (dragDepth.current === 0) {
       setDraggingFiles(false);
@@ -5777,15 +5861,23 @@ const App: React.FC = () => {
 
   const handleRootDrop = useCallback(
     (event: React.DragEvent<HTMLDivElement>) => {
-      if (!Array.from(event.dataTransfer.types).includes('Files')) return;
+      if (!hasFileDrag(event.dataTransfer)) return;
       dragDepth.current = 0;
       setDraggingFiles(false);
-      // Taken by a drop target of its own (a Needs you reply).
+      // Taken by a drop target of its own (a Needs you reply, or the bot composer itself).
       if (event.defaultPrevented) return;
       event.preventDefault();
-      void attachFiles(event.dataTransfer.files);
+      if (event.dataTransfer.files.length === 0) return;
+      const target = resolveCurrentRootFileDropTarget();
+      if (target === 'bot') {
+        void getBotFileDropHandler()?.onDrop(event.dataTransfer.files);
+        return;
+      }
+      if (target === 'thread' && selectedThread) {
+        void attachFilesToThread(selectedThread.id, event.dataTransfer.files);
+      }
     },
-    [attachFiles]
+    [attachFilesToThread, resolveCurrentRootFileDropTarget, selectedThread]
   );
 
   // Durango workspaces (docs/workspaces.md). A thread that has never run gets
@@ -11636,7 +11728,7 @@ const App: React.FC = () => {
 
   return (
     <div
-      className={`app-container ${draggingFiles ? 'dragging-files' : ''}`}
+      className={`app-container ${draggingFiles && rootFileDropLabel ? 'dragging-files' : ''}`}
       onDragEnter={handleRootDragEnter}
       onDragOver={handleRootDragOver}
       onDragLeave={handleRootDragLeave}
@@ -11667,11 +11759,11 @@ const App: React.FC = () => {
       />
       <ImageLightbox />
       <ConfirmDialogHost />
-      {draggingFiles && (
-        <div className="file-drop-overlay">
+      {draggingFiles && rootFileDropLabel && (
+        <div className="file-drop-overlay" data-drop-target={rootFileDropTarget}>
           <div className="file-drop-target">
             <Paperclip size={28} />
-            <span>Drop files to attach</span>
+            <span>{rootFileDropLabel}</span>
           </div>
         </div>
       )}
