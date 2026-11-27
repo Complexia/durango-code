@@ -582,6 +582,7 @@ export const LOCAL_BOT_TOOLS = [
       properties: {
         question: { type: 'string', minLength: 1, maxLength: 500 },
         options: { type: 'array', items: { type: 'string', minLength: 1, maxLength: 120 }, minItems: 1, maxItems: 6 },
+        recommended: { type: 'integer', minimum: 0, maximum: 5, description: 'Index of the option you suggest (optional).' },
       },
       required: ['question', 'options'],
     },
@@ -1958,7 +1959,21 @@ export const createLocalBotEngine = ({
           }
           // A card goes on the message it was made with (or the reply's next one).
           const shown = localCard(name, input, `ui-${reply.id}-${cardCount}`);
-          if (!shown) return { result: await callTool(entry, name, input) };
+          if (!shown) {
+            const result = await callTool(entry, name, input);
+            if (name === 'ask_user' && result?.ok && Array.isArray(result.options) && result.options.length > 0) {
+              const id = Number.isInteger(message) ? botReplyMessageId(reply.id, message) : null;
+              const props = {
+                question: result.asked,
+                options: result.options,
+                ...(typeof result.recommended === 'number' ? { recommended: result.recommended } : {}),
+              };
+              if (addReplyCards(entry, reply, [{ id: `ui-${reply.id}-${cardCount}`, component: 'bot-ask', props }], id)) {
+                cardCount += 1;
+              }
+            }
+            return { result };
+          }
           if (shown.error) return { result: { ok: false, error: shown.error } };
           reply.silent = false;
           reply.silentReason = null;
@@ -2797,6 +2812,10 @@ export const createLocalBotEngine = ({
         case 'ask_user': {
           const question = oneLine(input.question);
           const options = (Array.isArray(input.options) ? input.options : []).map(oneLine).filter(Boolean).slice(0, 6);
+          const recommended =
+            Number.isInteger(input.recommended) && input.recommended >= 0 && input.recommended < options.length
+              ? input.recommended
+              : undefined;
           if (!question) throw new Error('ask_user needs a question.');
           self.bot.needsYou = true;
           persistBot(self, { messages: false });
@@ -2806,6 +2825,7 @@ export const createLocalBotEngine = ({
             ok: true,
             asked: question,
             options,
+            ...(recommended !== undefined ? { recommended } : {}),
             note: 'Write the question and these options in your reply now (the person reads your reply), then end it. Their answer arrives as their next message.',
           };
         }

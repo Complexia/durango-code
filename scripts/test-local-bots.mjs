@@ -644,7 +644,7 @@ test('notify_user and ask_user', async () => {
   await waitFor(() => runner.lanes.length === 1);
   const call = (name, input) => runner.lanes[0].ctx.callTool({ name, input, toolCallId: 'x' }).then((out) => out.result);
   assert.deepEqual(await call('notify_user', { title: 'Found a flat', message: '2BR in Surry Hills' }), { ok: true });
-  const asked = await call('ask_user', { question: 'Which one?', options: ['A', 'B'] });
+  const asked = await call('ask_user', { question: 'Which one?', options: ['A', 'B'], recommended: 0 });
   assert.equal(asked.ok, true);
   assert.match(asked.note, /in your reply/);
   assert.equal((await engine.list()).bots[0].needsYou, true);
@@ -654,6 +654,9 @@ test('notify_user and ask_user', async () => {
   ]);
   runner.lanes[0].finish({ text: 'Which one: A or B?' });
   await engine.idle();
+  const askedThread = await engine.thread(primary.id);
+  const askCard = askedThread.messages.at(-1)?.cards?.find((card) => card.component === 'bot-ask');
+  assert.deepEqual(askCard?.props, { question: 'Which one?', options: ['A', 'B'], recommended: 0 });
   // The person's answer clears it.
   await engine.send(primary.id, { messageId: 'b', content: 'A' });
   assert.equal((await engine.list()).bots[0].needsYou, false);

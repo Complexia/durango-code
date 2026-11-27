@@ -72,6 +72,7 @@
     "test:workspace-sync-threads": "node --no-warnings scripts/test-workspace-sync-threads.mjs",
     "test:workspace-sync-removals": "node --no-warnings scripts/test-workspace-sync-removals.mjs",
     "test:bot-drafts": "bun scripts/test-bot-drafts.ts",
+    "test:bot-ask-card": "bun scripts/test-bot-ask-card.tsx",
     "test:bot-reply-quote": "bun scripts/test-bot-reply-quote.ts",
     "test:composer-drafts": "bun scripts/test-composer-drafts.ts && bun scripts/test-composer-drafts.ts --failed-backfill && bun scripts/test-composer-drafts.ts --cleared-backfill && bun scripts/test-composer-draft-controller.ts",
     "test:work-log": "bun scripts/test-work-log.tsx",
