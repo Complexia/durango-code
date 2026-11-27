@@ -277,6 +277,9 @@ export const botThreadTurnTitle = (trigger, threadTitle, changeId) => {
     const change = String(changeId ?? '').trim();
     return title ? `Ship button — ${title}` : change ? `Ship button (${change})` : 'Ship button';
   }
+  if (trigger === 'external') {
+    return title ? `External turn — ${title}` : 'External turn';
+  }
   return title ? `Person in thread — ${title}` : 'Person in thread';
 };
 
@@ -287,6 +290,10 @@ const botThreadTurnActor = (trigger, { threadTitle, changeId, surface } = {}) =>
     return `The person tapped the Ship button${change ? ` for ${change}` : ''} in the thread "${title}" you started (not your own request).`;
   }
   const cleanSurface = String(surface ?? '').replace(/\s+/g, ' ').trim();
+  if (trigger === 'external') {
+    const by = cleanSurface ? ` (started by ${clipText(cleanSurface, 60)}, not your own request)` : ' (not your own request)';
+    return `Another turn ran in the thread "${title}" you started${by}.`;
+  }
   const via = cleanSurface && cleanSurface.toLowerCase() !== 'desktop' ? ` (via ${clipText(cleanSurface, 60)})` : '';
   return `The person sent a message directly in the thread "${title}" you started${via} (not your own request).`;
 };
@@ -308,8 +315,8 @@ export const botThreadTurnReportText = ({
 } = {}) => {
   const stillWaiting = status === 'done' && Array.isArray(waiting) && waiting.length > 0;
   const actor = botThreadTurnActor(trigger, { threadTitle, changeId, surface });
-  const preview = trigger === 'person' ? clipText(promptPreview, 240) : '';
-  const asked = preview ? `\nWhat they asked: "${preview}"` : '';
+  const preview = trigger !== 'ship_button' ? clipText(promptPreview, 240) : '';
+  const asked = preview ? `\n${trigger === 'external' ? 'What it asked' : 'What they asked'}: "${preview}"` : '';
   const verb = status === 'done' ? 'finished' : 'failed';
   const header = stillWaiting
     ? `${actor} That turn isn't finished yet: the thread ended a turn but is still working in the background.${asked}\nIts update:`
@@ -324,8 +331,8 @@ export const botThreadTurnReportText = ({
 };
 
 /**
- * Notice body while a person- or Ship-button-started turn in a bot-started
- * thread still runs and needs the person or looks stuck.
+ * Notice body while a person-, Ship-button-, or externally-started turn in a
+ * bot-started thread still runs and needs the person or looks stuck.
  * Durango's copy: chat/convex/botPolicy.ts botThreadTurnNoticeText.
  */
 export const botThreadTurnNoticeText = ({ trigger, kind, detail, threadTitle, changeId, surface } = {}) => {
@@ -336,7 +343,9 @@ export const botThreadTurnNoticeText = ({ trigger, kind, detail, threadTitle, ch
   const from =
     trigger === 'ship_button'
       ? `the person's Ship button${change ? ` for ${change}` : ''}`
-      : `a message the person sent in the thread${via}`;
+      : trigger === 'external'
+        ? (cleanSurface ? `an external turn started by ${clipText(cleanSurface, 60)}` : 'an external turn')
+        : `a message the person sent in the thread${via}`;
   const head =
     kind === 'input'
       ? `NEEDS THE PERSON: the thread "${title}" (from ${from}, not your own request) is blocked: its thread is waiting for the person and does nothing until they answer. Tell the person now, in your reply, what it's waiting for; they answer it in that thread in Durango Code, or tell you. For a request with an id (ua_…), when they tell you they did it, mark it done yourself with answer_thread_request (answer "done"; "reply" with what they said otherwise). This isn't its report: it reports when its work ends.`

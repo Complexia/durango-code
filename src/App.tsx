@@ -182,7 +182,15 @@ import {
   remoteThreadRuntime,
   reportedSubagentSettingsPatch,
 } from './app/remote-control-policy';
-import { botThreadOwner, dispatchProjectsPayload, startDurangoDispatchNotices, startDurangoDispatchReporter } from './app/durangoDispatch';
+import {
+  applyBotThreadTurnReported,
+  botThreadOwner,
+  botThreadTurnStateAfterEdit,
+  dispatchProjectsPayload,
+  stampNextBotThreadTurn,
+  startDurangoDispatchNotices,
+  startDurangoDispatchReporter,
+} from './app/durangoDispatch';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
 import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
@@ -2228,8 +2236,8 @@ const App: React.FC = () => {
         return;
       }
       if (request.type === 'undelivered') {
-        // The agent's session ended before it saw these answers.
-        for (const text of request.texts) queueMessageToThread(thread.id, { text });
+        // The agent's session ended before it saw these answers: continue its active run chain.
+        for (const text of request.texts) queueMessageToThread(thread.id, { text, continuation: true });
         return;
       }
       if (request.type === 'resolve') {
@@ -5873,7 +5881,7 @@ const App: React.FC = () => {
     (
       threadId: string,
       promptText: string,
-      triggerOpt?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
+      triggerOpt?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
     ) => {
       if (triggerOpt === null || continuationTurnsRef.current.has(threadId)) return;
       const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
@@ -5886,17 +5894,18 @@ const App: React.FC = () => {
       const surface = triggerOpt?.surface ?? (trigger === 'person' ? 'desktop' : undefined);
       const changeId = triggerOpt?.changeId;
       const promptPreview =
-        trigger === 'person' ? promptText.replace(/\s+/g, ' ').trim().slice(0, 240) || undefined : undefined;
-      updateThread(threadId, {
-        botThreadTurn: {
+        trigger !== 'ship_button' ? promptText.replace(/\s+/g, ' ').trim().slice(0, 240) || undefined : undefined;
+      updateThread(
+        threadId,
+        stampNextBotThreadTurn(current, {
           runOffset,
           trigger,
           ...(changeId ? { changeId } : {}),
           ...(surface ? { surface } : {}),
           ...(promptPreview ? { promptPreview } : {}),
           startedAt: new Date().toISOString(),
-        },
-      });
+        })
+      );
     },
     [updateThread]
   );
@@ -5917,8 +5926,8 @@ const App: React.FC = () => {
       // it counts as the agent's only in a thread that agent created.
       fromAgent?: boolean,
       // Null for bot-dispatched turns (reported by durangoDispatch); omitted for
-      // local person turns; explicit for Ship button / remote turns.
-      botTurnTrigger?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
+      // local person turns; explicit for Ship button / remote / external turns.
+      botTurnTrigger?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
     ): Promise<ThreadTurnStartResult> => {
       await refreshLinkedTasksBeforeDispatch(threadId);
       if (claimStart && !(await claimRemoteThreadStart(() => claimStart(threadId), applyClaimedSettings))) {
@@ -7047,6 +7056,7 @@ const App: React.FC = () => {
         );
       }
 
+      updateThread(threadId, { status: 'running' });
       stampBotThreadTurn(threadId, rawText);
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
@@ -7062,7 +7072,6 @@ const App: React.FC = () => {
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
-      updateThread(threadId, { status: 'running' });
       pinThreadToBottom(threadId);
 
       void window.orion
@@ -7160,7 +7169,7 @@ const App: React.FC = () => {
         commit?: string;
         instructions?: string;
       },
-      botTurnTrigger?: { trigger: 'person' | 'ship_button'; changeId?: string; surface?: string } | null
+      botTurnTrigger?: { trigger: 'person' | 'ship_button' | 'external'; changeId?: string; surface?: string } | null
     ): { ok: boolean; error?: string } => {
       const state = useOrionStore.getState();
       const thread = state.threads.find((t) => t.id === threadId);
@@ -7211,6 +7220,7 @@ const App: React.FC = () => {
         updateThread(threadId, { title: 'Review Changes' });
       }
 
+      updateThread(threadId, { status: 'running' });
       stampBotThreadTurn(threadId, rawText, botTurnTrigger);
       addMessageToThread(threadId, { role: 'user', content: rawText });
       const messageId = addMessageToThread(threadId, {
@@ -7226,7 +7236,6 @@ const App: React.FC = () => {
       const runId = crypto.randomUUID();
       runOutputMessages.current.set(runId, { threadId, messageId });
       setActiveRunsByThread((current) => ({ ...current, [threadId]: runId }));
-      updateThread(threadId, { status: 'running' });
       pinThreadToBottom(threadId);
 
       void window.orion
@@ -7401,7 +7410,7 @@ const App: React.FC = () => {
       subagentReportThreadsRef.current.delete(threadId);
       void window.orion?.takeSubagentReports?.(threadId).then((result) => {
         if (!result?.text || !findThread(useOrionStore.getState().threads, threadId)) return;
-        queueMessageToThread(threadId, { text: result.text });
+        queueMessageToThread(threadId, { text: result.text, continuation: true });
       });
     }
   }, [threads, activeRunsByThread, queueMessageToThread, subagentReportsTick]);
@@ -8261,6 +8270,9 @@ const App: React.FC = () => {
             (exchange) => !exchange.afterMessageId || kept.some((message) => message.id === exchange.afterMessageId)
           ),
         }));
+        const priorRunCount = messages.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length;
+        const keptRunCount = kept.filter((message) => message.role === 'agent' && message.kind === 'agent-run').length;
+        const editedThread = findThread(useOrionStore.getState().threads, editedThreadId);
         const context = buildEditedThreadContext(kept);
         updateThread(editedThreadId, {
           agentSessionIds: {},
@@ -8268,6 +8280,7 @@ const App: React.FC = () => {
           // A Codex goal lived in the dropped session.
           goal: undefined,
           pendingResumeContext: context || undefined,
+          ...(editedThread ? botThreadTurnStateAfterEdit(editedThread, priorRunCount, keptRunCount) : {}),
         });
       }
     }
@@ -9347,10 +9360,33 @@ const App: React.FC = () => {
           const reviewBotTrigger =
             command.durangoDispatch?.origin === 'bot'
               ? null
-              : command.botTurnTrigger ?? {
-                  trigger: 'person' as const,
-                  surface: command.source?.machineName?.trim() || 'remote',
-                };
+              : command.botTurnTrigger ??
+                (command.fromAgent === true
+                  ? {
+                      trigger: 'external' as const,
+                      surface: command.source?.machineName?.trim()
+                        ? `another agent on ${command.source.machineName.trim()}`
+                        : 'another agent',
+                    }
+                  : command.durangoDispatch?.origin === 'api'
+                    ? {
+                        trigger: 'external' as const,
+                        surface: command.durangoDispatch.sourceLabel?.trim() || 'a connected app (API)',
+                      }
+                    : command.durangoDispatch?.origin === 'tasks'
+                      ? {
+                          trigger: 'external' as const,
+                          surface: command.durangoDispatch.sourceLabel?.trim() || 'Durango Tasks',
+                        }
+                      : command.durangoDispatch?.origin === 'chat'
+                        ? {
+                            trigger: 'person' as const,
+                            surface: command.durangoDispatch.sourceLabel?.trim() || 'Durango Chat',
+                          }
+                        : {
+                            trigger: 'person' as const,
+                            surface: command.source?.machineName?.trim() || 'remote',
+                          });
           const result = await startReviewForThread(threadId, promptText, reviewCommand.review, reviewBotTrigger);
           if (!result.ok && createdThread) useOrionStore.getState().deleteThread(threadId);
           return result.ok
@@ -9463,10 +9499,33 @@ const App: React.FC = () => {
         const remoteBotTurnTrigger =
           dispatch?.origin === 'bot'
             ? null
-            : command.botTurnTrigger ?? {
-                trigger: 'person' as const,
-                surface: command.source?.machineName?.trim() || 'remote',
-              };
+            : command.botTurnTrigger ??
+              (command.fromAgent === true
+                ? {
+                    trigger: 'external' as const,
+                    surface: command.source?.machineName?.trim()
+                      ? `another agent on ${command.source.machineName.trim()}`
+                      : 'another agent',
+                  }
+                : dispatch?.origin === 'api'
+                  ? {
+                      trigger: 'external' as const,
+                      surface: dispatch.sourceLabel?.trim() || 'a connected app (API)',
+                    }
+                  : dispatch?.origin === 'tasks'
+                    ? {
+                        trigger: 'external' as const,
+                        surface: dispatch.sourceLabel?.trim() || 'Durango Tasks',
+                      }
+                    : dispatch?.origin === 'chat'
+                      ? {
+                          trigger: 'person' as const,
+                          surface: dispatch.sourceLabel?.trim() || 'Durango Chat',
+                        }
+                      : {
+                          trigger: 'person' as const,
+                          surface: command.source?.machineName?.trim() || 'remote',
+                        });
         const start = thread
           ? startTurnForThreadRef.current?.(
               threadId,
@@ -10025,9 +10084,11 @@ const App: React.FC = () => {
       ...(settleBotTurn
         ? {
             settleBotTurn: (input) => settleBotTurn(input),
-            markBotTurnReported: (threadId, runOffset, reported) => {
-              const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId)?.botThreadTurn;
-              if (current?.runOffset === runOffset) updateThread(threadId, { botThreadTurn: { ...current, ...reported } });
+            markBotTurnReported: (threadId, runOffset, reported, seqBase) => {
+              const current = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+              if (!current) return;
+              const patch = applyBotThreadTurnReported(current, runOffset, reported, seqBase);
+              if (patch) updateThread(threadId, patch);
             },
           }
         : {}),

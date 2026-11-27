@@ -670,7 +670,7 @@ export type RemoteCommandRequest = {
     fromAgent?: boolean;
     /** runTurn: explicit trigger metadata (e.g. Ship button on a bot reply) for reporting back to a bot-started thread's owner. */
     botTurnTrigger?: {
-      trigger: 'person' | 'ship_button';
+      trigger: 'person' | 'ship_button' | 'external';
       changeId?: string;
       surface?: string;
     };
@@ -2212,7 +2212,7 @@ type OrionCodexBrowserIntegrationStatus = {
         threadTitle?: string;
         projectName?: string;
         workspacePath?: string;
-        trigger: 'person' | 'ship_button';
+        trigger: 'person' | 'ship_button' | 'external';
         changeId?: string;
         surface?: string;
         promptPreview?: string;
@@ -2224,15 +2224,15 @@ type OrionCodexBrowserIntegrationStatus = {
         seq: number;
       }) => Promise<{ ok: boolean; skipped?: boolean; retry?: boolean }>;
       /**
-       * Notice while a person- or Ship-button-started turn in a bot-started
-       * thread still runs and needs the person or looks stuck.
+       * Notice while a person-, Ship-button-, or externally-started turn in a
+       * bot-started thread still runs and needs the person or looks stuck.
        */
       botThreadTurnNotice?: (input: {
         owner: { mode: 'local' | 'durango'; botId?: string; botName?: string; originDispatchId?: string };
         threadId: string;
         threadTitle?: string;
         projectName?: string;
-        trigger: 'person' | 'ship_button';
+        trigger: 'person' | 'ship_button' | 'external';
         changeId?: string;
         surface?: string;
         kind: 'input' | 'stuck';

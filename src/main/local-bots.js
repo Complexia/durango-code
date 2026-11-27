@@ -133,7 +133,7 @@ Routines and reports:
 - When a task report or routine finds something the person should see, write it up in your reply and call notify_user so it shows as a notification on this computer.
 - A task report that starts "NOT FINISHED YET" (or says the task isn't finished yet) is an update, not the outcome: the thread is still working in the background and reports again when it finishes. Tell the person briefly where it stands if it matters, don't report it as done, and don't start the work again.
 - "NEEDS THE PERSON" from a task's thread: it is blocked on the person (an approval, a question, an action) and stays blocked until they answer in that thread. Tell them right away what it needs, in a line or two. "LOOKS STUCK": check the thread before you cancel or redo the work.
-- A task report labelled "Ship button — …" or "Person in thread — …" (saying the person tapped the Ship button or sent a message directly in a thread you started, not your own request) is an automatic update so you stay in sync with what happened there. Never echo or re-send that request back into the thread; note the outcome briefly for the person (and settle the thread if its work is now truly finished).
+- A task report labelled "Ship button — …", "Person in thread — …" or "External turn — …" (saying the person tapped the Ship button, sent a message directly, or another agent/app ran a turn in a thread you started, not your own request) is an automatic update so you stay in sync with what happened there. Never echo or re-send that request back into the thread; note the outcome briefly for the person (and settle the thread if its work is now truly finished).
 - When you need a decision or information from the person, call ask_user with the question and a few short options, and write the question and its options in your reply too (the person reads your reply, not the tool call). Wait for the answer; don't guess on things that matter (money, sending messages, applying, deleting).
 
 Show, don't point: your thread renders rich replies, so use them.
@@ -3231,10 +3231,14 @@ export const createLocalBotEngine = ({
     } = {}) {
       await ensureLoaded();
       const cleanThreadId = str(threadId).trim();
-      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' ? trigger : null;
+      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' || trigger === 'external' ? trigger : null;
       if (!cleanThreadId || !cleanTrigger || !Number.isSafeInteger(seq) || seq <= 0) return { ok: false };
-      let entry = str(botId).trim() ? entries.get(str(botId).trim()) : null;
-      if (!entry && str(botName).trim()) {
+      const cleanBotId = str(botId).trim();
+      let entry = cleanBotId ? entries.get(cleanBotId) : null;
+      // Never fall back to `botName` when a `botId` was supplied (prevents
+      // routing a deleted/other-account bot's thread to a different bot with
+      // the same name).
+      if (!cleanBotId && str(botName).trim()) {
         const wanted = str(botName).trim().toLowerCase();
         const matches = [...entries.values()].filter((candidate) => candidate.bot.name.trim().toLowerCase() === wanted);
         if (matches.length === 1) entry = matches[0];
@@ -3242,8 +3246,17 @@ export const createLocalBotEngine = ({
       if (!entry) return { ok: false };
       const runtime = runtimeFor(entry.bot.id);
       const stillWaiting = outcome === 'finished' && Array.isArray(waiting) && waiting.length > 0;
-      const reported = runtime.threadTurnReportedSeqs.get(cleanThreadId) ?? 0;
-      if (stillWaiting && seq % 2 === 1 && (reported >= seq + 1 || entry.messages.some((m) => m.id === botThreadTurnMessageId(cleanThreadId, seq + 1)))) {
+      const reportedPrefix = botThreadTurnMessageId(cleanThreadId, 0).slice(0, -1);
+      let persistedMaxSeq = 0;
+      for (const m of entry.messages) {
+        if (!m?.id?.startsWith(reportedPrefix)) continue;
+        const tail = m.id.slice(reportedPrefix.length);
+        if (!/^\d+$/.test(tail)) continue;
+        const n = Number(tail);
+        if (Number.isSafeInteger(n) && n > persistedMaxSeq) persistedMaxSeq = n;
+      }
+      const reported = Math.max(runtime.threadTurnReportedSeqs.get(cleanThreadId) ?? 0, persistedMaxSeq);
+      if (stillWaiting && seq % 2 === 1 && reported >= seq) {
         return { ok: true };
       }
       runtime.threadTurnReportedSeqs.set(cleanThreadId, Math.max(seq, reported));
@@ -3287,8 +3300,8 @@ export const createLocalBotEngine = ({
       return saved ? { ok: true } : { ok: false, retry: true };
     },
     /**
-     * Notice while a person- or Ship-button-started turn in a local-bot-started
-     * thread still runs and needs the person or looks stuck.
+     * Notice while a person-, Ship-button-, or externally-started turn in a
+     * local-bot-started thread still runs and needs the person or looks stuck.
      */
     async threadTurnNotice({
       botId,
@@ -3306,22 +3319,29 @@ export const createLocalBotEngine = ({
     } = {}) {
       await ensureLoaded();
       const cleanThreadId = str(threadId).trim();
-      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' ? trigger : null;
+      const cleanTrigger = trigger === 'ship_button' || trigger === 'person' || trigger === 'external' ? trigger : null;
       const id = str(noticeKey).replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120);
       if (!cleanThreadId || !cleanTrigger || !id || (kind !== 'input' && kind !== 'stuck')) return { ok: false };
-      let entry = str(botId).trim() ? entries.get(str(botId).trim()) : null;
-      if (!entry && str(botName).trim()) {
+      const cleanBotId = str(botId).trim();
+      let entry = cleanBotId ? entries.get(cleanBotId) : null;
+      if (!cleanBotId && str(botName).trim()) {
         const wanted = str(botName).trim().toLowerCase();
         const matches = [...entries.values()].filter((candidate) => candidate.bot.name.trim().toLowerCase() === wanted);
         if (matches.length === 1) entry = matches[0];
       }
       if (!entry) return { ok: false };
       const runtime = runtimeFor(entry.bot.id);
-      const reported = runtime.threadTurnReportedSeqs.get(cleanThreadId);
-      if (
-        (reported !== undefined && Number.isSafeInteger(seq) && seq <= reported) ||
-        (Number.isSafeInteger(seq) && seq > 0 && entry.messages.some((m) => m.id === botThreadTurnMessageId(cleanThreadId, seq)))
-      ) {
+      const reportedPrefix = botThreadTurnMessageId(cleanThreadId, 0).slice(0, -1);
+      let persistedMaxSeq = 0;
+      for (const m of entry.messages) {
+        if (!m?.id?.startsWith(reportedPrefix)) continue;
+        const tail = m.id.slice(reportedPrefix.length);
+        if (!/^\d+$/.test(tail)) continue;
+        const n = Number(tail);
+        if (Number.isSafeInteger(n) && n > persistedMaxSeq) persistedMaxSeq = n;
+      }
+      const reported = Math.max(runtime.threadTurnReportedSeqs.get(cleanThreadId) ?? 0, persistedMaxSeq);
+      if (reported > 0 && Number.isSafeInteger(seq) && seq <= reported) {
         return { ok: true, stale: true };
       }
       const thread = { threadId: cleanThreadId, project: str(project).trim() || null };

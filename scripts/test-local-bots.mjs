@@ -2315,7 +2315,7 @@ test('reorder persists project group order and per-project bot order across rest
 });
 
 test('local bot threadTurnSettled and threadTurnNotice report Ship button and person turns with waiting/notices and idempotency', async () => {
-  const { engine, runner } = makeEngine();
+  const { engine, runner, dir } = makeEngine();
   const [primary] = (await engine.list()).bots;
 
   // 1) Ship button turn ends still waiting -> NOT FINISHED YET, wakes bot once.
@@ -2413,6 +2413,88 @@ test('local bot threadTurnSettled and threadTurnNotice report Ship button and pe
   assert.deepEqual(stale, { ok: true, stale: true });
   await delay(5);
   assert.equal(runner.lanes.length, 3);
+
+  // External trigger (e.g. machine_run_agent / API) is labelled "External turn — …".
+  const external = await engine.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    threadTitle: 'Release 1.0.236',
+    project: 'durango',
+    trigger: 'external',
+    surface: 'another agent on Studio Mac',
+    promptPreview: 'Verify build artifacts',
+    outcome: 'finished',
+    summary: 'Artifacts verified.',
+    seq: 8,
+  });
+  assert.equal(external.ok, true);
+  await waitFor(() => runner.lanes.length === 4);
+  assert.match(runner.lanes[3].lane.prompt, /\[Task: External turn — Release 1\.0\.236\]:/);
+  assert.match(runner.lanes[3].lane.prompt, /Another turn ran in the thread "Release 1\.0\.236" you started \(started by another agent on Studio Mac, not your own request\)\./);
+  assert.match(runner.lanes[3].lane.prompt, /What it asked: "Verify build artifacts"/);
+  runner.lanes[3].finish({ text: 'Verified.' });
+  await engine.idle();
+
+  // Deleting a local bot and creating a replacement with the same name NEVER
+  // falls back to botName when botId is supplied.
+  const oldHelper = await engine.createBot({ name: 'Release Helper', job: 'Old' });
+  const oldHelperId = oldHelper.id;
+  await engine.deleteBot(oldHelperId);
+  const newHelper = await engine.createBot({ name: 'Release Helper', job: 'New' });
+  assert.notEqual(newHelper.id, oldHelperId);
+  const toDeleted = await engine.threadTurnSettled({
+    botId: oldHelperId,
+    botName: 'Release Helper',
+    threadId: 'thread_old_helper',
+    trigger: 'person',
+    outcome: 'finished',
+    summary: 'Should never reach newHelper.',
+    seq: 2,
+  });
+  assert.deepEqual(toDeleted, { ok: false });
+  const noticeToDeleted = await engine.threadTurnNotice({
+    botId: oldHelperId,
+    botName: 'Release Helper',
+    threadId: 'thread_old_helper',
+    trigger: 'person',
+    kind: 'input',
+    noticeKey: 'input:x',
+    seq: 2,
+    detail: 'Blocked.',
+  });
+  assert.deepEqual(noticeToDeleted, { ok: false });
+  await delay(5);
+  assert.equal(runner.lanes.length, 4);
+
+  // After a reload from disk (cold in-memory runtime map), a late waiting report
+  // from an earlier turn (seq 1) and a stale notice (seq 4) are still dropped
+  // because seq 8 is already persisted in the bot's messages.
+  await engine.flush();
+  const { engine: reloaded, runner: reloadedRunner } = makeEngine({ dir });
+  const lateWaitAfterRestart = await reloaded.threadTurnSettled({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    trigger: 'person',
+    outcome: 'finished',
+    summary: 'Old waiting update.',
+    waiting: ['background command: old'],
+    seq: 1,
+  });
+  assert.deepEqual(lateWaitAfterRestart, { ok: true });
+  const staleNoticeAfterRestart = await reloaded.threadTurnNotice({
+    botId: primary.id,
+    threadId: 'thread_ship_1',
+    trigger: 'person',
+    kind: 'stuck',
+    noticeKey: 'stuck:after-restart',
+    seq: 4,
+    detail: 'Stale.',
+  });
+  assert.deepEqual(staleNoticeAfterRestart, { ok: true, stale: true });
+  await delay(5);
+  assert.equal(reloadedRunner.lanes.length, 0);
+  await reloaded.stop();
+  await engine.stop();
 });
 
 // --- run -------------------------------------------------------------------------------------

@@ -5288,7 +5288,16 @@ const reportBotThreadTurn = async (input) => {
       return await durangoClient.reportBotThreadTurn(body);
     } catch (failure) {
       console.warn('[durango bots] reporting a bot thread turn failed:', failure?.message ?? failure);
-      if (failure instanceof DurangoError && failure.code === 'api' && failure.status && failure.status < 500) return { ok: false };
+      if (
+        failure instanceof DurangoError &&
+        failure.code === 'api' &&
+        failure.status &&
+        failure.status < 500 &&
+        failure.status !== 429 &&
+        failure.status !== 408
+      ) {
+        return { ok: false };
+      }
     }
   }
   return { ok: false, retry: true };
@@ -5317,14 +5326,37 @@ const sendBotThreadTurnNotice = async (input) => {
     return await durangoClient.noticeBotThreadTurn(body);
   } catch (failure) {
     console.warn('[durango bots] a bot thread turn notice failed:', failure?.message ?? failure);
-    if (failure instanceof DurangoError && failure.code === 'api' && failure.status && failure.status < 500) return { ok: false };
+    if (
+      failure instanceof DurangoError &&
+      failure.code === 'api' &&
+      failure.status &&
+      failure.status < 500 &&
+      failure.status !== 429 &&
+      failure.status !== 408
+    ) {
+      return { ok: false };
+    }
     return { ok: false, retry: true };
   }
 };
 
+// When a thread started by a signed-out local bot settles right after sign-in,
+// wait for the async local-bot upload (syncLocalBotsToDurango) so Convex has
+// its `localImportId` before we post; if unsynced local data remains, defer.
+const waitForLocalBotSyncBeforeDurangoReport = async (owner) => {
+  const isLocalOwned = owner?.mode === 'local' || (typeof owner?.botId === 'string' && owner.botId.trim().startsWith('lb'));
+  if (!isLocalOwned) return { ready: true };
+  if (localBotsSync) await localBotsSync.catch(() => {});
+  if (await localBots.hasDataToSync().catch(() => false)) {
+    void syncLocalBotsToDurango();
+    return { ready: false };
+  }
+  return { ready: true };
+};
+
 ipcMain.handle('bots:threadTurnSettled', async (_event, input) => {
   const threadId = typeof input?.threadId === 'string' ? input.threadId.trim() : '';
-  const trigger = input?.trigger === 'ship_button' || input?.trigger === 'person' ? input.trigger : null;
+  const trigger = input?.trigger === 'ship_button' || input?.trigger === 'person' || input?.trigger === 'external' ? input.trigger : null;
   const seq = dispatchSeq(input);
   if (!threadId || !trigger || seq === undefined) return { ok: false };
   const outcome = input?.outcome === 'finished' ? 'finished' : 'failed';
@@ -5368,12 +5400,14 @@ ipcMain.handle('bots:threadTurnSettled', async (_event, input) => {
       seq,
     });
   }
+  const syncReady = await waitForLocalBotSyncBeforeDurangoReport(input?.owner);
+  if (!syncReady.ready) return { ok: false, retry: true };
   return reportBotThreadTurn(payload);
 });
 
 ipcMain.handle('bots:threadTurnNotice', async (_event, input) => {
   const threadId = typeof input?.threadId === 'string' ? input.threadId.trim() : '';
-  const trigger = input?.trigger === 'ship_button' || input?.trigger === 'person' ? input.trigger : null;
+  const trigger = input?.trigger === 'ship_button' || input?.trigger === 'person' || input?.trigger === 'external' ? input.trigger : null;
   const kind = input?.kind === 'input' || input?.kind === 'stuck' ? input.kind : null;
   const key = typeof input?.key === 'string' ? input.key.trim().slice(0, 120) : '';
   const seq = dispatchSeq(input);
@@ -5396,6 +5430,8 @@ ipcMain.handle('bots:threadTurnNotice', async (_event, input) => {
       detail,
     });
   }
+  const syncReady = await waitForLocalBotSyncBeforeDurangoReport(input?.owner);
+  if (!syncReady.ready) return { ok: false, retry: true };
   return sendBotThreadTurnNotice({
     owner: input?.owner,
     threadId,

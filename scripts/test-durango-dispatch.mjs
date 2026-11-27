@@ -38,11 +38,15 @@ import {
   DISPATCH_STUCK_AFTER_MS,
   DISPATCH_SUMMARY_MAX_CHARS as RENDERER_DISPATCH_SUMMARY_MAX_CHARS,
   activityToolName,
+  applyBotThreadTurnReported,
   botThreadOwner,
   botThreadTurnLiveRunAt,
   botThreadTurnOutcome,
+  botThreadTurnReportSeq,
+  botThreadTurnStateAfterEdit,
   dispatchRunFinalText,
   durangoDispatchHasNewRuns,
+  stampNextBotThreadTurn,
   durangoDispatchLiveRun,
   durangoDispatchLiveRunAt,
   durangoDispatchOutcome,
@@ -2053,6 +2057,171 @@ try {
     });
     assert.deepEqual(await client.reportBotThreadTurn({ machineId: 'm1', botId: 'b1', threadId: 't_9', trigger: 'ship_button', outcome: 'finished', summary: 'Shipped.', seq: 4 }), { ok: true });
     assert.deepEqual(await client.noticeBotThreadTurn({ machineId: 'm1', botId: 'b1', threadId: 't_9', trigger: 'ship_button', notice: { kind: 'input', key: 'k', seq: 4, detail: 'd' } }), { ok: true, stale: true });
+  });
+
+  await test('botThreadTurn: queued follow-up preserves an unreported earlier turn for retry even while the newer turn is still running', async () => {
+    const botTurnSent = [];
+    let failFirstTurnOnce = true;
+    let state = { threads: [], transcripts: {} };
+    const listeners = new Set();
+    let clock = 0;
+    const timers = [];
+    const set = (patch) => {
+      const previous = state;
+      state = { ...state, ...patch };
+      for (const listener of [...listeners]) listener(state, previous);
+    };
+    const putThread = (next) => set({ threads: [...state.threads.filter((t) => t.id !== next.id), next] });
+    const stop = startDurangoDispatchReporter({
+      getState: () => state,
+      subscribe: (listener) => (listeners.add(listener), () => listeners.delete(listener)),
+      ensureTranscript: async () => null,
+      settle: async () => ({ ok: true }),
+      markReported: () => {},
+      settleBotTurn: async (input) => {
+        botTurnSent.push(input);
+        if (input.seq === 4 && failFirstTurnOnce) {
+          failFirstTurnOnce = false;
+          return { ok: false, retry: true };
+        }
+        return { ok: true };
+      },
+      markBotTurnReported: (threadId, runOffset, reported, seqBase) => {
+        const current = state.threads.find((t) => t.id === threadId);
+        if (!current) return;
+        const patch = applyBotThreadTurnReported(current, runOffset, reported, seqBase);
+        if (patch) putThread({ ...current, ...patch });
+      },
+      setTimer: (callback, ms) => {
+        const timer = { at: clock + ms, callback };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => timers.splice(timers.indexOf(timer), 1),
+      now: () => clock,
+      retryMs: 1_000,
+    });
+    const tick = async (ms = 0) => {
+      clock += ms;
+      for (const timer of timers.filter((t) => t.at <= clock)) {
+        timers.splice(timers.indexOf(timer), 1);
+        timer.callback();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    };
+
+    const run0 = agentRun({ status: 'done', content: 'Bot initial.' });
+    const run1 = agentRun({ status: 'done', content: 'Turn 1 done.' });
+    const run2Running = agentRun({ status: 'running', content: '' });
+    const t0 = {
+      id: 't_queue',
+      projectId: 'p1',
+      title: 'Queued test',
+      status: 'done',
+      startedByBot: 'durango-bots',
+      startedByBotId: 'bot_1',
+      durangoDispatch: { id: 'bottask:t0', sourceUrl: null, startedAt: 't0', reportedAt: 't0', reportedSeq: 2 },
+      botThreadTurn: { runOffset: 1, trigger: 'person', surface: 'desktop', promptPreview: 'first', startedAt: 't1' },
+      summary: { agentRunCount: 2 },
+    };
+    set({ transcripts: { t_queue: { messages: [run0, run1] } } });
+    putThread(t0);
+    await tick(0);
+    // First attempt of turn 1 failed with retry: true.
+    assert.equal(botTurnSent.length, 1);
+    assert.equal(botTurnSent[0].seq, 4);
+
+    // Queued turn 2 starts immediately before turn 1's retry fires.
+    const stamped2 = stampNextBotThreadTurn(state.threads[0], {
+      runOffset: 2,
+      trigger: 'person',
+      surface: 'desktop',
+      promptPreview: 'second',
+      startedAt: 't2',
+    });
+    assert.equal(stamped2.pendingBotThreadTurns?.length, 1, 'unreported turn 1 moved to pendingBotThreadTurns');
+    set({ transcripts: { t_queue: { messages: [run0, run1, run2Running] } } });
+    putThread({ ...state.threads[0], status: 'running', ...stamped2, summary: { agentRunCount: 3 } });
+
+    // Retry fires while turn 2 is STILL running: turn 1 delivers and prunes from pendingBotThreadTurns.
+    await tick(1_000);
+    assert.equal(botTurnSent.length, 2);
+    assert.equal(botTurnSent[1].seq, 4);
+    assert.equal(botTurnSent[1].summary, 'Turn 1 done.');
+    assert.equal(state.threads[0].pendingBotThreadTurns, undefined, 'delivered pending turn is pruned');
+
+    // Turn 2 finishes and reports cleanly.
+    const run2Done = agentRun({ status: 'done', content: 'Turn 2 done.' });
+    set({ transcripts: { t_queue: { messages: [run0, run1, run2Done] } } });
+    putThread({ ...state.threads[0], status: 'done', summary: { agentRunCount: 3 } });
+    await tick(0);
+    assert.equal(botTurnSent.length, 3);
+    assert.equal(botTurnSent[2].seq, 6);
+    assert.equal(botTurnSent[2].summary, 'Turn 2 done.');
+    stop();
+  });
+
+  await test('botThreadTurn: editing an earlier message advances seqBase so replacement turns and notices never reuse seq', () => {
+    const run0 = agentRun({ status: 'done', content: 'Bot initial.' });
+    const run1 = agentRun({ status: 'done', content: 'Old turn 1.' });
+    const run2 = agentRun({ status: 'done', content: 'Old turn 2.' });
+    const run3 = agentRun({ status: 'done', content: 'Old turn 3.' });
+    // Before edit: 4 runs, turn at runOffset 3 reported seq 8.
+    const beforeEdit = {
+      status: 'done',
+      startedByBot: 'durango-bots',
+      startedByBotId: 'bot_1',
+      botThreadTurn: { runOffset: 3, trigger: 'person', startedAt: 't3', reportedAt: 't3', reportedSeq: 8 },
+    };
+    assert.equal(botThreadTurnOutcome(beforeEdit, [run0, run1, run2, run3]), null);
+
+    // Edit truncates from 4 runs back to 1 run -> seqBase becomes 3, truncated turn cleared.
+    const afterEdit = { ...beforeEdit, ...botThreadTurnStateAfterEdit(beforeEdit, 4, 1) };
+    assert.equal(afterEdit.botThreadTurnSeqBase, 3);
+    assert.equal(afterEdit.botThreadTurn, undefined);
+
+    // Replacement turn at runOffset 1 gets seqBase 3 -> seq = 2 * (1 + 3 + 1) = 10 (> 8).
+    const stamped = stampNextBotThreadTurn(afterEdit, { runOffset: 1, trigger: 'person', startedAt: 't4' });
+    const threadAfterReplacement = { ...afterEdit, ...stamped };
+    const replacementRun = agentRun({ status: 'done', content: 'Edited turn result.' });
+    assert.deepEqual(botThreadTurnOutcome(threadAfterReplacement, [run0, replacementRun]), {
+      outcome: 'finished',
+      summary: 'Edited turn result.',
+      seq: 10,
+    });
+    assert.equal(botThreadTurnReportSeq(1, false, threadAfterReplacement.botThreadTurn.seqBase), 10);
+    assert.equal(durangoDispatchHasNewRuns({ ...threadAfterReplacement.botThreadTurn, reportedAt: 't4', reportedSeq: 10 }, 2), false);
+
+    // A second edit truncating from 2 runs back to 1 run advances seqBase to 4 -> next seq = 12 (> 10).
+    const afterSecondEdit = {
+      ...threadAfterReplacement,
+      botThreadTurn: { ...threadAfterReplacement.botThreadTurn, reportedAt: 't4', reportedSeq: 10 },
+    };
+    const nextEditState = botThreadTurnStateAfterEdit(afterSecondEdit, 2, 1);
+    assert.equal(nextEditState.botThreadTurnSeqBase, 4);
+    assert.equal(botThreadTurnReportSeq(1, false, nextEditState.botThreadTurnSeqBase), 12);
+  });
+
+  await test('regression: /goal and /review set status running before stamping botThreadTurn, wakeups set continuation: true, and main retries 429', async () => {
+    const appSource = await fs.readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+    const goalBlock = appSource.slice(appSource.indexOf('const startGoalRunForThreadLoaded'), appSource.indexOf('const startGoalRunForThread ='));
+    assert.ok(goalBlock.indexOf("updateThread(threadId, { status: 'running' })") !== -1);
+    assert.ok(
+      goalBlock.indexOf("updateThread(threadId, { status: 'running' })") < goalBlock.indexOf('stampBotThreadTurn('),
+      '/goal must set status running before stampBotThreadTurn'
+    );
+    const reviewBlock = appSource.slice(appSource.indexOf('const startReviewForThreadLoaded'), appSource.indexOf('const startReviewForThread ='));
+    assert.ok(reviewBlock.indexOf("updateThread(threadId, { status: 'running' })") !== -1);
+    assert.ok(
+      reviewBlock.indexOf("updateThread(threadId, { status: 'running' })") < reviewBlock.indexOf('stampBotThreadTurn('),
+      '/review must set status running before stampBotThreadTurn'
+    );
+    assert.match(appSource, /for \(const text of request\.texts\) queueMessageToThread\(thread\.id, \{ text, continuation: true \}\);/);
+    assert.match(appSource, /queueMessageToThread\(threadId, \{ text: result\.text, continuation: true \}\);/);
+
+    const mainSource = await fs.readFile(new URL('../src/main.js', import.meta.url), 'utf8');
+    assert.match(mainSource, /failure\.status !== 429 &&/);
+    assert.match(mainSource, /waitForLocalBotSyncBeforeDurangoReport/);
   });
 
 } finally {
