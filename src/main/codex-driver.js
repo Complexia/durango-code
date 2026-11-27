@@ -560,15 +560,22 @@ export const createCodexAppServerDriver = ({
   };
 
   const finishFailedTurn = (turn, fallbackError) => {
+    if (ended) return;
     const error = turn.error ?? fallbackError;
-    const message = error?.message ?? 'Codex turn failed.';
+    const errorText = (err) =>
+      (typeof err?.message === 'string' && err.message.trim() ? err.message : '') ||
+      codexErrorDetail(err);
+    const message =
+      errorText(error) ||
+      (error !== fallbackError ? errorText(fallbackError) : '') ||
+      'Codex turn failed.';
     callbacks.onActivity({
       type: 'error',
       title: 'Turn failed',
       detail: stringifySummary(message, 300),
       status: 'error',
     });
-    if (review) {
+    if (review || !goal) {
       fail(message);
       return;
     }

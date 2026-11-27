@@ -458,6 +458,8 @@ assert.equal(
 assert.equal(recoveryRunEnded, 1);
 
 const failedRecoveryRequests = [];
+const failedRecoveryFailures = [];
+const failedRecoveryTexts = [];
 let failedRecoveryRunEnded = 0;
 let failedRecoveryDriver;
 const failedRecoveryChild = {
@@ -516,7 +518,7 @@ failedRecoveryDriver = createCodexAppServerDriver({
   callbacks: {
     onActivity: () => {},
     onActionAccepted: () => {},
-    onFatal: (error) => assert.fail(error),
+    onFatal: (error) => failedRecoveryFailures.push(error),
     onGoal: () => {},
     onReasoning: () => {},
     onRunEnd: () => {
@@ -524,12 +526,12 @@ failedRecoveryDriver = createCodexAppServerDriver({
     },
     onSessionId: () => {},
     onStats: () => {},
-    onText: () => {},
+    onText: (text) => failedRecoveryTexts.push(text),
   },
 });
 
 await failedRecoveryDriver.start();
-for (let attempt = 0; attempt < 50 && failedRecoveryRunEnded === 0; attempt += 1) {
+for (let attempt = 0; attempt < 50 && failedRecoveryFailures.length === 0; attempt += 1) {
   await new Promise((resolve) => setTimeout(resolve, 5));
 }
 assert.deepEqual(
@@ -548,7 +550,9 @@ assert.equal(
   failedRecoveryRequests.at(-1)?.params.items[0].content[0].text,
   'preserve this failed prompt'
 );
-assert.equal(failedRecoveryRunEnded, 1);
+assert.deepEqual(failedRecoveryFailures, ['context window exceeded']);
+assert.equal(failedRecoveryRunEnded, 0);
+assert.deepEqual(failedRecoveryTexts, []);
 
 const cancelledRecoveryRequests = [];
 let cancelledRecoveryDriver;
@@ -777,9 +781,9 @@ const astraCallbacks = {
   onRunEnd: () => { astraRunEnded += 1; }, onUserInput: () => { inputChanges += 1; },
   onRetainUserInputs: (requests) => completedQuestions.retain('astra-run', requests),
 };
-const makeAstraDriver = (goal) => createCodexAppServerDriver({
+const makeAstraDriver = (goal, callbackOverrides = {}) => createCodexAppServerDriver({
   child: astraChild, cwd: '/tmp', model: astra, input: astraInput,
-  resumeSessionId: 'astra-native', accessMode: 'full-access', callbacks: astraCallbacks, goal,
+  resumeSessionId: 'astra-native', accessMode: 'full-access', callbacks: { ...astraCallbacks, ...callbackOverrides }, goal,
 });
 astraDriver = makeAstraDriver();
 await astraDriver.start();
@@ -944,7 +948,10 @@ for (const outcome of ['accepted', 'completed-before-ack', 'completed-before-rej
 }
 assert.ok(questionEvents.some((event) => event.type === 'user-input' && event.threadId === 'orion-astra'));
 
-astraDriver = makeAstraDriver();
+const astraFailedErrors = [];
+const astraRunEndBeforeFailure = astraRunEnded;
+const astraTextBeforeFailure = astraText.join('').length;
+astraDriver = makeAstraDriver(undefined, { onFatal: (error) => astraFailedErrors.push(error) });
 await astraDriver.start();
 astraDriver.handleMessage({ method: 'guardianWarning', params: { threadId: 'astra-native', message: 'Action requires review.' } });
 assert.equal(astraActivities.at(-1).detail, 'Action requires review.');
@@ -955,7 +962,190 @@ assert.ok(Math.abs(astraWire.at(-1).result.currentTimeAt - Date.now() / 1000) < 
 astraDriver.handleMessage({ method: 'turn/completed', params: { threadId: 'astra-native', turn: { id: 'astra-turn', status: 'failed', error: { message: 'Context full', codexErrorInfo: 'contextWindowExceeded' } } } });
 assert.equal(astraWire.some((message) => message.method === 'thread/rollback'), false, 'notes/searchable history must not enter legacy rollback recovery');
 assert.equal(astraWire.some((message) => message.method === 'thread/compact/start'), false);
+assert.deepEqual(astraFailedErrors, ['Context full'], 'failed non-goal Astra turns must report via onFatal with the real error');
+assert.equal(astraRunEnded, astraRunEndBeforeFailure, 'failed non-goal Astra turns must not resolve cleanly via onRunEnd');
+assert.equal(astraText.join('').slice(astraTextBeforeFailure), '', 'failed non-goal Astra turns must not append a goal pause note');
 await astraDriver.dispose();
+
+// Failed non-goal turns must fail via onFatal with the real error (never
+// resolving cleanly as a paused /goal run), while failed /goal turns keep
+// pausing the active goal and ending cleanly with the /goal resume note.
+{
+  const runFailedTurnScenario = async ({
+    goal,
+    review,
+    resumeSessionId,
+    preTurnMessages = [],
+    turnError,
+    goalSetResult = {},
+  }) => {
+    const wire = [];
+    const activities = [];
+    const fatalErrors = [];
+    const texts = [];
+    const goals = [];
+    let runEnds = 0;
+    let scenarioDriver;
+    scenarioDriver = createCodexAppServerDriver({
+      child: {
+        stdin: {
+          write(line) {
+            const message = JSON.parse(line);
+            wire.push(message);
+            if (message.id === undefined) return;
+            let result = {};
+            if (message.method === 'thread/start' || message.method === 'thread/resume') {
+              result = { thread: { id: resumeSessionId ?? 'failed-turn-thread' } };
+            } else if (message.method === 'turn/start') {
+              result = { turn: { id: 'failed-turn-1' } };
+            } else if (message.method === 'thread/goal/set') {
+              result =
+                message.params?.status === 'paused'
+                  ? goalSetResult
+                  : { goal: { objective: goal?.objective ?? '', status: 'active' } };
+            }
+            queueMicrotask(() => {
+              scenarioDriver.handleMessage({ jsonrpc: '2.0', id: message.id, result });
+              if (message.method === 'turn/start' || message.method === 'review/start') {
+                scenarioDriver.handleMessage({
+                  jsonrpc: '2.0',
+                  method: 'turn/started',
+                  params: { threadId: resumeSessionId ?? 'failed-turn-thread', turn: { id: 'failed-turn-1' } },
+                });
+              }
+            });
+          },
+        },
+      },
+      cwd: '/tmp/project',
+      model,
+      input: { prompt: 'do the task' },
+      goal,
+      review,
+      resumeSessionId,
+      accessMode: 'full-access',
+      callbacks: {
+        onActivity: (activity) => activities.push(activity),
+        onActionAccepted: () => {},
+        onFatal: (error) => fatalErrors.push(error),
+        onGoal: (nextGoal) => goals.push(nextGoal),
+        onReasoning: () => {},
+        onRunEnd: () => {
+          runEnds += 1;
+        },
+        onSessionId: () => {},
+        onStats: () => {},
+        onText: (text) => texts.push(text),
+      },
+    });
+    await scenarioDriver.start();
+    const targetThreadId = resumeSessionId ?? 'failed-turn-thread';
+    if (goal) {
+      scenarioDriver.handleMessage({
+        jsonrpc: '2.0',
+        method: 'turn/started',
+        params: { threadId: targetThreadId, turn: { id: 'failed-turn-1' } },
+      });
+    }
+    for (const msg of preTurnMessages) {
+      scenarioDriver.handleMessage({ jsonrpc: '2.0', ...msg });
+    }
+    scenarioDriver.handleMessage({
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: {
+        threadId: targetThreadId,
+        turn: {
+          id: 'failed-turn-1',
+          status: 'failed',
+          ...(turnError !== undefined ? { error: turnError } : {}),
+        },
+      },
+    });
+    for (let attempt = 0; attempt < 50 && fatalErrors.length === 0 && runEnds === 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await scenarioDriver.dispose();
+    return { wire, activities, fatalErrors, texts, goals, runEnds };
+  };
+
+  // 1. Ordinary non-goal turn failure with turn.error (even if a prior goal snapshot was active).
+  const ordinary = await runFailedTurnScenario({
+    resumeSessionId: 'resumed-with-old-goal',
+    preTurnMessages: [
+      {
+        method: 'thread/goal/updated',
+        params: { threadId: 'resumed-with-old-goal', goal: { objective: 'Old goal', status: 'active' } },
+      },
+    ],
+    turnError: { message: 'Rate limit exceeded' },
+  });
+  assert.deepEqual(ordinary.fatalErrors, ['Rate limit exceeded']);
+  assert.equal(ordinary.runEnds, 0);
+  assert.deepEqual(ordinary.texts, []);
+  assert.equal(ordinary.wire.some((m) => m.method === 'thread/goal/set'), false);
+  assert.equal(ordinary.activities.at(-1)?.title, 'Turn failed');
+  assert.equal(ordinary.activities.at(-1)?.detail, 'Rate limit exceeded');
+
+  // 2. Ordinary non-goal turn failure where error came from a terminal error notification.
+  const fromNotification = await runFailedTurnScenario({
+    preTurnMessages: [
+      {
+        method: 'error',
+        params: {
+          threadId: 'failed-turn-thread',
+          error: { message: 'Upstream 503 overloaded', codexErrorInfo: { serverError: { httpStatusCode: 503 } } },
+          willRetry: false,
+        },
+      },
+    ],
+  });
+  assert.deepEqual(fromNotification.fatalErrors, ['Upstream 503 overloaded']);
+  assert.equal(fromNotification.runEnds, 0);
+  assert.deepEqual(fromNotification.texts, []);
+
+  // 3. Ordinary non-goal turn failure with structured codexErrorInfo but no message string.
+  const structuredOnly = await runFailedTurnScenario({
+    turnError: { codexErrorInfo: 'unauthorized' },
+  });
+  assert.deepEqual(structuredOnly.fatalErrors, ['unauthorized']);
+  assert.equal(structuredOnly.runEnds, 0);
+
+  // 4. Inline review turn failure still reports via onFatal.
+  const reviewFailed = await runFailedTurnScenario({
+    review: { mode: 'uncommitted' },
+    turnError: { message: 'Review model unavailable' },
+  });
+  assert.deepEqual(reviewFailed.fatalErrors, ['Review model unavailable']);
+  assert.equal(reviewFailed.runEnds, 0);
+  assert.deepEqual(reviewFailed.texts, []);
+
+  // 5. Goal turn failure pauses the active goal and ends cleanly with the /goal resume note.
+  const goalFailed = await runFailedTurnScenario({
+    goal: { objective: 'Finish migration' },
+    turnError: { message: 'Model request failed' },
+    goalSetResult: {},
+  });
+  assert.deepEqual(goalFailed.fatalErrors, []);
+  assert.equal(goalFailed.runEnds, 1);
+  assert.match(goalFailed.texts.join(''), /Goal run stopped on an error — `\/goal resume` to retry\./);
+  assert.ok(
+    goalFailed.wire.some((m) => m.method === 'thread/goal/set' && m.params?.status === 'paused'),
+    'failed goal turns must pause the active stored goal'
+  );
+  assert.equal(goalFailed.activities.at(-1)?.title, 'Turn failed');
+  assert.equal(goalFailed.activities.at(-1)?.detail, 'Model request failed');
+
+  // 6. Goal turn failure when thread/goal/set returns the paused goal object.
+  const goalFailedWithSnapshot = await runFailedTurnScenario({
+    goal: { objective: 'Finish migration' },
+    turnError: { message: 'Model request failed' },
+    goalSetResult: { goal: { objective: 'Finish migration', status: 'paused' } },
+  });
+  assert.deepEqual(goalFailedWithSnapshot.fatalErrors, []);
+  assert.equal(goalFailedWithSnapshot.runEnds, 1);
+  assert.equal(goalFailedWithSnapshot.goals.at(-1)?.status, 'paused');
+}
 assert.equal(codexAppServerActivityFromItem({ id: 'sleep-1', type: 'sleep', durationMs: 5000 }, false).title, 'Waiting');
 assert.match(codexAppServerActivityFromItem({ id: 'call-1', type: 'functionCallOutput', name: 'exec', namespace: 'functions', output: 'completed' }, true).title, /functions.exec/);
 // Steps carry the tool they call (read by the bot-thread stuck check, app/durangoDispatch.ts).
