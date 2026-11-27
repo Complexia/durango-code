@@ -4433,13 +4433,16 @@ const BotComposer: React.FC<{
   const [attachError, setAttachError] = useState<string | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const scrollTimerRef = useRef<number | null>(null);
+  const atBottomRef = useRef(true);
   useEffect(
     () => () => {
       if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
     },
     []
   );
-  const markScrolling = () => {
+  const handleScroll = (event: React.UIEvent<HTMLTextAreaElement>) => {
+    const element = event.currentTarget;
+    atBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 2;
     setScrolling(true);
     if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
     scrollTimerRef.current = window.setTimeout(() => {
@@ -4451,12 +4454,15 @@ const BotComposer: React.FC<{
     const element = ref.current;
     if (!element) return;
     const prevScrollTop = element.scrollTop;
-    const atBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 2;
+    const stickToBottom =
+      atBottomRef.current &&
+      (document.activeElement !== element || element.selectionEnd === element.value.length);
     element.style.height = 'auto';
     element.style.height = `${element.scrollHeight}px`;
     if (element.scrollHeight > element.clientHeight) {
-      element.scrollTop = atBottom ? element.scrollHeight : prevScrollTop;
+      element.scrollTop = stickToBottom ? element.scrollHeight : prevScrollTop;
     }
+    atBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 2;
   }, [text]);
   // Thumbnails still in the box when it goes away are released (sent ones belong to their message).
   const filesRef = useRef(files);
@@ -4525,7 +4531,7 @@ const BotComposer: React.FC<{
           }}
         >
           {files.length > 0 && (
-            <div className="composer-attachments">
+            <div className="composer-attachments items-end">
               {files.map((file) =>
                 file.preview ? (
                   <span key={file.path} className="group relative h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-[var(--border-default)]" title={`${file.name} · ${formatFileSize(file.size)}`}>
@@ -4563,7 +4569,7 @@ const BotComposer: React.FC<{
             rows={2}
             placeholder={`Message ${botName}`}
             onChange={(event) => setText(event.target.value)}
-            onScroll={markScrolling}
+            onScroll={handleScroll}
             onPaste={(event) => {
               if (!event.clipboardData.files.length) return;
               event.preventDefault();
@@ -4599,7 +4605,7 @@ const BotComposer: React.FC<{
             </button>
           </div>
         </div>
-        {attachError && <div className="mt-1 px-1 text-[11.5px] text-red-400">{attachError}</div>}
+        {attachError && <div className="mt-1 px-1 text-[11.5px] text-[var(--danger)]">{attachError}</div>}
       </div>
     </div>
   );

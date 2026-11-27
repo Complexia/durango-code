@@ -320,17 +320,21 @@ export const Composer = ({
     setChatMention(null);
     chatMentionDismissRef.current = null;
     setSlashDismissedDraft(null);
+    atBottomRef.current = true;
   }, [draftKey]);
 
   const [scrolling, setScrolling] = useState(false);
   const scrollTimerRef = useRef<number | null>(null);
+  const atBottomRef = useRef(true);
   useEffect(
     () => () => {
       if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
     },
     []
   );
-  const markScrolling = useCallback(() => {
+  const handleChatScroll = useCallback((event: React.UIEvent<HTMLTextAreaElement>) => {
+    const el = event.currentTarget;
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
     setScrolling(true);
     if (scrollTimerRef.current !== null) window.clearTimeout(scrollTimerRef.current);
     scrollTimerRef.current = window.setTimeout(() => {
@@ -344,12 +348,15 @@ export const Composer = ({
   const resizeChatInput = useCallback((el: HTMLTextAreaElement | null) => {
     if (!el) return;
     const prevScrollTop = el.scrollTop;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
+    const stickToBottom =
+      atBottomRef.current &&
+      (document.activeElement !== el || el.selectionEnd === el.value.length);
     el.style.height = 'auto';
     el.style.height = `${el.scrollHeight}px`;
     if (el.scrollHeight > el.clientHeight) {
-      el.scrollTop = atBottom ? el.scrollHeight : prevScrollTop;
+      el.scrollTop = stickToBottom ? el.scrollHeight : prevScrollTop;
     }
+    atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 2;
   }, []);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   // The composer unmounts whenever the shell swaps views — Settings, the Code
@@ -1333,7 +1340,7 @@ export const Composer = ({
         className={`chat-input min-h-[52px]${
           offeredPromptSuggestion ? ' placeholder:!text-transparent' : ''
         }${scrolling ? ' is-scrolling' : ''}`}
-        onScroll={markScrolling}
+        onScroll={handleChatScroll}
         disabled={isNativeSubagentThread || workspaceUnavailable}
         placeholder={
           offeredPromptSuggestion

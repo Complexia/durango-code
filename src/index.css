@@ -5865,6 +5865,7 @@ html.theme-light .setting-row .release-notes-list {
 .chat-input::-webkit-scrollbar-thumb:hover,
 .chat-input::-webkit-scrollbar-thumb:active {
   background-color: color-mix(in srgb, var(--text-primary) 44%, transparent);
+  background-clip: content-box;
 }
 
 .chat-input::placeholder {
@@ -7282,11 +7283,11 @@ html.theme-light .setting-row .release-notes-list {
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #424242;
+  background-color: #424242;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #555;
+  background-color: #555;
 }
 
 /* ============ Linked board tasks (Orion web kanban) ============ */
