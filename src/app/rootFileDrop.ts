@@ -58,11 +58,18 @@ export const useBotFileDropHandler = (): BotFileDropHandler | null =>
 export const hasFileDrag = (dataTransfer: Pick<DataTransfer, 'types'> | null | undefined): boolean =>
   Boolean(dataTransfer && Array.from(dataTransfer.types ?? []).includes('Files'));
 
+const MODAL_DIALOG_SELECTOR = '[aria-modal="true"], dialog[open]';
+
 /** True when a blocking modal dialog covers the current view. */
 export const hasOpenModalDialog = (root?: ParentNode | null): boolean => {
   const container = root ?? (typeof document !== 'undefined' ? document : null);
   if (!container || typeof container.querySelector !== 'function') return false;
-  return Boolean(container.querySelector('[aria-modal="true"]'));
+  if (container.querySelector(MODAL_DIALOG_SELECTOR)) return true;
+  try {
+    return Boolean(container.querySelector(':modal'));
+  } catch {
+    return false;
+  }
 };
 
 /**

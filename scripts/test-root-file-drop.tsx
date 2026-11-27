@@ -93,7 +93,37 @@ assert.equal(rootFileDropOverlayLabel('none', 'durango-bots'), null);
 assert.equal(hasFileDrag({ types: ['Files', 'text/plain'] }), true);
 assert.equal(hasFileDrag({ types: ['text/plain'] }), false);
 assert.equal(hasFileDrag(null), false);
-assert.equal(hasOpenModalDialog({ querySelector: (selector: string) => (selector === '[aria-modal="true"]' ? ({} as Element) : null) } as ParentNode), true);
+assert.equal(
+  hasOpenModalDialog({
+    querySelector: (selector: string) => (selector.includes('[aria-modal="true"]') ? ({} as Element) : null),
+  } as ParentNode),
+  true,
+  'detects aria-modal dialogs'
+);
+assert.equal(
+  hasOpenModalDialog({
+    querySelector: (selector: string) => (selector.includes('dialog[open]') ? ({} as Element) : null),
+  } as ParentNode),
+  true,
+  'detects open native <dialog> elements'
+);
+assert.equal(
+  hasOpenModalDialog({
+    querySelector: (selector: string) => (selector === ':modal' ? ({} as Element) : null),
+  } as ParentNode),
+  true,
+  'detects top-layer :modal elements'
+);
+assert.equal(
+  hasOpenModalDialog({
+    querySelector: (selector: string) => {
+      if (selector === ':modal') throw new SyntaxError('unsupported pseudo-class');
+      return null;
+    },
+  } as unknown as ParentNode),
+  false,
+  'tolerates environments without :modal selector support'
+);
 assert.equal(hasOpenModalDialog({ querySelector: () => null } as unknown as ParentNode), false);
 
 // 6. Bot drop handler registry: safe across rapid switches (stale cleanup cannot clobber the newer bot).
@@ -126,10 +156,11 @@ unregisterB();
 assert.equal(getBotFileDropHandler(), null, 'active bot unregister clears the slot');
 
 // 7. Source-level invariants keeping special targets working and preventing regressions.
-const [appSource, botsSource, userActionsSource] = await Promise.all([
+const [appSource, botsSource, userActionsSource, htmlVisualSource] = await Promise.all([
   readFile(new URL('../src/App.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/app/BotsWorkspace.tsx', import.meta.url), 'utf8'),
   readFile(new URL('../src/app/UserActions.tsx', import.meta.url), 'utf8'),
+  readFile(new URL('../src/app/HtmlVisual.tsx', import.meta.url), 'utf8'),
 ]);
 
 const rootDropMatch = appSource.match(/const handleRootDrop = useCallback\(([\s\S]*?)\n  \);/);
@@ -139,7 +170,22 @@ assert.match(rootDropMatch[1], /resolveCurrentRootFileDropTarget\(\)/, 'handleRo
 assert.match(rootDropMatch[1], /getBotFileDropHandler\(\)\?\.onDrop/, 'handleRootDrop must route Bots-view drops to the registered bot composer');
 assert.doesNotMatch(rootDropMatch[1], /\battachFiles\(/, 'handleRootDrop must attach only to the visible thread, never calling resolveComposerTarget via attachFiles');
 
+const rootLeaveMatch = appSource.match(/const handleRootDragLeave = useCallback\(([\s\S]*?)\n  \}, \[\]\);/);
+assert.ok(rootLeaveMatch, 'handleRootDragLeave must exist in App.tsx');
+assert.match(
+  rootLeaveMatch[1],
+  /if \(!nextTarget \|\| !event\.currentTarget\.contains\(nextTarget\)\) \{[\s\S]*?dragDepth\.current = 0;[\s\S]*?setDraggingFiles\(false\);/,
+  'handleRootDragLeave must unconditionally clear overlay when pointer leaves root (even with empty dataTransfer.types)'
+);
+assert.match(appSource, /window\.addEventListener\('pointermove', clear, true\)/, 'stuck drag overlay must clear on pointermove');
+assert.match(appSource, /window\.addEventListener\('mousedown', clear, true\)/, 'stuck drag overlay must clear on mousedown');
+assert.match(appSource, /new MutationObserver\(\(\) => \{\s*if \(hasOpenModalDialog\(\)\) clear\(\);/, 'overlay must clear immediately if a modal opens mid-drag');
+
+assert.match(htmlVisualSource, /aria-modal=\{expanded \? true : undefined\}/, 'expanded HtmlVisual dialog must expose aria-modal');
+
 assert.match(botsSource, /registerBotFileDropHandler\(\{/, 'BotComposer must register its addFiles handler with rootFileDrop');
+assert.match(botsSource, /if \(!mountedRef\.current\) \{[\s\S]*?releasePreview\(file\.preview\)[\s\S]*?appendBotDraftFiles\(draftKey, ok, BOT_ATTACHMENTS_MAX\)/, 'BotComposer must persist late-resolving drops to the original draft and release previews on unmount');
+assert.match(botsSource, /onDrop=\{\(event\) => \{\s*setDragging\(false\);\s*if \(!event\.dataTransfer\.files\.length\) return;/, 'BotComposer must clear its dragging highlight even on a zero-file drop');
 assert.match(botsSource, /onDrop: \(event: React\.DragEvent\) => \{[\s\S]*?event\.stopPropagation\(\);/, 'ProjectLibrary must keep stopping propagation for library drops');
 assert.match(userActionsSource, /onDrop=\{\(event\) => \{[\s\S]*?event\.preventDefault\(\);/, 'Needs you replies must keep preventing default on drop so root skips them');
 

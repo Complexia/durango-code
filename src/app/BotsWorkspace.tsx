@@ -59,7 +59,7 @@ import { MarkdownContent } from './markdown';
 import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
 import { localMediaSrc } from './attachments';
-import { botDraftKey, loadBotDraft, projectBotDraftKey, restoreUnsentBotDraft, useBotDraftSaver } from './botDrafts';
+import { appendBotDraftFiles, botDraftKey, loadBotDraft, projectBotDraftKey, restoreUnsentBotDraft, useBotDraftSaver } from './botDrafts';
 import { BotActionsRow, BotCards, BotFileGallery, threadIsHere, useMessageFiles, type BotActionHandlers } from './BotReplyCards';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { sortProjectsByLatestThreadStart } from './projectOrder';
@@ -4441,7 +4441,14 @@ const BotComposer: React.FC<{
   // Thumbnails still in the box when it goes away are released (sent ones belong to their message).
   const filesRef = useRef(files);
   filesRef.current = files;
-  useEffect(() => () => filesRef.current.forEach((file) => releasePreview(file.preview)), []);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      filesRef.current.forEach((file) => releasePreview(file.preview));
+    };
+  }, []);
   const add = (next: BotAttachmentFile[]) => {
     setAttachError(null);
     const merged = [...filesRef.current];
@@ -4461,6 +4468,13 @@ const BotComposer: React.FC<{
   const addFiles = async (list: FileList | File[]) => {
     const picked = await Promise.all([...list].map((file) => fileToAttachment(file).catch(() => null)));
     const ok = picked.filter((file): file is BotAttachmentFile => Boolean(file));
+    if (!mountedRef.current) {
+      // Composer unmounted while staging (e.g. switched bots): release transient
+      // previews and save the files into the original bot's draft.
+      ok.forEach((file) => releasePreview(file.preview));
+      appendBotDraftFiles(draftKey, ok, BOT_ATTACHMENTS_MAX);
+      return;
+    }
     if (ok.length < picked.length) setAttachError('Some files couldn’t be attached.');
     add(ok);
   };
@@ -4474,9 +4488,37 @@ const BotComposer: React.FC<{
       }),
     [botName]
   );
+  useEffect(() => {
+    if (!dragging) return undefined;
+    const clear = () => setDragging(false);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') clear();
+    };
+    window.addEventListener('dragend', clear);
+    window.addEventListener('blur', clear);
+    window.addEventListener('drop', clear, true);
+    window.addEventListener('pointermove', clear, true);
+    window.addEventListener('mousedown', clear, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('dragend', clear);
+      window.removeEventListener('blur', clear);
+      window.removeEventListener('drop', clear, true);
+      window.removeEventListener('pointermove', clear, true);
+      window.removeEventListener('mousedown', clear, true);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [dragging]);
   const pick = async () => {
     const result = await window.orion?.pickBotAttachments?.();
     if (!result) return;
+    if (!mountedRef.current) {
+      if (result.ok && result.files?.length) {
+        result.files.forEach((file) => releasePreview(file.preview));
+        appendBotDraftFiles(draftKey, result.files, BOT_ATTACHMENTS_MAX);
+      }
+      return;
+    }
     if (!result.ok) {
       setAttachError(result.error ?? 'Couldn’t attach those files.');
       return;
@@ -4510,9 +4552,9 @@ const BotComposer: React.FC<{
             if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false);
           }}
           onDrop={(event) => {
+            setDragging(false);
             if (!event.dataTransfer.files.length) return;
             event.preventDefault();
-            setDragging(false);
             void addFiles(event.dataTransfer.files);
           }}
         >

@@ -5806,20 +5806,41 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!draggingFiles) return undefined;
-    if (rootFileDropTarget === 'none') {
-      dragDepth.current = 0;
-      setDraggingFiles(false);
-      return undefined;
-    }
     const clear = () => {
       dragDepth.current = 0;
       setDraggingFiles(false);
     };
+    if (rootFileDropTarget === 'none' || hasOpenModalDialog()) {
+      clear();
+      return undefined;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') clear();
+    };
     window.addEventListener('dragend', clear);
     window.addEventListener('blur', clear);
+    window.addEventListener('pointermove', clear, true);
+    window.addEventListener('mousedown', clear, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    let observer: MutationObserver | null = null;
+    if (typeof MutationObserver !== 'undefined' && document.body) {
+      observer = new MutationObserver(() => {
+        if (hasOpenModalDialog()) clear();
+      });
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['aria-modal', 'open'],
+      });
+    }
     return () => {
       window.removeEventListener('dragend', clear);
       window.removeEventListener('blur', clear);
+      window.removeEventListener('pointermove', clear, true);
+      window.removeEventListener('mousedown', clear, true);
+      window.removeEventListener('keydown', onKeyDown, true);
+      observer?.disconnect();
     };
   }, [draggingFiles, rootFileDropTarget]);
 
@@ -5851,6 +5872,12 @@ const App: React.FC = () => {
   );
 
   const handleRootDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
+    const nextTarget = event.relatedTarget as Node | null;
+    if (!nextTarget || !event.currentTarget.contains(nextTarget)) {
+      dragDepth.current = 0;
+      setDraggingFiles(false);
+      return;
+    }
     if (!hasFileDrag(event.dataTransfer)) return;
     if (dragDepth.current === 0) return;
     dragDepth.current = Math.max(0, dragDepth.current - 1);

@@ -127,6 +127,26 @@ export const restoreUnsentBotDraft = (key: string, draft: BotDraft) => {
   state.setBotDraft(key, draft);
 };
 
+/**
+ * Merges newly staged files directly into a bot's persisted draft (used when
+ * an async drop or file pick finishes after the composer has already unmounted).
+ * Deduplicates by path, respects `maxFiles`, and strips transient preview URLs.
+ */
+export const appendBotDraftFiles = (key: string, next: BotAttachmentFile[], maxFiles: number) => {
+  if (next.length === 0) return;
+  const state = useOrionStore.getState();
+  const existing = state.botDrafts[key];
+  const merged = [...(existing?.files ?? [])];
+  let added = false;
+  for (const file of next) {
+    if (!file.path || merged.some((item) => item.path === file.path) || merged.length >= maxFiles) continue;
+    merged.push({ path: file.path, name: file.name, size: file.size });
+    added = true;
+  }
+  if (!added) return;
+  state.setBotDraft(key, { text: existing?.text ?? '', files: merged });
+};
+
 /** A box's saver, flushed when it goes away (another bot, tab or thread), the window blurs or hides, and on unload. */
 export const useBotDraftSaver = (key: string): BotDraftSaver => {
   const saver = useMemo(() => createBotDraftSaver(key), [key]);
