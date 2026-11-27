@@ -29,6 +29,7 @@ import {
   BOT_WARM_PROCESSES_MAX,
   connectedConnectorsOf,
   connectorsStillConnectingNote,
+  connectorsThisReplyNote,
   createBotSessionStore,
   createWarmClaudeProcesses,
   keptConnectorsOf,
@@ -2647,6 +2648,9 @@ try {
     const stopped = await waitForConnectors({ query: { mcpServerStatus: async () => [] }, names: ['claude.ai Gmail'], signal: controller.signal, ...timing });
     assert.deepEqual([stopped.waitedMs, stopped.aborted], [0, true], 'a stopped reply does not wait');
     assert.equal(connectorsStillConnectingNote([]), '');
+    assert.equal(connectorsThisReplyNote([]), '');
+    assert.equal(connectorsThisReplyNote(null), '');
+    assert.match(connectorsThisReplyNote(['claude.ai Gmail', 'claude.ai Google Drive']), /this reply: claude\.ai Gmail, claude\.ai Google Drive\./);
     assert.match(connectorsStillConnectingNote(['claude.ai Gmail']), /not connected yet as this reply starts: claude\.ai Gmail\.[\s\S]*call ToolSearch/);
   });
 
@@ -2682,15 +2686,17 @@ try {
     await runLane(sessionLane(history, [1], { replyMessageId: 'r2' }), sessionCtx());
     const kept = JSON.parse(await fs.readFile(path.join(sessionsDir, 'bot_1__claude-opus-5-5.json'), 'utf8'));
     assert.deepEqual(kept.connectors, ['claude.ai Gmail'], 'the connectors it answered with are kept with the session');
-    assert.equal(pollsOf(0).beforeFirstInput, 0, 'a new bot has no connectors to wait for');
-    assert.match(sdk.runs[0].options.systemPrompt.append, /## Connectors\n\nEach of your replies starts Claude Code again/);
+    assert.equal(pollsOf(0).beforeFirstInput, 1, 'a new bot has no connectors to wait for (one read for the connected-now line)');
+    assert.match(textOf(sdk.runs[0].inputs[0]), /Connectors connected in Claude Code on this machine for this reply: claude\.ai Gmail\./, 'the first message names the connectors it has');
+    assert.match(sdk.runs[0].options.systemPrompt.append, /## Connectors\n\nThe connectors loaded in Claude Code here [\s\S]*never in a cloud task[\s\S]*sha256:<64 lowercase hex>:<absolute path>[\s\S]*Each of your replies starts Claude Code again/);
     assert.ok(sdk.runs[0].options.systemPrompt.append.endsWith(BOT_CONNECTORS_NOTE));
 
     const later = [...history, { id: 'r2', seq: 2, role: 'assistant', text: 'Drafted.' }, row(3, 'user', 'Now send it.')];
     await runLane(sessionLane(later, [3], { laneId: 'lane_2', replyMessageId: 'r4' }), sessionCtx());
     assert.equal(sdk.runs[1].options.resume, 'sess-c', 'resumed');
-    assert.equal(pollsOf(1).beforeFirstInput, 4, 'asked until Gmail was listed and connected, before the first message');
+    assert.equal(pollsOf(1).beforeFirstInput, 5, 'asked until Gmail was listed and connected, before the first message (and once for the connected-now line)');
     assert.doesNotMatch(textOf(sdk.runs[1].inputs[0]), /not connected yet/, 'all up: no note');
+    assert.match(textOf(sdk.runs[1].inputs[0]), /\(Connectors connected in Claude Code on this machine for this reply: claude\.ai Gmail\. Use them directly here/, 'the first message names the connectors it has');
     assert.ok(logs.some((line) => /bot bot_1 waited \d+ms for connectors$/.test(line)));
 
     // Gmail never comes up within the limit: the reply goes on, telling the model it is still connecting.
@@ -2700,6 +2706,7 @@ try {
     assert.ok(Date.now() - started < 3_000, 'bounded by connectorWaitMs');
     assert.equal(result.text, 'Drafted.');
     assert.match(textOf(sdk.runs[2].inputs[0]), /<new_messages>[\s\S]*And to Ana\.[\s\S]*Connectors not connected yet as this reply starts: claude\.ai Gmail\./);
+    assert.doesNotMatch(textOf(sdk.runs[2].inputs[0]), /Connectors connected in Claude Code/, 'Gmail down: not listed as connected');
     assert.ok(logs.some((line) => /not connected: claude\.ai Gmail/.test(line)));
     const keptAfter = JSON.parse(await fs.readFile(path.join(sessionsDir, 'bot_1__claude-opus-5-5.json'), 'utf8'));
     assert.deepEqual(keptAfter.connectors, [], 'a connector still down at the end is not waited for next time');
@@ -2854,7 +2861,8 @@ try {
     const prompt = textOf(sdk.runs[0].inputs[1]);
     assert.match(prompt, /<new_messages>\nPerson:\nOne near the station\.\n<\/new_messages>/);
     assert.doesNotMatch(prompt, /conversation_so_far|Find a cafe/, 'only what is new, like a resumed session');
-    assert.equal(statusCalls - statusBefore, 1, 'no connector wait: only the read at its end');
+    assert.equal(statusCalls - statusBefore, 1, 'no connector wait: one read, for its first message (and what it records)');
+    assert.match(prompt, /Connectors connected in Claude Code on this machine for this reply: claude\.ai Gmail\./);
     assert.deepEqual(firstCalls, []);
     assert.equal(secondCalls.length, 1, "the first process's tool calls this reply's handler");
     assert.deepEqual(secondCalls[0].input, { q: 'second' });

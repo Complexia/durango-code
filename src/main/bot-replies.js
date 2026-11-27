@@ -691,13 +691,22 @@ export const connectorsStillConnectingNote = (missing) =>
     : '';
 
 /**
- * Appended to a Claude Code bot reply's instructions: a connector that looks
- * gone at a reply's start is usually reconnecting (see above).
+ * Appended to a Claude Code bot reply's instructions: the connectors are this
+ * machine's (they work with its files, so work that needs both stays here),
+ * and a connector that looks gone at a reply's start is usually reconnecting
+ * (see above).
  */
 export const BOT_CONNECTORS_NOTE = [
   '## Connectors',
-  "Each of your replies starts Claude Code again, and its connectors (Gmail, Google Calendar, Google Drive and other claude.ai or MCP servers) connect again with it, which can take a few seconds. A connector whose tools are missing or listed as removed, or whose server is reported as disconnected or still connecting, is almost always reconnecting, not disconnected. Before you tell the person a connector is disconnected or unavailable, call ToolSearch for its tools (it waits for servers that are still connecting) and try the call again. Only if it still isn't there or keeps failing, tell them, with the error, and that they can check it in claude.ai's connector settings.",
+  "The connectors loaded in Claude Code here (Gmail, Google Calendar, Google Drive and other claude.ai or MCP servers) are yours to use directly in your replies, on this machine, next to its files: email, calendar and documents work that needs files from this machine is done here, in your reply (or in a Durango Code thread on this machine), never in a cloud task, which can't open them. Attaching a file from this machine (to a Gmail draft, a Drive upload…): a tool whose description starts with FILE REFERENCES takes `sha256:<64 lowercase hex>:<absolute path>` as the file's content instead of base64 (get the hash with `shasum -a 256 <path>`), and Claude Code fills in the file when the call runs. get_draft's default and FULL_CONTENT views don't list a draft's files even when they're on it, so don't redo a draft because they show none: to check, read it with messageFormat RAW and find each file's part (`filename=` in the MIME), before you say they're attached. Gmail's update_draft drops a draft's files: to change a draft that has files, create a new draft with the same files and delete the old one. A Gmail message is at most 25 MB in total: share bigger files from Drive and link them.",
+  "Each of your replies starts Claude Code again, and its connectors connect again with it, which can take a few seconds. A connector whose tools are missing or listed as removed, or whose server is reported as disconnected or still connecting, is almost always reconnecting, not disconnected. Before you tell the person a connector is disconnected or unavailable, call ToolSearch for its tools (it waits for servers that are still connecting) and try the call again. Only if it still isn't there or keeps failing, tell them, with the error, and that they can check it in claude.ai's connector settings.",
 ].join('\n\n');
+
+/** The connectors this reply has, for its first message (connected remote MCP server names). Pure. */
+export const connectorsThisReplyNote = (connected) =>
+  Array.isArray(connected) && connected.length
+    ? `(Connectors connected in Claude Code on this machine for this reply: ${connected.join(', ')}. Use them directly here; see Connectors in your instructions.)`
+    : '';
 
 /**
  * One prompt, one answer, no tools (a local bot's history summary). deps:
@@ -1316,6 +1325,13 @@ export const createClaudeLaneRunner = ({
         const stillConnecting = connectorsStillConnectingNote(connectorWait.missing);
         if (stillConnecting) firstPrompt = `${firstPrompt}\n\n${stillConnecting}`;
       }
+      // Which connectors it has now, named in its first message. A warm process's
+      // are up and stay so: what it records for the next reply. A new one's are
+      // recorded at its end (a first reply reads this before they're all listed).
+      const connectedNow = await readConnectors(query);
+      if (attempt.warm && connectedNow) attempt.connectors = connectedNow;
+      const connectedNote = connectorsThisReplyNote(connectedNow);
+      if (connectedNote) firstPrompt = `${firstPrompt}\n\n${connectedNote}`;
       // Stopped while it waited: the prompt never goes out.
       if (ctx.signal?.aborted || proc.closed) return attempt;
       inputQueue.push(userMessage(firstPrompt));
