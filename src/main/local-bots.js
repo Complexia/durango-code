@@ -2099,7 +2099,7 @@ export const createLocalBotEngine = ({
   const startTask = (entry, { title, instructions }) => {
     const runtime = runtimeFor(entry.bot.id);
     if (runtime.tasks.size >= LOCAL_BOT_MAX_TASKS) {
-      throw new Error(`You already have ${runtime.tasks.size} tasks running: wait for a report first.`);
+      throw new Error(`You already have ${runtime.tasks.size} background tasks running: wait for a report first (Durango Code project threads aren't capped).`);
     }
     const task = { id: newId('lt'), title: clip(oneLine(title), 80) || 'Task', startedAt: now(), abort: new AbortController() };
     runtime.tasks.set(task.id, task);

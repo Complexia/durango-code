@@ -2734,7 +2734,7 @@ test('local bots: Durango Code threads have no concurrency cap; headless non-pro
   }
   const fourth = await call({ title: 'Bg 4', instructions: 'Overflow.' });
   assert.equal(fourth.ok, false);
-  assert.match(fourth.error, /3 tasks running/);
+  assert.match(fourth.error, /3 background tasks running.*project threads aren't capped/);
 
   // Even while headless tasks are at their cap, another Durango Code thread still starts.
   const seventh = await call({ title: 'Work 7', instructions: 'Do work 7.', project: 'Durango' });
