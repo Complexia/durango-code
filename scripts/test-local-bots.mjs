@@ -2705,6 +2705,46 @@ test('silent turns (stay_silent): marks inbox card Read with no message/unread, 
   assert.match(t3.messages.at(-1)?.content ?? '', /no reply was produced/);
 });
 
+test('local bots: Durango Code threads have no concurrency cap; headless non-project tasks stay capped at LOCAL_BOT_MAX_TASKS', async () => {
+  const started = [];
+  const { engine, runner } = makeEngine({
+    listProjects: async () => [{ id: 'proj_1', name: 'Durango', path: '/Users/me/durango' }],
+    startProjectThread: async (input) => {
+      started.push(input);
+      return { ok: true, threadId: `thread_${started.length}` };
+    },
+  });
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'a', content: 'Run 6 threads in parallel.' });
+  await waitFor(() => runner.lanes.length === 1);
+  const call = (input) => runner.lanes[0].ctx.callTool({ name: 'delegate_task', input, toolCallId: 't' }).then((out) => out.result);
+
+  // Start more than LOCAL_BOT_MAX_TASKS (3) Durango Code threads at once: all succeed.
+  for (let i = 1; i <= 6; i += 1) {
+    const res = await call({ title: `Work ${i}`, instructions: `Do work ${i}.`, project: 'Durango' });
+    assert.equal(res.ok, true, `thread ${i} should start without hitting a cap`);
+    assert.equal(res.threadId, `thread_${i}`);
+  }
+  assert.equal(started.length, 6);
+
+  // Headless non-project background tasks are still capped at 3 and unaffected by running threads.
+  for (let i = 1; i <= 3; i += 1) {
+    const res = await call({ title: `Bg ${i}`, instructions: `Background ${i}.` });
+    assert.equal(res.ok, true, `background task ${i} should start`);
+  }
+  const fourth = await call({ title: 'Bg 4', instructions: 'Overflow.' });
+  assert.equal(fourth.ok, false);
+  assert.match(fourth.error, /3 tasks running/);
+
+  // Even while headless tasks are at their cap, another Durango Code thread still starts.
+  const seventh = await call({ title: 'Work 7', instructions: 'Do work 7.', project: 'Durango' });
+  assert.equal(seventh.ok, true);
+  assert.equal(seventh.threadId, 'thread_7');
+
+  runner.lanes[0].finish({ text: 'Started all 7 threads.' });
+  await engine.stop();
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 let failed = 0;

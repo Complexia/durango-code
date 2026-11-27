@@ -70,6 +70,7 @@ export const effectiveLocalBotReasoningEffort = (model, effort) => {
 export const LOCAL_BOT_COMPACTION_MODEL = 'claude-haiku-5-5';
 export const LOCAL_BOT_PARALLEL_AFTER_MS = 5_000;
 export const LOCAL_BOT_MAX_REPLIES = 2;
+/** Headless non-project background tasks running at once per local bot (Durango Code threads aren't capped). */
 export const LOCAL_BOT_MAX_TASKS = 3;
 export const LOCAL_BOT_TASK_RESULT_MAX_CHARS = 12_000;
 export const LOCAL_BOT_MESSAGE_CAP = 2_000;
@@ -2177,9 +2178,6 @@ export const createLocalBotEngine = ({
   ) => {
     if (!startProjectThread) throw new Error('Durango Code threads are not available here.');
     const runtime = runtimeFor(entry.bot.id);
-    if (runtime.threads.size >= LOCAL_BOT_MAX_TASKS) {
-      throw new Error(`You already have ${runtime.threads.size} Durango Code threads running: wait for a report first.`);
-    }
     const project = await resolveProject(projectName);
     const choice = resolveThreadModelChoice({
       model,
