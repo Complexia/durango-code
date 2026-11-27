@@ -24,7 +24,15 @@ import {
   BOT_THREAD_ACTIONS_FEATURE,
   BOT_THREAD_CONFIGURE_FEATURE,
   BOT_THREAD_REQUESTS_FEATURE,
+  BOT_CONNECTORS_NOTE,
+  BOT_WARM_PROCESS_MS,
+  BOT_WARM_PROCESSES_MAX,
+  connectedConnectorsOf,
+  connectorsStillConnectingNote,
   createBotSessionStore,
+  createWarmClaudeProcesses,
+  keptConnectorsOf,
+  waitForConnectors,
   botProjectsNote,
   botToolLabel,
   claudeEffortForBot,
@@ -89,7 +97,7 @@ const zod = await import('zod');
  * generator yielding SDK messages. `next()` reads the next user message from
  * the streaming input; abort ends the run with an AbortError.
  */
-const createFakeSdk = (script) => {
+const createFakeSdk = (script, { mcpServerStatus = null } = {}) => {
   const runs = [];
   return {
     runs,
@@ -122,6 +130,8 @@ const createFakeSdk = (script) => {
         close() {
           run.closed = true;
         },
+        // mcpServerStatus(run): the query's MCP servers (only when given, like an older SDK without it).
+        ...(mcpServerStatus ? { mcpServerStatus: async () => mcpServerStatus(run) } : {}),
       };
     },
   };
@@ -2563,6 +2573,731 @@ try {
     await runLane(sessionLane([row(1, 'user', 'hi'), row(2, 'user', '[Routine: digest]\ngo'), row(3, 'user', 'thanks')], [3], { model: 'claude-opus-5-5', laneId: 'l3' }), sessionCtx());
     assert.deepEqual(sdk.runs.map((run) => run.options.resume ?? null), [null, null, 'sess-1']);
     assert.match(textOf(sdk.runs[2].inputs[0]), /<since_your_last_reply>[\s\S]*Routine: digest/);
+  });
+
+  // Each reply is a new Claude Code process: the claude.ai connectors it had
+  // aren't listed for about a second, and a resumed session's first message
+  // before then told the model they had disconnected.
+  const gmail = (status) => ({ name: 'claude.ai Gmail', status, scope: 'claudeai', config: { type: 'claudeai-proxy' } });
+  const railway = (status) => ({ name: 'railway', status, scope: 'user', config: { type: 'stdio', command: 'railway' } });
+
+  await test('connectors: only connected remote servers are recorded; kept lists are cleaned', async () => {
+    assert.deepEqual(
+      connectedConnectorsOf([
+        gmail('connected'),
+        { name: 'claude.ai Google Drive', status: 'connected', scope: 'claudeai' },
+        { name: 'claude.ai Slack', status: 'needs-auth', scope: 'claudeai' },
+        { name: 'linear', status: 'connected', scope: 'user', config: { type: 'http', url: 'https://mcp.linear.app/mcp' } },
+        railway('connected'),
+        { name: 'durango_bot', status: 'connected', scope: 'dynamic', config: { type: 'sdk' } },
+        gmail('connected'),
+      ]),
+      ['claude.ai Gmail', 'claude.ai Google Drive', 'linear'],
+      'claude.ai and http servers, sorted and once each; stdio, SDK and not-connected ones left out'
+    );
+    assert.deepEqual(connectedConnectorsOf(null), []);
+    assert.deepEqual(keptConnectorsOf({ connectors: ['claude.ai Gmail', 7, '', 'claude.ai Gmail'] }), ['claude.ai Gmail']);
+    assert.deepEqual(keptConnectorsOf(null), []);
+    assert.deepEqual(keptConnectorsOf({ sessionId: 's' }), [], 'a session kept before this has none: no wait');
+  });
+
+  await test('connectors: the wait ends once they are listed and connected, or at its limit with what is missing', async () => {
+    let clock = 0;
+    const timing = { now: () => clock, sleep: async (ms) => void (clock += ms) };
+    // Not listed yet (the claude.ai fetch), then connecting, then connected; railway (not waited for) stays pending.
+    const timeline = [[railway('pending')], [railway('pending'), gmail('pending')], [railway('pending'), gmail('connected')]];
+    let polls = 0;
+    const query = { mcpServerStatus: async () => timeline[Math.min(polls++, timeline.length - 1)] };
+    const done = await waitForConnectors({ query, names: ['claude.ai Gmail'], timeoutMs: 10_000, pollMs: 150, ...timing });
+    assert.deepEqual(done, { waitedMs: 300, missing: [], aborted: false });
+    assert.equal(polls, 3);
+
+    clock = 0;
+    const never = await waitForConnectors({ query: { mcpServerStatus: async () => [railway('pending')] }, names: ['claude.ai Gmail'], timeoutMs: 1_000, pollMs: 150, ...timing });
+    assert.deepEqual(never, { waitedMs: 1_000, missing: ['claude.ai Gmail'], aborted: false }, 'stops at the limit, not past it');
+
+    clock = 0;
+    const failed = await waitForConnectors({ query: { mcpServerStatus: async () => [gmail('failed')] }, names: ['claude.ai Gmail'], ...timing });
+    assert.deepEqual(failed, { waitedMs: 0, missing: ['claude.ai Gmail'], aborted: false }, 'a failed connector is settled: no wait, reported missing');
+
+    let asked = 0;
+    const none = await waitForConnectors({ query: { mcpServerStatus: async () => ((asked += 1), []) }, names: [], ...timing });
+    assert.deepEqual(none, { waitedMs: 0, missing: [], aborted: false });
+    assert.equal(asked, 0, 'nothing to wait for: not even asked');
+    assert.deepEqual(await waitForConnectors({ query: {}, names: ['claude.ai Gmail'], ...timing }), { waitedMs: 0, missing: [], aborted: false }, 'an SDK without mcpServerStatus');
+    assert.deepEqual(
+      await waitForConnectors({
+        query: {
+          mcpServerStatus: async () => {
+            throw new Error('closed');
+          },
+        },
+        names: ['claude.ai Gmail'],
+        ...timing,
+      }),
+      { waitedMs: 0, missing: [], aborted: false },
+      'a failing status call ends the wait'
+    );
+    const silent = await waitForConnectors({ query: { mcpServerStatus: () => new Promise(() => {}) }, names: ['claude.ai Gmail'], timeoutMs: 50 });
+    assert.deepEqual(silent.missing, [], 'a status call that never answers (the process died) ends the wait at the limit');
+    assert.ok(silent.waitedMs >= 40 && silent.waitedMs < 1_000);
+    const controller = new AbortController();
+    controller.abort();
+    clock = 0;
+    const stopped = await waitForConnectors({ query: { mcpServerStatus: async () => [] }, names: ['claude.ai Gmail'], signal: controller.signal, ...timing });
+    assert.deepEqual([stopped.waitedMs, stopped.aborted], [0, true], 'a stopped reply does not wait');
+    assert.equal(connectorsStillConnectingNote([]), '');
+    assert.match(connectorsStillConnectingNote(['claude.ai Gmail']), /not connected yet as this reply starts: claude\.ai Gmail\.[\s\S]*call ToolSearch/);
+  });
+
+  await test('kept session: the next reply sends its first message only once the connectors the last one had are up', async () => {
+    const sessionsDir = path.join(testRoot, 'sessions-connectors');
+    const sessions = createBotSessionStore({ dir: sessionsDir });
+    // Per run: how many status polls until Gmail shows up connected (Infinity: never).
+    const readyAfter = [0, 3, Infinity];
+    const polls = new Map();
+    const sdk = createFakeSdk(
+      async function* ({ next, options }) {
+        await next();
+        yield { ...init(), session_id: options.resume ?? 'sess-c' };
+        yield assistant('a', [{ type: 'text', text: 'Drafted.' }]);
+        yield { ...success(), session_id: options.resume ?? 'sess-c', usage: { input_tokens: 1, output_tokens: 1 } };
+      },
+      {
+        mcpServerStatus: (run) => {
+          if (!polls.has(run)) polls.set(run, { index: sdk.runs.indexOf(run), count: 0, beforeFirstInput: 0 });
+          const entry = polls.get(run);
+          entry.count += 1;
+          if (!run.inputs.length) entry.beforeFirstInput += 1;
+          const ready = entry.count > readyAfter[entry.index];
+          return [railway('pending'), ...(ready ? [gmail('connected')] : entry.count > 1 ? [gmail('pending')] : [])];
+        },
+      }
+    );
+    const pollsOf = (index) => polls.get(sdk.runs[index]);
+    const logs = [];
+    const runLane = sdkRunner(sdk, { sessions, connectorWaitMs: 400, log: (...args) => logs.push(args.join(' ')) });
+    const history = [row(1, 'user', 'Draft a reply to Brett.')];
+
+    await runLane(sessionLane(history, [1], { replyMessageId: 'r2' }), sessionCtx());
+    const kept = JSON.parse(await fs.readFile(path.join(sessionsDir, 'bot_1__claude-opus-5-5.json'), 'utf8'));
+    assert.deepEqual(kept.connectors, ['claude.ai Gmail'], 'the connectors it answered with are kept with the session');
+    assert.equal(pollsOf(0).beforeFirstInput, 0, 'a new bot has no connectors to wait for');
+    assert.match(sdk.runs[0].options.systemPrompt.append, /## Connectors\n\nEach of your replies starts Claude Code again/);
+    assert.ok(sdk.runs[0].options.systemPrompt.append.endsWith(BOT_CONNECTORS_NOTE));
+
+    const later = [...history, { id: 'r2', seq: 2, role: 'assistant', text: 'Drafted.' }, row(3, 'user', 'Now send it.')];
+    await runLane(sessionLane(later, [3], { laneId: 'lane_2', replyMessageId: 'r4' }), sessionCtx());
+    assert.equal(sdk.runs[1].options.resume, 'sess-c', 'resumed');
+    assert.equal(pollsOf(1).beforeFirstInput, 4, 'asked until Gmail was listed and connected, before the first message');
+    assert.doesNotMatch(textOf(sdk.runs[1].inputs[0]), /not connected yet/, 'all up: no note');
+    assert.ok(logs.some((line) => /bot bot_1 waited \d+ms for connectors$/.test(line)));
+
+    // Gmail never comes up within the limit: the reply goes on, telling the model it is still connecting.
+    const third = [...later, { id: 'r4', seq: 4, role: 'assistant', text: 'Drafted.' }, row(5, 'user', 'And to Ana.')];
+    const started = Date.now();
+    const result = await runLane(sessionLane(third, [5], { laneId: 'lane_3', replyMessageId: 'r6' }), sessionCtx());
+    assert.ok(Date.now() - started < 3_000, 'bounded by connectorWaitMs');
+    assert.equal(result.text, 'Drafted.');
+    assert.match(textOf(sdk.runs[2].inputs[0]), /<new_messages>[\s\S]*And to Ana\.[\s\S]*Connectors not connected yet as this reply starts: claude\.ai Gmail\./);
+    assert.ok(logs.some((line) => /not connected: claude\.ai Gmail/.test(line)));
+    const keptAfter = JSON.parse(await fs.readFile(path.join(sessionsDir, 'bot_1__claude-opus-5-5.json'), 'utf8'));
+    assert.deepEqual(keptAfter.connectors, [], 'a connector still down at the end is not waited for next time');
+  });
+
+  await test('kept session: a session kept before connectors were recorded starts over once with the connectors note', async () => {
+    const sessionsDir = path.join(testRoot, 'sessions-connectors-old');
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const sdk = sessionSdk({ sessionId: 'sess-new' });
+    const lane = sessionLane([row(1, 'user', 'hi')], [1]);
+    // What an older Durango kept: the basis without the connectors note.
+    const { steady } = splitMemorySection(lane.systemPrompt);
+    const oldBasis = sessionBasis({ systemPrompt: steady, model: lane.model, tools: lane.tools });
+    await fs.writeFile(
+      path.join(sessionsDir, 'bot_1__claude-opus-5-5.json'),
+      JSON.stringify({ version: 1, sessionId: 'sess-old', basis: oldBasis, systemAppend: lane.systemPrompt, updatedAt: Date.now() })
+    );
+    const result = await sdkRunner(sdk, { sessions: createBotSessionStore({ dir: sessionsDir }) })(lane, sessionCtx());
+    assert.equal(sdk.runs[0].options.resume, undefined, 'not resumed');
+    assert.equal(result.usage.reason, 'basis');
+    assert.ok(sdk.runs[0].options.systemPrompt.append.includes(BOT_CONNECTORS_NOTE));
+  });
+
+  // --- warm processes: a bot's next reply within two minutes goes into the running process ---
+  const fakeTimers = () => {
+    const timers = [];
+    return {
+      timers,
+      setTimer: (fn, ms) => {
+        const timer = { fn, ms, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        if (timer) timer.cleared = true;
+      },
+      fire: () => {
+        for (const timer of timers.splice(0)) if (!timer.cleared) timer.fn();
+      },
+    };
+  };
+  /** A fake SDK whose every process answers each message it gets with "Reply <n>." (n counts per process). */
+  const warmSdk = ({ sessionId = 'sess-w', onTurn = null, mcpServerStatus = null } = {}) =>
+    createFakeSdk(
+      async function* ({ next, options, tools }) {
+        let input = await next();
+        yield { ...init(options.model), session_id: options.resume ?? sessionId };
+        for (let turn = 1; input; turn += 1) {
+          const outcome = onTurn ? await onTurn({ turn, input, options, tools }) : null;
+          if (outcome === 'die') return;
+          const text = `Reply ${turn}.`;
+          yield assistant(`a${turn}`, [{ type: 'text', text }]);
+          yield { ...success(), session_id: options.resume ?? sessionId, usage: { input_tokens: 1, output_tokens: 1 } };
+          input = await next();
+        }
+      },
+      mcpServerStatus ? { mcpServerStatus } : {}
+    );
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  await test('warm processes: park, take, idle close, mismatch, ended while idle, forget and close all', async () => {
+    const clock = fakeTimers();
+    const closed = [];
+    const logs = [];
+    const fakeProc = (name, { sessionId = 's1', optionsKey = 'k1', next = () => new Promise(() => {}) } = {}) => ({
+      name,
+      sessionId,
+      optionsKey,
+      iterator: { next },
+      close: () => closed.push(name),
+    });
+    const pool = createWarmClaudeProcesses({ ...clock, log: (line) => logs.push(line) });
+    const a = fakeProc('a');
+    pool.park('bot_1__m', a);
+    assert.equal(pool.size, 1);
+    assert.equal(clock.timers[0].ms, BOT_WARM_PROCESS_MS);
+    assert.equal(BOT_WARM_PROCESS_MS, 120_000, 'two minutes');
+    assert.equal(pool.take('bot_1__m', { sessionId: 's1', optionsKey: 'k1' }), a, 'same session and settings: reused');
+    assert.ok(a.pending instanceof Promise, 'read ahead while parked');
+    assert.equal(pool.size, 0, 'taken: one reply at a time');
+    assert.equal(clock.timers[0].cleared, true);
+    assert.equal(pool.take('bot_1__m', { sessionId: 's1', optionsKey: 'k1' }), null);
+
+    pool.park('bot_1__m', fakeProc('b'));
+    clock.fire();
+    assert.deepEqual(closed, ['b'], 'nothing new for two minutes: closed');
+    assert.equal(pool.size, 0);
+
+    pool.park('bot_1__m', fakeProc('c', { optionsKey: 'k1' }));
+    assert.equal(pool.take('bot_1__m', { sessionId: 's1', optionsKey: 'k2' }), null, 'other settings: not reused');
+    pool.park('bot_1__m', fakeProc('d', { sessionId: 's1' }));
+    assert.equal(pool.take('bot_1__m', { sessionId: 's2', optionsKey: 'k1' }), null, 'another session: not reused');
+    assert.deepEqual(closed, ['b', 'c', 'd'], 'a process that cannot be reused is closed');
+
+    pool.park('bot_1__m', fakeProc('e'));
+    pool.park('bot_1__m', fakeProc('f'));
+    assert.deepEqual(closed.slice(-1), ['e'], 'a newer process replaces the parked one');
+
+    let end;
+    pool.park('bot_2__m', fakeProc('g', { next: () => new Promise((resolve) => (end = resolve)) }));
+    end({ done: true });
+    await settle();
+    assert.deepEqual(closed.slice(-1), ['g'], 'a process that ends (crashes) while parked is closed and dropped');
+    assert.equal(pool.size, 1);
+    pool.park('bot_2__m', fakeProc('h', { next: () => Promise.reject(new Error('exited')) }));
+    await settle();
+    assert.deepEqual(closed.slice(-1), ['h'], 'one whose read fails too');
+    pool.park('bot_2__m', fakeProc('i', { next: async () => ({ done: false, value: { type: 'system', subtype: 'task_notification' } }) }));
+    await settle();
+    assert.deepEqual(closed.slice(-1), ['i'], 'one that starts something by itself is not reused');
+
+    pool.park('bot_10__m', fakeProc('j'));
+    pool.park('bot_2__m', fakeProc('k'));
+    pool.forgetBot('bot_1');
+    assert.deepEqual(closed.slice(-1), ['f'], "forgetBot closes that bot's processes only (not bot_10)");
+    pool.closeAll();
+    assert.deepEqual(closed.slice(-2).sort(), ['j', 'k'], 'closeAll (the app quits) closes the rest');
+    assert.equal(pool.size, 0);
+    assert.ok(logs.some((line) => /closed the warm Claude Code process of bot_1__m \(idle\)/.test(line)));
+  });
+
+  await test('warm processes: the next reply goes into the running process, with its own tools, and no connector wait', async () => {
+    const clock = fakeTimers();
+    const warmProcesses = createWarmClaudeProcesses(clock);
+    let statusCalls = 0;
+    const sdk = warmSdk({
+      mcpServerStatus: () => ((statusCalls += 1), [gmail('connected')]),
+      onTurn: async ({ turn, tools }) => {
+        if (turn === 2) await tools.web_search.handler({ q: 'second' });
+      },
+    });
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-a') });
+    const logs = [];
+    const runLane = sdkRunner(sdk, { sessions, warmProcesses, log: (...args) => logs.push(args.join(' ')) });
+    const tools = [{ name: 'web_search', description: 'Search the web', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } }];
+    const ctxWith = (calls) => ({ ...sessionCtx(), callTool: async (input) => (calls.push(input), { result: { ok: true } }) });
+    const history = [row(1, 'user', 'Find a cafe.')];
+    const firstCalls = [];
+    const first = await runLane(sessionLane(history, [1], { tools, replyMessageId: 'r2' }), ctxWith(firstCalls));
+    assert.equal(first.text, 'Reply 1.');
+    assert.equal(sdk.runs.length, 1);
+    assert.equal(sdk.runs[0].closed, false, 'left running');
+    assert.equal(warmProcesses.size, 1);
+
+    const later = [...history, { id: 'r2', seq: 2, role: 'assistant', text: 'Reply 1.' }, row(3, 'user', 'One near the station.')];
+    const statusBefore = statusCalls;
+    const secondCalls = [];
+    const second = await runLane(sessionLane(later, [3], { tools, laneId: 'lane_2', replyMessageId: 'r4' }), ctxWith(secondCalls));
+    assert.equal(sdk.runs.length, 1, 'no new process');
+    assert.equal(second.text, 'Reply 2.', 'answered by the same process, its second turn');
+    assert.equal(second.usage.mode, 'resume');
+    const prompt = textOf(sdk.runs[0].inputs[1]);
+    assert.match(prompt, /<new_messages>\nPerson:\nOne near the station\.\n<\/new_messages>/);
+    assert.doesNotMatch(prompt, /conversation_so_far|Find a cafe/, 'only what is new, like a resumed session');
+    assert.equal(statusCalls - statusBefore, 1, 'no connector wait: only the read at its end');
+    assert.deepEqual(firstCalls, []);
+    assert.equal(secondCalls.length, 1, "the first process's tool calls this reply's handler");
+    assert.deepEqual(secondCalls[0].input, { q: 'second' });
+    assert.ok(logs.some((line) => /reply goes into its warm Claude Code process/.test(line)));
+    assert.equal(warmProcesses.size, 1, 'parked again for the next one');
+
+    // Two minutes with nothing new: closed. The next reply resumes the kept session in a new process.
+    clock.fire();
+    assert.equal(sdk.runs[0].closed, true);
+    assert.equal(warmProcesses.size, 0, 'an idle bot holds no process');
+    const third = [...later, { id: 'r4', seq: 4, role: 'assistant', text: 'Reply 2.' }, row(5, 'user', 'Thanks.')];
+    const cold = await runLane(sessionLane(third, [5], { tools, laneId: 'lane_3', replyMessageId: 'r6' }), ctxWith([]));
+    assert.equal(sdk.runs.length, 2);
+    assert.equal(sdk.runs[1].options.resume, 'sess-w', 'a cold start resumes the kept session');
+    assert.equal(cold.text, 'Reply 1.');
+    warmProcesses.closeAll();
+  });
+
+  await test('warm processes: other settings (access mode, effort, model, tools) start a new process', async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    const sdk = warmSdk();
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-b') });
+    const runLane = sdkRunner(sdk, { sessions, warmProcesses });
+    let seq = 1;
+    let history = [row(seq, 'user', 'hi')];
+    const reply = async (overrides = {}, ctx = sessionCtx()) => {
+      const result = await runLane(sessionLane(history, [seq], { laneId: `l${seq}`, replyMessageId: `r${seq + 1}`, ...overrides }), ctx);
+      history = [...history, { id: `r${seq + 1}`, seq: seq + 1, role: 'assistant', text: result.text }, row(seq + 2, 'user', `msg ${seq + 2}`)];
+      seq += 2;
+      return result;
+    };
+    await reply();
+    await reply();
+    assert.equal(sdk.runs.length, 1, 'same settings: reused');
+    await reply({}, { ...sessionCtx(), accessMode: 'full-access' });
+    assert.equal(sdk.runs.length, 2, 'another access mode: a new process');
+    assert.equal(sdk.runs[0].closed, true, 'the old one is closed');
+    assert.equal(sdk.runs[1].options.resume, 'sess-w', 'resuming the same session');
+    await reply({}, { ...sessionCtx(), accessMode: 'full-access' });
+    assert.equal(sdk.runs.length, 2);
+    await reply({ reasoningEffort: 'high' }, { ...sessionCtx(), accessMode: 'full-access' });
+    assert.equal(sdk.runs.length, 3, 'another effort: a new process');
+    assert.equal(sdk.runs[2].options.effort, 'high');
+    await reply({ reasoningEffort: 'high', tools: [{ name: 'web_search', description: 'Search', inputSchema: { type: 'object' } }] }, { ...sessionCtx(), accessMode: 'full-access' });
+    assert.equal(sdk.runs.length, 4, 'other tools: a new process (its bot tool server is made at start)');
+    assert.equal(sdk.runs[3].options.resume, undefined, 'other tools are another session basis: fresh');
+    await reply({ model: 'claude-haiku-5-5', reasoningEffort: 'high' }, { ...sessionCtx(), accessMode: 'full-access' });
+    assert.equal(sdk.runs.length, 5, 'another model is another kept session, and its own process');
+    assert.equal(warmProcesses.size, 2, 'one per bot and model');
+    warmProcesses.closeAll();
+    assert.ok(sdk.runs.every((run) => run.closed));
+  });
+
+  await test('warm processes: a reply while another holds the session gets its own process, closed after it', async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    const sdk = warmSdk({
+      onTurn: async ({ input }) => {
+        if (/<new_messages>\nPerson:\nthe slow one/.test(textOf(input))) await gate;
+      },
+    });
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-c') });
+    const runLane = sdkRunner(sdk, { sessions, warmProcesses });
+    const slow = runLane(sessionLane([row(1, 'user', 'the slow one')], [1], { laneId: 'l1' }), sessionCtx());
+    await waitFor(() => sdk.runs.length === 1, { label: 'first process' });
+    const quick = await runLane(sessionLane([row(1, 'user', 'the slow one'), row(2, 'user', 'and a quick one')], [2], { laneId: 'l2' }), sessionCtx());
+    assert.equal(quick.text, 'Reply 1.');
+    assert.equal(sdk.runs.length, 2);
+    assert.equal(sdk.runs[1].options.persistSession, false, 'the second gets an unkept session');
+    assert.equal(sdk.runs[1].closed, true, 'and its process is not kept');
+    assert.equal(warmProcesses.size, 0);
+    release();
+    await slow;
+    assert.equal(sdk.runs[0].closed, false);
+    assert.equal(warmProcesses.size, 1, "the session's own reply parks its process");
+    warmProcesses.closeAll();
+  });
+
+  await test('warm processes: crashed while parked → a cold resume; dies on the next message → retried cold, same session', async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    let dieAfterFirst = true;
+    let dieOnSecond = false;
+    const sdk = createFakeSdk(async function* ({ next, options }) {
+      let input = await next();
+      yield { ...init(), session_id: options.resume ?? 'sess-x' };
+      for (let turn = 1; input; turn += 1) {
+        if (turn === 2 && dieOnSecond) return;
+        yield assistant(`a${turn}`, [{ type: 'text', text: `Reply ${turn}.` }]);
+        yield { ...success(), session_id: options.resume ?? 'sess-x', usage: { input_tokens: 1, output_tokens: 1 } };
+        if (dieAfterFirst) return;
+        input = await next();
+      }
+    });
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-d') });
+    const logs = [];
+    const runLane = sdkRunner(sdk, { sessions, warmProcesses, log: (...args) => logs.push(args.join(' ')) });
+    let history = [row(1, 'user', 'hi')];
+    await runLane(sessionLane(history, [1], { laneId: 'l1', replyMessageId: 'r2' }), sessionCtx());
+    await settle();
+    assert.equal(warmProcesses.size, 0, 'the process ended while parked: dropped');
+    assert.equal(sdk.runs[0].closed, true);
+
+    dieAfterFirst = false;
+    history = [...history, { id: 'r2', seq: 2, role: 'assistant', text: 'Reply 1.' }, row(3, 'user', 'again')];
+    const cold = await runLane(sessionLane(history, [3], { laneId: 'l3', replyMessageId: 'r4' }), sessionCtx());
+    assert.equal(sdk.runs.length, 2);
+    assert.equal(sdk.runs[1].options.resume, 'sess-x');
+    assert.equal(cold.text, 'Reply 1.');
+    assert.equal(warmProcesses.size, 1);
+
+    dieOnSecond = true;
+    history = [...history, { id: 'r4', seq: 4, role: 'assistant', text: 'Reply 1.' }, row(5, 'user', 'once more')];
+    const retried = await runLane(sessionLane(history, [5], { laneId: 'l5', replyMessageId: 'r6' }), sessionCtx());
+    assert.equal(sdk.runs.length, 3, 'the warm process died on the message: a new one');
+    assert.equal(sdk.runs[2].options.resume, 'sess-x', 'the same session, not a fresh one');
+    assert.match(textOf(sdk.runs[2].inputs[0]), /once more/);
+    assert.equal(retried.text, 'Reply 1.');
+    assert.equal(retried.usage.mode, 'resume');
+    assert.equal(sdk.runs[1].closed, true);
+    assert.ok(logs.some((line) => /warm Claude Code process failed, resuming in a new one/.test(line)));
+    warmProcesses.closeAll();
+  });
+
+  await test('warm processes: a reply stopped midway closes its process instead of parking it', async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    const controller = new AbortController();
+    const sdk = warmSdk({
+      onTurn: async ({ turn, options }) => {
+        if (turn === 2) {
+          // Stopped mid-turn: the reply closes its process, which aborts the query.
+          controller.abort();
+          if (options.abortController.signal.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        }
+      },
+    });
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-e') });
+    const runLane = sdkRunner(sdk, { sessions, warmProcesses });
+    await runLane(sessionLane([row(1, 'user', 'hi')], [1], { laneId: 'l1', replyMessageId: 'r2' }), sessionCtx());
+    assert.equal(warmProcesses.size, 1);
+    const history = [row(1, 'user', 'hi'), { id: 'r2', seq: 2, role: 'assistant', text: 'Reply 1.' }, row(3, 'user', 'stop me')];
+    const stopped = await runLane(sessionLane(history, [3], { laneId: 'l3' }), { ...sessionCtx(), signal: controller.signal });
+    assert.equal(sdk.runs.length, 1, 'it ran in the warm process');
+    assert.equal(stopped.aborted, true);
+    assert.equal(sdk.runs[0].closed, true, 'closed');
+    assert.equal(warmProcesses.size, 0);
+  });
+
+  await test('warm processes: without a pool every reply starts and closes its own process', async () => {
+    const sdk = warmSdk();
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-f') });
+    const runLane = sdkRunner(sdk, { sessions });
+    await runLane(sessionLane([row(1, 'user', 'hi')], [1], { laneId: 'l1', replyMessageId: 'r2' }), sessionCtx());
+    await runLane(sessionLane([row(1, 'user', 'hi'), { id: 'r2', seq: 2, role: 'assistant', text: 'Reply 1.' }, row(3, 'user', 'again')], [3], { laneId: 'l3' }), sessionCtx());
+    assert.equal(sdk.runs.length, 2);
+    assert.ok(sdk.runs.every((run) => run.closed));
+  });
+
+  // --- review fixes: real-latency connector waits, stops, warm crashes, rebinding, races, settings ---
+  const later = (ms, value) => new Promise((resolve) => setTimeout(() => resolve(value), ms));
+
+  await test('connectors: with real latency a timed-out wait still names what is missing', async () => {
+    // Every read takes 5 ms (stdio IPC), Gmail never connects.
+    const slow = { mcpServerStatus: () => later(5, [railway('pending'), gmail('pending')]) };
+    const timedOut = await waitForConnectors({ query: slow, names: ['claude.ai Gmail'], timeoutMs: 300, pollMs: 100 });
+    assert.deepEqual(timedOut.missing, ['claude.ai Gmail'], 'the read at the limit is not cut off by its own latency');
+    assert.equal(timedOut.aborted, false);
+    assert.ok(timedOut.waitedMs >= 300 && timedOut.waitedMs < 600, `bounded (${timedOut.waitedMs}ms)`);
+    // Answers once, then stops answering (the process died): what the last answer said.
+    let reads = 0;
+    const dying = { mcpServerStatus: () => (reads++ === 0 ? later(5, [gmail('pending')]) : new Promise(() => {})) };
+    const died = await waitForConnectors({ query: dying, names: ['claude.ai Gmail'], timeoutMs: 300, pollMs: 50 });
+    assert.deepEqual(died.missing, ['claude.ai Gmail']);
+    assert.ok(died.waitedMs < 600);
+  });
+
+  await test('connectors: a stop ends the wait at once, during a sleep or a read that hangs', async () => {
+    const pendingGmail = { mcpServerStatus: () => later(1, [gmail('pending')]) };
+    const duringSleep = new AbortController();
+    setTimeout(() => duringSleep.abort(), 40);
+    let started = Date.now();
+    const slept = await waitForConnectors({ query: pendingGmail, names: ['claude.ai Gmail'], timeoutMs: 5_000, pollMs: 1_000, signal: duringSleep.signal });
+    assert.equal(slept.aborted, true);
+    assert.ok(Date.now() - started < 500, 'not the 1 s poll, not the 5 s limit');
+    const duringRead = new AbortController();
+    setTimeout(() => duringRead.abort(), 40);
+    started = Date.now();
+    const hung = await waitForConnectors({ query: { mcpServerStatus: () => new Promise(() => {}) }, names: ['claude.ai Gmail'], timeoutMs: 5_000, signal: duringRead.signal });
+    assert.equal(hung.aborted, true);
+    assert.ok(Date.now() - started < 500);
+    let asked = 0;
+    const before = new AbortController();
+    before.abort();
+    const never = await waitForConnectors({ query: { mcpServerStatus: async () => ((asked += 1), []) }, names: ['claude.ai Gmail'], signal: before.signal });
+    assert.deepEqual([never.aborted, asked], [true, 0], 'stopped before it began: not even asked');
+  });
+
+  await test('kept session: a reply stopped while the session is taken starts no process and sends nothing', async () => {
+    const store = createBotSessionStore({ dir: path.join(testRoot, 'sessions-stop-a') });
+    const sdk = warmSdk();
+    const controller = new AbortController();
+    const sessions = {
+      ...store,
+      begin: async (key) => {
+        const claimed = await store.begin(key);
+        controller.abort();
+        return claimed;
+      },
+    };
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    const result = await sdkRunner(sdk, { sessions, warmProcesses })(sessionLane([row(1, 'user', 'hi')], [1]), { ...sessionCtx(), signal: controller.signal });
+    assert.equal(result.aborted, true);
+    assert.equal(sdk.runs.length, 0, 'no process started');
+    assert.equal(warmProcesses.size, 0);
+  });
+
+  await test('kept session: a reply stopped during the connector wait ends it at once and never sends its prompt', async () => {
+    const sessionsDir = path.join(testRoot, 'sessions-stop-b');
+    const sessions = createBotSessionStore({ dir: sessionsDir });
+    let gmailUp = true;
+    const sdk = warmSdk({ mcpServerStatus: () => later(1, gmailUp ? [gmail('connected')] : [railway('pending')]) });
+    const runLane = sdkRunner(sdk, { sessions, connectorWaitMs: 5_000 });
+    await runLane(sessionLane([row(1, 'user', 'hi')], [1], { replyMessageId: 'r2' }), sessionCtx());
+    gmailUp = false;
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 60);
+    const started = Date.now();
+    const history = [row(1, 'user', 'hi'), { id: 'r2', seq: 2, role: 'assistant', text: 'Reply 1.' }, row(3, 'user', 'again')];
+    const result = await runLane(sessionLane(history, [3], { laneId: 'l3' }), { ...sessionCtx(), signal: controller.signal });
+    assert.equal(result.aborted, true);
+    assert.ok(Date.now() - started < 1_000, `not the 5 s limit (${Date.now() - started}ms)`);
+    assert.equal(sdk.runs[1].inputs.length, 0, 'the prompt never went out');
+    assert.equal(sdk.runs[1].closed, true);
+  });
+
+  await test('warm processes: a warm process that dies after a message and a tool is not redone anywhere, and keeps its model', async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    // Turn 2 sends an acknowledgement and calls a tool, then the process dies.
+    const crashing = createFakeSdk(async function* ({ next, options, tools }) {
+      let input = await next();
+      yield { ...init('claude-opus-5-5'), session_id: options.resume ?? 'sess-m' };
+      for (let turn = 1; input; turn += 1) {
+        if (turn === 2) {
+          // As Claude Code does: PreToolUse, the step, then the call.
+          await options.hooks.PreToolUse[0].hooks[0]({ tool_name: 'mcp__durango_bot__web_search', tool_use_id: 'tu-1' });
+          yield assistant('a2', [{ type: 'text', text: 'On it.' }, { type: 'tool_use', id: 'tu-1', name: 'mcp__durango_bot__web_search', input: { q: 'x' } }]);
+          await tools.web_search.handler({ q: 'x' });
+          throw new Error('Claude Code process exited with code 1');
+        }
+        yield assistant(`a${turn}`, [{ type: 'text', text: `Reply ${turn}.` }]);
+        yield { ...success(), session_id: options.resume ?? 'sess-m', usage: { input_tokens: 1, output_tokens: 1 } };
+        input = await next();
+      }
+    });
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-crash') });
+    const runLane = sdkRunner(crashing, { sessions, warmProcesses });
+    const tools = [{ name: 'web_search', description: 'Search', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } }];
+    const sent = [];
+    const calls = [];
+    const ctx = () => ({
+      ...sessionCtx(),
+      callTool: async (input) => (calls.push(input), { result: { ok: true } }),
+      sendMessage: async (message) => (sent.push(message), true),
+    });
+    // No model on the lane: the one Claude Code reports (init) is the reply's.
+    const first = await runLane(sessionLane([row(1, 'user', 'hi')], [1], { model: null, tools, replyMessageId: 'r2' }), ctx());
+    assert.equal(first.modelId, 'anthropic/claude-opus-5.5');
+    assert.equal(warmProcesses.size, 1);
+    const history = [row(1, 'user', 'hi'), { id: 'r2', seq: 2, role: 'assistant', text: 'Reply 1.' }, row(3, 'user', 'search it')];
+    const second = await runLane(sessionLane(history, [3], { model: null, tools, laneId: 'l3' }), ctx());
+    assert.equal(crashing.runs.length, 1, 'not retried here: it already did things');
+    assert.equal(calls.length, 1, 'the tool ran once');
+    assert.deepEqual(sent.map((message) => message.text), ['On it.']);
+    assert.equal(second.retryElsewhere, false, 'not handed to another machine to do again');
+    assert.match(second.failure, /exited with code 1/);
+    assert.equal(second.modelId, 'anthropic/claude-opus-5.5', 'the warm turn keeps the model its process reported');
+    assert.equal(sent[0].modelId, 'anthropic/claude-opus-5.5');
+    assert.equal(warmProcesses.size, 0, 'a crashed process is not parked');
+  });
+
+  await test("warm processes: hooks and stderr call the reply the process runs now, and a subagent's calls aren't the reply's", async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    let hookOutput = null;
+    const sdk = createFakeSdk(async function* ({ next, options, tools }) {
+      let input = await next();
+      yield { ...init(), session_id: options.resume ?? 'sess-h' };
+      const pre = options.hooks.PreToolUse[0].hooks[0];
+      const post = options.hooks.PostToolUse[0].hooks[0];
+      for (let turn = 1; input; turn += 1) {
+        if (turn === 2) {
+          // A subagent's call first: it must not take the main loop's tool_use id.
+          await pre({ tool_name: 'mcp__durango_bot__web_search', tool_use_id: 'sub-1', agent_id: 'agent-1' });
+          await pre({ tool_name: 'mcp__durango_bot__web_search', tool_use_id: 'tu-main' });
+          yield assistant('a2t', [{ type: 'tool_use', id: 'tu-main', name: 'mcp__durango_bot__web_search', input: { q: 'y' } }]);
+          await tools.web_search.handler({ q: 'y' });
+          await post({ tool_name: 'mcp__durango_bot__web_search', tool_use_id: 'tu-main' });
+          await settle();
+          hookOutput = await post({ tool_name: 'mcp__durango_bot__web_search', tool_use_id: 'tu-main' });
+          yield toolResult('tu-main');
+        }
+        if (turn === 3) {
+          options.stderr('Error: not logged in · Please run /login');
+          yield { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['boom'], session_id: 'sess-h' };
+          input = await next();
+          continue;
+        }
+        yield assistant(`a${turn}`, [{ type: 'text', text: `Reply ${turn}.` }]);
+        yield { ...success(), session_id: options.resume ?? 'sess-h', usage: { input_tokens: 1, output_tokens: 1 } };
+        input = await next();
+      }
+    });
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-hooks') });
+    const runLane = sdkRunner(sdk, { sessions, warmProcesses });
+    const tools = [{ name: 'web_search', description: 'Search', inputSchema: { type: 'object', properties: { q: { type: 'string' } } } }];
+    const callsOf = [[], [], []];
+    const ctxFor = (index, inbox = []) => ({
+      ...sessionCtx(inbox),
+      callTool: async (input) => (callsOf[index].push(input), { result: { ok: true } }),
+    });
+    let history = [row(1, 'user', 'hi')];
+    await runLane(sessionLane(history, [1], { tools, replyMessageId: 'r2' }), ctxFor(0));
+    history = [...history, { id: 'r2', seq: 2, role: 'assistant', text: 'Reply 1.' }, row(3, 'user', 'search y')];
+    const second = await runLane(sessionLane(history, [3], { tools, laneId: 'l3', replyMessageId: 'r4' }), ctxFor(1, [{ seq: 4, source: 'person', label: null, content: 'and lunch?' }]));
+    assert.equal(sdk.runs.length, 1, 'warm');
+    assert.deepEqual(callsOf[0], [], "the first reply's handlers are not called");
+    assert.equal(callsOf[1].length, 1);
+    assert.equal(callsOf[1][0].toolCallId, 'tu-main', "PreToolUse recorded this reply's call; the subagent's id was not taken");
+    assert.match(JSON.stringify(hookOutput), /and lunch\?/, "PostToolUse delivered this reply's inbox");
+    assert.equal(second.text, 'Reply 2.');
+    // Turn 3: stderr goes to the third reply (a sign-in problem: handed elsewhere, not retried here).
+    history = [...history, { id: 'r4', seq: 4, role: 'assistant', text: 'Reply 2.' }, row(5, 'user', 'more')];
+    const third = await runLane(sessionLane(history, [5], { tools, laneId: 'l5' }), ctxFor(2));
+    assert.equal(sdk.runs.length, 1, 'stderr reached this reply: a sign-in failure is not retried in a new process');
+    assert.equal(third.retryElsewhere, true);
+    warmProcesses.closeAll();
+  });
+
+  await test('warm processes: a bot forgotten or all processes closed during a reply → its process is not parked', async () => {
+    for (const how of ['forgetBot', 'closeAll']) {
+      const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+      let release;
+      const gate = new Promise((resolve) => (release = resolve));
+      const sdk = warmSdk({ onTurn: async () => gate });
+      const sessions = createBotSessionStore({ dir: path.join(testRoot, `sessions-warm-race-${how}`) });
+      const reply = sdkRunner(sdk, { sessions, warmProcesses })(sessionLane([row(1, 'user', 'hi')], [1]), sessionCtx());
+      await waitFor(() => sdk.runs.length === 1, { label: 'started' });
+      if (how === 'forgetBot') warmProcesses.forgetBot('bot_1');
+      else warmProcesses.closeAll();
+      release();
+      const result = await reply;
+      assert.equal(result.text, 'Reply 1.', 'the reply itself still finishes');
+      assert.equal(warmProcesses.size, 0, `${how} during the reply: not parked`);
+      assert.equal(sdk.runs[0].closed, true);
+    }
+  });
+
+  await test('warm processes: projects, environment, Claude Code binary and reply files are part of the settings', async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    const sdk = warmSdk();
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-warm-key') });
+    let projectPath = path.join(testRoot, 'project-a');
+    await fs.mkdir(path.join(testRoot, 'project-a'), { recursive: true });
+    await fs.mkdir(path.join(testRoot, 'project-b'), { recursive: true });
+    let envValue = '1';
+    let binaryPath = '/opt/claude';
+    const runLane = sdkRunner(sdk, {
+      sessions,
+      warmProcesses,
+      getProjects: () => [{ id: 'p1', name: 'Site', path: projectPath }],
+      env: () => ({ TEST_ENV: envValue }),
+      resolveBinary: async () => binaryPath,
+    });
+    let seq = 1;
+    let history = [row(seq, 'user', 'hi')];
+    const reply = async (overrides = {}) => {
+      const result = await runLane(sessionLane(history, [seq], { laneId: `k${seq}`, replyMessageId: `kr${seq + 1}`, ...overrides }), sessionCtx());
+      history = [...history, { id: `kr${seq + 1}`, seq: seq + 1, role: 'assistant', text: result.text }, row(seq + 2, 'user', `m${seq + 2}`)];
+      seq += 2;
+      return result;
+    };
+    await reply();
+    await reply();
+    assert.equal(sdk.runs.length, 1, 'unchanged: reused');
+    envValue = '2';
+    await reply();
+    assert.equal(sdk.runs.length, 2, 'another environment');
+    binaryPath = '/opt/claude-next';
+    await reply();
+    assert.equal(sdk.runs.length, 3, 'another Claude Code binary');
+    assert.equal(sdk.runs[2].options.pathToClaudeCodeExecutable, '/opt/claude-next');
+    projectPath = path.join(testRoot, 'project-b');
+    await reply();
+    assert.equal(sdk.runs.length, 4, 'other projects');
+    await reply({ replyFiles: false });
+    assert.equal(sdk.runs.length, 5, 'no attach_files tool (a task lane)');
+    assert.ok(sdk.runs.slice(0, -1).every((run) => run.closed), 'each replaced process is closed');
+    warmProcesses.closeAll();
+  });
+
+  await test('warm processes: at most a few are kept (oldest first), and one parked across a sleep is not used', async () => {
+    const clock = fakeTimers();
+    let wall = 0;
+    const closed = [];
+    const proc = (name) => ({ name, sessionId: 's', optionsKey: 'k', iterator: { next: () => new Promise(() => {}) }, close: () => closed.push(name) });
+    const pool = createWarmClaudeProcesses({ ...clock, now: () => wall, maxSize: 2 });
+    assert.equal(BOT_WARM_PROCESSES_MAX, 3);
+    pool.park('a', proc('a'));
+    pool.park('b', proc('b'));
+    pool.park('c', proc('c'));
+    assert.deepEqual(closed, ['a'], 'the oldest goes');
+    assert.equal(pool.size, 2);
+    pool.park('b', proc('b2'));
+    pool.park('d', proc('d'));
+    assert.deepEqual(closed, ['a', 'b', 'c'], 'a re-parked key counts as newest');
+    // Timers stop while a Mac sleeps: the wall clock decides.
+    wall += BOT_WARM_PROCESS_MS;
+    assert.equal(pool.take('d', { sessionId: 's', optionsKey: 'k' }), null);
+    assert.deepEqual(closed.slice(-1), ['d']);
+    // A reply that started before forgetBot/closeAll can't park.
+    const ticket = pool.ticket('bot_9');
+    pool.forgetBot('bot_9');
+    assert.equal(pool.park('bot_9__m', proc('e'), ticket), false);
+    assert.deepEqual(closed.slice(-1), ['e']);
+    assert.equal(pool.park('bot_9__m', proc('f'), pool.ticket('bot_9')), true, 'a later reply can');
+    const old = pool.ticket('bot_7');
+    pool.closeAll();
+    assert.equal(pool.park('bot_7', proc('g'), old), false);
+  });
+
+  await test('a reply whose Claude Code fails to start is handed back, with nothing left running', async () => {
+    const warmProcesses = createWarmClaudeProcesses(fakeTimers());
+    const sdk = warmSdk();
+    const broken = {
+      ...sdk,
+      query: () => {
+        throw new Error('spawn ENOENT');
+      },
+    };
+    const sessions = createBotSessionStore({ dir: path.join(testRoot, 'sessions-broken-start') });
+    const result = await sdkRunner(broken, { sessions, warmProcesses })(sessionLane([row(1, 'user', 'hi')], [1]), sessionCtx());
+    assert.equal(result.retryElsewhere, true, 'nothing was written: another machine or the cloud answers');
+    assert.match(result.failure, /ENOENT/);
+    assert.equal(warmProcesses.size, 0);
   });
 
   await test('the claim asks for structured conversations; usage and compaction go back with the finish', async () => {

@@ -440,6 +440,265 @@ export const botCacheColdMs = (baseEnv) => {
   return str(resolved.CLAUDE_CODE_PROMPT_CACHE_TTL).trim().toLowerCase() === '1h' ? BOT_SESSION_COLD_MS : 4.5 * 60_000;
 };
 
+// --- connectors across replies ---------------------------------------------------------
+// Every bot reply is a new Claude Code process (a kept session is resumed by
+// id, not kept running). A new process connects its MCP servers again, and the
+// claude.ai connectors (Gmail, Calendar, Drive…) only appear about a second
+// after it starts: before that they aren't even listed as connecting. Claude
+// Code doesn't hold a streaming-input session's first message for them, so a
+// resumed session's first message told the model those servers "have
+// disconnected" and their tools were removed, and the bot told the person
+// Gmail was disconnected while it came back seconds later. So a reply waits,
+// before its first message, for the connectors the bot's last reply had.
+
+/** The longest a reply waits for its connectors before its first message (it goes on as soon as they're up). */
+export const BOT_CONNECTOR_WAIT_MS = 10_000;
+const BOT_CONNECTOR_POLL_MS = 150;
+const BOT_CONNECTORS_MAX = 40;
+const REMOTE_MCP_TYPES = new Set(['http', 'sse', 'claudeai-proxy']);
+
+/**
+ * Remote MCP servers (claude.ai connectors, http/sse servers): they connect over
+ * the network when a process starts. Local (stdio) servers aren't waited for:
+ * they're listed as connecting from the start and some take many seconds.
+ */
+const isRemoteMcpServer = (status) =>
+  status?.scope === 'claudeai' || /^claude\.ai /.test(str(status?.name)) || REMOTE_MCP_TYPES.has(str(status?.config?.type));
+
+/** The names of the connected remote MCP servers in a mcpServerStatus() list. Pure. */
+export const connectedConnectorsOf = (statuses) =>
+  Array.isArray(statuses)
+    ? [...new Set(statuses.filter((status) => status?.status === 'connected' && isRemoteMcpServer(status)).map((status) => str(status.name)).filter(Boolean))]
+        .sort()
+        .slice(0, BOT_CONNECTORS_MAX)
+    : [];
+
+/** A kept session's recorded connectors (bot-sessions state), cleaned. Pure. */
+export const keptConnectorsOf = (state) =>
+  Array.isArray(state?.connectors) ? [...new Set(state.connectors.filter((name) => typeof name === 'string' && name))].slice(0, BOT_CONNECTORS_MAX) : [];
+
+const abortableSleep = (ms, signal) =>
+  new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    }
+    signal?.addEventListener('abort', done, { once: true });
+  });
+
+/**
+ * `promise`'s value, or `fallback` after `ms` or once `signal` aborts (a status
+ * call to a process that died never answers).
+ */
+const within = async (promise, ms, fallback, signal = null) => {
+  let timer;
+  let onAbort;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(fallback), Math.max(0, ms));
+        if (signal) {
+          onAbort = () => resolve(fallback);
+          if (signal.aborted) onAbort();
+          else signal.addEventListener('abort', onAbort, { once: true });
+        }
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  }
+};
+
+/**
+ * Waits until each named server is listed by query.mcpServerStatus() and no
+ * longer connecting (connected, failed, needs sign-in…), or `timeoutMs` passes.
+ * → { waitedMs, missing, aborted }: `missing` are the names not connected when
+ * it stopped, from the last status it read. Nothing read at all (an older SDK
+ * without mcpServerStatus, a first call that fails or never answers) ends the
+ * wait with nothing known missing. A read that doesn't answer in time (at
+ * least `pollMs`), or fails, after one answered ends it with what the last
+ * answer said. `signal` ends it at once (`aborted`).
+ */
+export const waitForConnectors = async ({
+  query,
+  names,
+  timeoutMs = BOT_CONNECTOR_WAIT_MS,
+  pollMs = BOT_CONNECTOR_POLL_MS,
+  signal,
+  now = () => Date.now(),
+  sleep = abortableSleep,
+}) => {
+  const wanted = Array.isArray(names) ? names.filter(Boolean) : [];
+  if (signal?.aborted) return { waitedMs: 0, missing: [], aborted: true };
+  if (!wanted.length || typeof query?.mcpServerStatus !== 'function') return { waitedMs: 0, missing: [], aborted: false };
+  const started = now();
+  const elapsed = () => now() - started;
+  let byName = null; // the last status read
+  for (;;) {
+    if (signal?.aborted) return { waitedMs: elapsed(), missing: [], aborted: true };
+    // Each read gets at least one poll's time to answer, so the last one (at
+    // the limit) isn't cut off by the call's own latency.
+    let statuses = null;
+    try {
+      statuses = await within(Promise.resolve(query.mcpServerStatus()), Math.max(pollMs, timeoutMs - elapsed()), null, signal);
+    } catch {}
+    if (signal?.aborted) return { waitedMs: elapsed(), missing: [], aborted: true };
+    if (!Array.isArray(statuses)) {
+      if (!byName) return { waitedMs: elapsed(), missing: [], aborted: false };
+      break;
+    }
+    byName = new Map(statuses.map((status) => [str(status?.name), str(status?.status)]));
+    const unsettled = wanted.filter((name) => !byName.has(name) || byName.get(name) === 'pending');
+    if (!unsettled.length || elapsed() >= timeoutMs) break;
+    await sleep(Math.min(pollMs, Math.max(0, timeoutMs - elapsed())), signal);
+  }
+  return { waitedMs: elapsed(), missing: wanted.filter((name) => byName.get(name) !== 'connected'), aborted: false };
+};
+
+// --- warm processes --------------------------------------------------------------------
+// People text a bot several messages in a row. A reply's Claude Code process
+// is kept running for BOT_WARM_PROCESS_MS after it answers, and the bot's next
+// reply in that window (same kept session, same settings) is pushed into it:
+// no process start, no MCP reconnect, no connector wait. A bot idle past the
+// window holds no process. Like a Durango Code thread's session
+// (claude-driver.js), a process is reused only with the options it was
+// started with (`optionsKey`), and closed by closing its input and aborting it.
+
+/** How long a bot's Claude Code process stays running after a reply, for the next one. */
+export const BOT_WARM_PROCESS_MS = 2 * 60_000;
+/** The most processes kept warm at once (each holds a few hundred MB): the oldest goes first. */
+export const BOT_WARM_PROCESSES_MAX = 3;
+
+/**
+ * The bots' warm processes, one per kept session key. A process is
+ * { sessionId, optionsKey, model, iterator, pending, bindings, close() }:
+ * `bindings.current` is the reply it is running (its tool handlers, hooks,
+ * stderr), null between replies.
+ * - ticket(botId): taken when a reply starts; park() refuses a process whose
+ *   reply started before a forgetBot(botId) or closeAll() (the bot was cleared
+ *   or deleted, the Mac went to sleep, bots were turned off…).
+ * - park(key, process, ticket): keeps it for `idleMs` (replacing the key's
+ *   previous one; past `maxSize`, the oldest is closed). It reads one message
+ *   ahead: a process says nothing until it gets a message, so anything it
+ *   yields while parked (it ended, crashed, or started a turn by itself)
+ *   closes it. → whether it was kept.
+ * - take(key, { sessionId, optionsKey }): the parked process if it matches
+ *   and was parked less than `idleMs` ago by the wall clock (timers stop while
+ *   a Mac sleeps), else null (one that can't be used is closed).
+ * - forget(key), forgetBot(botId), closeAll(): close parked processes.
+ */
+export const createWarmClaudeProcesses = ({
+  idleMs = BOT_WARM_PROCESS_MS,
+  maxSize = BOT_WARM_PROCESSES_MAX,
+  setTimer = setTimeout,
+  clearTimer = clearTimeout,
+  now = () => Date.now(),
+  log = () => {},
+} = {}) => {
+  const parked = new Map(); // key -> { proc, timer, parkedAt }, oldest first
+  let epoch = 0; // bumped by closeAll()
+  const botEpochs = new Map(); // botId -> bumped by forgetBot(botId)
+  const drop = (key, why) => {
+    const entry = parked.get(key);
+    if (!entry) return;
+    parked.delete(key);
+    clearTimer(entry.timer);
+    entry.proc.close();
+    log(`closed the warm Claude Code process of ${key} (${why})`);
+  };
+  const current = (ticket) => !ticket || (ticket.epoch === epoch && ticket.botEpoch === (botEpochs.get(ticket.botId) ?? 0));
+  return {
+    ticket(botId) {
+      const id = str(botId);
+      return { botId: id, epoch, botEpoch: botEpochs.get(id) ?? 0 };
+    },
+    park(key, proc, ticket = null) {
+      drop(key, 'replaced');
+      if (!current(ticket)) {
+        proc.close();
+        log(`closed the Claude Code process of ${key} (forgotten during its reply)`);
+        return false;
+      }
+      while (parked.size >= Math.max(1, maxSize)) drop(parked.keys().next().value, 'too many warm processes');
+      const entry = { proc, timer: null, parkedAt: now() };
+      parked.set(key, entry);
+      entry.timer = setTimer(() => {
+        if (parked.get(key) === entry) drop(key, 'idle');
+      }, idleMs);
+      entry.timer?.unref?.();
+      proc.pending = proc.iterator.next();
+      const ended = () => {
+        if (parked.get(key) === entry) drop(key, 'ended while idle');
+      };
+      proc.pending.then(ended, ended);
+      return true;
+    },
+    take(key, { sessionId, optionsKey }) {
+      const entry = parked.get(key);
+      if (!entry) return null;
+      if (now() - entry.parkedAt >= idleMs) {
+        drop(key, 'idle (the timer was asleep)');
+        return null;
+      }
+      parked.delete(key);
+      clearTimer(entry.timer);
+      if (entry.proc.sessionId !== sessionId || entry.proc.optionsKey !== optionsKey) {
+        entry.proc.close();
+        log(`closed the warm Claude Code process of ${key} (${entry.proc.sessionId !== sessionId ? 'another session' : 'other settings'})`);
+        return null;
+      }
+      return entry.proc;
+    },
+    forget(key) {
+      drop(key, 'forgotten');
+    },
+    forgetBot(botId) {
+      const id = str(botId);
+      if (!id) return;
+      botEpochs.set(id, (botEpochs.get(id) ?? 0) + 1);
+      for (const key of [...parked.keys()]) if (key === id || key.startsWith(`${id}__`)) drop(key, 'forgotten');
+    },
+    closeAll(why = 'shutting down') {
+      epoch += 1;
+      for (const key of [...parked.keys()]) drop(key, why);
+    },
+    get size() {
+      return parked.size;
+    },
+  };
+};
+
+/** The connected remote MCP servers of a running query, or null (no answer within a second, an older SDK). */
+const readConnectors = async (query) => {
+  if (typeof query?.mcpServerStatus !== 'function') return null;
+  try {
+    const statuses = await within(query.mcpServerStatus(), 1_000, null);
+    return Array.isArray(statuses) ? connectedConnectorsOf(statuses) : null;
+  } catch {
+    return null;
+  }
+};
+
+/** For a reply whose connectors weren't up when it started (waitForConnectors' `missing`). Pure. */
+export const connectorsStillConnectingNote = (missing) =>
+  missing.length
+    ? `(Connectors not connected yet as this reply starts: ${missing.join(', ')}. They connect again at the start of every reply and usually come back within seconds, so their tools may be listed as removed or their servers as disconnected for now. Before you tell the person one is unavailable, call ToolSearch for its tools, which waits for servers that are still connecting, and try again.)`
+    : '';
+
+/**
+ * Appended to a Claude Code bot reply's instructions: a connector that looks
+ * gone at a reply's start is usually reconnecting (see above).
+ */
+export const BOT_CONNECTORS_NOTE = [
+  '## Connectors',
+  "Each of your replies starts Claude Code again, and its connectors (Gmail, Google Calendar, Google Drive and other claude.ai or MCP servers) connect again with it, which can take a few seconds. A connector whose tools are missing or listed as removed, or whose server is reported as disconnected or still connecting, is almost always reconnecting, not disconnected. Before you tell the person a connector is disconnected or unavailable, call ToolSearch for its tools (it waits for servers that are still connecting) and try the call again. Only if it still isn't there or keeps failing, tell them, with the error, and that they can check it in claude.ai's connector settings.",
+].join('\n\n');
+
 /**
  * One prompt, one answer, no tools (a local bot's history summary). deps:
  * loadSdk, resolveBinary and env as createClaudeLaneRunner's; cwd (or a
@@ -508,6 +767,9 @@ export const createClaudeOneShot = ({
  *   Claude Code session, resumed by its next reply (null: a fresh session every reply)
  * - maxPromptTokens / sessionResetTokens / sessionMaxTokens: the prompt and session size limits (bot-sessions.js)
  * - sessionColdMs: a kept session unused this long starts over (default: from the prompt cache's TTL)
+ * - connectorWaitMs: the longest a reply waits for its connectors before its first message (BOT_CONNECTOR_WAIT_MS)
+ * - warmProcesses: createWarmClaudeProcesses(): a kept session's process stays running for the
+ *   bot's next reply (null: every reply starts its own process)
  * - log(...): one line per reply with its token usage
  *
  * lane.threads: how the reply starts Durango Code threads in a project
@@ -547,6 +809,8 @@ export const createClaudeLaneRunner = ({
   sessionMaxTokens = BOT_SESSION_MAX_TOKENS,
   sessionColdMs = null,
   maxFinalInboxRounds = BOT_FINAL_INBOX_MAX_ROUNDS,
+  connectorWaitMs = BOT_CONNECTOR_WAIT_MS,
+  warmProcesses = null,
   log = (...args) => console.info('[bot replies]', ...args),
 }) => async (lane, ctx) => {
   const accessMode = ctx.accessMode || 'read-only';
@@ -579,7 +843,7 @@ export const createClaudeLaneRunner = ({
     resolveLocalPath: resolveLocalAttachment,
   }).catch(() => '');
   const z = zod?.z ?? zod;
-  const systemAppend = projectsNote ? `${lane.systemPrompt}\n\n${projectsNote}` : lane.systemPrompt;
+  const systemAppend = [lane.systemPrompt, projectsNote, BOT_CONNECTORS_NOTE].filter(Boolean).join('\n\n');
 
   // --- the bot's tools ---------------------------------------------------------------
   let silent = false;
@@ -589,8 +853,11 @@ export const createClaudeLaneRunner = ({
     silentReason = null;
   };
   const toolUseIds = new Map(); // tool name -> tool_use ids waiting for their handler
+  // The reply's tools: their handlers are this reply's; a process's SDK tools
+  // call the handlers of the reply it is running (startProcess).
+  const defineTool = (name, description, shape, handler, extras) => ({ name, description, shape, handler, extras });
   const botTools = lane.tools.map((definition) =>
-    sdk.tool(
+    defineTool(
       definition.name,
       definition.description || definition.name,
       zodShapeForInputSchema(z, definition.inputSchema),
@@ -629,7 +896,7 @@ export const createClaudeLaneRunner = ({
   const attaches = lane.replyFiles !== false;
   if (attaches && !lane.tools.some((definition) => definition.name === ATTACH_FILES_TOOL.name)) {
     botTools.push(
-      sdk.tool(
+      defineTool(
         ATTACH_FILES_TOOL.name,
         ATTACH_FILES_TOOL.description,
         zodShapeForInputSchema(z, ATTACH_FILES_TOOL.inputSchema),
@@ -642,9 +909,27 @@ export const createClaudeLaneRunner = ({
       )
     );
   }
-  const mcpServers = botTools.length
-    ? { [BOT_MCP_SERVER]: sdk.createSdkMcpServer({ name: BOT_MCP_SERVER, version: '1.0.0', tools: botTools }) }
-    : {};
+  // The SDK's tools for a process: they call the handlers of the reply that
+  // process is running (`bindings.current`), so a warm process's tools call
+  // whichever reply it runs now, and never another process's reply. Made once
+  // here too, so a bad schema fails before the bot's session is taken.
+  const sdkToolsFor = (bindings) =>
+    botTools.map((definition) =>
+      sdk.tool(
+        definition.name,
+        definition.description,
+        definition.shape,
+        async (args, extra) => {
+          const handler = bindings.current?.toolHandlers.get(definition.name);
+          if (!handler) return { content: [{ type: 'text', text: 'This reply has ended.' }], isError: true };
+          return handler(args, extra);
+        },
+        definition.extras
+      )
+    );
+  sdkToolsFor({ current: null });
+  // Taken as the reply starts: a forgetBot()/closeAll() meanwhile keeps its process from being parked.
+  const warmTicket = warmProcesses ? warmProcesses.ticket(lane.botId) : null;
   const recordToolUse = async (input) => {
     const name = String(input?.tool_name ?? '');
     if (name.startsWith(BOT_TOOL_PREFIX) && input?.tool_use_id) {
@@ -663,11 +948,17 @@ export const createClaudeLaneRunner = ({
   // Its basis leaves out the bot's summary: a kept session goes on with the
   // instructions it started with (the summary it had then) after compaction.
   const { steady: steadyPrompt, memory } = splitMemorySection(lane.systemPrompt);
-  const basis = sessionBasis({ systemPrompt: projectsNote ? `${steadyPrompt}\n\n${projectsNote}` : steadyPrompt, model: lane.model, tools: lane.tools });
+  const basis = sessionBasis({
+    systemPrompt: [steadyPrompt, projectsNote, BOT_CONNECTORS_NOTE].filter(Boolean).join('\n\n'),
+    model: lane.model,
+    tools: lane.tools,
+  });
   const coldAfterMs = sessionColdMs ?? botCacheColdMs(env());
   // Checked out from here until the reply ends (the `finally` below hands it
   // back); nothing that can throw runs before that `try` without handing it back.
   const claimed = keptSessions ? await keptSessions.begin(sessionKey) : { state: null, busy: false };
+  // The connectors the bot's last reply had: this reply's first message waits for them.
+  const expectedConnectors = keptConnectorsOf(claimed.state);
   const planFor = (state, budget = maxPromptTokens) =>
     session
       ? planBotPrompt({
@@ -853,9 +1144,93 @@ export const createClaudeLaneRunner = ({
   // --- the run -------------------------------------------------------------------------
   // One attempt: a resumed session that turns out missing or broken gets a
   // second, fresh one (before anything was written).
-  const runAttempt = async (attemptPlan) => {
+  // A new Claude Code process for an attempt. What it calls back (the bot's
+  // tools, hooks, permission checks, stderr) goes to `bindings.current`: the
+  // reply it is running, swapped when a warm process takes the next reply.
+  const startProcess = ({ attemptPlan, systemAppend: append, optionsKey, baseEnv, effort }) => {
     const inputQueue = createInputQueue();
     const abortController = new AbortController();
+    const proc = { sessionId: null, model: null, optionsKey, iterator: null, pending: null, bindings: { current: null }, closed: false };
+    const current = () => proc.bindings.current;
+    const tools = sdkToolsFor(proc.bindings);
+    let query = null;
+    proc.close = () => {
+      if (proc.closed) return;
+      proc.closed = true;
+      inputQueue.close();
+      try {
+        query?.close?.();
+      } catch {}
+      try {
+        abortController.abort();
+      } catch {}
+    };
+    try {
+      query = sdk.query({
+        prompt: inputQueue.stream(),
+        options: {
+          cwd,
+          ...(lane.model ? { model: lane.model } : {}),
+          ...(effort ? { effort } : {}),
+          systemPrompt: { type: 'preset', preset: 'claude_code', append },
+          settingSources: ['user', 'project', 'local'],
+          includePartialMessages: true,
+          ...(projects.length ? { additionalDirectories: projects.map((project) => project.path) } : {}),
+          mcpServers: tools.length ? { [BOT_MCP_SERVER]: sdk.createSdkMcpServer({ name: BOT_MCP_SERVER, version: '1.0.0', tools }) } : {},
+          ...claudePermissionOptionsForAccessMode(accessMode),
+          ...(accessMode !== 'full-access' && botTools.length
+            ? { allowedTools: [...lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`), ...(attaches ? [`${BOT_TOOL_PREFIX}${ATTACH_FILES_TOOL.name}`] : [])] }
+            : {}),
+          // Depends on the access mode only (part of optionsKey): the same for every reply it runs.
+          canUseTool: async (toolName, toolInput, toolOptions) =>
+            toolName.startsWith(BOT_TOOL_PREFIX) || fullAccessApproves(accessMode, toolName, toolOptions)
+              ? { behavior: 'allow', updatedInput: toolInput }
+              : { behavior: 'deny', message: toolDenial(toolName, accessMode) },
+          hooks: {
+            PreToolUse: [{ hooks: [async (input) => current()?.preToolUse(input) ?? { continue: true }] }],
+            PostToolUse: [{ hooks: [async (input) => current()?.postToolUse(input) ?? { continue: true }] }],
+            PostToolUseFailure: [{ hooks: [async (input) => current()?.postToolUseFailure(input) ?? { continue: true }] }],
+          },
+          // The kept session: resumed. A session that won't be kept isn't saved.
+          ...(attemptPlan.mode === 'resume' ? { resume: attemptPlan.sessionId } : {}),
+          ...(attemptPlan.keep ? {} : { persistSession: false }),
+          ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
+          abortController,
+          stderr: (data) => current()?.stderr(data),
+          env: botClaudeEnv(baseEnv),
+        },
+      });
+      proc.iterator = query[Symbol.asyncIterator]();
+    } catch (error) {
+      proc.close();
+      throw error;
+    }
+    proc.query = query;
+    proc.inputQueue = inputQueue;
+    proc.abortController = abortController;
+    return proc;
+  };
+  // What a process must have been started with to take this reply.
+  const processKeyOf = ({ append, baseEnv, effort }) =>
+    crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify([
+          binary ?? null,
+          cwd,
+          lane.model ?? null,
+          effort ?? null,
+          accessMode,
+          projects.map((project) => project.path),
+          append,
+          lane.tools,
+          botTools.map((definition) => definition.name),
+          botClaudeEnv(baseEnv),
+        ])
+      )
+      .digest('hex');
+
+  const runAttempt = async (attemptPlan) => {
     const attempt = {
       model: lane.model,
       // A resumed session goes on with the instructions it started with (its
@@ -872,70 +1247,86 @@ export const createClaudeLaneRunner = ({
       // A tool ran (anything with effects: a task started, a message sent, a
       // file attached): redoing the attempt would do it again.
       usedTools: false,
+      // The remote MCP servers connected when it answered (null: not read).
+      connectors: null,
+      // It ran in the process the bot's previous reply left running.
+      warm: false,
     };
     let lastAssistantId = null;
-    let query = null;
-    const onAbort = () => {
-      inputQueue.close();
-      try {
-        abortController.abort();
-      } catch {}
+    // Only a kept session's process outlives its reply (one reply holds a bot's session at a time).
+    const reusable = Boolean(warmProcesses) && keptSessions !== null && !claimed.busy && attemptPlan.keep === true;
+    let proc = null;
+    let onAbort = null;
+    // The first message a parked process yields was read ahead (createWarmClaudeProcesses).
+    const nextMessage = () => {
+      const ahead = proc.pending;
+      proc.pending = null;
+      return ahead ?? proc.iterator.next();
     };
-    ctx.signal?.addEventListener('abort', onAbort, { once: true });
-    const baseEnv = env();
-    const effort = claudeEffortForBot(lane.reasoningEffort);
     try {
-      inputQueue.push(userMessage(withAttachments(attemptPlan.prompt)));
-      query = sdk.query({
-        prompt: inputQueue.stream(),
-        options: {
-          cwd,
-          ...(lane.model ? { model: lane.model } : {}),
-          ...(effort ? { effort } : {}),
-          systemPrompt: { type: 'preset', preset: 'claude_code', append: attempt.systemAppend },
-          settingSources: ['user', 'project', 'local'],
-          includePartialMessages: true,
-          ...(projects.length ? { additionalDirectories: projects.map((project) => project.path) } : {}),
-          mcpServers,
-          ...claudePermissionOptionsForAccessMode(accessMode),
-          ...(accessMode !== 'full-access' && botTools.length
-            ? { allowedTools: [...lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`), ...(attaches ? [`${BOT_TOOL_PREFIX}${ATTACH_FILES_TOOL.name}`] : [])] }
-            : {}),
-          canUseTool: async (toolName, toolInput, toolOptions) =>
-            toolName.startsWith(BOT_TOOL_PREFIX) || fullAccessApproves(accessMode, toolName, toolOptions)
-              ? { behavior: 'allow', updatedInput: toolInput }
-              : { behavior: 'deny', message: toolDenial(toolName, accessMode) },
-          hooks: {
-            PreToolUse: [
-              {
-                hooks: [
-                  async (input) => {
-                    attempt.usedTools = true;
-                    return recordToolUse(input);
-                  },
-                ],
-              },
-            ],
-            PostToolUse: [{ hooks: [deliverAtToolResult('PostToolUse')] }],
-            PostToolUseFailure: [{ hooks: [deliverAtToolResult('PostToolUseFailure')] }],
-          },
-          // The kept session: resumed. A session that won't be kept isn't saved.
-          ...(attemptPlan.mode === 'resume' ? { resume: attemptPlan.sessionId } : {}),
-          ...(attemptPlan.keep ? {} : { persistSession: false }),
-          ...(binary ? { pathToClaudeCodeExecutable: binary } : {}),
-          abortController,
-          stderr: (data) => {
-            attempt.stderrTail = `${attempt.stderrTail}${data}`.slice(-2000);
-          },
-          env: botClaudeEnv(baseEnv),
+      // Stopped before it started (while attachments were saved or the session
+      // was taken): no process is started or taken, nothing is sent.
+      if (ctx.signal?.aborted) return attempt;
+      const baseEnv = env();
+      const effort = claudeEffortForBot(lane.reasoningEffort);
+      const optionsKey = processKeyOf({ append: attempt.systemAppend, baseEnv, effort });
+      proc =
+        reusable && attemptPlan.mode === 'resume' && !attemptPlan.cold
+          ? warmProcesses.take(sessionKey, { sessionId: attemptPlan.sessionId, optionsKey })
+          : null;
+      // A process left for an older session (this reply starts a new one) is of no use.
+      if (!proc && reusable) warmProcesses.forget(sessionKey);
+      if (proc) {
+        attempt.warm = true;
+        // Its first turn already said which session and model it runs (system init).
+        attempt.sawInit = true;
+        attempt.sessionId = proc.sessionId;
+        if (proc.model) attempt.model = modelOfReply = proc.model;
+        log(`bot ${lane.botId} reply goes into its warm Claude Code process`);
+      } else {
+        proc = startProcess({ attemptPlan, systemAppend: attempt.systemAppend, optionsKey, baseEnv, effort });
+      }
+      proc.bindings.current = {
+        toolHandlers: new Map(botTools.map((definition) => [definition.name, definition.handler])),
+        preToolUse: (input) => {
+          attempt.usedTools = true;
+          // A subagent's calls aren't this reply's own bot tool calls (deliverAtToolResult skips them too).
+          if (input?.agent_id) return { continue: true };
+          return recordToolUse(input);
         },
-      });
-      for await (const message of query) {
+        postToolUse: deliverAtToolResult('PostToolUse'),
+        postToolUseFailure: deliverAtToolResult('PostToolUseFailure'),
+        stderr: (data) => {
+          attempt.stderrTail = `${attempt.stderrTail}${data}`.slice(-2000);
+        },
+      };
+      const { query, inputQueue, abortController } = proc;
+      // A stopped reply ends its process (warm or not): it isn't kept.
+      const running = proc;
+      onAbort = () => running.close();
+      ctx.signal?.addEventListener('abort', onAbort, { once: true });
+      if (ctx.signal?.aborted) onAbort();
+      let firstPrompt = withAttachments(attemptPlan.prompt);
+      if (!attempt.warm) {
+        // The first message waits for the connectors (see BOT_CONNECTOR_WAIT_MS).
+        const connectorWait = await waitForConnectors({ query, names: expectedConnectors, timeoutMs: connectorWaitMs, signal: abortController.signal });
+        if (!connectorWait.aborted && (connectorWait.waitedMs > 0 || connectorWait.missing.length)) {
+          log(`bot ${lane.botId} waited ${connectorWait.waitedMs}ms for connectors${connectorWait.missing.length ? `, not connected: ${connectorWait.missing.join(', ')}` : ''}`);
+        }
+        const stillConnecting = connectorsStillConnectingNote(connectorWait.missing);
+        if (stillConnecting) firstPrompt = `${firstPrompt}\n\n${stillConnecting}`;
+      }
+      // Stopped while it waited: the prompt never goes out.
+      if (ctx.signal?.aborted || proc.closed) return attempt;
+      inputQueue.push(userMessage(firstPrompt));
+      for (;;) {
+        const { value: message, done } = await nextMessage();
+        if (done) break;
         if (ctx.signal?.aborted) break;
         const mainLoop = !message?.parent_tool_use_id;
         if (message?.type === 'system' && message.subtype === 'init') {
           attempt.sawInit = true;
-          if (typeof message.model === 'string' && message.model) attempt.model = modelOfReply = message.model;
+          if (typeof message.model === 'string' && message.model) attempt.model = modelOfReply = proc.model = message.model;
           if (typeof message.session_id === 'string' && message.session_id) attempt.sessionId = message.session_id;
           continue;
         }
@@ -1000,6 +1391,8 @@ export const createClaudeLaneRunner = ({
           partial = '';
           toolCalls.clear();
           if (message.is_error || message.subtype !== 'success') break;
+          // What the next reply waits for: the connectors this one had.
+          if (attempt.connectors === null) attempt.connectors = await readConnectors(query);
           // Before posting the final answer: check for unclaimed new messages
           // from the person (capped so a burst never loops forever).
           if (inboxRequest) await inboxRequest;
@@ -1034,14 +1427,17 @@ export const createClaudeLaneRunner = ({
     } catch (error) {
       attempt.thrown = error;
     } finally {
-      ctx.signal?.removeEventListener('abort', onAbort);
-      inputQueue.close();
-      try {
-        query?.close?.();
-      } catch {}
-      try {
-        abortController.abort();
-      } catch {}
+      if (onAbort) ctx.signal?.removeEventListener('abort', onAbort);
+      if (proc) {
+        proc.bindings.current = null;
+        // A complete reply in a kept session leaves its process running for the bot's next one.
+        if (reusable && !proc.closed && !attempt.thrown && !ctx.signal?.aborted && succeeded(attempt) && attempt.sessionId) {
+          proc.sessionId = attempt.sessionId;
+          warmProcesses.park(sessionKey, proc, warmTicket);
+        } else {
+          proc.close();
+        }
+      }
     }
     return attempt;
   };
@@ -1086,9 +1482,13 @@ export const createClaudeLaneRunner = ({
   let attempt;
   let resumeFailed = false;
   try {
-    attempt = await runAttempt(
-      plan.mode === 'resume' ? { ...plan, sessionId: claimed.state.sessionId, systemAppend: claimed.state.systemAppend } : plan
-    );
+    const firstPlan = plan.mode === 'resume' ? { ...plan, sessionId: claimed.state.sessionId, systemAppend: claimed.state.systemAppend } : plan;
+    attempt = await runAttempt(firstPlan);
+    if (attempt.warm && retryableHere(attempt)) {
+      // The warm process ended or broke before doing anything: the same session in a new one.
+      log(`bot ${lane.botId} warm Claude Code process failed, resuming in a new one`);
+      attempt = await startOver({ ...firstPlan, cold: true });
+    }
     if (plan.mode === 'resume' && retryableHere(attempt)) {
       // The kept session couldn't be resumed (missing, broken): start over fresh.
       resumeFailed = true;
@@ -1124,6 +1524,7 @@ export const createClaudeLaneRunner = ({
                 .slice(-4_000),
               contextKeys: plan.contextKeys,
               contextTokens: attempt.contextTokens,
+              connectors: attempt.connectors ?? expectedConnectors,
               replies: plan.mode === 'resume' ? (claimed.state?.replies ?? 0) + 1 : 1,
             }
           : null
@@ -1206,18 +1607,6 @@ export const createClaudeLaneRunner = ({
 };
 
 // --- the worker ------------------------------------------------------------------------
-
-const abortableSleep = (ms, signal) =>
-  new Promise((resolve) => {
-    if (signal?.aborted) return resolve();
-    const timer = setTimeout(done, ms);
-    function done() {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', done);
-      resolve();
-    }
-    signal?.addEventListener('abort', done, { once: true });
-  });
 
 const isAbort = (error) =>
   error?.name === 'AbortError' ||

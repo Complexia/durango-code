@@ -103,6 +103,7 @@ import {
   createBotSessionStore,
   createClaudeLaneRunner,
   createClaudeOneShot,
+  createWarmClaudeProcesses,
   normalizeBotSettings,
 } from './main/bot-replies.js';
 import { createBotAttachmentManager } from './main/bot-attachments.js';
@@ -930,6 +931,8 @@ const clearAccountSession = async ({ preserveRepository = false } = {}) => {
   // Durango Chat dispatch stops polling the moment sign-out begins.
   dispatchWorker.accountChanged(durangoMock);
   botReplyWorker.accountChanged(durangoMock);
+  // The account's bots no longer reply here: nothing of theirs stays running.
+  botWarmProcesses.closeAll('signed out');
   localBots.setActive(!durangoMock);
   deployWatcher.accountChanged(false);
   await Promise.all([repositoryClear, durangoClear.catch(() => {})]);
@@ -960,6 +963,8 @@ const publishAccountState = async (session) => {
   // deploy watcher (never checks or deploys while signed out).
   dispatchWorker.accountChanged(durangoMock || account.authenticated);
   botReplyWorker.accountChanged(durangoMock || account.authenticated);
+  // Signed in or out: the other side's bots reply from now on.
+  if (wasAuthenticated !== null && wasAuthenticated !== account.authenticated) botWarmProcesses.closeAll('account changed');
   // Bots on this device while signed out; signing in uploads them to Durango.
   localBots.setActive(!(durangoMock || account.authenticated));
   if (account.authenticated && wasAuthenticated !== true) void syncLocalBotsToDurango();
@@ -1548,6 +1553,8 @@ app.whenReady().then(async () => {
   powerMonitor.on('suspend', () => {
     dispatchWorker.suspend();
     botReplyWorker.suspend();
+    // Connections die over sleep, and timers stop: no warm process outlives it.
+    botWarmProcesses.closeAll('the computer went to sleep');
     deployWatcher.suspend();
   });
   powerMonitor.on('resume', () => {
@@ -1936,6 +1943,7 @@ app.on('will-quit', (event) => {
   dispatchWorker.stop();
   botReplyWorker.stop();
   void localBots.stop();
+  botWarmProcesses.closeAll();
   deployWatcher.stop();
   disposeForQuit();
   if (quitBarrierSatisfied) return;
@@ -1967,6 +1975,7 @@ const settleQuitBarrierForUpdate = async () => {
   dispatchWorker.stop();
   botReplyWorker.stop();
   void localBots.stop();
+  botWarmProcesses.closeAll();
   deployWatcher.stop();
   disposeForQuit('update');
   // If a quit is already draining this same work, waiting on it here settles at
@@ -4640,6 +4649,9 @@ const botSessions = createBotSessionStore({
   dir: () => path.join(app.getPath('userData'), 'bots', '.sessions'),
   log: (...args) => console.warn('[bot sessions]', ...args),
 });
+// A bot's Claude Code process, left running for two minutes after a reply so
+// the bot's next message goes straight into it (bot-replies.js).
+const botWarmProcesses = createWarmClaudeProcesses({ log: (...args) => console.info('[bot replies]', ...args) });
 
 // Local staging + background cloud upload for files attached to bot messages.
 // Replies on this Mac read the local copy straight away; cloud/other machines
@@ -4660,6 +4672,7 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
   getProjects: botProjects,
   resolveLocalAttachment: (item) => botAttachments.resolveLocalPath(item),
   sessions: botSessions,
+  warmProcesses: botWarmProcesses,
 });
 
 // Bot replies on a model that isn't Claude run on this machine's harness for
@@ -5116,6 +5129,8 @@ const syncLocalBotsToDurango = () => {
       }
       if (!(await stillSameAccount())) throw new LocalBotsAccountChanged();
       await localBots.markSynced();
+      // This device's bots are now Durango's (other ids): their processes go.
+      botWarmProcesses.closeAll('local bots uploaded');
       console.log(`[local bots] uploaded ${result.bots.length} bot(s) to Durango`);
     } catch (error) {
       if (error instanceof LocalBotsAccountChanged) rerun = true;
@@ -5204,6 +5219,7 @@ const configureDurango = async (input) => {
   // the projects they see are the ones allowed for Durango.
   const botSettings = normalizeBotSettings(input?.bots);
   botReplyWorker.configure({ settings: botSettings });
+  if (!botSettings.enabled) botWarmProcesses.closeAll('bot replies turned off');
   localBotsAccessMode = botSettings.accessMode;
   botAllowedProjectIds = settings.allowedProjectIds;
   return { ok: true, state: dispatchWorker.getState(), deployWatcherState: deployWatcher.getState() };
@@ -6492,6 +6508,7 @@ ipcMain.handle('bots:delete', async (_event, input) => {
   if (await localBotsMode()) {
     try {
       await localBots.deleteBot(botId);
+      botWarmProcesses.forgetBot(botId);
       await botSessions.forgetBot(botId).catch(() => {});
       return { ok: true };
     } catch (error) {
@@ -6500,6 +6517,7 @@ ipcMain.handle('bots:delete', async (_event, input) => {
   }
   try {
     await durangoClient.deleteBot(botId);
+    botWarmProcesses.forgetBot(botId);
     await botSessions.forgetBot(botId).catch(() => {});
     return { ok: true };
   } catch (error) {
@@ -6513,6 +6531,7 @@ ipcMain.handle('bots:clear', async (_event, input) => {
   if (await localBotsMode()) {
     try {
       const bot = await localBots.clear(botId);
+      botWarmProcesses.forgetBot(botId);
       await botSessions.forgetBot(botId).catch(() => {});
       return { ok: true, bot };
     } catch (error) {
@@ -6521,6 +6540,7 @@ ipcMain.handle('bots:clear', async (_event, input) => {
   }
   try {
     const result = await durangoClient.clearBot(botId);
+    botWarmProcesses.forgetBot(botId);
     await botSessions.forgetBot(botId).catch(() => {});
     return { ok: true, ...(result.bot ? { bot: result.bot } : {}) };
   } catch (error) {
