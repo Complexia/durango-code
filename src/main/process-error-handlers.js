@@ -94,15 +94,7 @@ export function installProcessErrorHandlers({
   const onStderrError = onStdioError('stderr');
 
   const onUncaughtException = (error, origin) => {
-    if (isBrokenPipe(error)) {
-      stdioBroken = true;
-      safeReport('[main] Uncaught EPIPE:', error, {
-        type: 'uncaughtException',
-        error,
-        origin: origin ?? null,
-      }, { skipLog: true });
-      return;
-    }
+    if (handling) return;
 
     const suffix = typeof origin === 'string' && origin ? ` (${origin})` : '';
     safeReport(`[main] Uncaught exception${suffix}:`, error, {
@@ -110,6 +102,8 @@ export function installProcessErrorHandlers({
       error,
       origin: origin ?? null,
     });
+
+    if (isBrokenPipe(error)) return;
 
     if (!isReadyToStayAlive()) {
       maybeTriggerFatal({

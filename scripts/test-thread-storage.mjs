@@ -768,7 +768,9 @@ try {
   await assert.rejects(fs.access(fileOf('manifest.json')), 'reading an empty threads dir must not commit an empty manifest');
   await fs.writeFile(getThreadsFilePath(), JSON.stringify({ version: 1, threads: [first] }), 'utf8');
   resetThreadStorageStateForTests();
-  assert.deepEqual(await readAllThreads(), [first], 'legacy v1 file still migrates even if an empty threads dir exists');
+  const [migratedConcurrentA, migratedConcurrentB] = await Promise.all([readAllThreads(), readAllThreads()]);
+  assert.deepEqual(migratedConcurrentA, [first], 'legacy v1 file still migrates even if an empty threads dir exists');
+  assert.deepEqual(migratedConcurrentB, [first], 'concurrent readers coalesce legacy v1 migration safely');
   await clearThreadsStorage();
   resetThreadStorageStateForTests();
 

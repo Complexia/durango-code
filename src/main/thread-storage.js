@@ -11,6 +11,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   utimesSync,
@@ -1128,48 +1129,58 @@ const archiveLegacyFile = (rename) => {
   }
 };
 
-const migrateLegacy = async () => {
-  let value;
+let legacyMigration = null;
+const migrateLegacy = () => {
   try {
-    value = await fs.readFile(getThreadsFilePath(), 'utf8');
-  } catch (error) {
-    if (error?.code === 'ENOENT') return null;
-    throw error;
-  }
-  const threads = legacyThreads(value);
-  const directory = getThreadsDirectoryPath();
-  const staging = `${directory}.migrating-${process.pid}-${Date.now()}`;
-  await fs.mkdir(staging, { recursive: false });
-  try {
-    const entries = [];
-    for (const thread of threads) {
-      const split = splitThread(thread, staging);
-      for (const file of split.files) await fs.writeFile(file.path, file.raw, 'utf8');
-      entries.push(migratedEntry(split.entry, sha256(JSON.stringify(thread)), { recoverable: false }));
-    }
-    const manifest = { version: MANIFEST_VERSION, revision: 1, entries };
-    await writeManifest(manifest, null, staging);
-    await fs.rename(staging, directory);
-    manifestCache = null;
+    const current = readManifestFileSync();
+    if (current.version === MANIFEST_VERSION) return Promise.resolve(current);
+  } catch {}
+  legacyMigration ??= (async () => {
+    let value;
     try {
-      await fs.rename(getThreadsFilePath(), backupPath());
+      value = await fs.readFile(getThreadsFilePath(), 'utf8');
     } catch (error) {
-      if (error?.code !== 'ENOENT' && error?.code !== 'EEXIST') {
-        console.warn('Could not archive legacy Orion threads file', error);
-      }
+      if (error?.code === 'ENOENT') return null;
+      throw error;
     }
-    return manifest;
-  } catch (error) {
-    await fs.rm(staging, { recursive: true, force: true });
-    throw error;
-  }
+    const threads = legacyThreads(value);
+    const directory = getThreadsDirectoryPath();
+    const staging = `${directory}.migrating-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+    await fs.mkdir(staging, { recursive: false });
+    try {
+      const entries = [];
+      for (const thread of threads) {
+        const split = splitThread(thread, staging);
+        for (const file of split.files) await fs.writeFile(file.path, file.raw, 'utf8');
+        entries.push(migratedEntry(split.entry, sha256(JSON.stringify(thread)), { recoverable: false }));
+      }
+      const manifest = { version: MANIFEST_VERSION, revision: 1, entries };
+      await writeManifest(manifest, null, staging);
+      await fs.rename(staging, directory);
+      manifestCache = null;
+      try {
+        await fs.rename(getThreadsFilePath(), backupPath());
+      } catch (error) {
+        if (error?.code !== 'ENOENT' && error?.code !== 'EEXIST') {
+          console.warn('Could not archive legacy Orion threads file', error);
+        }
+      }
+      return manifest;
+    } catch (error) {
+      await fs.rm(staging, { recursive: true, force: true });
+      throw error;
+    }
+  })().finally(() => {
+    legacyMigration = null;
+  });
+  return legacyMigration;
 };
 
 const migrateLegacySync = () => {
   if (!existsSync(getThreadsFilePath())) return null;
   const threads = legacyThreads(readFileSync(getThreadsFilePath(), 'utf8'));
   const directory = getThreadsDirectoryPath();
-  const staging = `${directory}.migrating-${process.pid}-${Date.now()}`;
+  const staging = `${directory}.migrating-${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
   mkdirSync(staging, { recursive: false });
   try {
     const entries = [];
@@ -1365,11 +1376,28 @@ export const retireLegacyThreadFiles = async () => {
 const hasRecoverableManifestState = (directory) =>
   existsSync(previousManifestPath(directory)) || threadFilesOnDisk(directory).size > 0;
 
-const isDisposableEmptyThreadsDir = (directory) => {
+// Synchronously remove an empty (or stale-temp-only) threads directory before
+// running legacy v1 migration. Uses non-recursive `rmdirSync` so if a
+// concurrent writer creates a manifest or thread file in the meantime, removal
+// fails safely with ENOTEMPTY and never deletes live data.
+const removeEmptyDisposableThreadsDirSync = (directory) => {
+  let names;
   try {
-    return readdirSync(directory).every((name) => TEMP_FILE.test(name));
-  } catch {
-    return false;
+    names = readdirSync(directory);
+  } catch (error) {
+    return error?.code === 'ENOENT';
+  }
+  if (!names.every((name) => TEMP_FILE.test(name))) return false;
+  for (const name of names) {
+    try {
+      rmSync(path.join(directory, name), { force: true });
+    } catch {}
+  }
+  try {
+    rmdirSync(directory);
+    return true;
+  } catch (error) {
+    return error?.code === 'ENOENT';
   }
 };
 
@@ -1406,8 +1434,7 @@ const ensureManifest = async ({ create = false } = {}) => {
       sweepUnreferencedFiles(manifest);
       return manifest;
     }
-    if (existsSync(getThreadsFilePath()) && isDisposableEmptyThreadsDir(directory)) {
-      await fs.rm(directory, { recursive: true, force: true });
+    if (existsSync(getThreadsFilePath()) && removeEmptyDisposableThreadsDirSync(directory)) {
       const migrated = await migrateLegacy();
       if (migrated) return migrated;
     }
@@ -1444,8 +1471,7 @@ const ensureManifestSync = ({ create = false } = {}) => {
       sweepUnreferencedFiles(manifest);
       return manifest;
     }
-    if (existsSync(getThreadsFilePath()) && isDisposableEmptyThreadsDir(directory)) {
-      rmSync(directory, { recursive: true, force: true });
+    if (existsSync(getThreadsFilePath()) && removeEmptyDisposableThreadsDirSync(directory)) {
       const migrated = migrateLegacySync();
       if (migrated) return migrated;
     }

@@ -84,16 +84,23 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
     boundary.state = { ...boundary.state, ...partial };
   }) as typeof boundary.setState;
 
-  let themeRemoved = false;
+  const removedStyleIds: string[] = [];
   const removedClasses: string[] = [];
+  const removedAttrs: string[] = [];
+  const dataset: Record<string, string | undefined> = { theme: 'custom-broken' };
   const prevDocument = (globalThis as { document?: unknown }).document;
   (globalThis as { document?: unknown }).document = {
     getElementById: (id: string) =>
-      id === 'durango-ui-theme' ? { remove: () => { themeRemoved = true; } } : null,
+      id === 'durango-theme-style' || id === 'durango-theme-values'
+        ? { remove: () => { removedStyleIds.push(id); } }
+        : null,
     documentElement: {
+      dataset,
       classList: {
         remove: (...names: string[]) => removedClasses.push(...names),
       },
+      getAttributeNames: () => ['data-theme', 'data-tv-intensity', 'class'],
+      removeAttribute: (name: string) => removedAttrs.push(name),
     },
   };
 
@@ -107,8 +114,15 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
     if (prevDocument === undefined) delete (globalThis as { document?: unknown }).document;
     else (globalThis as { document?: unknown }).document = prevDocument;
   }
-  assert.equal(themeRemoved, true, 'componentDidCatch must strip #durango-ui-theme so broken themes cannot hide recovery UI');
+  assert.deepEqual(
+    removedStyleIds.sort(),
+    ['durango-theme-style', 'durango-theme-values'],
+    'componentDidCatch must strip ThemeLayer style elements so broken themes cannot hide recovery UI'
+  );
   assert.ok(removedClasses.includes('durango-themed'));
+  assert.ok(removedClasses.includes('theme-light'));
+  assert.equal(dataset.theme, undefined);
+  assert.deepEqual(removedAttrs, ['data-tv-intensity']);
   assert.equal(logged.length, 1);
   assert.equal(reported?.error, err);
   assert.match(reported?.stack ?? '', /at BrokenView/);
@@ -176,12 +190,32 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   assert.equal(logCallsAfterPipeBreak, 1, 'once stderr emits EPIPE, further writes to broken stdio must stop');
   stopEpipe();
 
-  // Re-entrancy guard prevents synchronous recursion when an observer triggers another exception.
+  // A non-stdio EPIPE (e.g. from a child-process stdin pipe or socket) is logged
+  // without muting future error logs on healthy stdio or triggering onFatal.
+  const childEpipeProcess = makeFakeProcess();
+  const childEpipeLogs: unknown[][] = [];
+  let childEpipeFatals = 0;
+  const stopChildEpipe = installProcessErrorHandlers({
+    processRef: childEpipeProcess,
+    log: { error: (...args: unknown[]) => childEpipeLogs.push(args) },
+    isReadyToStayAlive: () => false,
+    onFatal: () => { childEpipeFatals += 1; },
+  });
+  childEpipeProcess.emit('uncaughtException', Object.assign(new Error('child pipe EPIPE'), { code: 'EPIPE' }), 'uncaughtException');
+  childEpipeProcess.emit('unhandledRejection', new Error('subsequent rejection still logged'), Promise.resolve());
+  assert.equal(childEpipeLogs.length, 2, 'child/socket EPIPE must not mute subsequent stdio error logs');
+  assert.equal(childEpipeFatals, 0, 'EPIPE must not trigger fatal exit');
+  stopChildEpipe();
+
+  // Re-entrancy guard prevents synchronous recursion and avoids double-counting toward burstLimit/onFatal.
   let reentrantObserved = 0;
+  let reentrantFatals = 0;
   const reentrantProcess = makeFakeProcess();
   const stopReentrant = installProcessErrorHandlers({
     processRef: reentrantProcess,
     log: { error: () => {} },
+    burstLimit: 2,
+    onFatal: () => { reentrantFatals += 1; },
     onError: () => {
       reentrantObserved += 1;
       if (reentrantObserved === 1) {
@@ -191,6 +225,7 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   });
   reentrantProcess.emit('uncaughtException', new Error('outer'), 'uncaughtException');
   assert.equal(reentrantObserved, 1, 'synchronous re-entrant uncaughtException must be suppressed');
+  assert.equal(reentrantFatals, 0, 'synchronous re-entrant uncaughtException must not increment burst counter');
   stopReentrant();
 
   // Broken stdout/stderr (synchronous throw) or throwing observer never crashes the handler.
@@ -351,12 +386,14 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
 // 4. Wiring checks in renderer.tsx, main.js, and one-shot ACP drivers
 {
   const srcDir = fileURLToPath(new URL('../src', import.meta.url));
-  const [rendererSource, mainSource, agySource, fxSource, kimiSource] = await Promise.all([
+  const [rendererSource, mainSource, agySource, fxSource, kimiSource, themeLayerSource, boundarySource] = await Promise.all([
     fs.readFile(path.join(srcDir, 'renderer.tsx'), 'utf8'),
     fs.readFile(path.join(srcDir, 'main.js'), 'utf8'),
     fs.readFile(path.join(srcDir, 'main', 'antigravity-driver.js'), 'utf8'),
     fs.readFile(path.join(srcDir, 'main', 'fx-driver.js'), 'utf8'),
     fs.readFile(path.join(srcDir, 'main', 'kimi-driver.js'), 'utf8'),
+    fs.readFile(path.join(srcDir, 'app', 'themes', 'ThemeLayer.tsx'), 'utf8'),
+    fs.readFile(path.join(srcDir, 'app', 'AppErrorBoundary.tsx'), 'utf8'),
   ]);
   assert.match(rendererSource, /<AppErrorBoundary>[\s\S]*<App \/>[\s\S]*<\/AppErrorBoundary>/);
   assert.match(mainSource, /installProcessErrorHandlers\(\{/);
@@ -366,6 +403,10 @@ import { installProcessErrorHandlers } from '../src/main/process-error-handlers.
   assert.match(agySource, /Promise\.resolve\(driver\.start\(\)\)\.catch\(\(\) => finish\(false\)\)/);
   assert.match(fxSource, /Promise\.resolve\(driver\.start\(\)\)\.catch\(\(\) => finish\(false\)\)/);
   assert.match(kimiSource, /Promise\.resolve\(driver\.start\(\)\)\.catch\(\(\) => finish\(false\)\)/);
+  // Keep AppErrorBoundary's cleared theme style IDs in sync with ThemeLayer.tsx.
+  for (const [, styleId] of themeLayerSource.matchAll(/const (?:STYLE_ID|VALUES_STYLE_ID)\s*=\s*'([^']+)'/g)) {
+    assert.ok(boundarySource.includes(`'${styleId}'`), `AppErrorBoundary must strip ThemeLayer style id '${styleId}'`);
+  }
 }
 
 console.log('crash protection tests passed');

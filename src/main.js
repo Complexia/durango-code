@@ -2171,12 +2171,14 @@ const writeStoreSnapshotAtomically = async (storagePath, data, seq) => {
 ipcMain.handle('storage:load', async () => {
   try {
     const readSeq = storageWriteSeq;
+    const readCommittedSeq = storageCommittedSeq;
     const storagePath = getStorageFilePath();
     const value = await fs.readFile(storagePath, 'utf-8');
     const sanitized = sanitizeStoreValue(value);
     if (
       sanitized &&
       sanitized !== value &&
+      readCommittedSeq === readSeq &&
       storageWriteSeq === readSeq &&
       storageCommittedSeq === readSeq
     ) {

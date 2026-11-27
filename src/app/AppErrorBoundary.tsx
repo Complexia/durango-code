@@ -1,13 +1,27 @@
 import React from 'react';
 
-const THEME_STYLE_ID = 'durango-ui-theme';
+const THEME_STYLE_IDS = ['durango-theme-style', 'durango-theme-values'];
 
 const clearInjectedThemeOverrides = () => {
   if (typeof document === 'undefined') return;
   try {
-    document.getElementById(THEME_STYLE_ID)?.remove();
+    for (const id of THEME_STYLE_IDS) {
+      document.getElementById(id)?.remove();
+    }
     const root = document.documentElement;
-    root.classList.remove('durango-themed', 'has-theme-backdrop', 'theme-static-frost', 'theme-panel-blur');
+    root.classList.remove(
+      'durango-themed',
+      'has-theme-backdrop',
+      'theme-light',
+      'theme-static-frost',
+      'theme-panel-blur'
+    );
+    if (root.dataset) delete root.dataset.theme;
+    if (typeof root.getAttributeNames === 'function') {
+      for (const attr of root.getAttributeNames()) {
+        if (attr.startsWith('data-tv-')) root.removeAttribute(attr);
+      }
+    }
   } catch {
     // Best effort: never let DOM cleanup mask the crash fallback.
   }
