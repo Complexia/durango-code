@@ -38,6 +38,7 @@ import {
   ListChecks,
   Loader2,
   MessageCircleQuestion,
+  Mail,
   MessagesSquare,
   NotebookPen,
   Paperclip,
@@ -4760,7 +4761,7 @@ const AssistantRow: React.FC<{ bot: DesktopBot; projectPath?: string | null; chi
   </div>
 );
 
-const INBOX_ICON = { routine: CalendarClock, task: ListChecks, bot: Bot } as const;
+const INBOX_ICON = { routine: CalendarClock, task: ListChecks, bot: Bot, agent: Mail } as const;
 
 const BotMessage: React.FC<{
   bot: DesktopBot;

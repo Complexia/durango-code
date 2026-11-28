@@ -490,11 +490,12 @@ export const LOCAL_BOT_PLACE = 'machine:local';
 export type BotThreadResult = { ok: boolean; error?: string; code?: string } & Partial<DesktopBotThread>;
 
 /** Where an inbox message came from, by its label (the person's own messages have none). */
-export const botInboxSource = (authorLabel: string | null | undefined): 'person' | 'routine' | 'task' | 'bot' => {
+export const botInboxSource = (authorLabel: string | null | undefined): 'person' | 'routine' | 'task' | 'bot' | 'agent' => {
   if (!authorLabel) return 'person';
   if (authorLabel.startsWith('Routine: ')) return 'routine';
   if (authorLabel.startsWith('Task: ')) return 'task';
   if (authorLabel.startsWith('Bot: ')) return 'bot';
+  if (authorLabel.startsWith('Agent: ')) return 'agent';
   return 'person';
 };
 

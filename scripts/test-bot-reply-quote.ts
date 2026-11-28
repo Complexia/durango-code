@@ -7,6 +7,7 @@ import {
   parseBotReplyQuote,
   withBotReplyQuote,
 } from '../src/app/botReplyQuote';
+import { botInboxSource } from '../src/app/bots';
 import { botWindowAround, BOT_WINDOW_INITIAL } from '../src/app/botThreadWindow';
 
 // Round trip: the quote line in front of the text, parsed back.
@@ -48,6 +49,9 @@ assert.equal(botReplyAuthor({ role: 'assistant' }, 'Durango'), 'Durango');
 assert.equal(botReplyAuthor({ role: 'user', authorLabel: null }, 'Durango'), 'my message');
 assert.equal(botReplyAuthor({ role: 'user', authorLabel: 'Task: Fix the sidebar' }, 'Durango'), 'Task: Fix the sidebar');
 assert.equal(botReplyAuthor({ role: 'user', authorLabel: 'Routine: Morning brief' }, 'Durango'), 'Routine: Morning brief');
+assert.equal(botReplyAuthor({ role: 'user', authorLabel: 'Agent: grok@roma.dev' }, 'Durango'), 'Agent: grok@roma.dev');
+assert.equal(botInboxSource('Agent: grok@roma.dev'), 'agent');
+assert.equal(botInboxSource(null), 'person');
 
 // A target for a files-only message names the files.
 const target = botReplyTarget({ id: 'm1', seq: 9, role: 'user', content: '', createdAt: Date.UTC(2026, 10, 27, 4, 15), files: [{ name: 'a.png' }] }, 'Durango');

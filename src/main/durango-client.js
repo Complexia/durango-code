@@ -488,7 +488,7 @@ export const normalizeBotLane = (lane) => {
   };
 };
 
-const BOT_INBOX_SOURCES = new Set(['person', 'routine', 'task', 'bot']);
+const BOT_INBOX_SOURCES = new Set(['person', 'routine', 'task', 'bot', 'agent']);
 export const normalizeBotInbox = (inbox) =>
   (Array.isArray(inbox) ? inbox : [])
     .filter((item) => item && typeof item === 'object' && typeof item.content === 'string')

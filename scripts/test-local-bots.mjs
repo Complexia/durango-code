@@ -14,8 +14,10 @@ import {
   compactionBoundary,
   createLocalBotEngine,
   durangoModelForLocalBot,
+  inboxSourceOf,
   nextRunAfter,
 } from '../src/main/local-bots.js';
+import { normalizeBotInbox } from '../src/main/durango-client.js';
 import { createClaudeOneShot } from '../src/main/bot-replies.js';
 import { createBotThreadTools } from '../src/main/bot-thread-tools.js';
 import { EARLIER_HISTORY_MAX_CHARS, SUMMARY_MAX_CHARS, memorySection, parseCompaction } from '../src/main/bot-memory.js';
@@ -2808,6 +2810,20 @@ test('local bots: Durango Code threads have no concurrency cap; headless non-pro
 
   runner.lanes[0].finish({ text: 'Started all 7 threads.' });
   await engine.stop();
+});
+
+test('Agent: inbox labels classify as untrusted external agent source, never person', () => {
+  assert.equal(inboxSourceOf(null), 'person');
+  assert.equal(inboxSourceOf('Routine: Morning'), 'routine');
+  assert.equal(inboxSourceOf('Task: Build'), 'task');
+  assert.equal(inboxSourceOf('Bot: Helper'), 'bot');
+  assert.equal(inboxSourceOf('Agent: grok@roma.dev'), 'agent');
+  assert.deepEqual(
+    normalizeBotInbox([
+      { seq: 7, source: 'agent', label: 'Agent: grok@roma.dev', content: 'External report' },
+    ]),
+    [{ seq: 7, source: 'agent', label: 'Agent: grok@roma.dev', content: 'External report' }],
+  );
 });
 
 // --- run -------------------------------------------------------------------------------------
