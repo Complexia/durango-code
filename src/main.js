@@ -128,7 +128,7 @@ import {
   startBundledDeployRunner,
 } from './main/durango-deploy-watcher.js';
 import { createProfileMemoryCache, durangoErrorText, setDurangoToolsClient } from './main/durango-tools.js';
-import { createProjectNotesReader, setProjectNotesReader } from './main/project-notes-tool.js';
+import { createProjectFileReader, createProjectNotesReader, setProjectFileReader, setProjectNotesReader } from './main/project-notes-tool.js';
 import { readImportableSessions, scanImportableSessions } from './main/session-import.js';
 import { clearThreadsStorage, readThreadById, readThreadsByIds, readThreadsForSync, readThreadsBatch, readThreadRawSync, readThreadShells, readThreadsIndex, searchThreadBodies, searchThreadExcerpts, warmThreadSearch, writeThreadsPatch, writeThreadsPatchSync } from './main/thread-storage.js';
 import { ensureMediaExtension, getMimeTypeForMediaPath, mediaPreviewExtensions, sanitizeAttachmentName } from './main/media.js';
@@ -6928,6 +6928,15 @@ setProjectNotesReader(
     projectTarget: botProjectTarget,
     localProject: (project) => localBots.projectByKey(project),
     remoteProject: (key) => durangoClient.projectMemory(key),
+  })
+);
+setProjectFileReader(
+  createProjectFileReader({
+    projects: () => configuredProjects,
+    isLocal: async () => !(await isDispatchSignedIn()),
+    projectTarget: botProjectTarget,
+    localFile: (project, name) => localBots.projectFilePathByKey(project, name),
+    remoteFile: (key, name) => durangoClient.readProjectFile(key, name),
   })
 );
 

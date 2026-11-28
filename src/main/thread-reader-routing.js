@@ -97,7 +97,7 @@ export const orionMachineToolNamesForAccessMode = (accessMode) =>
 // The thread's project notes (project-notes-tool.js) only read the person's
 // own notes, so every mode approves them. Served through `__tools` for the
 // bridge, like the theme tools.
-export const ORION_PROJECT_NOTES_TOOL_NAMES = Object.freeze(['project_notes']);
+export const ORION_PROJECT_NOTES_TOOL_NAMES = Object.freeze(['project_notes', 'read_project_file']);
 
 // load_tools (mcp-on-demand.js, mcp-bridge-shim.cjs) only returns tool
 // definitions and connects servers the user set up; their tools keep their

@@ -1117,9 +1117,9 @@ export const createDurangoClient = ({
       if (!data.bot || typeof data.bot !== 'object') throw new DurangoError('api', errorMessageFrom(data) || 'Durango did not return the new project bot.');
       return data.bot;
     },
-    /** A project bot's notes and files → the project, or null for a bot without one. */
+    /** A project bot's notes and files (contract v2: Durango viewer links) → the project, or null for a bot without one. */
     async botProject(botId) {
-      const data = await request('GET', `/bots/${encodeURIComponent(str(botId))}/project`);
+      const data = await request('GET', `/bots/${encodeURIComponent(str(botId))}/project`, { query: { v: '2' } });
       return data.project ?? null;
     },
     /**
@@ -1133,10 +1133,18 @@ export const createDurangoClient = ({
       if (key) form.append('key', str(key));
       return await request('POST', '/bots/project-files', { form, timeout: Math.max(timeoutMs, 120_000), ...(account ? { account } : {}) });
     },
-    /** A project's notes and files by its key (a project needs no bot) → the project. */
+    /** A project's notes and files by its key (contract v2: Durango viewer links) → the project. */
     async projectMemory(key) {
-      const data = await request('GET', '/bots/projects/memory', { query: { key: str(key) } });
+      const data = await request('GET', '/bots/projects/memory', {
+        query: { key: str(key), v: '2' },
+      });
       return data.project ?? null;
+    },
+    /** Reads one project file server-side (returns text content, or Durango viewer link for binary files). */
+    async readProjectFile(key, name) {
+      return await request('GET', '/bots/projects/memory/file', {
+        query: { key: str(key), name: str(name) },
+      });
     },
     /** Changes a project's notes and files by its key (actions as botProjectAction). */
     async projectMemoryAction(key, body, { account } = {}) {
@@ -1677,6 +1685,9 @@ export const createMockDurangoClient = ({ dispatchDelayMs = 4_000, botLanesFile 
       throw new DurangoError('api', 'Mock Durango has no project bots.');
     },
     async projectMemory() {
+      return null;
+    },
+    async readProjectFile() {
       return null;
     },
     async uploadProjectFile() {

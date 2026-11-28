@@ -69,7 +69,15 @@ import { ORION_DEVICE_TOOL_NAMES } from '../src/main/thread-reader-routing.js';
 import { VISUAL_TOOL_DESCRIPTIONS, VISUAL_TOOL_INPUT_SCHEMAS, VISUAL_TOOL_NAMES } from '../src/main/visual-tools.js';
 import { THEME_TOOL_DESCRIPTIONS, THEME_TOOL_INPUT_SCHEMAS } from '../src/main/theme-tools.js';
 import { orionThemeToolNamesForAccessMode } from '../src/main/thread-reader-routing.js';
-import { PROJECT_NOTES_TOOL_DESCRIPTION, createProjectNotesReader, formatProjectNotes, runProjectNotesTool, setProjectNotesReader } from '../src/main/project-notes-tool.js';
+import {
+  PROJECT_NOTES_TOOL_DESCRIPTION,
+  createProjectFileReader,
+  createProjectNotesReader,
+  formatProjectNotes,
+  runProjectNotesTool,
+  setProjectFileReader,
+  setProjectNotesReader,
+} from '../src/main/project-notes-tool.js';
 import { setDeviceDataRootForTests } from '../src/main/devices/device-settings.js';
 import shimSource from '../src/mcp-bridge-shim.cjs?raw';
 
@@ -502,12 +510,14 @@ try {
   assert.equal(registered.some((entry) => entry.name === 'app_click'), false, 'Read only lists no app actions');
   assert.equal(isPreapprovedOrionTool('app_snapshot', 'read-only'), true);
   assert.equal(isPreapprovedOrionTool('project_notes', 'read-only'), true, 'project_notes only reads');
+  assert.equal(isPreapprovedOrionTool('read_project_file', 'read-only'), true, 'read_project_file only reads');
   assert.equal(isPreapprovedOrionTool('app_snapshot', 'workspace-write'), true);
   assert.equal(isPreapprovedOrionTool('app_click', 'workspace-write'), false, 'Workspace write asks before acting in the app');
   assert.equal(isPreapprovedOrionTool('app_type', 'full-access'), true);
 
-  // --- project_notes: every thread reads its project's notes (not pasted into prompts) ---
+  // --- project_notes & read_project_file: every thread reads its project's notes & files ---
   assert.ok(registered.some((entry) => entry.name === 'project_notes'), 'Claude registers project_notes');
+  assert.ok(registered.some((entry) => entry.name === 'read_project_file'), 'Claude registers read_project_file');
   assert.match(formatProjectNotes(null), /does not run in one of the Durango Code projects/);
   assert.equal(formatProjectNotes({ name: 'Site', notes: [], files: [] }), 'Site has no project notes or files yet.');
   const notesText = formatProjectNotes({
@@ -516,10 +526,18 @@ try {
       { content: 'The site runs on Next.js.', createdAt: 2 },
       { content: 'Deploys go\nthrough land.', createdAt: 1 },
     ],
-    files: [{ name: 'plan.md', path: '/tmp/plan.md' }, { name: 'logo.png', url: 'https://example.com/logo.png' }],
+    files: [
+      { name: 'plan.md', path: '/tmp/plan.md' },
+      {
+        name: 'logo.png',
+        url: 'https://example.com/logo.png',
+        readUrl: 'https://raw-convex.invalid/secret-blob',
+      },
+    ],
   });
   assert.match(notesText, /Notes \(oldest first\):\n- Deploys go through land\.\n- The site runs on Next\.js\./);
   assert.match(notesText, /Files:\n- plan\.md: \/tmp\/plan\.md\n- logo\.png: https:\/\/example\.com\/logo\.png/);
+  assert.equal(notesText.includes('raw-convex.invalid'), false, 'project_notes never leaks raw readUrl into transcripts');
   // File names and paths exactly as stored: repeated spaces stay.
   const spaced = formatProjectNotes({ name: 'Site', notes: [], files: [{ name: 'Q4  plan.md', path: '/files/ab12/Q4  plan.md' }] });
   assert.match(spaced, /\n- Q4  plan\.md: \/files\/ab12\/Q4  plan\.md$/);
@@ -578,6 +596,33 @@ try {
     text: 'Durango Code could not read the project notes: offline',
   });
   setProjectNotesReader(null);
+
+  // read_project_file resolves text contents through the authenticated reader (local or remote),
+  // never requiring raw Convex/R2 URLs in project_notes.
+  const localPlan = path.join(testRoot, 'local-plan.md');
+  await fs.writeFile(localPlan, '# Local plan\nShips cleanly.', 'utf8');
+  const readFile = (signedIn) =>
+    createProjectFileReader({
+      projects: () => [{ id: 'p1', name: 'Site', path: '/Users/me/site' }],
+      isLocal: async () => !signedIn,
+      projectTarget: async () => ({ project: { key: 'repo:r1', name: 'Site' } }),
+      localFile: async (_project, name) => (name === 'local-plan.md' ? localPlan : null),
+      remoteFile: async (key, name) => ({
+        ok: true,
+        name,
+        url: 'https://durango.sh/studio/library?asset=asset_plan',
+        content: `remote(${key}): ${name}`,
+      }),
+    });
+  setProjectFileReader(readFile(true));
+  const remoteRead = await runProjectNotesTool('read_project_file', { name: 'spec.md' }, { projectId: 'p1', projectPath: '/ws/site-fix' });
+  assert.equal(remoteRead.ok, true);
+  assert.match(remoteRead.text, /\[Project file: spec\.md · https:\/\/durango\.sh\/studio\/library\?asset=asset_plan\]\n\nremote\(repo:r1\): spec\.md/);
+  setProjectFileReader(readFile(false));
+  const localRead = await runProjectNotesTool('read_project_file', { name: 'local-plan.md' }, { projectId: 'p1', projectPath: '/ws/site-fix' });
+  assert.equal(localRead.ok, true);
+  assert.match(localRead.text, /# Local plan\nShips cleanly\./);
+  setProjectFileReader(null);
 
   // --- Device tools: Claude registers them only with agent access, mirroring device-tools.js ---
   setDeviceDataRootForTests(path.join(testRoot, 'device-data'));
@@ -1053,7 +1098,7 @@ try {
     // Theme tools come from the app (`__tools`), after the shim's own.
     const themeNames = orionThemeToolNamesForAccessMode('read-only');
     const appNames = orionAppToolNamesForAccessMode('read-only');
-    assert.deepEqual(shimTools.map((tool) => tool.name), [...ORION_BUILTIN_TOOL_NAMES, ...themeNames, ...appNames, 'project_notes']);
+    assert.deepEqual(shimTools.map((tool) => tool.name), [...ORION_BUILTIN_TOOL_NAMES, ...themeNames, ...appNames, 'project_notes', 'read_project_file']);
     const notesTool = shimTools.find((candidate) => candidate.name === 'project_notes');
     assert.equal(notesTool.description, PROJECT_NOTES_TOOL_DESCRIPTION, 'project_notes description matches project-notes-tool.js');
     const shimNotes = await call('tools/call', { name: 'project_notes', arguments: {} });

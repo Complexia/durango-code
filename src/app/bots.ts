@@ -46,7 +46,9 @@ export type BotProjectFile = {
   contentType: string;
   author: string;
   updatedAt: number;
-  /** Signed in: the download link. */
+  /** Library asset backing this file (absent for legacy Convex-storage files or signed-out local files). */
+  assetId?: string | null;
+  /** Signed in: the Durango Library link for viewing this file. */
   url: string | null;
 };
 export type BotProject = { projectKey: string; name: string | null; botId: string | null; notes: BotProjectNote[]; files: BotProjectFile[] };

@@ -67,7 +67,7 @@ import { CopyMessageButton } from './chat';
 import { handleLightboxImageClick } from './imageLightbox';
 import { localMediaSrc } from './attachments';
 import { appendBotDraftFiles, botDraftKey, loadBotDraft, projectBotDraftKey, restoreUnsentBotDraft, useBotDraftSaver } from './botDrafts';
-import { BotActionsRow, BotCards, BotFileGallery, threadIsHere, useMessageFiles, type BotActionHandlers } from './BotReplyCards';
+import { BotActionsRow, BotCards, BotFileGallery, threadIsHere, useBotFileLinks, useMessageFiles, type BotActionHandlers } from './BotReplyCards';
 import { SidebarFooter, type SidebarFooterProps } from './SidebarFooter';
 import { sortProjectsByLatestThreadStart } from './projectOrder';
 import { useSidebarResize } from './useSidebarResize';
@@ -4230,14 +4230,15 @@ const ContextPanel: React.FC<{
   );
 };
 
-const FileThumb: React.FC<{ file: BotProjectFile }> = ({ file }) => {
+const FileThumb: React.FC<{ file: BotProjectFile; previewUrl?: string | null }> = ({ file, previewUrl }) => {
   const kind = fileKind(file);
   const [broken, setBroken] = useState(false);
   const Icon = kind.icon;
+  useEffect(() => setBroken(false), [previewUrl]);
   return (
     <span className="relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white/[0.04] ring-1 ring-white/[0.07]">
-      {kind.image && file.url && !broken ? (
-        <img src={file.url} alt="" draggable={false} loading="lazy" onError={() => setBroken(true)} className="h-full w-full object-cover" />
+      {kind.image && previewUrl && !broken ? (
+        <img src={previewUrl} alt="" draggable={false} loading="lazy" onError={() => setBroken(true)} className="h-full w-full object-cover" />
       ) : (
         <Icon size={16} strokeWidth={1.75} className={kind.tint} />
       )}
@@ -4245,7 +4246,13 @@ const FileThumb: React.FC<{ file: BotProjectFile }> = ({ file }) => {
   );
 };
 
-const FileRow: React.FC<{ file: BotProjectFile; bot: DesktopBot | null; onOpen: () => void; onDelete: () => Promise<void> }> = ({ file, bot, onOpen, onDelete }) => {
+const FileRow: React.FC<{
+  file: BotProjectFile;
+  previewUrl?: string | null;
+  bot: DesktopBot | null;
+  onOpen: () => void;
+  onDelete: () => Promise<void>;
+}> = ({ file, previewUrl, bot, onOpen, onDelete }) => {
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const kind = fileKind(file);
@@ -4259,8 +4266,8 @@ const FileRow: React.FC<{ file: BotProjectFile; bot: DesktopBot | null; onOpen: 
       className={`group flex items-center gap-1 rounded-lg pr-1.5 transition-colors duration-75 hover:bg-white/[0.04] ${deleting ? 'opacity-40' : ''}`}
       onMouseLeave={() => setConfirming(false)}
     >
-      <button type="button" onClick={onOpen} title={`Open ${file.name}`} className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-1.5 py-1.5 text-left">
-        <FileThumb file={file} />
+      <button type="button" onClick={onOpen} title={`Open ${file.name} in Durango`} className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-1.5 py-1.5 text-left">
+        <FileThumb file={file} previewUrl={previewUrl} />
         <span className="min-w-0 flex-1">
           <span className="block truncate text-[13px] leading-5 text-neutral-200">{file.name}</span>
           <span className="flex items-center gap-1 truncate text-[11px] leading-4 text-neutral-500">
@@ -4314,7 +4321,15 @@ const FilesPanel: React.FC<{
   onBrowse: () => void;
   onOpen: (file: BotProjectFile) => void;
   onDelete: (file: BotProjectFile) => Promise<void>;
-}> = ({ files, bot, projectName, uploading, dragging, onBrowse, onOpen, onDelete }) => (
+}> = ({ files, bot, projectName, uploading, dragging, onBrowse, onOpen, onDelete }) => {
+  const imageAssetIds = useMemo(
+    () =>
+      [...new Set((files ?? []).filter((file) => fileKind(file).image && file.assetId).map((file) => file.assetId as string))].sort(),
+    [files]
+  );
+  const fileLinks = useBotFileLinks(imageAssetIds);
+
+  return (
   <LibraryPanel
     icon={<Paperclip size={14} />}
     title="Files"
@@ -4374,7 +4389,14 @@ const FilesPanel: React.FC<{
             </li>
           )}
           {files.map((file) => (
-            <FileRow key={file.id} file={file} bot={bot} onOpen={() => onOpen(file)} onDelete={() => onDelete(file)} />
+            <FileRow
+              key={file.id}
+              file={file}
+              previewUrl={file.assetId ? fileLinks.get(file.assetId)?.url ?? null : null}
+              bot={bot}
+              onOpen={() => onOpen(file)}
+              onDelete={() => onDelete(file)}
+            />
           ))}
         </ul>
         <p className="mt-2 flex items-center gap-1.5 px-1.5 text-[11px] text-neutral-600">
@@ -4383,7 +4405,8 @@ const FilesPanel: React.FC<{
       </>
     )}
   </LibraryPanel>
-);
+  );
+};
 
 /**
  * A project's library: its context notes and files, kept with the project

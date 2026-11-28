@@ -720,7 +720,7 @@ const TOOL_AREAS = [
   [/^machine_/, 'other machines'],
   [/_app_theme$|^generate_theme_media$/, 'app theme'],
   [/^app_(snapshot|click|type|press|scroll)$/, 'app window'],
-  [/^project_notes$/, 'project notes'],
+  [/^(project_notes|read_project_file)$/, 'project notes'],
   [/^load_tools$/, 'connected apps'],
 ];
 const serverInstructions = (all) => {
