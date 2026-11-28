@@ -4314,6 +4314,83 @@ try {
     assert.equal(canUseReadOnly.behavior, 'deny', 'read-only still denies connected app calls');
     pool.closeAll();
   });
+
+  await test('strips leaked card-history notes and suppresses duplicate reply repeated after show_actions', async () => {
+    const live = [];
+    const sent = [];
+    const calls = [];
+    const leaked = 'Opened chg_abcdefgh12 for review.\n\n[Showed buttons under "Review": "View change" (open_change chg_abcdefgh12), "Open thread" (open_thread thr_1)]';
+    const sdk = createFakeSdk(async function* ({ next, options, tools }) {
+      await next();
+      yield init('claude-opus-5-5');
+      yield delta('Opened chg_abcdefgh12 for review.\n\n[Showed buttons under "Review": "View change"');
+      yield assistant('a1', [{ type: 'text', text: leaked }]);
+      yield assistant('a1', [{ type: 'tool_use', id: 'tu1', name: 'mcp__durango_bot__show_actions', input: {} }]);
+      await options.hooks.PreToolUse[0].hooks[0]({ tool_name: 'mcp__durango_bot__show_actions', tool_use_id: 'tu1', tool_input: {} });
+      await tools.show_actions.handler({ actions: [] });
+      yield toolResult('tu1');
+      // Model repeats the exact same answer after show_actions, plus a leaked XML card note.
+      yield assistant('a2', [{ type: 'text', text: 'Opened chg_abcdefgh12 for review.\n<bot_card_history tool="show_actions">Buttons (Review)</bot_card_history>' }]);
+      yield success();
+    });
+    const outcome = await sdkRunner(sdk)(actionsLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: ({ text }) => live.push(text),
+      takeInbox: async () => [],
+      callTool: async (call) => {
+        calls.push(call);
+        return { result: { ok: true } };
+      },
+      sendMessage: async (message) => {
+        sent.push(message);
+        return true;
+      },
+    });
+    assert.ok(live.every((text) => !text.includes('[Showed buttons') && !text.includes('<bot_card_history')), 'leaked notes never show live');
+    assert.deepEqual(sent.map((m) => m.text), ['Opened chg_abcdefgh12 for review.']);
+    assert.equal(calls[0].message, 0);
+    assert.equal(outcome.text, '', 'duplicate final answer is suppressed');
+    assert.equal(outcome.sent, 1);
+  });
+
+  await test('flushing a repeated pre-inbox draft on non-person inbox still deduplicates before clearing dedup state', async () => {
+    const sent = [];
+    let round = 0;
+    const sdk = createFakeSdk(async function* ({ next, options, tools }) {
+      await next();
+      yield init('claude-opus-5-5');
+      yield assistant('a1', [{ type: 'text', text: 'Working on it.' }]);
+      yield assistant('a1', [{ type: 'tool_use', id: 'tu1', name: 'mcp__durango_bot__show_actions', input: {} }]);
+      await options.hooks.PreToolUse[0].hooks[0]({ tool_name: 'mcp__durango_bot__show_actions', tool_use_id: 'tu1', tool_input: {} });
+      await tools.show_actions.handler({ actions: [] });
+      yield toolResult('tu1');
+      // Repeated draft before a non-person routine item arrives at result.
+      yield assistant('a2', [{ type: 'text', text: 'Working on it.' }]);
+      yield success();
+      // Second turn after routine item delivered: legitimate same text is allowed now.
+      await next();
+      yield assistant('a3', [{ type: 'text', text: 'Working on it.' }]);
+      yield success();
+    });
+    const outcome = await sdkRunner(sdk)(actionsLane(), {
+      signal: new AbortController().signal,
+      accessMode: 'full-access',
+      update: () => {},
+      takeInbox: async ({ beforeFinish } = {}) => {
+        if (!beforeFinish) return [];
+        round += 1;
+        return round === 1 ? [{ seq: 9, source: 'routine', label: 'Routine: check', text: 'Check status' }] : [];
+      },
+      callTool: async () => ({ result: { ok: true } }),
+      sendMessage: async (message) => {
+        sent.push(message);
+        return true;
+      },
+    });
+    assert.deepEqual(sent.map((m) => m.text), ['Working on it.'], 'pre-inbox duplicate draft was deduplicated');
+    assert.equal(outcome.text, 'Working on it.', 'reply after routine inbox delivery is NOT suppressed');
+  });
 } finally {
   await fs.rm(testRoot, { recursive: true, force: true });
 }

@@ -18,7 +18,14 @@ import {
   saveLaneAttachments,
   SILENT_BREAKING_TOOLS,
 } from './bot-replies.js';
-import { ATTACH_FILES_TOOL, createReplyFiles, finishReplyFiles, messageMediaOf } from './bot-reply-extras.js';
+import {
+  ATTACH_FILES_TOOL,
+  createReplyFiles,
+  finishReplyFiles,
+  messageMediaOf,
+  normalizeBotReplyForDedup,
+  stripBotCardHistoryNotes,
+} from './bot-reply-extras.js';
 import {
   BOT_SESSION_MAX_TOKENS,
   BOT_SESSION_RESET_TOKENS,
@@ -906,6 +913,8 @@ export const createHarnessLaneRunner = ({
   let partial = ''; // the block streaming now
   let segments = []; // without messages: the text between tool calls (finalMessageOnly)
   let sentCount = 0;
+  let lastSentIndex = null;
+  let lastSentText = null;
   const unsent = [];
   let sending = Promise.resolve();
   const fileLookups = [];
@@ -927,21 +936,29 @@ export const createHarnessLaneRunner = ({
     const names = [...runningTools.values()];
     return names.length ? botToolLabel(names[names.length - 1]) : null;
   };
-  const update = () => ctx.update({ text: silent ? '' : pendingText(), activeTool: activeTool() });
+  const update = () => ctx.update({ text: silent ? '' : stripBotCardHistoryNotes(pendingText(), { streaming: true }), activeTool: activeTool() });
   // The message written so far goes out as one of its own → its index, or null.
   const sendPending = () => {
-    const text = pendingText();
+    const raw = pendingText();
     blocks = [];
     partial = '';
-    if (!text || silent) return null;
+    if (!raw || silent) return null;
+    const text = stripBotCardHistoryNotes(raw);
+    if (!text) return null;
     if (!sendsMessages || sentCount >= BOT_REPLY_MESSAGES_MAX) {
       segments.push(text);
       return null;
     }
-    const index = sentCount;
-    sentCount += 1;
     const media = attaches ? messageMediaOf(text) : { text, paths: [] };
     if (media.paths.length) fileLookups.push(replyFiles.add(media.paths, { quiet: true }).catch(() => []));
+    const dedupKey = normalizeBotReplyForDedup(media.text);
+    if (lastSentIndex !== null && lastSentText !== null && dedupKey && dedupKey === lastSentText) {
+      return lastSentIndex;
+    }
+    const index = sentCount;
+    sentCount += 1;
+    lastSentIndex = index;
+    lastSentText = dedupKey || null;
     let result;
     try {
       result = Promise.resolve(ctx.sendMessage({ index, text: media.text, ...(modelId ? { modelId } : {}) }));
@@ -952,10 +969,20 @@ export const createHarnessLaneRunner = ({
       sending,
       result.then(
         (ok) => {
-          if (ok === false) unsent[index] = text;
+          if (ok === false) {
+            unsent[index] = text;
+            if (lastSentIndex === index) {
+              lastSentIndex = null;
+              lastSentText = null;
+            }
+          }
         },
         () => {
           unsent[index] = text;
+          if (lastSentIndex === index) {
+            lastSentIndex = null;
+            lastSentText = null;
+          }
         }
       ),
     ]);
@@ -1144,7 +1171,8 @@ export const createHarnessLaneRunner = ({
       const items = takePending();
       const ok = await current.steer(formatBotInbox(items)).catch(() => false);
       log(`bot ${lane.botId} ${providerId} steer: ${ok ? 'taken into the running turn' : 'refused, kept for the final answer'}`);
-      if (!ok) giveBack(items);
+      if (ok) lastSentText = null;
+      else giveBack(items);
     });
     return steering;
   };
@@ -1220,12 +1248,14 @@ export const createHarnessLaneRunner = ({
           blocks = [];
           partial = '';
           afterTool = false;
+          lastSentText = null;
           update();
           result = await current.prompt(formatBotFinalInbox(items, { replacedDraft: hadDraft }));
         } else {
-          // Not from the person (a routine, a task report): what was answered
-          // so far stays a message of its own, and the reply goes on.
+          // Not from the person (a routine, a task report): flush the pre-inbox
+          // draft first (preserving dedup), then clear dedup before delivering items.
           sendPending();
+          lastSentText = null;
           afterTool = false;
           stepMessage = null;
           update();
@@ -1264,6 +1294,8 @@ export const createHarnessLaneRunner = ({
     if (plan.mode === 'resume' && !ctx.signal?.aborted && !attempt.unavailable && (attempt.resumeFailed || retryableHere(attempt))) {
       resumeFailed = true;
       clearSilent();
+      lastSentIndex = null;
+      lastSentText = null;
       pendingInbox.unshift(...deliveredItems.splice(0));
       deliveredSeqs.length = 0;
       finalRounds = 0;
@@ -1312,16 +1344,31 @@ export const createHarnessLaneRunner = ({
   };
   await sending;
   await Promise.all(fileLookups);
-  const written =
+  const rawWritten =
     lane.finalMessageOnly && !sendsMessages
       ? selectFinalMessage([...segments, pendingText()].filter((text) => text.trim()))
       : [...segments, ...unsent.filter(Boolean), pendingText()].filter((text) => text.trim()).join('\n\n');
+  const written = stripBotCardHistoryNotes(rawWritten);
   const withModel = modelId ? { modelId } : {};
   const withSent = sentCount ? { sent: sentCount } : {};
   if (ctx.signal?.aborted) return { text: written, aborted: true, ...withSent, ...withModel, ...extras };
-  const { text, files } = attaches
+  const finished = attaches
     ? await finishReplyFiles(written, replyFiles).catch(() => ({ text: written, files: replyFiles.list() }))
     : { text: written, files: [] };
+  const files = finished.files;
+  let text = stripBotCardHistoryNotes(finished.text);
+  if (
+    attempt.ok &&
+    sendsMessages &&
+    sentCount > 0 &&
+    lastSentIndex !== null &&
+    lastSentText !== null &&
+    !unsent.some(Boolean) &&
+    text &&
+    normalizeBotReplyForDedup(text) === lastSentText
+  ) {
+    text = '';
+  }
   const withFiles = files.length ? { files } : {};
   if (attempt.ok && silent && sentCount === 0) {
     return { text: '', silent: true, ...(silentReason ? { silentReason } : {}), ...withModel, ...extras };

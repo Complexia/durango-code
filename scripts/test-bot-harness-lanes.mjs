@@ -1143,6 +1143,42 @@ await test('codex: enables web_search and merges mcpRuntimeConfig overrides clea
   );
 });
 
+await test('codex: strips leaked card-history notes and suppresses duplicate reply after show_actions', async () => {
+  const registry = fakeRegistry();
+  const codex = fakeCodex({
+    registry,
+    script: async (_index, _text, api) => {
+      api.delta('Opened chg_abcdefgh12.\n\n[Showed buttons under "Review": "View change" (open_change chg_abcdefgh12)]');
+      await api.tool('show_actions', async () => {
+        await api.callBotTool('show_actions', { actions: [{ kind: 'open_change', change_id: 'chg_abcdefgh12' }] });
+      });
+      // Model repeats identical message after show_actions.
+      api.delta('Opened chg_abcdefgh12.\n<bot_card_history tool="show_actions">Buttons (Review)</bot_card_history>');
+      api.complete();
+    },
+  });
+  const ctx = ctxFor();
+  const outcome = await runnerFor({ harnesses: { codex: createCodexBotHarness({ spawnProcess: codex.spawnProcess }) }, registry })(
+    lane({ tools: [{ name: 'show_actions', description: 'Buttons', inputSchema: { type: 'object', properties: { actions: { type: 'array' } } } }] }),
+    ctx
+  );
+  assert.ok(ctx.updates.every((u) => !String(u.text ?? '').includes('[Showed buttons') && !String(u.text ?? '').includes('<bot_card_history')));
+  assert.deepEqual(ctx.messages.map((m) => m.text), ['Opened chg_abcdefgh12.']);
+  assert.equal(ctx.calls[0].message, 0);
+  assert.equal(outcome.text, '', 'duplicate final answer is suppressed');
+  assert.equal(outcome.sent, 1);
+
+  // Also verify standalone bot-reply-extras.js sanitizer handles nested brackets, CRLF fences, and ReDoS inputs linearly.
+  const { stripBotCardHistoryNotes } = await import('../src/main/bot-reply-extras.js');
+  assert.equal(stripBotCardHistoryNotes('Done.\n[Showed buttons: "Open [v2]" (reply)]'), 'Done.');
+  assert.equal(stripBotCardHistoryNotes('The [Showed buttons: `label`] card', { streaming: true }), 'The [Showed buttons: `label`] card');
+  assert.equal(stripBotCardHistoryNotes('```\na\n\n\nb\n```\n\n[Showed buttons: "Ship"]'), '```\na\n\n\nb\n```');
+  const t0 = performance.now();
+  const adv = `${' '.repeat(10_000)}<bot_card_history>${'a'.repeat(10_000)}`;
+  assert.equal(stripBotCardHistoryNotes(adv), adv);
+  assert.ok(performance.now() - t0 < 100, 'linear sanitizer avoids ReDoS');
+});
+
 await fs.rm(testRoot, { recursive: true, force: true }).catch(() => {});
 if (failures) {
   console.error(`\n${failures} bot harness test(s) failed.`);

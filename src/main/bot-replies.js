@@ -77,7 +77,15 @@ const enrichDelegateTaskTool = (definition) => {
     },
   };
 };
-import { ATTACH_FILES_TOOL, BOT_REPORT_GUIDE, createReplyFiles, finishReplyFiles, messageMediaOf } from './bot-reply-extras.js';
+import {
+  ATTACH_FILES_TOOL,
+  BOT_REPORT_GUIDE,
+  createReplyFiles,
+  finishReplyFiles,
+  messageMediaOf,
+  normalizeBotReplyForDedup,
+  stripBotCardHistoryNotes,
+} from './bot-reply-extras.js';
 import {
   BOT_SESSION_COLD_MS,
   BOT_SESSION_MAX_TOKENS,
@@ -1094,6 +1102,8 @@ export const createClaudeLaneRunner = ({
   let partial = ''; // the text block streaming now
   const toolCalls = new Map(); // tool_use id -> tool name (main loop)
   let sentCount = 0; // messages sent before the final answer
+  let lastSentIndex = null; // index of the immediately preceding sent message (for duplicate suppression)
+  let lastSentText = null; // normalized text of that message (cleared when new inbox items arrive)
   const unsent = []; // index -> text of a message that couldn't be sent: it goes out with the final answer
   let sending = Promise.resolve(); // every send and file lookup so far
   const fileLookups = []; // files the sent messages point at, being added
@@ -1112,18 +1122,28 @@ export const createClaudeLaneRunner = ({
   // Sends the message written so far as one of its own → its index, or null (nothing to send).
   const sendPending = () => {
     if (!sendsMessages || sentCount >= BOT_REPLY_MESSAGES_MAX || silent) return null;
-    const text = pendingText();
-    if (!text) return null;
-    const index = sentCount;
-    sentCount += 1;
+    const raw = pendingText();
+    if (!raw) return null;
+    const text = stripBotCardHistoryNotes(raw);
     blocks.length = 0;
     finalStart = 0;
     toolBoundaries.length = 0;
+    if (!text) return null;
     const modelId = durangoModelIdForClaude(modelOfReply);
     // Screenshots and files it names are attached (with its final answer, or
     // its last message); their local embeds leave the text.
     const media = attaches ? messageMediaOf(text) : { text, paths: [] };
     if (media.paths.length) fileLookups.push(replyFiles.add(media.paths, { quiet: true }).catch(() => []));
+    const dedupKey = normalizeBotReplyForDedup(media.text);
+    // If the model repeats the exact message it just sent before a tool call,
+    // reuse that message for any cards made in this step instead of posting twice.
+    if (lastSentIndex !== null && lastSentText !== null && dedupKey && dedupKey === lastSentText) {
+      return lastSentIndex;
+    }
+    const index = sentCount;
+    sentCount += 1;
+    lastSentIndex = index;
+    lastSentText = dedupKey || null;
     // Handed over now, before the reply writes on: its place and the live text
     // move on to the next message only once this one is stored.
     let result;
@@ -1139,7 +1159,13 @@ export const createClaudeLaneRunner = ({
     sending = Promise.all([
       sending,
       stored.then((ok) => {
-        if (!ok) unsent[index] = text;
+        if (!ok) {
+          unsent[index] = text;
+          if (lastSentIndex === index) {
+            lastSentIndex = null;
+            lastSentText = null;
+          }
+        }
       }),
     ]);
     return index;
@@ -1169,7 +1195,7 @@ export const createClaudeLaneRunner = ({
     const names = [...toolCalls.values()];
     return names.length ? botToolLabel(names[names.length - 1]) : null;
   };
-  const update = () => ctx.update({ text: silent ? '' : currentText(), activeTool: activeTool() });
+  const update = () => ctx.update({ text: silent ? '' : stripBotCardHistoryNotes(currentText(), { streaming: true }), activeTool: activeTool() });
 
   // --- inbox: taken between steps, read at the next tool result or turn end -------
   const pendingInbox = [];
@@ -1219,6 +1245,7 @@ export const createClaudeLaneRunner = ({
     const items = takePending();
     if (finalInboxRounds < maxFinalInboxRounds) void requestInbox();
     if (items.length) {
+      lastSentText = null;
       return { hookSpecificOutput: { hookEventName, additionalContext: formatBotInbox(items) } };
     }
     // Once stay_silent succeeds and nothing new arrived, stop the turn right away
@@ -1536,12 +1563,15 @@ export const createClaudeLaneRunner = ({
             const hadDraft = blocks.slice(finalStart).some((part) => String(part ?? '').trim());
             blocks.length = finalStart;
             while (toolBoundaries.length && toolBoundaries[toolBoundaries.length - 1] > finalStart) toolBoundaries.pop();
+            lastSentText = null;
             update();
             inputQueue.push(userMessage(formatBotFinalInbox(items, { replacedDraft: hadDraft })));
           } else {
             // Non-person items (e.g. a routine already claimed mid-reply):
-            // keep what was answered so far as its own message and go on.
+            // flush the pre-inbox draft first (preserving dedup against the
+            // earlier sent message), then clear dedup before delivering items.
             sendPending();
+            lastSentText = null;
             finalStart = blocks.length;
             toolBoundaries.push(blocks.length);
             update();
@@ -1591,6 +1621,8 @@ export const createClaudeLaneRunner = ({
   const startOver = async (nextPlan) => {
     plan = nextPlan;
     clearSilent();
+    lastSentIndex = null;
+    lastSentText = null;
     blocks.length = 0;
     finalStart = 0;
     toolBoundaries.length = 0;
@@ -1691,10 +1723,11 @@ export const createClaudeLaneRunner = ({
     }
     return selectFinalMessage(segments);
   };
-  const written =
+  const rawWritten =
     lane.finalMessageOnly && !sendsMessages
       ? finalMessageText()
       : [...unsent.filter(Boolean), currentText()].filter((text) => text.trim()).join('\n\n');
+  const written = stripBotCardHistoryNotes(rawWritten);
   const modelId = durangoModelIdForClaude(attempt.model);
   const withModel = modelId ? { modelId } : {};
   // Messages it sent before its final answer.
@@ -1704,9 +1737,25 @@ export const createClaudeLaneRunner = ({
     return { text: '', silent: true, ...(silentReason ? { silentReason } : {}), ...withModel, ...extras };
   }
   // Screenshots the text names are attached too; their /tmp embeds leave the text.
-  const { text, files } = attaches
+  const finished = attaches
     ? await finishReplyFiles(written, replyFiles).catch(() => ({ text: written, files: replyFiles.list() }))
     : { text: written, files: [] };
+  const files = finished.files;
+  let text = stripBotCardHistoryNotes(finished.text);
+  // Suppress a final answer that repeats the immediately preceding sent message
+  // verbatim (e.g. after show_actions or notify_user). Trailing files still attach to it.
+  if (
+    succeeded(attempt) &&
+    sendsMessages &&
+    sentCount > 0 &&
+    lastSentIndex !== null &&
+    lastSentText !== null &&
+    !unsent.some(Boolean) &&
+    text &&
+    normalizeBotReplyForDedup(text) === lastSentText
+  ) {
+    text = '';
+  }
   const withFiles = files.length ? { files } : {};
   if (succeeded(attempt)) return { text, ...withSent, ...withFiles, ...withModel, ...extras };
 
@@ -2735,7 +2784,7 @@ export const createBotReplyWorker = ({
             : { text, ...(failure ? { failure } : {}) };
         if (outcome?.modelId) body.modelId = outcome.modelId;
         // Its files go up now, in parallel (on its final answer, or its last message); one that doesn't is named under the text.
-        if (!body.retryElsewhere && !body.silent && (body.text || sent) && outcome?.files?.length && uploadReplyFile) {
+        if (!body.retryElsewhere && !body.silent && (!failure || body.text || sent) && outcome?.files?.length && uploadReplyFile) {
           const uploads = await Promise.all(
             outcome.files.map((file) =>
               Promise.resolve()

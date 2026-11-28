@@ -22,7 +22,14 @@ import {
   withThreadReportFooter,
 } from './bot-thread-tools.js';
 import { clipMiddle, compactFileLinks } from '../report-clip.js';
-import { BOT_REPORT_GUIDE, LOCAL_CARD_TOOLS, localCard } from './bot-reply-extras.js';
+import {
+  BOT_REPORT_GUIDE,
+  LOCAL_CARD_TOOLS,
+  formatBotCardHistoryNote,
+  localCard,
+  normalizeBotReplyForDedup,
+  stripBotCardHistoryNotes,
+} from './bot-reply-extras.js';
 import { planBotPrompt } from './bot-sessions.js';
 import { COMPACTION_PROMPT, SEARCH_HISTORY_TOOL, compactionInput, memorySection, parseCompaction, searchMessages } from './bot-memory.js';
 
@@ -120,8 +127,8 @@ How your replies show: like texting, as messages you choose to send.
 - Your thinking is never shown. Anything the person should read must be in a message you write, never only in your thinking.
 - First, acknowledge: when replying to the person and you need any tool call, start with one short line that shows you got it and what you're doing ("Nice one on the call. Checking SF weather now."), before the first call. A quick answer that needs no tools is just the answer. When waking up on a routine, task report, or bot message that might not need a reply, skip the opening line so you can stay silent if nothing needs saying.
 - Then progress, when it's worth it: during long or multi-step work, send a short update when there's something worth knowing (what you found, what you're on next, a step done), not before every tool call. Quick one- or two-step work needs none.
-- Last, the final answer: once the work is done, write the whole answer as your last message, after your last tool call — never leave an answer in your thinking or only in an earlier progress line, and never end on a tool call unless you explicitly end the turn silently with \`stay_silent\`.
-- Cards go on the message you write them with: buttons (show_actions), pages (show_html) and questions (ask_user) attach to the text you wrote right before the call in the same step; called with no text before it, they go on the next message you write; files (attach_files) go with your final answer. For buttons under your final answer: call show_actions first (no text before it), then write the answer; don't mention the buttons.
+- Last, the final answer: once the work is done, write the whole answer as your last message, after your last tool call — never leave an answer in your thinking or only in an earlier progress line, and never end on a tool call unless you explicitly end the turn silently with \`stay_silent\`. Call any closing tools (show_actions, notify_user) with no text before them, then write the answer once — never repeat a message you already sent before a tool call.
+- Cards go on the message you write them with: buttons (show_actions), pages (show_html) and questions (ask_user) attach to the text you wrote right before the call in the same step; called with no text before it, they go on the next message you write; files (attach_files) go with your final answer. For buttons under your final answer: call show_actions first (no text before it), then write the answer; don't mention the buttons. Always use the tools to show cards — never write <bot_card_history …> tags or bracketed card notes like [Showed buttons…] or [Asked the person…] in your replies (those appear in history only as system records of past tool calls, not text you wrote).
 
 Stay responsive:
 - Reply fast, like a person texting: short, warm, direct. No preambles or recaps of the question.
@@ -614,7 +621,7 @@ export const LOCAL_BOT_TOOLS = [
   {
     name: 'ask_user',
     description:
-      'Mark that you need the person to answer a question before going on (their bot list shows you as waiting on them, and they get a notification). The person only sees your reply text, so write the question and these options in your reply too. End your reply after asking; their answer arrives as their next message.',
+      'Mark that you need the person to answer a question before going on (their bot list shows you as waiting on them, and they get a notification). The person only sees your reply text, so write the question and these options in your reply too. End your reply after asking; their answer arrives as their next message. Never write card-history notes like [Asked the person: …] or <bot_card_history …> in your message text.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1802,14 +1809,38 @@ export const createLocalBotEngine = ({
       const files = [
         ...(message.attachments ?? []).map((item) => `[attached file: ${item.name}]`),
         ...(message.cards ?? []).map((card) => {
-          if (card.component === 'html') return `[showed a page "${card.props?.title ?? ''}"]`;
+          if (card.component === 'html') return formatBotCardHistoryNote('show_html', `Page: "${oneLine(card.props?.title)}"`);
           if (card.component === 'bot-ask') {
             const q = oneLine(card.props?.question);
             const opts = Array.isArray(card.props?.options) ? card.props.options.map((o) => `"${oneLine(o)}"`).join(', ') : '';
-            const status = card.props?.dismissed === true ? ' — dismissed by the person without answering; do not ask again' : '';
-            return `[Asked the person: "${q}"${opts ? ` Options: ${opts}` : ''}${status}]`;
+            const dismissed = card.props?.dismissed === true;
+            const status = dismissed ? ' — dismissed by the person without answering; do not ask again' : '';
+            return formatBotCardHistoryNote('ask_user', `Question: "${q}"${opts ? `; options: ${opts}` : ''}${status}`, dismissed ? { status: 'dismissed' } : {});
           }
-          return '[showed buttons]';
+          const title = oneLine(card.props?.title);
+          const actions = Array.isArray(card.props?.actions) ? card.props.actions : [];
+          const list = actions.map((action) => {
+            const label =
+              oneLine(action?.label) ||
+              (action?.kind === 'ship_change'
+                ? 'Ship'
+                : action?.kind === 'open_change'
+                  ? 'View change'
+                  : action?.kind === 'open_thread'
+                    ? 'Open thread'
+                    : action?.kind === 'reply'
+                      ? oneLine(action?.text).slice(0, 40) || 'Reply'
+                      : 'Open');
+            const target = action?.change_id
+              ? ` ${action.change_id}`
+              : action?.thread_id
+                ? ` ${action.thread_id}`
+                : action?.kind === 'open_url' && action?.url
+                  ? ` ${action.url}`
+                  : '';
+            return `"${label}" (${action?.kind ?? 'action'}${target})`;
+          });
+          return formatBotCardHistoryNote('show_actions', `Buttons${title ? ` (${title})` : ''}${list.length ? `: ${list.join(', ')}` : ''}`);
         }),
       ].join('\n');
       return {
@@ -1920,11 +1951,30 @@ export const createLocalBotEngine = ({
   // text of their own, for the next message).
   const sendReplyMessage = (entry, reply, { index, text }) => {
     if (reply.cleared || reply.abort.signal.aborted || index >= BOT_REPLY_MESSAGES_MAX) return false;
-    const content = str(text).trim();
+    const content = stripBotCardHistoryNotes(str(text)).trim();
     if (!content) return false;
     const { bot } = entry;
     const id = botReplyMessageId(reply.id, index);
     if (entry.messages.some((message) => message.id === id)) return true;
+    // Suppress an identical consecutive message within the same reply unless
+    // a new inbox item arrived after the previous one.
+    const lastSentId = reply.sent?.[reply.sent.length - 1];
+    const lastSent = lastSentId ? entry.messages.find((message) => message.id === lastSentId) : null;
+    const dedupKey = normalizeBotReplyForDedup(content);
+    if (
+      lastSent &&
+      dedupKey &&
+      reply.claimSeqs.length === (reply.claimsAtLastSent ?? reply.claimSeqs.length) &&
+      normalizeBotReplyForDedup(lastSent.content) === dedupKey
+    ) {
+      if (reply.cards?.length) {
+        addReplyCards(entry, reply, reply.cards, lastSent.id);
+        reply.cards = [];
+      }
+      reply.seq = undefined;
+      reply.text = '';
+      return true;
+    }
     const message = {
       id,
       seq: reply.seq ?? bot.nextSeq,
@@ -1942,6 +1992,7 @@ export const createLocalBotEngine = ({
     reply.silent = false;
     reply.silentReason = null;
     reply.sent = [...(reply.sent ?? []), id];
+    reply.claimsAtLastSent = reply.claimSeqs.length;
     reply.firstSeq ??= message.seq;
     insertMessage(entry, message);
     bot.lastActivityAt = message.createdAt;
@@ -1992,7 +2043,7 @@ export const createLocalBotEngine = ({
             changed();
             return;
           }
-          if (typeof text === 'string') reply.text = text;
+          if (typeof text === 'string') reply.text = stripBotCardHistoryNotes(text, { streaming: true });
           // The reply takes its place in the thread when it first shows text:
           // what the person sends after that comes below it.
           if (reply.seq === undefined && reply.text.trim()) {
@@ -2072,15 +2123,27 @@ export const createLocalBotEngine = ({
     // move its cursor past the reply, and a new message would start a reply
     // that doesn't see this one).
     const sentIds = reply.sent ?? [];
-    const text = str(outcome?.text).trim();
+    let text = stripBotCardHistoryNotes(str(outcome?.text)).trim();
     const failure = outcome?.failure ? clip(oneLine(outcome.failure), 300) : null;
+    if (!failure && text && sentIds.length) {
+      const lastSent = entry.messages.find((message) => message.id === sentIds[sentIds.length - 1]);
+      const dedupKey = normalizeBotReplyForDedup(text);
+      if (
+        lastSent &&
+        dedupKey &&
+        reply.claimSeqs.length === (reply.claimsAtLastSent ?? reply.claimSeqs.length) &&
+        normalizeBotReplyForDedup(lastSent.content) === dedupKey
+      ) {
+        text = '';
+      }
+    }
     const hasPersonClaim = reply.claimSeqs.some((seq) => {
       const msg = entry.messages.find((item) => item.seq === seq);
       return Boolean(msg && msg.role === 'user' && inboxSourceOf(msg.authorLabel) === 'person');
     });
     const silentEnd = !reply.abort.signal.aborted && !outcome?.aborted && !failure && !sentIds.length && !hasPersonClaim && (reply.silent === true || outcome?.silent === true);
     const attachments =
-      !reply.abort.signal.aborted && !outcome?.aborted && !silentEnd && (text || sentIds.length)
+      !reply.abort.signal.aborted && !outcome?.aborted && !silentEnd && (!failure || text || sentIds.length) && outcome?.files?.length
         ? await copyReplyFiles(reply.id, outcome?.files)
         : [];
     runtime.replies.delete(reply.id);
@@ -2113,17 +2176,18 @@ export const createLocalBotEngine = ({
       await compactIfNeeded(entry, { force: outcome?.compact === true });
       return;
     }
-    const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : !sentIds.length ? "Couldn't reply on this computer: no reply was produced." : '');
+    const cardOnly = !text && !failure && !sentIds.length && Boolean(reply.cards?.length || attachments.length);
+    const content = text || (failure ? `Couldn't reply on this computer: ${failure}` : !sentIds.length && !cardOnly ? "Couldn't reply on this computer: no reply was produced." : '');
     // Its last message came before its last tool call: that is the answer, and
     // the files and cards made after it go with it.
     const last =
-      !content && sentIds.length && (attachments.length || reply.cards?.length)
+      !content && !cardOnly && sentIds.length && (attachments.length || reply.cards?.length)
         ? replaceMessage(entry, sentIds[sentIds.length - 1], (message) => ({
             ...(attachments.length ? { attachments: [...(message.attachments ?? []), ...attachments] } : {}),
             ...(reply.cards?.length ? { cards: [...(message.cards ?? []), ...reply.cards] } : {}),
           }))
         : false;
-    if (content) {
+    if (content || cardOnly) {
       const { bot } = entry;
       const message = {
         id: reply.id,
@@ -2133,15 +2197,15 @@ export const createLocalBotEngine = ({
         authorLabel: null,
         createdAt: now(),
         ...(attachments.length ? { attachments } : {}),
-        ...(text && reply.cards?.length ? { cards: reply.cards } : {}),
+        ...((text || cardOnly) && reply.cards?.length ? { cards: reply.cards } : {}),
       };
       if (reply.seq === undefined) bot.nextSeq += 1;
       insertMessage(entry, message);
       bot.lastActivityAt = message.createdAt;
-      bot.lastPreview = lastPreview(content);
+      if (content) bot.lastPreview = lastPreview(content);
       bot.unread += 1;
     }
-    persistBot(entry, { messages: Boolean(content || last) });
+    persistBot(entry, { messages: Boolean(content || cardOnly || last) });
     changed();
     if (!runtime.replies.size && hasUnclaimed(entry) && active && !entry.bot.paused) startReply(entry);
     await compactIfNeeded(entry, { force: outcome?.compact === true });

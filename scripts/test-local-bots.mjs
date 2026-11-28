@@ -1237,10 +1237,13 @@ test('a signed-out reply keeps its files and cards (show_html, show_actions)', a
       ],
     ]
   );
-  // The next reply knows what this one showed.
+  // The next reply knows what this one showed (as system-record tags, not bracketed prose).
   await engine.send(primary.id, { messageId: 'r2', content: 'Thanks' });
   await waitFor(() => runner.lanes.length === 2);
-  assert.match(runner.lanes[1].lane.prompt, /\[attached file: shot\.png\]\n\[showed a page "Flow"\]\n\[showed buttons\]/);
+  assert.match(
+    runner.lanes[1].lane.prompt,
+    /\[attached file: shot\.png\]\n<bot_card_history tool="show_html">Page: "Flow"<\/bot_card_history>\n<bot_card_history tool="show_actions">Buttons: "Looks good" \(reply\), "Open thread" \(open_thread thr-1\), "Ship" \(ship_change chg_abcdefgh12\)<\/bot_card_history>/
+  );
   runner.lanes[1].finish({ text: 'Anytime.' });
   await engine.idle();
   await engine.stop();
@@ -2824,6 +2827,62 @@ test('Agent: inbox labels classify as untrusted external agent source, never per
     ]),
     [{ seq: 7, source: 'agent', label: 'Agent: grok@roma.dev', content: 'External report' }],
   );
+});
+
+test('local bots strip leaked card-history notes and suppress consecutive duplicate messages after show_actions', async () => {
+  const { engine, runner } = makeEngine();
+  const [primary] = (await engine.list()).bots;
+  await engine.send(primary.id, { messageId: 'm1', content: 'Open a change.' });
+  await waitFor(() => runner.lanes.length === 1);
+  const { ctx } = runner.lanes[0];
+  // Live streaming strips partial/complete card-history notes.
+  ctx.update({ text: 'Opened chg_abcdefgh12.\n\n[Showed buttons under "Ready": "View change" (open_change chg_abcdefgh12' });
+  assert.equal((await engine.thread(primary.id)).live[0].content, 'Opened chg_abcdefgh12.');
+  // Pre-tool message strips leaked note; show_actions attaches to message 0.
+  assert.equal(await ctx.sendMessage({ index: 0, text: 'Opened chg_abcdefgh12.\n[Showed buttons under "Ready": "View change" (open_change chg_abcdefgh12)]' }), true);
+  await ctx.callTool({ name: 'show_actions', input: { title: 'Ready', actions: [{ kind: 'open_thread', thread_id: 'thr-1' }] }, message: 0 });
+  // Repeating the identical message mid-turn or as the final answer (even with a leaked XML note) does not duplicate it.
+  assert.equal(await ctx.sendMessage({ index: 1, text: 'Opened chg_abcdefgh12.' }), true);
+  runner.lanes[0].finish({ text: 'Opened chg_abcdefgh12.\n<bot_card_history tool="show_actions">Buttons (Ready): "Open thread" (open_thread thr-1)</bot_card_history>' });
+  await engine.idle();
+  const replies = (await engine.thread(primary.id)).messages.filter((m) => m.role === 'assistant');
+  assert.equal(replies.length, 1, 'identical repeated message is not posted twice');
+  assert.equal(replies[0].content, 'Opened chg_abcdefgh12.');
+  assert.equal(replies[0].cards?.[0]?.component, 'bot-actions');
+  await engine.stop();
+});
+
+test('local bots preserve card-only reply when runner stripped leaked note to empty text and do not suppress after seq < lastSent.seq claim', async () => {
+  // 1. Card-only reply where runner already stripped leaked card note to text: "".
+  const { engine: e1, runner: r1 } = makeEngine();
+  const [b1] = (await e1.list()).bots;
+  await e1.send(b1.id, { messageId: 'c1', content: 'Show buttons.' });
+  await waitFor(() => r1.lanes.length === 1);
+  await r1.lanes[0].ctx.callTool({ name: 'show_actions', input: { actions: [{ kind: 'reply', label: 'Go' }] } });
+  r1.lanes[0].finish({ text: '' });
+  await e1.idle();
+  const r1Msgs = (await e1.thread(b1.id)).messages.filter((m) => m.role === 'assistant');
+  assert.equal(r1Msgs.length, 1);
+  assert.equal(r1Msgs[0].content, '');
+  assert.equal(r1Msgs[0].cards?.[0]?.component, 'bot-actions');
+  await e1.stop();
+
+  // 2. Mid-turn inbox message with seq < lastSent.seq still allows repeating the same reply text.
+  const { engine: e2, runner: r2 } = makeEngine();
+  const [b2] = (await e2.list()).bots;
+  await e2.send(b2.id, { messageId: 'u1', content: 'Status?' });
+  await waitFor(() => r2.lanes.length === 1);
+  // Person sends u2 BEFORE _m00 reserves a seq, so u2 gets seq=2 and _m00 gets seq=3.
+  await e2.send(b2.id, { messageId: 'u2', content: 'Still running?' });
+  await r2.lanes[0].ctx.sendMessage({ index: 0, text: 'Still running.' });
+  const taken = await r2.lanes[0].ctx.takeInbox({ beforeFinish: true });
+  assert.equal(taken.length, 1);
+  assert.equal(taken[0].content, 'Still running?');
+  r2.lanes[0].finish({ text: 'Still running.' });
+  await e2.idle();
+  const r2Msgs = (await e2.thread(b2.id)).messages.filter((m) => m.role === 'assistant');
+  assert.equal(r2Msgs.length, 2, 'reply answering newly claimed message with seq < lastSent.seq is kept');
+  await e2.stop();
 });
 
 // --- run -------------------------------------------------------------------------------------

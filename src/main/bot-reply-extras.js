@@ -201,7 +201,7 @@ export const LOCAL_CARD_TOOLS = Object.freeze([
   {
     name: 'show_actions',
     description:
-      'Show buttons under your reply that the person can tap. Kinds: open_thread (a Durango Code thread on this computer, thread_id), open_url (a web page, url + label), reply (sends text, or the label, as the person\'s next message: quick replies). ship_change ships a Durango Source change (chg_…) through the thread that made it: give its thread_id from the task report too (the person confirms first; that thread ships it its project\'s way). open_change takes a change id and needs the person signed in. At most 6 buttons; never invent ids or URLs. The buttons go on the text you wrote right before the call in the same step; called with no text before it, on the next message you write. For buttons under your final answer: call it first, then write the answer (don\'t mention the buttons).',
+      'Show buttons under your reply that the person can tap. Kinds: open_thread (a Durango Code thread on this computer, thread_id), open_url (a web page, url + label), reply (sends text, or the label, as the person\'s next message: quick replies). ship_change ships a Durango Source change (chg_…) through the thread that made it: give its thread_id from the task report too (the person confirms first; that thread ships it its project\'s way). open_change takes a change id and needs the person signed in. At most 6 buttons; never invent ids or URLs. The buttons go on the text you wrote right before the call in the same step; called with no text before it, on the next message you write. For buttons under your final answer: call it first, then write the answer (don\'t mention the buttons, and never write [Showed buttons…] or <bot_card_history …> notes in your text).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -284,3 +284,387 @@ export const localCard = (name, input, id) => {
   if (normalized.error) return { error: normalized.error };
   return { card: { id, component: name === 'show_html' ? 'html' : 'bot-actions', props: normalized.props } };
 };
+
+// --- card history markers & outgoing reply guards -------------------------------------------
+// Mirrors chat/convex/botPolicy.ts (code/ is projected publicly and stays standalone).
+
+/** Formats a card for a bot's conversation history as a system-record tag instead of bracketed prose. */
+export const formatBotCardHistoryNote = (tool, body, { status } = {}) => {
+  const clean = String(body ?? '')
+    .replace(/\s+/g, ' ')
+    .replace(/<\/?bot_card_history\b/gi, '')
+    .trim();
+  const statusAttr = status
+    ? ` status="${String(status).replace(/\s+/g, ' ').replace(/"/g, "'").trim()}"`
+    : '';
+  return `<bot_card_history tool="${tool}"${statusAttr}>${clean}</bot_card_history>`;
+};
+
+const BOT_CARD_HISTORY_FAST_RE =
+  /(?:<bot_card_history|\[showed buttons|\[asked the (?:person|user)|\[showed a page|\[displayed html artifact)/i;
+
+const findInlineCodeSpansOnLine = (line) => {
+  const runs = [];
+  for (let i = 0; i < line.length; ) {
+    if (line.charCodeAt(i) !== 96) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i < line.length && line.charCodeAt(i) === 96) i += 1;
+    runs.push({ start, len: i - start });
+  }
+  if (runs.length < 2) return [];
+  const byLen = new Map();
+  for (let r = 0; r < runs.length; r += 1) {
+    const list = byLen.get(runs[r].len);
+    if (list) list.push(r);
+    else byLen.set(runs[r].len, [r]);
+  }
+  const cursor = new Map();
+  const spans = [];
+  for (let r = 0; r < runs.length; ) {
+    const len = runs[r].len;
+    const list = byLen.get(len);
+    let c = cursor.get(len) ?? 0;
+    while (c < list.length && list[c] <= r) c += 1;
+    cursor.set(len, c);
+    if (c < list.length) {
+      const closeIdx = list[c];
+      spans.push([runs[r].start, runs[closeIdx].start + runs[closeIdx].len]);
+      r = closeIdx + 1;
+    } else {
+      r += 1;
+    }
+  }
+  return spans;
+};
+
+const splitMarkdownCodeSegments = (text) => {
+  const segments = [];
+  const push = (slice, isCode) => {
+    if (!slice) return;
+    const prev = segments[segments.length - 1];
+    if (prev && prev.isCode === isCode) prev.text += slice;
+    else segments.push({ text: slice, isCode });
+  };
+
+  let pos = 0;
+  let fenceChar = '';
+  let fenceLen = 0;
+  let fenceStart = -1;
+
+  while (pos < text.length) {
+    const nl = text.indexOf('\n', pos);
+    const lineEnd = nl === -1 ? text.length : nl + 1;
+    const rawLine = text.slice(pos, lineEnd);
+    const lineBody = rawLine.endsWith('\r\n')
+      ? rawLine.slice(0, -2)
+      : rawLine.endsWith('\n')
+        ? rawLine.slice(0, -1)
+        : rawLine;
+
+    if (fenceChar) {
+      let indent = 0;
+      while (indent < lineBody.length && indent < 3 && (lineBody[indent] === ' ' || lineBody[indent] === '\t')) {
+        indent += 1;
+      }
+      let run = indent;
+      while (run < lineBody.length && lineBody[run] === fenceChar) run += 1;
+      let tail = run;
+      while (tail < lineBody.length && (lineBody[tail] === ' ' || lineBody[tail] === '\t')) tail += 1;
+      if (run - indent >= fenceLen && tail === lineBody.length) {
+        const bodyEnd = pos + lineBody.length;
+        push(text.slice(fenceStart, bodyEnd), true);
+        if (bodyEnd < lineEnd) push(text.slice(bodyEnd, lineEnd), false);
+        fenceChar = '';
+        fenceLen = 0;
+        fenceStart = -1;
+      }
+      pos = lineEnd;
+      continue;
+    }
+
+    let indent = 0;
+    while (indent < lineBody.length && indent < 3 && (lineBody[indent] === ' ' || lineBody[indent] === '\t')) {
+      indent += 1;
+    }
+    const ch = lineBody[indent];
+    if (ch === '`' || ch === '~') {
+      let run = indent;
+      while (run < lineBody.length && lineBody[run] === ch) run += 1;
+      const count = run - indent;
+      if (count >= 3 && (ch === '~' || lineBody.indexOf('`', run) === -1)) {
+        fenceChar = ch;
+        fenceLen = count;
+        fenceStart = pos;
+        pos = lineEnd;
+        continue;
+      }
+    }
+
+    const spans = rawLine.includes('`') ? findInlineCodeSpansOnLine(rawLine) : [];
+    if (!spans.length) {
+      push(rawLine, false);
+    } else {
+      let last = 0;
+      for (const [s, e] of spans) {
+        if (s > last) push(rawLine.slice(last, s), false);
+        push(rawLine.slice(s, e), true);
+        last = e;
+      }
+      if (last < rawLine.length) push(rawLine.slice(last), false);
+    }
+    pos = lineEnd;
+  }
+
+  if (fenceChar && fenceStart >= 0) {
+    push(text.slice(fenceStart), true);
+  }
+  return segments;
+};
+
+const isHorizontalSpace = (ch) => ch === ' ' || ch === '\t';
+
+const matchesBracketCardPrefix = (lower, index, allowStreamingTail) => {
+  if (lower.startsWith('[showed buttons', index)) {
+    const after = index + '[showed buttons'.length;
+    if (after === lower.length) return allowStreamingTail;
+    const next = lower[after];
+    if (next === ']' || next === ':') return true;
+    if (isHorizontalSpace(next)) {
+      let p = after;
+      while (p < lower.length && isHorizontalSpace(lower[p])) p += 1;
+      if (lower[p] === ':') return true;
+      if (lower.startsWith('under', p)) {
+        const u = p + 'under'.length;
+        return u === lower.length ? allowStreamingTail : isHorizontalSpace(lower[u]);
+      }
+    }
+    return false;
+  }
+  for (const prefix of ['[asked the person', '[asked the user']) {
+    if (lower.startsWith(prefix, index)) {
+      let p = index + prefix.length;
+      while (p < lower.length && isHorizontalSpace(lower[p])) p += 1;
+      return lower[p] === ':';
+    }
+  }
+  for (const prefix of ['[showed a page', '[displayed html artifact']) {
+    if (lower.startsWith(prefix, index)) {
+      let p = index + prefix.length;
+      if (p === lower.length || !isHorizontalSpace(lower[p])) continue;
+      while (p < lower.length && isHorizontalSpace(lower[p])) p += 1;
+      return lower[p] === '"' || lower[p] === '\u201c';
+    }
+  }
+  return false;
+};
+
+const findClosingBracketOnLine = (text, openIndex, lineEnd) => {
+  let depth = 1;
+  let quote = '';
+  for (let j = openIndex + 1; j < lineEnd; j += 1) {
+    const ch = text[j];
+    if (quote) {
+      if (ch === '\\' && j + 1 < lineEnd) {
+        j += 1;
+        continue;
+      }
+      if ((quote === '"' && ch === '"') || (quote === '\u201c' && (ch === '\u201d' || ch === '"'))) {
+        quote = '';
+      }
+      continue;
+    }
+    if (ch === '"' || ch === '\u201c') {
+      quote = ch;
+    } else if (ch === '[') {
+      depth += 1;
+    } else if (ch === ']') {
+      depth -= 1;
+      if (depth === 0) return j;
+    }
+  }
+  if (quote) {
+    depth = 1;
+    for (let j = openIndex + 1; j < lineEnd; j += 1) {
+      const ch = text[j];
+      if (ch === '[') depth += 1;
+      else if (ch === ']') {
+        depth -= 1;
+        if (depth === 0) return j;
+      }
+    }
+  }
+  return -1;
+};
+
+const stripCardNotesFromSegment = (segment, allowStreamingTail) => {
+  const lower = segment.toLowerCase();
+  const spans = [];
+  let nextXmlClose = -2;
+  let cachedLineEnd = -1;
+  let cachedLineBreak = -1;
+
+  for (let i = 0; i < segment.length; ) {
+    const ch = segment[i];
+    if (ch === '<' && lower.startsWith('<bot_card_history', i)) {
+      const afterName = i + '<bot_card_history'.length;
+      const boundary = segment[afterName];
+      const validBoundary =
+        afterName === segment.length
+          ? allowStreamingTail
+          : boundary === '>' || boundary === '/' || boundary === ' ' || boundary === '\t' || boundary === '\r' || boundary === '\n';
+      if (!validBoundary) {
+        i += 1;
+        continue;
+      }
+      let gt = -1;
+      let quote = '';
+      const tagLimit = Math.min(segment.length, i + 512);
+      for (let j = afterName; j < tagLimit; j += 1) {
+        const c = segment[j];
+        if (quote) {
+          if (c === quote) quote = '';
+        } else if (c === '"' || c === "'") {
+          quote = c;
+        } else if (c === '>') {
+          gt = j;
+          break;
+        }
+      }
+      if (gt === -1) {
+        if (allowStreamingTail && segment.length - i <= 512) {
+          spans.push({ start: i, end: segment.length });
+          break;
+        }
+        i += 1;
+        continue;
+      }
+      if (nextXmlClose === -2 || (nextXmlClose !== -1 && nextXmlClose <= gt)) {
+        nextXmlClose = lower.indexOf('</bot_card_history>', gt + 1);
+      }
+      if (nextXmlClose !== -1 && nextXmlClose - gt <= 4000) {
+        const end = nextXmlClose + '</bot_card_history>'.length;
+        spans.push({ start: i, end });
+        i = end;
+        continue;
+      }
+      if (allowStreamingTail && nextXmlClose === -1 && segment.length - i <= 4000) {
+        spans.push({ start: i, end: segment.length });
+        break;
+      }
+      i = gt + 1;
+      continue;
+    }
+
+    if (ch === '[' && matchesBracketCardPrefix(lower, i, allowStreamingTail)) {
+      if (i > cachedLineBreak) {
+        const nl = segment.indexOf('\n', i);
+        cachedLineBreak = nl === -1 ? segment.length : nl;
+        cachedLineEnd = nl === -1
+          ? segment.length
+          : nl > 0 && segment[nl - 1] === '\r'
+            ? nl - 1
+            : nl;
+      }
+      const lineEnd = cachedLineEnd;
+      const scanLimit = Math.min(lineEnd, i + 2501);
+      const closeIdx = findClosingBracketOnLine(segment, i, scanLimit);
+      if (closeIdx !== -1) {
+        const nextChar = segment[closeIdx + 1];
+        if (nextChar === '(' || nextChar === '[') {
+          i = closeIdx + 1;
+          continue;
+        }
+        spans.push({ start: i, end: closeIdx + 1 });
+        i = closeIdx + 1;
+        continue;
+      }
+      if (allowStreamingTail && lineEnd === segment.length && segment.length - i <= 2500) {
+        spans.push({ start: i, end: segment.length });
+        break;
+      }
+    }
+
+    i += 1;
+  }
+
+  if (!spans.length) return { text: segment, changed: false };
+
+  let out = '';
+  let cursor = 0;
+  for (const span of spans) {
+    let start = span.start;
+    const end = span.end;
+    if (start < cursor) start = cursor;
+    let wsBefore = start;
+    while (wsBefore > cursor && isHorizontalSpace(segment[wsBefore - 1])) wsBefore -= 1;
+    let wsAfter = end;
+    while (wsAfter < segment.length && isHorizontalSpace(segment[wsAfter])) wsAfter += 1;
+
+    const atLineStart = wsBefore === 0 || segment[wsBefore - 1] === '\n';
+    const atLineEnd = wsAfter === segment.length || segment[wsAfter] === '\n' || segment[wsAfter] === '\r';
+
+    if (atLineStart && atLineEnd) {
+      out += segment.slice(cursor, wsBefore);
+      let nextPos = wsAfter;
+      if (segment[nextPos] === '\r' && segment[nextPos + 1] === '\n') nextPos += 2;
+      else if (segment[nextPos] === '\n') nextPos += 1;
+      cursor = nextPos;
+    } else if (atLineEnd) {
+      out += segment.slice(cursor, wsBefore);
+      cursor = wsAfter;
+    } else if (atLineStart) {
+      out += segment.slice(cursor, start);
+      cursor = wsAfter;
+    } else {
+      const beforeChar = wsBefore > cursor ? segment[wsBefore - 1] : out[out.length - 1] ?? '';
+      const afterChar = segment[wsAfter] ?? '';
+      out += segment.slice(cursor, wsBefore);
+      if (beforeChar && !/\s/.test(beforeChar) && afterChar && !/\s/.test(afterChar)) {
+        out += ' ';
+      }
+      cursor = wsAfter;
+    }
+  }
+  if (cursor < segment.length) out += segment.slice(cursor);
+
+  const normalized = out.replace(/\r?\n[ \t]*(?=\r?\n)/g, '\n').replace(/\n{3,}/g, '\n\n');
+  return { text: normalized, changed: true };
+};
+
+/**
+ * Defensive guard for outgoing bot text: strips leaked card-history markers
+ * (`<bot_card_history …>`, `[Showed buttons…]`, `[Asked the person: …]`,
+ * `[showed a page "…"]`, `[Displayed html artifact "…"]`) outside fenced and
+ * inline code spans in strict O(n) time while leaving normal prose, links,
+ * and code untouched. Pure.
+ */
+export const stripBotCardHistoryNotes = (text, { streaming = false } = {}) => {
+  if (typeof text !== 'string' || !text) return '';
+  if (!BOT_CARD_HISTORY_FAST_RE.test(text)) return text;
+  const segments = splitMarkdownCodeSegments(text);
+  let changed = false;
+  const outSegments = segments.map((segment, index) => {
+    if (segment.isCode) return segment;
+    const isFinalTail = streaming === true && index === segments.length - 1;
+    const cleaned = stripCardNotesFromSegment(segment.text, isFinalTail);
+    if (cleaned.changed) changed = true;
+    return { text: cleaned.text, isCode: false };
+  });
+  if (!changed) return text;
+  let first = 0;
+  while (first < outSegments.length && !outSegments[first].isCode && !outSegments[first].text.trim()) first += 1;
+  let last = outSegments.length - 1;
+  while (last >= first && !outSegments[last].isCode && !outSegments[last].text.trim()) last -= 1;
+  if (first > last) return '';
+  const trimmed = outSegments.slice(first, last + 1);
+  if (!trimmed[0].isCode) trimmed[0] = { ...trimmed[0], text: trimmed[0].text.replace(/^\s+/, '') };
+  const tailIdx = trimmed.length - 1;
+  if (!trimmed[tailIdx].isCode) trimmed[tailIdx] = { ...trimmed[tailIdx], text: trimmed[tailIdx].text.replace(/\s+$/, '') };
+  return trimmed.map((seg) => seg.text).join('');
+};
+
+/** Canonical text for spotting an identical consecutive message within a single bot reply. Pure. */
+export const normalizeBotReplyForDedup = (text) => stripBotCardHistoryNotes(text).replace(/\s+/g, ' ').trim();
