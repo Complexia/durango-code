@@ -40,7 +40,7 @@ const withTimeout = (promise, ms, message) => {
 const errorText = (error) => String(error?.message ?? error ?? 'Unknown error').slice(0, 300);
 
 /** The bridge's tool definitions (MCP tools/list shape) for a run with `names` loadable. */
-export const onDemandMcpToolDefinitions = (names = []) =>
+export const onDemandMcpToolDefinitions = (names = [], { secretRefs = true } = {}) =>
   names.length === 0
     ? []
     : [
@@ -64,7 +64,11 @@ export const onDemandMcpToolDefinitions = (names = []) =>
         },
         {
           name: CALL_APP_TOOL_NAME,
-          description: `Call a tool of an app loaded with ${LOAD_TOOLS_TOOL_NAME}. Pass the app, the tool's name and its arguments as described by its input schema. A secret ref from request_secret (\`dsr_…\`) anywhere in the arguments is replaced by the secret, and the result comes back with it replaced by [secret].`,
+          description:
+            `Call a tool of an app loaded with ${LOAD_TOOLS_TOOL_NAME}. Pass the app, the tool's name and its arguments as described by its input schema.` +
+            (secretRefs
+              ? ' A secret ref from request_secret (`dsr_…`) anywhere in the arguments is replaced by the secret, and the result comes back with it replaced by [secret].'
+              : ''),
           inputSchema: {
             type: 'object',
             properties: {

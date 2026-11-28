@@ -33,6 +33,7 @@ import {
   createBotSessionStore,
   createWarmClaudeProcesses,
   keptConnectorsOf,
+  loadableAppsNote,
   waitForConnectors,
   botProjectsNote,
   botToolLabel,
@@ -98,7 +99,7 @@ const zod = await import('zod');
  * generator yielding SDK messages. `next()` reads the next user message from
  * the streaming input; abort ends the run with an AbortError.
  */
-const createFakeSdk = (script, { mcpServerStatus = null } = {}) => {
+const createFakeSdk = (script, { mcpServerStatus = null, setMcpServers = null } = {}) => {
   const runs = [];
   return {
     runs,
@@ -106,7 +107,7 @@ const createFakeSdk = (script, { mcpServerStatus = null } = {}) => {
     createSdkMcpServer: ({ name, tools }) => ({ type: 'sdk', name, tools }),
     query: ({ prompt, options }) => {
       const iterator = prompt[Symbol.asyncIterator]();
-      const run = { options, inputs: [], closed: false };
+      const run = { options, inputs: [], mcpSets: [], closed: false };
       runs.push(run);
       const signal = options.abortController.signal;
       const aborted = new Promise((_, reject) =>
@@ -120,7 +121,7 @@ const createFakeSdk = (script, { mcpServerStatus = null } = {}) => {
         return item.value;
       };
       const tools = Object.fromEntries((options.mcpServers?.durango_bot?.tools ?? []).map((tool) => [tool.name, tool]));
-      const generator = script({ next, options, tools, signal, aborted });
+      const generator = script({ next, options, tools, signal, aborted, run });
       return {
         async *[Symbol.asyncIterator]() {
           for await (const message of generator) {
@@ -133,6 +134,14 @@ const createFakeSdk = (script, { mcpServerStatus = null } = {}) => {
         },
         // mcpServerStatus(run): the query's MCP servers (only when given, like an older SDK without it).
         ...(mcpServerStatus ? { mcpServerStatus: async () => mcpServerStatus(run) } : {}),
+        ...(setMcpServers
+          ? {
+              setMcpServers: async (servers) => {
+                run.mcpSets.push(servers);
+                return await setMcpServers(servers, run);
+              },
+            }
+          : {}),
       };
     },
   };
@@ -3226,7 +3235,7 @@ try {
     assert.deepEqual(kept.connectors, ['claude.ai Gmail'], 'the connectors it answered with are kept with the session');
     assert.equal(pollsOf(0).beforeFirstInput, 1, 'a new bot has no connectors to wait for (one read for the connected-now line)');
     assert.match(textOf(sdk.runs[0].inputs[0]), /Connectors connected in Claude Code on this machine for this reply: claude\.ai Gmail\./, 'the first message names the connectors it has');
-    assert.match(sdk.runs[0].options.systemPrompt.append, /## Connectors\n\nThe connectors loaded in Claude Code here [\s\S]*never in a cloud task[\s\S]*sha256:<64 lowercase hex>:<absolute path>[\s\S]*Each of your replies starts Claude Code again/);
+    assert.match(sdk.runs[0].options.systemPrompt.append, /## Connectors\n\nBoth the connectors loaded in Claude Code here [\s\S]*load_tools[\s\S]*sha256:<64 lowercase hex>:<absolute path>[\s\S]*Each of your replies starts Claude Code again/);
     assert.ok(sdk.runs[0].options.systemPrompt.append.endsWith(BOT_CONNECTORS_NOTE));
 
     const later = [...history, { id: 'r2', seq: 2, role: 'assistant', text: 'Drafted.' }, row(3, 'user', 'Now send it.')];
@@ -4213,6 +4222,97 @@ try {
     assert.equal(byLane.get('l_empty').silent, undefined, 'empty answer without stay_silent is never silent');
     assert.equal(byLane.get('l_fail').silent, undefined, 'actual error after stay_silent is never silent');
     assert.equal(byLane.get('l_fail').failure, 'ACP stream failed');
+  });
+
+  await test('Claude Code lane: Durango connectors load on demand via load_tools (setMcpServers), sync on warm reuse, and never stall waitForConnectors', async () => {
+    assert.equal(loadableAppsNote([]), '');
+    assert.match(loadableAppsNote(['durango-notion', 'durango-whoop']), /load_tools[\s\S]*durango-notion, durango-whoop/);
+    assert.deepEqual(
+      connectedConnectorsOf(
+        [
+          { name: 'claude.ai Gmail', scope: 'claudeai', status: 'connected' },
+          { name: 'durango-notion', status: 'connected', config: { type: 'http' } },
+        ],
+        { exclude: ['durango-notion'] }
+      ),
+      ['claude.ai Gmail'],
+      'on-demand Durango connectors are excluded from expected startup connectors'
+    );
+
+    const sessionsDir = path.join(testRoot, 'sessions-ondemand-mcps');
+    const sessions = createBotSessionStore({ dir: sessionsDir });
+    const pool = createWarmClaudeProcesses({ log: () => {} });
+    let activeServers = {
+      'durango-notion': { type: 'http', url: 'https://durango.sh/api/v1/connectors/cn_1/mcp', headers: { Authorization: 'Bearer dgo_1' } },
+      'durango-whoop': { type: 'http', url: 'https://durango.sh/api/v1/connectors/cn_2/mcp', headers: { Authorization: 'Bearer dgo_1' } },
+    };
+    let loadOutput = '';
+    let canUseNotion = null;
+    let canUseReadOnly = null;
+    const sdk = createFakeSdk(
+      async function* ({ next, options, tools }) {
+        let input = await next();
+        yield { ...init(options.model), session_id: options.resume ?? 'sess-ondemand' };
+        for (let turn = 1; input; turn += 1) {
+          if (turn === 1) {
+            const loaded = await tools.load_tools.handler({ apps: ['durango-notion'] });
+            loadOutput = loaded.content[0].text;
+            canUseNotion = await options.canUseTool('mcp__durango-notion__search', { query: 'test' }, {});
+          }
+          yield assistant(`a${turn}`, [{ type: 'text', text: `Answer ${turn}.` }]);
+          yield { ...success(), session_id: options.resume ?? 'sess-ondemand', usage: { input_tokens: 1, output_tokens: 1 } };
+          input = await next();
+        }
+      },
+      {
+        mcpServerStatus: () => [
+          { name: 'claude.ai Gmail', scope: 'claudeai', status: 'connected' },
+          { name: 'durango-notion', status: 'connected', config: { type: 'http' } },
+        ],
+        setMcpServers: async () => ({ errors: {} }),
+      }
+    );
+
+    const runLane = sdkRunner(sdk, {
+      sessions,
+      warmProcesses: pool,
+      getMcpServers: async () => activeServers,
+    });
+    const h1 = [row(1, 'user', 'Check Notion.')];
+    const r1 = await runLane(sessionLane(h1, [1], { replyMessageId: 'r2' }), { ...sessionCtx(), accessMode: 'workspace-write' });
+    assert.equal(r1.text, 'Answer 1.');
+    assert.deepEqual(Object.keys(sdk.runs[0].options.mcpServers), ['durango_bot'], 'on-demand connectors stay off startup mcpServers');
+    assert.ok(sdk.runs[0].options.allowedTools.includes('mcp__durango_bot__load_tools'), 'load_tools pre-approved outside full-access');
+    assert.match(textOf(sdk.runs[0].inputs[0]), /Connected apps available on demand via load_tools for this reply: durango-notion, durango-whoop\./);
+    assert.match(loadOutput, /Loaded durango-notion\. Their tools are named mcp__durango-notion__<tool>/);
+    assert.equal(sdk.runs[0].mcpSets.length, 1);
+    assert.deepEqual(Object.keys(sdk.runs[0].mcpSets[0]).sort(), ['durango-notion', 'durango_bot']);
+    assert.equal(canUseNotion.behavior, 'allow', 'loaded Durango connector tools are allowed in workspace-write');
+    const kept = JSON.parse(await fs.readFile(path.join(sessionsDir, 'bot_1__claude-opus-5-5.json'), 'utf8'));
+    assert.deepEqual(kept.connectors, ['claude.ai Gmail'], 'durango-notion is not persisted in startup-wait connectors');
+
+    // Warm process reuse syncs refreshed credentials via setMcpServers without restarting the process.
+    activeServers = {
+      'durango-notion': { type: 'http', url: 'https://durango.sh/api/v1/connectors/cn_1/mcp', headers: { Authorization: 'Bearer dgo_2' } },
+    };
+    const h2 = [...h1, { id: 'r2', seq: 2, role: 'assistant', text: 'Answer 1.' }, row(3, 'user', 'Check again.')];
+    const r2 = await runLane(sessionLane(h2, [3], { laneId: 'lane_2', replyMessageId: 'r4' }), { ...sessionCtx(), accessMode: 'workspace-write' });
+    assert.equal(r2.text, 'Answer 2.');
+    assert.equal(sdk.runs.length, 1, 'warm process reused');
+    assert.equal(sdk.runs[0].mcpSets.length, 2, 'warm process synced refreshed auth header');
+    assert.equal(sdk.runs[0].mcpSets[1]['durango-notion'].headers.Authorization, 'Bearer dgo_2');
+
+    // Read-only denies loaded connector tools.
+    const sdkRo = createFakeSdk(async function* ({ next, options }) {
+      await next();
+      yield init();
+      canUseReadOnly = await options.canUseTool('mcp__durango-notion__search', { query: 'test' }, {});
+      yield assistant('a', [{ type: 'text', text: 'Read only.' }]);
+      yield success();
+    });
+    await sdkRunner(sdkRo, { getMcpServers: async () => activeServers })(makeLane(), { ...sessionCtx(), accessMode: 'read-only' });
+    assert.equal(canUseReadOnly.behavior, 'deny', 'read-only still denies connected app calls');
+    pool.closeAll();
   });
 } finally {
   await fs.rm(testRoot, { recursive: true, force: true });

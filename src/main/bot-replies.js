@@ -6,6 +6,7 @@ import { DurangoError } from './durango-client.js';
 import { answeredRequestSummary } from './durango-dispatch.js';
 import { selectFinalMessage } from '../report-clip.js';
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
+import { loadClaudeMcpServers, loadToolsDescription, syncClaudeMcpServers } from './claude-on-demand-mcps.js';
 import { zodShapeForInputSchema } from './json-schema-zod.js';
 import { recordClaudeRateLimit } from './usage-limits.js';
 import { BOT_THREAD_ACCESS_MODES, SHIP_VIA_THREAD_MESSAGE, machineNameKey, resolveThreadModelChoice } from './bot-thread-tools.js';
@@ -475,13 +476,27 @@ const REMOTE_MCP_TYPES = new Set(['http', 'sse', 'claudeai-proxy']);
 const isRemoteMcpServer = (status) =>
   status?.scope === 'claudeai' || /^claude\.ai /.test(str(status?.name)) || REMOTE_MCP_TYPES.has(str(status?.config?.type));
 
-/** The names of the connected remote MCP servers in a mcpServerStatus() list. Pure. */
-export const connectedConnectorsOf = (statuses) =>
-  Array.isArray(statuses)
-    ? [...new Set(statuses.filter((status) => status?.status === 'connected' && isRemoteMcpServer(status)).map((status) => str(status.name)).filter(Boolean))]
+/** The names of the connected remote MCP servers in a mcpServerStatus() list (excluding on-demand servers loaded via load_tools). Pure. */
+export const connectedConnectorsOf = (statuses, { exclude = null } = {}) => {
+  const skip = exclude instanceof Set ? exclude : Array.isArray(exclude) ? new Set(exclude) : null;
+  return Array.isArray(statuses)
+    ? [
+        ...new Set(
+          statuses
+            .filter(
+              (status) =>
+                status?.status === 'connected' &&
+                isRemoteMcpServer(status) &&
+                (!skip || !skip.has(str(status?.name)))
+            )
+            .map((status) => str(status.name))
+            .filter(Boolean)
+        ),
+      ]
         .sort()
         .slice(0, BOT_CONNECTORS_MAX)
     : [];
+};
 
 /** A kept session's recorded connectors (bot-sessions state), cleaned. Pure. */
 export const keptConnectorsOf = (state) =>
@@ -684,11 +699,11 @@ export const createWarmClaudeProcesses = ({
 };
 
 /** The connected remote MCP servers of a running query, or null (no answer within a second, an older SDK). */
-const readConnectors = async (query) => {
+const readConnectors = async (query, { exclude = null } = {}) => {
   if (typeof query?.mcpServerStatus !== 'function') return null;
   try {
     const statuses = await within(query.mcpServerStatus(), 1_000, null);
-    return Array.isArray(statuses) ? connectedConnectorsOf(statuses) : null;
+    return Array.isArray(statuses) ? connectedConnectorsOf(statuses, { exclude }) : null;
   } catch {
     return null;
   }
@@ -703,13 +718,16 @@ export const connectorsStillConnectingNote = (missing) =>
 /**
  * Appended to a Claude Code bot reply's instructions: the connectors are this
  * machine's (they work with its files, so work that needs both stays here),
- * and a connector that looks gone at a reply's start is usually reconnecting
- * (see above).
+ * Durango account connectors and Durango Code MCP servers load on demand via
+ * `load_tools`, and a claude.ai connector that looks gone at a reply's start
+ * is usually reconnecting (see above).
  */
 export const BOT_CONNECTORS_NOTE = [
   '## Connectors',
-  "The connectors loaded in Claude Code here (Gmail, Google Calendar, Google Drive and other claude.ai or MCP servers) are yours to use directly in your replies, on this machine, next to its files: email, calendar and documents work that needs files from this machine is done here, in your reply (or in a Durango Code thread on this machine), never in a cloud task, which can't open them. Attaching a file from this machine (to a Gmail draft, a Drive upload…): a tool whose description starts with FILE REFERENCES takes `sha256:<64 lowercase hex>:<absolute path>` as the file's content instead of base64 (get the hash with `shasum -a 256 <path>`), and Claude Code fills in the file when the call runs. get_draft's default and FULL_CONTENT views don't list a draft's files even when they're on it, so don't redo a draft because they show none: to check, read it with messageFormat RAW and find each file's part (`filename=` in the MIME), before you say they're attached. Gmail's update_draft drops a draft's files: to change a draft that has files, create a new draft with the same files and delete the old one. A Gmail message is at most 25 MB in total: share bigger files from Drive and link them.",
-  "Each of your replies starts Claude Code again, and its connectors connect again with it, which can take a few seconds. A connector whose tools are missing or listed as removed, or whose server is reported as disconnected or still connecting, is almost always reconnecting, not disconnected. Before you tell the person a connector is disconnected or unavailable, call ToolSearch for its tools (it waits for servers that are still connecting) and try the call again. Only if it still isn't there or keeps failing, tell them, with the error, and that they can check it in claude.ai's connector settings.",
+  "Both the connectors loaded in Claude Code here (Gmail, Google Calendar, Google Drive and other claude.ai or MCP servers) and the person's Durango account connectors (such as `durango-notion` and others) and Durango Code MCP servers are yours to use directly in your replies, on this machine, next to its files: email, calendar, Notion and documents work that needs files from this machine (or doesn't) is done directly here, in your reply, never sent to a Durango Code thread or cloud task just for connector access.",
+  "Durango account connectors (`durango-…`) and Durango Code MCP servers load on demand through your `load_tools` tool (just like in a Durango Code thread): call `load_tools({ apps: [...] })` (or with no apps to list what is available), then call their tools directly as `mcp__<app>__<tool>` (use ToolSearch if a loaded tool's schema isn't in your list yet).",
+  "Attaching a file from this machine (to a Gmail draft, a Drive upload…): a tool whose description starts with FILE REFERENCES takes `sha256:<64 lowercase hex>:<absolute path>` as the file's content instead of base64 (get the hash with `shasum -a 256 <path>`), and Claude Code fills in the file when the call runs. get_draft's default and FULL_CONTENT views don't list a draft's files even when they're on it, so don't redo a draft because they show none: to check, read it with messageFormat RAW and find each file's part (`filename=` in the MIME), before you say they're attached. Gmail's update_draft drops a draft's files: to change a draft that has files, create a new draft with the same files and delete the old one. A Gmail message is at most 25 MB in total: share bigger files from Drive and link them.",
+  "Each of your replies starts Claude Code again, and its claude.ai connectors connect again with it, which can take a few seconds. A connector whose tools are missing or listed as removed, or whose server is reported as disconnected or still connecting, is almost always reconnecting, not disconnected. Before you tell the person a connector is disconnected or unavailable, call ToolSearch for its tools (it waits for servers that are still connecting) and try the call again. Only if it still isn't there or keeps failing, tell them, with the error, and that they can check it in claude.ai's connector settings.",
 ].join('\n\n');
 
 /** The connectors this reply has, for its first message (connected remote MCP server names). Pure. */
@@ -717,6 +735,15 @@ export const connectorsThisReplyNote = (connected) =>
   Array.isArray(connected) && connected.length
     ? `(Connectors connected in Claude Code on this machine for this reply: ${connected.join(', ')}. Use them directly here; see Connectors in your instructions.)`
     : '';
+
+/** The on-demand Durango connectors / Durango Code MCP servers available for this reply, for its first message. Pure. */
+export const loadableAppsNote = (names, { viaCallAppTool = false } = {}) => {
+  const list = Array.isArray(names) ? names.filter((name) => typeof name === 'string' && name) : [];
+  if (!list.length) return '';
+  return viaCallAppTool
+    ? `(Connected apps available on demand for this reply: ${list.join(', ')}. Call load_tools({ apps: [...] }) to load an app's tools, then call_app_tool({ app, tool, arguments }) to call them directly here.)`
+    : `(Connected apps available on demand via load_tools for this reply: ${list.join(', ')}. Call load_tools({ apps: [...] }) first, then call their tools directly here as mcp__<app>__<tool>.)`;
+};
 
 /**
  * One prompt, one answer, no tools (a local bot's history summary). deps:
@@ -818,6 +845,7 @@ export const createClaudeLaneRunner = ({
   botsDir,
   env = defaultClaudeEnv,
   getProjects = () => [],
+  getMcpServers = null,
   mkdir = (dir) => fs.mkdir(dir, { recursive: true }),
   randomId = () => crypto.randomUUID(),
   downloadAttachment = defaultDownload,
@@ -854,6 +882,26 @@ export const createClaudeLaneRunner = ({
     return { text: '', retryElsewhere: true, failure: shorten(`Claude Code is not available here: ${error?.message ?? error}`) };
   }
   if (ctx.signal?.aborted) return { text: '', aborted: true };
+  // On-demand MCP servers (Durango account connectors like durango-notion, plus
+  // Durango Code's enabled MCP servers): loaded mid-turn over the SDK control
+  // channel via `load_tools`, matching Durango Code threads (claude-driver.js).
+  let onDemandMcps = {};
+  if (typeof getMcpServers === 'function') {
+    try {
+      const raw = await getMcpServers({ cwd, signal: ctx.signal });
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        for (const [name, config] of Object.entries(raw)) {
+          if (name && name !== BOT_MCP_SERVER && config && typeof config === 'object') {
+            onDemandMcps[name] = config;
+          }
+        }
+      }
+    } catch {}
+  }
+  if (ctx.signal?.aborted) return { text: '', aborted: true };
+  const onDemandNames = Object.keys(onDemandMcps);
+  const onDemandSet = new Set(onDemandNames);
+  const botMcpOptions = { baseServerName: BOT_MCP_SERVER, getBaseServer: (target) => target.botMcpServer };
   // Files attached in the conversation: saved next to the reply for Claude Code
   // (using any local staged copy on this computer before downloading).
   const attachmentsDir = path.join(cwd, 'attachments');
@@ -928,11 +976,31 @@ export const createClaudeLaneRunner = ({
       )
     );
   }
+  if (onDemandNames.length > 0 && !lane.tools.some((definition) => definition.name === 'load_tools')) {
+    botTools.push(
+      defineTool(
+        'load_tools',
+        loadToolsDescription({ orionMcpServers: onDemandMcps }),
+        {
+          apps: z
+            .array(z.string())
+            .optional()
+            .describe('Names of the apps to load. Omit to list the apps that can be loaded.'),
+        },
+        async (args, _extra, proc) => {
+          if (!proc) return { content: [{ type: 'text', text: 'This reply has ended.' }], isError: true };
+          const text = await loadClaudeMcpServers(proc, args?.apps, botMcpOptions);
+          return { content: [{ type: 'text', text }] };
+        },
+        { alwaysLoad: true, annotations: { readOnlyHint: true } }
+      )
+    );
+  }
   // The SDK's tools for a process: they call the handlers of the reply that
   // process is running (`bindings.current`), so a warm process's tools call
   // whichever reply it runs now, and never another process's reply. Made once
   // here too, so a bad schema fails before the bot's session is taken.
-  const sdkToolsFor = (bindings) =>
+  const sdkToolsFor = (bindings, proc = null) =>
     botTools.map((definition) =>
       sdk.tool(
         definition.name,
@@ -941,7 +1009,7 @@ export const createClaudeLaneRunner = ({
         async (args, extra) => {
           const handler = bindings.current?.toolHandlers.get(definition.name);
           if (!handler) return { content: [{ type: 'text', text: 'This reply has ended.' }], isError: true };
-          return handler(args, extra);
+          return handler(args, extra, proc);
         },
         definition.extras
       )
@@ -977,7 +1045,8 @@ export const createClaudeLaneRunner = ({
   // back); nothing that can throw runs before that `try` without handing it back.
   const claimed = keptSessions ? await keptSessions.begin(sessionKey) : { state: null, busy: false };
   // The connectors the bot's last reply had: this reply's first message waits for them.
-  const expectedConnectors = keptConnectorsOf(claimed.state);
+  // On-demand servers (load_tools) are excluded: they don't connect at process startup.
+  const expectedConnectors = keptConnectorsOf(claimed.state).filter((name) => !onDemandSet.has(name));
   const planFor = (state, budget = maxPromptTokens) =>
     session
       ? planBotPrompt({
@@ -1169,9 +1238,25 @@ export const createClaudeLaneRunner = ({
   const startProcess = ({ attemptPlan, systemAppend: append, optionsKey, baseEnv, effort }) => {
     const inputQueue = createInputQueue();
     const abortController = new AbortController();
-    const proc = { sessionId: null, model: null, optionsKey, iterator: null, pending: null, bindings: { current: null }, closed: false };
+    const proc = {
+      sessionId: null,
+      model: null,
+      optionsKey,
+      iterator: null,
+      pending: null,
+      bindings: { current: null },
+      closed: false,
+      botMcpServer: null,
+      orionMcpServers: onDemandMcps,
+      loadedMcpServers: [],
+      orionMcpKey: undefined,
+      liveMcpNames: [],
+      mcpLoadChain: null,
+    };
     const current = () => proc.bindings.current;
-    const tools = sdkToolsFor(proc.bindings);
+    const tools = sdkToolsFor(proc.bindings, proc);
+    const botMcpServer = tools.length ? sdk.createSdkMcpServer({ name: BOT_MCP_SERVER, version: '1.0.0', tools }) : null;
+    proc.botMcpServer = botMcpServer;
     let query = null;
     proc.close = () => {
       if (proc.closed) return;
@@ -1195,14 +1280,17 @@ export const createClaudeLaneRunner = ({
           settingSources: ['user', 'project', 'local'],
           includePartialMessages: true,
           ...(projects.length ? { additionalDirectories: projects.map((project) => project.path) } : {}),
-          mcpServers: tools.length ? { [BOT_MCP_SERVER]: sdk.createSdkMcpServer({ name: BOT_MCP_SERVER, version: '1.0.0', tools }) } : {},
+          mcpServers: botMcpServer ? { [BOT_MCP_SERVER]: botMcpServer } : {},
           ...claudePermissionOptionsForAccessMode(accessMode),
           ...(accessMode !== 'full-access' && botTools.length
-            ? { allowedTools: [...lane.tools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`), ...(attaches ? [`${BOT_TOOL_PREFIX}${ATTACH_FILES_TOOL.name}`] : [])] }
+            ? { allowedTools: botTools.map((definition) => `${BOT_TOOL_PREFIX}${definition.name}`) }
             : {}),
           // Depends on the access mode only (part of optionsKey): the same for every reply it runs.
           canUseTool: async (toolName, toolInput, toolOptions) =>
-            toolName.startsWith(BOT_TOOL_PREFIX) || fullAccessApproves(accessMode, toolName, toolOptions)
+            toolName.startsWith(BOT_TOOL_PREFIX) ||
+            (accessMode !== 'read-only' &&
+              Object.keys(proc.orionMcpServers ?? {}).some((name) => toolName.startsWith(`mcp__${name}__`))) ||
+            fullAccessApproves(accessMode, toolName, toolOptions)
               ? { behavior: 'allow', updatedInput: toolInput }
               : { behavior: 'deny', message: toolDenial(toolName, accessMode) },
           hooks: {
@@ -1296,6 +1384,15 @@ export const createClaudeLaneRunner = ({
       // A process left for an older session (this reply starts a new one) is of no use.
       if (!proc && reusable) warmProcesses.forget(sessionKey);
       if (proc) {
+        try {
+          await syncClaudeMcpServers(proc, onDemandMcps, botMcpOptions);
+        } catch (error) {
+          log(`bot ${lane.botId} warm Claude Code process MCP sync failed, starting a new one:`, error?.message ?? error);
+          proc.close();
+          proc = null;
+        }
+      }
+      if (proc) {
         attempt.warm = true;
         // Its first turn already said which session and model it runs (system init).
         attempt.sawInit = true;
@@ -1338,10 +1435,12 @@ export const createClaudeLaneRunner = ({
       // Which connectors it has now, named in its first message. A warm process's
       // are up and stay so: what it records for the next reply. A new one's are
       // recorded at its end (a first reply reads this before they're all listed).
-      const connectedNow = await readConnectors(query);
+      const connectedNow = await readConnectors(query, { exclude: onDemandSet });
       if (attempt.warm && connectedNow) attempt.connectors = connectedNow;
       const connectedNote = connectorsThisReplyNote(connectedNow);
       if (connectedNote) firstPrompt = `${firstPrompt}\n\n${connectedNote}`;
+      const appsNote = loadableAppsNote(onDemandNames);
+      if (appsNote) firstPrompt = `${firstPrompt}\n\n${appsNote}`;
       // Stopped while it waited: the prompt never goes out.
       if (ctx.signal?.aborted || proc.closed) return attempt;
       inputQueue.push(userMessage(firstPrompt));
@@ -1418,7 +1517,7 @@ export const createClaudeLaneRunner = ({
           toolCalls.clear();
           if (message.is_error || message.subtype !== 'success') break;
           // What the next reply waits for: the connectors this one had.
-          if (attempt.connectors === null) attempt.connectors = await readConnectors(query);
+          if (attempt.connectors === null) attempt.connectors = await readConnectors(query, { exclude: onDemandSet });
           // Before posting the final answer: check for unclaimed new messages
           // from the person (capped so a burst never loops forever).
           if (inboxRequest) await inboxRequest;

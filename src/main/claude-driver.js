@@ -4,6 +4,11 @@ import { claudeNoticeActivity, claudeUserContent, createClaudeInputRequests } fr
 import { claudePermissionOptionsForAccessMode, fullAccessApproves, withClaudeEnv } from './claude-env.js';
 import { CLAUDE_CHROME_BROWSER_TIPS, claudeChromeLeaseHooks } from './claude-chrome.js';
 import { claudeForegroundWaitHooks } from './claude-foreground-wait.js';
+import {
+  loadClaudeMcpServers,
+  loadToolsDescription,
+  syncClaudeMcpServers,
+} from './claude-on-demand-mcps.js';
 import { existsSync } from 'node:fs';
 import crypto from 'node:crypto';
 import { emitAgentEvent } from './events.js';
@@ -2122,132 +2127,14 @@ export const pumpClaudeSession = async (session) => {
 // MCP servers connected to Durango Code or to the Durango account (Notion,
 // Gmail, ...) are not connected when a session starts or a turn begins: the
 // agent loads the ones a task needs with orion's `load_tools`, mid-turn.
-// Connecting every server up front made each new session wait on all of
-// them (a slow or overloaded CLI then failed the turn before it started) and
-// listed tools most turns never use. `orion` itself is always loaded.
-//
-// They join the live session over the SDK control channel rather than
-// `mcpServers` (which the SDK puts on the CLI's argv, exposing OAuth tokens
-// to `ps`). `session.orionMcpServers` is what the agent may load this turn;
-// `session.loadedMcpServers` the names it loaded. Only loaded servers are
-// live, so the per-turn sync below is a no-op unless a loaded server's
-// configuration changed (a refreshed sign-in) or it was switched off.
-const CLAUDE_MCP_SYNC_TIMEOUT_MS = 20_000;
-const CLAUDE_MCP_LOAD_TIMEOUT_MS = 30_000;
+// Shared with bot-replies.js (claude-on-demand-mcps.js).
+export { loadToolsDescription };
 
-const liveClaudeMcpServers = (session) => {
-  const available = session.orionMcpServers ?? {};
-  const live = {};
-  for (const name of session.loadedMcpServers ?? []) {
-    if (name in available) live[name] = available[name];
-  }
-  return live;
-};
+export const syncClaudeOrionMcpServers = (session, servers = {}) =>
+  syncClaudeMcpServers(session, servers);
 
-const setClaudeLiveMcpServers = async (session, timeoutMs) => {
-  const next = liveClaudeMcpServers(session);
-  const key = JSON.stringify(next);
-  const previous = session.liveMcpNames ?? [];
-  const removed = previous.filter((name) => !(name in next));
-  if (key === (session.orionMcpKey === undefined ? '{}' : session.orionMcpKey)) return {};
-  if (!session.query || !session.orionMcpServer) return {};
-  // A partial failure can change the live set. Invalidate the previous key
-  // until every server is synchronized, including when reverting to that set.
-  session.orionMcpKey = null;
-  session.liveMcpNames = [...new Set([...previous, ...Object.keys(next)])];
-  let timer;
-  try {
-    const result = await Promise.race([
-      session.query.setMcpServers({ ...next, orion: session.orionMcpServer }),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('Timed out connecting MCP servers.')), timeoutMs);
-      }),
-    ]);
-    const errors = result?.errors && typeof result.errors === 'object' ? result.errors : {};
-    if (removed.length > 0 && Object.keys(errors).length > 0) {
-      throw new Error(`Could not confirm MCP removal: ${removed.join(', ')}.`);
-    }
-    if (Object.keys(errors).length === 0) {
-      session.orionMcpKey = key;
-      session.liveMcpNames = Object.keys(next);
-    }
-    return errors;
-  } finally {
-    clearTimeout(timer);
-  }
-};
-
-// Called before every turn with the servers the agent may load. Returns
-// per-server errors; throws when the live tool set is unknown, and the caller
-// must then discard the session before another prompt can use stale tools.
-export const syncClaudeOrionMcpServers = async (session, servers = {}) => {
-  session.orionMcpServers = servers && typeof servers === 'object' ? servers : {};
-  try {
-    return await setClaudeLiveMcpServers(session, CLAUDE_MCP_SYNC_TIMEOUT_MS);
-  } catch (error) {
-    throw new Error(`Could not synchronize MCP servers: ${error?.message ?? String(error)}`, { cause: error });
-  }
-};
-
-const availableClaudeMcpList = (session) => {
-  const names = Object.keys(session.orionMcpServers ?? {});
-  return names.length > 0 ? names.join(', ') : 'none';
-};
-
-export const loadToolsDescription = (session) =>
-  "Load the tools of an app the user connected (an MCP server such as Notion or Gmail), then call them directly. " +
-  "Their tools are not loaded until you load the app, so load one only when the task needs it. " +
-  `Apps available when this session started: ${availableClaudeMcpList(session)}. ` +
-  "Call with no apps for the current list. If a tool of an app you loaded earlier is missing, load the app again.";
-
-// orion's load_tools: connects the named servers mid-turn. Loads are queued
-// so concurrent calls never race the control channel. Never throws: the
-// agent gets a readable outcome and the turn goes on.
-export const loadClaudeOrionMcpServers = (session, apps) => {
-  const run = async () => {
-    const available = session.orionMcpServers ?? {};
-    const requested = [...new Set((Array.isArray(apps) ? apps : []).map((app) => String(app).trim().replace(/^@/, '')).filter(Boolean))];
-    if (requested.length === 0) {
-      return `Apps you can load: ${availableClaudeMcpList(session)}.`;
-    }
-    const unknown = requested.filter((name) => !(name in available));
-    const wanted = requested.filter((name) => name in available);
-    const lines = [];
-    if (wanted.length > 0) {
-      const before = session.loadedMcpServers ?? [];
-      session.loadedMcpServers = [...new Set([...before, ...wanted])];
-      let errors = {};
-      try {
-        errors = await setClaudeLiveMcpServers(session, CLAUDE_MCP_LOAD_TIMEOUT_MS);
-      } catch (error) {
-        // Unknown live state: forget the key so the next load or turn retries.
-        session.orionMcpKey = null;
-        session.loadedMcpServers = before;
-        return `Could not load ${wanted.join(', ')}: ${error?.message ?? String(error)}`;
-      }
-      const failed = wanted.filter((name) => errors[name]);
-      if (failed.length > 0) {
-        session.loadedMcpServers = session.loadedMcpServers.filter((name) => !failed.includes(name));
-        lines.push(
-          ...failed.map((name) => `Could not connect ${name}: ${String(errors[name]).slice(0, 300)}`)
-        );
-      }
-      const loaded = wanted.filter((name) => !failed.includes(name));
-      if (loaded.length > 0) {
-        lines.push(
-          `Loaded ${loaded.join(', ')}. Their tools are named ${loaded.map((name) => `mcp__${name}__<tool>`).join(', ')}; call them directly (find a tool's schema with ToolSearch if it is not in your tool list yet).`
-        );
-      }
-    }
-    if (unknown.length > 0) {
-      lines.push(`Not connected: ${unknown.join(', ')}. Apps you can load: ${availableClaudeMcpList(session)}.`);
-    }
-    return lines.join('\n');
-  };
-  const pending = (session.mcpLoadChain ?? Promise.resolve()).then(run, run);
-  session.mcpLoadChain = pending.catch(() => {});
-  return pending;
-};
+export const loadClaudeOrionMcpServers = (session, apps) =>
+  loadClaudeMcpServers(session, apps);
 
 export const createClaudeSdkSession = ({
   sender,

@@ -103,6 +103,7 @@ import {
   normalizeDispatchSettings,
 } from './main/durango-dispatch.js';
 import {
+  BOT_MCP_SERVER,
   createBotReplyWorker,
   createBotSessionStore,
   createClaudeLaneRunner,
@@ -4747,6 +4748,34 @@ const botAttachments = createBotAttachmentManager({
 });
 void app.whenReady().then(() => botAttachments.pruneStagedFiles().catch(() => {}));
 
+// Same MCP servers a Durango Code thread on this machine gets: Durango Code's
+// enabled servers (orion-mcps.js) plus the Durango account's connectors
+// (account-connectors.js, e.g. durango-notion), minus servers the provider's
+// own config already loads. Best effort: a failing lookup never fails a reply.
+const resolveBotMcpServers = async ({ providerId, cwd, signal } = {}) => {
+  const orionMcps = await resolveOrionMcpsForRun([], { signal }).catch(() => ({ servers: [], needsSignIn: [] }));
+  const accountMcps = await accountConnectors.forRun({
+    taken: orionMcps.servers.map((server) => server.name),
+  });
+  const combined = [...orionMcps.servers, ...accountMcps].filter(
+    (server) => server?.name && server.name !== BOT_MCP_SERVER
+  );
+  if (combined.length === 0) return [];
+  if (providerId === 'claude') {
+    return withoutClaudeNativeMcps(combined, cwd).catch(() => combined);
+  }
+  if (providerId === 'codex') {
+    const options = { cwd, shellCwd: os.homedir(), configArgs: [] };
+    if (accountMcps.length === 0) return withoutCodexNativeMcps(orionMcps.servers, options).catch(() => orionMcps.servers);
+    try {
+      return await withoutCodexNativeMcps(combined, options);
+    } catch {
+      return withoutCodexNativeMcps(orionMcps.servers, options).catch(() => orionMcps.servers);
+    }
+  }
+  return combined;
+};
+
 const claudeBotLaneRunner = createClaudeLaneRunner({
   loadSdk: loadClaudeSdk,
   loadZod,
@@ -4754,6 +4783,8 @@ const claudeBotLaneRunner = createClaudeLaneRunner({
   createInputQueue: createClaudeInputQueue,
   botsDir: () => path.join(app.getPath('userData'), 'bots'),
   getProjects: botProjects,
+  getMcpServers: async ({ cwd, signal }) =>
+    claudeOrionMcpServers(await resolveBotMcpServers({ providerId: 'claude', cwd, signal })),
   resolveLocalAttachment: (item) => botAttachments.resolveLocalPath(item),
   sessions: botSessions,
   warmProcesses: botWarmProcesses,
@@ -4807,7 +4838,12 @@ const resolveBotHarnessModel = async (lane) => {
 const harnessBotLaneRunner = createHarnessLaneRunner({
   resolveModel: resolveBotHarnessModel,
   harnesses: {
-    codex: createCodexBotHarness({ spawnProcess: spawnBotHarness, clientVersion: app.getVersion() }),
+    codex: createCodexBotHarness({
+      spawnProcess: spawnBotHarness,
+      clientVersion: app.getVersion(),
+      getMcpRuntimeConfig: ({ cwd }) =>
+        readMcpRuntimeConfig({ cwd, shellCwd: os.homedir(), configArgs: [] }).catch(() => ({})),
+    }),
     antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: spawnBotHarness }),
     grok: createAcpBotHarness({ provider: 'grok', spawnProcess: spawnBotHarness }),
     muse: createMuseBotHarness({
@@ -4819,9 +4855,10 @@ const harnessBotLaneRunner = createHarnessLaneRunner({
       },
     }),
   },
-  registerTools: ({ tools, call }) => registerBotToolsBridge({ tools, call }),
+  registerTools: ({ tools, call, userServers }) => registerBotToolsBridge({ tools, call, userServers }),
   botsDir: () => path.join(app.getPath('userData'), 'bots'),
   getProjects: botProjects,
+  getMcpServers: ({ providerId, cwd, signal }) => resolveBotMcpServers({ providerId, cwd, signal }),
   resolveLocalAttachment: (item) => botAttachments.resolveLocalPath(item),
   sessions: botSessions,
   onUnavailable: (providerId, reason) => {

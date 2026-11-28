@@ -18,7 +18,7 @@ process.env.ORION_MCP_CREDENTIALS_PATH = path.join(testRoot, 'orion-mcp-credenti
 
 const { app, shell } = await import('electron');
 const orionMcps = await import('../src/main/orion-mcps.js');
-const { mcpBridgePluginConfig, openCodeMcpConfigContent, orionAcpMcpServers, registerMcpBridgeForRun } = await import(
+const { mcpBridgePluginConfig, openCodeMcpConfigContent, orionAcpMcpServers, registerBotToolsBridge, registerMcpBridgeForRun } = await import(
   '../src/main/mcp-bridge.js'
 );
 const { syncClaudeOrionMcpServers, loadClaudeOrionMcpServers, loadToolsDescription, createClaudeSdkSession, claudeSdkSessions, runClaudeSdkTurn, terminatingClaudeSdkSessions } = await import('../src/main/claude-driver.js');
@@ -767,6 +767,49 @@ await server.connect(new StdioServerTransport());
       assert.match((await ask('call_app_tool', { app: 'ghost', tool: 'echo' })).text, /Not connected: ghost/);
     } finally {
       registration.release();
+    }
+    // Bot tools bridge (`durango_bot`, Codex/Antigravity/Grok/Muse bot replies):
+    // exposes bot tools plus on-demand `load_tools` and `call_app_tool` for
+    // Durango account connectors and Durango Code MCP servers.
+    const botBridge = await registerBotToolsBridge({
+      tools: [{ name: 'list_machines', description: 'List machines', inputSchema: { type: 'object', properties: {} } }],
+      call: async (name) => ({ ok: true, text: `bot:${name}` }),
+      userServers: run.servers,
+    });
+    assert.ok(botBridge, 'bot tools bridge registered');
+    try {
+      const socketPath = botBridge.args[botBridge.args.indexOf('--socket') + 1];
+      const askBot = (tool, args = {}) => new Promise((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        let buffer = '';
+        socket.on('connect', () => socket.write(`${JSON.stringify({ id: 1, token: botBridge.token, tool, args })}\n`));
+        socket.on('data', (chunk) => {
+          buffer += chunk;
+          const newline = buffer.indexOf('\n');
+          if (newline !== -1) { socket.destroy(); resolve(JSON.parse(buffer.slice(0, newline))); }
+        });
+        socket.on('error', reject);
+      });
+      const botListed = await askBot('__tools');
+      assert.deepEqual(
+        botListed.tools.map((tool) => tool.name),
+        ['list_machines', 'load_tools', 'call_app_tool']
+      );
+      assert.doesNotMatch(
+        botListed.tools.find((tool) => tool.name === 'call_app_tool').description,
+        /request_secret/,
+        'bot call_app_tool description omits thread-only request_secret hint'
+      );
+      const botLoaded = await askBot('load_tools', { apps: ['secure'] });
+      assert.equal(botLoaded.ok, true, botLoaded.text);
+      assert.match(botLoaded.text, /echo/);
+      const botCalled = await askBot('call_app_tool', { app: 'secure', tool: 'echo', arguments: { text: 'bot auth ok' } });
+      assert.equal(botCalled.ok, true, botCalled.text);
+      assert.equal(botCalled.text, 'bot auth ok');
+      const botOwn = await askBot('list_machines', {});
+      assert.equal(botOwn.text, 'bot:list_machines');
+    } finally {
+      botBridge.release();
     }
     const readOnly = await registerMcpBridgeForRun({
       getSender: () => null, threadId: 'on-demand-ro', runId: 'on-demand-ro', projectPath: testRoot,

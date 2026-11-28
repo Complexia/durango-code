@@ -23,6 +23,7 @@ import {
   localBotModelIds,
 } from '../src/main/bot-harness-models.js';
 import {
+  BOT_HARNESS_CONNECTORS_NOTE,
   HarnessError,
   botInstructionsBlock,
   isApiErrorAnswer,
@@ -33,7 +34,7 @@ import {
   createMuseBotHarness,
   isHarnessUnavailableError,
 } from '../src/main/bot-harness-lanes.js';
-import { BOT_FINAL_INBOX_HEADER, BOT_INBOX_HEADER, createBotSessionStore, presenceOf } from '../src/main/bot-replies.js';
+import { BOT_FINAL_INBOX_HEADER, BOT_INBOX_HEADER, createBotSessionStore, loadableAppsNote, presenceOf } from '../src/main/bot-replies.js';
 import { normalizeBotLane } from '../src/main/durango-client.js';
 import { mergeDesktopBotModelCatalog } from '../src/main/bot-models.js';
 
@@ -115,8 +116,8 @@ const lane = (overrides = {}) => ({
 // The bot tools' MCP server, as registerBotToolsBridge hands it out (the call is kept for tests).
 const fakeRegistry = () => {
   const registry = { registered: [], released: 0 };
-  registry.register = async ({ tools, call }) => {
-    registry.registered.push({ tools, call });
+  registry.register = async ({ tools, call, userServers = [] }) => {
+    registry.registered.push({ tools, call, userServers });
     return {
       command: '/fake/electron',
       args: ['/fake/shim.cjs', '--socket', '/fake.sock', '--token', 'tok', '--bot-tools'],
@@ -154,7 +155,7 @@ const ctxFor = ({ inbox = [], beforeFinish = [], tool = async () => ({ result: {
   return ctx;
 };
 
-const runnerFor = ({ harnesses, registry = fakeRegistry(), sessions = null, resolved, onUnavailable = () => {} }) =>
+const runnerFor = ({ harnesses, registry = fakeRegistry(), sessions = null, resolved, getMcpServers = null, onUnavailable = () => {} }) =>
   createHarnessLaneRunner({
     resolveModel: async (item) =>
       resolved ??
@@ -171,6 +172,7 @@ const runnerFor = ({ harnesses, registry = fakeRegistry(), sessions = null, reso
     registerTools: registry.register,
     botsDir: path.join(testRoot, 'bots'),
     getProjects: () => [{ name: 'durango', path: testRoot }],
+    getMcpServers,
     sessions,
     onUnavailable,
     log: () => {},
@@ -1010,6 +1012,135 @@ await test('antigravity over ACP: stay_silent is served in mcpServers and ends t
   assert.equal(agy2.seen.filter((m) => m.method === 'session/prompt').length, 2, 'the message went in as a steer');
   assert.equal(outcome2.silent, undefined, 'new input broke the silence');
   assert.equal(outcome2.text, 'Yes, I am here.');
+});
+
+// --- Durango connectors & on-demand MCP servers on harness lanes --------------------------
+
+await test('harness lanes: Durango connectors pass through registerTools, load on demand via load_tools/call_app_tool, and appear in instructions & first prompt', async () => {
+  assert.equal(loadableAppsNote([], { viaCallAppTool: true }), '');
+  assert.match(
+    loadableAppsNote(['durango-notion', 'durango-whoop'], { viaCallAppTool: true }),
+    /durango-notion, durango-whoop[\s\S]*load_tools[\s\S]*call_app_tool/
+  );
+
+  // Full on-demand MCP round-trip over the bot-tools bridge handler (same path Codex/Antigravity/Grok/Muse use).
+  const fakeConnectors = [
+    { name: 'durango-notion', transport: 'http', url: 'https://durango.sh/api/v1/connectors/cn_1/mcp', headers: { Authorization: 'Bearer dgo_dev' } },
+    { name: 'durango-whoop', transport: 'http', url: 'https://durango.sh/api/v1/connectors/cn_2/mcp', headers: { Authorization: 'Bearer dgo_dev' } },
+  ];
+  const called = [];
+  const botToolDefs = [{ name: 'list_machines', description: 'List machines', inputSchema: { type: 'object', properties: {} } }];
+  const appToolDefs = [
+    {
+      name: 'load_tools',
+      description: 'Load apps: durango-notion, durango-whoop',
+      inputSchema: { type: 'object', properties: { apps: { type: 'array', items: { type: 'string' } } } },
+    },
+    {
+      name: 'call_app_tool',
+      description: 'Call a tool of an app loaded with load_tools.',
+      inputSchema: { type: 'object', properties: { app: { type: 'string' }, tool: { type: 'string' }, arguments: { type: 'object' } }, required: ['app', 'tool'] },
+    },
+  ];
+  const handler = createOrionMcpBridgeHandler({
+    botTools: true,
+    callOrion: async (tool, args) => {
+      if (tool === '__tools') return { ok: true, text: '', tools: [...botToolDefs, ...appToolDefs] };
+      called.push({ tool, args });
+      if (tool === 'load_tools') return { ok: true, text: JSON.stringify({ apps: [{ app: 'durango-notion', tools: [{ name: 'notion_search' }] }] }) };
+      if (tool === 'call_app_tool') return { ok: true, text: `${args.app}:${args.tool}:${JSON.stringify(args.arguments)}` };
+      return { ok: true, text: `bot:${tool}` };
+    },
+  });
+  const listed = (await handler.handleMessage({ jsonrpc: '2.0', id: 1, method: 'tools/list' })).result.tools;
+  assert.deepEqual(
+    listed.map((t) => t.name),
+    ['list_machines', 'load_tools', 'call_app_tool']
+  );
+  const loaded = await handler.handleMessage({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/call',
+    params: { name: 'load_tools', arguments: { apps: ['durango-notion'] } },
+  });
+  assert.equal(loaded.result.isError, false);
+  assert.match(loaded.result.content[0].text, /notion_search/);
+  const invoked = await handler.handleMessage({
+    jsonrpc: '2.0',
+    id: 3,
+    method: 'tools/call',
+    params: { name: 'call_app_tool', arguments: { app: 'durango-notion', tool: 'notion_search', arguments: { query: 'notes' } } },
+  });
+  assert.equal(invoked.result.isError, false);
+  assert.equal(invoked.result.content[0].text, 'durango-notion:notion_search:{"query":"notes"}');
+  assert.equal(called.length, 2);
+
+  // Antigravity over ACP: receives userServers on registerTools, connectors note in systemPrompt.append,
+  // loadable apps in first prompt, and uses only official ACP methods.
+  const registry = fakeRegistry();
+  let seenPrompt = '';
+  const agy = fakeAcp({
+    provider: 'antigravity',
+    registry,
+    caps: { _meta: { antigravity: { systemPrompt: { append: true } } } },
+    onPrompt: async ({ message, peer, update }) => {
+      seenPrompt = message.params.prompt[0].text;
+      update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Checked Notion.' } });
+      peer.reply(message, { stopReason: 'end_turn' });
+    },
+  });
+  const outcome = await runnerFor({
+    harnesses: { antigravity: createAcpBotHarness({ provider: 'antigravity', spawnProcess: agy.spawnProcess }) },
+    registry,
+    getMcpServers: async ({ providerId }) => {
+      assert.equal(providerId, 'antigravity');
+      return fakeConnectors;
+    },
+  })(lane({ modelId: 'google/gemini-4-neon' }), ctxFor());
+  assert.equal(outcome.text, 'Checked Notion.');
+  assert.deepEqual(
+    registry.registered[0].userServers.map((s) => s.name),
+    ['durango-notion', 'durango-whoop']
+  );
+  const created = agy.seen.find((m) => m.method === 'session/new').params;
+  assert.ok(created._meta.antigravity.systemPrompt.append.includes(BOT_HARNESS_CONNECTORS_NOTE));
+  assert.match(seenPrompt, /Connected apps available on demand for this reply: durango-notion, durango-whoop\./);
+  assert.deepEqual(
+    [...new Set(agy.seen.filter((m) => m.method).map((m) => m.method))].sort(),
+    ['initialize', 'session/new', 'session/prompt', 'session/set_model'],
+    'Antigravity uses official ACP only'
+  );
+});
+
+await test('codex: enables web_search and merges mcpRuntimeConfig overrides cleanly with durango_bot', async () => {
+  const registry = fakeRegistry();
+  const codex = fakeCodex({
+    registry,
+    script: async (_index, _text, api) => {
+      api.delta('Done.');
+      api.complete();
+    },
+  });
+  const outcome = await runnerFor({
+    harnesses: {
+      codex: createCodexBotHarness({
+        spawnProcess: codex.spawnProcess,
+        getMcpRuntimeConfig: async () => ({ mcp_servers: { linear: { enabled: false, url: 'https://linear.example/mcp' } } }),
+      }),
+    },
+    registry,
+    getMcpServers: async () => [{ name: 'durango-notion', transport: 'http', url: 'https://durango.sh/api/v1/connectors/cn_1/mcp', headers: {} }],
+  })(lane(), ctxFor());
+  assert.equal(outcome.text, 'Done.');
+  const started = codex.seen.find((m) => m.method === 'thread/start').params;
+  assert.equal(started.config['tools.web_search'], true, 'Codex bot replies enable web_search');
+  assert.equal(started.config.mcp_servers.linear.enabled, false, 'user MCP overrides preserved');
+  assert.equal(started.config.mcp_servers.durango_bot.default_tools_approval_mode, 'approve', 'durango_bot folded into mcp_servers table');
+  assert.equal(started.config['mcp_servers.durango_bot.command'], undefined, 'no mixed dotted mcp_servers keys');
+  assert.deepEqual(
+    registry.registered[0].userServers.map((s) => s.name),
+    ['durango-notion']
+  );
 });
 
 await fs.rm(testRoot, { recursive: true, force: true }).catch(() => {});

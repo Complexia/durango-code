@@ -32,7 +32,7 @@ const STDIO_PROBE_TIMEOUT_MS = 60_000;
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
 // Names Orion already uses for its own servers, plus the other @-mention kinds.
-export const reservedNicknames = new Set(['orion', 'thread', 'model', 'mcp', 'claude-in-chrome', 'chrome_devtools']);
+export const reservedNicknames = new Set(['orion', 'durango_bot', 'thread', 'model', 'mcp', 'claude-in-chrome', 'chrome_devtools']);
 export const nicknamePattern = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 export const orionMcpRegistryPath = () =>

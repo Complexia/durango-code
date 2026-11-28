@@ -13,6 +13,7 @@ import {
   formatBotFinalInbox,
   formatBotInbox,
   isRetryElsewhereError,
+  loadableAppsNote,
   normalizeSilentReason,
   saveLaneAttachments,
   SILENT_BREAKING_TOOLS,
@@ -66,6 +67,17 @@ export const HARNESS_HANDSHAKE_TIMEOUT_MS = 60_000;
 const FAILURE_MAX_CHARS = 500;
 const STDERR_TAIL_CHARS = 4_000;
 const BOT_TOOLS_SERVER = 'durango_bot';
+
+/**
+ * Appended to non-Claude machine bot replies' instructions: Durango account
+ * connectors and Durango Code MCP servers load on demand through `load_tools`
+ * and `call_app_tool` on the `durango_bot` MCP server, next to this machine's
+ * files.
+ */
+export const BOT_HARNESS_CONNECTORS_NOTE = [
+  '## Connectors',
+  "Your Durango account's connected apps (such as `durango-notion` and others) and any MCP servers connected to Durango Code are available directly in your replies on this machine, next to its files, through `load_tools` and `call_app_tool` on your `durango_bot` MCP server. Their tools load on demand: call `load_tools({ apps: [...] })` (or with no apps to list what is available) to get each tool's name and input schema, then call `call_app_tool({ app, tool, arguments })`. Use them directly here — don't hand work that uses them to a Durango Code thread or a cloud task just for connector access.",
+].join('\n\n');
 
 const str = (value) => (typeof value === 'string' ? value : '');
 const shorten = (value, max = FAILURE_MAX_CHARS) => {
@@ -258,7 +270,12 @@ const CODEX_TEXTLESS_ITEMS = new Set(['agentMessage', 'reasoning', 'userMessage'
  * createHarnessLaneRunner). Full access: danger-full-access sandbox and no
  * approvals (nobody is at the machine during a bot reply; the person's choice).
  */
-export const createCodexBotHarness = ({ spawnProcess, clientVersion = '0.0.0', handshakeTimeoutMs = HARNESS_HANDSHAKE_TIMEOUT_MS }) => ({
+export const createCodexBotHarness = ({
+  spawnProcess,
+  clientVersion = '0.0.0',
+  handshakeTimeoutMs = HARNESS_HANDSHAKE_TIMEOUT_MS,
+  getMcpRuntimeConfig = null,
+}) => ({
   id: 'codex',
   steers: true,
   async open({ cwd, model, effort, instructions, resumeSessionId, mcp, onEvent, signal }) {
@@ -354,8 +371,15 @@ export const createCodexBotHarness = ({ spawnProcess, clientVersion = '0.0.0', h
     opening.check();
     if (init.error) fail(init.error, { retryElsewhere: true });
     peer.notify('initialized', {});
+    const runtimeMcpConfig =
+      typeof getMcpRuntimeConfig === 'function'
+        ? await Promise.resolve(getMcpRuntimeConfig({ cwd })).catch(() => ({}))
+        : {};
+    opening.check();
     const config = {
       ...(effort ? { model_reasoning_effort: effort } : {}),
+      'tools.web_search': true,
+      ...(runtimeMcpConfig && typeof runtimeMcpConfig === 'object' ? runtimeMcpConfig : {}),
       ...(mcp
         ? {
             [`mcp_servers.${BOT_TOOLS_SERVER}.command`]: mcp.command,
@@ -368,6 +392,18 @@ export const createCodexBotHarness = ({ spawnProcess, clientVersion = '0.0.0', h
           }
         : {}),
     };
+    // Codex rejects a config map mixing an `mcp_servers` table with dotted
+    // `mcp_servers.<name>.<key>` entries (codex-driver.js). Fold them together.
+    if (config.mcp_servers && typeof config.mcp_servers === 'object' && !Array.isArray(config.mcp_servers)) {
+      const merged = { ...config.mcp_servers };
+      for (const key of Object.keys(config)) {
+        const match = key.match(/^mcp_servers\.([^.]+)\.(.+)$/);
+        if (!match) continue;
+        merged[match[1]] = { ...merged[match[1]], [match[2]]: config[key] };
+        delete config[key];
+      }
+      config.mcp_servers = merged;
+    }
     const threadParams = {
       cwd,
       model: model.slug,
@@ -804,6 +840,7 @@ export const createHarnessLaneRunner = ({
   registerTools,
   botsDir,
   getProjects = () => [],
+  getMcpServers = null,
   mkdir = (dir) => fs.mkdir(dir, { recursive: true }),
   randomId = () => crypto.randomUUID(),
   downloadAttachment,
@@ -839,12 +876,26 @@ export const createHarnessLaneRunner = ({
     return { text: '', retryElsewhere: true, failure: shorten(`The bot's folder could not be made: ${error?.message ?? error}`) };
   }
   if (ctx.signal?.aborted) return { text: '', aborted: true };
+  // On-demand MCP servers (Durango account connectors like durango-notion, plus
+  // Durango Code's enabled MCP servers): served on `durango_bot` through
+  // `load_tools` and `call_app_tool` (mcp-on-demand.js), matching threads.
+  let mcpServers = [];
+  if (typeof getMcpServers === 'function') {
+    try {
+      const raw = await getMcpServers({ providerId, cwd, signal: ctx.signal });
+      if (Array.isArray(raw)) {
+        mcpServers = raw.filter((server) => server?.name && server.name !== BOT_TOOLS_SERVER);
+      }
+    } catch {}
+  }
+  if (ctx.signal?.aborted) return { text: '', aborted: true };
+  const mcpServerNames = mcpServers.map((server) => server.name);
   const attachmentsDir = path.join(cwd, 'attachments');
   const attachmentsNote = await saveLaneAttachments(lane.attachments, attachmentsDir, {
     ...(downloadAttachment ? { download: downloadAttachment } : {}),
     resolveLocalPath: resolveLocalAttachment,
   }).catch(() => '');
-  const systemAppend = projectsNote ? `${lane.systemPrompt}\n\n${projectsNote}` : lane.systemPrompt;
+  const systemAppend = [lane.systemPrompt, projectsNote, BOT_HARNESS_CONNECTORS_NOTE].filter(Boolean).join('\n\n');
   const withAttachments = (prompt) => (attachmentsNote ? `${prompt}\n\n${attachmentsNote}` : prompt);
 
   // --- the reply's messages ------------------------------------------------------------
@@ -999,7 +1050,10 @@ export const createHarnessLaneRunner = ({
       return { ok: false, text: `The ${name} tool failed: ${error?.message ?? error}` };
     }
   };
-  const mcp = toolDefinitions.length && registerTools ? await registerTools({ tools: toolDefinitions, call: callBotTool }).catch(() => null) : null;
+  const mcp =
+    (toolDefinitions.length || mcpServers.length) && registerTools
+      ? await registerTools({ tools: toolDefinitions, call: callBotTool, userServers: mcpServers }).catch(() => null)
+      : null;
   // Without its tools it isn't the same bot: the next place answers.
   if (toolDefinitions.length && registerTools && !mcp) {
     return { text: '', retryElsewhere: true, failure: "The bot's tools couldn't be served to the harness here." };
@@ -1014,7 +1068,11 @@ export const createHarnessLaneRunner = ({
   const keptSessions = session && sessions ? sessions : null;
   const sessionKey = `${lane.botId}__${providerId}__${String(modelId || resolved.model.slug).replace(/[^A-Za-z0-9_-]/g, '_')}`;
   const { steady: steadyPrompt, memory } = splitMemorySection(lane.systemPrompt);
-  const basis = sessionBasis({ systemPrompt: projectsNote ? `${steadyPrompt}\n\n${projectsNote}` : steadyPrompt, model: `${providerId}:${modelId}`, tools: lane.tools });
+  const basis = sessionBasis({
+    systemPrompt: [steadyPrompt, projectsNote, BOT_HARNESS_CONNECTORS_NOTE].filter(Boolean).join('\n\n'),
+    model: `${providerId}:${modelId}`,
+    tools: lane.tools,
+  });
   const claimed = keptSessions ? await keptSessions.begin(sessionKey) : { state: null, busy: false };
   const planFor = (state, budget = maxPromptTokens) =>
     session
@@ -1130,7 +1188,8 @@ export const createHarnessLaneRunner = ({
     };
     ctx.signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      const firstText = withAttachments(attemptPlan.prompt);
+      const appsNote = loadableAppsNote(mcpServerNames, { viaCallAppTool: true });
+      const firstText = [withAttachments(attemptPlan.prompt), appsNote].filter(Boolean).join('\n\n');
       let result = await current.prompt(resume || current.instructionsApplied ? firstText : `${botInstructionsBlock(attempt.systemAppend)}${firstText}`);
       for (;;) {
         await steering;

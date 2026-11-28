@@ -220,10 +220,34 @@ export const dispatchBridgeToolCall = async (session, tool, rawArgs) => {
     redactSecrets({ ok, text, ...(extra ?? {}) }, { alsoValues });
 
   // A Durango bot's reply on Codex, Antigravity, Grok or Muse
-  // (registerBotToolsBridge): the server lists the bot's tools and nothing of
-  // Durango Code's own; each call goes to the reply (bot-harness-lanes.js).
+  // (registerBotToolsBridge): the server lists the bot's tools plus the
+  // on-demand connector tools (`load_tools`, `call_app_tool`, mcp-on-demand.js)
+  // for Durango account connectors and Durango Code MCP servers; bot tool calls
+  // go to the reply (bot-harness-lanes.js).
   if (session.bot) {
-    if (tool === '__tools') return finish(true, '', { tools: session.bot.tools });
+    const onDemandNames = session.onDemandMcps?.names() ?? [];
+    if (tool === '__tools') {
+      return finish(true, '', {
+        tools: [
+          ...session.bot.tools,
+          ...onDemandMcpToolDefinitions(onDemandNames, { secretRefs: false }),
+        ],
+      });
+    }
+    if (tool === LOAD_TOOLS_TOOL_NAME || tool === CALL_APP_TOOL_NAME) {
+      if (!session.onDemandMcps || onDemandNames.length === 0) {
+        return finish(false, 'No connected apps are available in this reply.');
+      }
+      try {
+        const { ok, text, content } =
+          tool === LOAD_TOOLS_TOOL_NAME
+            ? await session.onDemandMcps.load(args)
+            : await session.onDemandMcps.call(args, { accessMode: session.accessMode });
+        return finish(ok, text, Array.isArray(content) && content.length ? { content } : undefined);
+      } catch (error) {
+        return finish(false, `${tool} failed: ${error?.message ?? error}`);
+      }
+    }
     if (!session.bot.tools.some((definition) => definition.name === tool)) return finish(false, `Unknown tool: ${tool}`);
     try {
       const result = await session.bot.call(tool, args);
@@ -1093,7 +1117,7 @@ export const registerMcpBridgeForRun = async ({
  * config root). → null when the bridge can't start.
  */
 export const BOT_TOOLS_SERVER_NAME = 'durango_bot';
-export const registerBotToolsBridge = async ({ tools, call }) => {
+export const registerBotToolsBridge = async ({ tools, call, userServers = [] }) => {
   try {
     const [{ shimPath, socketPath }, httpBridge] = await Promise.all([
       ensureMcpBridge(),
@@ -1102,10 +1126,12 @@ export const registerBotToolsBridge = async ({ tools, call }) => {
     const token = crypto.randomUUID();
     const tokenRoot = path.join(app.getPath('userData'), 'orion-mcp-runs', token);
     await fs.mkdir(tokenRoot, { recursive: true, mode: 0o700 });
+    const onDemandMcps = createOnDemandMcps(userServers);
     const session = {
       bot: { tools: Array.isArray(tools) ? tools : [], call },
       providerId: 'bot',
       accessMode: 'full-access',
+      onDemandMcps,
       abortController: new AbortController(),
       released: false,
       turnGeneration: 1,
@@ -1127,6 +1153,7 @@ export const registerBotToolsBridge = async ({ tools, call }) => {
         mcpBridgeSessions.delete(token);
         session.httpMcpHandler = null;
         session.abortController.abort();
+        void onDemandMcps.close();
         void fs.rm(tokenRoot, { recursive: true, force: true }).catch(() => {});
       },
     };
