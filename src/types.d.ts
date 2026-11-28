@@ -2269,6 +2269,17 @@ type OrionCodexBrowserIntegrationStatus = {
         reply?: string;
         sealed?: string;
       }) => Promise<{ ok: boolean; error?: string; machineName?: string | null; online?: boolean; at?: number }>;
+      /** Marks a local (signed-out) bot's "NEEDS THE PERSON" inbox notice as resolved. */
+      resolveLocalBotNotice?: (input: {
+        botId: string;
+        threadId: string;
+        requestId: string;
+        kind: 'action' | 'secret' | 'input';
+        op: 'done' | 'reply' | 'dismiss' | 'save' | 'decline' | 'answered' | 'resolved';
+        by: 'person' | 'bot' | 'agent';
+        byName?: string;
+        at?: number;
+      }) => Promise<{ ok: boolean; updated?: number; error?: string }>;
       onDurangoDispatchState?: (cb: (state: DurangoDispatchState) => void) => () => void;
       onDurangoFocusThread?: (cb: (payload: { threadId: string }) => void) => () => void;
       workspaceSyncConfigure?: (

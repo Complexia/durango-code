@@ -10,8 +10,10 @@ import {
   Bot,
   CalendarClock,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Clock,
   Copy,
   CornerDownLeft,
@@ -31,6 +33,7 @@ import {
   Folder,
   FolderOpen,
   GripVertical,
+  Hand,
   Library,
   ListChecks,
   Loader2,
@@ -88,8 +91,12 @@ import {
   LOCAL_BOT_PLACE,
   formatFileSize,
   newBotMessageId,
+  noticeRequestIdFromMessageId,
+  parseNeedsPersonNotice,
   projectBotsFor,
   relativeBotTime,
+  requestResolutionActor,
+  requestResolutionLabel,
   resolveThreadStarter,
   taskReportActions,
   taskReportBody,
@@ -100,6 +107,7 @@ import {
   type DesktopBot,
   type DesktopBotLive,
   type DesktopBotMessage,
+  type DesktopBotRequestResolution,
   type DesktopBotThread,
   type BotAttachmentFile,
   type BotAttachmentUploadStatus,
@@ -116,7 +124,16 @@ import {
 } from './useSidebarDragReorder';
 import { BotModelMenu } from './BotModelMenu';
 import { BotNeedsYouPanel, type UserActionHandlers } from './BotNeedsYou';
-import { allBotCards, botSentAnswers, threadCardsKey, withNeedsYouNow, type BotThreadRequest } from './botThreadRequests';
+import {
+  allBotCards,
+  botNeedsYouCards,
+  botResolvedRequests,
+  botSentAnswers,
+  localResolutionForNotice,
+  threadCardsKey,
+  withNeedsYouNow,
+  type BotThreadRequest,
+} from './botThreadRequests';
 
 // The sidebar's Bots tab (once "Sidebar v3" in Settings → Experimental): the
 // sidebar lists the person's Durango bots under the shared header
@@ -212,6 +229,7 @@ const clearBotCaches = () => {
   botListCache = null;
   // Answers sent from the old account's bot chats don't apply to the next one.
   botSentAnswers.clear();
+  botResolvedRequests.clear();
   botThreadCache.clear();
   botThreadEpochs.clear();
   botProjectCache.clear();
@@ -3070,7 +3088,15 @@ const BotPane: React.FC<{
   /** The newest page, replacing what was loaded (opening the thread, or catching up after a long gap). */
   const loadNewest = useCallback(async () => {
     const result = await fetchPage({ limit: BOT_THREAD_FIRST_PAGE });
-    if (result) setThread(() => ({ bot: result.bot, live: result.live ?? [], messages: result.messages ?? [], hasMore: result.hasMore === true }));
+    if (result) {
+      setThread(() => ({
+        bot: result.bot,
+        ...(result.resolvedRequests?.length ? { resolvedRequests: result.resolvedRequests } : {}),
+        live: result.live ?? [],
+        messages: result.messages ?? [],
+        hasMore: result.hasMore === true,
+      }));
+    }
   }, [fetchPage, setThread]);
 
   /**
@@ -3096,8 +3122,20 @@ const BotPane: React.FC<{
         if (!current) return current;
         const messages = mergeBotMessages(current.messages, result.messages);
         const live = result.live ?? [];
-        const same = messages === current.messages && JSON.stringify([current.bot, current.live]) === JSON.stringify([result.bot, live]);
-        return same ? current : { ...current, bot: result.bot, live, messages };
+        const resolvedRequests = result.resolvedRequests ?? [];
+        const same =
+          messages === current.messages &&
+          JSON.stringify([current.bot, current.live, current.resolvedRequests ?? []]) ===
+            JSON.stringify([result.bot, live, resolvedRequests]);
+        return same
+          ? current
+          : {
+              ...current,
+              bot: result.bot,
+              ...(resolvedRequests.length ? { resolvedRequests } : { resolvedRequests: undefined }),
+              live,
+              messages,
+            };
       });
       // Durango without cursors (older) sends the newest page: merged above, done.
       if (result.hasNewer !== true || !result.messages?.length) return;
@@ -3210,11 +3248,23 @@ const BotPane: React.FC<{
     [botId]
   );
 
-  // Brisk while a reply is being written (or just sent), slow otherwise.
+  // Local resolutions (answered here in a thread or local panel card): show at 0 ms and refresh soon.
+  const localResolved = useSyncExternalStore(botResolvedRequests.subscribe, botResolvedRequests.get);
+  const storeThreads = useOrionStore((state) => state.threads);
+  const hasOpenRequests = Boolean((requests?.length ?? 0) > 0 || (thread?.bot.requests?.length ?? 0) > 0);
+  useEffect(() => {
+    if (localResolved.size === 0) return undefined;
+    const timer = window.setTimeout(() => {
+      if (visible()) void poll().catch(() => {});
+    }, 700);
+    return () => window.clearTimeout(timer);
+  }, [localResolved, poll]);
+
+  // Brisk while a reply is being written (or just sent, or requests are pending/answering), slow otherwise.
   // A poll that finds nothing new keeps the same thread object, so this
   // timer is set again by `tick` itself rather than by a redraw.
   const workingRef = useRef(false);
-  workingRef.current = working || sending;
+  workingRef.current = working || sending || hasOpenRequests;
   useEffect(() => {
     let timer = 0;
     let stopped = false;
@@ -3222,12 +3272,12 @@ const BotPane: React.FC<{
       if (visible()) await poll().catch(() => {});
       if (!stopped) timer = window.setTimeout(tick, workingRef.current ? THREAD_POLL_ACTIVE_MS : THREAD_POLL_IDLE_MS);
     };
-    timer = window.setTimeout(tick, working || sending ? THREAD_POLL_ACTIVE_MS : THREAD_POLL_IDLE_MS);
+    timer = window.setTimeout(tick, working || sending || hasOpenRequests ? THREAD_POLL_ACTIVE_MS : THREAD_POLL_IDLE_MS);
     return () => {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [poll, working, sending]);
+  }, [poll, working, sending, hasOpenRequests]);
 
   const messageIds = useMemo(() => thread?.messages.map((message) => message.id) ?? [], [thread?.messages]);
   const stored = useMemo(() => new Set(messageIds), [messageIds]);
@@ -3495,6 +3545,23 @@ const BotPane: React.FC<{
   }
   const { bot } = thread;
   const rowBot = face ?? bot;
+  const activeRequests = requests ?? bot.requests;
+  const liveCards = botNeedsYouCards(bot.id, activeRequests, storeThreads);
+  const openPendingRequestIds = new Set<string>();
+  for (const card of liveCards) {
+    if (card.request?.status === 'answering' || card.request?.status === 'resolved') continue;
+    if (card.kind === 'input') {
+      let raw = card.action.id.startsWith('q:') ? card.action.id.slice(2) : card.action.id;
+      if (card.request?.actionThreadId && raw.startsWith(`${card.request.actionThreadId}:`)) raw = raw.slice(card.request.actionThreadId.length + 1);
+      openPendingRequestIds.add(`input:${raw}`);
+    } else {
+      openPendingRequestIds.add(`action:${card.action.id}`);
+    }
+  }
+  const latestAssistantAt = thread.messages.reduce(
+    (max, message) => (message.role === 'assistant' && message.createdAt > max ? message.createdAt : max),
+    0
+  );
   const live = thread.live.filter((reply) => !stored.has(reply.messageId));
   // A reply that has shown text has its place: messages sent after that go below it, here and once stored.
   const placed = live.filter((reply): reply is DesktopBotLive & { seq: number } => typeof reply.seq === 'number');
@@ -3597,8 +3664,17 @@ const BotPane: React.FC<{
               {loadingOlder && <Loader2 size={12} className="animate-spin" />}
             </div>
           )}
-          {timeline.map((row) =>
-            row.kind === 'message' ? (
+          {timeline.map((row) => {
+            if (row.kind !== 'message') return liveRow(row.reply);
+            const noticeRef = row.message.role === 'user' ? noticeRequestIdFromMessageId(row.message.id) : null;
+            const resolvedOverride = !row.message.requestResolved ? localResolutionForNotice(localResolved, noticeRef) : null;
+            const waitingRequest = Boolean(
+              !row.message.requestResolved &&
+                !resolvedOverride &&
+                noticeRef &&
+                openPendingRequestIds.has(`${noticeRef.kind}:${noticeRef.id}`)
+            );
+            return (
               <div key={row.message.id} data-bot-row={row.message.id} className="flex flex-col">
                 <BotMessage
                   bot={rowBot}
@@ -3606,16 +3682,16 @@ const BotPane: React.FC<{
                   message={row.message}
                   handlers={handlers}
                   answeredQuestions={answeredQuestions}
+                  waitingRequest={waitingRequest}
+                  resolvedOverride={resolvedOverride}
                   uploadStatuses={row.message.role === 'user' && row.message.files?.some((file) => file.pendingId) ? uploadStatuses : undefined}
                   onRetryAttachment={retryAttachment}
                   onReplyTo={replyToMessage}
                   onJumpTo={jumpToMessage}
                 />
               </div>
-            ) : (
-              liveRow(row.reply)
-            )
-          )}
+            );
+          })}
           {range.following && pending.map((message) => (
             <PersonBubble
               key={message.id}
@@ -3671,7 +3747,15 @@ const BotPane: React.FC<{
         </button>
       )}
       </div>
-      <BotNeedsYouPanel botId={bot.id} requests={requests} handlers={userActionHandlers} onOpenThread={onOpenThread} />
+      <BotNeedsYouPanel
+        botId={bot.id}
+        requests={activeRequests}
+        resolvedRequests={thread.resolvedRequests}
+        latestAssistantAt={latestAssistantAt || undefined}
+        handlers={userActionHandlers}
+        onAnswered={() => void poll()}
+        onOpenThread={onOpenThread}
+      />
       <BotComposer
         draftKey={botDraftKey(bot.id)}
         botName={bot.name}
@@ -4661,13 +4745,16 @@ const BotMessage: React.FC<{
   message: DesktopBotMessage;
   handlers: BotActionHandlers;
   answeredQuestions: ReadonlyMap<string, string>;
+  waitingRequest?: boolean;
+  resolvedOverride?: DesktopBotRequestResolution | null;
   uploadStatuses?: ReadonlyMap<string, BotAttachmentUploadStatus>;
   onRetryAttachment?: (messageId: string, pendingId: string) => void;
   /** Reply to this message (the composer quotes it); stable across redraws. */
   onReplyTo?: (message: DesktopBotMessage) => void;
   /** A reply quote was clicked: show the message it answers. */
   onJumpTo?: (seq: number) => void;
-}> = React.memo(({ bot, projectPath, message, handlers, answeredQuestions, uploadStatuses, onRetryAttachment, onReplyTo, onJumpTo }) => {
+}> = React.memo(({ bot, projectPath, message, handlers, answeredQuestions, waitingRequest, resolvedOverride, uploadStatuses, onRetryAttachment, onReplyTo, onJumpTo }) => {
+  const [expanded, setExpanded] = useState(false);
   const files = useMessageFiles(message.files);
   const replyTo = onReplyTo ? () => onReplyTo(message) : undefined;
   if (message.role === 'assistant') {
@@ -4697,27 +4784,111 @@ const BotMessage: React.FC<{
   const Icon = INBOX_ICON[source];
   // A task report carries its thread and change: open or ship them from here.
   const actions = source === 'task' ? taskReportActions(message.content) : [];
+  const resolved = message.requestResolved ?? resolvedOverride ?? null;
+  const needsPerson = source === 'task' ? parseNeedsPersonNotice(message.content) : null;
+  if (resolved) {
+    const dismissed = resolved.op === 'dismiss';
+    const summary = needsPerson?.summary ?? taskReportBody(message.content);
+    const fullText = taskReportBody(message.content);
+    const expandable = expanded || summary.length > 160 || fullText !== summary;
+    return (
+      <div
+        className={`bot-msg inbox mx-auto w-full max-w-[92%] rounded-xl border px-3 py-2 text-[12.5px] ${
+          dismissed
+            ? 'border-white/[0.07] bg-white/[0.02]'
+            : 'border-emerald-400/25 bg-emerald-400/[0.045]'
+        }`}
+      >
+        {replyTo && <ReplyMessageButton onClick={replyTo} />}
+        <div className="flex items-center gap-1.5 text-neutral-400">
+          {dismissed ? (
+            <X size={12} className="shrink-0 text-neutral-400" />
+          ) : (
+            <CheckCircle2 size={12} className="shrink-0 text-emerald-400" />
+          )}
+          <span className="truncate font-medium text-neutral-200">{message.authorLabel}</span>
+          <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10.5px] text-neutral-500">
+            <span>{relativeBotTime(message.createdAt)}</span>
+          </span>
+        </div>
+        <div
+          className={`mt-1.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11.5px] ${
+            dismissed ? 'text-neutral-400' : 'text-emerald-300'
+          }`}
+        >
+          <span className="inline-flex items-center gap-1 font-medium">
+            {!dismissed && <Check size={11} className="shrink-0" />}
+            {requestResolutionLabel(resolved)}
+          </span>
+          <span className="text-[10.5px] text-neutral-500">
+            · {requestResolutionActor(resolved)} · {relativeBotTime(resolved.at)}
+          </span>
+        </div>
+        <div className={`mt-1 whitespace-pre-wrap text-neutral-400/85 ${expanded ? '' : 'line-clamp-2'}`}>
+          {expanded ? fullText : summary}
+        </div>
+        {expandable && (
+          <button
+            type="button"
+            onClick={() => setExpanded((value) => !value)}
+            className="mt-1 inline-flex items-center gap-0.5 text-[11px] text-neutral-500 hover:text-neutral-300"
+          >
+            {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+            {expanded ? 'Less' : 'Details'}
+          </button>
+        )}
+        {actions.length > 0 && <BotActionsRow actions={actions} handlers={handlers} />}
+      </div>
+    );
+  }
+  const activeWaiting = Boolean(needsPerson && waitingRequest);
+  const bodyText = activeWaiting && !expanded ? needsPerson!.summary : source === 'task' ? taskReportBody(message.content) : message.content;
+  const fullText = source === 'task' ? taskReportBody(message.content) : message.content;
+  const canExpand = activeWaiting && fullText !== needsPerson!.summary;
   return (
-    <div className="bot-msg inbox mx-auto w-full max-w-[92%] rounded-xl border border-white/[0.07] bg-white/[0.025] px-3 py-2 text-[12.5px]">
+    <div
+      className={`bot-msg inbox mx-auto w-full max-w-[92%] rounded-xl border px-3 py-2 text-[12.5px] ${
+        activeWaiting
+          ? 'border-amber-400/35 bg-amber-400/[0.06]'
+          : 'border-white/[0.07] bg-white/[0.025]'
+      }`}
+    >
       {replyTo && <ReplyMessageButton onClick={replyTo} />}
       <div className="flex items-center gap-1.5 text-neutral-400">
-        <Icon size={12} />
+        {activeWaiting ? <Hand size={12} className="shrink-0 text-amber-300" /> : <Icon size={12} />}
         <span className="truncate font-medium text-neutral-300">{message.authorLabel}</span>
         <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10.5px] text-neutral-600">
-          {message.silentRead && (
-            <span
-              className="inline-flex items-center gap-0.5 text-neutral-500"
-              title={message.silentRead.reason ? `Read without replying: ${message.silentRead.reason}` : 'Read without replying'}
-            >
-              <Check size={10} />
-              Read
-            </span>
-          )}
-          {message.silentRead && <span aria-hidden="true">·</span>}
+          {activeWaiting ? (
+            <>
+              <span className="font-medium text-amber-300">Waiting on you</span>
+              <span aria-hidden="true">·</span>
+            </>
+          ) : message.silentRead ? (
+            <>
+              <span
+                className="inline-flex items-center gap-0.5 text-neutral-500"
+                title={message.silentRead.reason ? `Read without replying: ${message.silentRead.reason}` : 'Read without replying'}
+              >
+                <Check size={10} />
+                Read
+              </span>
+              <span aria-hidden="true">·</span>
+            </>
+          ) : null}
           <span>{relativeBotTime(message.createdAt)}</span>
         </span>
       </div>
-      <div className="mt-1 line-clamp-4 whitespace-pre-wrap text-neutral-400">{source === 'task' ? taskReportBody(message.content) : message.content}</div>
+      <div className={`mt-1 whitespace-pre-wrap text-neutral-400 ${expanded ? '' : 'line-clamp-4'}`}>{bodyText}</div>
+      {canExpand && (
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-1 inline-flex items-center gap-0.5 text-[11px] text-neutral-500 hover:text-neutral-300"
+        >
+          {expanded ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+          {expanded ? 'Less' : 'Details'}
+        </button>
+      )}
       {actions.length > 0 && <BotActionsRow actions={actions} handlers={handlers} />}
     </div>
   );

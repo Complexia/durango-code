@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Check, MessageCircleQuestion } from 'lucide-react';
+import { useOrionStore } from '../store';
 import { ApprovalCard, type ExplainApproval } from './ApprovalCard';
+import { pendingInputCardText, recordBotThreadRequestResolution } from './botThreadRequests';
 
 /** A tool call waiting for approval, as the approval card shows it (main/approval-explainer.js). */
 export type ToolApproval = {
@@ -179,6 +181,27 @@ const QuestionCard = ({
         ? await onAsyncAnswer?.(request, answers)
         : await send?.(request.runId, request.requestId, answers);
       if (!accepted) setError(request.async ? 'Could not send your answers. Try again.' : 'This question is no longer waiting for an answer.');
+      else if (!request.async) {
+        const recorded = recordBotThreadRequestResolution(useOrionStore.getState().threads, {
+          threadId: request.threadId,
+          requestId: String(request.requestId),
+          kind: 'input',
+          text: pendingInputCardText(request),
+          op: 'answered',
+          by: 'person',
+        });
+        if (recorded?.owner.mode === 'local' && recorded.owner.botId) {
+          void window.orion?.resolveLocalBotNotice?.({
+            botId: recorded.owner.botId,
+            threadId: recorded.root.id,
+            requestId: recorded.requestId,
+            kind: 'input',
+            op: recorded.resolution.op,
+            by: recorded.resolution.by,
+            at: recorded.resolution.at,
+          });
+        }
+      }
       refresh();
     } catch {
       setError('Could not send your answers. Try again.');

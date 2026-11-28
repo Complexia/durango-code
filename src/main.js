@@ -6454,6 +6454,7 @@ const botThreadRequests = createBotThreadRequestsBridge({
 });
 ipcMain.handle('bots:syncThreadRequests', (_event, input) => botThreadRequests.sync(input ?? {}));
 ipcMain.handle('bots:answerThreadRequest', (_event, input) => botThreadRequests.answer(input ?? {}));
+ipcMain.handle('bots:resolveLocalNotice', (_event, input) => localBots.resolveNotice(input ?? {}).catch(localBotsIpcError));
 const localBotsIpcError = (error) => ({
   ok: false,
   ...(typeof error?.code === 'string' ? { code: error.code } : {}),

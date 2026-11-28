@@ -54,6 +54,11 @@ export const sameBotMessage = (a: DesktopBotMessage, b: DesktopBotMessage) =>
   a.createdAt === b.createdAt &&
   a.silentRead?.at === b.silentRead?.at &&
   a.silentRead?.reason === b.silentRead?.reason &&
+  a.requestResolved?.at === b.requestResolved?.at &&
+  a.requestResolved?.op === b.requestResolved?.op &&
+  a.requestResolved?.by === b.requestResolved?.by &&
+  a.requestResolved?.byName === b.requestResolved?.byName &&
+  a.requestResolved?.machineName === b.requestResolved?.machineName &&
   sameFiles(a.files, b.files) &&
   sameCards(a.cards, b.cards);
 

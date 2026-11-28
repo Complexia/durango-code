@@ -65,6 +65,18 @@ test('merging a page keeps unchanged messages as the same objects (no redraw)', 
     mergeBotMessages(marked, [message(2, { role: 'user', authorLabel: 'Task: Build', silentRead: { at: 100, reason: 'Interim' } })]),
     marked
   );
+  // Request resolved mark: adding or changing requestResolved triggers a row update; identical keeps object.
+  const resolvedMsg = mergeBotMessages(inbox, [
+    message(2, { role: 'user', authorLabel: 'Task: Build', requestResolved: { op: 'done', by: 'person', at: 200 } }),
+  ]);
+  assert.notEqual(resolvedMsg, inbox);
+  assert.equal(resolvedMsg[0].requestResolved?.op, 'done');
+  assert.equal(
+    mergeBotMessages(resolvedMsg, [
+      message(2, { role: 'user', authorLabel: 'Task: Build', requestResolved: { op: 'done', by: 'person', at: 200 } }),
+    ]),
+    resolvedMsg
+  );
 });
 
 test('older pages merge in seq order, all the way back past 200 and 2,000', () => {

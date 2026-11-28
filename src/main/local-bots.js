@@ -195,6 +195,42 @@ const localSilentReadNote = (silentRead) => {
     ? `(You already read this earlier and chose to stay silent: ${reason})`
     : '(You already read this earlier and chose to stay silent.)';
 };
+const LOCAL_RESOLUTION_OPS = new Set(['done', 'reply', 'dismiss', 'save', 'decline', 'answered', 'resolved']);
+const LOCAL_RESOLUTION_BYS = new Set(['person', 'bot', 'agent']);
+const normalizeLocalRequestResolved = (raw) => {
+  if (!raw || typeof raw !== 'object') return null;
+  const op = LOCAL_RESOLUTION_OPS.has(raw.op) ? raw.op : null;
+  const by = LOCAL_RESOLUTION_BYS.has(raw.by) ? raw.by : null;
+  const at = Number.isFinite(raw.at) && raw.at > 0 ? Math.round(raw.at) : 0;
+  if (!op || !by || !at) return null;
+  const byName = clip(oneLine(raw.byName), 80);
+  const machineName = clip(oneLine(raw.machineName), 80);
+  return {
+    op,
+    by,
+    ...(byName ? { byName } : {}),
+    ...(machineName ? { machineName } : {}),
+    at,
+  };
+};
+const localRequestResolvedNote = (resolved) => {
+  const clean = normalizeLocalRequestResolved(resolved);
+  if (!clean) return '';
+  const who = clean.by === 'person' ? 'the person' : clean.by === 'bot' ? (clean.byName ? `bot ${clean.byName}` : 'a bot') : 'the thread';
+  const what = {
+    done: 'marked done',
+    reply: 'replied to',
+    dismiss: 'dismissed',
+    save: 'answered (secret saved)',
+    decline: 'declined',
+    answered: 'answered',
+    resolved: 'resolved',
+  }[clean.op];
+  const tail = clean.op === 'dismiss'
+    ? 'It was dismissed; do not ask the person about this request again.'
+    : 'The thread is continuing; do not ask the person about this request again.';
+  return `[This request was already ${what} by ${who}. ${tail}]`;
+};
 const newId = (prefix) => `${prefix}${Date.now().toString(36)}${crypto.randomBytes(6).toString('hex')}`;
 const finite = (value, fallback) => (Number.isFinite(value) ? value : fallback);
 
@@ -989,6 +1025,10 @@ const normalizeMessage = (raw) =>
               },
             }
           : {}),
+        // "NEEDS THE PERSON" inbox notice whose thread request was resolved.
+        ...(normalizeLocalRequestResolved(raw.requestResolved)
+          ? { requestResolved: normalizeLocalRequestResolved(raw.requestResolved) }
+          : {}),
       }
     : null;
 
@@ -1769,7 +1809,7 @@ export const createLocalBotEngine = ({
         id: message.id,
         seq: message.seq,
         role: message.role,
-        text: [message.content.trim(), files, localSilentReadNote(message.silentRead)].filter(Boolean).join('\n'),
+        text: [message.content.trim(), files, localSilentReadNote(message.silentRead), localRequestResolvedNote(message.requestResolved)].filter(Boolean).join('\n'),
         ...(message.role === 'user' && message.authorLabel ? { label: message.authorLabel } : {}),
       };
     };
@@ -2911,6 +2951,7 @@ export const createLocalBotEngine = ({
           authorLabel: message.authorLabel,
           createdAt: message.createdAt,
           ...(message.silentRead ? { silentRead: message.silentRead } : {}),
+          ...(message.requestResolved ? { requestResolved: message.requestResolved } : {}),
           // Not answered here yet: Durango answers it after the upload.
           ...(message.role === 'user' &&
           (message.seq > bot.processedSeq || (bot.requeue ?? []).includes(message.seq) || (bot.inFlight ?? []).includes(message.seq))
@@ -3236,6 +3277,7 @@ export const createLocalBotEngine = ({
             (message) =>
               !seen.has(message.id) &&
               ((message.silentRead && message.silentRead.at >= cutoff) ||
+                (message.requestResolved && message.requestResolved.at >= cutoff) ||
                 (typeof message.cardUpdatedAt === 'number' && message.cardUpdatedAt >= cutoff))
           );
         if (recentUpdates.length) slice = [...recentUpdates, ...slice];
@@ -3612,6 +3654,40 @@ export const createLocalBotEngine = ({
       let saved = (await (entry.saved ?? Promise.resolve(true))) && onDisk();
       if (!saved) saved = (await persistBot(entry)) && onDisk();
       return saved ? { ok: true } : { ok: false, retry: true };
+    },
+    /** Marks any matching "NEEDS THE PERSON" inbox notice as resolved on this local bot. */
+    async resolveNotice({ botId, threadId, requestId, kind, op, by, byName, at } = {}) {
+      await ensureLoaded();
+      const entry = entries.get(str(botId).trim());
+      if (!entry) return { ok: true, updated: 0 };
+      const reqId = str(requestId).trim();
+      const resolved = normalizeLocalRequestResolved({ op, by, byName, at: Number.isFinite(at) ? at : now() });
+      if (!reqId || !resolved) return { ok: false, updated: 0 };
+      const rawKey = kind === 'input'
+        ? `input:${reqId.startsWith('q:') ? reqId.slice(2).split(':').pop() : reqId}`
+        : `action:${reqId}`;
+      const normalizedKey = rawKey.replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 120);
+      const cleanThreadId = str(threadId).trim();
+      let updated = 0;
+      const startIdx = Math.max(0, entry.messages.length - 80);
+      for (let i = entry.messages.length - 1; i >= startIdx; i -= 1) {
+        const message = entry.messages[i];
+        if (!message || message.role !== 'user' || inboxSourceOf(message.authorLabel) !== 'task') continue;
+        if (!str(message.content).startsWith('NEEDS THE PERSON:')) continue;
+        const id = str(message.id);
+        const matches =
+          id.endsWith(`_n_${normalizedKey}`) ||
+          id.endsWith(`_${normalizedKey}`) ||
+          (kind !== 'input' &&
+            (str(message.content).includes(`(Request ${reqId}:`) || str(message.content).includes(`(Secret request ${reqId}:`)));
+        if (!matches) continue;
+        if (kind === 'input' && cleanThreadId && str(message.content).includes('(Durango Code thread ') && !str(message.content).includes(`(Durango Code thread ${cleanThreadId}`)) {
+          continue;
+        }
+        if (replaceMessage(entry, message.id, () => ({ requestResolved: resolved }))) updated += 1;
+      }
+      if (updated > 0) await persistBot(entry);
+      return { ok: true, updated };
     },
     /** Routines fire and waiting messages are answered only while active (signed out of Durango). */
     setActive(next) {

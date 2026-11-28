@@ -69,6 +69,17 @@ export type CreateProjectBotInput = {
   model?: string;
 };
 
+export type DesktopBotRequestResolutionOp = 'done' | 'reply' | 'dismiss' | 'save' | 'decline' | 'answered' | 'resolved';
+export type DesktopBotRequestResolutionBy = 'person' | 'bot' | 'agent';
+
+export type DesktopBotRequestResolution = {
+  op: DesktopBotRequestResolutionOp;
+  by: DesktopBotRequestResolutionBy;
+  byName?: string;
+  machineName?: string;
+  at: number;
+};
+
 export type DesktopBotMessage = {
   id: string;
   seq: number;
@@ -78,6 +89,8 @@ export type DesktopBotMessage = {
   authorLabel: string | null;
   /** Set on an inbox item when the bot explicitly chose stay_silent (no reply posted). */
   silentRead?: { at: number; reason?: string } | null;
+  /** Set on a "NEEDS THE PERSON" inbox notice once its thread request was resolved. */
+  requestResolved?: DesktopBotRequestResolution | null;
   createdAt: number;
   /** Files sent with it (signed in: their library ids; signed out: their paths here). */
   files?: BotMessageFile[];
@@ -225,6 +238,8 @@ export type DesktopBotLive = {
 
 export type DesktopBotThread = {
   bot: DesktopBot;
+  /** Recently resolved thread requests for this bot (brief confirmation above the composer). */
+  resolvedRequests?: BotThreadRequest[];
   messages: DesktopBotMessage[];
   live: DesktopBotLive[];
   hasMore: boolean;
@@ -509,4 +524,64 @@ export const taskReportBody = (content: string) => {
   let body = content;
   for (let pass = 0; pass < 2; pass += 1) body = body.replace(REPORT_FOOTER, '').replace(REPORT_REFS, '');
   return body.trimEnd();
+};
+
+/** Human-facing status line for a resolved thread request card / inbox notice (mirrors convex/botPolicy.ts). */
+export const requestResolutionLabel = (resolved: Pick<DesktopBotRequestResolution, 'op'>): string => {
+  switch (resolved.op) {
+    case 'done':
+      return 'Done · thread continuing';
+    case 'reply':
+      return 'Replied · thread continuing';
+    case 'save':
+      return 'Secret saved · thread continuing';
+    case 'decline':
+      return 'Declined · thread continuing';
+    case 'answered':
+      return 'Answered · thread continuing';
+    case 'dismiss':
+      return 'Dismissed';
+    case 'resolved':
+      return 'Resolved · thread continuing';
+  }
+};
+
+/** Who resolved a thread request, shown next to the status label (mirrors convex/botPolicy.ts). */
+export const requestResolutionActor = (resolved: Pick<DesktopBotRequestResolution, 'op' | 'by' | 'byName'>): string => {
+  if (resolved.by === 'person') return 'You';
+  if (resolved.by === 'bot') return resolved.byName?.trim() || 'Bot';
+  return resolved.op === 'done' ? 'Auto-detected' : 'Thread';
+};
+
+const NEEDS_PERSON_PREFIX = 'NEEDS THE PERSON:';
+const NOTICE_REQUEST_HINT = /\n*\((?:Secret request|Request) [A-Za-z0-9:_.-]{1,128}:[^\n]*\)\s*$/i;
+const NOTICE_THREAD_FOOTER = /\n*\(Durango Code thread [A-Za-z0-9_-]{1,128}(?=[,.])[^\n]*\)\s*$/;
+
+/** Extracts the human-facing ask from a `NEEDS THE PERSON:` inbox notice; null for other messages. */
+export const parseNeedsPersonNotice = (content: string): { summary: string; detail: string } | null => {
+  if (!content.startsWith(NEEDS_PERSON_PREFIX)) return null;
+  const split = content.indexOf('\n\n');
+  let detail = split >= 0 ? content.slice(split + 2).trim() : content.slice(NEEDS_PERSON_PREFIX.length).trim();
+  for (let pass = 0; pass < 2; pass += 1) {
+    detail = detail.replace(NOTICE_THREAD_FOOTER, '').replace(NOTICE_REQUEST_HINT, '').trim();
+  }
+  const summary = detail
+    .replace(/^It asked the person to:\s*/i, '')
+    .replace(/^It asked the person:\s*/i, '')
+    .trim();
+  return { summary: summary || detail || 'Waiting on you', detail: detail || content };
+};
+
+/** Extracts the request ref from a `NEEDS THE PERSON` notice message id (`task_…_n_action:ua_…`, `btt_…_n_input:…`, `notice_…_action:ua_…`). */
+export const noticeRequestIdFromMessageId = (messageId: string): { kind: 'action' | 'input'; id: string } | null => {
+  const marker = messageId.indexOf('_n_');
+  let key = marker >= 0 ? messageId.slice(marker + 3).trim() : '';
+  if (!key && messageId.startsWith('notice_')) {
+    const match = /_(action:[^\s]+|input:[^\s]+)$/.exec(messageId);
+    if (match) key = match[1];
+  }
+  if (!key) return null;
+  if (key.startsWith('action:')) return { kind: 'action', id: key.slice('action:'.length) };
+  if (key.startsWith('input:')) return { kind: 'input', id: key.slice('input:'.length) };
+  return null;
 };

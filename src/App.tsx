@@ -195,7 +195,7 @@ import {
   startDurangoDispatchNotices,
   startDurangoDispatchReporter,
 } from './app/durangoDispatch';
-import { startBotThreadRequestSync } from './app/botThreadRequests';
+import { pendingInputCardText, recordBotThreadRequestResolution, startBotThreadRequestSync } from './app/botThreadRequests';
 import MachinePicker from './app/MachinePicker';
 import RemoteBranchPill from './app/RemoteBranchPill';
 import { dismissRemoteThread, remoteSettingsOf, remoteTurnSettingsToSend } from './app/remoteThreads';
@@ -2044,6 +2044,36 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [threadsNeedingInput, awaitingUserActionKey, remoteNeedingInputKey]
   );
+  const recordBotRequestResolution = useCallback(
+    (
+      threads: Thread[],
+      input: {
+        threadId: string;
+        requestId: string;
+        kind: 'action' | 'secret' | 'input';
+        text?: string;
+        op: 'done' | 'reply' | 'dismiss' | 'save' | 'decline' | 'answered' | 'resolved';
+        by: 'person' | 'bot' | 'agent';
+        byName?: string;
+      }
+    ) => {
+      const recorded = recordBotThreadRequestResolution(threads, input);
+      if (recorded?.owner.mode === 'local' && recorded.owner.botId) {
+        void window.orion?.resolveLocalBotNotice?.({
+          botId: recorded.owner.botId,
+          threadId: recorded.root.id,
+          requestId: recorded.requestId,
+          kind: input.kind,
+          op: recorded.resolution.op,
+          by: recorded.resolution.by,
+          ...(recorded.resolution.byName ? { byName: recorded.resolution.byName } : {}),
+          at: recorded.resolution.at,
+        });
+      }
+    },
+    []
+  );
+
   // Done, Reply, or a `check` seeing it done: clears the action and tells the
   // agent that asked without interrupting it (agent:notifyTurn): at its next
   // tool call while it works, or in a turn of its own once it is idle. Only
@@ -2061,6 +2091,16 @@ const App: React.FC = () => {
       const remaining = (thread?.userActions ?? []).filter((action) => action.id !== actionId);
       updateThread(threadId, { userActions: remaining.length ? remaining : undefined });
       if (!thread || !done) return;
+      const byBotRaw = answer.byBot?.trim() || '';
+      recordBotRequestResolution(threads, {
+        threadId,
+        requestId: actionId,
+        kind: done.secret ? 'secret' : 'action',
+        text: done.action,
+        op: answer.reply !== undefined ? 'reply' : 'done',
+        by: byBotRaw ? 'bot' : answer.detected ? 'agent' : 'person',
+        ...(byBotRaw ? { byName: byBotRaw } : {}),
+      });
       // A provider-native subagent's transcript is read-only; its driver
       // thread is the one that can take the message.
       let target: Thread | undefined = thread;
@@ -2134,7 +2174,7 @@ const App: React.FC = () => {
         );
       });
     },
-    [agentModels, pinThreadToBottom, queueMessageToThread, updateThread]
+    [agentModels, pinThreadToBottom, queueMessageToThread, recordBotRequestResolution, updateThread]
   );
   const answerUserActionRef = useRef(answerUserAction);
   useLayoutEffect(() => {
@@ -2152,15 +2192,29 @@ const App: React.FC = () => {
   // The X on a card: the action is redundant (already done, superseded, or
   // asked twice), so it goes away without telling the agent anything.
   const dismissUserAction = useCallback(
-    (threadId: string, actionId: string) => {
-      const thread = useOrionStore.getState().threads.find((candidate) => candidate.id === threadId);
+    (threadId: string, actionId: string, options?: { byBot?: string; silent?: boolean }) => {
+      const threads = useOrionStore.getState().threads;
+      const thread = threads.find((candidate) => candidate.id === threadId);
       const current = thread?.userActions ?? [];
+      const dismissed = current.find((action) => action.id === actionId);
       const remaining = current.filter((action) => action.id !== actionId);
       if (remaining.length === current.length) return;
       updateThread(threadId, { userActions: remaining.length ? remaining : undefined });
       if (remaining.length === 0) settleWaitingOnUserCaptions(threadId);
+      if (dismissed) {
+        const byBot = options?.byBot?.trim() || undefined;
+        recordBotRequestResolution(threads, {
+          threadId,
+          requestId: actionId,
+          kind: dismissed.secret ? 'secret' : 'action',
+          text: dismissed.secret ? dismissed.secret.label : dismissed.action,
+          op: options?.silent ? 'resolved' : 'dismiss',
+          by: options?.silent ? 'agent' : byBot ? 'bot' : 'person',
+          ...(byBot ? { byName: byBot } : {}),
+        });
+      }
     },
-    [updateThread]
+    [recordBotRequestResolution, updateThread]
   );
   const setUserActionWatching = useCallback(
     (threadId: string, actionId: string, watching: boolean) => {
@@ -2275,6 +2329,20 @@ const App: React.FC = () => {
           request.id ? action.id !== request.id || (action.secret && request.source !== 'secret') : Boolean(action.secret)
         );
         if (remaining.length !== current.length) {
+          const remainingIds = new Set(remaining.map((action) => action.id));
+          if (request.source !== 'secret') {
+            for (const removed of current) {
+              if (remainingIds.has(removed.id)) continue;
+              recordBotRequestResolution(state.threads, {
+                threadId: thread.id,
+                requestId: removed.id,
+                kind: removed.secret ? 'secret' : 'action',
+                text: removed.secret ? removed.secret.label : removed.action,
+                op: 'resolved',
+                by: 'agent',
+              });
+            }
+          }
           updateThread(thread.id, { userActions: remaining.length ? remaining : undefined });
           if (remaining.length === 0) settleWaitingOnUserCaptions(thread.id);
         }
@@ -2305,7 +2373,7 @@ const App: React.FC = () => {
         ...(onScreen ? {} : { wokeAt: now, wokeReason: 'attention' as const }),
       });
     });
-  }, [queueMessageToThread, setUserActionWatching, updateThread]);
+  }, [queueMessageToThread, recordBotRequestResolution, setUserActionWatching, updateThread]);
   // A secret card's answer (request_secret) goes straight to the main
   // process, which saves the value to a file and ends the agent's wait; its
   // `resolve` then clears the card. A request that already ended (the run
@@ -2316,12 +2384,24 @@ const App: React.FC = () => {
       actionId: string,
       answer: { type: 'save'; value: string } | { type: 'decline' }
     ): Promise<string | undefined> => {
+      const threads = useOrionStore.getState().threads;
+      const asked = threads.find((candidate) => candidate.id === threadId)?.userActions?.find((action) => action.id === actionId);
       const result = await window.orion?.answerSecretRequest?.({ threadId, id: actionId, answer });
-      if (result?.ok) return undefined;
-      if (!result || result.ended) dismissUserAction(threadId, actionId);
+      if (result?.ok) {
+        recordBotRequestResolution(threads, {
+          threadId,
+          requestId: actionId,
+          kind: 'secret',
+          text: asked?.secret?.label || asked?.action || 'Secret request',
+          op: answer.type,
+          by: 'person',
+        });
+        return undefined;
+      }
+      if (!result || result.ended) dismissUserAction(threadId, actionId, { silent: true });
       return result?.error ?? 'Durango Code could not take the answer.';
     },
-    [dismissUserAction]
+    [dismissUserAction, recordBotRequestResolution]
   );
   // A secret card of a thread on another machine is answered there: the value
   // goes to that machine (end-to-end encrypted), whose agent asked for it, and
@@ -2359,7 +2439,7 @@ const App: React.FC = () => {
           for (const action of thread.userActions ?? []) {
             if (!action.secret || live.has(action.id)) continue;
             if ((Date.parse(action.requestedAt) || 0) >= startedAt) continue;
-            dismissUserAction(thread.id, action.id);
+            dismissUserAction(thread.id, action.id, { silent: true });
           }
         }
       });
@@ -10002,6 +10082,16 @@ const App: React.FC = () => {
           : request.providerId === 'claude'
             ? await window.orion?.answerClaudeQuestions?.(request.runId, request.requestId, answers)
             : await window.orion?.answerCodexQuestions?.(request.runId, request.requestId, answers);
+        if (accepted && !request.async) {
+          recordBotRequestResolution(state.threads, {
+            threadId: request.threadId,
+            requestId: String(request.requestId),
+            kind: 'input',
+            text: pendingInputCardText(request),
+            op: 'answered',
+            by: 'person',
+          });
+        }
         return accepted
           ? { ok: true, threadId }
           : { ok: false, error: 'This question is no longer waiting for an answer.' };
@@ -10052,7 +10142,7 @@ const App: React.FC = () => {
         if (command.op === 'done') markUserActionDone(threadId, actionId, byBot);
         else if (command.op === 'reply') {
           replyToUserAction(threadId, actionId, command.reply ?? '', Array.isArray(command.attachments) ? command.attachments : [], byBot);
-        } else if (command.op === 'dismiss') dismissUserAction(threadId, actionId);
+        } else if (command.op === 'dismiss') dismissUserAction(threadId, actionId, { byBot });
         else if (command.op === 'watch') setUserActionWatching(threadId, actionId, command.watching === true);
         else if (command.op === 'secret' && command.secretAnswer) {
           const error = await answerSecretRequest(threadId, actionId, command.secretAnswer);
@@ -10445,7 +10535,7 @@ const App: React.FC = () => {
               });
             }),
       // A secret request that ended before its answer arrived: its card goes, as in the thread view.
-      dropCard: (threadId, requestId) => userActionHandlersRef.current.dismissUserAction(threadId, requestId),
+      dropCard: (threadId, requestId) => userActionHandlersRef.current.dismissUserAction(threadId, requestId, { silent: true }),
       apply: (answer) => {
         const handlers = userActionHandlersRef.current;
         if (answer.op === 'done') handlers.onUserActionDone(answer.actionThreadId, answer.requestId);

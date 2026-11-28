@@ -73,7 +73,7 @@ export const createBotThreadRequestsBridge = ({
     return null;
   };
 
-  const syncSet = async (threads, reported) => {
+  const syncSet = async (threads, reported, resolved) => {
     const machineId = await Promise.resolve(getMachineId()).catch(() => null);
     if (!machineId) return { ok: false, code: 'no_machine' };
     const machineName = await Promise.resolve(getMachineName()).catch(() => null);
@@ -84,13 +84,14 @@ export const createBotThreadRequestsBridge = ({
         ...(machineName ? { machineName } : {}),
         threads,
         ...(reported.length ? { failed: reported.slice(0, 50) } : {}),
+        ...(resolved.length ? { resolved: resolved.slice(0, 50) } : {}),
       }),
     };
   };
 
   return {
     /**
-     * `{ threads: [{ threadId, owner, threadTitle?, projectName?, requests: [{ requestId, kind, text, … }] }], failed? }`
+     * `{ threads: [{ threadId, owner, threadTitle?, projectName?, requests: [{ requestId, kind, text, … }] }], failed?, resolved? }`
      * → `{ ok, answers }` (Done / Reply / Dismiss for the renderer to press),
      * or `{ ok: false, code }` (signed out, offline).
      */
@@ -107,9 +108,10 @@ export const createBotThreadRequestsBridge = ({
       }));
       keys.keepOnly(secretIds);
       const reported = [...(Array.isArray(input.failed) ? input.failed : []), ...failed.values()];
+      const resolved = Array.isArray(input.resolved) ? input.resolved : [];
       let result;
       try {
-        const synced = await syncSet(threads, reported);
+        const synced = await syncSet(threads, reported, resolved);
         if (!synced.ok) return synced;
         result = synced.result;
       } catch (error) {
@@ -145,7 +147,7 @@ export const createBotThreadRequestsBridge = ({
     async clear() {
       if (await Promise.resolve(signedOut()).catch(() => true)) return { ok: false };
       keys.keepOnly([]);
-      const synced = await syncSet([], []);
+      const synced = await syncSet([], [], []);
       return { ok: synced.ok };
     },
     /** The person answers from this computer's bot chat a request whose thread isn't here: `{ requestId, op, reply?, sealed? }`. */

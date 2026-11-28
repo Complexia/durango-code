@@ -2,8 +2,12 @@ import assert from 'node:assert/strict';
 import {
   allBotCards,
   botNeedsYouCards,
+  botResolvedRequests,
   botSentAnswers,
+  localResolutionForNotice,
+  recordBotThreadRequestResolution,
   threadCardsKey,
+  visibleResolvedBotCards,
   withNeedsYouNow,
   botThreadRequestSet,
   localNeedsYouBotKey,
@@ -450,6 +454,81 @@ const taskThread = thread('t3', {
   assert.throws(() => keys.open('sr_s', sealed), /already has its value/);
   const env = JSON.parse(await sealBotSecret(keys.publicKeyFor('sr_iv'), 'sr_iv', 'x'));
   assert.throws(() => keys.open('sr_iv', JSON.stringify({ ...env, iv: Buffer.alloc(16).toString('base64') })), /bad nonce/);
+}
+
+// --- local resolution tracking, sync flushing, and visible confirmation cards ---
+{
+  botResolvedRequests.clear();
+  const now = 1_700_000_000_000;
+  const recorded = recordBotThreadRequestResolution([botThread, subagent], {
+    threadId: 't1',
+    requestId: 'ua_auth',
+    kind: 'action',
+    text: 'Authorize device',
+    op: 'done',
+    by: 'person',
+    at: now,
+  });
+  assert.ok(recorded);
+  assert.equal(botResolvedRequests.pending().length, 1);
+  assert.equal(botResolvedRequests.pending()[0].requestId, 'ua_auth');
+  assert.equal(botResolvedRequests.pending()[0].op, 'done');
+  assert.equal(localResolutionForNotice(botResolvedRequests.get(), { kind: 'action', id: 'ua_auth' })?.op, 'done');
+
+  const cards = visibleResolvedBotCards({
+    botId: 'bot_1',
+    localResolved: botResolvedRequests.get(),
+    dismissed: new Set(),
+    latestAssistantAt: now - 1_000,
+    now: now + 5_000,
+  });
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].resolved.op, 'done');
+  assert.equal(
+    visibleResolvedBotCards({
+      botId: 'bot_1',
+      localResolved: botResolvedRequests.get(),
+      dismissed: new Set(),
+      latestAssistantAt: now + 1_000,
+      now: now + 5_000,
+    }).length,
+    0,
+    'newer bot assistant reply supersedes the resolved strip'
+  );
+  assert.equal(
+    visibleResolvedBotCards({
+      botId: 'bot_1',
+      localResolved: botResolvedRequests.get(),
+      dismissed: new Set([cards[0].dismissKey]),
+      now: now + 5_000,
+    }).length,
+    0,
+    'dismissed confirmation stays hidden'
+  );
+
+  const syncedBodies: BotThreadRequestSyncInput[] = [];
+  const stop = startBotThreadRequestSync({
+    getState: () => ({ threads: [{ ...botThread, userActions: undefined }] }),
+    subscribe: () => () => undefined,
+    sync: async (input) => {
+      syncedBodies.push(input);
+      return { ok: true, answers: [] };
+    },
+    apply: () => undefined,
+    hadRequests: () => false,
+    setTimer: (fn) => {
+      queueMicrotask(fn);
+      return 1;
+    },
+    clearTimer: () => undefined,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stop();
+  assert.equal(syncedBodies.length, 1);
+  assert.equal(syncedBodies[0].resolved?.length, 1);
+  assert.equal(syncedBodies[0].resolved?.[0].requestId, 'ua_auth');
+  assert.equal(botResolvedRequests.pending().length, 0, 'acknowledged after sync');
+  botResolvedRequests.clear();
 }
 
 console.log('bot thread requests: ok');

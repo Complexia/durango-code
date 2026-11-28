@@ -14,6 +14,7 @@
 // answering in either place clears both.
 
 import type { Thread, UserAction } from '../store';
+import type { DesktopBotRequestResolution, DesktopBotRequestResolutionBy, DesktopBotRequestResolutionOp } from './bots';
 import { botThreadOwner, safeApprovalReason, type BotThreadOwner, type PendingInputRequest } from './durangoDispatch';
 import { pendingUserActions, type PendingUserAction } from './threadLists';
 
@@ -39,10 +40,11 @@ export type BotThreadRequest = {
   /** The machine's key a secret's value is sealed to; null when its Durango Code can't take one from here. */
   secretKey: string | null;
   requestedAt: number;
-  /** answering: answered in a bot's chat, on its way to the thread. */
-  status: 'pending' | 'answering';
+  /** answering: answered in a bot's chat, on its way to the thread. resolved: no longer waiting. */
+  status: 'pending' | 'answering' | 'resolved';
   answeredAt: number | null;
   answer: 'done' | 'reply' | 'dismiss' | 'save' | 'decline' | null;
+  resolved?: DesktopBotRequestResolution | null;
   /** Why the last answer didn't go through there, and when Durango recorded it. */
   error: string | null;
   errorAt?: number | null;
@@ -73,7 +75,24 @@ export type BotThreadRequestSyncThread = {
 /** An answer from a bot's chat this machine couldn't apply (Durango shows the card again, with why). */
 export type BotThreadRequestFailure = { threadId: string; requestId: string; at: number; error: string };
 
-export type BotThreadRequestSyncInput = { threads: BotThreadRequestSyncThread[]; failed?: BotThreadRequestFailure[] };
+/** A resolution that happened on this machine (in the thread, via local panel card, or answer_thread_request). */
+export type BotThreadRequestResolution = {
+  threadId: string;
+  actionThreadId?: string;
+  owner?: BotThreadOwnerRefs;
+  requestId: string;
+  kind?: BotThreadRequestKind;
+  op: DesktopBotRequestResolutionOp;
+  by: DesktopBotRequestResolutionBy;
+  byName?: string;
+  at: number;
+};
+
+export type BotThreadRequestSyncInput = {
+  threads: BotThreadRequestSyncThread[];
+  failed?: BotThreadRequestFailure[];
+  resolved?: BotThreadRequestResolution[];
+};
 
 /** An answer given in a bot's chat on another device, for this machine to press. */
 export type BotThreadRequestAnswer = {
@@ -251,6 +270,12 @@ export type BotThreadRequestSyncDeps = {
    */
   hadRequests?: () => boolean;
   setHadRequests?: (value: boolean) => void;
+  /** Resolution queue for this machine (defaults to the shared `botResolvedRequests` store). */
+  resolutions?: {
+    subscribe: (listener: () => void) => () => void;
+    pending: () => BotThreadRequestResolution[];
+    acknowledge: (sent: readonly BotThreadRequestResolution[]) => void;
+  };
   now?: () => number;
   setTimer?: (callback: () => void, ms: number) => unknown;
   clearTimer?: (timer: unknown) => void;
@@ -269,6 +294,7 @@ export const startBotThreadRequestSync = ({
   projectName,
   hadRequests = () => true,
   setHadRequests = () => undefined,
+  resolutions = botResolvedRequests,
   now = () => Date.now(),
   setTimer = (callback, ms) => setTimeout(callback, ms),
   clearTimer = (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -336,12 +362,17 @@ export const startBotThreadRequestSync = ({
     const key = setKey(set);
     if (key !== sentKey) changedAt = now();
     const waiting = set.length > 0;
-    if (key === sentKey && !dirty && !waiting && failures.length === 0) return;
+    const pendingResolved = resolutions.pending();
+    if (key === sentKey && !dirty && !waiting && failures.length === 0 && pendingResolved.length === 0) return;
     inFlight = true;
     const reporting = failures;
     let result: Awaited<ReturnType<typeof sync>>;
     try {
-      result = await sync({ threads: set, ...(reporting.length ? { failed: reporting } : {}) });
+      result = await sync({
+        threads: set,
+        ...(reporting.length ? { failed: reporting } : {}),
+        ...(pendingResolved.length ? { resolved: pendingResolved } : {}),
+      });
     } catch {
       result = undefined;
     }
@@ -355,6 +386,7 @@ export const startBotThreadRequestSync = ({
     sentKey = key;
     dirty = false;
     failures = failures.filter((failure) => !reporting.includes(failure));
+    if (pendingResolved.length) resolutions.acknowledge(pendingResolved);
     setHadRequests(waiting);
     for (const ended of result.ended ?? []) {
       try {
@@ -418,6 +450,10 @@ export const startBotThreadRequestSync = ({
     const thread = threads.find((candidate) => candidate.id === event.threadId);
     if (thread && ownedRootOf(threadsById(threads), thread)) readInputs(thread.id);
   });
+  const unsubscribeResolutions = resolutions.subscribe(() => {
+    if (stopped || resolutions.pending().length === 0) return;
+    schedule(150);
+  });
   // Only once the app has loaded its threads (then Durango drops what this machine no longer waits on).
   void Promise.resolve()
     .then(() => whenReady())
@@ -433,6 +469,7 @@ export const startBotThreadRequestSync = ({
     stopped = true;
     unsubscribe();
     unsubscribeEvents?.();
+    unsubscribeResolutions();
     if (timer !== null) clearTimer(timer);
     timer = null;
   };
@@ -494,6 +531,7 @@ export const botNeedsYouCards = (botId: string, requests: BotThreadRequest[] | u
   const cards: BotNeedsYouCard[] = [];
   const seen = new Set<string>();
   for (const request of requests ?? []) {
+    if (request.status === 'resolved') continue;
     const key = `${request.threadId}:${request.requestId}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -638,10 +676,10 @@ export const allBotCards = (bots: ReadonlyArray<{ id: string; requests?: BotThre
 /**
  * Whether a bot's card still needs the person: questions do until their
  * thread has them; others until answered here or there (Durango's
- * `answering`, or sent from this computer and on its way).
+ * `answering` / `resolved`, or sent from this computer and on its way).
  */
 export const cardNeedsYou = (card: BotNeedsYouCard, sent: ReadonlyMap<string, SentBotAnswer>) =>
-  card.kind === 'input' || (card.request?.status !== 'answering' && !sent.has(card.key));
+  card.kind === 'input' || (card.request?.status !== 'answering' && card.request?.status !== 'resolved' && !sent.has(card.key));
 
 /**
  * The bot list with `needsYou` as it stands on this computer now: the bot
@@ -701,4 +739,250 @@ export const withLocalNeedsYou = <T extends { id: string; needsYou: boolean }>(b
   if (!bots || !localKey) return bots;
   const local = new Set(localKey.split('\n'));
   return bots.map((bot) => (!bot.needsYou && local.has(bot.id) ? { ...bot, needsYou: true } : bot));
+};
+
+// --- Resolutions recorded on this computer ----------------------------------------
+
+export const BOT_RESOLVED_KEEP_MS = 10 * 60_000;
+
+export type LocalResolvedBotRequest = {
+  key: string;
+  botId: string | null;
+  threadId: string;
+  actionThreadId?: string;
+  threadTitle: string;
+  requestId: string;
+  kind: BotThreadRequestKind;
+  text: string;
+  resolved: DesktopBotRequestResolution;
+};
+
+let localResolvedMap: ReadonlyMap<string, LocalResolvedBotRequest> = new Map();
+let pendingResolutionMap = new Map<string, BotThreadRequestResolution>();
+const resolvedListeners = new Set<() => void>();
+
+const emitResolved = () => {
+  for (const listener of resolvedListeners) listener();
+};
+
+const pruneLocalResolved = (map: ReadonlyMap<string, LocalResolvedBotRequest>, now = Date.now()) => {
+  let pruned = false;
+  const next = new Map<string, LocalResolvedBotRequest>();
+  for (const [key, item] of map) {
+    if (now - item.resolved.at >= BOT_RESOLVED_KEEP_MS) {
+      pruned = true;
+      continue;
+    }
+    next.set(key, item);
+  }
+  while (next.size > 60) {
+    next.delete(next.keys().next().value as string);
+    pruned = true;
+  }
+  return pruned ? next : map;
+};
+
+/**
+ * Resolutions that happened on this computer (in a thread, via a local bot chat
+ * panel card, or via answer_thread_request). Holds two things:
+ * - a short-lived local cache (`get`) so desktop Bots views update immediately
+ *   at 0 ms (and signed-out local bots show the confirmation strip too), and
+ * - a pending queue (`pending` / `acknowledge`) flushed on the next
+ *   `syncBotThreadRequests` call so Durango stamps the inbox card and notifies
+ *   all other devices.
+ */
+export const botResolvedRequests = {
+  get: () => localResolvedMap,
+  subscribe(listener: () => void) {
+    resolvedListeners.add(listener);
+    return () => {
+      resolvedListeners.delete(listener);
+    };
+  },
+  pending: (): BotThreadRequestResolution[] => [...pendingResolutionMap.values()],
+  acknowledge(sent: readonly BotThreadRequestResolution[]) {
+    let changed = false;
+    for (const item of sent) {
+      const k = `${item.threadId}\n${item.requestId}`;
+      if (pendingResolutionMap.get(k) === item) {
+        pendingResolutionMap.delete(k);
+        changed = true;
+      }
+    }
+    if (changed) emitResolved();
+  },
+  record(entry: LocalResolvedBotRequest, syncPayload?: BotThreadRequestResolution | null) {
+    const base = pruneLocalResolved(localResolvedMap);
+    const next = new Map(base);
+    next.set(entry.key, entry);
+    localResolvedMap = next;
+    if (syncPayload) {
+      pendingResolutionMap.set(`${syncPayload.threadId}\n${syncPayload.requestId}`, syncPayload);
+      while (pendingResolutionMap.size > 50) {
+        pendingResolutionMap.delete(pendingResolutionMap.keys().next().value as string);
+      }
+    }
+    emitResolved();
+  },
+  clear() {
+    if (localResolvedMap.size === 0 && pendingResolutionMap.size === 0) return;
+    localResolvedMap = new Map();
+    pendingResolutionMap = new Map();
+    emitResolved();
+  },
+};
+
+/** Finds the bot-started root of `threadId` (Durango or local) and records a request resolution. */
+export const recordBotThreadRequestResolution = (
+  threads: Thread[],
+  input: {
+    threadId: string;
+    requestId: string;
+    kind: BotThreadRequestKind;
+    text?: string;
+    op: DesktopBotRequestResolutionOp;
+    by: DesktopBotRequestResolutionBy;
+    byName?: string;
+    at?: number;
+  }
+): { owner: BotThreadOwner; root: Thread; resolution: DesktopBotRequestResolution; requestId: string } | null => {
+  const byId = threadsById(threads);
+  const thread = byId.get(input.threadId);
+  if (!thread) return null;
+  let root = thread;
+  for (let depth = 0; root.parentThreadId && depth < 20; depth += 1) {
+    const parent = byId.get(root.parentThreadId);
+    if (!parent) return null;
+    root = parent;
+  }
+  const owner = botThreadOwner(root);
+  if (!owner) return null;
+  const own = root.id === thread.id;
+  const requestId =
+    input.kind === 'input' && !input.requestId.startsWith('q:')
+      ? `q:${own ? '' : `${thread.id}:`}${input.requestId}`.slice(0, 128)
+      : input.requestId.slice(0, 128);
+  const at = input.at ?? Date.now();
+  const byName = input.byName?.trim().slice(0, 80) || undefined;
+  const resolution: DesktopBotRequestResolution = {
+    op: input.op,
+    by: input.by,
+    ...(byName ? { byName } : {}),
+    at,
+  };
+  const key = `${root.id}:${requestId}`;
+  const entry: LocalResolvedBotRequest = {
+    key,
+    botId: owner.botId ?? null,
+    threadId: root.id,
+    ...(!own ? { actionThreadId: thread.id } : {}),
+    threadTitle: root.title || 'A thread',
+    requestId,
+    kind: input.kind,
+    text: clip(input.text?.trim() || 'Request', 400),
+    resolved: resolution,
+  };
+  const syncPayload: BotThreadRequestResolution | null =
+    owner.mode === 'durango'
+      ? {
+          threadId: root.id,
+          ...(!own ? { actionThreadId: thread.id } : {}),
+          owner: botOwnerRefs(owner),
+          requestId,
+          kind: input.kind,
+          op: resolution.op,
+          by: resolution.by,
+          ...(byName ? { byName } : {}),
+          at,
+        }
+      : null;
+  botResolvedRequests.record(entry, syncPayload);
+  return { owner, root, resolution, requestId };
+};
+
+/** Looks up a local resolution matching a `NEEDS THE PERSON` notice's request ref (for 0 ms optimistic inbox updates). */
+export const localResolutionForNotice = (
+  localResolved: ReadonlyMap<string, LocalResolvedBotRequest>,
+  ref: { kind: 'action' | 'input'; id: string } | null
+): DesktopBotRequestResolution | null => {
+  if (!ref || localResolved.size === 0) return null;
+  for (const item of localResolved.values()) {
+    if (ref.kind === 'action' && item.kind !== 'input' && item.requestId === ref.id) return item.resolved;
+    if (ref.kind === 'input' && item.kind === 'input') {
+      let raw = item.requestId.startsWith('q:') ? item.requestId.slice(2) : item.requestId;
+      if (item.actionThreadId && raw.startsWith(`${item.actionThreadId}:`)) raw = raw.slice(item.actionThreadId.length + 1);
+      if (raw === ref.id) return item.resolved;
+    }
+  }
+  return null;
+};
+
+export type BotResolvedCard = {
+  key: string;
+  dismissKey: string;
+  threadId: string;
+  threadTitle: string;
+  machineName: string | null;
+  text: string;
+  resolved: DesktopBotRequestResolution;
+};
+
+/**
+ * Resolved request confirmations to show briefly above the composer: merges
+ * Durango's `resolvedRequests` and this machine's `localResolved`, drops any
+ * that are dismissed, expired, or superseded by a newer bot assistant reply.
+ */
+export const visibleResolvedBotCards = ({
+  botId,
+  resolvedRequests,
+  localResolved,
+  activeKeys,
+  dismissed,
+  latestAssistantAt,
+  now = Date.now(),
+}: {
+  botId: string;
+  resolvedRequests?: readonly BotThreadRequest[];
+  localResolved: ReadonlyMap<string, LocalResolvedBotRequest>;
+  activeKeys?: ReadonlySet<string>;
+  dismissed: ReadonlySet<string>;
+  latestAssistantAt?: number;
+  now?: number;
+}): BotResolvedCard[] => {
+  const byKey = new Map<string, BotResolvedCard>();
+  for (const request of resolvedRequests ?? []) {
+    if (request.status !== 'resolved' || !request.resolved) continue;
+    const key = `${request.threadId}:${request.requestId}`;
+    if (activeKeys?.has(key)) continue;
+    byKey.set(key, {
+      key,
+      dismissKey: `${key}:${request.resolved.at}`,
+      threadId: request.threadId,
+      threadTitle: request.threadTitle || 'A thread',
+      machineName: request.machineName,
+      text: request.kind === 'secret' ? request.secretLabel || request.text : request.text,
+      resolved: request.resolved,
+    });
+  }
+  for (const item of localResolved.values()) {
+    if (item.botId !== botId) continue;
+    if (activeKeys?.has(item.key) || byKey.has(item.key)) continue;
+    byKey.set(item.key, {
+      key: item.key,
+      dismissKey: `${item.key}:${item.resolved.at}`,
+      threadId: item.threadId,
+      threadTitle: item.threadTitle,
+      machineName: null,
+      text: item.text,
+      resolved: item.resolved,
+    });
+  }
+  return [...byKey.values()]
+    .filter((card) => {
+      if (dismissed.has(card.dismissKey)) return false;
+      if (now - card.resolved.at >= BOT_RESOLVED_KEEP_MS) return false;
+      if (typeof latestAssistantAt === 'number' && latestAssistantAt > card.resolved.at) return false;
+      return true;
+    })
+    .sort((a, b) => a.resolved.at - b.resolved.at);
 };
